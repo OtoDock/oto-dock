@@ -25,7 +25,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import config
-from api.apps import app_proxy
+from api.apps import app_outside, app_proxy
 from app import app
 from auth.providers import UserContext, get_current_user
 from auth.session_token import create_session_token
@@ -393,6 +393,36 @@ def ws_upstream():
     yield port_box["port"]
     loop.call_soon_threadsafe(port_box["stop"].set_result, None)
     t.join(5)
+
+
+def test_the_app_socket_takes_no_session_token(agent_tree, ws_upstream, monkeypatch):
+    """The socket bridge is the browser's: an agent session's token is
+    closed with 4403 and the route-list sentence at the auth frame and at a
+    rotation, on either listener, before the app is woken. A viewer's token
+    is no session token and opens the socket as before."""
+    from starlette.websockets import WebSocketDisconnect
+
+    from auth.external_endpoints import SESSION_ROUTE_DETAIL
+    row = _folder_row("team", "", None)   # the agent's shared app: its HTTP methods reach it
+    _install(row, ws_upstream)
+    agent_tok = live_session_token("sess-ws", AGENT, "")
+    url = f"/v1/apps/{row['id']}/ws/chat"
+    for listener in (45123, 80):   # the public side, then the test client's own port (inside)
+        monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", listener)
+        with client.websocket_connect(url) as ws:
+            ws.send_text(json.dumps({"type": "auth", "token": agent_tok}))
+            with pytest.raises(WebSocketDisconnect) as e:
+                ws.receive_text()
+        assert (e.value.code, e.value.reason) == (4403, SESSION_ROUTE_DETAIL), listener
+    with client.websocket_connect(url) as ws:
+        ws.send_text(json.dumps({"type": "auth", "token": _viewer_token(row["id"])}))
+        assert json.loads(ws.receive_text())["headers"]["x-otodock-basis"] == "viewer"
+        # A rotation to a session's token closes the open socket the same way.
+        ws.send_text(json.dumps({"type": "auth", "token": agent_tok}))
+        ws.send_text("after")
+        with pytest.raises(WebSocketDisconnect) as e:
+            ws.receive_text()
+    assert (e.value.code, e.value.reason) == (4403, SESSION_ROUTE_DETAIL)
 
 
 def test_ws_bridge_authenticates_first_then_forwards_both_ways(agent_tree, ws_upstream):
@@ -794,21 +824,12 @@ def test_apps_owner_standing(owner_standing, monkeypatch):
     every surface answers as for a missing app, its server stops at the
     removal, nothing is deleted, and a re-attach brings it back; an admin
     still sees the row."""
-    from starlette.websockets import WebSocketDisconnect
-
     from api.apps import apps as apps_api
     row, inst = owner_standing
     _as(PM)
     claim = _viewer_token(row["id"])
     assert client.get(f"/v1/apps/{row['id']}/api/x", headers=_bearer(claim)).status_code == 200
     session = live_session_token("s-pm", AGENT, "pm-sub")
-    # The server's open subscription socket loses its feeds at its next
-    # frame (the row is read afresh per frame).
-    socket_cm = client.websocket_connect(f"/v1/apps/{row['id']}/platform/ws")
-    open_socket = socket_cm.__enter__()
-    open_socket.send_text(json.dumps({"type": "auth", "token": inst.token}))
-    open_socket.send_text(json.dumps({"type": "catalog_subscribe", "feed": "sessions"}))
-    assert open_socket.receive_json()["ok"] is True
     woken: list[str] = []
 
     async def _no_wake(r, name="live"):
@@ -826,9 +847,6 @@ def test_apps_owner_standing(owner_standing, monkeypatch):
     # The subscriber stopped the server; nothing else changed (the row, its
     # approval, its handler schedules and triggers stay for a re-attach).
     assert app_supervisor.get(row["id"]) is None and forgotten == []
-    open_socket.send_text(json.dumps({"type": "catalog_subscribe", "feed": "sessions"}))
-    assert open_socket.receive_json() == {"type": "catalog_ack", "feed": "sessions", "ok": False}
-    socket_cm.__exit__(None, None, None)
     kept = task_store.get_app(row["id"])
     assert kept and not kept["hidden"] and task_store.app_actions_approved(kept)
     monkeypatch.setattr(app_supervisor, "ensure_up", _no_wake)
@@ -847,10 +865,6 @@ def test_apps_owner_standing(owner_standing, monkeypatch):
                             headers=_bearer(token)).status_code == 404
         assert client.post(f"/v1/apps/{row['id']}/push", json={"payload": {}},
                            headers=_bearer(token)).status_code == 404
-    with client.websocket_connect(f"/v1/apps/{row['id']}/platform/ws") as ws:
-        with pytest.raises(WebSocketDisconnect) as e:
-            ws.receive_text()
-    assert e.value.code == 1008
     assert woken == []
     # An admin still reads the row.
     _as(ROOT)
@@ -1183,9 +1197,8 @@ def test_a_person_placement_admits_their_own_user_scope_sessions_alone(agent_tre
 
 
 def test_a_placed_session_reaches_the_exports_and_nothing_else(agent_tree, ws_upstream):
-    """Push, state, the platform route and the socket refuse a placed
-    agent's session, with or without a person, and a placed session's token
-    never keeps alive a socket the home agent's own session opened."""
+    """Push, state and the platform route refuse a placed agent's session,
+    with or without a person, and the socket takes no session token."""
     from starlette.websockets import WebSocketDisconnect
 
     from api.apps import apps as apps_api
@@ -1203,18 +1216,163 @@ def test_a_placed_session_reaches_the_exports_and_nothing_else(agent_tree, ws_up
                            headers=_bearer(tok)).status_code == 403
         assert client.post(f"/v1/apps/{row['id']}/platform/viewer.me", json={},
                            headers=_bearer(tok)).status_code == 403
+        # The socket takes no session token at all (the bridge is the
+        # browser's), a placed session's included.
         with client.websocket_connect(f"/v1/apps/{row['id']}/ws/live") as ws:
             ws.send_text(json.dumps({"type": "auth", "token": tok}))
             with pytest.raises(WebSocketDisconnect) as e:
                 ws.receive_text()
-        assert e.value.code == 1008
+        assert e.value.code == 4403
     assert task_store.get_app_state(row["id"])[1] == 0
-    own = live_session_token("s-own", AGENT, "bob-sub")
-    with client.websocket_connect(f"/v1/apps/{row['id']}/ws/chat") as ws:
-        ws.send_text(json.dumps({"type": "auth", "token": own}))
-        ws.receive_text()
-        ws.send_text(json.dumps({"type": "auth", "token": bob}))
-        ws.send_text("after")
-        with pytest.raises(WebSocketDisconnect) as e:
+
+
+# ── an outside person's session on an app opened to external identities ────
+
+OUTSIDE_EXPORTS = {"methods": {
+    "book": {"description": "Book a free time", "min_role": "external"},
+    "status": {"description": "the register's status"},
+    "purge-cache": {"description": "drop the cache", "min_role": "manager"},
+}}
+CALLER_NUMBER = "+302101234567"
+
+
+def _outside_row(slug: str = "booking") -> dict:
+    row = task_store.upsert_app(AGENT, "", None, slug, title=slug.title(), rel_path=f"workspace/apps/{slug}",
+                                kind="folder", actions_json="[]",
+                                blocks={"exports": task_store.canonical_actions_json(OUTSIDE_EXPORTS)})
+    task_store.approve_app_actions(row["id"], task_store.manifest_sig(row), "alice-sub")
+    return task_store.get_app(row["id"])
+
+
+def _outside_session(sid: str, apps: tuple, *, ext: str = f"phone:{CALLER_NUMBER}", verified: bool = False) -> str:
+    from auth.path_policy import SecurityContext
+    from core.session import session_state
+    session_state.set_session_security(sid, SecurityContext(
+        role="external", username="", agent=AGENT, is_admin_agent=False, session_scope="agent",
+        principal="external", external_channel="phone", external_claim=ext, external_verified=verified,
+        outside_apps=apps, outside_grants=(("outside-apps", None),)))
+    return live_session_token(sid, AGENT, "", external=ext)
+
+
+@pytest.fixture
+def outside_cache():
+    app_outside._outside_picks_cache.clear()
+    yield
+    app_outside._outside_picks_cache.clear()
+    from core.session import session_state
+    for sid in ("s-out", "s-out-2", "s-person", "s-damaged"):
+        session_state._session_security.pop(sid, None)
+
+
+def test_an_outside_session_reaches_only_a_picked_apps_methods_open_to_it(agent_tree, upstream, outside_cache):
+    """A caller's session (``ext``, no person) on the agent's app: refused
+    until a manager picks the app; then the methods floored ``external``
+    answer, forwarded as exported methods, with an ``external`` claim that
+    names the channel and an opaque person, never the number; every other
+    door refuses it; a removal bites at the next call."""
+    from starlette.websockets import WebSocketDisconnect
+
+    from core.session import external_identity
+    from storage.agents import outside_store
+    from storage.identity import external_identity_store
+    row = _outside_row()
+    upstream.app_id = row["id"]
+    _install(row, upstream.server_port)
+    url = f"/v1/apps/{row['id']}/api"
+    person_id = external_identity_store.touch(AGENT, "phone", CALLER_NUMBER, external_identity.slug_for(CALLER_NUMBER))
+    # Not picked: the session's own start-time picks name nothing. Without
+    # the apps tool the route list refuses before the door.
+    token = _outside_session("s-out", ())
+    r = client.post(f"{url}/book", headers=_bearer(token))
+    assert r.status_code == 404 and "App not found" in r.text
+    from core.session import session_state
+    ctx = session_state.get_session_security("s-out")
+    session_state.set_session_security("s-out", type(ctx)(**{**ctx.__dict__, "outside_grants": ()}))
+    assert client.post(f"{url}/book", headers=_bearer(token)).status_code == 403
+    # Picked (the store and the session's start-time picks).
+    outside_store.update(AGENT, add_apps=[{"app_id": row["id"], "methods": ["book"]}])
+    token = _outside_session("s-out", (row["id"],))
+    r = client.post(f"{url}/book", headers=_bearer(token), json={"when": "tomorrow"})
+    assert r.status_code == 200, r.text
+    seen = r.json()
+    assert seen["path"] == "/api/book" and seen["headers"]["x-otodock-basis"] == "external"
+    claim = app_tokens.verify(seen["headers"]["x-otodock-viewer"], row["id"], app_tokens.PURPOSE_CALLER)
+    assert claim["principal"] == "external" and claim["role"] == "external" and claim["external"] is True
+    assert claim["channel"] == "phone" and claim["person"] == person_id and claim["verified"] is False
+    assert claim["ephemeral"] is False and claim["sub"] == "" and "session" not in claim
+    assert CALLER_NUMBER not in seen["headers"]["x-otodock-viewer"] and CALLER_NUMBER not in json.dumps(claim)
+    # Methods not open to outside people, and paths that name no method.
+    for path in ("status", "purge-cache", "raw"):
+        assert client.post(f"{url}/{path}", headers=_bearer(token)).status_code == 404, path
+    # A path of more than one segment never passes the route list.
+    assert client.post(f"{url}/_handler/x", headers=_bearer(token)).status_code == 403
+    # The other doors that serve an app refuse it.
+    assert client.post(f"/v1/apps/{row['id']}/platform/viewer.me", json={"args": {}},
+                       headers=_bearer(token)).status_code == 403
+    assert client.post(f"/v1/apps/{row['id']}/push", json={"data": {}}, headers=_bearer(token)).status_code == 403
+    assert client.patch(f"/v1/apps/{row['id']}/state", json={"patch": {}}, headers=_bearer(token)).status_code == 403
+    with client.websocket_connect(f"/v1/apps/{row['id']}/ws/live", headers={"origin": "http://testserver"}) as ws:
+        ws.send_text(json.dumps({"type": "auth", "token": token}))
+        with pytest.raises(WebSocketDisconnect) as closed:
             ws.receive_text()
-    assert e.value.code == 4401
+    assert closed.value.code == 1008
+    # Another agent's app, even picked by name on this agent's session.
+    other = task_store.upsert_app(OTHER_AGENT, "", None, "theirs", rel_path="workspace/apps/theirs", kind="folder")
+    assert client.post(f"/v1/apps/{other['id']}/api/book", headers=_bearer(token)).status_code == 404
+    # A manager takes the app off: the next call is refused.
+    outside_store.update(AGENT, remove_apps=[row["id"]])
+    app_outside._outside_picks_cache.clear()
+    r = client.post(f"{url}/book", headers=_bearer(token))
+    assert r.status_code == 403 and "not available right now" in r.text
+
+
+def test_an_outside_claim_relayed_by_the_apps_server_is_refused(agent_tree, upstream, outside_cache):
+    """S-F4: an outside person's call is never the app's own identity: its
+    claim passed on by the app's server is refused at the platform route
+    and at the broker."""
+    from storage.agents import outside_store
+    row = _outside_row()
+    upstream.app_id = row["id"]
+    inst = _install(row, upstream.server_port)
+    outside_store.update(AGENT, add_apps=[{"app_id": row["id"], "methods": ["book"]}])
+    token = _outside_session("s-out-2", (row["id"],))
+    seen = client.post(f"/v1/apps/{row['id']}/api/book", headers=_bearer(token)).json()
+    relayed = seen["headers"]["x-otodock-viewer"]
+    headers = {**_bearer(inst.token), "X-OtoDock-Viewer": relayed}
+    r = client.post(f"/v1/apps/{row['id']}/platform/viewer.me", json={"args": {}}, headers=headers)
+    assert r.status_code == 403 and "outside people" in r.text
+
+
+def test_a_route_tied_to_a_person_keeps_its_refusal_and_a_damaged_claim_is_refused(agent_tree, outside_cache):
+    """The outside door takes ``ext`` with no person only; a token of a route
+    tied to a person carries ``ext`` too and keeps today's 401; a damaged
+    claim is refused, never demoted."""
+    row = _outside_row()
+    person = live_session_token("s-person", AGENT, "alice-sub", external=f"phone:{CALLER_NUMBER}")
+    r = client.post(f"/v1/apps/{row['id']}/api/book", headers=_bearer(person))
+    assert r.status_code == 401 and "external sessions cannot call apps" in r.text
+    # A live session whose claim is damaged: refused at the claim itself,
+    # never taken as some caller.
+    damaged = app_proxy.validate_session_token(live_session_token("s-damaged", AGENT, "", external="nochannel"))
+    assert damaged and damaged.get("ext") == "nochannel"
+    _outside_session("s-damaged", (row["id"],), ext="nochannel")
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(app_outside.outside_caller(damaged, row))
+    assert exc.value.status_code == 401 and exc.value.detail == "the session token is damaged"
+
+
+def test_the_route_list_admits_an_app_method_only_with_the_apps_tool():
+    from types import SimpleNamespace
+
+    from auth.external_endpoints import is_external_endpoint_allowed
+    path = "/v1/apps/0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b/api/book"
+    with_tool = SimpleNamespace(outside_grants=(("outside-apps", None),))
+    without = SimpleNamespace(outside_grants=(("crm", ("find",)),))
+    assert is_external_endpoint_allowed("POST", path, with_tool)
+    assert not is_external_endpoint_allowed("POST", path, without)
+    assert not is_external_endpoint_allowed("GET", path, with_tool)
+    for other in ("/v1/apps/0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b/platform/viewer.me",
+                  "/v1/apps/0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b/api/book/x",
+                  "/v1/apps/0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b/push",
+                  "/v1/apps/0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b/api/Book"):
+        assert not is_external_endpoint_allowed("POST", other, with_tool), other

@@ -8,8 +8,9 @@ import { useState } from 'react'
 // into its chip and a pressed chip opens into its window (a plain swap under
 // reduced motion), the chip is the button with its X always shown, the
 // chips reorder by drag and move the dock to the other side past the middle
-// (remembered per device), a phone places a window beside the dock. The
-// motion tokens' mirror follows tokens.css.
+// (remembered per device), a phone places a window beside the dock, a video
+// fits its window with its full screen in view. The motion tokens' mirror
+// follows tokens.css.
 
 import ArtifactDock from '@/components/chat/artifacts/ArtifactDock'
 import ArtifactWindows from '@/components/chat/artifacts/ArtifactWindows'
@@ -424,5 +425,40 @@ describe('a window and its chip', () => {
     setDockSide(DOCK_SIDE.RIGHT)
     render(<Page wins={[win(2, 'Two')]} />)
     expect(windowEl(2).style.left).toBe('24px')
+  })
+})
+
+describe('a video window', () => {
+  const video = (id: number): ArtifactWindow => ({
+    id, title: 'Clip', block: { type: 'video', srcKind: 'url', url: 'https://cdn.example.com/tall.mp4', title: 'Clip' },
+  })
+
+  it('lays its player out to fit, so a tall clip keeps the full screen button in the window', () => {
+    media.narrow = true
+    media.coarse = true
+    render(<Page wins={[video(1)]} />)
+    // The window caps its height; its body is a column the player shrinks
+    // in, and the frame may shrink below the clip's own shape.
+    const body = windowEl(1).children[1] as HTMLElement
+    expect(body.className).toMatch(/\bflex\b/)
+    expect(body.className).toMatch(/\bflex-col\b/)
+    const frame = body.querySelector('video')!.parentElement!
+    expect(frame.className).toMatch(/\bmin-h-0\b/)
+    const root = frame.parentElement!
+    expect(root.parentElement).toBe(body)
+    expect(root.className).toMatch(/\bflex-col\b/)
+    expect(root.className).toMatch(/\bmin-h-0\b/)
+    // The button sits in the frame, and asks the frame for full screen.
+    const asked = vi.fn(() => Promise.resolve())
+    frame.requestFullscreen = asked
+    const button = screen.getByRole('button', { name: 'Fullscreen' })
+    expect(frame.contains(button)).toBe(true)
+    fireEvent.click(button)
+    expect(asked).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves the other windows as they were', () => {
+    render(<Page wins={[win(1, 'One')]} />)
+    expect((windowEl(1).children[1] as HTMLElement).className).not.toMatch(/\bflex-col\b/)
   })
 })

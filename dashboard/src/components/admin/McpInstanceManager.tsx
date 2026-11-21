@@ -192,13 +192,12 @@ export default function McpInstanceManager({ mcpName, agents, apiKeyRelay, airGa
       {hasSshKeyField && <SshKeysSection />}
 
       {/* Trust note: authorizing an agent for a host hands it shell access
-          there — the session gets the referenced private key (0600, wiped at
-          session end) and each ssh command still passes the bash permission
-          gate, but key material is readable by that agent while it runs. */}
+          there. The platform keeps the key and signs for the session, and
+          each ssh command passes the bash permission gate. */}
       {hasSshKeyField && (
         <div className="text-2xs px-2.5 py-2 rounded-card border border-status-warning-border bg-status-warning-bg text-status-warning-fg">
-          Giving an agent a host gives it shell access there. Its sessions get
-          the private key and run ssh directly. Give hosts only to agents you
+          Giving an agent a host gives it shell access there. Its sessions can
+          run any ssh command on that host. Give hosts only to agents you
           trust that much.
         </div>
       )}

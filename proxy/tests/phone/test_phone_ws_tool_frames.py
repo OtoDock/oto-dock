@@ -22,6 +22,18 @@ def _item(etype: str, **data) -> dict:
     return {"pump_type": "ws_event", "event": {"type": etype, **data}}
 
 
+def test_an_error_frame_carries_the_callers_line_only_when_the_ending_has_one():
+    """The phone socket's ``error`` frame: ``data.say`` is what the caller
+    hears for an ending that has a line (``TurnEnding.spoken``). Without
+    one the frame is the one an older phone service already reads."""
+    say = "Sorry, I had to stop for a moment. Could you say that again?"
+    with_line = _pump_item_to_phone_ws({"pump_type": "error", "message": "card text", "say": say}, 4)
+    assert with_line == {"type": "error", "turn": 4, "data": {"message": "card text", "say": say}}
+    plain = _pump_item_to_phone_ws({"pump_type": "error", "message": "card text"}, 4)
+    assert plain == {"type": "error", "turn": 4, "data": {"message": "card text"}}
+    assert _pump_item_to_phone_ws({"pump_type": "error", "message": "x", "say": ""}, 4)["data"] == {"message": "x"}
+
+
 class TestToolFrameTranslation:
     def test_pump_tool_start_translates(self):
         # The name the pump ACTUALLY emits (stream_pump TOOL_USE handler).

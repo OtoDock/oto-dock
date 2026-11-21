@@ -425,9 +425,10 @@ def test_a_git_ref_is_a_commit_only_at_40_lowercase_hex():
 
 @pytest.mark.asyncio
 async def test_a_repair_never_waits_for_a_young_release(tmp_path, doc, converge, monkeypatch):
-    """A venv the sandbox cannot run is rebuilt at once, at the installed
-    version, and the newer release keeps waiting on the page."""
-    from services.mcp import mcp_venv_bootstrap
+    """A tool the compute machine does not hold in a healthy build is
+    rebuilt at once, at the installed version, and the newer release keeps
+    waiting on the page."""
+    from services.remote import machine_tools
     monkeypatch.setattr(mcp_updater, "_utcnow", lambda: NOW)
     m = _npm_manifest(tmp_path)
     m.server.source = "pypi:pkg@1.0.0"
@@ -437,7 +438,7 @@ async def test_a_repair_never_waits_for_a_young_release(tmp_path, doc, converge,
     async def _entry(name):
         return {"name": name, "version": "", "source": "pypi:pkg"}
     monkeypatch.setattr(mcp_updater, "_catalog_entry", _entry)
-    monkeypatch.setattr(mcp_venv_bootstrap, "venv_outside_sandbox", lambda d: True)
+    monkeypatch.setattr(machine_tools, "missing_on_builder", lambda name: name == "pkg-mcp")
     kept = {}
     monkeypatch.setattr(mcp_updater, "_keep_check_result", lambda n, info: kept.update({n: info}))
     monkeypatch.setattr(mcp_updater.mcp_registry, "get_manifest", lambda n: m)

@@ -60,14 +60,14 @@ def _assign_user(sub: str, agents: dict[str, str]) -> None:
     task_store.set_user_agents(sub, list(agents), ADMIN, agent_roles=agents)
 
 
-def _mk_dept(client, name="Engineering", levels=None, **extra):
+def _mk_dept(client, name="Engineering", levels=None, headers=None, **extra):
     # 'both' pins the symmetric shapes the older tests assert; the API's
     # own default ('down') has its own test in TestDelegationDirection.
     r = client.post(
         "/v1/departments",
         json={"name": name, "levels": levels or ["Head", "Senior", "Junior"],
               "mode": "both", **extra},
-        headers=ADMIN_H(),
+        headers=(headers or ADMIN_H)(),
     )
     assert r.status_code == 200, r.text
     return r.json()
@@ -251,7 +251,7 @@ class TestAssignmentFieldGate:
         assert r.status_code == 403
 
     def test_creator_manager_assigns_and_clears(self, client):
-        dept = _mk_dept(client)
+        dept = _mk_dept(client, headers=CREATOR_H)
         _mk_agent("gate-b")
         _assign_user(CREATOR, {"gate-b": "manager"})
         level_id = dept["levels"][0]["id"]
@@ -986,3 +986,235 @@ class TestPromptDepartmentLine:
             "pr-solo", delegation_targets=["pr-solo2"]
         )
         assert "department" not in text
+
+
+def test_only_the_placement_writes_the_record_of_a_departments_set_members():
+    """``department_set_members`` decides which agent a binding reaches from
+    inside a department: the set install's placement writes it, a placement
+    that passed the placement rule fills an empty place (``fill_place``),
+    an agent's delete empties a place. No other code writes it."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    found: dict[str, set[str]] = {}
+    files = [p for d in ("adapters", "api", "auth", "configuration", "core", "hooks", "services", "storage", "ws")
+             for p in (root / d).rglob("*.py")] + list(root.glob("*.py"))
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for verb in ("INSERT INTO", "UPDATE", "DELETE FROM"):
+            if f"{verb} department_set_members" in text:
+                found.setdefault(path.relative_to(root).as_posix(), set()).add(verb)
+    assert found == {"storage/agents/db_departments.py": {"INSERT INTO", "DELETE FROM", "UPDATE"},
+                     "storage/agents/agent_store.py": {"UPDATE"}}
+    import inspect
+
+    from storage.agents import db_departments
+    assert "department_set_members" in inspect.getsource(db_departments.place_members)
+    # The department store's one UPDATE of the record is a hand placement's fill.
+    source = inspect.getsource(db_departments)
+    assert source.count("UPDATE department_set_members") == 1
+    assert "UPDATE department_set_members" in inspect.getsource(db_departments.fill_place)
+
+
+def test_a_department_is_written_on_an_agent_only_by_a_validated_placement():
+    """``update_agent`` fills a department's empty place whenever it writes a
+    department: its callers that pass one are the PATCH route (``**fields``,
+    after the placement rule) and ``assignment.assign``."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    callers = set()
+    for d in ("adapters", "api", "auth", "configuration", "core", "hooks", "services", "storage", "ws"):
+        for path in (root / d).rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            if "update_agent" in text and "department_id=" in text:
+                callers.add(path.relative_to(root).as_posix())
+    assert callers == {"services/departments/assignment.py"}
+
+
+def test_an_install_from_before_the_record_gets_its_table_and_keeps_its_departments(temp_db):
+    """A 1.9.1 database has departments and no record of their set members:
+    the startup creates the table empty and touches nothing else."""
+    from storage.agents import db_departments
+    from storage.agents.schema import init_departments
+    from storage.pg import get_conn
+    dept = db_departments.create_department("Before", ADMIN, mode="down", reach="adjacent",
+                                            level_names=["Head"], community_set="office",
+                                            community_set_version="0.1.0")
+    with get_conn() as conn:
+        conn.execute("DROP TABLE department_set_members")
+        conn.commit()
+    with get_conn() as conn:
+        init_departments(conn)
+        conn.commit()
+    assert db_departments.get_department(dept["id"])["community_set"] == "office"
+    assert db_departments.set_members_all() == {}
+    assert db_departments.set_member(dept["id"], "head") is None
+
+
+# --- the placement right (who may put an agent in a department) -------------------------
+
+def _creator_u(managed: list[str]):
+    from auth.providers import UserContext
+    return UserContext(sub=CREATOR, email="manager@test.com", name="C", role="creator", agents=list(managed),
+                       agent_roles={a: "manager" for a in managed})
+
+
+class TestPlacementRight:
+    def test_a_creator_places_into_the_department_they_made_or_whose_agents_they_all_manage(self, client):
+        from services.departments import assignment
+        mine = _mk_dept(client, name="Mine", headers=CREATOR_H)
+        theirs = _mk_dept(client, name="Theirs")
+        for slug in ("pr-a", "pr-b", "pr-c"):
+            _mk_agent(slug)
+        _assign_user(CREATOR, {"pr-a": "manager", "pr-b": "manager"})
+        head, senior = theirs["levels"][0]["id"], theirs["levels"][1]["id"]
+        # Their empty department: refused, with the one sentence.
+        r = client.patch("/v1/agents/pr-a", json={"department_id": theirs["id"], "department_level_id": head},
+                         headers=CREATOR_H())
+        assert r.status_code == 403 and r.json()["detail"] == assignment.PLACE_REFUSED
+        # Their department holding only an agent the creator manages: allowed.
+        _assign_dept("pr-b", theirs, "Head")
+        r = client.patch("/v1/agents/pr-a", json={"department_id": theirs["id"], "department_level_id": senior},
+                         headers=CREATOR_H())
+        assert r.status_code == 200, r.text
+        # One member the creator does not manage: refused, a level move inside it too.
+        _assign_dept("pr-c", theirs, "Junior")
+        r = client.patch("/v1/agents/pr-a", json={"department_id": theirs["id"], "department_level_id": head},
+                         headers=CREATOR_H())
+        assert r.status_code == 403 and r.json()["detail"] == assignment.PLACE_REFUSED
+        # Clearing stays as before.
+        r = client.patch("/v1/agents/pr-a", json={"department_id": "", "department_level_id": ""},
+                         headers=CREATOR_H())
+        assert r.status_code == 200
+        # Their own department, empty: allowed.
+        r = client.patch("/v1/agents/pr-a", json={"department_id": mine["id"],
+                                                  "department_level_id": mine["levels"][0]["id"]},
+                         headers=CREATOR_H())
+        assert r.status_code == 200, r.text
+
+    def test_the_list_says_where_this_person_may_place_and_the_admin_anywhere(self, client):
+        from services.departments import assignment
+        mine = _mk_dept(client, name="Mine", headers=CREATOR_H)
+        theirs = _mk_dept(client, name="Theirs")
+        _mk_agent("pl-a")
+        _assign_user(CREATOR, {"pl-a": "manager"})
+        _assign_dept("pl-a", theirs, "Head")
+        _mk_dept(client, name="Empty")
+        got = {d["name"]: d for d in client.get("/v1/departments", headers=CREATOR_H()).json()["departments"]}
+        assert got["Mine"]["can_place"] is True and got["Mine"]["place_refusal"] == ""
+        # Every agent of it is the creator's: allowed.
+        assert got["Theirs"]["can_place"] is True
+        assert "Empty" not in got        # not listed to them at all
+        admin = {d["name"]: d for d in client.get("/v1/departments", headers=ADMIN_H()).json()["departments"]}
+        assert all(d["can_place"] for d in admin.values())
+        # A member places nothing.
+        member = client.get("/v1/departments", headers=MEMBER_H()).json()["departments"]
+        assert all(d["can_place"] is False and d["place_refusal"] == assignment.ONLY_ADMINS_AND_CREATORS
+                   for d in member)
+        assert mine["id"]
+
+    def test_the_rule_refuses_the_master_key_a_session_with_no_person_and_a_member(self, temp_db):
+        from auth.providers import UserContext
+        from services.departments import assignment
+        from storage.agents import db_departments
+        dept = db_departments.create_department("Any", ADMIN, level_names=["Head"])
+        master = UserContext(sub="api-key", email="", name="", role="admin", agents=[], agent_roles={})
+        nobody = UserContext(sub="session:x", email="", name="", role="admin", agents=[], agent_roles={},
+                             agent="alpha", is_api_key=True)
+        member = UserContext(sub=MEMBER, email="viewer@test.com", name="M", role="member", agents=[],
+                             agent_roles={})
+        for u in (master, nobody, member):
+            assert assignment.may_place_into(u, dept) is False
+        # A creator's session names the person: it may place into what they made.
+        mine = db_departments.create_department("Mine", CREATOR, level_names=["Head"])
+        session = UserContext(sub=CREATOR, email="manager@test.com", name="C", role="creator", agents=[],
+                              agent_roles={}, is_api_key=True, session_id="sid-x")
+        assert assignment.may_place_into(session, mine) is True
+        assert assignment.may_place_into(session, dept) is False
+
+
+# --- a hand placement fills an empty place ----------------------------------------------
+
+def _set_department(template_slugs: dict[str, str]):
+    """A department a set install recorded: head on top, the rest below."""
+    from services.departments import edge_compiler
+    from storage.agents import agent_store, db_departments
+    dept = db_departments.create_department("Boat", CREATOR, mode="down_across", level_names=["Head", "Team"],
+                                            community_set="office", community_set_version="0.1.0")
+    levels = {lv["name"]: lv["id"] for lv in dept["levels"]}
+    for template, slug in template_slugs.items():
+        agent_store.create_agent(slug, slug.title(), created_by=ADMIN, community_template=template)
+    db_departments.place_members(dept["id"], [(s, levels["Head" if t == "head" else "Team"])
+                                              for t, s in template_slugs.items()], dict(template_slugs))
+    edge_compiler.recompile()
+    return dept, levels
+
+
+class TestHandPlacementFillsAnEmptyPlace:
+    def test_a_left_place_is_filled_by_the_next_placement_and_a_filled_one_never_taken(self, temp_db):
+        import asyncio
+
+        from services.departments import assignment
+        from storage.agents import agent_store, db_departments
+        dept, levels = _set_department({"head": "fh-head", "clerk": "fh-clerk"})
+        for slug in ("fh-clerk-2", "fh-clerk-3"):
+            agent_store.create_agent(slug, slug, created_by=ADMIN, community_template="clerk")
+        me = _creator_u(["fh-head", "fh-clerk", "fh-clerk-2", "fh-clerk-3"])
+        # The place is filled: a second clerk joins with no place.
+        asyncio.run(assignment.assign("fh-clerk-2", dept["id"], levels["Team"], me))
+        assert db_departments.set_member(dept["id"], "clerk") == "fh-clerk"
+        # The recorded clerk leaves: the next placement of a clerk fills it,
+        # here the level move of the clerk already in the department.
+        asyncio.run(assignment.assign("fh-clerk", "", "", me))
+        asyncio.run(assignment.assign("fh-clerk-2", dept["id"], levels["Head"], me))
+        assert db_departments.set_member(dept["id"], "clerk") == "fh-clerk-2"
+        # It comes back: the place is taken now.
+        asyncio.run(assignment.assign("fh-clerk", dept["id"], levels["Team"], me))
+        assert db_departments.set_member(dept["id"], "clerk") == "fh-clerk-2"
+        # A template the record names no place for, and a department with no record: nothing.
+        agent_store.create_agent("fh-scribe", "S", created_by=ADMIN, community_template="scribe")
+        asyncio.run(assignment.assign("fh-scribe", dept["id"], levels["Team"], _creator_u(
+            ["fh-head", "fh-clerk", "fh-clerk-2", "fh-scribe"])))
+        assert db_departments.set_member(dept["id"], "scribe") is None
+        plain = db_departments.create_department("Plain", CREATOR, level_names=["Head"])
+        asyncio.run(assignment.assign("fh-clerk-3", plain["id"], plain["levels"][0]["id"], me))
+        assert db_departments.set_members_all().get((plain["id"], "clerk")) is None
+
+    def test_a_place_needs_a_member_of_the_department_from_its_template(self):
+        from storage.agents import db_departments
+        cases = [
+            ({"department_id": "d", "department_level_id": "l", "community_template": "t"}, True),
+            ({"department_id": "d", "department_level_id": "", "community_template": "t"}, False),
+            ({"department_id": "e", "department_level_id": "l", "community_template": "t"}, False),
+            ({"department_id": "d", "department_level_id": "l", "community_template": "u"}, False),
+            (None, False),
+        ]
+        for agent, member in cases:
+            assert db_departments.member_from(agent, "d", "t") is member, agent
+        assert db_departments.member_from(cases[0][0], "", "t") is False
+
+    def test_two_placements_of_one_template_at_once_fill_the_place_once(self, temp_db):
+        import threading
+
+        from storage.agents import agent_store, db_departments
+        from storage.pg import get_conn
+        dept, levels = _set_department({"head": "tp-head", "clerk": "tp-clerk"})
+        agent_store.delete_agent("tp-clerk")
+        for slug in ("tp-a", "tp-b"):
+            agent_store.create_agent(slug, slug, created_by=ADMIN, community_template="clerk")
+        # The first placement holds the place's lock; the second waits on it.
+        with get_conn() as conn:
+            template = db_departments.lock_place(conn, "tp-a", dept["id"])
+            assert template == "clerk"
+            second = threading.Thread(target=agent_store.update_agent, args=("tp-b",),
+                                      kwargs={"department_id": dept["id"], "department_level_id": levels["Team"]})
+            second.start()
+            second.join(timeout=1.0)
+            assert second.is_alive()
+            conn.execute("UPDATE agents SET department_id = %s, department_level_id = %s WHERE slug = %s",
+                         (dept["id"], levels["Team"], "tp-a"))
+            assert db_departments.fill_place(conn, "tp-a", dept["id"], template) is True
+            conn.commit()
+        second.join(timeout=10)
+        assert not second.is_alive()
+        assert db_departments.set_member(dept["id"], "clerk") == "tp-a"
+        assert agent_store.get_agent("tp-b")["department_id"] == dept["id"]

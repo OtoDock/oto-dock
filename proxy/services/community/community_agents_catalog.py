@@ -21,17 +21,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
 
 from services.community import community_catalog
+from services.infra import archive_read
 from services.infra.path_confinement import (
     PathOutsideRoot,
     normalize_rel_path,
@@ -225,25 +224,26 @@ async def fetch_and_extract_template(template_slug: str) -> Path:
     Path-traversal safe: every extracted entry's resolved absolute path is
     checked to remain inside the tempdir.
     """
-    tarball = await _fetch_tarball()
-    return await asyncio.to_thread(_extract_template_subfolder, tarball, template_slug)
+    try:
+        tarball = await _fetch_tarball()
+        return await asyncio.to_thread(_extract_template_subfolder, tarball, template_slug)
+    except archive_read.ArchiveTooLarge as exc:
+        from fastapi import HTTPException
+        raise HTTPException(502, f"The community agents could not be read. {exc}") from exc
 
 
 async def _fetch_tarball() -> bytes:
     """Fetch the repo tarball. Tries codeload first (CDN), then archive
-    fallback. Both follow redirects automatically."""
+    fallback. Both follow redirects automatically. A body past the catalog's
+    cap is ``archive_read.ArchiveTooLarge`` and is not tried again."""
     async with community_catalog.http_client(
         timeout=TARBALL_TIMEOUT_SECONDS, follow_redirects=True,
     ) as client:
         try:
-            resp = await client.get(TARBALL_URL)
-            resp.raise_for_status()
-            return resp.content
+            return await community_catalog.get_archive(client, TARBALL_URL)
         except httpx.HTTPError:
             logger.warning("codeload fetch failed; trying archive URL")
-            resp = await client.get(TARBALL_FALLBACK_URL)
-            resp.raise_for_status()
-            return resp.content
+            return await community_catalog.get_archive(client, TARBALL_FALLBACK_URL)
 
 
 def _is_safe_name(name: str) -> bool:
@@ -261,10 +261,13 @@ def _extract_template_subfolder(tarball: bytes, template_slug: str) -> Path:
     """
     if not _is_safe_name(template_slug):
         raise ValueError(f"Unsafe template slug: {template_slug!r}")
-    tempdir = Path(tempfile.mkdtemp(prefix=f"community-agent-{template_slug}-"))
-    with tarfile.open(fileobj=BytesIO(tarball), mode="r:gz") as tar:
+    with archive_read.open_tar_gz(tarball, max_unpacked=community_catalog.CATALOG_UNPACKED_MAX_BYTES) as tar:
+        # The whole listing under the catalog's caps before the folder is made.
+        listed = archive_read.members(tar, max_members=community_catalog.CATALOG_MAX_MEMBERS,
+                                      max_member_bytes=community_catalog.CATALOG_MEMBER_MAX_BYTES)
+        tempdir = Path(tempfile.mkdtemp(prefix=f"community-agent-{template_slug}-"))
         root_prefix: str | None = None
-        for member in tar.getmembers():
+        for member in listed:
             # The repo tarball wraps everything in a top-level dir like
             # "OtoDock-community-agents-9c62e60/". Strip it.
             parts = member.name.split("/", 1)
@@ -312,49 +315,72 @@ def _extract_template_subfolder(tarball: bytes, template_slug: str) -> Path:
 # What an install needs (the dialogs' preview)
 # ---------------------------------------------------------------------------
 
+def _mcp_label(name: str, manifest: Any, catalog_entry: dict[str, Any] | None) -> str:
+    """The name a person reads for an MCP: the installed one's, else the
+    community catalog's, else its id."""
+    return (manifest.label if manifest else (catalog_entry or {}).get("label")) or name
+
+
+async def mcp_labels(names: list[str]) -> dict[str, str]:
+    """The name a person reads for each MCP a template lists, for the store's
+    cards (``_mcp_label``, the install preview's own)."""
+    from services.community import community_catalog
+    from services.mcp import mcp_registry
+    try:
+        catalog = {m.get("name"): m for m in (await community_catalog.fetch_registry()).get("mcps", [])}
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as exc:
+        logger.debug("Community registry lookup for MCP labels failed: %s", exc)
+        catalog = {}
+    return {n: _mcp_label(n, mcp_registry.get_manifest(n), catalog.get(n)) for n in names}
+
+
 async def mcp_plan(entry: dict[str, Any], proposed_slug: str, is_admin: bool) -> list[dict[str, Any]]:
     """Every MCP a template requires, classified for the install dialog:
     ready, to be requested, or blocked (installed nowhere, in no catalog,
-    or explicit with no instance)."""
+    or explicit with no instance). Each row names the MCP as a person reads
+    it (``label``) and says whether every agent has it (``core``). A row from
+    the community catalog needs a request unless the installer is an admin,
+    whose install adds the MCP itself."""
     from services.mcp import mcp_registry
     from storage.mcp import mcp_store
+    core = set(await asyncio.to_thread(mcp_registry.core_mcp_names))
     out: list[dict[str, Any]] = []
     for raw in entry.get("required_mcps") or []:
         name = raw.get("name") if isinstance(raw, dict) else None
         if not name:
             continue
         local_manifest = await asyncio.to_thread(mcp_registry.get_manifest, name)
-        catalog_name = None
+        catalog_entry = None
         try:
             from services.community import community_catalog
             mcps_registry = await community_catalog.fetch_registry()
-            catalog_name = next(
-                (m["name"] for m in mcps_registry.get("mcps", []) if m.get("name") == name), None)
+            catalog_entry = next((m for m in mcps_registry.get("mcps", []) if m.get("name") == name), None)
         except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as exc:
             logger.debug("Community registry lookup for MCP %s failed: %s", name, exc)
+        named = {"name": name, "core": name in core, "label": _mcp_label(name, local_manifest, catalog_entry)}
         if local_manifest is None:
             out.append({
-                "name": name, "installed": False,
-                "request_type": "install" if catalog_name else None,
-                "blocked": catalog_name is None, "needs_request": True,
-                "reason": "Not installed" + ("; in community catalog" if catalog_name else "; NOT in any catalog"),
+                **named, "installed": False,
+                "request_type": "install" if catalog_entry else None,
+                "blocked": catalog_entry is None, "needs_request": catalog_entry is None or not is_admin,
+                "reason": "Not installed" + ("; in community catalog" if catalog_entry else "; NOT in any catalog"),
             })
             continue
         assignment = getattr(local_manifest, "assignment_mode", mcp_manifest_types.ASSIGNMENT_AUTO)
         if assignment != mcp_manifest_types.ASSIGNMENT_EXPLICIT:
-            out.append({"name": name, "installed": True, "request_type": None, "blocked": False,
+            out.append({**named, "installed": True, "request_type": None, "blocked": False,
                         "needs_request": False, "reason": "Auto-mode — ready"})
             continue
         instances = await asyncio.to_thread(mcp_store.get_mcp_instances, name)
         if any(i.get("assigned_to_all") for i in instances) or any(
                 proposed_slug in (i.get("agents") or []) for i in instances):
-            out.append({"name": name, "installed": True, "request_type": None, "blocked": False,
+            out.append({**named, "installed": True, "request_type": None, "blocked": False,
                         "needs_request": False, "reason": "Explicit-mode — instance authorizes this agent"})
         elif instances:
-            out.append({"name": name, "installed": True, "request_type": "access", "blocked": False,
+            out.append({**named, "installed": True, "request_type": "access", "blocked": False,
                         "needs_request": not is_admin, "reason": "Explicit-mode — agent will be attached to an instance"})
         else:
-            out.append({"name": name, "installed": True, "request_type": "access", "blocked": True,
+            out.append({**named, "installed": True, "request_type": "access", "blocked": True,
                         "needs_request": True,
                         "reason": "Explicit-mode — no instances configured (admin must create one first)"})
     return out

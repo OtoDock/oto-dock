@@ -1,0 +1,69 @@
+{
+ "absent": {
+  "parsed": []
+ },
+ "bad anchor": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['a']: relative_anchor must start with '/', got 'rel'"
+ },
+ "bad mode": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['a']: mode must be one of ['read', 'write'], got 'exec'"
+ },
+ "bracket string": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['a[\"k\"]']: bracket-string subscripts (e.g. [\"key\"]) are not supported"
+ },
+ "declaration not an object": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['a'] must be an object, got int"
+ },
+ "double star": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['a**']: wildcard '**' is not supported"
+ },
+ "empty path": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['']: json_path must be a non-empty string"
+ },
+ "empty tool name": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths keys must be non-empty tool name strings"
+ },
+ "good": {
+  "parsed": [
+   {
+    "json_path": "a.b",
+    "tool": "fetch"
+   },
+   {
+    "json_path": "items[*].path",
+    "mode": "write",
+    "optional": true,
+    "relative_anchor": "/workspace",
+    "tool": "fetch"
+   },
+   {
+    "json_path": "file",
+    "tool": "store"
+   }
+  ]
+ },
+ "leading dot": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['.a']: leading or trailing '.' is not allowed"
+ },
+ "not an object": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths must be an object, got list"
+ },
+ "numeric index": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['a[3]']: numeric indices (e.g. [3]) are not supported"
+ },
+ "other syntax": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['a b']: unsupported JSONPath syntax (allowed: name, a.b, name[*])"
+ },
+ "predicate": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['a[?(@.b)]']: filter predicates ('[?(...)]') are not supported"
+ },
+ "recursive": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['a..b']: recursive descent ('..') is not supported"
+ },
+ "tool not an object": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch'] must be an object, got list"
+ },
+ "trailing dot": {
+  "refused": "char-mcp: invalid tool_arg_paths — tool_arg_paths['fetch']['a.']: leading or trailing '.' is not allowed"
+ }
+}

@@ -1,12 +1,15 @@
 import { useState, useEffect, useLayoutEffect, useRef, type JSX } from 'react'
+import { createPortal } from 'react-dom'
 import {
-  ASK_MODE, AUTO_REVIEW_MODE, DONT_ASK_CHIP, DONT_ASK_MODE, PLAN_MODE, currentMode, modeOffered,
+  ASK_MODE, AUTO_REVIEW_MODE, DONT_ASK_CHIP, DONT_ASK_MODE, PLAN_MODE, modeOffered,
 } from '../../lib/engines/modes'
 import IconDropdown, { type IconDropdownGroup } from '../ui/IconDropdown'
 import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, POPOVER } from '../ui/classes'
 import { useDialogs } from '../ui/dialogs'
 import { emitAppToast } from '../../lib/appToasts'
 import { BG_COMMAND_BLOCK } from '../../lib/kinds/block'
+import { usePortalMenu } from '../../hooks/usePortalMenu'
+import { PlaceNote } from './RunsOnChip'
 
 export interface ActiveAgent {
   id: string
@@ -68,10 +71,10 @@ interface Props {
   richViewAvailable?: boolean
   richViewActive?: boolean
   onToggleRichView?: () => void
-  /** Interactive mode manages permissions inside the TUI (Shift+Tab) on top of
-   * the platform's always-on baseline + path enforcement, so the dashboard
-   * permission-mode dropdown is hidden (it can't drive the live TUI). */
-  hidePermissions?: boolean
+  /** Why the mode button takes no pick now (a turn runs on the live
+   * terminal, or it starts again): the button looks unavailable and a click
+   * opens this note, the machine button's own busy pattern. */
+  modeBusyReason?: string
   /** In interactive mode the turn metrics (live timer, context gauge, cost) come
    * from the `-p` pump, which doesn't run — the TUI owns its own status line. Any
    * leftover values (e.g. a prior `-p` turn persisted to this chat before it was
@@ -100,9 +103,17 @@ interface Props {
    * Used by the interactive terminal control-key bar —
    * it scrolls horizontally within this slot, ~20px before the model control. */
   leftSlot?: JSX.Element
-  /** Optional icon pill rendered before the view toggle on a live terminal
-   * (then the model button) and before the mode icon headless: the chat's
-   * "Runs on" control, built by the page. */
+  /** Below `md`, the slot the badges float in over the chat's bottom right
+   *  corner (`ChatBottomPanel`'s), while the message list or the terminal
+   *  holds the pane. Null keeps them in a row of their own above the status
+   *  row. */
+  badgeFloat?: HTMLElement | null
+  /** The terminal holds the pane: its floated badges take the compact form,
+   *  so they cover less of the engine's last line. */
+  terminalShown?: boolean
+  /** Optional icon pill rendered after the view toggle on a live terminal
+   * and before the mode icon: the chat's "Runs on" control, built by the
+   * page. */
   targetSlot?: JSX.Element
   onModeChange: (mode: string) => void
   onModelChange: (model: string) => void
@@ -142,7 +153,7 @@ const MODE_CONFIG: Record<string, { label: string; bg: string; text: string; bor
 const MODE_OPTIONS = Object.entries(MODE_CONFIG).map(([value, c]) => ({ value, label: c.label }))
 
 /** The model chip's letter: the initial of the model's display name (the
- *  descriptor's row — "Fable 5.1" → F, "Opus 5" → O), else of its id (a chat
+ *  descriptor's row — "Fable 5.2" → F, "Opus 5" → O), else of its id (a chat
  *  pinned to a retired id the catalog no longer serves). */
 function getModelLetter(model: string, label?: string): string {
   const source = (label || model).trim()
@@ -151,7 +162,7 @@ function getModelLetter(model: string, label?: string): string {
 
 // Default fallback options (used when modelOptions prop not provided)
 const DEFAULT_MODEL_OPTIONS = [
-  { value: 'claude-fable-5-1', label: 'Fable 5.1 (1M)' },
+  { value: 'claude-fable-5-2', label: 'Fable 5.2 (1M)' },
   { value: 'claude-opus-5-5', label: 'Opus 5.5 (1M)' },
   { value: 'claude-sonnet-5-5', label: 'Sonnet 5.5 (1M)' },
   { value: 'claude-haiku-5-5', label: 'Haiku 5.5 (1M)' },
@@ -223,12 +234,14 @@ export default function ChatStatusBar({
   richViewAvailable,
   richViewActive,
   onToggleRichView,
-  hidePermissions,
+  modeBusyReason,
   interactiveActive,
   modelLocked,
   modeLocked,
   lockReason,
   leftSlot,
+  badgeFloat,
+  terminalShown,
   targetSlot,
   onModeChange,
   onModelChange,
@@ -276,10 +289,41 @@ export default function ChatStatusBar({
   const delegatedAgents = activeAgents.filter(a => a.type === 'delegate')
   const hasActiveAgents = fgAgents.length > 0 || bgAgents.length > 0 || bgCommands.length > 0 || delegatedAgents.length > 0
 
+  const badgeKinds: BadgeKind[] = [
+    { label: 'Foreground', agents: fgAgents, tone: AGENT_WORK, glyph: null },
+    { label: 'Background', agents: bgAgents, tone: AGENT_WORK, glyph: GLYPH.background },
+    { label: 'Commands', agents: bgCommands, tone: COMMANDS, glyph: GLYPH.commands },
+    { label: 'Delegated', agents: delegatedAgents, tone: AGENT_WORK, glyph: GLYPH.delegated },
+  ]
+
+  // The live chips inline on desktop (a phone floats them, or shows them in
+  // the row above): the Meeting chip, then the running work. One block, which
+  // the row places by whether it holds the terminal's keys. A chip keeps its
+  // width: in a narrow window the key bar scrolls instead.
+  const liveChips = (
+    <div className="hidden md:contents *:shrink-0 *:whitespace-nowrap">
+      {meetingActive && (
+        <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-accent-agent-bg border border-accent-agent-border text-accent-agent-fg">
+          <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent-agent-solid animate-pulse" />
+          Meeting
+        </span>
+      )}
+      <AgentBadge agents={fgAgents} label="Foreground" {...AGENT_WORK} />
+      <AgentBadge agents={bgAgents} label="Background" {...AGENT_WORK} />
+      <AgentBadge agents={bgCommands} label="Commands" {...COMMANDS} />
+      <AgentBadge agents={delegatedAgents} label="Delegated" {...AGENT_WORK} />
+    </div>
+  )
+
   return (
     <div className="px-3 py-1.5 text-xs select-none">
-      {/* Agent + meeting badges — own row on mobile, inline on desktop */}
-      {(hasActiveAgents || meetingActive) && (
+      {/* Agent + meeting badges: on a phone over the chat's bottom right
+          corner, so nothing moves when one comes or goes (a row of their
+          own where the pane holds no chat), inline on desktop. */}
+      {badgeFloat ? createPortal(
+        <FloatBadges kinds={badgeKinds} meetingActive={!!meetingActive} terminalShown={!!terminalShown} />,
+        badgeFloat,
+      ) : (hasActiveAgents || meetingActive) && (
         <div className="flex items-center gap-2 mb-1.5 justify-end md:hidden">
           <AgentBadge agents={fgAgents} label="Foreground" {...AGENT_WORK} />
           <AgentBadge agents={bgAgents} label="Background" {...AGENT_WORK} />
@@ -423,27 +467,25 @@ export default function ChatStatusBar({
           )
         })()}
 
-        {/* Meeting badge — desktop only (mobile shows in row above) */}
-        {meetingActive && (
-          <span className="hidden md:flex items-center gap-1 px-2 py-0.5 rounded-full bg-accent-agent-bg border border-accent-agent-border text-accent-agent-fg whitespace-nowrap shrink-0">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent-agent-solid animate-pulse" />
-            Meeting
-          </span>
-        )}
-
-        {/* Agent badges — inline on desktop, hidden on mobile (shown in row above) */}
-        <div className="hidden md:contents">
-          <AgentBadge agents={fgAgents} label="Foreground" {...AGENT_WORK} />
-          <AgentBadge agents={bgAgents} label="Background" {...AGENT_WORK} />
-          <AgentBadge agents={bgCommands} label="Commands" {...COMMANDS} />
-          <AgentBadge agents={delegatedAgents} label="Delegated" {...AGENT_WORK} />
-        </div>
-
         {/* Left slot (interactive control-key bar) fills the spacer so the model
-            control stays right-aligned; scrolls horizontally within itself. */}
-        {leftSlot
-          ? <div className="flex-1 min-w-0 mr-3">{leftSlot}</div>
-          : <div className="flex-1" />}
+            control stays right-aligned. The chips follow the left group, as
+            they follow the gauge with no key bar: the keys at the far left,
+            the chips right after them, a little apart, then the free space.
+            When the row is short the free space goes first, then the keys
+            scroll within their bar: no chip and no control shrinks. The key
+            area positions the bar's More keys panel, so it keeps the area's
+            width. */}
+        {leftSlot ? (
+          <div className="relative flex-1 min-w-0 mr-3 flex items-center gap-2">
+            <div className="min-w-0 md:mr-1">{leftSlot}</div>
+            {liveChips}
+          </div>
+        ) : (
+          <>
+            {liveChips}
+            <div className="flex-1" />
+          </>
+        )}
 
         {/* Cost: the money this chat has cost, an API key's or the relay's
             turns and every tool fee, never a subscription's or a local
@@ -490,14 +532,11 @@ export default function ChatStatusBar({
           )
         })()}
 
-        {/* The chat's "Runs on" control, when the page provides one: before
-            the view toggle on a live terminal, before the mode icon headless. */}
-        {targetSlot}
-
         {/* View toggle — flip the live terminal ⇄ the DB
             rich conversation history WITHOUT killing the session. Shown only
-            while a terminal is live (richViewAvailable); the session keeps
-            running (the terminal stays mounted, hidden) in either view. */}
+            while a terminal is live (richViewAvailable), first of the row, so
+            the row is the same in both views; the session keeps running (the
+            terminal stays mounted, hidden) in either view. */}
         {richViewAvailable && (
           <button
             type="button"
@@ -527,10 +566,27 @@ export default function ChatStatusBar({
           </button>
         )}
 
-        {/* Mode icon dropdown — hidden in interactive mode (the TUI owns its
-            permission mode; our baseline + path enforcement still apply). */}
-        {!hidePermissions && (() => {
-          const mc = MODE_CONFIG[currentMode(mode)] || MODE_CONFIG[ASK_MODE]
+        {/* The chat's "Runs on" control, when the page provides one: after
+            the view toggle, before the mode icon. */}
+        {targetSlot}
+
+        {/* Mode icon dropdown, in both views. On a live terminal a pick starts
+            it again in that mode; while a turn runs there it takes no pick and
+            says why (the machine button's busy pattern). */}
+        {(() => {
+          const mc = MODE_CONFIG[mode] || MODE_CONFIG[ASK_MODE]
+          if (modeBusyReason) {
+            return (
+              <PlaceNote
+                lines={[`Mode: ${mc.label}`, modeBusyReason]}
+                testId="mode-busy"
+                disabled
+                className={`flex items-center justify-center w-7 h-7 shrink-0 rounded-control border ${mc.bg} ${mc.border} ${mc.text} aria-disabled:opacity-60`}
+              >
+                {mc.icon}
+              </PlaceNote>
+            )
+          }
           const offered = permissionModesProp ?? Object.keys(MODE_CONFIG)
           const modeOptions = modeLocked
             ? [{ value: mode, label: mc.label }]
@@ -598,8 +654,111 @@ export default function ChatStatusBar({
 
 // The running-work badges: subagents, background agents and delegated work
 // are agent work; a background shell command is information.
-const AGENT_WORK = { bgClass: 'bg-accent-agent-bg border-accent-agent-border', textClass: 'text-accent-agent-fg', spinnerClass: 'border-accent-agent-solid' }
-const COMMANDS = { bgClass: 'bg-status-info-bg border-status-info-border', textClass: 'text-status-info-fg', spinnerClass: 'border-status-info-solid' }
+type BadgeTone = { bgClass: string; textClass: string; spinnerClass: string }
+const AGENT_WORK: BadgeTone = { bgClass: 'bg-accent-agent-bg border-accent-agent-border', textClass: 'text-accent-agent-fg', spinnerClass: 'border-accent-agent-solid' }
+const COMMANDS: BadgeTone = { bgClass: 'bg-status-info-bg border-status-info-border', textClass: 'text-status-info-fg', spinnerClass: 'border-status-info-solid' }
+
+/** One kind of work a badge counts. `glyph` names it in the compact form
+ *  (null: the working ring, Foreground's). */
+interface BadgeKind {
+  label: string
+  agents: ActiveAgent[]
+  tone: BadgeTone
+  glyph: string | null
+}
+
+/** The compact form's glyphs (24-unit outline paths): the work's kind at a
+ *  glance where a label does not fit. */
+const GLYPH = {
+  background: 'M6.429 9.75L2.25 12l4.179 2.25m0-4.5l5.571 3 5.571-3m-11.142 0L2.25 7.5 12 2.25l9.75 5.25-4.179 2.25m0 0L21.75 12l-4.179 2.25m0 0l4.179 2.25L12 21.75 2.25 16.5l4.179-2.25m11.142 0l-5.571 3-5.571-3',
+  commands: 'M6.75 7.5l3 2.25-3 2.25m4.5 0h3m-9 8.25h13.5A2.25 2.25 0 0021 18V6a2.25 2.25 0 00-2.25-2.25H5.25A2.25 2.25 0 003 6v12a2.25 2.25 0 002.25 2.25z',
+  delegated: 'M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25',
+  meeting: 'M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 01-.825-.242m9.345-8.334a2.126 2.126 0 00-.476-.095 48.64 48.64 0 00-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6.637c0-1.621-1.152-3.026-2.76-3.235A48.455 48.455 0 0011.25 3c-2.115 0-4.198.137-6.24.402-1.608.209-2.76 1.614-2.76 3.235v6.226c0 1.621 1.152 3.026 2.76 3.235.577.075 1.157.14 1.74.194V21l4.155-4.155',
+}
+
+function Glyph({ path }: { path: string }) {
+  return (
+    <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d={path} />
+    </svg>
+  )
+}
+
+// A floated pill sits on the page colour under its own tint: its fill is
+// solid over the chat and the terminal, in light and dark.
+const FLOAT_PILL_BASE = 'pointer-events-auto rounded-full bg-surface-page shadow-elevation-1'
+
+/** The badges floated over a phone's chat. Several pills, or the terminal
+ *  under them, take the compact form (the kind's glyph and the count), so
+ *  they stay in one row in the right half and cover less of the engine's
+ *  last line; one pill over the history keeps its label. */
+function FloatBadges({ kinds, meetingActive, terminalShown }: { kinds: BadgeKind[]; meetingActive: boolean; terminalShown: boolean }) {
+  const shown = kinds.filter((k) => k.agents.length > 0)
+  const compact = terminalShown || shown.length + (meetingActive ? 1 : 0) > 1
+  return (
+    <>
+      {shown.map((k) => <FloatBadge key={k.label} kind={k} compact={compact} />)}
+      {meetingActive && (
+        <span className={FLOAT_PILL_BASE}>
+          <span
+            data-testid="float-badge-meeting"
+            role="img"
+            aria-label="Meeting"
+            title="Meeting"
+            className="flex items-center gap-1 px-2 py-0.5 rounded-full border bg-accent-agent-bg border-accent-agent-border text-accent-agent-fg text-xs whitespace-nowrap select-none"
+          >
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent-agent-solid animate-pulse" />
+            {compact ? <Glyph path={GLYPH.meeting} /> : 'Meeting'}
+          </span>
+        </span>
+      )}
+    </>
+  )
+}
+
+/** A floated badge: a tap opens its list upward (the kind and each item's
+ *  words), since a phone shows no hover title. */
+function FloatBadge({ kind, compact }: { kind: BadgeKind; compact: boolean }) {
+  const { open, buttonRef, panelRef, style, portalRoot, toggle, onKeyDown } = usePortalMenu({ align: 'right', prefer: 'above' })
+  const name = `${kind.agents.length} ${kind.label}`
+  return (
+    <span className={FLOAT_PILL_BASE}>
+      <button
+        ref={buttonRef}
+        type="button"
+        onClick={toggle}
+        aria-label={name}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        data-testid={`float-badge-${kind.label.toLowerCase()}`}
+        className={`flex items-center gap-1 px-2 py-0.5 rounded-full border text-xs whitespace-nowrap select-none ${kind.tone.bgClass} ${kind.tone.textClass} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring/50`}
+      >
+        {compact && kind.glyph
+          ? <Glyph path={kind.glyph} />
+          : <span className={`inline-block w-2 h-2 border-[1.5px] ${kind.tone.spinnerClass} border-t-transparent rounded-full animate-spin`} />}
+        {compact ? kind.agents.length : name}
+      </button>
+      {open && createPortal(
+        <div
+          ref={panelRef}
+          role="menu"
+          aria-label={name}
+          style={style}
+          onKeyDown={onKeyDown}
+          className={`${POPOVER} w-64 max-w-[calc(100vw-1.5rem)] py-1.5 text-xs`}
+        >
+          <p className="px-3 py-1 font-medium text-primary">{name}</p>
+          {kind.agents.map((a) => (
+            <div key={a.id} role="menuitem" tabIndex={-1} className="px-3 py-1 text-secondary break-words focus:outline-none focus-visible:bg-surface-hover">
+              {a.description}
+            </div>
+          ))}
+        </div>,
+        portalRoot,
+      )}
+    </span>
+  )
+}
 
 function AgentBadge({
   agents,

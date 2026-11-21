@@ -72,7 +72,7 @@ class TestMidTurnReattach:
                 history = await ws.expect({
                     "type": "chat_history", "chat_id": chat_id, "agent": ANY,
                     "messages": ANY, "has_more": False,
-                    "restore": {"todos": [], "meeting": None, "goal": None},
+                    "restore": {"todos": [], "meeting": None, "goal": None, "cost": {"billed": True, "fees": 0}},
                     "plans": [], "total_cost": 0, "context_used": 0,
                     "context_max": 0, "cache_read": 0, "cache_write": 0,
                     "output_tokens": 0,
@@ -152,7 +152,7 @@ class TestBgNudgeServerTurn:
                     "chat_id": chat_id, "session_id": sid,
                 })
 
-                await ws.expect({"type": "bg_agents_complete", "count": 2})
+                await ws.expect({"type": "bg_agents_complete", "count": 2, "chat_id": chat_id})
                 await ws.expect({"type": "server_turn_start",
                                  "chat_id": chat_id, "cause": "bg_review"})
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
@@ -225,7 +225,7 @@ class TestBgNudgeServerTurn:
                     "labels": labels,
                 })
 
-                await ws.expect({"type": "bg_agents_complete", "count": 2})
+                await ws.expect({"type": "bg_agents_complete", "count": 2, "chat_id": chat_id})
                 # Drain the rest of the turn without pinning every frame —
                 # the un-labeled twin above covers the full sequence.
                 while True:
@@ -255,9 +255,9 @@ class TestExistingChatWarmupInline:
         slug = make_test_agent()
         sid = str(uuid.uuid4())
         layer.alive.add(sid)
-        set_session_mode(sid, "default")
+        set_session_mode(sid, "ask")
         cid = str(uuid.uuid4())
-        task_store.create_chat(cid, "user-admin", slug, "default",
+        task_store.create_chat(cid, "user-admin", slug, "ask",
                                model=TEST_MODEL,
                                execution_path="claude-code-cli")
         task_store.update_chat(cid, session_id=sid)
@@ -343,7 +343,7 @@ class TestMidTurnReattachKeepsSteeredMessage:
                 history = await ws.expect({
                     "type": "chat_history", "chat_id": chat_id, "agent": ANY,
                     "messages": ANY, "has_more": False,
-                    "restore": {"todos": [], "meeting": None, "goal": None},
+                    "restore": {"todos": [], "meeting": None, "goal": None, "cost": {"billed": True, "fees": 0}},
                     "plans": [], "total_cost": 0, "context_used": 0,
                     "context_max": 0, "cache_read": 0, "cache_write": 0,
                     "output_tokens": 0,

@@ -85,13 +85,56 @@ async def test_server_injection_is_never_gated():
     assert s.pty.written, "server-injected prompt was swallowed"
 
 
-async def test_ownerless_session_fails_open():
-    """Phone/legacy sessions never recorded an owner. Refusing them would be a
-    regression with no security gain — they are not reachable from a second
-    dashboard user. Deliberate, hence pinned."""
+async def test_a_terminal_built_for_nobody_is_watched_never_driven():
+    """A wake that built a terminal for nobody on a chat people open (the
+    agent's shared chat once the agent left Shared-only): no member types,
+    pastes or attaches into it, at any door. Server injection (the wake's
+    own prompt) still passes. Its start records the unattended word, which
+    is what marks it."""
+    from core.session import session_state
     s = _mk(user_sub="")
+    session_state._session_modes["sid-1"] = "auto"   # what the wake's start records
+    assert s.may_drive(OTHER) is False
+    assert s.deliver_dashboard_input(b"ls\r", sender_sub=OTHER) is False
+    assert s.deliver_dashboard_input(b"\x1b[200~a file\x1b[201~\r", composer=True,
+                                     sender_sub=OTHER) is False
+    assert s.pty.written == []
+    assert s.may_drive("") is True
+    session_state._session_modes.pop("sid-1", None)
+    # Phone and legacy sessions with no owner, in a person's mode, stay open.
     assert s.may_drive(OTHER) is True
-    assert s.deliver_dashboard_input(b"x", sender_sub=OTHER) is True
+
+
+async def test_a_chat_surface_lanes_terminal_is_driven_by_its_person(monkeypatch):
+    """A lane in a chat (surface ``chat``) has a plain id and the run's
+    unattended word: it is exempt by its chat's origin, so its person types
+    into it, and a take-over by someone else starts their own terminal in
+    the lane, which they drive."""
+    from core.session import session_state
+    lane_row = {"user_sub": OWNER, "origin": "delegated"}
+    s = I.InteractiveSession(session_id="sid-lane", chat_id="5d1f7a3e-lane", agent_name="a",
+                             user_sub=OWNER, role="manager", username="alice", chat_row=lane_row)
+    s.pty, s._ready = FakePty(), True
+    monkeypatch.setitem(session_state._session_modes, "sid-lane", "auto")
+    assert s.may_drive(OWNER) is True
+    assert s.deliver_dashboard_input(b"steer\r", sender_sub=OWNER) is True
+    assert s.may_drive(OTHER) is False          # another person: the take-over
+    taken = I.InteractiveSession(session_id="sid-lane-2", chat_id="5d1f7a3e-lane", agent_name="a",
+                                 user_sub=OTHER, role="manager", username="bob", chat_row=lane_row)
+    monkeypatch.setitem(session_state._session_modes, "sid-lane-2", "auto")
+    assert taken.may_drive(OTHER) is True
+
+
+async def test_a_terminal_in_a_mode_nobody_picks_refuses_its_own_person(monkeypatch):
+    """A wake built it as the person, but in the unattended word: their
+    keys never ride it either. A take-over closes it (``may_drive`` False)."""
+    from core.session import session_state
+    s = _mk()
+    monkeypatch.setitem(session_state._session_modes, "sid-1", "auto")
+    assert s.may_drive(OWNER) is False
+    assert s.deliver_dashboard_input(b"x", sender_sub=OWNER) is False
+    monkeypatch.setitem(session_state._session_modes, "sid-1", "ask")
+    assert s.may_drive(OWNER) is True
 
 
 async def test_task_chats_are_exempt():
@@ -103,6 +146,15 @@ async def test_task_chats_are_exempt():
     s = _mk("task-run-42")
     assert s.may_drive(OTHER) is True
     assert s.deliver_dashboard_input(b"steer\r", sender_sub=OTHER) is True
+    # A lane's terminal runs in the unattended word, ownerless, and stays
+    # steerable by role.
+    from core.session import session_state
+    lane = _mk("task-run-43", user_sub="")
+    session_state._session_modes["sid-1"] = "auto"
+    try:
+        assert lane.may_drive(OTHER) is True
+    finally:
+        session_state._session_modes.pop("sid-1", None)
 
 
 async def test_cold_start_first_input_lands_before_attach():

@@ -95,15 +95,40 @@ def read_stale_line(session_id: str, data: dict) -> str:
     return str(data.get("type") or "?") if kind == FRAME_MAIN else kind
 
 
-def resolve_background_work(session_id: str, data: dict) -> bool:
-    """``resolve_background_frame`` for a reader that counts progress: True
-    when the line ended a background command or sub-agent."""
+def read_line_between_turns(session_id: str, data: dict) -> tuple[str, bool]:
+    """``read_stale_line`` for the one reader between turns: the line's
+    census name, and whether it ended a background command or sub-agent."""
     from core.events.bg_command_state import peek_bg_command_registry
     regs = [r for r in (peek_bg_command_registry(session_id),
                         _subagent_registries.get(session_id)) if r is not None]
     before = [r.pending_count for r in regs]
-    resolve_background_frame(session_id, data)
-    return [r.pending_count for r in regs] != before
+    kind = read_stale_line(session_id, data)
+    return kind, [r.pending_count for r in regs] != before
+
+
+def ended_during_turn(session_id: str) -> bool:
+    """Whether background work of the session ended during its last turn (a
+    command, or a background sub-agent; the registries keep only what still
+    runs when a turn begins). Claude Code reviews such an end with a turn of
+    its own right after the turn's result, unless the model read it inside
+    the turn."""
+    from core.events.bg_command_state import peek_bg_command_registry
+    commands = peek_bg_command_registry(session_id)
+    agents = _subagent_registries.get(session_id)
+    return bool((commands is not None and commands.completed)
+                or (agents is not None and agents.completed & agents.background))
+
+
+def read_after_turn(session_id: str) -> bool:
+    """Whether the platform keeps reading a session after its turn ends:
+    background work still runs, or some ended during the turn and the
+    engine's own review of it may follow."""
+    from core.events.bg_command_state import peek_bg_command_registry
+    commands = peek_bg_command_registry(session_id)
+    agents = _subagent_registries.get(session_id)
+    return bool((commands is not None and commands.has_pending)
+                or (agents is not None and agents.has_pending)
+                or ended_during_turn(session_id))
 
 
 def log_between_turns_census(who: str, drained) -> None:
@@ -153,3 +178,28 @@ def running_background(chat_ids) -> dict[str, list[dict]]:
             if tuid:
                 commands.append({"id": tuid, "description": bgreg.description_for(task_id)})
     return {"agents": agents, "commands": commands}
+
+
+async def running_work(chat_ids) -> dict[str, list[dict]]:
+    """What a history frame's ``running`` names: ``running_background``'s
+    sub-agents and commands, and the delegations still running that report
+    to these chats (``delegates``: the task's id, the id the caller's spawn
+    row carries, its name and its agent), read from the task store off the
+    loop. A delegation is named whatever runs the caller: a terminal's too,
+    and across a restart, since the record is the task store's."""
+    from storage import database as task_store
+    from storage.pg import run_db
+    running = running_background(chat_ids)
+    wanted = [c for c in dict.fromkeys(chat_ids) if c]
+    running["delegates"] = await run_db(task_store.live_delegations_reporting_to, wanted) if wanted else []
+    return running
+
+
+async def running_fields(chat_ids) -> dict[str, dict[str, list[dict]]]:
+    """The ``running`` field of a history frame, to merge into it: every
+    sender of ``chat_history`` and ``chat_history_delta`` takes it from here
+    (the page replaces its list with each frame's, so a frame without it
+    clears the badges of the work older than its rows). Empty when nothing
+    runs: the frame then carries no ``running``."""
+    running = await running_work(chat_ids)
+    return {"running": running} if any(running.values()) else {}

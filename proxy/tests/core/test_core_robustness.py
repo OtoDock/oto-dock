@@ -1,16 +1,13 @@
 """The proxy core holds its bookkeeping when one piece fails: a reaped
 session's seat and slot, a satellite frame that cannot be encoded, the
-database liveness probe, a CLI result with no cost, and the sandbox
-preflight's account of a missing tap device."""
+database liveness probe, and a CLI result with no cost."""
 
 import asyncio
 import logging
-import os
 
 import pytest
 
 from core import concurrency
-from core.sandbox import sandbox as sandbox_mod
 
 # --- the reapers -------------------------------------------------------------
 
@@ -66,6 +63,7 @@ async def test_the_direct_reaper_goes_on_past_a_failed_close(released, monkeypat
 
     class _S:
         last_activity = time.monotonic() - 10_000
+        mcp_manager = None
 
     closed = []
 
@@ -92,33 +90,40 @@ async def test_the_direct_reaper_goes_on_past_a_failed_close(released, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_the_codex_reaper_goes_on_past_a_failed_close(released, monkeypatch):
-    from core.layers.codex import session as codex
+async def test_the_reaper_of_sessions_on_machines_goes_on_past_a_failed_close(monkeypatch, caplog):
+    """One machine's idle sessions are closed one after another: a close
+    that raises is logged and the next session is still closed."""
+    import time
+    from types import SimpleNamespace
+
+    from core.remote import remote_reaper
     from core.session import session_state
     closed = []
 
-    async def close(sid):
+    async def close_session(sid):
         closed.append(sid)
-        if sid == "c1":
-            raise RuntimeError("daemon close failed")
+        if sid == "r1":
+            raise RuntimeError("close failed")
 
-    ticks = []
+    class _Machines:
+        def is_connected(self, machine_id):
+            return True
 
-    async def one_tick(seconds):
-        ticks.append(seconds)
-        if len(ticks) > 1:
-            raise asyncio.CancelledError  # the reaper's second wait ends the test
+        def is_session_in_grace(self, machine_id, session_id):
+            return False
 
-    async def idle_timeout():
-        return 60
-    monkeypatch.setattr(codex, "_codex_reap_candidates", lambda now, idle: ["c1", "c2"])
-    monkeypatch.setattr(codex, "close_codex_session", close)
-    monkeypatch.setattr(session_state, "cached_idle_timeout", idle_timeout)
-    monkeypatch.setattr(codex.asyncio, "sleep", one_tick)
-    with pytest.raises(asyncio.CancelledError):
-        await codex.reap_idle_codex_sessions()
-    assert closed == ["c1", "c2"]
-    assert released == {"slot": ["c1", "c2"], "seat": ["c1", "c2"]}
+    def _idle():
+        return SimpleNamespace(last_activity=time.monotonic() - 10_000, machine_id="m",
+                               turn_active=False, cli_dead=False)
+
+    layer = SimpleNamespace(_sessions={"r1": _idle(), "r2": _idle()}, _cm=_Machines(),
+                            close_session=close_session, is_spawning=lambda sid: False)
+    monkeypatch.setattr(session_state, "has_pending_prompt", lambda sid: False)
+    monkeypatch.setattr(remote_reaper, "_idle_session_has_pending_work", lambda *a, **k: False)
+    with caplog.at_level(logging.ERROR):
+        await remote_reaper._reap_machine(layer, "m", ["r1", "r2"], 60)
+    assert closed == ["r1", "r2"]
+    assert "close failed" in caplog.text
 
 
 # --- a satellite frame that cannot be encoded ---------------------------------
@@ -187,34 +192,3 @@ def test_a_result_with_a_null_cost_reads_zero():
          "usage": {"input_tokens": 1, "output_tokens": 1}})
     meta = [c.event_data for c in chunks if c.event_type == "metadata"]
     assert meta and meta[0]["cost_usd"] == 0.0
-
-
-# --- the sandbox preflight and the tap device -----------------------------------
-
-def test_a_missing_tun_device_is_named(monkeypatch, tmp_path):
-    monkeypatch.setattr(sandbox_mod, "_TUN_DEVICE", str(tmp_path / "tun"))
-    assert "is missing" in sandbox_mod._tun_unavailable("anything")
-    (tmp_path / "tun").write_text("")
-    assert "not a character device" in sandbox_mod._tun_unavailable("anything")
-
-
-@pytest.mark.skipif(not os.path.exists("/dev/null"), reason="needs a character device")
-def test_the_probes_error_naming_the_tap_is_the_cause(monkeypatch):
-    monkeypatch.setattr(sandbox_mod, "_TUN_DEVICE", "/dev/null")
-    detail = "pasta: Failed to open tun socket in namespace"
-    assert sandbox_mod._tun_unavailable(detail) == detail
-    assert sandbox_mod._tun_unavailable("bwrap: setting up uid map: Permission denied") is None
-
-
-def test_the_preflight_never_claims_the_sandbox_works_without_the_tap(monkeypatch, caplog, tmp_path):
-    monkeypatch.setattr(sandbox_mod, "_TUN_DEVICE", str(tmp_path / "missing"))
-    with caplog.at_level(logging.WARNING):
-        sandbox_mod._warn_nested_probe("pasta: Failed to open tun socket in namespace")
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert errors and "no session can start in this server's sandbox" in errors[0].getMessage()
-    assert "itself works" not in caplog.text
-    caplog.clear()
-    monkeypatch.setattr(sandbox_mod, "_TUN_DEVICE", "/dev/null")
-    with caplog.at_level(logging.WARNING):
-        sandbox_mod._warn_nested_probe("bwrap: setting up uid map: Permission denied")
-    assert "itself works" in caplog.text and not [r for r in caplog.records if r.levelno == logging.ERROR]

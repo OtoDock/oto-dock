@@ -55,12 +55,20 @@ _DEFAULT_HTTP_API_PORT = "9093"
 
 
 def load_adapter(server_row: dict) -> PhoneServerAdapter:
-    """Build the control-plane adapter for a ``phone_servers`` row."""
+    """Build the control-plane adapter for a ``phone_servers`` row. A local
+    PBX row while ``LOCAL_PBX_ENABLED`` is off (a hosted install, or a
+    Twilio-only self-host) is refused: the one gate every dial of a PBX
+    passes (the routes' provisioning, the health worker, bootstrap, verify
+    and health). A deferred provider's legacy row still loads its stub."""
     adapter_type = server_row.get("adapter_type", "")
     cls = ADAPTER_CLASSES.get(adapter_type)
     if cls is None:
         raise PhoneAdapterError(
             f"Unknown adapter type {adapter_type!r}", status_code=400,
+        )
+    if adapter_type in LOCAL_PBX_ADAPTERS and not config.LOCAL_PBX_ENABLED:
+        raise PhoneAdapterError(
+            "This phone server's type is not available on this install.", status_code=400,
         )
     return cls(
         server_row,

@@ -116,8 +116,12 @@ export interface AccountSummary {
   created_at: string
   configured_keys: string[]
   connected_services: string[]
+  /** Every agent whose set of accounts holds this one: an agent may use
+   * several of the person's accounts of one tool. */
   agent_overrides: string[]
-  /** The reach of each agent of ``agent_overrides`` (GitHub). */
+  /** The agents whose set starts on this account (its default there). */
+  agent_defaults?: string[]
+  /** This account's own reach for each agent of ``agent_overrides`` (GitHub). */
   agent_reaches?: AgentReach[]
   missing_scopes: string[]
   service_bindings?: ServiceBindingSummary[]
@@ -153,7 +157,7 @@ export const RECONNECT_REASONS: Record<string, string> = {
   installation_expired: "the installation's access expired and was not renewed yet",
   app_changed: "this install's GitHub credentials are no longer the GitHub App the account signed in through",
   installation_not_owned: "the account's owner no longer owns the installation the agent's GitHub identity uses",
-  installation_hosted: 'hosted sign-in gives an agent no app identity. A manager binds the account itself in Agent Settings, MCPs',
+  installation_hosted: 'hosted sign-in gives an agent no app identity. A manager adds the account itself in Agent Settings, MCPs',
   installation_reach_outdated: 'a repository the agent may reach is no longer in the installation. A manager picks the repositories again in Agent Settings, MCPs',
   removed_at_vendor: "OtoDock's app was removed from this account at the vendor",
   refused: 'the vendor no longer accepts its access',
@@ -179,9 +183,15 @@ export interface Integration {
   candidate_agents: string[]
   /** A choice of account for an agent may narrow its GitHub reach. */
   reach_supported?: boolean
-  /** The candidate agents in Shared-only mode: their chats use the agent's
-   * own GitHub account, so a person's choice offers no repositories there. */
-  shared_only_agents?: string[]
+  /** The candidate agents whose people's chats run on the agent's own
+   * accounts (Shared only, or the team account on): a person's choice never
+   * applies there, so the card offers none. */
+  agents_on_own_accounts?: string[]
+  /** The account such an agent's chats start on, by agent. */
+  agent_accounts?: Record<string, string>
+  /** Of those, the agents whose team account floor this person is below:
+   * their chats there get no account for the tool. */
+  agents_below_floor?: string[]
 }
 
 // The credential schema of every installed MCP (the manifest's credential
@@ -260,7 +270,7 @@ export const useDeleteIntegration = () => {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// Multi-account: default + per-agent binding
+// Multi-account: default + each agent's set of accounts
 // ───────────────────────────────────────────────────────────────────
 
 export const useSetDefaultAccount = () => {
@@ -282,13 +292,17 @@ export const useSetDefaultAccount = () => {
   })
 }
 
-export interface SetAccountAgentBindingResponse {
+export interface AddAgentAccountResponse {
   status: string
   repositories?: string[]
   read_only?: boolean
+  /** The account is the agent's default now (the first one of its set). */
+  is_default?: boolean
 }
 
-export const useSetAccountAgentBinding = () => {
+/** Adds one of the person's accounts to an agent's set, or changes this
+ * account's reach for the agent. The first account of a set is its default. */
+export const useAddAgentAccount = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({
@@ -297,6 +311,7 @@ export const useSetAccountAgentBinding = () => {
       accountLabel,
       repositories,
       readOnly,
+      makeDefault,
     }: {
       mcpName: string
       agentName: string
@@ -304,16 +319,41 @@ export const useSetAccountAgentBinding = () => {
       /** The person's own GitHub reach for the agent; absent keeps it. */
       repositories?: string[]
       readOnly?: boolean
-    }): Promise<SetAccountAgentBindingResponse> => {
-      return apiJson<SetAccountAgentBindingResponse>(`/v1/users/me/integrations/${mcpName}/agent-binding`, {
+      makeDefault?: boolean
+    }): Promise<AddAgentAccountResponse> => {
+      return apiJson<AddAgentAccountResponse>(`/v1/users/me/integrations/${mcpName}/agent-accounts`, {
           method: 'PUT',
           body: JSON.stringify({
             agent_name: agentName,
             account_label: accountLabel,
             ...(repositories !== undefined ? { repositories } : {}),
             ...(readOnly !== undefined ? { read_only: readOnly } : {}),
+            ...(makeDefault !== undefined ? { make_default: makeDefault } : {}),
           }),
-        }, 'Failed to bind agent')
+        }, 'Failed to add the account for the agent')
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['my-integrations'] }),
+  })
+}
+
+/** Makes one account of an agent's set its default. */
+export const useSetAgentDefaultAccount = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({
+      mcpName,
+      agentName,
+      accountLabel,
+    }: {
+      mcpName: string
+      agentName: string
+      accountLabel: string
+    }) => {
+      return apiJson(
+        `/v1/users/me/integrations/${mcpName}/agent-accounts/${encodeURIComponent(agentName)}/default`,
+        { method: 'PUT', body: JSON.stringify({ account_label: accountLabel }) },
+        'Failed to set the default account for the agent',
+      )
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['my-integrations'] }),
   })
@@ -335,20 +375,25 @@ export const useMyAccountRepositories = (mcpName: string, accountLabel: string, 
     enabled,
   })
 
-export const useRemoveAccountAgentBinding = () => {
+/** Takes one account out of an agent's set. When it was the default, the
+ * server makes the oldest one left the default. */
+export const useRemoveAgentAccount = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({
       mcpName,
       agentName,
+      accountLabel,
     }: {
       mcpName: string
       agentName: string
+      accountLabel: string
     }) => {
+      const qs = `?account_label=${encodeURIComponent(accountLabel)}`
       return apiJson(
-        `/v1/users/me/integrations/${mcpName}/agent-binding/${encodeURIComponent(agentName)}`,
+        `/v1/users/me/integrations/${mcpName}/agent-accounts/${encodeURIComponent(agentName)}${qs}`,
         { method: 'DELETE' },
-      ).catch(withMessage('Failed to remove agent binding'))
+      ).catch(withMessage('Failed to remove the account for the agent'))
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['my-integrations'] }),
   })

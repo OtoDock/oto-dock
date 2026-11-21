@@ -17,14 +17,17 @@ and every ``.ts`` / ``.tsx`` under ``dashboard/src`` (tests excluded):
    sites, each another vocabulary that shares the word (the auth provider,
    the browser MCP's server key);
 2. the offline sentinel's prefix spelled outside the leaf: none;
-3. ``"admin_remote"`` / ``"user_remote"`` / ``"machine"`` compared outside
-   the leaf: none (a check document and an app step target say ``site``);
+3. ``"admin_remote"`` / ``"user_remote"`` / ``"compute"`` / ``"machine"``
+   compared outside the leaf: none (a check document and an app step target
+   say ``site``; a row's scope is asked through ``machine_is_*``);
 4. the disassembled descriptor's old names — the nine unambiguous
    ``target_*`` fields in ANY form (an attribute, a keyword, a ``getattr``
    or ``.get`` string) and ``target_kind`` on a context-named receiver or as
    a ``getattr`` string — outside the security index's codec: none (the
    sharing routes' and the webhook store's ``target_kind`` — app | chat,
-   organization — is a homonym this pass never scores);
+   organization — is a homonym this pass never scores); and ``.is_local``
+   on a placement, which left the descriptor when its facts were named
+   apart (a site asks the fact it means);
 5. the leaf is used module-qualified: ``from core.placement import`` names
    the class and the local placement only, never a string or a predicate;
    the dashboard compares ``'local'`` / ``'machine'`` only in the mirror
@@ -62,7 +65,7 @@ KNOWN_SITES: dict[str, tuple[str, int]] = {
     "proxy/api/auth/identity.py": ("the auth provider (local | oidc:<name>), not a placement", 3),
     "proxy/api/auth/admin_users.py": ("the auth provider, not a placement", 2),
     "proxy/auth/providers/local_provider.py": ("the auth provider, not a placement", 1),
-    "proxy/services/mcp/mcp_registry.py": ("the browser MCP's server key `local` on the servers map, not a placement", 2),
+    "proxy/services/mcp/mcp_session_config.py": ("the browser MCP's server key `local` on the servers map, not a placement", 2),
     "proxy/services/mcp/compose_rewrite.py": ("the Docker volume driver word local, not a placement", 1),
 }
 
@@ -107,7 +110,7 @@ def _local_sites(tree: ast.AST) -> int:
 
 def _kind_or_site_sites(tree: ast.AST) -> list[str]:
     return [e.value for e in _compare_operands(tree)
-            if isinstance(e, ast.Constant) and e.value in ("admin_remote", "user_remote", "machine")]
+            if isinstance(e, ast.Constant) and e.value in ("admin_remote", "user_remote", "compute", "machine")]
 
 
 def _sentinel_spellings(tree: ast.AST) -> int:
@@ -123,13 +126,22 @@ def _receiver_name(node: ast.AST) -> str:
     return ""
 
 
+_PLACEMENT_NAMES = frozenset({"placement", "target", "_os_placement", "pl", "caps"})
+
+
 def _old_field_reads(tree: ast.AST) -> list[str]:
     """The nine names in any form; ``target_kind`` only on a context-named
-    receiver or as a ``getattr`` string."""
+    receiver or as a ``getattr`` string; ``is_local`` on a placement."""
     hits: list[str] = []
+    # ``placement.is_local(value)`` is the leaf's predicate on a stored value:
+    # only the descriptor's property, read without a call, is gone.
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
     for n in ast.walk(tree):
         if isinstance(n, ast.Attribute):
-            if n.attr in _OLD_FIELDS:
+            if (n.attr == "is_local" and id(n) not in called
+                    and _receiver_name(n.value) in _PLACEMENT_NAMES):
+                hits.append(f"{n.lineno}: {_receiver_name(n.value)}.is_local")
+            elif n.attr in _OLD_FIELDS:
                 hits.append(f"{n.lineno}: .{n.attr}")
             elif n.attr == "target_kind" and _receiver_name(n.value) in _CTX_NAMES:
                 hits.append(f"{n.lineno}: {_receiver_name(n.value)}.target_kind")

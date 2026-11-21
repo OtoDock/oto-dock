@@ -1,0 +1,61 @@
+{
+ "chats": [
+  {
+   "agent": "warm-undecided-away",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [
+    [
+     "user",
+     "hello"
+    ]
+   ],
+   "session_id": "<id2>",
+   "title": "hello",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  {
+   "agent": "warm-undecided-away",
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "new_chat": false,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id1>",
+   "error": "The machine running this chat is not answering. Your message above was not delivered; send it again in a moment.",
+   "reason": "target_unavailable",
+   "type": "warmup_failed"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  }
+ ],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [
+   "<id2>"
+  ],
+  "messages": [],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [
+   "<id2>"
+  ],
+  "started": []
+ },
+ "slots": {
+  "acquired": [],
+  "released": []
+ }
+}

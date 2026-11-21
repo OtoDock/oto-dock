@@ -9,6 +9,7 @@ One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 
 import asyncio
 import logging
+import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -28,6 +29,7 @@ from core import layout
 from core.session.session_state import (
     get_session_security,
 )
+from services.infra import safe_fs
 
 if TYPE_CHECKING:
     from services.path_policy_v2 import PathResolution
@@ -76,7 +78,7 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
             metadata sidecar so write-back targets the original
             absolute path on the satellite.
     """
-    await verify_session_match_async(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id, accept_callback=True)
 
     ctx = get_session_security(req.session_id)
     if not ctx:
@@ -111,10 +113,7 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
         except (OSError, ValueError):
             contained = False
         if contained and candidate.is_file():
-            acc = check_host_path_access(candidate, ctx, writing=False)
-            if not acc.allowed:
-                raise HTTPException(status_code=403, detail=acc.reason or "access denied")
-            return _answer(str(candidate), ctx)
+            return _answer(_judged_or_403(req.session_id, ctx, candidate, writing=False), ctx)
 
     from core.remote import remote_file_flow
     is_remote = remote_file_flow.is_remote_session(req.session_id)
@@ -179,7 +178,7 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
         # agents-relative form lets file-tools' existing
         # `MOUNT_AGENTS_DIR + agents_rel` logic work unchanged — no
         # MCP-side code change needed for satellite-host paths.
-        return _answer(str(cached), ctx)
+        return _answer(_judged_or_403(req.session_id, ctx, cached, writing=req.writing), ctx)
 
     # ANY policy denial → 403 with the resolver's reason. This must precede both
     # the remote pull-through and the local _sandbox_to_host translate below: a
@@ -223,7 +222,7 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
                        "write that folder",
             )
         if cached is not None and cached.is_file():
-            return _answer(str(cached), ctx)
+            return _answer(_judged_or_403(req.session_id, ctx, cached, writing=req.writing), ctx)
         if held:
             # The machine's copy is never read for a path the session may
             # not write back, and the platform has none: the lexical
@@ -244,32 +243,115 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
         ):
             from core.remote.file_sync import is_canonical_rel_path
             if is_canonical_rel_path(rel):
-                create_host = (agent_dir / rel).resolve()
-                try:
-                    create_host.relative_to(agent_dir.resolve())
-                except ValueError as exc:
-                    raise HTTPException(status_code=403, detail="access denied") from exc
-                return _answer(str(create_host), ctx)
+                return _answer(_judged_or_403(req.session_id, ctx, agent_dir / rel, writing=True), ctx)
 
-    # Translate sandbox-internal paths to host paths (local sessions). Re-gate
-    # the TRANSLATED host path: _sandbox_to_host is purely lexical, and an
-    # expansion like /.claude/x.json -> users/{u}/.claude/x.json only becomes
-    # protected after translation. Mirrors _gate_in_tree_host on the pull path.
+    # Translate sandbox-internal paths to host paths (local sessions) and
+    # judge the TRANSLATION where it lands: _sandbox_to_host is purely
+    # lexical (an expansion of /.claude only becomes protected after
+    # translation), and it sends a role below the workspace tier to its own
+    # folder, which the policy verdict above never saw. A path whose text
+    # leaves the agents tree (/screenshots) keeps its lexical answer: the
+    # Docker MCP confines it itself.
     host_path = _sandbox_to_host(raw, ctx, agent_dir)
+    if not _names_agents_tree(host_path):
+        return _answer(host_path, ctx)
+    answer, why = await asyncio.to_thread(
+        _judge, req.session_id, ctx, host_path, writing=req.writing,
+    )
+    if answer is None:
+        raise HTTPException(status_code=403, detail=why)
+    return _answer(str(answer), ctx)
+
+
+def _asked_name(raw: str) -> str:
+    """The last part of a path as the session asked for it (a Windows path
+    from a paired computer included): the name a download or a preview
+    shows, never the name of the place a link led to. A last part of dots
+    names no file: "" (the callers then show the file's own name)."""
+    name = raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return name if name.strip(".") else ""
+
+
+def machine_origin(session_id: str, resolution: "PathResolution | None") -> tuple[str, str | None]:
+    """``(origin_path, machine_id)`` a ``media_tokens`` row records for a
+    file ``_classify_and_pull`` answered: the file's place on the paired
+    computer when it is the computer's own (its copy sits in the session's
+    host cache, which the session's close removes, so ``serve_media``
+    fetches it again from there), and the machine the session runs on.
+    ``("", None)`` for a session on the platform."""
+    from core.remote import remote_file_flow
+    ref = resolution.path_ref if resolution is not None else None
+    origin = ref.value if ref is not None and ref.kind == "satellite_host" else ""
+    info = remote_file_flow._get_remote_session_info(session_id)
+    return origin, getattr(info, "machine_id", None)
+
+
+def _names_agents_tree(host_path: str) -> bool:
+    """Whether the TEXT of ``host_path`` lies in the agents tree."""
+    agents = str(config.AGENTS_DIR).rstrip("/")
+    return host_path == agents or host_path.startswith(agents + "/")
+
+
+_OUTSIDE = "Access denied: that path is outside this agent's files."
+_WRITES_NO_FILES = "This session writes no files"
+
+
+def _writes_no_files(session_id: str, ctx: SecurityContext) -> bool:
+    """Whether the session writes no files at all (a check's judge): the
+    files routes' own grant reads the session's read-only mark, and the
+    hooks ask that grant."""
+    from api.agents.files import _SessionGrant
+    return _SessionGrant.of(session_id, ctx).read_only
+
+
+def _judge(session_id: str, ctx: SecurityContext, host: str | os.PathLike[str], *,
+           writing: bool) -> tuple[Path | None, str]:
+    """``(answer, "")`` when this session may use the place ``host`` names,
+    else ``(None, why)``. The place is the kernel's answer (every link
+    followed, ``..`` folded after them), judged there: in the session's own
+    agent by the role matrix (``check_host_path_access`` takes the resolved
+    path), in the session's own host cache as allowed, anywhere else
+    refused. The answer is that place beneath ``AGENTS_DIR`` as configured,
+    with no link left in it: the caller opens it through ``safe_fs`` and
+    never resolves it again, so a link put in after this judgement is
+    refused at the open instead of followed (``safe_fs.canonical_rel``'s
+    rule). A session that writes no files (``_writes_no_files``) is refused
+    every write. Blocking (a realpath)."""
+    if writing and _writes_no_files(session_id, ctx):
+        return None, _WRITES_NO_FILES
     try:
-        in_tree = await asyncio.to_thread(_resolves_under, host_path, agent_dir)
+        real = os.path.realpath(host)
+        rel = safe_fs.rel_under(real, config.AGENTS_DIR)
     except (OSError, ValueError):
-        in_tree = False
-    if in_tree:
-        acc = check_host_path_access(Path(host_path), ctx, writing=req.writing)
+        return None, _OUTSIDE
+    if rel == ctx.agent or rel.startswith(ctx.agent + "/"):
+        acc = check_host_path_access(Path(real), ctx, writing=writing)
         if not acc.allowed:
-            raise HTTPException(status_code=403, detail=acc.reason or "access denied")
-    return _answer(host_path, ctx)
+            return None, acc.reason or "access denied"
+    elif not in_own_host_cache(session_id, rel):
+        return None, _OUTSIDE
+    return config.AGENTS_DIR / rel, ""
 
 
-def _resolves_under(host_path: str, agent_dir: Path) -> bool:
-    """``host_path`` resolves inside ``agent_dir`` (links followed)."""
-    return Path(host_path).resolve().is_relative_to(agent_dir.resolve())
+def in_own_host_cache(session_id: str, rel: str) -> bool:
+    """Whether ``rel`` (beneath ``AGENTS_DIR``) lies in this session's own
+    lazy-pull host cache, read as TEXT: the cache folder's own realpath is
+    never consulted, so a link at it cannot make another tree its cache.
+    ``rel`` comes from a realpath, so it never holds a dot segment."""
+    from services.media.media_pipeline import HOST_CACHE_SEGMENT
+    if not session_id or "/" in session_id:
+        return False
+    root = f"{HOST_CACHE_SEGMENT}/{session_id}"
+    return rel == root or rel.startswith(root + "/")
+
+
+def _judged_or_403(session_id: str, ctx: SecurityContext, host: str | os.PathLike[str], *,
+                   writing: bool) -> str:
+    """``_judge``'s answer as text, or the 403 that carries its reason."""
+    answer, why = _judge(session_id, ctx, host, writing=writing)
+    if answer is None:
+        raise HTTPException(status_code=403, detail=why)
+    return str(answer)
 
 
 def _answer(host_path: str, ctx) -> dict:
@@ -298,10 +380,10 @@ def _session_scope_root(ctx: SecurityContext, agent_dir: Path) -> Path:
     """The session's own workspace on the host — the default save dir and
     the anchor for relative paths: an external caller's tree, else the MOUNT
     user's workspace, else the shared one."""
-    from core.session.external_identity import external_home_of
-    ext_home = external_home_of(ctx)
-    if ext_home:
-        return Path(ext_home) / layout.WORKSPACE
+    from core.session.external_identity import caller_home_of
+    caller_home = caller_home_of(ctx)
+    if caller_home:
+        return Path(caller_home) / layout.WORKSPACE
     return layout.workspace_dir(agent_dir, ctx.mount_username)
 
 
@@ -329,20 +411,25 @@ def _sandbox_to_host(sandbox_path: str, ctx: SecurityContext, agent_dir: Path) -
     # /workspace redirects there too (the same asymmetry as the user viewer
     # below). RBAC re-gates every result (check_host_path_access), so an
     # editor/manager caller's /workspace still lands in the shared one.
-    from core.session.external_identity import external_home_of
+    # A wrap-up's /caller is the tree of the person it writes up; the rest of
+    # its paths are the agent's (read only, by the policy).
+    from core.session.external_identity import caller_home_of, external_home_of
+    caller_home = caller_home_of(ctx)
+    if caller_home and (p == "/caller" or p.startswith("/caller/")):
+        rest = p[len("/caller"):].lstrip("/")
+        return str(Path(caller_home) / rest) if rest else caller_home
     ext_home = external_home_of(ctx)
     if ext_home:
         home = Path(ext_home)
-        if p == "/caller" or p.startswith("/caller/"):
-            rest = p[len("/caller"):].lstrip("/")
-            return str(home / rest) if rest else str(home)
         if p.startswith("/.claude/") or p == "/.claude":
             return str(home / ".claude" / p[9:])
         if p.startswith("/.codex/") or p == "/.codex":
             return str(home / ".codex" / p[8:])
         if p.startswith("/context/") or p == "/context":
             return str(home / layout.CONTEXT / p[9:])
-        if ctx.role == roles.VIEWER and layout.under(p, layout.V_WORKSPACE):
+        if layout.under(p, layout.V_WORKSPACE):
+            # An outside person is below the workspace tier: /workspace
+            # names their own folder (the asymmetry of the user viewer below).
             return str(home / layout.WORKSPACE / p[11:])
 
     # /.claude/ → session's .claude/ dir
@@ -567,44 +654,25 @@ async def _classify_and_pull(
     ctx = get_session_security(session_id)
     if ctx is None:
         return None, None
-    agent_root = (config.AGENTS_DIR / ctx.agent).resolve()
 
-    def _gate_in_tree_host(host: "Path") -> bool:
-        # In the session's OWN agent tree → full cross-user + role RBAC.
-        # Under AGENTS_DIR but a DIFFERENT agent's tree → cross-agent escape →
-        # deny. Truly outside AGENTS_DIR → deny: on the local branch below the
-        # interceptor's resolve-tool-arg-paths gate is NOT wired (it's remote-
-        # only), so a form-1 host path that ``_resolve_hook_path`` accepted
-        # verbatim (``Path(raw).is_file()``) would otherwise be served straight
-        # from the proxy host — an arbitrary-file read of anything uid 1000 can
-        # reach (config.env, other users' tokens). path_policy_v2's own local
-        # contract rejects every non-sandbox-virtual absolute path; mirror it.
-        rh = host.resolve()
-        if rh.is_relative_to(agent_root):
-            return check_host_path_access(host, ctx, writing=writing).allowed
-        # The session's OWN lazy-pull host cache (a Desktop/Downloads file the
-        # resolve-path hook already policy-gated and pulled). Session-scoped:
-        # another session's cache stays denied. Without this carve-out the
-        # agent-tree confinement (c59e551f) 400'd EVERY satellite-host
-        # preview — the cache lives beside, not inside, the agent trees.
-        try:
-            cache_root = remote_file_flow.host_cache_session_root(
-                session_id,
-            ).resolve()
-            if rh.is_relative_to(cache_root):
-                return True
-        except OSError:
-            pass
-        return False
-
+    # Every answer below is judged where it lands and handed back as that
+    # place (``_judge``): the consumers open it strictly and never resolve
+    # it again. Truly outside AGENTS_DIR is refused there: on the local
+    # branch the interceptor's resolve-tool-arg-paths gate is NOT wired (it's
+    # remote-only), so a form-1 host path that ``_resolve_hook_path``
+    # accepted verbatim (``Path(raw).is_file()``) would otherwise be served
+    # straight from the proxy host. The session's OWN lazy-pull host cache
+    # (a Desktop/Downloads file the resolve-path hook already policy-gated
+    # and pulled) is allowed; another session's cache stays denied.
     if not remote_file_flow.is_remote_session(session_id):
         host = _resolve_hook_path(session_id, raw_path)
         # The local form-2 resolver skips the security context →
         # re-gate so a session can't read another user's file via the
         # display / preview / media / temp-image hooks.
-        if not host.is_file() or not _gate_in_tree_host(host):
+        answer, _why = _judge(session_id, ctx, host, writing=writing)
+        if answer is None or not answer.is_file():
             return None, None
-        return host, None
+        return answer, None
 
     # Docker MCPs (file-tools) post an ALREADY-RESOLVED agents-relative path —
     # the exact form the resolve-path hook handed back: "<agent>/users/.../f.docx"
@@ -618,9 +686,8 @@ async def _classify_and_pull(
         agents_root = config.AGENTS_DIR.resolve()
         direct = (agents_root / raw_path).resolve()
         if direct.is_file() and (direct == agents_root or agents_root in direct.parents):
-            if not _gate_in_tree_host(direct):
-                return None, None
-            return direct, None
+            answer, _why = _judge(session_id, ctx, direct, writing=writing)
+            return answer, None
 
     from services import path_policy_v2 as _v2
     policy_ctx = _v2.context_from_security(ctx)
@@ -644,7 +711,13 @@ async def _classify_and_pull(
     else:  # agent_tree
         pulled = await remote_file_flow.pull_through(session_id, ref.value, held=held)
     if pulled is not None and pulled.is_file():
-        return pulled, resolution
+        # Judged once more where the pull's answer lands, after the path
+        # lock's wait: the role check above read the path before it.
+        answer, why = _judge(session_id, ctx, pulled, writing=writing)
+        if answer is None:
+            import dataclasses
+            return None, dataclasses.replace(resolution, allowed=False, error=why)
+        return answer, resolution
     if held:
         import dataclasses
         return None, dataclasses.replace(

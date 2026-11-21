@@ -21,7 +21,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-from pathlib import Path
+import tarfile
+from pathlib import Path, PureWindowsPath
 
 logger = logging.getLogger("satellite.auth-paths")
 
@@ -122,3 +123,44 @@ def assert_agent_path_safe(
     if not is_path_under_root(target, agent_dir):
         raise ValueError(f"target escapes agent_dir: {target}")
     return target
+
+
+def unpack_tarball(tar: tarfile.TarFile, dest: Path) -> None:
+    """Unpack ``tar`` into ``dest``: the platform's update and a tool's
+    package. Every member's path must stay under ``dest`` once resolved
+    (``is_path_under_root``), checked before anything is written. Python's
+    ``data`` filter then refuses links out of ``dest``, devices and pipes,
+    and drops set-id bits. Where Python has no filter (python.org's last
+    3.10 for Windows), this function keeps those promises itself, before
+    anything is written: a regular file or a folder alone, a name with no
+    drive, no root and no ``..`` read as Windows reads it, and modes as the
+    filter sets them. Raises ``ValueError`` naming the first member refused."""
+    members = tar.getmembers()
+    for member in members:
+        if not is_path_under_root(dest / member.name, dest):
+            raise ValueError(f"tarball escaped: {member.name}")
+    if hasattr(tarfile, "data_filter"):
+        tar.extractall(dest, filter="data")
+        return
+    for member in members:
+        why = _refused_without_filter(member)
+        if why:
+            raise ValueError(f"tarball member {member.name!r} refused: {why}")
+    for member in members:
+        if member.isreg():
+            mode = (member.mode & 0o755) | 0o600
+            member.mode = mode if mode & 0o100 else mode & ~0o111
+        else:
+            member.mode = (member.mode & 0o755) | 0o700
+    tar.extractall(dest)
+
+
+def _refused_without_filter(member: tarfile.TarInfo) -> str:
+    """Why the ``data`` filter would refuse ``member`` (stricter on links:
+    none at all), or ``""``."""
+    if not (member.isreg() or member.isdir()):
+        return "not a regular file or a folder"
+    name = PureWindowsPath(member.name)
+    if not member.name or "\0" in member.name or name.drive or name.root or ".." in name.parts:
+        return "its name is absolute, names a drive or climbs"
+    return ""

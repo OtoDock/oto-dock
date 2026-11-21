@@ -10,6 +10,8 @@ import logging
 import re
 import time
 
+from audio.log_policy import log_transcript
+
 from proxy.client import TOOL_USE_SIGNAL
 
 from .markers import _CALL_COMPLETE_RE, _QUESTION_RE
@@ -189,10 +191,9 @@ class LlmStreamingMixin:
         if self.state._aborted_turn_text and not is_opening:
             transcript = f"{self.state._aborted_turn_text} {transcript}"
             self.state._aborted_turn_text = None
-            logger.info(
-                "[%s] Folding aborted turn into new "
-                "dispatch: %s", self.conn.peer_addr, transcript[:80]
-            )
+            log_transcript(
+                logger, f"[{self.conn.peer_addr}] Folding aborted turn into new dispatch",
+                transcript, event=True)
 
         pending_response: str | None = None  # pre-collected LLM text from parallel processing
 
@@ -1089,10 +1090,9 @@ class LlmStreamingMixin:
                     # continuation (batched with the aborted transcript when
                     # applicable) as a new turn.
                     resend_text = resend_base
-                    logger.info(
-                        "[%s] Continuation (LLM done) "
-                        "— new turn: %s", self.conn.peer_addr, resend_text
-                    )
+                    log_transcript(
+                        logger, f"[{self.conn.peer_addr}] Continuation (LLM done) — new turn",
+                        resend_text, event=True)
                     if self.state._call_transcript and self.state._call_transcript[-1]["role"] == "user":
                         self.state._call_transcript.pop()
 
@@ -1133,10 +1133,9 @@ class LlmStreamingMixin:
                     )
                     continue
                 else:
-                    logger.info(
-                        "[%s] Starting parallel LLM "
-                        "while TTS plays: %s", self.conn.peer_addr, next_transcript
-                    )
+                    log_transcript(
+                        logger, f"[{self.conn.peer_addr}] Starting parallel LLM while TTS plays",
+                        next_transcript, event=True)
 
                     # Raw transcript, like every other turn — the spoken-style
                     # rules live in the SYSTEM prompt (phone context / duplex
@@ -1180,11 +1179,9 @@ class LlmStreamingMixin:
                         logger.warning("[%s] Pre-tool text wait timed out", self.conn.peer_addr)
 
                     if self.state._parallel_pre_tool_text:
-                        logger.info(
-                            "[%s] Playing intermediate pre-tool TTS: "
-                            "%s",
-                            self.conn.peer_addr, self.state._parallel_pre_tool_text[:60]
-                        )
+                        log_transcript(
+                            logger, f"[{self.conn.peer_addr}] Playing intermediate pre-tool TTS",
+                            self.state._parallel_pre_tool_text, event=True)
                         await asyncio.sleep(self.cfg.tts_response_gap_s)
 
                         # Play pre-tool text via TTS
@@ -1305,10 +1302,9 @@ class LlmStreamingMixin:
                     # Don't pop from llm.messages or call_transcript —
                     # they reflect what happened.
                     # Send only the continuation as a new turn.
-                    logger.info(
-                        "[%s] Late continuation — "
-                        "new turn: %s", self.conn.peer_addr, late_text
-                    )
+                    log_transcript(
+                        logger, f"[{self.conn.peer_addr}] Late continuation — new turn",
+                        late_text, event=True)
                     transcript = await self._wait_for_complete_continuation(
                         late_text,
                     )
@@ -1404,11 +1400,9 @@ class LlmStreamingMixin:
                         pre_tool_text = "".join(pre_tool).strip()
                         if pre_tool_text:
                             self.state._parallel_pre_tool_text = pre_tool_text
-                            logger.info(
-                                "[%s] Parallel LLM pre-tool text "
-                                "(%s chars): %s",
-                                self.conn.peer_addr, len(pre_tool_text), pre_tool_text[:80]
-                            )
+                            log_transcript(
+                                logger, f"[{self.conn.peer_addr}] Parallel LLM pre-tool text",
+                                pre_tool_text, event=True)
                         else:
                             self.state._parallel_pre_tool_text = None
                         self.state._parallel_pre_tool_ready.set()

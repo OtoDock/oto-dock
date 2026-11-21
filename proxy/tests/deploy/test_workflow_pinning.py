@@ -92,6 +92,25 @@ def test_a_required_proxy_check_stands_for_every_part_of_the_suite(required, par
     assert suite["env"]["SHARD"] == "${{ matrix.shard }}" and "if" not in suite
 
 
+# ── the writing rules ───────────────────────────────────────────────────────
+
+
+def test_the_prose_job_runs_the_engine_on_its_oldest_python_with_nothing_held():
+    """The job runs in this repository only, on the Python the engine
+    promises, inside five minutes, and no step's shell line reads a value of
+    the pull request (a title or a branch name is text a stranger writes)."""
+    job = yaml.safe_load((_WORKFLOWS / "ci.yml").read_text())["jobs"]["prose"]
+    assert job["if"] == "github.repository == 'OtoDock/oto-dock'"
+    assert job["timeout-minutes"] == 5
+    setup = next(step for step in job["steps"] if "setup-python" in step.get("uses", ""))
+    assert setup["with"]["python-version"] == "3.10"
+    runs = [step["run"] for step in job["steps"] if "run" in step]
+    assert runs == ["python scripts/prose/prose_check.py --self-test",
+                    "python scripts/prose/prose_check.py . --no-nested"]
+    assert not any("${{" in run for run in runs)
+    assert "env" not in job and "secrets" not in str(job)
+
+
 # ── the contributor agreement's check ───────────────────────────────────────
 
 _REPO = _WORKFLOWS.parents[1]

@@ -41,6 +41,7 @@ CONTINUATION = "continuation"
 APP = "app"
 DELEGATE = "delegate"
 CHECK = "check"
+WRAPUP = "wrapup"
 
 # ---------------------------------------------------------------------------
 # the run's kind (task_runs.task_type)
@@ -52,6 +53,7 @@ RUN_TRIGGER = "trigger"
 RUN_DELEGATE = "delegate"
 RUN_APP = "app"
 RUN_CHECK = "check"
+RUN_WRAPUP = "wrapup"
 
 # ---------------------------------------------------------------------------
 # the origin (task_runs.trigger_type)
@@ -80,7 +82,8 @@ class TaskKind:
     clocked: bool         # registers an APScheduler job when it has timing (a trigger task never)
     unscheduled: bool     # accepted by POST /v1/tasks/one-time, which needs no clock
     fires: str            # SESSION | WAKE | HANDLER
-    judge: bool           # a judge session: never judged, titled by the task's name
+    judge: bool           # the platform's own run (a check's judge, a call's wrap-up): never
+                          # judged, titled by the task's name, never held by a drain
     worker: bool          # a delegate worker: a chat row with lineage, titled by the task's name
     knowledge_rw: bool    # the manager-provenance knowledge-write opt-in at fire (PERMISSIONS.md)
     button_target: bool   # an app's fire_task may point at it (a one-time task deletes itself)
@@ -109,6 +112,9 @@ KINDS: dict[str, TaskKind] = {k.name: k for k in (
              knowledge_rw=True, button_target=False, run_kind=RUN_DELEGATE),
     TaskKind(CHECK, clocked=True, unscheduled=False, fires=SESSION, judge=True, worker=False,
              knowledge_rw=False, button_target=False, run_kind=RUN_CHECK),
+    # A call's wrap-up (task_type='wrapup', in-memory only, services/phone/wrapup.py).
+    TaskKind(WRAPUP, clocked=False, unscheduled=False, fires=SESSION, judge=True, worker=False,
+             knowledge_rw=False, button_target=False, run_kind=RUN_WRAPUP),
 )}
 TASK_KINDS = frozenset(KINDS)
 
@@ -125,13 +131,14 @@ RUN_KINDS: dict[str, RunKind] = {k.name: k for k in (
     RunKind(RUN_DELEGATE, knowledge_rw=True),
     RunKind(RUN_APP, knowledge_rw=False),
     RunKind(RUN_CHECK, knowledge_rw=False),
+    RunKind(RUN_WRAPUP, knowledge_rw=False),
 )}
 RUN_KIND_NAMES = frozenset(RUN_KINDS)
 
 # The kinds whose run row's word comes from the definition's kind alone;
 # every other definition (and an empty, pre-derivation value) is classified
 # by its timing.
-_EXPLICIT = (DELEGATE, APP, CHECK, TRIGGER)
+_EXPLICIT = (DELEGATE, APP, CHECK, WRAPUP, TRIGGER)
 
 
 def derive(schedule, interval_seconds) -> str:

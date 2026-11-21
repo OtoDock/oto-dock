@@ -8,9 +8,10 @@ gone, and the app-server answer write blew up on a closed transport
 exception. The answer vanished and the turn never resumed.
 
 Three seams pinned here:
-  * the codex idle sweep spares a session with a pending prompt (an approval
-    the bridge holds; a question holds nothing since 1.9.1)
-    (``_codex_reap_candidates``);
+  * the idle sweep spares a session with a pending prompt (an approval the
+    bridge holds; a question holds nothing since 1.9.1) only while the prompt
+    still waits and its machine is there (``remote_reaper._verdict``; the
+    spare past the turn ceiling is ``tests/session/test_reaper_idle_timeout.py``'s);
   * a ``question_response`` (a held question card stored by 1.9.0) is the
     person's next message: the chat path (``_handle_chat`` → registry-aware
     single-flight revival), claimed once across sockets;
@@ -21,10 +22,12 @@ No daemon / no DB.
 Run individually (conftest DB-pool gotcha):
     venv/bin/python -m pytest tests/session/test_codex_question_survival.py -q
 """
+from types import SimpleNamespace
+
 import pytest
 
-from core.layers.codex import session as codex_session
 from core.layers.codex.app_server_client import AppServerClient, AppServerError
+from core.remote import remote_reaper
 from core.session import session_state
 from ws.dashboard_dispatch import (
     ClientMessageDispatcher,
@@ -33,22 +36,33 @@ from ws.dashboard_dispatch import (
 from ws.dashboard_prompts import PromptController
 
 # ─────────────────────────────────────────────────────────────────────────
-# Codex idle sweep: the question spare
+# The idle sweep: what a parked prompt spares
 # ─────────────────────────────────────────────────────────────────────────
 
-class _FakeCodexSession:
-    def __init__(self, idle: float, *, alive: bool = True):
-        self.last_activity = 1000.0 - idle
-        self.is_alive = alive
-        self._current_turn_id = None
+class _Machines:
+    def __init__(self, connected: bool):
+        self._connected = connected
+
+    def is_connected(self, machine_id):
+        return self._connected
+
+    def is_session_in_grace(self, machine_id, session_id):
+        return False
+
+
+def _sweep(session_id: str, *, idle: float, connected: bool = True) -> str:
+    """The reaper's verdict for a session between turns, ``idle`` seconds
+    after its last event, under an idle timeout of 100 s."""
+    info = SimpleNamespace(last_activity=1000.0 - idle, machine_id="m", turn_active=False,
+                           cli_dead=False)
+    return remote_reaper._verdict(
+        SimpleNamespace(_cm=_Machines(connected)), session_id, info, 1000.0, 100)
 
 
 @pytest.fixture
-def codex_registry():
-    """Isolate the module-level session pool + the prompt registries."""
-    codex_session._codex_sessions.clear()
-    yield codex_session._codex_sessions
-    codex_session._codex_sessions.clear()
+def prompts():
+    """Isolate the prompt registries."""
+    yield
     for rid in ("q-1", "q-x"):
         session_state._permission_events.pop(rid, None)
     session_state._session_permission_requests.clear()
@@ -59,34 +73,20 @@ def _park_question(session_id: str, request_id: str = "q-1") -> None:
     session_state.open_permission_wait(request_id, session_id)
 
 
-class TestCodexReapCandidates:
-    def test_over_idle_without_question_is_reaped(self, codex_registry):
-        codex_registry["s-idle"] = _FakeCodexSession(idle=200)
-        assert codex_session._codex_reap_candidates(1000.0, 100) == ["s-idle"]
-
-    def test_pending_question_spared_under_cap(self, codex_registry):
-        # Blocked on a HUMAN: byte-idle but not abandoned.
-        codex_registry["s-parked"] = _FakeCodexSession(idle=150)
-        _park_question("s-parked")
-        assert codex_session._codex_reap_candidates(1000.0, 100) == []
-
-    def test_pending_question_spared_while_it_waits(self, codex_registry):
-        # The prompt's own wait (PROMPT_WAIT_S) bounds the spare, not the
-        # idle knob: a question parked overnight is still answerable.
-        codex_registry["s-parked"] = _FakeCodexSession(idle=10 * 100 + 10)
-        _park_question("s-parked")
-        assert codex_session._codex_reap_candidates(1000.0, 100) == []
-
-    def test_answered_question_does_not_spare(self, codex_registry):
+class TestTheIdleSweepAndAParkedPrompt:
+    def test_an_answered_prompt_spares_nothing(self, prompts):
         # The waiter is gone (answered/released) → nothing left to wait on.
-        codex_registry["s-answered"] = _FakeCodexSession(idle=150)
         session_state._session_permission_requests["s-answered"] = {"q-gone"}
-        assert codex_session._codex_reap_candidates(1000.0, 100) == ["s-answered"]
+        assert _sweep("s-answered", idle=150) == remote_reaper.REAP
+        _park_question("s-parked")
+        assert _sweep("s-parked", idle=150) == remote_reaper.KEEP
 
-    def test_dead_session_is_reaped_regardless_of_question(self, codex_registry):
-        codex_registry["s-dead"] = _FakeCodexSession(idle=1, alive=False)
-        _park_question("s-dead")
-        assert codex_session._codex_reap_candidates(1000.0, 100) == ["s-dead"]
+    def test_a_session_whose_machine_is_gone_is_reaped_whatever_waits(self, prompts):
+        # Nobody can answer a card of a session that runs nowhere.
+        _park_question("s-gone")
+        assert _sweep("s-gone", idle=150) == remote_reaper.KEEP
+        assert _sweep("s-gone", idle=150, connected=False) == remote_reaper.REAP
+        assert _sweep("s-gone", idle=1, connected=False) == remote_reaper.REAP
 
 
 # ─────────────────────────────────────────────────────────────────────────

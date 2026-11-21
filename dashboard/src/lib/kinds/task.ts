@@ -8,7 +8,7 @@
  * run column has always had) and a run's ORIGIN (`task_runs.trigger_type`).
  */
 
-/** `dynamic_tasks.task_type` (`check` is a judge run's in-memory kind). */
+/** `dynamic_tasks.task_type` (`check` is a judge run's in-memory kind, `wrapup` a call's wrap-up's). */
 export const TASK_KIND = {
   SCHEDULED: 'scheduled',
   ONE_TIME: 'one_time',
@@ -17,6 +17,7 @@ export const TASK_KIND = {
   APP: 'app',
   DELEGATE: 'delegate',
   CHECK: 'check',
+  WRAPUP: 'wrapup',
 } as const
 export type TaskKind = (typeof TASK_KIND)[keyof typeof TASK_KIND]
 
@@ -28,6 +29,7 @@ export const RUN_KIND = {
   DELEGATE: 'delegate',
   APP: 'app',
   CHECK: 'check',
+  WRAPUP: 'wrapup',
 } as const
 export type RunKind = (typeof RUN_KIND)[keyof typeof RUN_KIND]
 
@@ -38,6 +40,7 @@ export const RUN_KIND_LABEL: Record<RunKind, string> = {
   [RUN_KIND.DELEGATE]: 'Delegate',
   [RUN_KIND.APP]: 'App',
   [RUN_KIND.CHECK]: 'Check',
+  [RUN_KIND.WRAPUP]: 'After a call',
 }
 
 // A run kind's chip, by meaning: neutral information for the platform's
@@ -50,6 +53,7 @@ export const RUN_KIND_STYLE: Record<RunKind, string> = {
   [RUN_KIND.DELEGATE]: 'bg-accent-agent-bg text-accent-agent-fg',
   [RUN_KIND.APP]: 'bg-accent-media-bg text-accent-media-fg',
   [RUN_KIND.CHECK]: 'bg-surface-muted text-secondary',
+  [RUN_KIND.WRAPUP]: 'bg-accent-media-bg text-accent-media-fg',
 }
 
 export function isRunKind(t: string | null | undefined): t is RunKind {

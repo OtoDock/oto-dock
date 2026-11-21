@@ -55,6 +55,9 @@ const EDGE = 8
 // the IFRAME is the single scroller — an overflow-auto body around an
 // auto-height iframe stacks two scrollbars.
 const isFrameWin = (w: ArtifactWindow) => w.block.type === 'ui'
+// A video fits its window: the body is a column the player's frame shrinks
+// in, so a tall clip keeps its controls (and its full screen) in view.
+const isFitWin = (w: ArtifactWindow) => w.block.type === 'video'
 const winWidthPx = (w: ArtifactWindow) => (isFrameWin(w) ? WIN_W_FRAME : WIN_W_DEFAULT)
 const NONE: ReadonlySet<number> = new Set()
 
@@ -383,7 +386,7 @@ export default function ArtifactWindows({ windows, minimized, onClose, onMinimiz
                 </svg>
               </button>
             </div>
-            <div className={`min-h-0 flex-1 ${frame ? 'overflow-hidden' : 'overflow-auto p-3'}`}>
+            <div className={`min-h-0 flex-1 ${frame ? 'overflow-hidden' : `overflow-auto p-3${isFitWin(w) ? ' flex flex-col' : ''}`}`}>
               <ArtifactView block={w.block} agent={agent} embedded={frame} onArtifactInteraction={onArtifactInteraction} />
             </div>
           </div>

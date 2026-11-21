@@ -4,7 +4,7 @@ import {
   useRemoteMachines, usePairMachine, useDeleteMachine, useAssignAgent, useUnassignAgent,
   useSetAutoUpdate, useTriggerUpdateNow, useSetAllowFullFs, useSetDeviceGrants,
   useSetMaxSessions, useSetAllRolesRunHere,
-  DEVICE_CAPABILITY_INFO,
+  DEVICE_CAPABILITY_INFO, MACHINE_UPDATE_STATE,
   deviceGrantBody,
   type DeviceCapabilityInfo,
   type RemoteMachine, type PairResult,
@@ -23,11 +23,13 @@ import { browserModeDesc, browserModeOf } from '../../lib/remote/browserMode'
 import { errorText, apiJson, toastError, withMessage } from '../../lib/http/apiJson'
 import { useDialogs } from '../../components/ui/dialogs'
 import AlertDialog from '../../components/ui/AlertDialog'
+import ComputeMachinesSection from './RemoteMachinesPage.compute'
 import Dialog from '../../components/ui/Dialog'
 import Button from '../../components/ui/Button'
 import { Input, Select } from '../../components/ui/Field'
 import { BADGE_BASE, BADGE_TONE, CARD, DIALOG_PANEL } from '../../components/ui/classes'
 import InfoTip from '../../components/ui/InfoTip'
+import MachineToolsLine from '../../components/MachineToolsLine'
 import { CheckboxRow, SaveState } from '../../components/ui/SettingsControls'
 import { useSaveState } from '../../hooks/useSaveState'
 
@@ -38,10 +40,19 @@ interface SatelliteStat {
   machine_id: string
   name: string
   online: boolean
-  active_sessions: number
+  // null while the machine has not reported a count since it signed in.
+  active_sessions: number | null
   max_sessions: number | null
   cpu_pct: number
   mem_pct: number
+  // A machine whose satellite watches its memory (0.5.177): memory decides
+  // how many sessions start there; low_memory while a new start waits.
+  memory_watched?: boolean
+  // A system whose memory the guard does not watch (its reading is not measured there).
+  memory_unwatched?: boolean
+  mem_free_mb?: number
+  mem_total_mb?: number
+  low_memory?: boolean
 }
 
 function useSatelliteStats() {
@@ -62,9 +73,9 @@ function useSatelliteStats() {
 }
 
 // Per-machine live capacity (active/max sessions, cpu%/mem%) + an
-// editable proxy-side max_sessions override. Empty input = NULL (use the
-// satellite's own recommendation). The satellite still hard-caps at its
-// physical max on its own — this is just the proxy soft pre-check value.
+// editable proxy-side max_sessions override. Empty input = NULL: memory
+// decides on a machine that watches its memory, else the satellite's own
+// recommendation.
 function MachineCapacityControls({
   machine, stat,
 }: {
@@ -87,6 +98,8 @@ function MachineCapacityControls({
   // The recommendation the satellite reports (the effective cap when no
   // override is set), shown as the input placeholder.
   const recommended = stat && stat.max_sessions != null ? stat.max_sessions : null
+  const byMemory = stat?.mem_total_mb != null
+  const unwatched = stat?.memory_unwatched === true
 
   const save = () => {
     if (value === persisted) return
@@ -100,9 +113,12 @@ function MachineCapacityControls({
       { failTitle: 'The session limit was not saved' })
   }
 
-  const sessionsLabel = stat
-    ? `${stat.active_sessions} / ${stat.max_sessions ?? '∞'}`
-    : '—'
+  const count = stat?.active_sessions ?? '—'
+  const sessionsLabel = !stat
+    ? '—'
+    : byMemory && machine.max_sessions == null
+      ? `${count}`
+      : `${count} / ${stat.max_sessions ?? '∞'}`
 
   return (
     <div className="pt-2 border-t border-subtle space-y-2">
@@ -119,7 +135,17 @@ function MachineCapacityControls({
               </span>
             )}
           </p>
-          <p className="text-3xs text-tertiary max-w-md">Blank uses the machine's own recommendation{recommended != null ? `, ${recommended}` : ''}.</p>
+          {byMemory ? (
+            <p className="text-3xs text-tertiary max-w-md">Memory decides how many sessions this computer runs. Set a number to cap them.</p>
+          ) : (
+            <p className="text-3xs text-tertiary max-w-md">Blank uses the machine's own recommendation{recommended != null ? `, ${recommended}` : ''}.</p>
+          )}
+          {stat?.low_memory && (
+            <p className="text-3xs text-status-warning-fg max-w-md">This computer is low on memory. New chats cannot start, and tasks wait.</p>
+          )}
+          {unwatched && (
+            <p className="text-3xs text-tertiary max-w-md">Memory is not watched on this computer. A command that uses too much is not stopped here.</p>
+          )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <span>
@@ -131,7 +157,7 @@ function MachineCapacityControls({
             type="number"
             min={1}
             value={value}
-            placeholder={recommended != null ? `Auto (${recommended})` : 'Auto'}
+            placeholder={byMemory ? 'No limit' : recommended != null ? `Auto (${recommended})` : 'Auto'}
             onChange={e => setValue(e.target.value)}
             onBlur={save}
             disabled={setMaxSessions.isPending}
@@ -156,21 +182,56 @@ const STATUS_COLORS: Record<MachineState, string> = {
 
 // Per-machine update controls — version + auto-update toggle +
 // manual "Update now" button. Rendered inside the expanded machine row.
-function MachineUpdateControls({ machine }: { machine: RemoteMachine }) {
+/** What the update confirm says about the sessions a press stops: the
+ *  card's own count, or a sentence without one while none is known. */
+function updateConfirmBody(sessions: number | null): string {
+  if (sessions == null) return 'The update stops the sessions on this machine. Chats that are working continue by themselves after it. Idle chats start again at their next message.'
+  if (sessions === 1) return 'This machine runs 1 session now. The update stops it. If its chat is working, it continues by itself after the update. An idle chat starts again at its next message.'
+  return `This machine runs ${sessions} sessions now. The update stops them. Chats that are working continue by themselves after it. Idle chats start again at their next message.`
+}
+
+function MachineUpdateControls({ machine, stat }: { machine: RemoteMachine; stat?: SatelliteStat }) {
   const setAutoUpdate = useSetAutoUpdate()
   const { stateOf, run } = useSaveState()
   const triggerUpdate = useTriggerUpdateNow()
+  const [confirming, setConfirming] = useState(false)
   const autoEnabled = machine.auto_update_enabled ?? true
   const version = machine.satellite_version || 'unknown'
   const updateError = machine.last_update_error
-  const pending = machine.pending_update ?? false
+  const state = machine.update_state || ''
+  // The proxy's state decides; a row without one (no update offered) keeps
+  // the queued mark as it stands.
+  const queued = state ? state === MACHINE_UPDATE_STATE.QUEUED : (machine.pending_update ?? false)
+  const current = state === MACHINE_UPDATE_STATE.CURRENT
+  const running = state === MACHINE_UPDATE_STATE.RUNNING
+  const manual = state === MACHINE_UPDATE_STATE.MANUAL
+  const refused = state === MACHINE_UPDATE_STATE.REFUSED
+  const waiting = state === MACHINE_UPDATE_STATE.WAITING
   // Proxy-side budget (ws/satellite.py MAX_AUTO_UPDATE_ROLLBACKS = 2): once
   // the same target rolled back twice, automatic pushes of it stop and only
   // "Update now" retries — say so, or the admin keeps waiting for an update
   // that will never come by itself.
   const rollbackCount = machine.update_rollback_count ?? 0
   const rollbackTarget = machine.update_rollback_target || ''
-  const autoPaused = autoEnabled && !pending && !!rollbackTarget && rollbackCount >= 2
+  const showButton = !current && !manual
+  const pressable = showButton && !running && !queued
+  // The notice asks for a press: only while one is possible.
+  const autoPaused = autoEnabled && pressable && !waiting && !!rollbackTarget && rollbackCount >= 2
+  const online = machine.status === MACHINE_STATE.ONLINE
+  // null while the machine has not reported a count since it signed in.
+  const sessions = stat ? stat.active_sessions : null
+  // A press that stops sessions asks first. The request ends with its
+  // condition (the update started or ended meanwhile), so the confirm never
+  // comes back by itself: a press is a person's act each time.
+  const asks = online && sessions !== 0
+  const offered = pressable && asks
+  // Ended in render, on the change, as the capacity field's buffer is.
+  if (confirming && !offered) setConfirming(false)
+
+  const update = () => {
+    setConfirming(false)
+    void triggerUpdate.mutateAsync(machine.id).catch(toastError('The update was not started'))
+  }
 
   return (
     <div className="pt-2 border-t border-subtle space-y-2">
@@ -179,9 +240,23 @@ function MachineUpdateControls({ machine }: { machine: RemoteMachine }) {
         <div className="flex flex-col gap-0.5 min-w-0">
           <p className="text-xs text-primary">
             Satellite version: <span className="font-mono">{version}</span>
-            {pending && (
-              <span className={`${BADGE_BASE} ${BADGE_TONE.warning} ml-2`}>
-                Update queued for next reconnect
+            {current && (
+              <span className={`${BADGE_BASE} ${BADGE_TONE.success} ml-2`} data-testid="update-state">Up to date</span>
+            )}
+            {running && (
+              <span className={`${BADGE_BASE} ${BADGE_TONE.info} ml-2`} data-testid="update-state">Updating</span>
+            )}
+            {waiting && (
+              <span className={`${BADGE_BASE} ${BADGE_TONE.info} ml-2`} data-testid="update-state">Update waiting</span>
+            )}
+            {queued && (
+              <span className={`${BADGE_BASE} ${BADGE_TONE.warning} ml-2`} data-testid="update-state">
+                Update queued
+              </span>
+            )}
+            {refused && (
+              <span className={`${BADGE_BASE} ${BADGE_TONE.warning} ml-2`} data-testid="update-state">
+                Update needed
               </span>
             )}
           </p>
@@ -197,6 +272,10 @@ function MachineUpdateControls({ machine }: { machine: RemoteMachine }) {
               {rollbackCount} times. Click "Update now" to try again.
             </p>
           )}
+          {running && <p className="text-xs text-secondary">This machine is updating. Chats that were working continue by themselves when it is back.</p>}
+          {waiting && <p className="text-xs text-secondary">The update starts when nothing runs on this machine.</p>}
+          {queued && <p className="text-xs text-secondary">The update runs when this machine connects.</p>}
+          {manual && <p className="text-xs text-secondary">Run the installer on this machine again to update it.</p>}
         </div>
         <div className="flex items-center gap-2">
           <label className="inline-flex items-center gap-1.5 text-xs text-primary cursor-pointer">
@@ -213,27 +292,41 @@ function MachineUpdateControls({ machine }: { machine: RemoteMachine }) {
             />
             Auto-update
           </label>
-          <Button
-            size="xs"
-            type="button"
-            onClick={() => { void triggerUpdate.mutateAsync(machine.id).catch(toastError('The update was not started')) }}
-            disabled={triggerUpdate.isPending}
-            title={
-              machine.status === MACHINE_STATE.ONLINE
-                ? 'Send the latest version to this machine now'
-                : 'Update this machine the next time it connects'
-            }
-          >
-            {triggerUpdate.isPending ? 'Triggering…' : 'Update now'}
-          </Button>
+          {showButton && (
+            <Button
+              size="xs"
+              type="button"
+              onClick={() => { if (asks) setConfirming(true); else update() }}
+              disabled={triggerUpdate.isPending || !pressable}
+              title={
+                !pressable
+                  ? undefined
+                  : online
+                    ? 'Send the latest version to this machine now'
+                    : 'Update this machine the next time it connects'
+              }
+            >
+              {triggerUpdate.isPending ? 'Triggering…' : 'Update now'}
+            </Button>
+          )}
         </div>
       </div>
       {!autoEnabled && (
         <p className="text-3xs text-tertiary">
           Auto-update is off. OtoDock refuses this machine when it needs a
-          newer version. Click "Update now" to update it.
+          newer version.{pressable && ' Click "Update now" to update it.'}
         </p>
       )}
+      <AlertDialog
+        open={confirming && offered}
+        title={`Update ${machine.name} now?`}
+        confirmLabel="Update now"
+        onConfirm={update}
+        onCancel={() => setConfirming(false)}
+        data-testid="update-confirm"
+      >
+        {updateConfirmBody(sessions)}
+      </AlertDialog>
     </div>
   )
 }
@@ -484,9 +577,11 @@ export default function RemoteMachinesPage() {
 
   if (isLoading) return <div className="p-6 text-tertiary">Loading...</div>
 
-  // Split admin-paired (this section is fully managed here) from
-  // user-paired (read-only observability section below).
-  const adminMachines = (machines ?? []).filter(m => m.pairing_scope !== PAIRING_SCOPE.USER)
+  // By scope: admin-paired (fully managed here), the compute machines the
+  // platform runs itself (their own section), user-paired (the read-only
+  // overview below).
+  const adminMachines = (machines ?? []).filter(m => m.pairing_scope === PAIRING_SCOPE.ADMIN)
+  const computeMachines = (machines ?? []).filter(m => m.pairing_scope === PAIRING_SCOPE.COMPUTE)
   const userMachines = (machines ?? []).filter(m => m.pairing_scope === PAIRING_SCOPE.USER)
 
   return (
@@ -536,6 +631,7 @@ export default function RemoteMachinesPage() {
                 <p className="font-medium text-primary truncate">{m.name}</p>
                 <p className="text-xs text-tertiary truncate">{m.id.slice(0, 8)} · {m.capabilities?.os || 'unknown'}</p>
                 <MachineLinkNotice linkOk={m.link_ok} downS={m.link_down_s} error={m.link_error} detail={expandedId === m.id} />
+                <MachineToolsLine machine={m} />
               </div>
             </div>
             <div className="flex items-center gap-2 sm:gap-3 shrink-0">
@@ -640,7 +736,7 @@ export default function RemoteMachinesPage() {
               <MachineCapacityControls machine={m} stat={statByMachine.get(m.id)} />
 
               {/* Auto-update controls */}
-              <MachineUpdateControls machine={m} />
+              <MachineUpdateControls machine={m} stat={statByMachine.get(m.id)} />
 
               {/* Filesystem-access policy */}
               <MachineFsPolicyControls machine={m} />
@@ -676,6 +772,8 @@ export default function RemoteMachinesPage() {
           )}
         </div>
       ))}
+
+      <ComputeMachinesSection machines={computeMachines} onRemove={handleDelete} removing={deleteMachine.isPending} />
 
       {/* User-Paired Remote Machines — an overview, collapsed by default,
           of ALL user-paired machines regardless of status so admins can
@@ -733,6 +831,7 @@ export default function RemoteMachinesPage() {
                         {m.capabilities?.os || 'unknown'}
                       </p>
                       <MachineLinkNotice linkOk={m.link_ok} downS={m.link_down_s} />
+                      <MachineToolsLine machine={m} />
                     </div>
                     <span className={`${BADGE_BASE} ${STATUS_COLORS[m.status] ?? STATUS_COLORS.never_connected} shrink-0`}>
                       {m.status}

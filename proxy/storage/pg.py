@@ -427,12 +427,21 @@ class LoopPool:
             name=self.name, open=False,
         )
 
-    def open(self, wait_s: float = 0.0) -> None:
-        """Open the pool; with ``wait_s`` also wait for its connections and
-        connect the sentinel, so the first probe is one query, not a connect."""
-        self._pool.open(wait=wait_s > 0, timeout=wait_s or 30.0)
-        if wait_s > 0:
-            self._liveness.probe()
+    def open(self, wait_s: float = 0.0) -> bool:
+        """Open the pool; with ``wait_s`` also wait that long for a first
+        connection and connect the sentinel, so the first probe is one query,
+        not a connect. False when no connection came in time: the pool stays
+        open and keeps connecting by itself (psycopg's own ``wait`` closes
+        the pool on its timeout)."""
+        self._pool.open(wait=False)
+        if wait_s <= 0:
+            return True
+        try:
+            self._pool.putconn(self._pool.getconn(timeout=wait_s))
+        except psycopg_pool.PoolTimeout:
+            return False
+        self._liveness.probe()
+        return True
 
     # -- the watched wait -------------------------------------------------
 
@@ -640,9 +649,10 @@ def arm_loop_pool(thread_ident: int | None = None, *, open_wait_s: float = 2.0) 
         probe_after_s=config.DB_LOOP_LIVENESS_PROBE_S,
     )
     try:
-        lp.open(wait_s=open_wait_s)
+        if not lp.open(wait_s=open_wait_s):
+            logger.warning("loop DB pool: no connection after %.0fs, it keeps connecting", open_wait_s)
     except psycopg.Error:
-        logger.warning("loop DB pool: not full after %.0fs; it keeps connecting", open_wait_s)
+        logger.warning("loop DB pool: its first connection failed, it keeps connecting", exc_info=True)
     old = _loop_db
     _set_loop_pool(lp)
     if old is not None:

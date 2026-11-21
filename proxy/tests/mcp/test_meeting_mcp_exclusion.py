@@ -96,7 +96,9 @@ def test_shipped_manifests_opt_out_of_tasks_and_meetings():
 
     root = PROXY_DIR.parent / "mcps" / "custom"
     # ("external" = never on a phone caller's session — tests/mcp/test_external_exclusions.py)
-    assert _parse_manifest(root / "agent-config-mcp" / "manifest.json").exclude_from == ["task", "meeting", "external"]
+    # agent-config-mcp loads in a task since 2.0, for the two session tools alone
+    # (its server lists them, the hook's limit holds them: tests/mcp/test_agent_config_task_session.py).
+    assert _parse_manifest(root / "agent-config-mcp" / "manifest.json").exclude_from == ["meeting", "external"]
     assert _parse_manifest(root / "mcps-mcp" / "manifest.json").exclude_from == ["task", "meeting", "external"]
     creator = _parse_manifest(root / "agent-creator-mcp" / "manifest.json")
     assert set(creator.exclude_from) == {"phone", "task", "meeting", "external"}
@@ -118,9 +120,12 @@ def test_the_generation_tools_load_in_tasks_and_never_in_meetings():
             "Excluded in meeting mode"
         assert session_exclusion_reason(m, contexts={"meeting"}, external=False) is not None
         assert [s.default_exclude_from for s in m.skills] == [["meeting"]]
-    for name in ("agent-config-mcp", "agent-creator-mcp", "mcps-mcp", "location-mcp"):
+    for name in ("agent-creator-mcp", "mcps-mcp", "location-mcp"):
         m = _parse_manifest(root / name / "manifest.json")
         assert session_exclusion_reason(m, contexts={"task"}, external=False) == "Excluded in task mode"
+    m = _parse_manifest(root / "agent-config-mcp" / "manifest.json")
+    assert session_exclusion_reason(m, contexts={"task"}, external=False) is None
+    assert session_exclusion_reason(m, contexts={"task", "meeting"}, external=False) == "Excluded in meeting mode"
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +184,8 @@ def test_prompt_only_advertises_servers_the_config_loads(monkeypatch, tmp_path, 
     ]
     by_name = {m.name: m for m in manifests}
     _stub_assembly(monkeypatch, manifests, env_by_mcp={}, tmp_path=tmp_path)
-    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: list(manifests))
+    from services.mcp import mcp_agent_skills
+    monkeypatch.setattr(mcp_agent_skills, "get_agent_mcps", lambda *a, **k: list(manifests))
 
     path, _env, _excluded, _bundles, _bash = mcp_registry.build_session_mcp_config(
         "agent", None, **kwargs,
@@ -200,3 +206,21 @@ def test_prompt_only_advertises_servers_the_config_loads(monkeypatch, tmp_path, 
     assert _keys(advertised | skill_owners) <= loaded
     assert loaded == _keys(advertised)
 
+
+
+def test_a_build_logs_the_tools_left_out_once_with_their_reasons(monkeypatch, tmp_path, caplog):
+    """A tool switched on that did not reach a session leaves one line in the
+    log, with each tool and its reason, and no path."""
+    import logging
+    with caplog.at_level(logging.INFO, logger="services.mcp.mcp_session_config"):
+        _build(monkeypatch, tmp_path,
+               [_manifest("config-clone", ["meeting"]), _manifest("neutral", [])],
+               task_mode=True, meeting_mode=True, session_id="sess-1234-abcd")
+    lines = [r.getMessage() for r in caplog.records if "left out" in r.getMessage()]
+    assert len(lines) == 1
+    assert "config-clone: Excluded in meeting mode" in lines[0] and "neutral" not in lines[0]
+    assert "sess-123" in lines[0] and "/" not in lines[0]
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="services.mcp.mcp_session_config"):
+        _build(monkeypatch, tmp_path, [_manifest("neutral", [])], task_mode=True)
+    assert not [r for r in caplog.records if "left out" in r.getMessage()]

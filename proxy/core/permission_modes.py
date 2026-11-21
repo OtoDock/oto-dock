@@ -1,5 +1,5 @@
-"""The permission modes: the words a chat's ``permission_mode`` holds, the
-words a release before 1.9 used, and Claude Code's own word for each.
+"""The permission modes: the words a chat's ``permission_mode`` holds and
+Claude Code's own word for each.
 
 A stdlib-only leaf (storage reads chat rows through it);
 ``core/execution_layer.py`` re-exports every name, the engines' descriptors
@@ -25,9 +25,6 @@ JUDGE_MODE = "judge"
 #: ``permission_modes`` may declare (the dashboard's menu is the declared
 #: subset).
 PERMISSION_MODES: tuple[str, ...] = (ASK_MODE, AUTO_REVIEW_MODE, DONT_ASK_MODE, PLAN_MODE)
-#: The words a release before 1.9 stored and sent, and what they read as now:
-#: mapped on entry and on read, never written back.
-LEGACY_MODES: dict[str, str] = {"default": ASK_MODE, "acceptEdits": AUTO_REVIEW_MODE}
 #: Claude Code's own word for each mode (its ``--permission-mode`` and its
 #: ``set_permission_mode`` control request). Don't Ask and the unattended
 #: word are the hook's decision, the CLI stays in its asking mode under them.
@@ -40,17 +37,11 @@ _CLI_MODES: dict[str, str] = {
 CLI_AUTO_WORD = _CLI_MODES[AUTO_REVIEW_MODE]
 
 
-def current_mode(word: str) -> str:
-    """A stored or sent mode word in the current vocabulary: an old word
-    mapped, every other word unchanged."""
-    return LEGACY_MODES.get(word, word)
-
-
 def entry_mode(word: str, offered: tuple[str, ...] | list[str] = PERMISSION_MODES) -> str:
     """A person's mode as it enters (a socket frame, an API body, a stored
     preference): the current word when ``offered`` holds it, else the first
     mode ``offered`` declares (an unknown word, a mode this engine lacks)."""
-    word = current_mode(word or "")
+    word = word or ""
     if word in offered:
         return word
     return offered[0] if offered else ASK_MODE
@@ -60,14 +51,28 @@ def entry_mode(word: str, offered: tuple[str, ...] | list[str] = PERMISSION_MODE
 STORED_ONLY_MODES = frozenset({UNATTENDED_MODE, JUDGE_MODE})
 
 
+def known_mode(word: str) -> str:
+    """A recorded mode as the permission hook decides by it: a word outside
+    the vocabulary (no release writes one) is Ask."""
+    return word if word in PERMISSION_MODES or word in STORED_ONLY_MODES else ASK_MODE
+
+
 def offered_mode(word: str, offered: tuple[str, ...] | list[str] = PERMISSION_MODES) -> str:
-    """A chat's mode against what its engine offers: an old word mapped, no
-    word read as Auto (a new chat's mode), a mode the engine lacks (Auto on
-    Direct LLM) dropped to its first; the unattended and judge words kept."""
-    word = current_mode(word or "")
+    """A chat's mode against what its engine offers: no word read as Auto (a
+    new chat's mode), a mode the engine lacks (Auto on Direct LLM) dropped to
+    its first; the unattended and judge words kept."""
+    word = word or ""
     if word in STORED_ONLY_MODES:
         return word
     return entry_mode(word or AUTO_REVIEW_MODE, offered)
+
+
+def stored_mode(raw: object) -> str | None:
+    """A task's mode in the words its column holds: '' for Don't Ask, the
+    Auto word for Auto, None for a word a task may not take."""
+    if raw in (None, "", DONT_ASK_MODE):
+        return ""
+    return AUTO_REVIEW_MODE if raw == AUTO_REVIEW_MODE else None
 
 
 def task_run_mode(task) -> str:
@@ -79,7 +84,7 @@ def task_run_mode(task) -> str:
 def cli_mode(mode: str) -> str:
     """Claude Code's word for a platform mode (``default`` for an unknown
     one: the hook decides above it)."""
-    return _CLI_MODES.get(current_mode(mode), "default")
+    return _CLI_MODES.get(mode, "default")
 
 
 def terminal_mode(mode: str) -> str:
@@ -88,11 +93,3 @@ def terminal_mode(mode: str) -> str:
     TUI asks; under Don't Ask and the unattended word the hook allows)."""
     word = cli_mode(mode)
     return word if word in ("auto", "plan") else "default"
-
-
-def chat_row(row) -> dict:
-    """A chat row as a dict with its mode in the current vocabulary."""
-    chat = dict(row)
-    if chat.get("permission_mode") in LEGACY_MODES:
-        chat["permission_mode"] = LEGACY_MODES[chat["permission_mode"]]
-    return chat

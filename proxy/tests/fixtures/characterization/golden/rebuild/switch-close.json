@@ -1,0 +1,135 @@
+{
+ "a dead session": {
+  "bound_session": null,
+  "closed_on_layer": [],
+  "frames": [
+   {
+    "execution_mode": "interactive",
+    "mode": "ask",
+    "model": "test-model",
+    "type": "chat_history"
+   }
+  ],
+  "row": {
+   "execution_mode": "interactive",
+   "permission_mode": "ask",
+   "session_id": "sid-old"
+  },
+  "slots_released": [],
+  "terminal_closed": null,
+  "viewer_detached": 1,
+  "warmup": [
+   {
+    "background": false,
+    "chat_id": "<chat>",
+    "execution_mode": "interactive"
+   }
+  ]
+ },
+ "a headless turn still streaming": {
+  "bound_session": null,
+  "closed_on_layer": [
+   "sid-old"
+  ],
+  "frames": [
+   {
+    "execution_mode": "interactive",
+    "mode": "ask",
+    "model": "test-model",
+    "type": "chat_history"
+   }
+  ],
+  "row": {
+   "execution_mode": "interactive",
+   "permission_mode": "ask",
+   "session_id": "sid-old"
+  },
+  "slots_released": [],
+  "terminal_closed": null,
+  "viewer_detached": 1,
+  "warmup": [
+   {
+    "background": false,
+    "chat_id": "<chat>",
+    "execution_mode": "interactive"
+   }
+  ]
+ },
+ "a live headless session, to a terminal": {
+  "bound_session": null,
+  "closed_on_layer": [
+   "sid-old"
+  ],
+  "frames": [
+   {
+    "execution_mode": "interactive",
+    "mode": "ask",
+    "model": "test-model",
+    "type": "chat_history"
+   }
+  ],
+  "row": {
+   "execution_mode": "interactive",
+   "permission_mode": "ask",
+   "session_id": "sid-old"
+  },
+  "slots_released": [],
+  "terminal_closed": null,
+  "viewer_detached": 1,
+  "warmup": [
+   {
+    "background": false,
+    "chat_id": "<chat>",
+    "execution_mode": "interactive"
+   }
+  ]
+ },
+ "a live terminal, to headless": {
+  "bound_session": null,
+  "closed_on_layer": [],
+  "frames": [
+   {
+    "execution_mode": "-p",
+    "mode": "ask",
+    "model": "test-model",
+    "type": "chat_history"
+   }
+  ],
+  "row": {
+   "execution_mode": "-p",
+   "permission_mode": "ask",
+   "session_id": "sid-old"
+  },
+  "slots_released": [],
+  "terminal_closed": [
+   "mode-switch"
+  ],
+  "viewer_detached": 1,
+  "warmup": [
+   {
+    "background": false,
+    "chat_id": "<chat>",
+    "execution_mode": "-p"
+   }
+  ]
+ },
+ "a person who may not open the chat": {
+  "bound_session": "sid-old",
+  "closed_on_layer": [],
+  "frames": [
+   {
+    "message": "Access denied",
+    "type": "error"
+   }
+  ],
+  "row": {
+   "execution_mode": "",
+   "permission_mode": "ask",
+   "session_id": "sid-old"
+  },
+  "slots_released": [],
+  "terminal_closed": [],
+  "viewer_detached": 0,
+  "warmup": []
+ }
+}

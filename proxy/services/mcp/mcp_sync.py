@@ -26,12 +26,15 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from core import placement as _placement
 from services.mcp import (
     mcp_installer,
     mcp_manifest_types as _mt,
+    mcp_pin,
     mcp_registry,
     mcp_tarball,
 )
+from services.remote import machine_tools
 
 logger = logging.getLogger("otodock.mcp-sync")
 
@@ -141,14 +144,15 @@ _UNSAT_FAIL_RE = re.compile(
     r"|RequiredDependencyException|(?:rustc|cargo)\b[^\n]*not (?:found|installed)"
 )
 # Words of a network, service, disk or file-lock failure (uv's, pip's,
-# cargo's, the OS's): never memoized, whatever else the error names, since
-# the next start may well succeed. The satellite keeps such lines first in a failure's cause, by the
+# cargo's, the OS's) and of the satellite's memory guard stopping a build:
+# never memoized, whatever else the error names, since the next start may
+# well succeed. The satellite keeps such lines first in a failure's cause, by the
 # same words (``mcp_install_support._NETWORK_WORDS``, held equal by a test).
 _TRANSIENT_FAIL_RE = re.compile(
     r"Failed to fetch|Failed to download|resolve host|spurious network error|error sending request"
     r"|dns error|timed out|Connection (?:reset|refused|closed)|Network is unreachable|tls handshake"
     r"|No space left on device|Disk quota exceeded|Text file busy|resource busy"
-    r"|being used by another process|Resource temporarily unavailable",
+    r"|being used by another process|Resource temporarily unavailable|used too much memory and was stopped",
     re.IGNORECASE,
 )
 # How long a memoized failure is skipped before the next start tries again.
@@ -208,9 +212,7 @@ def unavailable_reasons(result: SyncResult, assigned) -> dict[str, str]:
             out[name] = "not installed yet on this machine, a new chat here installs it"
             continue
         # Whole enough to carry the cause the machine reported first.
-        err = " ".join(str(result.failed.get(name) or "").split())
-        if len(err) > 600:
-            err = err[:597] + "..."
+        err = machine_tools.said(result.failed.get(name))
         out[name] = (f"could not be installed on this machine ({err})" if err
                      else "could not be installed on this machine")
     return out
@@ -355,7 +357,7 @@ class InstallWatch:
                                  f"{round(self.budgets[name] / 60)} minutes")
         self.unstarted = set(self.pending())
         logger.warning("sync_mcps %s: past the install budget, %s did not end",
-                       self.machine_id[:8], sorted(self.unstarted) or "the check")
+                       _placement.log_id(self.machine_id), sorted(self.unstarted) or "the check")
 
     def so_far(self) -> SyncResult:
         """The plan as far as it went, for a session that starts before it
@@ -464,7 +466,7 @@ def _skip_known(machine_id: str, to_install: set[str], to_update: set[str],
         if deferred_now:
             logger.info(
                 "sync_mcps: skipping %d deferred update(s) for %s (in use): %s",
-                len(deferred_now), machine_id[:8], sorted(deferred_now),
+                len(deferred_now), _placement.log_id(machine_id), sorted(deferred_now),
             )
             to_update -= deferred_now
     memo_skips: dict[str, str] = {}
@@ -492,7 +494,7 @@ def _skip_known(machine_id: str, to_install: set[str], to_update: set[str],
         to_update -= set(memo_skips)
         logger.info(
             "sync_mcps: skipping %d memoized unsatisfiable install(s) "
-            "for %s: %s", len(memo_skips), machine_id[:8],
+            "for %s: %s", len(memo_skips), _placement.log_id(machine_id),
             sorted(memo_skips),
         )
     return memo_skips
@@ -522,24 +524,26 @@ async def _beside_running_sync(cm, machine_id: str, desired: set[str], *,
     hashes = await version_hashes_for(desired, force=force)
     to_install, to_update, _ = _diff(desired=desired, installed=installed, force=force,
                                      hashes=hashes)
+    busy = _being_installed(to_install | to_update)
+    to_update -= busy
     sat_ver = getattr(cm.get_connection(machine_id), "satellite_version", "") or ""
     memo_skips = _skip_known(machine_id, to_install, to_update, hashes, sat_ver, force=force)
     watch = _watches.get(machine_id)
+    # Only what the running plan's watch follows reads as still installing,
+    # so the chat hears when it ends. What an ahead run has still queued
+    # reads as not installed yet: no watch follows it, nothing is promised.
     running = set(watch.pending()) if watch is not None else set()
     still = (to_install | to_update) & running
     missing = to_install - running
     logger.info("sync_mcps: %s still installs for another session; this one starts without "
                 "%s (installing) and %s (not installed yet)",
-                machine_id[:8], sorted(still), sorted(missing))
+                _placement.log_id(machine_id), sorted(still), sorted(missing))
     return _with_memo(SyncResult(still_installing=still, not_installed=missing,
                                  excluded_names=still | missing,
                                  watch=watch if still else None), memo_skips)
 
 
-# The satellite version that removes an MCP from any category when the
-# frame says ``remove_any_category`` (older ones never touch ``core``), and
-# the categories a removal may name at all.
-_REMOVE_ANY_CATEGORY_MIN_VERSION = (0, 5, 137)
+# The categories a removal may name at all.
 _MCP_CATEGORIES = frozenset({"core", "custom", "community"})
 
 
@@ -559,18 +563,38 @@ def _session_contexts(client_type: str) -> set[str]:
 def _lifted(agent_name: str, launched: set[str], *, contexts: set[str],
             external: bool, role: str, placement) -> set[str]:
     """See ``lifted_by_context``. Reads the database: off the loop."""
+    candidates = [
+        m for m in mcp_registry.get_agent_mcps(agent_name, placement=placement)
+        if m.name not in launched and _mt.installs_on_host(m.server)
+        # another gate left it out: it stays out
+        and mcp_registry.session_exclusion_reason(m, contexts=contexts, external=external) is not None
+    ]
+    return _admitted(agent_name, candidates, role=role, placement=placement, per_user=False)
+
+
+def machine_admitted(agent_name: str, *, role: str, placement) -> set[str]:
+    """What a session of ``agent_name`` on this machine could be given, by
+    the gates a session's build applies on a machine (``_admitted``), its
+    context aside: what install ahead sends the machine, never more. A tool
+    on a person's account is in: the package is the same for everyone. Reads
+    the database: off the loop."""
+    candidates = [m for m in mcp_registry.get_agent_mcps(agent_name, placement=placement)
+                  if _mt.installs_on_host(m.server)]
+    return _admitted(agent_name, candidates, role=role, placement=placement, per_user=True)
+
+
+def _admitted(agent_name: str, manifests, *, role: str, placement, per_user: bool) -> set[str]:
+    """The names of ``manifests`` a session on this machine may get: its
+    role's audience, the admin-machine-only rule, the instances a machine
+    can be given and the agent's service credentials."""
+    from services.mcp.mcp_session_config import kept_off_a_persons_machine
     from storage.mcp import mcp_store
     out: set[str] = set()
     infra: list[str] = []
-    for m in mcp_registry.get_agent_mcps(agent_name, placement=placement):
-        if m.name in launched or not _mt.installs_on_host(m.server):
-            continue
-        if mcp_registry.session_exclusion_reason(m, contexts=contexts, external=external) is None:
-            continue                    # another gate left it out: it stays out
+    for m in manifests:
         if getattr(m, "audience", "") and not mcp_registry.audience_admits(m.audience, role):
             continue
-        if (m.remote_policy == "admin_paired_only" and placement.is_remote
-                and not placement.admin_paired):
+        if placement.user_paired and kept_off_a_persons_machine(m):
             continue
         inst = getattr(m, "instances", None)
         if inst is not None:
@@ -580,7 +604,7 @@ def _lifted(agent_name: str, launched: set[str], *, contexts: set[str],
                     and not mcp_store.get_instance_for_agent_env_delivery(m.name, agent_name)):
                 continue
         kind = getattr(getattr(m, "credentials", None), "type", "none")
-        if kind == "per_user":
+        if kind == "per_user" and not per_user:
             continue                    # the build's identity is not known here
         if kind == "infra":
             infra.append(m.name)
@@ -626,6 +650,84 @@ async def lifted_by_context(config, launched: set[str]) -> set[str]:
         return set()
 
 
+def _sent_here(cm, machine_id: str, names) -> set[str]:
+    """``names`` as far as the machine is sent them: all of them, and to the
+    compute machine beside the platform the community tools alone (the
+    bundled ones come with its image, in folders it never writes)."""
+    names = set(names)
+    if not cm.builds_own_tools(machine_id):
+        return names
+    return {n for n in names
+            if (m := mcp_registry.get_manifest(n)) is not None and machine_tools.built_on_machine(m)}
+
+
+def _key(name: str) -> str:
+    """The machine's key of the registry's tool ``name`` (its folder,
+    ``machine_tools.key_of``), ``name`` itself for one the registry does not
+    hold."""
+    manifest = mcp_registry.get_manifest(name)
+    return machine_tools.key_of(manifest) if manifest is not None else name
+
+
+def _names_by_key() -> dict[str, str]:
+    """``{folder: name}`` of the registry's tools a machine keys otherwise
+    than the platform: a machine keys a tool by its folder, which is its
+    name for every tool but one uploaded before names had the machine's
+    rule. A folder that is another tool's name stays that tool's."""
+    manifests = mcp_registry.get_all_manifests()
+    return {key: m.name for m in manifests.values()
+            if (key := machine_tools.key_of(m)) != m.name and key not in manifests}
+
+
+def _named(answer: dict) -> dict:
+    """A machine's answer keyed by tool (its verify, an ack's results), by
+    the registry's names (``_names_by_key``). A folder named after a tool
+    whose own folder is another (``machine_tools.key_of``) is a copy a
+    machine kept from before tools were keyed by folder: it is not that
+    tool, so the sync installs the tool under its folder, where its start
+    command points. That copy is left on the machine: nothing starts it, and
+    removing it by the tool's name would take the tool's own folder."""
+    manifests = mcp_registry.get_all_manifests()
+    keys = {machine_tools.key_of(m) for m in manifests.values()}
+    stale = {name for name, m in manifests.items() if machine_tools.key_of(m) != name and name not in keys}
+    by_key = _names_by_key()
+    return {by_key.get(key, key): info for key, info in answer.items() if key not in stale}
+
+
+#: The installer's own progress lines name the folder it builds in.
+_STAGED = ".new"
+
+
+def _event(ev: dict) -> dict:
+    """A machine's progress event as the platform takes it: its tool by the
+    registry's name, its words cut (``machine_tools.said``), its percentage
+    a whole number from 0 to 100."""
+    out = dict(ev)
+    for field_name in ("mcp", "phase", "message", "error"):
+        if field_name in out:
+            out[field_name] = machine_tools.said(out[field_name])
+    if out.get("mcp"):
+        key, staged = str(out["mcp"]), ""
+        if key.endswith(_STAGED):
+            key, staged = key[:-len(_STAGED)], _STAGED
+        out["mcp"] = _names_by_key().get(key, key) + staged
+    if "pct" in out:
+        try:
+            out["pct"] = max(0, min(100, int(out["pct"])))
+        except (TypeError, ValueError, OverflowError):
+            out["pct"] = 0
+    return out
+
+
+def _being_installed(names) -> set[str]:
+    """The tools of ``names`` an install on the platform is rewriting now
+    (its install lock is held): no sync plans one, or a machine would be
+    sent sources the install has not accepted yet. The install's own build
+    (``build_on_machine``) sends its tool itself."""
+    from core.credentials import catalog_install_registry
+    return {n for n in names if catalog_install_registry.lock_for(n).locked()}
+
+
 async def _tarball_of(name: str) -> mcp_tarball.TarballResult:
     """``name``'s tarball, off the loop (the walk and the gzip took over a
     second on a session start), built once more when an install changed the
@@ -646,6 +748,8 @@ async def sync_mcps_for_session(
     progress_cb: ProgressCb = None,
     force: bool = False,
     early_start_s: float | None = None,
+    remove_unwanted: bool | None = None,
+    install_only: bool = False,
 ) -> SyncResult:
     """Align the satellite's installed MCPs with what this session needs.
 
@@ -679,6 +783,11 @@ async def sync_mcps_for_session(
     background with the machine's install lock until it ends; ``watch``
     tells when. A start that finds another plan holding the lock that long
     starts beside it, installing nothing.
+
+    ``remove_unwanted``: ``True`` removes every MCP outside the desired set
+    (Sync Now; ``None`` with no session means it too), ``False`` removes
+    nothing at all (install ahead). ``install_only`` leaves an outdated MCP
+    for a session's start (install ahead at a sign-in).
     """
     from core.remote.remote_execution import get_remote_layer
     from core.remote.satellite_connection import get_connection_manager
@@ -698,6 +807,7 @@ async def sync_mcps_for_session(
         if other_info.machine_id != machine_id:
             continue
         desired.update(getattr(other_info, "used_mcps", set()) or set())
+    desired = _sent_here(cm, machine_id, desired)
 
     until = None if early_start_s is None else time.monotonic() + early_start_s
     stack = contextlib.AsyncExitStack()
@@ -714,7 +824,7 @@ async def sync_mcps_for_session(
         installed = await _fetch_satellite_state(cm, machine_id)
 
         hashes = await version_hashes_for(desired, force=force)
-        gc = not session_id
+        gc = (not session_id) if remove_unwanted is None else remove_unwanted
         to_install, to_update, to_remove = _diff(
             desired=desired,
             installed=installed,
@@ -723,16 +833,24 @@ async def sync_mcps_for_session(
             gc=gc,
         )
         # A removal goes only where the satellite can act on it: a known
-        # category (a failed verify reports none), and ``core`` only for a
-        # satellite that removes from any category when told so. The flag
-        # rides a session start's frame only: Sync Now keeps its reach.
-        any_category = not gc and cm._satellite_at_least(
-            machine_id, _REMOVE_ANY_CATEGORY_MIN_VERSION)
-        to_remove = {
+        # category (a failed verify reports none), and ``core`` only when the
+        # frame says ``remove_any_category``. The flag rides a session
+        # start's frame only: Sync Now keeps its reach.
+        any_category = not gc
+        to_remove = set() if remove_unwanted is False else {
             n for n in to_remove
             if (installed.get(n) or {}).get("category") in _MCP_CATEGORIES
             and (any_category or installed[n]["category"] != "core")
         }
+        if install_only:
+            to_update = set()
+        # A tool the platform is installing right now is never sent: its
+        # update waits for the install's end, and one the machine lacks is
+        # left out of this session as not installed yet.
+        busy = _being_installed(to_install | to_update)
+        left_out = to_install & busy
+        to_install -= busy
+        to_update -= busy
 
         # What this machine already answered: a recently deferred update, a
         # memoized unsatisfiable install.
@@ -740,15 +858,23 @@ async def sync_mcps_for_session(
         _sat_ver = getattr(_conn, "satellite_version", "") or ""
         memo_skips = _skip_known(machine_id, to_install, to_update, hashes, _sat_ver,
                                  force=force)
+        # A machine takes no tool under a folder name outside its own rule:
+        # such a tool is not sent, and reads as failed with what to do.
+        for name in sorted(n for n in to_install | to_update if not machine_tools.safe_key(_key(n))):
+            to_install.discard(name)
+            to_update.discard(name)
+            memo_skips[name] = machine_tools.UNSAFE_KEY_CAUSE
 
         def _with_memo_skips(r: SyncResult) -> SyncResult:
+            r.not_installed |= left_out
+            r.excluded_names |= left_out
             return _with_memo(r, memo_skips)
 
         if not (to_install or to_update or to_remove):
             return _with_memo_skips(SyncResult(ok=True))
         logger.info(
             "sync_mcps plan %s: install=%s update=%s remove=%s",
-            machine_id[:8], sorted(to_install), sorted(to_update), sorted(to_remove),
+            _placement.log_id(machine_id), sorted(to_install), sorted(to_update), sorted(to_remove),
         )
 
         # Announce the install plan upfront so the caller's UI can render
@@ -762,6 +888,7 @@ async def sync_mcps_for_session(
         # Build tarballs for install + update. Docker MCPs stay on the
         # platform; don't ship those.
         specs = []
+        planned: list[str] = []
         shipped_hashes: dict[str, str] = {}
         for name in sorted(to_install | to_update):
             manifest = mcp_registry.get_manifest(name)
@@ -783,12 +910,15 @@ async def sync_mcps_for_session(
                 continue
             shipped_hashes[name] = tb.version_hash
             specs.append(_install_spec(name, manifest, tb))
+            planned.append(name)
 
         command_id = str(uuid.uuid4())
-        watch = InstallWatch(machine_id, [s["name"] for s in specs],
-                             {s["name"]: _install_budget(s) for s in specs}, set(to_install))
+        watch = InstallWatch(machine_id, planned,
+                             {name: _install_budget(spec) for name, spec in zip(planned, specs, strict=True)},
+                             set(to_install))
 
         async def _progress_forwarder(ev: dict):
+            ev = _event(ev)
             logger.debug(
                 "mcp_sync._progress_forwarder: cmd=%s mcp=%s phase=%s pct=%s cb=%s",
                 command_id[:8], ev.get("mcp", "-"), ev.get("phase", "-"),
@@ -811,13 +941,7 @@ async def sync_mcps_for_session(
         # the satellite would receive a different generated id and emit
         # `mcp_install_progress` events with that one — leaving the
         # callback orphaned and the dashboard install bar stuck at 0%.
-        frame: dict = {
-            "type": "sync_mcps",
-            "mcps_to_install": specs,
-            "mcps_to_remove": sorted(to_remove),
-        }
-        if any_category and to_remove:
-            frame["remove_any_category"] = True
+        frame = await _frame(cm, machine_id, specs, to_remove, any_category=any_category)
         # The command's own timeout lies past every budget: the watch ends
         # the wait first, each MCP by its own budget.
         ack = asyncio.ensure_future(cm.send_command(
@@ -870,11 +994,37 @@ async def sync_mcps_for_session(
         # never runs its body, and the lock would stay held.
         await asyncio.sleep(0)
         logger.info("sync_mcps %s: the session starts while %s still install",
-                    machine_id[:8], watch.pending())
+                    _placement.log_id(machine_id), watch.pending())
         return _with_memo_skips(watch.so_far())
     finally:
         if not handed_off:
             await stack.aclose()
+
+
+async def _frame(cm, machine_id: str, specs: list[dict], to_remove=(), *,
+                 any_category: bool = False) -> dict:
+    """The ``sync_mcps`` frame for the machine: the installs, the removals
+    and what its builds must know of the platform (a hosted install's
+    ranges; for the compute machine beside the platform, the platform's own
+    egress settings, ``mcp_egress.build_egress_block``)."""
+    frame: dict = {
+        "type": "sync_mcps",
+        "mcps_to_install": specs,
+        "mcps_to_remove": sorted(_key(name) for name in to_remove),
+    }
+    if any_category and to_remove:
+        frame["remove_any_category"] = True
+    import config as app_config
+    if app_config.OTODOCK_CLOUD:
+        # A compute machine's own builds block a hosted install's ranges
+        # too (the render's --hosted); an older satellite ignores it.
+        frame["hosted"] = True
+    if cm.builds_own_tools(machine_id):
+        from services.mcp import mcp_egress
+        block = await asyncio.to_thread(mcp_egress.build_egress_block)
+        if block:
+            frame["egress"] = block
+    return frame
 
 
 def _concluded(watch: InstallWatch, ack: asyncio.Future, *, machine_id: str,
@@ -895,7 +1045,7 @@ def _concluded(watch: InstallWatch, ack: asyncio.Future, *, machine_id: str,
     if exc is not None:
         logger.error("sync_mcps command failed: %s", exc)
         return SyncResult(ok=False, failed={"__transport__": str(exc)})
-    results = ack.result().get("results", {}) or {}
+    results = _named(ack.result().get("results", {}) or {})
     result = SyncResult()
     for name, info in results.items():
         status = info.get("status", "error")
@@ -903,6 +1053,7 @@ def _concluded(watch: InstallWatch, ack: asyncio.Future, *, machine_id: str,
             # Update landed — clear any deferral backoff for this MCP.
             _deferred_updates.pop((machine_id, name), None)
             _unsatisfiable_installs.pop((machine_id, name), None)
+            machine_tools.note_installed(machine_id, name, str(info.get("version_hash") or ""))
             if name in to_install:
                 result.installed.append(name)
             else:
@@ -912,15 +1063,18 @@ def _concluded(watch: InstallWatch, ack: asyncio.Future, *, machine_id: str,
             # the working old version. NOT a failure — do not exclude. Back
             # off so we don't re-ship + rebuild it every session until the
             # holding session closes.
-            result.deferred[name] = info.get("error", "")
+            result.deferred[name] = machine_tools.said(info.get("error", ""))
             _mark_update_deferred(machine_id, name)
         elif status == "removed":
+            machine_tools.note_removed(machine_id, name)
             result.removed.append(name)
         elif status == "not_found":
             # Nothing to remove — not a failure.
             pass
         else:
-            err = info.get("error", "unknown")
+            # The machine cuts its own cause to this length: the bound is
+            # for one that says more.
+            err = machine_tools.said(info.get("error", "unknown"))
             result.failed[name] = err
             result.excluded_names.add(name)
             # A resolver-unsatisfiable failure is DETERMINISTIC for these
@@ -937,24 +1091,207 @@ def _concluded(watch: InstallWatch, ack: asyncio.Future, *, machine_id: str,
         # didn't answer initialize in time. Advisory — not excluded.
         warm = info.get("warmup", "")
         if isinstance(warm, str) and warm.startswith("warn:"):
-            result.warmup_failed[name] = warm[len("warn:"):]
+            result.warmup_failed[name] = machine_tools.said(warm[len("warn:"):])
     return result
 
 
+async def pending_for(machine_id: str, names: set[str], *, install_only: bool = False) -> set[str]:
+    """The tools of ``names`` a sync would install on the machine now: those
+    it lacks, and those it holds outdated unless ``install_only``. A read of
+    the machine's own state; the sync checks again under the lock. When the
+    machine did not answer, the list it reported at sign-in knows no hash:
+    the missing tools alone, never every tool read as outdated."""
+    from core.remote.satellite_connection import get_connection_manager
+    cm = get_connection_manager()
+    names = _sent_here(cm, machine_id, names)
+    installed = await _fetch_satellite_state(cm, machine_id)
+    hashes = await version_hashes_for(names)
+    to_install, to_update, _ = _diff(desired=set(names), installed=installed, hashes=hashes)
+    busy = _being_installed(to_install | to_update)
+    to_install -= busy
+    to_update -= busy
+    if install_only or any(v.get("unverified") for v in installed.values()):
+        return to_install
+    return to_install | to_update
+
+
+class NoBuildMachine(RuntimeError):
+    """No compute machine is connected to build a tool on: the install is
+    refused with the sentence and nothing of it ran."""
+
+
+@dataclass
+class Built:
+    """How an install's build on a compute machine ended: ``log`` is the
+    cause of a failure, ``resolved_version`` the version the build read back
+    (a plain version, ``""`` for a source with none) and ``version_hash``
+    the machine's hash of the folder it now holds."""
+    ok: bool
+    log: str = ""
+    resolved_version: str = ""
+    version_hash: str = ""
+    machine_id: str = ""
+
+
+_SYSTEM_LISTS = ("debian", "ubuntu", "rhel", "arch", "macos_brew")
+
+
+def _build_spec(name: str, mcp_dir: Path, manifest_data: dict, source: str) -> dict:
+    """The install spec of a folder the registry does not know yet, from its
+    own manifest: ``_install_spec``'s shape, keyed by the folder as the
+    machine keeps it, with no expected hash (the pin the machine writes
+    after the build changes it) and ``pin`` for a source whose version is
+    read back. Blocking (packs the folder)."""
+    server = manifest_data.get("server") or {}
+    reqs = manifest_data.get("system_requirements") or {}
+    parsed = mcp_installer.parse_source(source) if source else None
+    return {
+        "name": Path(mcp_dir).name,
+        "category": mcp_installer.COMMUNITY,
+        "runtime": server.get("runtime", ""),
+        "source": source,
+        "source_build": list(server.get("source_build") or []),
+        "manifest_data": {"name": name, "server_name": manifest_data.get("server_name") or "",
+                          "category": mcp_installer.COMMUNITY, "version": manifest_data.get("version") or ""},
+        "tarball_b64": mcp_tarball.pack_folder(mcp_dir, manifest_data.get("data_dirs")),
+        "version_hash": "",
+        "pin": bool(parsed and parsed.registry in mcp_pin.PINNED_REGISTRIES),
+        "system_requirements": {
+            **{key: list(reqs.get(key) or []) for key in _SYSTEM_LISTS},
+            "node_min": reqs.get("node_min") or "", "notes": reqs.get("notes") or "",
+        },
+    }
+
+
+async def build_on_machine(name: str, mcp_dir: Path, manifest_data: dict, source: str, *,
+                           progress_cb: ProgressCb = None,
+                           on_wait: Callable[[], Awaitable[None]] | None = None) -> Built:
+    """An install's build of ``name``. The platform builds no tool: the
+    folder the install copied in (``mcp_dir``, not in the registry yet) goes
+    as a one-tool ``sync_mcps`` to the compute machine that builds for the
+    install (``building_machine``), which builds it into ``<tool>.new`` and
+    swaps it in only when the build succeeded, so a failure leaves the
+    machine's installed version as it was. ``source`` is the source to
+    install (pinned by the caller where it could resolve a version).
+
+    With no such machine connected it waits for one, at most
+    ``concurrency.NO_COMPUTE_WAIT_S`` (``on_wait`` is told first), then
+    raises ``NoBuildMachine``. A build that failed, ran past its budget or
+    lost its link answers ``Built.ok`` False with the cause, never raises.
+    Under the machine's install lock, as every sync is."""
+    from core import concurrency
+    from core.remote.satellite_connection import get_connection_manager
+    cm = get_connection_manager()
+    if not cm.building_machine():
+        if on_wait is not None:
+            await on_wait()
+        await concurrency.wait_for_compute(lambda: bool(cm.building_machine()))
+    machine_id = cm.building_machine()
+    if not machine_id:
+        raise NoBuildMachine(_placement.NO_COMPUTE_SENTENCE)
+    spec = await asyncio.to_thread(_build_spec, name, Path(mcp_dir), manifest_data, source)
+    command_id = str(uuid.uuid4())
+
+    async def _forward(ev: dict) -> None:
+        r = progress_cb(_event(ev)) if progress_cb is not None else None
+        if asyncio.iscoroutine(r):
+            await r
+
+    async with cm.get_install_lock(machine_id):
+        cm.register_install_progress(command_id, _forward)
+        try:
+            ack = await cm.send_command(
+                machine_id, await _frame(cm, machine_id, [spec]),
+                timeout=_install_budget(spec) + VERIFY_BUDGET_S, command_id=command_id)
+        except RuntimeError as e:
+            logger.warning("the build of %s on %s did not end: %s", name, _placement.log_id(machine_id), e)
+            return Built(False, f"The build on the compute machine did not finish: {e}",
+                         machine_id=machine_id)
+        finally:
+            cm.unregister_install_progress(command_id)
+    info = (ack.get("results") or {}).get(spec["name"])
+    if not isinstance(info, dict) or info.get("status") != "ok":
+        cause = machine_tools.said((info or {}).get("error")) or "The compute machine did not build the tool."
+        return Built(False, cause, machine_id=machine_id)
+    version_hash = str(info.get("version_hash") or "")
+    machine_tools.note_installed(machine_id, name, version_hash, category=mcp_installer.COMMUNITY)
+    return Built(True, "", mcp_installer.plain_version(info.get("resolved_version")),
+                 version_hash, machine_id)
+
+
+async def remove_gone(machine_id: str) -> list[str]:
+    """Take away from the machine the tools the platform no longer has (an
+    uninstalled tool's folder), for a machine no session's sync reaches: the
+    compute machine beside the platform. Nothing while the registry holds no
+    manifest, and never a tool an install is writing (``_gone``). Here
+    "no longer has" means uninstalled, never a tool a scan lost (a tools
+    folder that was not mounted, a manifest that did not parse): an
+    uninstall deletes the tool's state row, so a name that still has one is
+    kept, with what the tool wrote on the machine, and named in one
+    warning. Answers the names removed."""
+    from core.remote.satellite_connection import get_connection_manager
+    cm = get_connection_manager()
+    if not cm.is_connected(machine_id):
+        return []
+    async with cm.get_install_lock(machine_id):
+        installed = await _fetch_satellite_state(cm, machine_id)
+        gone = {n for n in _gone(installed) if installed[n].get("category") in _MCP_CATEGORIES}
+        if gone:
+            from storage.mcp import mcp_store
+            rows = await asyncio.to_thread(mcp_store.get_all_mcp_states)
+            lost = sorted(n for n in gone if n in rows)
+            if lost:
+                logger.warning("sync_mcps %s: %s not removed. The registry lost them and nobody uninstalled them: "
+                               "check the platform's tools folder", _placement.log_id(machine_id), ", ".join(lost))
+            gone -= set(lost)
+        if not gone:
+            return []
+        try:
+            ack = await cm.send_command(machine_id, await _frame(cm, machine_id, [], gone),
+                                        timeout=VERIFY_BUDGET_S)
+        except RuntimeError as e:
+            logger.warning("sync_mcps %s: removing %s failed: %s", _placement.log_id(machine_id), sorted(gone), e)
+            return []
+    removed = sorted(n for n, info in _named(ack.get("results") or {}).items()
+                     if isinstance(info, dict) and info.get("status") == "removed")
+    for name in removed:
+        machine_tools.note_removed(machine_id, name)
+    if removed:
+        logger.info("sync_mcps %s: removed %s, which the platform no longer has",
+                    _placement.log_id(machine_id), removed)
+    return removed
+
+
+async def forget_never_installed(name: str) -> None:
+    """A first install failed after its scan had made the tool's state row.
+    The platform never came to have the tool: the row goes, or
+    ``remove_gone`` would read the tool as installed and leave its copy on
+    the machine that built it. Best effort."""
+    from storage.mcp import mcp_store
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(mcp_store.delete_mcp_all_data, name)
+
+
 async def _fetch_satellite_state(cm, machine_id: str) -> dict[str, dict]:
-    """Run sync_mcps_verify and return {mcp_name: {version_hash, healthy}}."""
+    """Run sync_mcps_verify and return {mcp_name: {version_hash, healthy}},
+    by the registry's names (``_named``)."""
     try:
         ack = await cm.send_command(machine_id, {
             "type": "sync_mcps_verify",
         }, timeout=15.0)
-        return ack.get("mcps", {}) or {}
+        mcps = _named(ack.get("mcps", {}) or {})
+        machine_tools.note_verify(machine_id, mcps)
+        return mcps
     except RuntimeError as e:
         logger.warning("sync_mcps_verify failed: %s", e)
         # Fall back to the last-reported capabilities — better than nothing.
+        # They carry no hash (``unverified``): the session's sync reads each
+        # as outdated, as before; the plan of an ahead run never does.
         conn = cm.get_connection(machine_id)
         if conn:
             caps_installed = conn.capabilities.get("installed_mcps", [])
-            return {name: {"version_hash": "", "healthy": True} for name in caps_installed}
+            return _named({name: {"version_hash": "", "healthy": True, "unverified": True}
+                           for name in caps_installed})
         return {}
 
 
@@ -967,9 +1304,7 @@ def _diff(
     install: in desired but not installed (or unhealthy)
     update:  in desired, installed, but version_hash differs from current
     remove:  installed, not desired, and no longer shipped by the platform;
-             with ``gc`` (admin Sync Now) shipped ones too. Nothing while the
-             registry holds no manifest (a failed scan must not wipe a
-             working satellite).
+             with ``gc`` (admin Sync Now) shipped ones too (``_gone``).
 
     ``hashes`` is the current version hash per name (``version_hashes_for``,
     computed off the loop); without it each one is read here, from the cache
@@ -977,7 +1312,6 @@ def _diff(
     """
     to_install: set[str] = set()
     to_update: set[str] = set()
-    to_remove: set[str] = set()
 
     for name in desired:
         info = installed.get(name)
@@ -1002,22 +1336,35 @@ def _diff(
         if force or (current_hash and current_hash != info.get("version_hash", "")):
             to_update.add(name)
 
-    known = mcp_registry.get_all_manifests()
-    if known:
-        for name in installed:
-            if name not in desired and (gc or name not in known):
-                to_remove.add(name)
+    return to_install, to_update, _gone(installed, desired, gc=gc)
 
-    return to_install, to_update, to_remove
+
+def _gone(installed: dict[str, dict], desired=frozenset(), *, gc: bool = False) -> set[str]:
+    """The tools a machine holds (``installed``, its verify) that a sync
+    takes away: outside ``desired`` and no longer on the platform, with
+    ``gc`` the ones it still has too. Nothing while the registry holds no
+    manifest (a failed scan must not wipe a working machine), and never a
+    tool an install is writing now: the machine that built it holds it
+    before the registry knows it. Tools only: a machine's verify also names
+    the folders an install or a copy staged, and a machine removes nothing
+    under a name it would not install under (``machine_tools.safe_key``)."""
+    known = mcp_registry.get_all_manifests()
+    if not known:
+        return set()
+    gone = {name for name in installed if name not in desired and (gc or name not in known)
+            and machine_tools.safe_key(_key(name))}
+    return gone - _being_installed(gone)
 
 
 def _install_spec(name: str, manifest, tb) -> dict:
-    """One entry of ``mcps_to_install``: what the satellite's installer needs
-    beside the tarball, ``source_build`` included (the packages the manifest
-    allows to build from source; a satellite older than 0.5.130 ignores the
-    key and installs the way its own vendored installer does)."""
+    """One entry of ``mcps_to_install``, keyed by the tool's folder as the
+    machine keeps it (``machine_tools.key_of``): what the satellite's
+    installer needs beside the tarball, ``source_build`` included (the
+    packages the manifest allows to build from source; a satellite older
+    than 0.5.130 ignores the key and installs the way its own vendored
+    installer does)."""
     return {
-        "name": name,
+        "name": machine_tools.key_of(manifest),
         "category": manifest.category,
         "runtime": manifest.server.runtime,
         "source": manifest.server.source,

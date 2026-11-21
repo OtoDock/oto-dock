@@ -137,6 +137,8 @@ def _meeting_start(row: dict) -> bool:
 
 
 def _strip_preludes(text: str) -> str:
+    from storage.chat.chat_titles import without_start_context
+    text = without_start_context(text)
     while True:
         cut = _PRELUDE_RE.sub("", text, count=1)
         if cut == text:

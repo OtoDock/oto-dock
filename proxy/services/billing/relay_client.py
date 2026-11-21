@@ -52,8 +52,11 @@ from typing import TYPE_CHECKING, Any
 import psycopg
 
 import config
+from storage.pg import get_conn, run_db
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import httpx
 
 logger = logging.getLogger("otodock.relay-client")
@@ -324,16 +327,27 @@ def get_install_id() -> str:
     from storage import database as db
 
     iid = db.get_platform_setting("install_id")
-    if not iid:
-        iid = uuid.uuid4().hex
-        db.set_platform_setting("install_id", iid)
-    return iid
+    if iid:
+        return iid
+    iid = uuid.uuid4().hex
+    # A new install's first relay calls race on threads: the first commit
+    # names the install and every caller answers it, because a licence binds
+    # to the id its activation sent (an empty row counts as absent).
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO platform_settings (key, value) VALUES (%s, %s) "
+            "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value "
+            "WHERE platform_settings.value=''",
+            ("install_id", iid),
+        )
+        conn.commit()
+    return db.get_platform_setting("install_id") or iid
 
 
 def _relay_identity() -> dict:
-    """Identity payload included with every relay request: the install id + the
-    signed license key (the relay verifies the license and enforces seat/credit).
-    The real client methods attach this once the relay ships."""
+    """Identity payload of the license-bound relay requests: the install id + the
+    signed license key (the relay verifies the license and enforces its seat cap).
+    The API and credit relay takes :func:`_link_identity` instead."""
     import auth.license as L
 
     return {
@@ -348,6 +362,28 @@ def _link_identity() -> dict:
     account from the install_link). Distinct from :func:`_relay_identity` (license-
     based), used by license activate/check, OAuth, push, and events."""
     return {"install_id": get_install_id(), "account_token": get_account_token()}
+
+
+def _link_identity_if_connected() -> dict | None:
+    """``_link_identity``, None with no account to bill."""
+    return _link_identity() if is_connected() else None
+
+
+def _gated_identity(read: Callable[[], Any]) -> Any:
+    """The head of an async relay call, one ``run_db`` job: the gate, then
+    what the call sends. Both resolve as this module's globals at the call,
+    never from the ``relay_identity`` cache: a patch of either name holds."""
+    _require_relay()
+    return read()
+
+
+def _disconnect_body() -> dict | None:
+    """What the relay's revoke of the link sends, None when there is nothing
+    to revoke there (no token, or no relay)."""
+    token = get_account_token()
+    if token and is_available():
+        return {"install_id": get_install_id(), "account_token": token}
+    return None
 
 
 # The identity a push sends, cached so a fan-out reads the store once, off
@@ -553,15 +589,16 @@ async def activate_license(license_key: str) -> str:
     key it was called with), so the worker can adopt a re-issued key from it. A maxed
     key raises ``RelayError("activation_limit_reached")``.
     """
-    _require_relay()
-    data = await _relay_post("/v1/licenses/activate", _relay_identity())
+    identity = await run_db(_gated_identity, _relay_identity)
+    data = await _relay_post("/v1/licenses/activate", identity)
     # The relay auto-links this install to the license's account for the API/credit
     # relay and returns a per-install account_token ONCE — store it so a paid admin
     # is connected without the browser handshake. (Using hosted credits still needs
     # the admin to flip the master 'OtoDock hosted relay' toggle.)
     token = data.get("account_token") or ""
     if token:
-        store_account_token(token)
+        # The relay answers this token once: a cancel cannot drop its write.
+        await asyncio.shield(run_db(store_account_token, token))
     return data.get("receipt", "")
 
 
@@ -577,8 +614,8 @@ async def license_check(license_key: str) -> dict:
     **Fail-open** at the call site — an unreachable relay must never downgrade a
     paying customer (the client's unreachable-grace window handles outages).
     """
-    _require_relay()
-    data = await _relay_post("/v1/licenses/check", _relay_identity())
+    identity = await run_db(_gated_identity, _relay_identity)
+    data = await _relay_post("/v1/licenses/check", identity)
     return {
         "status": data.get("status", ""),
         "license": data.get("license", ""),
@@ -592,8 +629,8 @@ async def deactivate_license(license_key: str) -> None:
     activated on another install. Best-effort — both callers wrap this in
     ``try/except``, so a relay rejection / outage is non-fatal.
     """
-    _require_relay()
-    await _relay_post("/v1/licenses/deactivate", _relay_identity())
+    identity = await run_db(_gated_identity, _relay_identity)
+    await _relay_post("/v1/licenses/deactivate", identity)
 
 
 async def relay_credits(user_sub: str) -> dict:
@@ -604,14 +641,14 @@ async def relay_credits(user_sub: str) -> dict:
     :func:`is_available`; the caller (``api/billing/billing.py``) falls back to the
     zero-balance stub when the relay isn't configured or errors.
     """
-    _require_relay()
-    if not is_connected():
+    identity = await run_db(_gated_identity, _link_identity_if_connected)
+    if identity is None:
         # Not connected → no account to bill; return the zero-balance stub rather
         # than a doomed relay call (the caller shows zero / hides credits).
         return {"balance_usd": 0.0, "balance_eur_approx": 0.0,
                 "low_threshold": 0.0, "recent_transactions": []}
     return await _relay_post(
-        "/v1/relay/credits", {**_link_identity(), "user_sub": user_sub or ""},
+        "/v1/relay/credits", {**identity, "user_sub": user_sub or ""},
     )
 
 
@@ -820,10 +857,10 @@ async def oauth_authorize_url(
     empty lets the relay choose by the scopes, and a GitHub App it no longer
     offers is refused with ``RelayError("provider_not_app")``.
     """
-    _require_relay()
+    identity = await run_db(_gated_identity, _relay_identity)
     try:
         data = await _relay_post("/v1/oauth/authorize-url", {
-            **_relay_identity(),
+            **identity,
             "provider_id": provider_id,
             "scopes": scopes,
             "state": state,
@@ -844,9 +881,9 @@ async def oauth_exchange(
     ``TokenSet`` whose ``.raw`` carries ``{"via_relay": True}`` (the marker lands
     in the token file's ``extra`` so refreshes route back through the relay; no
     ``client_secret`` is ever persisted)."""
-    _require_relay()
+    identity = await run_db(_gated_identity, _relay_identity)
     data = await _relay_post("/v1/oauth/exchange", {
-        **_relay_identity(), "provider_id": provider_id, "code": code,
+        **identity, "provider_id": provider_id, "code": code,
     })
     return _tokenset_from(data)
 
@@ -854,9 +891,9 @@ async def oauth_exchange(
 async def oauth_refresh(*, provider_id: str, refresh_token: str):
     """Refresh a hosted token via the relay (relay holds the secret). Returns a
     ``TokenSet`` with ``.raw`` preserving ``{"via_relay": True}``."""
-    _require_relay()
+    identity = await run_db(_gated_identity, _relay_identity)
     data = await _relay_post("/v1/oauth/refresh", {
-        **_relay_identity(), "provider_id": provider_id,
+        **identity, "provider_id": provider_id,
         "refresh_token": refresh_token,
     })
     return _tokenset_from(data)
@@ -866,9 +903,9 @@ async def oauth_revoke(*, provider_id: str, token: str) -> None:
     """Revoke a hosted token at the vendor via the relay (relay holds the
     secret). Best-effort — callers wrap this in try/except and proceed with local
     cleanup regardless."""
-    _require_relay()
+    identity = await run_db(_gated_identity, _relay_identity)
     await _relay_post("/v1/oauth/revoke", {
-        **_relay_identity(), "provider_id": provider_id, "token": token,
+        **identity, "provider_id": provider_id, "token": token,
     })
 
 
@@ -891,9 +928,9 @@ async def events_register(
     when the relay has no event support for the provider (callers fall back
     to the manifest's own mode).
     """
-    _require_relay()
+    identity = await run_db(_gated_identity, _relay_identity)
     payload: dict[str, Any] = {
-        **_relay_identity(),
+        **identity,
         "provider_id": provider_id,
         "events_url": events_url,
         "enabled": enabled,
@@ -912,10 +949,10 @@ async def events_unbind(
     given (the GitHub App takes only that). Always signed with the forward
     secret. ``{ok, removed}``; an older relay answers
     ``RelayError('provider_unknown')``."""
-    _require_relay()
+    identity = await run_db(_gated_identity, _relay_identity)
     if not sign_with:
         raise ValueError("an unbind is signed with the forward secret")
-    payload: dict[str, Any] = {**_relay_identity(), "provider_id": provider_id}
+    payload: dict[str, Any] = {**identity, "provider_id": provider_id}
     if scope_id:
         payload["scope_id"] = scope_id
     if user_key:
@@ -936,9 +973,9 @@ async def account_connect_authorize_url(*, state: str, install_callback: str) ->
     types it on the consent page, proving the connect started from their own
     install). Carries no license/account_token — this is how an unconnected install
     authenticates."""
-    _require_relay()
+    install_id = await run_db(_gated_identity, get_install_id)
     return await _relay_post("/v1/connect/authorize-url", {
-        "install_id": get_install_id(), "state": state,
+        "install_id": install_id, "state": state,
         "install_callback": install_callback,
     })
 
@@ -946,13 +983,14 @@ async def account_connect_authorize_url(*, state: str, install_callback: str) ->
 async def account_connect_exchange(*, code: str) -> str:
     """Redeem the one-time connect handle for this install's ``account_token`` and
     persist it. Returns the token ('' on failure)."""
-    _require_relay()
+    install_id = await run_db(_gated_identity, get_install_id)
     data = await _relay_post("/v1/connect/exchange", {
-        "install_id": get_install_id(), "code": code,
+        "install_id": install_id, "code": code,
     })
     token = data.get("account_token", "")
     if token:
-        store_account_token(token)
+        # The handle is one-time: a cancel cannot drop what it redeemed for.
+        await asyncio.shield(run_db(store_account_token, token))
     return token
 
 
@@ -961,16 +999,15 @@ async def account_disconnect() -> None:
     at the relay (token-authed), then ALWAYS clear the local token (in ``finally``)
     so the install stops using the relay even if the relay is unreachable. Does NOT
     require the relay — a local disconnect must always succeed."""
-    token = get_account_token()
     try:
-        if token and is_available():
-            await _relay_post("/v1/connect/disconnect", {
-                "install_id": get_install_id(), "account_token": token,
-            })
+        body = await run_db(_disconnect_body)
+        if body:
+            await _relay_post("/v1/connect/disconnect", body)
     except Exception:  # noqa: BLE001  # the relay's revoke may fail, the local token clears anyway
         logger.warning("relay link revoke failed; clearing local token anyway", exc_info=True)
     finally:
-        clear_account_token()
+        # A cancel of the route cannot leave the token behind.
+        await asyncio.shield(run_db(clear_account_token))
 
 
 # ---------------------------------------------------------------------------
@@ -990,8 +1027,9 @@ def mint_session_token(user_sub: str) -> str:
     """Mint a per-user relay token for paid ``api_key_relay`` MCP calls.
 
     Injected (with ``OTODOCK_RELAY_BASE``) into the MCP subprocess env so the MCP
-    calls the relay instead of the vendor; the relay validates the token + license
-    + the calling user's credit, appends the vendor key, meters, and proxies.
+    calls the relay instead of the vendor; the relay validates the token and the
+    calling user's credit (it finds the account by the install's link, no license
+    is sent), appends the vendor key, meters, and proxies.
     Per-USER (the session user) so metering debits the right balance. **Sync**
     (called from the sync config builder), so it uses a sync HTTP client + an
     in-process TTL cache.

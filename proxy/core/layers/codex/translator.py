@@ -31,10 +31,16 @@ from core.events.common_events import (
     note_mark,
 )
 from core.layers.codex import tool_names
+from core.layers.codex.events import CodexEvent
 from core.layers.codex.helpers import will_retry
-from core.layers.codex.session import TURN_ENDING_EVENT, CodexEvent
+from storage.pg import run_db_fast
 
 logger = logging.getLogger("codex-layer")
+
+
+def _model_rates(model: str) -> tuple[float, float, float, float]:
+    """A Codex model's per-1M rates. Store reads."""
+    return app_config.get_model_pricing(model, app_config.get_model_provider(model))
 
 
 def _codex_tool_summary(item_type: str, item: dict) -> str:
@@ -173,6 +179,10 @@ _RECOVERED_WARNINGS = ("Falling back from WebSockets to HTTPS transport", "Model
 # before a tool call): shown as a progress note. Codex fills the phase when
 # the backend does ("callers must treat None as phase unknown").
 _COMMENTARY = "commentary"
+# ``AgentMessageDelivery`` of a message the model sent while its turn goes on
+# (``send_message_to_user_async``, the GPT-6.2 rows): whole at its end, no
+# deltas.
+_ASYNC_DELIVERY = "async"
 
 
 # ``TurnError.codexErrorInfo`` values that end a turn for a reason the
@@ -183,6 +193,42 @@ _ENDING_INFO = {
     "misalignmentPolicyViolation": (turn_ending.DECLINED, "policy"),
     "tooManyDenials": (turn_ending.DECLINED, turn_ending.DENIALS),   # Guardian's circuit breaker (0.160)
 }
+
+
+def _refused_sign_in(info) -> bool:
+    """Whether Codex's error code says the vendor refused the session's
+    sign-in: ``unauthorized`` (the token was refused and Codex could not
+    renew it itself, which with the platform's blank renewal token is every
+    refusal), or a request answered 401, in a rollout's snake case or a
+    frame's camel case."""
+    if isinstance(info, str):
+        return info.lower() == "unauthorized"
+    if isinstance(info, dict):
+        return any(isinstance(v, dict) and v.get("http_status_code", v.get("httpStatusCode")) == 401
+                   for v in info.values())
+    return False
+
+
+def task_complete_ending(payload: dict) -> turn_ending.TurnEnding | None:
+    """The typed ending a rollout's ``task_complete`` carries when its turn
+    failed, the terminal's twin of ``_error_event``: Codex 0.166 persists a
+    turn's error only there (``error.message``, ``error.codex_error_info`` in
+    snake case; its ``error`` event is never written to the rollout). A usage
+    limit or a policy decline through ``_ENDING_INFO``, a limit notice by its
+    words, any other error an ``error`` ending; None for a turn that finished
+    clean. No reset rides it: the pool reads the account's (``follow_ending``)."""
+    err = payload.get("error")
+    if not isinstance(err, dict):
+        return None
+    message = str(err.get("message") or "")
+    info = err.get("codex_error_info", err.get("codexErrorInfo"))
+    key = "".join(w if i == 0 else w.title() for i, w in enumerate(info.split("_"))) if isinstance(info, str) else ""
+    reason, detail = _ENDING_INFO.get(key, ("", ""))
+    if not reason and turn_ending.is_limit_text(message):
+        reason = turn_ending.LIMIT
+    if not reason:
+        return turn_ending.TurnEnding(reason=turn_ending.ERROR, detail=message, sign_in=_refused_sign_in(info))
+    return turn_ending.TurnEnding(reason=reason, detail=message if reason == turn_ending.LIMIT else detail)
 
 
 def _declared_window(minutes) -> str:
@@ -208,9 +254,20 @@ class CodexEventTranslator:
     ``params`` (see :class:`CodexEvent`).
     """
 
+    def _compacted(self) -> None:
+        """The summary took the start's data with it (``start_context``);
+        where the engine reports the compaction, so every reader of the
+        stream gets it."""
+        if self._session_id:
+            from core.session import start_context
+            start_context.reset(self._session_id)
+
     def __init__(self, model: str = "", *, supervised_bg: bool = False,
                  session_id: str = "", supervised_bg_commands: bool = False) -> None:
         self._model = model
+        # (model, its rates) as ``read_turn_rates`` found them at the turn's
+        # start. A turn the owner did not read for reads at its end.
+        self.turn_rates: tuple[str, tuple[float, float, float, float]] | None = None
         # When True (local layer always; remote when the satellite forwards
         # past main-turn end, ≥0.5.18), background sub-agents still active at
         # main-turn end are NOT swept — a per-thread supervisor emits each
@@ -229,11 +286,6 @@ class CodexEventTranslator:
         # satellites — no idle delivery), still-open terminals are resolved to
         # "completed" at every turn end so a badge can never dangle.
         self._supervised_bg_commands = supervised_bg_commands
-        # Whether an ``error`` notification Codex will retry still ends the
-        # platform's turn: a remote session on a satellite below 0.5.131,
-        # which ends its own turn on that notification (it read ``willRetry``
-        # nested), keeps the ERROR so the turn does not end silently.
-        self.retried_errors_end_turn: bool = False
         # The reset instant and the declared key of the account's reached
         # window (the last rate-limit snapshot), for a usage-limit ending.
         self._limit_resets_at: str = ""
@@ -397,6 +449,7 @@ class CodexEventTranslator:
             # contextCompaction ITEM handled in _on_item_completed). Same
             # first-class contract as the Claude layer's compact lift.
             self._await_post_compact_usage = True
+            self._compacted()
             return [CommonEvent(type=CONTEXT_COMPACT, data={
                 "phase": "completed", "trigger": "auto",
             })]
@@ -418,20 +471,9 @@ class CodexEventTranslator:
         if method == "turn/completed":
             return self._on_turn_completed(params.get("turn", {}))
 
-        if method == TURN_ENDING_EVENT:
-            # The session's own typed ending (silence past the ceiling, the
-            # daemon gone): the ERROR with the ending, then the turn's end.
-            ending = turn_ending.from_dict(params)
-            if ending is None:
-                return [CommonEvent(type=ERROR, data={"message": "Codex error"}),
-                        CommonEvent(type=DONE)]
-            return [CommonEvent(type=ERROR, data={"message": ending.line(),
-                                                   "ending": ending.as_dict()}),
-                    CommonEvent(type=DONE)]
-
         if method == "error":
             err = params.get("error", {}) or {}
-            if will_retry(params) and not self.retried_errors_end_turn:
+            if will_retry(params):
                 # Codex retries it and goes on: the turn is not over.
                 logger.info("Codex: retrying after %s", err.get("message", "an error"))
                 return []
@@ -482,7 +524,8 @@ class CodexEventTranslator:
         if not reason:
             # The engine's own error: the daemon stays warm, the ending
             # names the reason and carries Codex's words.
-            ending = turn_ending.TurnEnding(reason=turn_ending.ERROR, detail=message)
+            ending = turn_ending.TurnEnding(reason=turn_ending.ERROR, detail=message,
+                                            sign_in=_refused_sign_in(error_info))
             return CommonEvent(type=ERROR, data={"message": ending.line(),
                                                  "ending": ending.as_dict()})
         ending = turn_ending.TurnEnding(
@@ -649,6 +692,7 @@ class CodexEventTranslator:
             # swallows the deprecated thread/compacted for v2 clients) —
             # auto AND manual compaction both arrive as this item.
             self._await_post_compact_usage = True
+            self._compacted()
             return [CommonEvent(type=CONTEXT_COMPACT, data={
                 "phase": "completed", "trigger": "auto",
             })]
@@ -754,6 +798,9 @@ class CodexEventTranslator:
         text = item.get("text", "")
         if streamed or not text:
             return []
+        if item.get("delivery") == _ASYNC_DELIVERY:
+            # The pump appends a turn's text to one block: a paragraph of its own.
+            text = f"\n\n{text.strip()}\n\n"
         return [self._text_event(text, note=opened_as_note or phase == _COMMENTARY)]
 
     def _on_reasoning_completed(self, item_id: str, item: dict) -> list[CommonEvent]:
@@ -982,10 +1029,10 @@ class CodexEventTranslator:
             # The registry's long-context tier applies past its line (OpenAI's
             # 272K: the whole request at 2x input / 1.5x output). A window past
             # the line is OpenAI's catalog for this Codex, not a platform choice.
+            model, rates = self.turn_rates or (self._model, _model_rates(self._model))
             cost = app_config.price_usage(
-                self._model, app_config.get_model_provider(self._model),
-                input_tokens=plain_input, output_tokens=output_tokens,
-                cache_write_tokens=cache_write, cache_read_tokens=cached,
+                model, input_tokens=plain_input, output_tokens=output_tokens,
+                cache_write_tokens=cache_write, cache_read_tokens=cached, rates=rates,
             )
 
         # Context gauge: Codex app-server reports the last turn's prompt size +
@@ -1077,6 +1124,14 @@ class CodexEventTranslator:
         item = (params.get("item") if isinstance(params, dict) else None) or {}
         return (item.get("type") == "commandExecution"
                 and item.get("id") in self._bg_commands)
+
+    async def read_turn_rates(self) -> None:
+        """The price of the turn about to run, off the loop. ``turn/completed``
+        is translated in the owner's sync loop, which cannot await, and a read
+        there would hold the turn's ``DONE`` behind the lane. So a model set
+        during the turn prices the next one, not the one that ran."""
+        model = self._model
+        self.turn_rates = (model, await run_db_fast(_model_rates, model)) if model else None
 
     def thread_id_metadata(self, thread_id: str) -> list[CommonEvent]:
         """Emit codex_thread_id once for DB persistence (called by the session)."""

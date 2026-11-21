@@ -169,8 +169,8 @@ def build_for_user(user) -> dict:
     the user's toggle is on; this endpoint only derives from the caller's
     ADDED agents (their user_agents rows — the roster they curated), never
     from the admin's platform-wide access. Non-browser callers: none exist
-    (a session JWT can reach this route but simply gets enabled:false when
-    it carries no added agents).
+    (a session's token does not reach this person's route,
+    ``auth/external_endpoints.SESSION_ROUTES``).
     """
     if task_store.get_platform_setting("audio_wake_word_enabled") == "false":
         return {

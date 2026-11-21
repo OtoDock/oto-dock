@@ -1,0 +1,10 @@
+{
+ "a pinned chat stays": "editor",
+ "a platform admin with no row": "admin",
+ "a shared-only chat at their standing": "editor",
+ "below the editor tier there": null,
+ "no longer holds it": null,
+ "their row changed, another place": null,
+ "their row changed, the same place": "editor",
+ "their row, unchanged": "editor"
+}

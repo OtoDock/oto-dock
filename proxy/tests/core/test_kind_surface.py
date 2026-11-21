@@ -66,7 +66,7 @@ MACHINES: tuple[Machine, ...] = (
             frozenset({"url", "file", "video", "audio", "ui"}),
             ("proxy/core/events/artifact_events.py",),
             ("proxy/core/events/", "proxy/ws/dashboard_pty.py", "proxy/services/sharing/chat_snapshot.py",
-             "proxy/core/session/interactive_session.py"),
+             "proxy/core/session/interactive_"),
             (_TS + "lib/kinds/artifact.ts",),
             (_TS + "hooks/useChatStream.ts", _TS + "hooks/chatStream/", _TS + "hooks/useArtifactWindows.ts",
              _TS + "hooks/useChatMessages.ts",
@@ -166,7 +166,8 @@ KNOWN_TS_SITES: dict[str, tuple[str, dict[str, int]]] = {
         "ONE kind's card per file in the streaming message (a preview's push replaces its card)",
         {"artifact:document_preview": 1}),
     "dashboard/src/components/chat/artifacts/ArtifactWindows.tsx": (
-        "a window size for the iframe-hosting kind (a ui page)", {"artifact:ui": 1}),
+        "a window size for the iframe-hosting kind (a ui page), and a body that fits its window for a video",
+        {"artifact:ui": 1, "artifact:video": 1}),
     "dashboard/src/components/apps/AppFrame.tsx": (
         "the app_action WIRE frame (phase 6's axis), not a run's origin", {"task:app_action": 1}),
     "dashboard/src/sharehost/host.ts": (

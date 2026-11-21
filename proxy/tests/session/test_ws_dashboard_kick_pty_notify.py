@@ -99,11 +99,11 @@ class TestPtyViewer:
         slug = make_test_agent()
         sid = str(uuid.uuid4())
         cid = str(uuid.uuid4())
-        task_store.create_chat(cid, "user-admin", slug, "default",
+        task_store.create_chat(cid, "user-admin", slug, "ask",
                                model=TEST_MODEL,
                                execution_path="claude-code-cli")
         task_store.update_chat(cid, session_id=sid)
-        set_session_mode(sid, "default")
+        set_session_mode(sid, "ask")
         isess = FakeInteractiveSession(sid, cid, scrollback=scrollback,
                                        tui_theme="light")
         monkeypatch.setitem(interactive_session._sessions, sid, isess)
@@ -113,7 +113,7 @@ class TestPtyViewer:
         ws.client_send({"type": "resume_chat", "chat_id": cid})
         await ws.expect({
             "type": "chat_history", "chat_id": cid, "agent": ANY, "messages": [],
-            "has_more": False, "restore": {"todos": [], "meeting": None, "goal": None},
+            "has_more": False, "restore": {"todos": [], "meeting": None, "goal": None, "cost": {"billed": True, "fees": 0}},
             "plans": [], "total_cost": 0, "context_used": 0,
             "context_max": 0, "cache_read": 0, "cache_write": 0,
             "output_tokens": 0, "execution_path": "claude-code-cli",
@@ -682,6 +682,30 @@ class TestFirstMessageAttachments:
         assert [p.relative_to(cfg.AGENTS_DIR / slug).as_posix() for p in photos] == [meta["images"][0]["path"]]
         assert not [f for f in out["frames"] if f.get("subtype") == "photos_not_attached"]
 
+    def test_a_picture_in_a_format_the_chat_does_not_keep_is_left_out_and_told(self, temp_db, monkeypatch):
+        """The message goes on with its text and its other pictures, and the
+        chat says what to do with the one left out."""
+        import io
+
+        from PIL import Image
+
+        from ws import wire_events as wire
+        layer = self._layer(monkeypatch)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        buf = io.BytesIO()
+        Image.new("RGB", (4, 4), (30, 30, 200)).save(buf, format="PPM")
+        odd = "data:image/x-portable-pixmap;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        out = self._run(layer, {"type": "warmup", "agent": slug, "text": "look at both",
+                                "images": [{"data": _photo_data_url(), "name": "pic.png"},
+                                           {"data": odd, "name": "odd.ppm"}]})
+        assert not [f for f in out["frames"] if f["type"] == "error"]
+        notices = [f for f in out["frames"] if f.get("subtype") == "photos_not_attached"]
+        assert [f["message"] for f in notices] == [wire.PHOTOS_NOT_ATTACHED_ONE]
+        assert wire.PHOTOS_NOT_ATTACHED_ONE == "The photo did not reach the agent. Attach it again as JPEG or PNG."
+        _sid, prompt, _kw = layer.messages[0]
+        assert prompt.startswith("look at both\n\nThe user has attached 1 image(s).")
+
     def test_a_message_of_photos_alone_starts_its_turn(self, temp_db, monkeypatch):
         import json as jsonlib
         layer = self._layer(monkeypatch)
@@ -705,6 +729,8 @@ class TestFirstMessageAttachments:
                                            "name": "gone.pdf"}]})
         errors = [f for f in out["frames"] if f["type"] == "error"]
         assert [e["message"] for e in errors] == [wire.NOTHING_REACHED_THE_AGENT]
+        assert wire.NOTHING_REACHED_THE_AGENT == ("None of the photos or files reached the agent, so nothing "
+                                                  "was sent. Attach them again, with photos as JPEG or PNG.")
         assert out["frames"][-1] == {"type": "done", "chat_id": out["chat_id"]}
         assert layer.messages == []
         assert temp_db.get_chat_messages(out["chat_id"]) == []
@@ -744,7 +770,7 @@ class TestFirstMessageAttachments:
         assert notice < kinds.index(("text", None))
         frame = out["frames"][notice]
         assert frame["chat_id"] == out["chat_id"]
-        assert frame["message"] == "The photo did not reach the agent. Attach it again to send it."
+        assert frame["message"] == "The photo did not reach the agent. Attach it again as JPEG or PNG."
         _sid, prompt, _kw = layer.messages[0]
         assert prompt == "look again"
         rows = temp_db.get_chat_messages(out["chat_id"])
@@ -855,3 +881,51 @@ class TestInteractiveFirstMessageAttachments:
         assert not out["argv"]
         submitted, = out["submitted"]
         assert "- /users/admin/workspace/uploads/photos/img_" in submitted
+
+
+class TestAPhotoItsFolderRefuses:
+    """A pasted photo whose folder leads out of the person's own folder is
+    not saved: the chat's notice counts it, and the message goes on without
+    it (one owner tells a person about a photo that did not reach the
+    agent)."""
+
+    def test_the_notice_counts_it_and_the_message_goes_on(self, temp_db, monkeypatch):
+        import json as jsonlib
+
+        import config as cfg
+        from core.events.common_events import DONE, TEXT, CommonEvent
+        layer = FakeExecutionLayer()
+        layer.turn_events = [
+            CommonEvent(type=TEXT, data={"content": "answer"}),
+            CommonEvent(type=DONE, data={}),
+        ]
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        elsewhere = cfg.AGENTS_DIR / slug / "users" / "other" / "workspace"
+        elsewhere.mkdir(parents=True)
+        uploads = cfg.AGENTS_DIR / slug / "users" / "admin" / "workspace" / "uploads"
+        uploads.mkdir(parents=True)
+        (uploads / "photos").symlink_to(elsewhere)
+        out: dict = {}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, _sid = await warm_new_chat(ws, layer, slug)
+                ws.client_send({"type": "chat", "chat_id": chat_id, "text": "what is this",
+                                "images": [{"data": _photo_data_url(), "name": "pic.png"}]})
+                out["chat_id"] = chat_id
+                out["frames"] = await _frames_until(ws, "done")
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+        notices = [f for f in out["frames"] if f.get("subtype") == "photos_not_attached"]
+        assert [(n["chat_id"], n["count"]) for n in notices] == [(out["chat_id"], 1)]
+        _sid, prompt, _kw = layer.messages[-1]
+        assert prompt.endswith("what is this") and "uploads/photos" not in prompt
+        rows = temp_db.get_chat_messages(out["chat_id"])
+        user_row = [r for r in rows if r["role"] == "user"][-1]
+        assert user_row["content"] == "what is this"
+        assert any(r["role"] == "event" and jsonlib.loads(r["event_data"])["subtype"] == "photos_not_attached"
+                   for r in rows)
+        assert list(elsewhere.iterdir()) == []

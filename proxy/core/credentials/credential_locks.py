@@ -2,8 +2,8 @@
 
 Three call sites must coordinate to avoid interleaved partial writes of
 refreshed tokens:
-  1. Lazy refresh inside ``OAuthProvider.refresh()`` (called from any
-     session at any time when an access token is near expiry).
+  1. A tool's renewal of its token (``oauth_refresh_worker.refresh_if_due``,
+     on the worker's own path).
   2. Background refresh worker (``services/oauth_refresh_worker``) scanning
      and refreshing tokens with <5 min remaining lifetime.
 

@@ -1,0 +1,80 @@
+{
+ "absent": {
+  "parsed": null
+ },
+ "amount bool": {
+  "refused": "char-mcp: invalid costs block — costs.rules[0].amount must be a number, got bool"
+ },
+ "amount negative": {
+  "refused": "char-mcp: invalid costs block — costs.rules[0].amount must be >= 0, got -1.0"
+ },
+ "amount text": {
+  "refused": "char-mcp: invalid costs block — costs.rules[0].amount must be a number, got str"
+ },
+ "bad currency": {
+  "refused": "char-mcp: invalid costs block — costs.currency must be \"USD\" (v1 only), got 'EUR'"
+ },
+ "duplicate rule": {
+  "refused": "char-mcp: invalid costs block — costs.rules[1] duplicates an earlier rule for tool='fetch' match={}"
+ },
+ "empty provider": {
+  "refused": "char-mcp: invalid costs block — costs.provider must be a non-empty string"
+ },
+ "empty tool": {
+  "refused": "char-mcp: invalid costs block — costs.rules[0].tool must be a non-empty string"
+ },
+ "good": {
+  "parsed": {
+   "currency": "USD",
+   "provider": "v",
+   "rules": [
+    {
+     "amount": 1.0,
+     "tool": "fetch"
+    },
+    {
+     "amount": 1.0,
+     "match": {
+      "size": [
+       "a",
+       "b"
+      ]
+     },
+     "tool": "fetch"
+    },
+    {
+     "amount": 1.0,
+     "match": {
+      "hd": true
+     },
+     "multiply_by": "n",
+     "tool": "fetch"
+    }
+   ]
+  }
+ },
+ "match empty list": {
+  "refused": "char-mcp: invalid costs block — costs.rules[0].match['k'] must be a non-empty list of scalars"
+ },
+ "match nested list": {
+  "refused": "char-mcp: invalid costs block — costs.rules[0].match['k'] must be a non-empty list of scalars"
+ },
+ "match not an object": {
+  "refused": "char-mcp: invalid costs block — costs.rules[0].match must be an object, got list"
+ },
+ "match object": {
+  "refused": "char-mcp: invalid costs block — costs.rules[0].match['k'] must be a scalar or a list of scalars"
+ },
+ "multiply_by number": {
+  "refused": "char-mcp: invalid costs block — costs.rules[0].multiply_by must be a string (arg name), got int"
+ },
+ "no rules": {
+  "refused": "char-mcp: invalid costs block — costs.rules must be a non-empty list"
+ },
+ "not an object": {
+  "refused": "char-mcp: invalid costs block — costs must be an object, got list"
+ },
+ "rule not an object": {
+  "refused": "char-mcp: invalid costs block — costs.rules[0] must be an object, got int"
+ }
+}

@@ -101,9 +101,10 @@ class OllamaAdapter(OpenAIAdapter):
 
         url = f"{self.native_api_base(endpoint_url)}/api/tags"
         try:
-            # An admin's own endpoint, here or on the LAN: checked at the dial.
+            # An admin's own endpoint, here or on the LAN: checked at the dial
+            # (public only on a hosted install).
             async with pinned_http.checked_client(
-                    url, pinned_http.model_server, timeout=10) as client:
+                    url, pinned_http.admin_host, timeout=10) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
                 data = resp.json()

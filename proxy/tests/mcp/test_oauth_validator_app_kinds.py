@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from services.mcp import mcp_manifest_parse, mcp_registry
+from services.mcp import mcp_manifest_parse, mcp_manifest_store, mcp_registry
 from services.mcp.mcp_validate_oauth import _validate_oauth_services
 from services.oauth import oauth_engine
 from storage.identity import oauth_app_kinds as kinds
@@ -79,10 +79,10 @@ class TestValidator:
 
 @pytest.fixture
 def registry(monkeypatch):
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     from auth import oauth_providers
     oauth_providers.clear_manifest_cache()
-    yield mcp_registry._manifests
+    yield mcp_manifest_store._manifests
     oauth_providers.clear_manifest_cache()
 
 

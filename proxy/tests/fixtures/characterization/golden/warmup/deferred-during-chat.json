@@ -1,0 +1,116 @@
+{
+ "chats": [
+  {
+   "agent": "warm-picks-chat",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "other-model",
+   "pending_history_seed": "",
+   "permission_mode": "plan",
+   "rows": [],
+   "session_id": "<id2>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  {
+   "agent": "warm-picks-chat",
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "",
+   "new_chat": true,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id1>",
+   "mode": "plan",
+   "type": "mode_changed"
+  },
+  {
+   "model": "other-model",
+   "type": "model_changed"
+  },
+  {
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "fallback_reason": null,
+   "interactive": false,
+   "mode": "autoReview",
+   "model": "test-model",
+   "offline_machine_name": "",
+   "session_id": "<id2>",
+   "type": "warmup_ready"
+  },
+  {
+   "mode": "plan",
+   "type": "mode_changed"
+  },
+  {
+   "model": "other-model",
+   "type": "model_changed"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  }
+ ],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [
+   [
+    "<id2>",
+    "plan"
+   ]
+  ],
+  "model_changes": [
+   [
+    "<id2>",
+    "other-model"
+   ]
+  ],
+  "prepared_resume": [],
+  "reconnect_waits": [],
+  "started": [
+   {
+    "agent": "warm-picks-chat",
+    "chat_id": "<id1>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "autoReview",
+    "model": "test-model",
+    "resume": false,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id2>",
+    "user_sub": "user-admin",
+    "username": ""
+   }
+  ]
+ },
+ "slots": {
+  "acquired": [
+   [
+    "<id2>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": []
+ }
+}

@@ -291,10 +291,8 @@ class TestPlanReviewBetweenTurns:
         # Back to the mode Plan was entered from, the engine too.
         assert layer.mode_changes == [(seen["sid"], "ask")]
 
-    # ``implement_accept_edits``: the answer of a tab opened before 1.9.
     @pytest.mark.parametrize("action,answer,mode", [
         ("implement_auto", "implement_auto", "autoReview"),
-        ("implement_accept_edits", "implement_auto", "autoReview"),
         ("implement_ask", "implement_ask", "ask"),
     ])
     def test_implement_changes_the_mode_and_starts_the_implement_turn(
@@ -325,7 +323,7 @@ class TestPlanReviewBetweenTurns:
 class TestImplementPlanMode:
     @pytest.mark.parametrize("path,picked,runs", [
         ("direct-llm", "autoReview", "ask"),          # Direct LLM offers no Auto
-        ("claude-code-cli", "acceptEdits", "autoReview"),
+        ("claude-code-cli", "autoReview", "autoReview"),
     ])
     def test_the_picked_mode_is_entered_as_the_chats_engine_offers_it(
             self, temp_db, monkeypatch, path, picked, runs):
@@ -465,6 +463,10 @@ class TestCompactContext:
         set_username("user-admin", "admin")
         arms: list[str] = []
         monkeypatch.setattr(memory_nudge, "arm", arms.append)
+        # The start's riding part goes again after a compaction too.
+        from core.session import start_context
+        restarts: list[str] = []
+        monkeypatch.setattr(start_context, "reset", restarts.append)
 
         async def compact(sid):
             return answer
@@ -490,6 +492,7 @@ class TestCompactContext:
         run_ws_scenario(scenario)
 
         assert arms == ([seen["sid"]] if armed else [])
+        assert restarts == arms
 
 
 class _PlanConnection:

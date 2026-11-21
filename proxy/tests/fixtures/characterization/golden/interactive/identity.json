@@ -1,0 +1,116 @@
+[
+ {
+  "input": true,
+  "may_drive": [
+   true,
+   true
+  ],
+  "slot_acquired": [
+   [
+    "sid-task-term",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "sole_driver": "",
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-task-term": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": true,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [
+     "steer"
+    ],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [
+     "_mark_ready"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "a task's terminal",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ },
+ {
+  "may_drive": true,
+  "slot_acquired": [
+   [
+    "sid-no-owner",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": null
+    }
+   ]
+  ],
+  "sole_driver": "",
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-no-owner": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [
+     "_mark_ready"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "no owner recorded",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ }
+]

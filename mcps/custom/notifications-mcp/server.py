@@ -75,6 +75,27 @@ async def _delete(path: str) -> dict:
     return resp.json()
 
 
+def _refused(what: str, e: httpx.HTTPStatusError) -> str:
+    """What the agent reads when the platform refuses a call: what was not
+    done, then the platform's own sentence for why and what to do (the
+    route's ``{"detail": "..."}``), never the raw answer around it."""
+    try:
+        detail = e.response.json().get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    if isinstance(detail, str) and detail.strip():
+        reason = detail.strip()
+        if not reason.endswith((".", "!", "?")):
+            reason += "."
+    elif e.response.status_code == 422:
+        reason = "One of the values was not accepted. Check them and call again."
+    elif e.response.status_code >= 500:
+        reason = "The platform could not finish it. Try again in a moment."
+    else:
+        reason = "The platform gave no reason. Tell the person it was refused."
+    return f"{what} {reason}"
+
+
 async def _get_current_session() -> dict:
     """Get the current session context (username, chat_id, etc.)."""
     try:
@@ -462,8 +483,7 @@ async def _handle_create(args: dict) -> list[TextContent]:
                      f"Severity: {severity}, scope: {scope}.",
             )]
     except httpx.HTTPStatusError as e:
-        detail = e.response.text if e.response else str(e)
-        return [TextContent(type="text", text=f"Failed to create notification: {detail}")]
+        return [TextContent(type="text", text=_refused("The notification was not created.", e))]
     except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
@@ -497,6 +517,8 @@ async def _handle_list(args: dict) -> list[TextContent]:
             lines.append(f"- [{severity}] {title}{timing} (id={nid}, type={ntype}, {status})")
 
         return [TextContent(type="text", text="\n".join(lines))]
+    except httpx.HTTPStatusError as e:
+        return [TextContent(type="text", text=_refused("The notifications could not be listed.", e))]
     except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error listing notifications: {e}")]
 
@@ -509,7 +531,7 @@ async def _handle_cancel(args: dict) -> list[TextContent]:
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return [TextContent(type="text", text=f"Notification {nid} not found.")]
-        return [TextContent(type="text", text=f"Failed to delete: {e.response.text}")]
+        return [TextContent(type="text", text=_refused("The notification was not deleted.", e))]
     except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
@@ -530,7 +552,7 @@ async def _handle_pause(args: dict) -> list[TextContent]:
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return [TextContent(type="text", text=f"Notification {nid} not found.")]
-        return [TextContent(type="text", text=f"Failed to pause: {e.response.text}")]
+        return [TextContent(type="text", text=_refused("The notification was not paused.", e))]
     except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
@@ -555,7 +577,7 @@ async def _handle_resume(args: dict) -> list[TextContent]:
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return [TextContent(type="text", text=f"Notification {nid} not found.")]
-        return [TextContent(type="text", text=f"Failed to resume: {e.response.text}")]
+        return [TextContent(type="text", text=_refused("The notification was not resumed.", e))]
     except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
@@ -593,7 +615,7 @@ async def _handle_edit(args: dict) -> list[TextContent]:
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return [TextContent(type="text", text=f"Notification {nid} not found.")]
-        return [TextContent(type="text", text=f"Failed to edit: {e.response.text}")]
+        return [TextContent(type="text", text=_refused("The notification was not changed.", e))]
     except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 

@@ -34,7 +34,7 @@ from storage.agents import agent_store
 from storage.agents.agent_store import _get_execution_paths, _get_local_only_engines
 from storage.agents.schema import DEFAULT_EXECUTION_PATH
 from storage.automation import trigger_store
-from storage.pg import run_db
+from storage.pg import run_db, run_db_fast
 
 logger = logging.getLogger("otodock.agents")
 
@@ -61,7 +61,7 @@ def _mcp_names_by_agent(slugs: list[str]) -> dict[str, list[str]]:
     manager-enabled sets, the platform state and the explicit-instance
     visibility once each, the manifests from the registry's in-memory map,
     and every capability probe once per capability token. The rule mirrors
-    ``mcp_registry._agent_base_manifests`` drop for drop (not manager-enabled,
+    ``mcp_manifest_store._agent_base_manifests`` drop for drop (not manager-enabled,
     not platform-enabled, unknown manifest, explicit and not visible,
     platform-attached, capability unavailable) plus the skill filter of
     ``_get_mcp_info``; the listing's parity test holds the two together."""
@@ -347,6 +347,7 @@ def _list_agents_rows(u: UserContext, all: bool) -> list[dict]:
             "default_scope": (agent_data.get("default_scope") if agent_data else "user") or "user",
             "default_execution_mode": (agent_data.get("default_execution_mode", "") if agent_data else ""),
             "collaborative": bool(agent_data.get("collaborative", True)) if agent_data else True,
+            "team_account": bool(agent_data.get("team_account")) if agent_data else False,
             "color": agent_data.get("color", "") if agent_data else "",
             "description": agent_data.get("description", "") if agent_data else "",
             "mcp_count": len(mcp_names),
@@ -455,6 +456,8 @@ def _agent_info(name: str, agent_data: dict | None, mcp_names: list[str], has_wo
         "default_effort": agent_data["default_effort"] if agent_data else "",
         "default_scope": (agent_data.get("default_scope") if agent_data else "user") or "user",
         "collaborative": bool(agent_data.get("collaborative", True)) if agent_data else True,
+        "team_account": bool(agent_data.get("team_account")) if agent_data else False,
+        "team_account_floor": (agent_data.get("team_account_floor") if agent_data else "") or "editor",
         "color": agent_data.get("color", "") if agent_data else "",
         "description": agent_data.get("description", "") if agent_data else "",
         "mcps": mcp_names,
@@ -478,6 +481,35 @@ def _agent_info(name: str, agent_data: dict | None, mcp_names: list[str], has_wo
     }
 
 
+def _status_target(sub: str, name: str) -> tuple[str, str, dict] | None:
+    """The machine a caller's dot reports, one job for the 15 s poll: its
+    id, the scope and its row (``{}`` when gone), or None when the agent runs
+    locally for this caller."""
+    from storage import remote_store
+
+    # Priority 1: the caller's own per-agent override (their machine).
+    # Honored for every role — the user owns the hardware — and reported
+    # as the 'user' scope so the dot is amber when offline (the session
+    # soft-falls-back to local for this user, it doesn't hard-block).
+    user_target = remote_store.get_user_remote_target(sub, name)
+    if user_target and user_target.get("machine_id"):
+        target = user_target["machine_id"]
+        return target, "user", remote_store.get_remote_machine(target) or {}
+
+    # Priority 2: the agent's admin-paired default target. Shown to every
+    # user on the agent — when it's offline it blocks all of them.
+    agent_data = agent_store.get_agent(name) or {}
+    target = agent_data.get("execution_target") or placement.LOCAL
+    if placement.is_local(target):
+        return None
+    machine = remote_store.get_remote_machine(target) or {}
+    if not placement.machine_is_admin_paired(machine):
+        # A user-paired machine set as an agent default shouldn't happen
+        # (the admin assign endpoint refuses it), but guard anyway.
+        return None
+    return target, "admin", machine
+
+
 @router.get("/v1/agents/{name}/target-status")
 async def get_agent_target_status(
     name: str, user: UserContext | None = Depends(get_current_user),
@@ -491,55 +523,36 @@ async def get_agent_target_status(
     fallback, so an offline target still lights the dot.
 
     Response (200) shapes:
-        {"state": null} — agent runs locally for this caller.
+        {"state": null} — the agent runs in the platform's place for this caller.
         {"state": "online"|"stale"|"paused"|"disconnected"|"never_connected",
          "scope": "admin"|"user", "machine_name": str,
          "last_heartbeat_age_s": int|null, "last_seen_iso": str}
 
     `scope` lets the frontend pick severity: an admin-paired target that's
     down blocks everyone on the agent (red dot); a user's own machine
-    that's down only soft-falls-back to local for that user (amber dot).
+    that's down affects that user alone (amber dot).
     Any user with access to the agent may call this — the admin target
     blocks all of them, and the user-override branch is naturally scoped
     to the caller's own `user_remote_targets` row.
     """
     from services.remote.remote_status import get_live_machine_status
-    from storage import remote_store
 
     u = require_auth(user)
     require_agent_access(u, name)
 
-    def _status_payload(target: str, scope: str) -> dict:
-        machine = remote_store.get_remote_machine(target) or {}
-        status = get_live_machine_status(target)
-        return {
-            "state": status["state"],
-            "scope": scope,
-            "machine_name": machine.get("name") or "",
-            "last_heartbeat_age_s": status["last_heartbeat_age_s"],
-            "last_seen_iso": status["last_seen_iso"],
-        }
-
-    # Priority 1: the caller's own per-agent override (their machine).
-    # Honored for every role — the user owns the hardware — and reported
-    # as the 'user' scope so the dot is amber when offline (the session
-    # soft-falls-back to local for this user, it doesn't hard-block).
-    user_target = remote_store.get_user_remote_target(u.sub, name)
-    if user_target and user_target.get("machine_id"):
-        return _status_payload(user_target["machine_id"], "user")
-
-    # Priority 2: the agent's admin-paired default target. Shown to every
-    # user on the agent — when it's offline it blocks all of them.
-    agent_data = agent_store.get_agent(name) or {}
-    target = agent_data.get("execution_target") or placement.LOCAL
-    if placement.is_local(target):
+    found = await run_db_fast(_status_target, u.sub, name)
+    if found is None:
         return {"state": None}
-    machine = remote_store.get_remote_machine(target) or {}
-    if not placement.machine_is_admin_paired(machine):
-        # A user-paired machine set as an agent default shouldn't happen
-        # (the admin assign endpoint refuses it), but guard anyway.
-        return {"state": None}
-    return _status_payload(target, "admin")
+    target, scope, machine = found
+    # A machine that is given, ``{}`` too, is not read again.
+    status = get_live_machine_status(target, machine=machine)
+    return {
+        "state": status["state"],
+        "scope": scope,
+        "machine_name": machine.get("name") or "",
+        "last_heartbeat_age_s": status["last_heartbeat_age_s"],
+        "last_seen_iso": status["last_seen_iso"],
+    }
 
 
 @router.post("/v1/agents/{name}/complete-setup")

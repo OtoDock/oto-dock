@@ -5,7 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 import type { ReactNode } from 'react'
 
-import { acquireMic, releaseMic, micBusy, subscribeMic } from '@/audio/micCoordinator'
+import { acquireMic, captureLive, noteCapture, releaseMic, micBusy, subscribeMic } from '@/audio/micCoordinator'
 import { isWakeDiagOn, setWakeDiag } from '@/audio/wakeDiag'
 import { WakeWordSection } from '@/pages/UserSettings.general'
 import { useWakeWord } from '@/hooks/useWakeWord'
@@ -87,6 +87,24 @@ describe('micCoordinator', () => {
     acquireMic('a')
     expect(cb).toHaveBeenCalledTimes(2)
     releaseMic('a')
+  })
+
+  it('a noted capture is live without owning the mic, and notifies on its edges only', () => {
+    const cb = vi.fn()
+    const unsub = subscribeMic(cb)
+    expect(captureLive()).toBe(false)
+    noteCapture('wake', true)
+    noteCapture('wake', true)
+    // The wake listener pauses for owners only: its own capture must not.
+    expect(micBusy()).toBe(false)
+    expect(captureLive()).toBe(true)
+    noteCapture('wake', false)
+    noteCapture('wake', false)
+    expect(captureLive()).toBe(false)
+    expect(cb).toHaveBeenCalledTimes(2)
+    acquireMic('a')
+    expect(captureLive()).toBe(true)
+    unsub()
   })
 })
 
@@ -298,6 +316,33 @@ describe('useWakeWord', () => {
 
       worker.onmessage?.({ data: { type: 'detect', keyword: 'alpha' } })
       expect(navigate).toHaveBeenCalledWith('/chat/alpha?wake=1')
+    } finally {
+      uninstallMicEnv()
+    }
+  })
+
+  it('notes its capture before the mic opens, and clears it when the mic fails or stops', async () => {
+    // The playback session puts "auto" back on that note: WebKit refuses a
+    // capture under "playback" and cuts a live one.
+    mockApi({ wakeEnabled: true })
+    vi.stubGlobal('Worker', FakeWorker as unknown as typeof Worker)
+    const mic = installMicEnv()
+    Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true })
+    const seen: boolean[] = []
+    mic.getUserMedia.mockImplementationOnce(async () => {
+      seen.push(captureLive())
+      throw new Error('NotAllowedError')
+    })
+    try {
+      const { unmount } = render(<Harness navigate={vi.fn()} entry="/agents" />)
+      await waitFor(() => expect(mic.getUserMedia).toHaveBeenCalledTimes(1), { timeout: 4000 })
+      await waitFor(() => expect(captureLive()).toBe(false))
+      // The bounded retry a second later opens it.
+      await waitFor(() => expect(mic.getUserMedia).toHaveBeenCalledTimes(2), { timeout: 4000 })
+      expect(captureLive()).toBe(true)
+      unmount()
+      expect(captureLive()).toBe(false)
+      expect(seen).toEqual([true])
     } finally {
       uninstallMicEnv()
     }

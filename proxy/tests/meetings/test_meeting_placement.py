@@ -15,6 +15,8 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from core import placement
 
 _FULL = placement.PlacementCapabilities(
@@ -33,6 +35,9 @@ def _stub(monkeypatch, captured: dict):
     from storage import remote_store
     monkeypatch.setattr(tcb, "resolve_task_identity", lambda *a, **k: tcb.TaskIdentity(
         username="alice", role="manager", scope="user", creds_user_sub="alice-sub"))
+    # The meeting's person holds the agent (who pays is not this file's).
+    from core.config import spender
+    monkeypatch.setattr(spender, "may_spend", lambda *a, **k: True)
     monkeypatch.setattr(mc.agent_store, "get_delegation_targets", lambda *a, **k: [])
     monkeypatch.setattr(mc.agent_store, "is_admin_only", lambda *a, **k: False)
     monkeypatch.setattr(mc.agent_store, "get_agent", lambda *a, **k: {"execution_path": "claude-code-cli"})
@@ -95,6 +100,106 @@ def test_the_participant_keeps_the_kind_and_the_label_only(monkeypatch):
     assert p.allow_full_fs is False and p.device_grants == set() and p.site == placement.SITE_LOCAL
 
 
+_COMPUTE = placement.from_machine(placement.KIND_COMPUTE, {"id": "compute-1", "name": "Compute", "pairing_scope": "compute"})
+
+
+def _direct_world(monkeypatch, captured, *, row, engine="direct-llm"):
+    from services.meetings import meeting_context as mc
+    from services.remote import remote_status
+    from storage import remote_store
+    _stub(monkeypatch, captured)
+    monkeypatch.setattr(mc.agent_store, "get_agent", lambda *a, **k: {"execution_path": engine})
+    monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
+
+    def _serving(path="", **kw):
+        captured["path"], captured["asked"] = path, kw
+        return row
+    monkeypatch.setattr(remote_status, "serving_compute_machine", _serving)
+
+    def _placement_of(value, sub, agent, *, compute=None):
+        return _COMPUTE if compute else placement.LOCAL_PLACEMENT
+    monkeypatch.setattr(remote_store, "placement_of", _placement_of)
+
+
+def test_a_direct_llm_participants_tools_go_to_the_compute_machine(monkeypatch):
+    """Its record keeps the machine: the relay opens by it and the tools'
+    callbacks are admitted by it (the stripped form would lose the id)."""
+    from services.meetings import meeting_context as mc
+    captured: dict = {}
+    _direct_world(monkeypatch, captured, row={"id": "compute-1"})
+    cfg = asyncio.run(mc.build_meeting_agent_config(
+        "pa", {"scope": "user", "created_by": "alice-sub", "id": "mt-1"}, "sess-1"))
+    assert captured["path"] == "direct-llm"
+    assert cfg.security_context.placement.machine_id == "compute-1"
+    assert cfg.security_context.placement.kind == placement.KIND_COMPUTE
+    assert captured["mcp_placement"].kind == placement.KIND_COMPUTE
+    # Its target stays the platform's: the machine is in the placement.
+    assert placement.is_local(cfg.execution_target)
+
+
+@pytest.mark.parametrize("engine", ["claude-code-cli", "codex-cli"])
+def test_a_cli_participant_runs_on_the_compute_machine(monkeypatch, engine):
+    """A Claude Code or Codex participant's session goes to the compute
+    machine that serves, one that shares the platform's folders. Its record
+    keeps the machine whole: the layer and admission read it there."""
+    from services.meetings import meeting_context as mc
+    captured: dict = {}
+    _direct_world(monkeypatch, captured, row={"id": "compute-1"}, engine=engine)
+    cfg = asyncio.run(mc.build_meeting_agent_config(
+        "pa", {"scope": "user", "created_by": "alice-sub", "id": "mt-1"}, "sess-1"))
+    assert captured["path"] == engine and captured["asked"] == {"prefer": "", "shared_folder": True}
+    assert cfg.security_context.placement.machine_id == "compute-1"
+    assert cfg.security_context.placement.kind == placement.KIND_COMPUTE
+    assert placement.is_local(cfg.execution_target)
+
+
+def test_a_participant_on_a_paired_machine_never_asks_for_a_compute_machine(monkeypatch):
+    """Only the platform's place is served by a compute machine: a
+    participant whose target is a person's or an admin's machine keeps it."""
+    from services.meetings import meeting_context as mc
+    from services.remote import remote_status
+    captured: dict = {}
+    _stub(monkeypatch, captured)
+    monkeypatch.setattr(remote_status, "serving_compute_machine",
+                        lambda *a, **k: captured.__setitem__("asked", True))
+    cfg = asyncio.run(mc.build_meeting_agent_config(
+        "pa", {"scope": "user", "created_by": "alice-sub", "id": "mt-1"}, "sess-1"))
+    assert cfg.execution_target == "m-1" and "asked" not in captured
+
+
+@pytest.mark.parametrize("engine", ["direct-llm", "claude-code-cli", "codex-cli"])
+def test_with_no_serving_machine_a_participant_is_refused(monkeypatch, engine):
+    """The platform runs no session itself: with no compute machine a
+    participant's build is refused with the one sentence, on every engine
+    (a Direct LLM participant's tools are part of its session), before the
+    meeting takes any slot."""
+    from services.meetings import meeting_context as mc
+    captured: dict = {}
+    _direct_world(monkeypatch, captured, row=None, engine=engine)
+    with pytest.raises(placement.NoComputeMachine) as refused:
+        asyncio.run(mc.build_meeting_agent_config(
+            "pa", {"scope": "user", "created_by": "alice-sub", "id": "mt-1"}, "sess-1"))
+    assert str(refused.value) == placement.NO_COMPUTE_SENTENCE
+    assert "mcp_placement" not in captured
+
+
+def test_the_meeting_build_judges_the_audience_with_the_participants_role(monkeypatch):
+    """A Direct LLM participant's tools are this build's: the audience gate
+    needs the role, which the manager's own build used to apply."""
+    from services.meetings import meeting_context as mc
+    captured: dict = {}
+    _stub(monkeypatch, captured)
+    seen: dict = {}
+
+    def _build_mcp(*a, **k):
+        seen.update(k)
+        return (None, {}, {}, {}, set())
+    monkeypatch.setattr(mc.mcp_registry, "build_session_mcp_config", _build_mcp)
+    asyncio.run(mc.build_meeting_agent_config(
+        "pa", {"scope": "user", "created_by": "alice-sub", "id": "mt-1"}, "sess-1"))
+    assert seen["user_role"] == "manager" and seen["username"] == "alice"
+
+
 _REAL_TO_THREAD = asyncio.to_thread
 
 
@@ -125,3 +230,29 @@ def test_the_prompt_is_built_off_the_loop(monkeypatch):
         "pa", {"scope": "user", "created_by": "alice-sub", "id": "mt-2"}, "sess-2"))
     assert "PROMPT" in cfg.system_prompt
     assert seen["thread"] != threading.get_ident() and seen["loop"] is None
+
+
+def test_a_person_with_no_engine_is_refused_by_the_meetings_build(monkeypatch):
+    """The refusal a chat and a task meet, with its reason: the meeting's
+    card offers the connection instead of a participant starting empty."""
+    import pytest
+
+    from services.meetings import meeting_context as mc
+    _stub(monkeypatch, {})
+    monkeypatch.setattr(mc.subscription_pool, "resolve_subscription_env", lambda *a, **k: ("", {}))
+    monkeypatch.setattr(mc.subscription_pool, "user_scope_block_reason", lambda *a, **k: "auth_off")
+    with pytest.raises(mc.subscription_pool.NoSubscriptionError) as refused:
+        asyncio.run(mc.build_meeting_agent_config(
+            "pa", {"scope": "user", "created_by": "alice-sub", "id": "mt-1"}, "sess-1"))
+    assert refused.value.reason == "auth_off"
+
+
+def test_an_agent_scope_meeting_with_no_account_is_left_to_the_pool(monkeypatch):
+    """No person to connect anything: as an agent-scope task is, it is not
+    refused here."""
+    from services.meetings import meeting_context as mc
+    _stub(monkeypatch, {})
+    monkeypatch.setattr(mc.subscription_pool, "resolve_subscription_env", lambda *a, **k: ("", {}))
+    cfg = asyncio.run(mc.build_meeting_agent_config(
+        "pa", {"scope": "agent", "created_by": "", "id": "mt-1"}, "sess-1"))
+    assert cfg.subscription_id in ("", None)

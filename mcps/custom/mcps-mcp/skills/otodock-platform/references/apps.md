@@ -36,14 +36,18 @@ wrong, ask the agent that built it.
 
 ## What an app can do
 
-- **Buttons** that fire a task, send a prompt into the open chat, or call one tool
-  directly. They run on the approver's authority, so a viewer can press them, and a
-  button can carry a role floor (contributor, editor or manager). A personal app's
-  buttons use the owner's connected accounts whoever presses them; the app's card says
-  whose.
+- **Buttons** that fire a task, send a prompt into the open chat or a new one, or call
+  one tool directly. They run on the approver's authority, so a viewer can press them. A value
+  the person types, or a list of edits, acts with that person's own rights. A button
+  can carry a role floor (contributor, editor or manager). A tool or task button can also
+  be opened to external identities, and only such a button works for a link's visitor. A personal app's buttons use
+  the owner's connected accounts whoever presses them, and the owner's files for the
+  owner alone; the app's card says whose.
 - **Live platform data**: chats, tasks, notifications, file changes, checks and their
   verdicts as they happen, each viewer their own slice; a single-file app also keeps a
   small document per viewer, which only that viewer's own page reads and writes.
+- **Media**: the app plays the workspace's video, audio and pictures in its own page, from
+  the folders it may read. A document opens over the app, and Back closes it.
 - **A server and a database** (a folder app: `apps/<slug>/` with `app.json`, `client/`
   and an optional `server/`), which the agent's own sessions reach too, and whose
   exported methods the sessions of agents it is shared with reach at the share's role.
@@ -67,7 +71,11 @@ Nothing an app declares works until a person approves it. The card lists in plai
 everything the app may do (buttons, platform data, files, hosts, wakes, what it offers
 and uses from other apps, the secrets it needs), with **Details** and the exact manifest
 beneath. Any change to what the app may do voids the approval and the new release waits
-on the card, as does a release whose required secret has no value yet. The approver
+on the card, as does a release whose required secret has no value yet. A release that
+gives the app its own program waits too, even when nothing else changed. The card then
+says "This release runs its own program on your OtoDock, so it needs approval." A new
+app's first release with its own program waits the same way. A person with the right (the table
+below) presses **Approve and go live** or **Reject** on the card. The approver
 must also be allowed to run every task the app's buttons fire. The card is never
 approved automatically and your session cannot approve it.
 
@@ -79,7 +87,8 @@ its server answers, so a server that fails to start leaves the old one serving. 
 deploy the platform checks the app: what the sandbox would refuse, and how it renders on
 a phone, a tablet and a desktop in both themes. **Roll back** (app menu, or your
 `rollback_app`) returns to the release before the current one, and a folder app's
-database goes back with it.
+database goes back with it. Your `rollback_app` refuses to bring back a release with its
+own program while the live one has none: a person rolls that back from the app's menu.
 
 ## Who does what
 
@@ -95,8 +104,8 @@ database goes back with it.
 | Where it comes from | — | anyone, on a placed app |
 | Remove from this agent | — | **editor+** on the receiving agent (an agent share); admin (a department share, which ends it for the whole department) |
 
-Logs, View the working copy, Settings and Delete exist only on an app with a server,
-Roll back once there is an earlier release. Admins hold the same authority on every app
+Logs, View the working copy, Settings and Delete exist only on a folder app, Roll back
+once there is an earlier release. Admins hold the same authority on every app
 (another person's personal app is not in their list; they reach it at its address).
 
 Approving, sharing and setting a secret are always a person's action on the dashboard.
@@ -113,8 +122,11 @@ at" and "Agents may open apps on my screen" (both on by default).
 - **Community agent templates ship apps**: shared copies for the agent and personal
   copies, one per member (one of which can be the agent's setup page), up to four in all,
   approved once in the install dialog (an admin's consent covers every member's copy; a
-  copy that acts as the member needs that member's own approval). A template update
+  copy that acts as the member needs that member's own approval). The install and update
+  dialogs say which app comes with its own program on the install. A template update
   replaces an untouched copy and keeps an edited one, with the new version beside it.
+  **Update and approve** puts its new app releases live, a new program included.
+  Unticked, each waits on its card.
 - **`.otoapp`**: `export_app(slug)` packs an app with a server as `apps/<slug>.otoapp`,
   with the tasks its buttons fire; `import_app(path)` installs a bundle on the agent
   whose session runs it (to move an app, copy the bundle into the other agent's
@@ -156,13 +168,17 @@ Default visibility never changes; a share adds access on top.
   cannot be shared.
 - **A teammate** acts at the role the share gave them (viewer unless the sharer picked
   higher; a placement's role is also capped by their own role on the agent it sits
-  in): buttons run on the approver's authority, and they see none of the agent's
-  files or chats unless they are on the agent. A personal app and a chat go to
+  in): buttons run on the approver's authority, a value they type reaches none of the
+  agent's files, and they see none of the agent's files or chats unless they are on the
+  agent. A personal app and a chat go to
   people only.
-- **A link** is for someone without an account. It has a password by default (generated,
-  shown once, editable) and expires by default (30 days, or the admin's longest share
-  expiry when that is shorter; editable within it), and it can be revoked any time. A link's buttons stay off until its **Buttons** switch is turned on;
-  a link never sends prompts, reads the agent's files or opens platform pages. Making a
+- **A link** is for someone without an account. It has a password by default (generated
+  and shown once) and expires by default (30 days, or the admin's longest share
+  expiry when that is shorter; editable within it), and it can be revoked any time. A link's visitors are external identities. A button works there only
+  when the app opens it to them and the link's **Buttons** box is ticked. When the link is
+  made, that box is **Let the link use the buttons**. A link never sends prompts, reads the agent's files or opens platform
+  pages. An app that reads the agent's folders gets a link only when each is a knowledge
+  folder added on the agent's **External identities** card. Making a
   link and turning its buttons on ask the person to confirm who they are; a link without
   a password takes a second confirmation.
 - **A shared chat** is a read-only copy of the conversation as it stood when shared

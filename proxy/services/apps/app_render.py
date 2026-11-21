@@ -25,8 +25,6 @@ import json
 import logging
 import re
 import secrets
-import shutil
-import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -36,6 +34,7 @@ import httpx
 
 from auth import render_principal as rp
 from services.apps import app_sandbox, app_supervisor, releases
+from services.infra import pinned_http, safe_fs
 from storage import database as task_store
 
 if TYPE_CHECKING:
@@ -131,18 +130,30 @@ def renderer_base_url() -> str:
     return f"http://{deployment.docker_mcp_host(m)}:{port}"
 
 
+def _renderer_tool():
+    from services.mcp import mcp_registry
+    return mcp_registry.get_manifest("file-tools")
+
+
 async def renderer_available() -> tuple[bool, str]:
-    """A cached probe of file-tools' ``/health``: (available, reason)."""
+    """A cached probe of file-tools' ``/health``: (available, reason). A
+    container an admin put to sleep is woken first (its door)."""
     now = time.monotonic()
     if now - float(_probe["at"]) < PROBE_TTL_S:
         return bool(_probe["ok"]), str(_probe["reason"])
+    tool = _renderer_tool()
+    if tool is not None:
+        from services.containers import door
+        if sentence := await door.ready(tool):
+            _probe.update({"at": now, "ok": False, "reason": sentence, "base": ""})
+            return False, sentence
     base = await asyncio.to_thread(renderer_base_url)
     ok, reason = False, ""
     if not base:
         reason = "file-tools is not installed on this platform"
     else:
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with httpx.AsyncClient(**pinned_http.tool_transport(timeout=3.0)) as client:
                 r = await client.get(f"{base}/health")
             body = r.json() if r.status_code == 200 else {}
             ok = bool(body.get("render"))
@@ -153,10 +164,21 @@ async def renderer_available() -> tuple[bool, str]:
     return ok, reason
 
 
+def _held():
+    """file-tools in use for the life of a render or a conversion."""
+    import contextlib
+
+    from services.containers import door
+    tool = _renderer_tool()
+    return door.hold(tool) if tool is not None else contextlib.nullcontext()
+
+
 async def _call_renderer(base: str, token: str, path: str, *, timeout_s: int) -> dict:
     """One ``POST /render`` on file-tools; raises ``RuntimeError`` with the
-    reason when the renderer refuses or fails."""
-    async with httpx.AsyncClient(timeout=CALL_TIMEOUT_S) as client:
+    reason when the renderer refuses or fails. Both of file-tools' dials are
+    a Docker tool's: on a hosted install only inside the install's tool
+    networks (``pinned_http.docker_tool``)."""
+    async with httpx.AsyncClient(**pinned_http.tool_transport(timeout=CALL_TIMEOUT_S)) as client:
         r = await client.post(f"{base}/render", json={
             "path": path, "cookie": token, "widths": WIDTHS, "timeout_s": timeout_s,
             "settle_ms": 1500, "theme": "light", "second_theme": "dark",
@@ -188,32 +210,27 @@ def copy_working_tree(row: dict, source_dir: Path) -> Path:
     from services.apps.app_deploy import confine_to_scope
     confine_to_scope(row["agent"], row.get("username") or "", source_dir)
     base = releases.app_release_dir(row)
-    base.mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    for old in base.glob(f"{releases.CHECK_DIR_PREFIX}*"):
-        try:
-            if now - old.stat().st_mtime > STALE_CHECK_S:
-                shutil.rmtree(old, ignore_errors=True)
-        except OSError:
-            pass
+    safe_fs.mkdirs_beneath(*releases.agents_rel(base))
+    releases.sweep_stale(base, releases.CHECK_DIR_PREFIX, STALE_CHECK_S)
     dest = base / f"{releases.CHECK_DIR_PREFIX}{secrets.token_hex(4)}"
     try:
         releases.copy_tree(source_dir, dest)
     except BaseException:
-        shutil.rmtree(dest, ignore_errors=True)
+        releases.remove_tree(dest)
         raise
     return dest
 
 
-def seeds_live_data(row: dict, manifest: Manifest | None) -> bool:
+def seeds_live_data(row: dict, manifest: Manifest | None, adds_server: bool) -> bool:
     """Whether code that is not live yet (a working tree's copy, a release
     before it goes live, the preview) may run on a copy of the live
     database: only when a deploy of it goes live without a person's review
     anyway. ``manifest`` is that code's own (``app_deploy.working_manifest``;
     None when it would not deploy): its actions and blocks must be approved
     as the row stands, and the per-app approval switch must be off on the
-    row and in its app.json. Else the code runs on empty data."""
-    if manifest is None or manifest.requires_approval:
+    row and in its app.json. ``adds_server`` (``releases.adds_server`` on
+    that code) waits for a person too. Else the code runs on empty data."""
+    if manifest is None or manifest.requires_approval or adds_server:
         return False
     deployed = {**row, "actions": manifest.actions_json, **manifest.blocks()}
     return task_store.app_actions_approved(deployed) and not row.get("deploy_requires_approval")
@@ -222,12 +239,9 @@ def seeds_live_data(row: dict, manifest: Manifest | None) -> bool:
 def _seed(row: dict, scratch: Path) -> bool:
     """The live database copied into the scratch data directory when it is
     small enough; False when there is none or it is too big to copy."""
-    from services.apps.app_deploy import snapshot_db
-    live = releases.app_data_dir(row) / "app.db"
+    from services.apps import app_db
     try:
-        if not live.is_file() or live.stat().st_size > DB_SEED_MAX_BYTES:
-            return False
-        return snapshot_db(live, scratch / "app.db")
+        return app_db.snapshot_db(row, scratch / app_db.DB_NAME, max_size=DB_SEED_MAX_BYTES)
     except Exception:  # noqa: BLE001  # a seed is a nicety
         return False
 
@@ -298,21 +312,23 @@ def judge(raw: dict, report: RenderReport, *, approved: bool) -> RenderReport:
 
 def _store(row: dict, report: RenderReport, raw: dict) -> None:
     """The pictures and the report beside the releases, for the record."""
-    d = releases.app_release_dir(row) / CHECKS_DIRNAME
-    d.mkdir(parents=True, exist_ok=True)
+    root, d = releases.agents_rel(releases.app_release_dir(row) / CHECKS_DIRNAME)
     for p in raw.get("pages") or []:
         w, theme = int(p.get("width") or 0), str(p.get("theme") or "light")
         name = IMAGE_NAMES.get(w, str(w)) + ("" if theme == "light" else f"-{theme}")
         b64 = str(p.get("jpeg_b64") or "")
         try:
-            (d / f"{name}.jpg").write_bytes(base64.b64decode(b64))
+            safe_fs.atomic_write_beneath(root, f"{d}/{name}.jpg", base64.b64decode(b64), mkdirs=True,
+                                         fsync=False)
         except (OSError, ValueError):
             continue
         report.images.append({"name": name, "width": w, "theme": theme,
                               "bytes": int(p.get("bytes") or 0), "jpeg_b64": b64,
                               "overflow": int(p.get("overflow") or 0)})
     with contextlib.suppress(OSError):
-        (d / "report.json").write_text(json.dumps(report.as_dict(images=False), indent=1), "utf-8")
+        safe_fs.atomic_write_beneath(root, f"{d}/report.json",
+                                     json.dumps(report.as_dict(images=False), indent=1).encode("utf-8"),
+                                     mkdirs=True, fsync=False)
 
 
 async def render_tree(row: dict, tree_dir: Path, *, approved: bool, seed: bool) -> RenderReport:
@@ -331,7 +347,7 @@ async def render_tree(row: dict, tree_dir: Path, *, approved: bool, seed: bool) 
         report.reason = "the tree has no manifest"
         return report
     async with _renderer_slot:
-        scratch = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="otodock-app-render-"))
+        scratch = await asyncio.to_thread(releases.scratch_data_dir, row)
         report.seeded = seed and await asyncio.to_thread(_seed, row, scratch)
         report.egress = approved
         token, jti = rp.mint(row["id"], viewer_sub_for(row), row.get("agent") or "")
@@ -355,7 +371,8 @@ async def render_tree(row: dict, tree_dir: Path, *, approved: bool, seed: bool) 
             last = ""
             for attempt in range(2):
                 try:
-                    raw = await _call_renderer(base, token, path, timeout_s=RENDER_TIMEOUT_S)
+                    with _held():
+                        raw = await _call_renderer(base, token, path, timeout_s=RENDER_TIMEOUT_S)
                 except (httpx.HTTPError, RuntimeError, ValueError) as e:
                     last = str(e) or type(e).__name__
                     raw = None
@@ -377,7 +394,7 @@ async def render_tree(row: dict, tree_dir: Path, *, approved: bool, seed: bool) 
             rp.release(jti)
             if started:
                 await app_supervisor.stop(row["id"], app_supervisor.CHECK)
-            await asyncio.to_thread(shutil.rmtree, scratch, True)
+            await asyncio.to_thread(releases.remove_tree, scratch)
 
 
 async def render_working_tree(row: dict, source_dir: Path, *, approved: bool) -> RenderReport:
@@ -388,13 +405,18 @@ async def render_working_tree(row: dict, source_dir: Path, *, approved: bool) ->
     from services.apps.app_deploy import working_manifest
     from services.apps.releases import _deploy_lock
     async with _deploy_lock(row["id"]):
+        fresh = await asyncio.to_thread(task_store.get_app, row["id"])
+        row = fresh or row
         tree = await asyncio.to_thread(copy_working_tree, row, source_dir)
         try:
-            manifest = await asyncio.to_thread(working_manifest, row, tree)
-            return await render_tree(row, tree, approved=approved,
-                                     seed=seeds_live_data(row, manifest))
+            manifest, gains = await asyncio.to_thread(
+                lambda: (working_manifest(row, tree), releases.adds_server(row, tree)))
+            # Code that brings a server the live release has not runs as an
+            # unapproved manifest's would: none of the approved sites.
+            return await render_tree(row, tree, approved=approved and not gains,
+                                     seed=seeds_live_data(row, manifest, gains))
         finally:
-            await asyncio.to_thread(shutil.rmtree, tree, True)
+            await asyncio.to_thread(releases.remove_tree, tree)
 
 
 async def render_live(row: dict, *, approved: bool) -> RenderReport:

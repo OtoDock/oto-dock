@@ -75,22 +75,31 @@ def test_the_preview_plans_each_member_with_its_consent_items(temp_db):
     assert body["department_name"] == "Lady G" and body["name_problem"] is None and body["running_job"] is None
     head, clerk = body["members"]
     assert head["action"] == installer.ACTION_NEW and head["slug"] == "head" and head["apps"][0]["sig"] == "sig-b"
-    assert clerk["action"] == installer.ACTION_ADOPT and clerk["slug"] == "clerk"
+    assert clerk["action"] == installer.ACTION_ADOPT and clerk["slug"] == "clerk" and clerk["choice"] == "clerk"
+    assert clerk["options"] == [{"slug": "clerk", "display_name": "Clerk", "department": ""}]
     assert body["library"] == {"source": "head", "subdir": "facts", "writable": False}
     assert body["consent_scope"] == "everyone" and body["levels"] == ["Head", "Team"]
-    # The name the person typed: a department this set made under it
-    # holds members the preview shows as used, never as placed elsewhere.
+    # The name the person typed: a department this set made under it keeps
+    # the members it holds, with no choice.
     dept = db_departments.create_department("Lady G", ADMIN, level_names=["Head", "Team"],
                                             community_set="office", community_set_version="0.1.0")
     db_departments.place_members(dept["id"], [("clerk", dept["levels"][1]["id"])])
     r = ADMIN_C().get("/v1/community/departments/office/preview", params={"department_name": "Lady G"})
     clerk = r.json()["members"][1]
-    assert clerk["action"] == installer.ACTION_ADOPT and clerk["slug"] == "clerk" and clerk["placed"] == []
+    assert clerk["action"] == installer.ACTION_ADOPT and clerk["slug"] == "clerk" and clerk["kept"] is True
+    assert clerk["options"] == []
+    # Another name: the set's own department is no place to take an agent from.
     r = ADMIN_C().get("/v1/community/departments/office/preview", params={"department_name": "Other"})
     clerk = r.json()["members"][1]
-    assert clerk["action"] == installer.ACTION_NEW and clerk["placed"] == ["clerk"]
-    r = ADMIN_C().get("/v1/community/departments/office/preview", params={"department_name": "a:b", "new": "clerk"})
+    assert clerk["action"] == installer.ACTION_NEW and clerk["options"] == []
+    db_departments.delete_department(dept["id"])
+    r = ADMIN_C().get("/v1/community/departments/office/preview",
+                      params={"department_name": "a:b", "use": "clerk:new"})
     assert r.json()["name_problem"] and r.json()["members"][1]["action"] == installer.ACTION_NEW
+    # A choice no member may take: one sentence, nothing planned.
+    r = ADMIN_C().get("/v1/community/departments/office/preview", params={"use": "head:clerk"})
+    assert r.status_code == 400
+    assert r.json()["detail"] == "clerk cannot fill the place of Head. Choose another agent or install a new one."
     assert ADMIN_C().get("/v1/community/departments/nope/preview").status_code == 404
     r = ADMIN_C().get("/v1/community/departments/broken/preview")
     assert r.status_code == 409 and "not in the catalog" in r.json()["detail"]
@@ -100,10 +109,10 @@ def test_the_install_starts_a_job_that_the_starter_and_an_admin_may_read(temp_db
     with patch.object(installer, "start", new=AsyncMock(side_effect=lambda dset, registry, name, u, consent, choices=None:
                                                          db_set_installs.create(dset.slug, dset.version, name, u.acting_sub, []))) as start:
         r = CREATOR_C().post("/v1/community/departments/office/install",
-                             json={"department_name": "Lady G", "consent": True, "new": ["clerk"]})
+                             json={"department_name": "Lady G", "consent": True, "use": {"clerk": "new"}})
     assert r.status_code == 202, r.text
     job_id = r.json()["job_id"]
-    assert start.await_args.kwargs["consent"] is True and start.await_args.kwargs["choices"] == {"clerk": installer.ACTION_NEW}
+    assert start.await_args.kwargs["consent"] is True and start.await_args.kwargs["choices"] == {"clerk": installer.USE_NEW}
     assert CREATOR_C().get(f"/v1/community/departments/installs/{job_id}").json()["department_name"] == "Lady G"
     assert ADMIN_C().get(f"/v1/community/departments/installs/{job_id}").status_code == 200
     _make_user("user-other", "o@test.com", "creator")

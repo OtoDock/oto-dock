@@ -1,0 +1,32 @@
+{
+ "a person who holds no target": [
+  "char-agent"
+ ],
+ "a person who holds one": [
+  "char-shared",
+  "char-agent"
+ ],
+ "a person who holds the target": [
+  "char-agent",
+  "char-peer"
+ ],
+ "a platform admin": [
+  "char-agent",
+  "char-peer"
+ ],
+ "no targets": [
+  "char-peer"
+ ],
+ "nobody at manager": [
+  "char-agent",
+  "char-peer"
+ ],
+ "the admin role": [
+  "char-agent",
+  "char-peer"
+ ],
+ "the agent among its targets": [
+  "char-peer",
+  "char-self"
+ ]
+}

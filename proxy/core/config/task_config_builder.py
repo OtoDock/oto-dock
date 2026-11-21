@@ -7,8 +7,9 @@ Extracted from services/scheduler/scheduler.py to centralize config building.
 """
 
 import asyncio
+import functools
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple, cast
 
 import psycopg
@@ -62,6 +63,12 @@ class TaskIdentity(NamedTuple):
     # next run. Always False for user-scope identities (their username drives
     # the ordinary owner-tier knowledge path).
     knowledge_rw: bool = False
+    # The person behind the run (its creator, for a task of theirs), in every
+    # mode: on a Shared-only agent the run resolves the agent's credentials
+    # (``creds_user_sub`` None) yet is still a person's, so it takes the
+    # tool limits of people's chats (``tool_limits.governs_of``). None for
+    # the agent's own runs.
+    person: str | None = None
 
 
 # Dynamic-task fire shapes eligible for manager-provenance knowledge writes.
@@ -116,6 +123,102 @@ def _creator_grants_knowledge_rw(agent_name: str, created_by: str | None) -> boo
         roles.effective_role(creator.get("role"), task_store.get_user_agent_roles(created_by), agent_name))
 
 
+def session_holds_knowledge_write(session_id: str | None) -> bool:
+    """Whether this live session's own context writes the agent's knowledge."""
+    if not session_id:
+        return False
+    from core.session import session_state
+    ctx = session_state.get_session_security(session_id)
+    return bool(ctx is not None and ctx.knowledge_rw)
+
+
+def run_holds_knowledge_write(run: dict) -> bool:
+    """Whether a session of this agent-scope task run writes the agent's
+    knowledge: one that is live now, or the one its next start builds.
+
+    Whoever drives such a run steers a session with a manager's write, so
+    the continue gate asks the manager tier of them
+    (``core/session/visibility.task_continue_refusal``). Live: the run row's
+    session and its chat row's (a re-warm that could not resume writes its
+    new id on the chat row alone), each asked of the session's own context.
+    Next: the grant's own rule, the fire's kind table while the run is
+    queued or running and the re-warm's once it ended, and a creator who
+    manages the agent now. Reads the store: off the loop."""
+    from storage.automation import run_status
+    if (run.get("scope") or SCOPE_AGENT) != SCOPE_AGENT:
+        return False
+    chat_id = run.get("chat_id") or ""
+    chat = task_store.get_chat(chat_id) if chat_id else None
+    if (session_holds_knowledge_write(run.get("session_id"))
+            or session_holds_knowledge_write((chat or {}).get("session_id"))):
+        return True
+    word = run.get("task_type") or ""
+    if run_status.is_live(run.get("status")):
+        takes = any(k.knowledge_rw for k in task_kinds.KINDS.values() if k.run_kind == word)
+    else:
+        takes = run_allows_knowledge_rw(word)
+    return takes and _creator_grants_knowledge_rw(run.get("agent") or "", run.get("created_by"))
+
+
+#: What a session with no person reads when it may not change what a task
+#: runs: a task that fires with the knowledge write, a wake of another chat.
+PROMPT_EDIT_REFUSAL = (
+    "This task runs with the right to change the agent's knowledge, which this session "
+    "does not hold. A manager of the agent changes its prompt, its mode and its checks."
+)
+WAKE_EDIT_REFUSAL = (
+    "This wake belongs to another chat. Only the session of the chat it wakes changes "
+    "its prompt."
+)
+
+
+#: The edit's field that names the checks judging a task's run.
+_CHECKS_FIELD = "checks"
+
+
+def changes_what_runs(task_row: dict, fields: dict) -> bool:
+    """Whether an edit changes what the task's run does or what judges it:
+    its prompt, its mode (Auto or Don't Ask) or its checks. A prompt or a
+    mode sent back as it is stored is no change; a ``checks`` list always
+    counts."""
+    if fields.get("prompt") not in (None, task_row.get("prompt")):
+        return True
+    if "permission_mode" in fields and (
+            (fields["permission_mode"] == AUTO_REVIEW_MODE)
+            != ((task_row.get("permission_mode") or "") == AUTO_REVIEW_MODE)):
+        return True
+    return _CHECKS_FIELD in fields
+
+
+def prompt_edit_refusal(task_row: dict, session_id: str) -> str:
+    """Why a session with no person may not change what this task runs (its
+    prompt, mode or checks: ``changes_what_runs``), "" when it may. A
+    session with no person manages its agent's agent-scope tasks, and an
+    editor can start one (their own agent-scope task, the agent's shared
+    chat). Two rules:
+
+    - The next fire of a manager's task runs its prompt with the knowledge
+      write, so only a session that holds that write itself changes it.
+    - A wake's text goes into its target chat's live session as it stands,
+      and that session may hold the write. So only the session of the chat
+      a wake targets changes it, the rule its creation has
+      (``api/tasks/continuations.py``).
+
+    Reads the store: off the loop."""
+    if (task_row.get("scope") or SCOPE_USER) != SCOPE_AGENT:
+        return ""
+    if (task_row.get("task_type") or "") == task_kinds.CONTINUATION:
+        chat = task_store.get_chat_by_session(session_id) if session_id else None
+        driven = (chat or {}).get("id") or ""
+        return "" if driven and driven == (task_row.get("target_chat_id") or "") else WAKE_EDIT_REFUSAL
+    kind = task_kinds.of_word(task_row.get("task_type") or "")
+    if (task_row.get("transferred_from") or "") or not (kind and kind.knowledge_rw):
+        return ""
+    if not _creator_grants_knowledge_rw(task_row.get("agent") or "", task_row.get("created_by")):
+        return ""
+    return "" if session_holds_knowledge_write(session_id) else PROMPT_EDIT_REFUSAL
+
+
 def resolve_task_identity(
     agent_name: str, scope: str, created_by: str | None,
     *, allow_knowledge_rw: bool = False,
@@ -131,12 +234,12 @@ def resolve_task_identity(
       ``manager``). The empty username is what drives the agent-scope sandbox
       mount (``/workspace`` RW + ``/knowledge`` RO, no ``/config``, no
       ``/users``) regardless of the role label — see
-      ``core/sandbox/sandbox.py:_workspace_mounts``.
+      ``core/sandbox/sandbox.py:_role_mount_table``.
     - **Shared-only** agents ALWAYS run agent-scoped (shared workspace), no
       matter how the run row stored ``scope`` — they have no per-user scope.
       Forcing it here (not just clamping the mount downstream) is what keeps the
-      task's CREDENTIALS agent-scope: ``creds_user_sub`` stays ``None`` so the
-      session draws on the platform pool, never the creator's subscription.
+      task's tool accounts agent-scope: ``creds_user_sub`` stays ``None``. Who
+      pays for the run is not decided here (``core/config/spender.py``).
     - **knowledge_rw** (agent scope only): computed from ``created_by``
       provenance when ``allow_knowledge_rw`` is passed. The task kinds whose
       ``knowledge_rw`` fact is set opt in (``services/scheduler/task_kinds``:
@@ -147,11 +250,13 @@ def resolve_task_identity(
       at spawn: a creator demoted mid-run keeps knowledge RW until that run
       ends (next fire re-resolves).
     """
+    person = created_by if scope == SCOPE_USER and created_by else None
     if scope == "user" and created_by and not is_shared_only(agent_name):
         username = task_store.get_username_by_sub(created_by) or ""
         role = acting_role_of(created_by, agent_name)
         return TaskIdentity(
             username=username, role=role, scope="user", creds_user_sub=created_by,
+            person=person,
         )
     if (scope == SCOPE_USER and created_by and not agent_store.is_admin_only(agent_name)
             and task_store.get_user(created_by)):
@@ -161,29 +266,34 @@ def resolve_task_identity(
         # there does.
         role = acting_role_of(created_by, agent_name)
         if not roles.can_edit(role):
-            return TaskIdentity(username="", role=role, scope=SCOPE_AGENT, creds_user_sub=None)
+            return TaskIdentity(username="", role=role, scope=SCOPE_AGENT, creds_user_sub=None,
+                                person=person)
     knowledge_rw = (
         allow_knowledge_rw
         and _creator_grants_knowledge_rw(agent_name, created_by)
     )
     if agent_store.is_admin_only(agent_name):
         return TaskIdentity(username="", role="admin", scope="agent",
-                            creds_user_sub=None, knowledge_rw=knowledge_rw)
+                            creds_user_sub=None, knowledge_rw=knowledge_rw, person=person)
     return TaskIdentity(username="", role=roles.MANAGER, scope="agent",
-                        creds_user_sub=None, knowledge_rw=knowledge_rw)
+                        creds_user_sub=None, knowledge_rw=knowledge_rw, person=person)
 
 
 #: The config's ``fallback_reason`` when a task's own machine could not take
 #: the run (the guard refused it now, or it is offline): the run used the
 #: resolver's answer and its chat says so (``task_machine_note``).
 FALLBACK_TASK_MACHINE = "task-machine-unavailable"
+#: The config's ``fallback_reason`` when a continue's round may not use the
+#: machine its chat's session lives on (``continue_place``): the round ends
+#: with ``continue_refused`` and starts nothing elsewhere.
+FALLBACK_CONTINUE_REFUSED = "continue-machine-refused"
 
 
 class TaskTarget(NamedTuple):
     """Where one task run goes (``task_target``)."""
 
     target: str                  # the resolver's form: local, a machine id, or the offline sentinel
-    fallback_reason: str | None  # FALLBACK_TASK_MACHINE when the task's machine gave way, else None
+    fallback_reason: str | None  # FALLBACK_TASK_MACHINE or FALLBACK_CONTINUE_REFUSED, else None
     wanted_label: str            # the passed-over machine's name, else ""
 
 
@@ -203,20 +313,6 @@ def worker_machine_owner(task) -> str | None:
     if not task_store.get_user(by) or not roles.can_edit(acting_role_of(by, task.agent)):
         return None
     return by
-
-
-def owners_computer_person(task) -> str | None:
-    """The delegator when a chat worker's round is to run on their own
-    computer (its ``target_machine`` is a user machine they paired): its
-    spend is theirs, so their own limits apply too. Synchronous."""
-    owner = worker_machine_owner(task)
-    wanted = task.target_machine or ""
-    if not owner or not wanted or placement.is_local(wanted):
-        return None
-    row = remote_store.get_remote_machine(wanted)
-    if not row or placement.machine_is_admin_paired(row) or row.get("registered_by") != owner:
-        return None
-    return owner
 
 
 def attended_chat_worker(task, creds_sub: str | None) -> bool:
@@ -265,11 +361,48 @@ def _guard_passes(machine: dict | None, identity: TaskIdentity, owner: str | Non
         agent_default=(agent_store.get_agent(agent) or {}).get("execution_target"))
 
 
+def continues_in_chat(task) -> bool:
+    """A delegate's round that resumes its chat's session (a continue): it
+    runs where that session lives, read when the round starts."""
+    from services.scheduler.runner import _is_valid_session_uuid
+    return (getattr(task, "task_type", "") == task_kinds.DELEGATE
+            and bool(getattr(task, "target_chat_id", ""))
+            and _is_valid_session_uuid(getattr(task, "continue_session", None)))
+
+
+def continue_refused(label: str) -> str:
+    """The sentence of a continue whose run may not use the machine its
+    chat's session lives on (the spawn's 409, the round's end)."""
+    return f"This chat runs on {label}, which this work can't use. Move the chat, then continue it."
+
+
+def continue_place(chat: dict, identity: TaskIdentity, owner: str | None, *,
+                   agent: str) -> tuple[str, str]:
+    """Where a continue of ``chat`` runs, as ``(place, refusal)``: the place
+    its session lives (``chat_move.session_place``; ``""`` the agent's
+    default), with ``continue_refused``'s sentence when this run may not use
+    that machine (``_guard_passes``): a fresh session elsewhere would leave
+    the work's memory behind. ``owner`` is a chat worker's
+    (``worker_machine_owner``). Synchronous: the DB executor."""
+    from services.remote import chat_move, chat_targets
+    place = chat_move.session_place(chat, chat_targets.RunPerson(identity.creds_user_sub,
+                                                                 identity.role))
+    if not place or placement.is_local(place):
+        return place, ""
+    row = remote_store.get_remote_machine(place)
+    if row is None:
+        return "", ""
+    if _guard_passes(row, identity, owner, agent=agent):
+        return place, ""
+    return place, continue_refused(chat_targets.place_phrase(place, chat_targets.label_of(place, row)))
+
+
 def task_target(task, identity: TaskIdentity, *, agent: str = "") -> TaskTarget:
     """The run's target, one decision for the runner's slot and the config:
     a judge's ``execution_target_override`` (when the guard lets this run
     there), then the task's own ``target_machine`` (``local``, or a machine
-    the guard passes that is reachable now), then the resolver. A task
+    the guard passes that is reachable now; a continue's is where its chat's
+    session lives now, ``continue_place``), then the resolver. A task
     machine that cannot take the run gives way to the resolver with
     ``FALLBACK_TASK_MACHINE`` and its name. ``agent`` defaults to the
     task's own. Synchronous: the DB executor."""
@@ -291,20 +424,31 @@ def task_target(task, identity: TaskIdentity, *, agent: str = "") -> TaskTarget:
                        placement.machine_of(override)[:8])
         return TaskTarget(_resolved(), None, "")
     wanted = getattr(task, "target_machine", "") or ""
+    owner = None if identity.creds_user_sub else worker_machine_owner(task)
+    continues = continues_in_chat(task)
+    if continues:
+        # Read now, not at the spawn: a move of the chat since is followed.
+        chat = task_store.get_chat(task.target_chat_id)
+        if chat is not None:
+            wanted, refused = continue_place(chat, identity, owner, agent=agent_name)
+            if refused:
+                from services.remote import chat_targets
+                return TaskTarget(placement.offline_sentinel(wanted), FALLBACK_CONTINUE_REFUSED,
+                                  chat_targets.label_of(wanted))
     if not wanted:
         return TaskTarget(_resolved(), None, "")
     if placement.is_local(wanted):
         return TaskTarget(placement.LOCAL, None, "")
     from services.remote import chat_targets
     row = remote_store.get_remote_machine(wanted)
-    owner = None if identity.creds_user_sub else worker_machine_owner(task)
     if row and _guard_passes(row, identity, owner, agent=agent_name) and remote_status.is_reachable(wanted):
         return TaskTarget(wanted, None, "")
     label = chat_targets.label_of(wanted, row or {})
-    if (owner and row and not placement.machine_is_admin_paired(row)
+    if (row and (continues or (owner and not placement.machine_is_admin_paired(row)))
             and _guard_passes(row, identity, owner, agent=agent_name)):
-        # A chat worker on its delegator's own computer waits for it, as a
-        # chat placed there does: the round ends with the sentence.
+        # A continue of a chat's session, or a chat worker on its
+        # delegator's own computer, waits for its machine, as a chat placed
+        # there does: the round ends with the sentence.
         return TaskTarget(placement.offline_sentinel(wanted), None, label)
     logger.info("Task %s: its machine %s cannot take this run (%s); the agent's default runs it",
                 getattr(task, "id", "?"), label,
@@ -332,7 +476,9 @@ def rewarm_task_identity(chat_id: str, agent_name: str) -> TaskIdentity | None:
     (``task_kinds.RUN_KINDS``: scheduled and delegate opt in). Reads the
     store: callers on the loop run it in a worker thread."""
     run = task_store.get_run(session_kind.run_id_of_chat(chat_id))
-    if not run:
+    if not run or run.get("task_type") == task_kinds.RUN_WRAPUP:
+        # A call's wrap-up is a record, never a chat anyone continues: its
+        # profile lived with its run (``visibility.drive_refusal``).
         return None
     return resolve_task_identity(
         agent_name, run.get("scope") or "agent", run.get("created_by"),
@@ -443,9 +589,14 @@ class _TaskSessionReads:
     is_admin_only: bool
     vis: VisibilityResolution
     chat_worker: bool
+    # Whose accounts the run's chat chooses among and its choices
+    # (``account_context.choice_scope`` with ``task``: the agent's own, the
+    # creator's, or none), as the run's own switch wrote them.
+    choice_scope: str = ""
+    account_choices: dict[str, str] = field(default_factory=dict)
 
 
-def _task_session_reads(agent_name: str, task) -> _TaskSessionReads:
+def _task_session_reads(agent_name: str, task, session_id: str = "") -> _TaskSessionReads:
     """The identity a task session runs as and what follows from it, read
     from the store (a worker-thread job of :func:`build_task_agent_config`)."""
     # Resolve the scope + identity this task session runs as. Single source
@@ -495,10 +646,21 @@ def _task_session_reads(agent_name: str, task) -> _TaskSessionReads:
         user_sub=creds_sub or "",
         scope_override=identity.scope,
     )
+    # The run's chat: a worker chat, else the chat the run's session was
+    # written on before this build (``task_run._open_round``).
+    from services.mcp import account_context
+    chat_id = getattr(task, "target_chat_id", None) or (
+        (task_store.get_chat_by_session(session_id) or {}).get("id", "") if session_id else "")
+    choice_scope = account_context.choice_scope(
+        chat_id, mount_scope=identity.scope, role=identity.role or "", task=True) if chat_id else ""
+    choices = account_context.session_choices(
+        chat_id, creds_sub or "", mount_scope=identity.scope, role=identity.role or "",
+        task=True) if choice_scope else {}
     return _TaskSessionReads(
         identity=identity, platform_role=platform_role, resolved_targets=resolved_targets,
         agent_info=agent_info, is_admin_only=is_admin_only, vis=vis,
         chat_worker=attended_chat_worker(task, creds_sub),
+        choice_scope=choice_scope, account_choices=choices,
     )
 
 
@@ -531,6 +693,9 @@ async def build_task_agent_config(
     *,
     execution_path: str = "",
     model: str = "",
+    prefer: str = "",
+    stay_shared: bool = False,
+    stay_on: bool = False,
 ) -> AgentConfig:
     """Build an AgentConfig for task execution.
 
@@ -551,6 +716,11 @@ async def build_task_agent_config(
             manifest ``agent_context`` blocks resolve ``${trigger.*}``
             tokens. ``None`` for scheduled / manual fires.
     """
+    if getattr(task, "wrapup", None):
+        # A call's wrap-up: the phone builder's profile, never a task's.
+        from core.config.phone_config_builder import build_wrapup_agent_config
+        return await build_wrapup_agent_config(
+            agent_name, task.wrapup, session_id, model=model, prefer=prefer)
     # Resolve the scope + identity this task session runs as. Single source
     # of truth (shared with the dashboard WS re-warm path) so a continued
     # task keeps its original scope — see ``resolve_task_identity``. Computed
@@ -561,7 +731,7 @@ async def build_task_agent_config(
     # provenance check on the creator still decides.
     # Every read of the identity — the creator's rows, the delegation
     # targets, the agent row, the visibility mode — in one worker-thread job.
-    reads = await asyncio.to_thread(_task_session_reads, agent_name, task)
+    reads = await asyncio.to_thread(_task_session_reads, agent_name, task, session_id)
     identity = reads.identity
     task_username = identity.username
     task_role = identity.role
@@ -618,9 +788,22 @@ async def build_task_agent_config(
     # the path facts the Pass-1 gate needs (without them every
     # satellite-absolute path is outside the synced tree and, with no home
     # and allow_full_fs off, fail-closes), the grants, the display.
-    target = await asyncio.to_thread(
-        remote_store.placement_of, task_target_value, _target_user_sub, agent_name,
-    )
+    # ``prefer``: the compute machine the run's slot was taken on, or the
+    # one its chat's engine record lives on, so the build and the slot
+    # agree; a judge needs the platform's own folder, and so does a run
+    # whose chat's record lives there (``stay_shared``). The run's agent
+    # names the rule of a tool's local address, unless its chat stays on the
+    # machine on another host its record lives on (``stay_on``,
+    # ``ChatPlace.stays``: its round resumes there by id).
+    # With none to take a run of the platform's place the build is refused
+    # (``placement.NoComputeMachine``), which is the run's failed report.
+    compute_row = await asyncio.to_thread(
+        functools.partial(remote_status.compute_row_for, task_target_value, execution_path,
+                          prefer=prefer, shared_folder=bool(judge) or stay_shared,
+                          agent="" if stay_on else agent_name))
+    from services.remote import machine_away
+    target = await machine_away.settled_placement(task_target_value, _target_user_sub, agent_name,
+                                                  compute=compute_row)
     is_remote = target.is_remote
     # A chat worker on its delegator's own computer (``worker_machine_owner``):
     # the placement guard judges it for that person, and the AI account it
@@ -629,6 +812,11 @@ async def build_task_agent_config(
     machine_owner = (await asyncio.to_thread(worker_machine_owner, task)
                      if not user_sub_for_creds else None)
     on_owners_computer = bool(machine_owner and target.user_paired)
+    # Who pays (``core/config/spender.py``): a lane's recorded person, the
+    # creator of a person's own run, else the shared subscriptions. Who the
+    # run works as stays this builder's.
+    from core.config import spender
+    payer = await asyncio.to_thread(functools.partial(spender.run_spender, task, agent=agent_name))
     # There it runs as that person, at their role, its token in their name,
     # as their own Shared-only chat moved there does: the agent's own role
     # and person-less token never reach a personal disk. The mount, the
@@ -644,17 +832,34 @@ async def build_task_agent_config(
     )
     vis = reads.vis
     from core.config.config_builder import personal_machine_bundles, personal_owner_of
+    from services.mcp import account_context
+    # Whose credentials the run resolves (``account_context.credential_identity``,
+    # the session build asks the same): the agent's for a run with no person
+    # and for a person's run on an agent whose people use its accounts.
+    agents_accounts = (await asyncio.to_thread(
+        account_context.credential_identity, agent_name, user_sub_for_creds,
+        mount_scope=identity.scope, role=task_role or "")).agents
     personal_owner = personal_owner_of(
-        target, vis.mount_username, machine_owner if on_owners_computer else user_sub_for_creds,
+        target, agents_accounts, machine_owner if on_owners_computer else user_sub_for_creds,
         target_browser)
-    on_personal = target.user_paired and not vis.mount_username
+    on_personal = target.user_paired and agents_accounts
     owner_kw: dict[str, Any] = {"personal_owner": personal_owner} if on_personal else {}
+    if reads.account_choices:
+        # The run's own choice of account per tool (``chat_reload.schedule_for_run``).
+        owner_kw["account_choices"] = reads.account_choices
     # The agent's MCP set on this placement, read once (the path_env values
     # and the assigned names below).
     agent_mcps = await asyncio.to_thread(
         mcp_registry.get_agent_mcps, agent_name, placement=target,
     ) or []
 
+    # The agent's tool limits for a run: the chats column behind a person
+    # (their own run, in every mode: ``TaskIdentity.person``), the runs
+    # column behind none; and the run's own limit on the self-config tool
+    # (``tool_limits.TASK_SESSION_LIMIT``).
+    from services.mcp import tool_limits
+    limits = await asyncio.to_thread(
+        tool_limits.load, agent_name, tool_limits.governs_of(external=False, person=identity.person))
     mcp_config, credential_env, excluded_mcps, secret_bundles, bash_env_keys = (
         await asyncio.to_thread(
             mcp_registry.build_session_mcp_config,
@@ -662,6 +867,7 @@ async def build_task_agent_config(
             user_sub_for_creds,
             session_id=session_id,
             task_mode=True,
+            limits=limits or None,
             # A person's own chat lane takes the chat's tools; it is never
             # the person's own chat, so the shared-chat context joins.
             chat_worker=reads.chat_worker,
@@ -685,10 +891,16 @@ async def build_task_agent_config(
     )
 
     is_admin_only = reads.is_admin_only
+    # The manager's limits of the attached servers, for the prompt; with
+    # the run's own pair folded in (one pair per server), for the hook and
+    # the engines.
+    manager_pairs = tool_limits.grants(
+        limits, [m for m in agent_mcps if m.name not in (excluded_mcps or {})])
+    limit_pairs = tool_limits.merged(manager_pairs, tool_limits.TASK_SESSION_LIMIT)
     # No secret file of the agent's goes to a personal disk (the chat
     # builder's rule): an agent-scope run there carries only what is its
     # person's, the chat worker's delegator on their own computer.
-    secret_bundles = personal_machine_bundles(secret_bundles or {}, target, vis.mount_username,
+    secret_bundles = personal_machine_bundles(secret_bundles or {}, target, agents_accounts,
                                               agent_name, who="build_task_agent_config",
                                               owner=personal_owner)
     # A person's own task on a Shared-only agent below the editor tier would
@@ -754,7 +966,7 @@ async def build_task_agent_config(
     # payload. Its iat is the session's token floor (``token_minted_at``).
     from auth.session_token import mint_session_env
     token_minted_at = mint_session_env(
-        credential_env, session_id or "", agent_name, token_sub, external="",
+        credential_env, session_id or "", agent_name, token_sub, external="", role=task_role or "",
     )
 
     # A Codex config gets the credential environment written in, after
@@ -790,6 +1002,7 @@ async def build_task_agent_config(
         knowledge_libraries=_knowledge_libraries,
         knowledge_rw=identity.knowledge_rw,
         read_only=bool(judge),
+        tool_limits=limit_pairs,
     )
 
     # Resolve dynamic MCP context. Pass user_sub + user_role so manifest
@@ -820,10 +1033,9 @@ async def build_task_agent_config(
         # Pre-resolved off-loop: the delegation + meetings providers are no-I/O.
         delegation_roster=await asyncio.to_thread(
             dynamic_context.build_delegation_roster, resolved_targets,
-            # The person whose accounts the run spends (the creator; the
-            # delegator on their own computer): the roster lists what they
-            # may run on each target.
-            user_sub_for_creds or (machine_owner if on_owners_computer else "") or "",
+            # The person whose accounts the run spends: the roster lists
+            # what they may run on each target.
+            payer.sub or "",
         ),
         meetings_access=await asyncio.to_thread(
             dynamic_context.build_meetings_access, token_sub, task_role or "",
@@ -834,7 +1046,16 @@ async def build_task_agent_config(
         nouser_reads=not token_sub,
         trigger_payload=trigger_payload,
         placement=target,
+        **({"account_choices": reads.account_choices} if reads.account_choices else {}),
     )
+    # The accounts block: whose accounts the run uses when they are a
+    # person's, and the accounts it may switch to for its next round where
+    # the run chooses (``_with_accounts_block``).
+    from core.config.config_builder import _with_accounts_block
+    dynamic_contexts = await _with_accounts_block(
+        dynamic_contexts or [], agent_name, assigned_mcp_names, user_sub_for_creds or "",
+        reads.account_choices, switchable=bool(reads.choice_scope) and not judge,
+        scope=reads.choice_scope, run=True)
 
     # Build system prompt. MOUNT username drives the tree + user-context
     # sections; the real creator identity is rendered from task_security.
@@ -856,6 +1077,8 @@ async def build_task_agent_config(
         mount_shared=vis.mount_shared,
         execution_path=execution_path or "",
         read_only=bool(judge),
+        tool_limits=manager_pairs,
+        session_id=session_id,
     )
     agent_prompt = (agent_prompt or "") + build_permission_context(
         task_security,
@@ -885,13 +1108,6 @@ async def build_task_agent_config(
     #   meetings-mcp, notifications-mcp, schedules-mcp, delegation-mcp manifest.json.
     task_extra_env: dict[str, str] = {}
 
-    # Acquire execution layer subscription (API key, OAuth, or local endpoint)
-    # (execution_path already resolved above for sandbox rewrite gating)
-    subscription_id = ""
-    # User-scoped tasks prefer the creator's subscription; agent-scoped use
-    # platform pool, except a chat worker on its delegator's own computer.
-    sub_user = user_sub_for_creds or (machine_owner if on_owners_computer else None)
-
     # Prepare the persistent config dir — .codex/ for Codex, .claude/ otherwise.
     # The codex layer reads ``config.sandbox_host_claude_dir`` AS its CODEX_HOME;
     # a Codex task whose config landed in .claude/ ran against a missing .codex
@@ -901,6 +1117,7 @@ async def build_task_agent_config(
     # Computed BEFORE the subscription resolve — the dir keys the scope-sticky
     # acquisition below.
     from core.sandbox.sandbox import ensure_persistent_agent_dir
+    from core.sandbox.session_config_dir import session_home_for
     host_claude_dir = await asyncio.to_thread(
         ensure_persistent_agent_dir,
         agent_name,
@@ -909,29 +1126,20 @@ async def build_task_agent_config(
         scope=vis.mount_scope,
         read_only=bool(judge),
     )
+    home = session_home_for(host_claude_dir, session_id, execution_path=execution_path, ctx=task_security)
 
-    try:
-        subscription_id, sub_env = await asyncio.to_thread(
-            subscription_pool.resolve_subscription_env,
-            execution_path, sub_user,
-            model=resolved_model, agent_info=agent_info,
-            # Scope-sticky: sessions sharing this credential dir must run on
-            # ONE account (same key the layer stamps at bind_session).
-            sticky_scope=subscription_pool.credential_scope_key(
-                task_target_value, str(host_claude_dir)),
-        )
-        task_extra_env.update(sub_env)
-    except subscription_pool.NoSubscriptionError:
-        raise
-    except Exception as e:  # noqa: BLE001  # the pool spans db, relay and engine: a user task gets a clean block
-        logger.warning("Subscription pool error for task on %s: %s", agent_name, e)
-    # User-scoped task with no resolved credentials → surface a clean block (the
-    # task runner marks the run failed with this reason) rather than a cryptic
-    # mid-run provider error. Agent-scoped tasks use the platform pool as before.
-    if sub_user and not subscription_id:
-        raise subscription_pool.NoSubscriptionError(
-            subscription_pool.user_scope_block_reason(execution_path, sub_user)
-        )
+    # The account (API key, OAuth, or local endpoint) through the one
+    # owner: a person who resolves nothing, or who lost the agent, is a
+    # clean block (the runner fails the run with the sentence), never the
+    # shared subscriptions.
+    spent = await asyncio.to_thread(functools.partial(
+        spender.spend_env, payer, execution_path, model=resolved_model, agent_info=agent_info,
+        # Scope-sticky: sessions sharing this credential dir must run on
+        # ONE account (same key the layer stamps at bind_session).
+        sticky_scope=subscription_pool.scope_key_for(task_target_value, str(host_claude_dir), home),
+        agent=agent_name, lane=spender.run_kind(task) is spender.Kind.CHAT_LANE))
+    subscription_id = spent.subscription_id
+    task_extra_env.update(spent.env)
 
     # Execution-mode resolver: an autonomous task runs
     # as the native interactive TUI — instead of headless -p — when the global
@@ -962,8 +1170,11 @@ async def build_task_agent_config(
         task_interactive = default_interactive and _caps.runtime.supports_interactive_pty
     if task_interactive and is_remote:
         from core.remote.satellite_connection import get_connection_manager
+        # The machine that runs it: the compute machine for a compute
+        # placement (its target value is the platform's place).
+        _pl = placement.compute_of(target)
         task_interactive = get_connection_manager().satellite_supports_pty(
-            task_target_value
+            _pl.machine_id if _pl is not None else task_target_value
         )
     if judge:
         # A judge is one headless turn, never a terminal.
@@ -991,11 +1202,13 @@ async def build_task_agent_config(
         effort=resolved_effort,
         resume=False,  # Only True for continue_session (set by scheduler)
         token_minted_at=token_minted_at,
+        account_choices=reads.account_choices,
         extra_env=task_extra_env,
         security_context=task_security,
         subscription_id=subscription_id,
-        subscription_user_sub=sub_user or "",
+        subscription_user_sub=spent.bound_sub,
         sandbox_host_claude_dir=str(host_claude_dir),
+        session_home=home,
         multi_value_envs=multi_value_envs,
         execution_target=task_target_value,
         # Set only when the task's own machine gave way (the run's chat
@@ -1009,6 +1222,7 @@ async def build_task_agent_config(
 
 async def build_delivery_security_context(
     agent_name: str, *, user_sub: str | None, role: str, target: str,
+    compute: dict | None = None, tool_limits: tuple = (),
 ) -> SecurityContext:
     """SecurityContext for a server-driven one-shot resume of an existing
     chat session (delegate-result delivery).
@@ -1035,9 +1249,8 @@ async def build_delivery_security_context(
         return username, vis, agent_store.is_admin_only(agent_name)
 
     username, vis, is_admin_agent = await asyncio.to_thread(_identity_reads)
-    where = await asyncio.to_thread(
-        remote_store.placement_of, target, user_sub, agent_name,
-    )
+    from services.remote import machine_away
+    where = await machine_away.settled_placement(target, user_sub, agent_name, compute=compute)
     try:
         from storage.knowledge import db_knowledge_libraries as _db_kl
         _kl_rows = await asyncio.to_thread(
@@ -1057,4 +1270,5 @@ async def build_delivery_security_context(
         config_visible=vis.config_visible,
         available_scopes=vis.available_scopes,
         knowledge_libraries=_knowledge_libraries,
+        tool_limits=tool_limits,
     )

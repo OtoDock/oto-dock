@@ -8,10 +8,9 @@
 // because installs are shared across chats. See store/installStore.ts.
 
 import { create } from 'zustand'
-import { persist, createJSONStorage, type StateStorage } from 'zustand/middleware'
 
-import { toQueuedMessage, type PendingImage, type PendingFile, type QueuedMessage } from './types'
-import { CHAT_PHASE, isLiveChatPhase, type ChatStreamPhase } from '../lib/status/chat'
+import type { PendingImage, PendingFile, QueuedMessage } from './types'
+import { CHAT_PHASE, type ChatStreamPhase } from '../lib/status/chat'
 
 // The slice's phase is the mirror's union minus the widget's derived
 // `finished` (lib/status/chat.ts); re-exported for the slice's readers.
@@ -25,6 +24,20 @@ export interface TargetMismatch {
   pinnedLabel: string
   resolvedTarget: string
   resolvedLabel: string
+}
+
+/** The banner's fields as `warmup_ready` and `target_mismatch` carry them,
+ *  or null when the frame has none. */
+export function targetMismatchOf(frame: {
+  pinned_target?: string; pinned_label?: string; resolved_target?: string; resolved_label?: string
+}): TargetMismatch | null {
+  if (!frame.pinned_target || !frame.resolved_target) return null
+  return {
+    pinnedTarget: frame.pinned_target,
+    pinnedLabel: frame.pinned_label || frame.pinned_target,
+    resolvedTarget: frame.resolved_target,
+    resolvedLabel: frame.resolved_label || frame.resolved_target,
+  }
 }
 
 export interface ChatSlice {
@@ -43,15 +56,15 @@ export interface ChatSlice {
   warmupStartedAt: number | null
   warmupError: string | null
   lastEventAt: number
-  // Persisted (localStorage via partialize). Draft text the user
-  // typed but hasn't sent. Survives chat-to-chat nav, browser reload,
-  // app background. Cleared on successful send.
+  // Stored in the browser per chat (store/chatDrafts.ts). Draft text the
+  // user typed but hasn't sent. Survives chat-to-chat nav, browser reload,
+  // app background and other windows. Cleared on successful send.
   draftInput: string
   // Messages the user typed during streaming that the backend queued
   // for the next turn. Mirrors `pump.message_queue` on the proxy via
   // onQueued / onQueueRemoved / onQueueSent deltas + a queue_snapshot
-  // emitted by the backend on resume_chat (reconciles against any
-  // localStorage drift). Persisted across reloads (text + attachment meta).
+  // emitted by the backend on resume_chat (reconciles against what the
+  // browser stored). Stored like the draft (text + attachment meta).
   queuedMessages: QueuedMessage[]
   // Pending attachments — in-memory only. Survive chat-to-chat nav (the
   // per-chat slice is keyed by chat_id) but NOT a full reload (base64
@@ -98,6 +111,8 @@ interface ChatStoreState {
     },
   ) => void
   failWarmup: (chatId: string, error: string) => void
+  /** The banner's mismatch read again (`target_mismatch`); nothing else changes. */
+  setTargetMismatch: (chatId: string, mismatch: TargetMismatch | null) => void
   setStreaming: (chatId: string) => void
   setReady: (chatId: string) => void
   setUnread: (chatId: string, unread: boolean) => void
@@ -153,32 +168,6 @@ const _emptySlice = (chatId: string): ChatSlice => ({
   pendingFiles: [],
 })
 
-// 300ms-debounced wrapper around localStorage. The persist middleware writes
-// synchronously on every state mutation — without debouncing, each textarea
-// keystroke triggers a JSON.stringify + localStorage.setItem (~1KB) which
-// adds latency on slower devices. Risk: a 300ms window where a tab crash
-// loses the latest keystroke. Acceptable for draft text.
-function debouncedLocalStorage(): StateStorage {
-  let pending: ReturnType<typeof setTimeout> | null = null
-  let queued: Record<string, string> = {}
-  return {
-    getItem: (key) => localStorage.getItem(key),
-    setItem: (key, value) => {
-      queued[key] = value
-      if (pending) clearTimeout(pending)
-      pending = setTimeout(() => {
-        for (const [k, v] of Object.entries(queued)) localStorage.setItem(k, v)
-        queued = {}
-        pending = null
-      }, 300)
-    },
-    removeItem: (key) => {
-      delete queued[key]
-      localStorage.removeItem(key)
-    },
-  }
-}
-
 /** The slices without the chips of `queueIds`, wherever they sit; the same
  *  object when no slice held one. */
 function withoutQueueIds(byChat: Record<string, ChatSlice>, queueIds: string[]): Record<string, ChatSlice> {
@@ -192,7 +181,7 @@ function withoutQueueIds(byChat: Record<string, ChatSlice>, queueIds: string[]):
   return out
 }
 
-export const useChatStore = create<ChatStoreState>()(persist((set, get) => ({
+export const useChatStore = create<ChatStoreState>()((set, get) => ({
   byChat: {},
 
   beginWarmup: (chatId, data) =>
@@ -298,6 +287,12 @@ export const useChatStore = create<ChatStoreState>()(persist((set, get) => ({
       return {
         byChat: { ...s.byChat, [chatId]: { ...prev, status: CHAT_PHASE.READY, lastEventAt: Date.now() } },
       }
+    }),
+
+  setTargetMismatch: (chatId, mismatch) =>
+    set((s) => {
+      const prev = s.byChat[chatId] ?? _emptySlice(chatId)
+      return { byChat: { ...s.byChat, [chatId]: { ...prev, targetMismatch: mismatch } } }
     }),
 
   setUnread: (chatId, unread) =>
@@ -517,55 +512,9 @@ export const useChatStore = create<ChatStoreState>()(persist((set, get) => ({
       const { [chatId]: _, ...rest } = s.byChat
       return { byChat: rest }
     }),
-}), {
-  name: 'oto-dock-chat-store',
-  storage: createJSONStorage(debouncedLocalStorage),
-  // Version 1 persisted a queued message as its bare text, version 2 the
-  // item with its attachment meta; version 3 items carry their queue id and
-  // author. The migration lifts old entries (no id), and the queue_snapshot
-  // on resume replaces them: the chat's queue is the proxy's.
-  version: 3,
-  migrate: (persisted) => {
-    const state = (persisted ?? {}) as { byChat?: Record<string, ChatSlice> }
-    for (const slice of Object.values(state.byChat ?? {})) {
-      if (Array.isArray(slice.queuedMessages)) {
-        slice.queuedMessages = slice.queuedMessages.map(toQueuedMessage)
-      }
-    }
-    return state as Partial<ChatStoreState>
-  },
-  // Persist ONLY draftInput + queuedMessages (text + attachment meta, small). Live
-  // session metadata is in-memory; pending attachments contain
-  // non-serializable File / AbortController refs and base64 blobs too
-  // big for localStorage. Backend resends a queue_snapshot on resume_chat
-  // so any persisted queuedMessages drift gets reconciled within ~200ms
-  // of reconnect (see proxy/ws/dashboard.py::_handle_resume_chat).
-  partialize: (state) => ({
-    byChat: Object.fromEntries(
-      Object.entries(state.byChat)
-        .filter(([_, slice]) =>
-          (slice.draftInput && slice.draftInput.length > 0) ||
-          slice.queuedMessages.length > 0,
-        )
-        .map(([chatId, slice]) => [
-          chatId,
-          {
-            ..._emptySlice(chatId),
-            draftInput: slice.draftInput,
-            queuedMessages: slice.queuedMessages,
-          },
-        ]),
-    ),
-  }) as Partial<ChatStoreState>,
 }))
 
 // ─── selector hooks ───────────────────────────────────────────────────────
 
 export const useChatSlice = (chatId: string | null | undefined): ChatSlice | undefined =>
   useChatStore((s) => (chatId ? s.byChat[chatId] : undefined))
-
-// Non-hook accessor for WS dispatch callbacks.
-export const getActiveChatIds = (): string[] => {
-  const byChat = useChatStore.getState().byChat
-  return Object.keys(byChat).filter((cid) => isLiveChatPhase(byChat[cid]?.status))
-}

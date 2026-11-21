@@ -36,7 +36,7 @@ from fastapi import HTTPException
 
 import config
 from auth import roles
-from core import layout
+from core import agent_folder, layout
 from services.apps import app_deploy
 from services.community import template_sig
 from services.community.community_agent_template_store import (
@@ -48,8 +48,11 @@ from services.community.community_agent_template_store import (
     substitute_template_vars,
     template_to_persistable_dict,
 )
+from services.infra import safe_fs
 from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
+from services.scheduler import task_fields
 from storage.agents import agent_store
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock.community-agent-updater")
 
@@ -154,10 +157,13 @@ async def _fetch_new(agent_row: dict) -> tuple[CommunityAgentTemplate, Path, dic
     return template, extracted, entry
 
 
-def consent_lines(template: CommunityAgentTemplate, old: CommunityAgentTemplate | None) -> dict:
+def consent_lines(agent: str, template: CommunityAgentTemplate, old: CommunityAgentTemplate | None) -> dict:
     """The apps and checks of the new version the presser consents to, in
     the install dialog's shape, each marked new or changed against the
-    installed version (an unchanged one needs no new consent)."""
+    installed version (an unchanged one needs no new consent), and an app
+    marked ``adds_server`` when it has a server the installed version does
+    not run (``_installed_runs_server``)."""
+    from services.apps import app_sandbox
     from services.community import template_app_seeder
     old_apps = {a.slug: a for a in (old.apps if old else [])}
     old_checks = {c.name: c for c in (old.checks if old else [])}
@@ -166,12 +172,14 @@ def consent_lines(template: CommunityAgentTemplate, old: CommunityAgentTemplate 
         assert a.dir is not None
         doc = json.loads((a.dir / template_sig.MANIFEST_DOC).read_text(encoding="utf-8"))
         bp = a.blueprint or None
-        row = template_app_seeder.preview_shape(doc, a.visibility, bp)
+        has_server = bool(app_sandbox.server_entry(a.dir))
+        row = template_app_seeder.preview_shape(doc, a.visibility, bp, has_server=has_server)
         row["slug"] = a.slug
         prev = old_apps.get(a.slug)
         apps.append({
             "slug": a.slug, "title": a.title or a.slug, "visibility": a.visibility, "sig": a.sig,
             "owner_approval": a.owner_approval, "row": row,
+            "adds_server": has_server and not _installed_runs_server(agent, a),
             "blueprint_tasks": [{"slug": str(t.get("slug") or ""), "description": str(t.get("description") or ""),
                                  "prompt": str(t.get("prompt") or "")}
                                 for t in (bp or {}).get("tasks") or [] if isinstance(t, dict)],
@@ -195,6 +203,24 @@ def consent_lines(template: CommunityAgentTemplate, old: CommunityAgentTemplate 
             "change": "new" if prev_check is None else ("changed" if prev_check.sig != c.sig else "same"),
         })
     return {"apps": apps, "checks": checks}
+
+
+def _installed_runs_server(agent: str, item: AppItem) -> bool:
+    """Whether the installed version of a template app has a server: the
+    agent's shared app of that name by its live release, else a per-user
+    app's stored copy (the seed of the installed version). What cannot be
+    read counts as none, so the dialog then says the new version adds one.
+    A shared app of the same name that runs a server hides the line, and its
+    consent then never covers a server added to a live copy."""
+    from services.apps import app_sandbox, releases
+    from services.community import template_app_seeder
+    from storage import database as task_store
+    row = task_store.get_app_by_slug(agent, "", item.slug)
+    if row and releases.live_runs_server(row):
+        return True
+    source = template_app_seeder.seed_source_dir(agent, item.slug)
+    return bool(template_app_seeder.unlinked(source, config.get_agent_dir(agent))
+                and app_sandbox.server_entry(source))
 
 
 # ── the layers ──────────────────────────────────────────────────────────────
@@ -246,14 +272,15 @@ class _Run:
         """A locally changed piece stays; the new version lands beside it
         (a file's text, or an app folder's tree) for "Take the new version"."""
         if self.apply:
+            from services.apps import releases
             from services.community.template_app_seeder import guard
             dest = guard(self.agent_dir, self.beside / new_rel)
             if new_text is not None:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(new_text, encoding="utf-8")
+                _write(dest, new_text)
             elif new_tree is not None:
-                shutil.rmtree(dest, ignore_errors=True)
-                shutil.copytree(new_tree, dest, symlinks=False)
+                root, rel = agent_folder.beneath_agent(dest)
+                safe_fs.rmtree_beneath(root, rel, missing_ok=True)
+                safe_fs.copytree_beneath(*releases.tree_root(new_tree), root, rel, symlinks="skip")
         self.report["kept"].append({
             "what": what, "reason": reason, "path": path,
             "new_path": f"config/{BESIDE_DIR}/{self.new.version}/{new_rel}",
@@ -264,11 +291,26 @@ def _sha(text: str) -> str:
     return template_sig.sha256_text(text)
 
 
+#: A template piece (a persona, a guide, a context file, a check's script)
+#: is read whole, at most this much.
+_PIECE_MAX_BYTES = 8 * 1024 * 1024
+
+
 def _read(path: Path) -> str | None:
+    """A piece's text, read beneath the agent's real folder with no link
+    followed; None when it is not there, not a plain file or not text."""
     try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
+        data = safe_fs.read_bytes_beneath(*agent_folder.beneath_agent(path), max_size=_PIECE_MAX_BYTES)
+        return data.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
         return None
+
+
+def _write(path: Path, text: str) -> None:
+    """A piece written whole beneath the agent's real folder with no link
+    followed: a link at the name is replaced, never written through."""
+    safe_fs.atomic_write_beneath(*agent_folder.beneath_agent(path), text.encode("utf-8"),
+                                 mkdirs=True, fsync=False)
 
 
 def _file_layer(run: _Run, what: str, path: Path, rel: str, new_text: str, base_sha: str | None,
@@ -278,12 +320,15 @@ def _file_layer(run: _Run, what: str, path: Path, rel: str, new_text: str, base_
     anything else → kept with the new version beside."""
     from services.community.template_app_seeder import guard
     local = _read(path)
+    if local is None and _piece_kind(path) != "missing":
+        # There, but not a plain text file within the cap: kept, never taken for missing.
+        run.kept(what, "not a plain text file", rel, new_rel, new_text=new_text)
+        return
     if local is None:
         if not add_when_missing:
             return
         if run.apply:
-            guard(run.agent_dir, path).parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(new_text, encoding="utf-8")
+            _write(guard(run.agent_dir, path), new_text)
             _push(run, path, commit=commit)
         run.added(what)
         return
@@ -292,7 +337,7 @@ def _file_layer(run: _Run, what: str, path: Path, rel: str, new_text: str, base_
         return
     if base_sha and _sha(local) == base_sha:
         if run.apply:
-            guard(run.agent_dir, path).write_text(new_text, encoding="utf-8")
+            _write(guard(run.agent_dir, path), new_text)
             _push(run, path, commit=commit)
         run.replaced(what)
         return
@@ -352,7 +397,7 @@ def _layer_context(run: _Run) -> None:
     for rel, content in sorted(run.new.context_files.items()):
         stripped = _strip_context(rel)
         path = run.agent_dir / layout.CONFIG / layout.CONTEXT / stripped
-        if stripped in old_names and not path.is_file():
+        if stripped in old_names and _piece_kind(path) == "missing":
             run.removed(f"context/{stripped}")
             continue
         _file_layer(run, f"context/{stripped}", path,
@@ -366,7 +411,7 @@ def _layer_setup(run: _Run) -> None:
     if run.new.setup_md is None:
         return
     path = run.agent_dir / layout.CONFIG / layout.CONTEXT / "setup.md"
-    if not path.is_file():
+    if _piece_kind(path) == "missing":
         run.report.setdefault("notes", []).append("the setup guide was completed; the new one was not added")
         return
     _file_layer(run, "the setup guide (setup.md)", path, "config/context/setup.md",
@@ -390,19 +435,23 @@ def _layer_user_setup(run: _Run) -> None:
                 new_text, base, "user-setup.md", add_when_missing=True)
     replaced = kept = 0
     users_dir = run.agent_dir / layout.USERS
-    if users_dir.is_dir():
-        for udir in sorted(p for p in users_dir.iterdir() if p.is_dir()):
-            copy = udir / layout.CONTEXT / "user-setup.md"
-            text = _read(copy)
-            if text is None or text == new_text:
-                continue
-            if (base and _sha(text) == base) or (follows and text == old_text):
-                if run.apply:
-                    copy.write_text(new_text, encoding="utf-8")
-                    _push(run, copy, commit=False)
-                replaced += 1
-            else:
-                kept += 1
+    try:
+        step = next(safe_fs.walk_beneath(*agent_folder.beneath_agent(users_dir)))
+        members = sorted(step.dirs)
+    except (OSError, StopIteration):
+        members = []
+    for name in members:
+        copy = users_dir / name / layout.CONTEXT / "user-setup.md"
+        text = _read(copy)
+        if text is None or text == new_text:
+            continue
+        if (base and _sha(text) == base) or (follows and text == old_text):
+            if run.apply:
+                _write(copy, new_text)
+                _push(run, copy, commit=False)
+            replaced += 1
+        else:
+            kept += 1
     run.report["members"]["user_setup_replaced"] = replaced
     run.report["members"]["user_setup_kept"] = kept
 
@@ -524,9 +573,10 @@ def _layer_items(run: _Run) -> None:
                 run.report["kept"].append({"what": what, "reason": "edited locally", "path": "", "new_path": ""})
 
 
-def _task_groups(item) -> tuple[dict, dict, dict]:
-    """A template task's row fields in the three groups an update judges
-    apart: the text and the clock, the model and the engine, the mode."""
+def _task_groups(item) -> tuple[dict, ...]:
+    """A template task's row fields in the groups an update judges apart:
+    the text and the clock, the model and the engine, the notification
+    mode, the permission mode, the timeout."""
     return (
         {
             "prompt": item.prompt, "name": item.description or item.slug,
@@ -536,6 +586,8 @@ def _task_groups(item) -> tuple[dict, dict, dict]:
         },
         {"override_model": item.override_model or "", "override_execution_path": item.layer or ""},
         {"notification_mode": item.notification_mode},
+        {"permission_mode": item.permission_mode},
+        {"timeout_seconds": item.timeout_seconds},
     )
 
 
@@ -612,9 +664,16 @@ def _merge_task_row(run: _Run, row: dict, item, prev, what: str) -> None:
     from storage.automation import db_tasks
     changes: dict = {}
     kept = False
-    old_groups = _task_groups(prev) if prev is not None else (None, None, None)
-    for new, old in zip(_task_groups(item), old_groups, strict=True):
+    new_groups = _task_groups(item)
+    old_groups = _task_groups(prev) if prev is not None else (None,) * len(new_groups)
+    for new, old in zip(new_groups, old_groups, strict=True):
         if _row_holds(row, new):
+            continue
+        if new.get("permission_mode") and task_fields.mode_problem(
+                run.agent, row.get("override_execution_path") or None, new["permission_mode"]):
+            # A template's Auto on a row a person pinned to an engine with
+            # no reviewer: the row keeps its mode, the update goes on.
+            kept = True
             continue
         if old is not None and _row_holds(row, old):
             changes.update(new)
@@ -635,6 +694,31 @@ def _merge_task_row(run: _Run, row: dict, item, prev, what: str) -> None:
         run.same()
 
 
+def _piece_kind(path: Path) -> str:
+    """``"file"``, ``"missing"`` or ``"other"`` (a link, a folder, anything
+    a session put at the name, or a link on the way): looked at with no link
+    followed, so the dry run and the apply decide the same."""
+    try:
+        kind = safe_fs.kind_beneath(*agent_folder.beneath_agent(path)).kind
+    except OSError:
+        return "other"
+    return "other" if kind == "dir" else kind
+
+
+def _write_dashboard(path: Path, html: str, *, exclusive: bool = False) -> bool:
+    """The catalog's page beneath the agent's real folder
+    (``core/agent_folder.py``): a link at the name is replaced, never
+    written through, a link below the agent's folder refuses it, and
+    ``exclusive`` keeps whatever is already there. False when refused."""
+    try:
+        safe_fs.atomic_write_beneath(*agent_folder.beneath_agent(path), html.encode("utf-8"),
+                                     mkdirs=True, exclusive=exclusive)
+    except OSError:
+        logger.warning("template update: %s was not written", path, exc_info=True)
+        return False
+    return True
+
+
 def _layer_dashboards(run: _Run) -> None:
     from storage import database as task_store
     base = run.baseline.get("dashboards") or {}
@@ -648,9 +732,7 @@ def _layer_dashboards(run: _Run) -> None:
         if not html.strip():
             continue
         if run.apply:
-            from services.community.template_app_seeder import guard
-            src_dir.mkdir(parents=True, exist_ok=True)
-            guard(run.agent_dir, src_dir / f"{d.slug}.html").write_text(html, encoding="utf-8")
+            _write_dashboard(src_dir / f"{d.slug}.html", html)
         targets: list[tuple[str, Path, str]] = []
         if d.visibility == "agent":
             targets.append(("", run.agent_dir / layout.WORKSPACE / "apps" / f"{d.slug}.html",
@@ -659,18 +741,22 @@ def _layer_dashboards(run: _Run) -> None:
             users_dir = run.agent_dir / layout.USERS
             for udir in sorted(p for p in users_dir.iterdir() if p.is_dir()) if users_dir.is_dir() else []:
                 p = udir / layout.WORKSPACE / "apps" / f"{d.slug}.html"
-                if p.is_file():
+                if _piece_kind(p) == "file":
                     targets.append((udir.name, p, f"{layout.user_rel(udir.name)}/{layout.WORKSPACE}/apps/{d.slug}.html"))
         for username, path, rel in targets:
             what = f"the dashboard '{d.slug}'" + (f" of {username}" if username else "")
-            local = _read(path)
-            if local is None:
+            kind = _piece_kind(path)
+            local = _read(path) if kind == "file" else None
+            if kind == "other" or (kind == "file" and local is None):
+                run.kept(what, "not a plain file", rel, f"dashboards/{d.slug}.html", new_text=html)
+            elif local is None:
                 if d.slug in old_dash:
                     run.removed(what)
                     continue
                 if run.apply:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(html, encoding="utf-8")
+                    if not _write_dashboard(path, html, exclusive=True):
+                        run.kept(what, "not a plain file", rel, f"dashboards/{d.slug}.html", new_text=html)
+                        continue
                     task_store.upsert_app(run.agent, "", None, d.slug, title=d.title, rel_path=rel,
                                           actions_json="[]")
                 run.added(what)
@@ -678,7 +764,9 @@ def _layer_dashboards(run: _Run) -> None:
                 run.same()
             elif base.get(d.slug) and _sha(local) == base[d.slug]:
                 if run.apply:
-                    path.write_text(html, encoding="utf-8")
+                    if not _write_dashboard(path, html):
+                        run.kept(what, "not a plain file", rel, f"dashboards/{d.slug}.html", new_text=html)
+                        continue
                     _push(run, path, commit=False)
                 run.replaced(what)
             else:
@@ -854,13 +942,14 @@ async def _layer_apps(run: _Run, new_data: dict) -> None:
                 trig_items = await asyncio.to_thread(
                     _plan_copy_triggers, run, item, prev, owner_sub, trig_seen)
                 if run.apply:
-                    by, why = seeder.admits(item, seeder.consent_entry(new_data, "apps", item.slug),
-                                            run.agent, username, owner_sub)
+                    entry = seeder.consent_entry(new_data, "apps", item.slug)
+                    by, why = await run_db(seeder.admits, item, entry, run.agent, username, owner_sub)
                     try:
                         res = await app_blueprints.import_folder(
                             run.agent, username, owner_sub, item.slug, item.dir,
                             template_slug=run.new.slug, tasks=list(item.blueprint.get("tasks") or []),
-                            cold=True, approve_as=by, template_ref=ref, triggers=trig_items,
+                            cold=True, approve_as=by, **seeder.consent_reach(item, entry, row), template_ref=ref,
+                            triggers=trig_items,
                             origin=(run.new.slug, run.new.version))
                     except Exception as e:  # noqa: BLE001  # an app's deploy spans the store and the pipeline, it is reported kept
                         run.report["kept"].append({"what": what, "reason": f"the new version failed to deploy: {e}",
@@ -966,9 +1055,8 @@ def _layer_checks(run: _Run, new_data: dict) -> None:
                      f"config/checks/{item.name}/check.json", f"checks/{item.name}/check.json", new_text=text)
             if item.script is not None and item.script_name and run.apply:
                 from services.community.template_app_seeder import guard
-                p = guard(run.agent_dir, run.beside / "checks" / item.name / item.script_name)
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(item.script, encoding="utf-8")
+                _write(guard(run.agent_dir, run.beside / "checks" / item.name / item.script_name),
+                       item.script)
 
 
 async def _layer_mcps(run: _Run) -> None:
@@ -1114,7 +1202,8 @@ async def plan(agent_slug: str, by_sub: str, by_role: str) -> dict:
         return {
             "agent_slug": agent_slug, "from_version": str(row.get("community_template_version") or ""),
             "to_version": template.version, "template_slug": template.slug,
-            "display_name": template.display_name, **report, **consent_lines(template, run.old),
+            "display_name": template.display_name, **report,
+            **await asyncio.to_thread(consent_lines, agent_slug, template, run.old),
             "consent_scope": "everyone" if roles.is_admin(by_role) else "own",
             "has_baseline": bool(run.baseline),
         }
@@ -1123,7 +1212,8 @@ async def plan(agent_slug: str, by_sub: str, by_role: str) -> dict:
 
 
 async def apply(agent_slug: str, by_sub: str, by_role: str, *, from_version: str,
-                app_consent: dict[str, str] | None, check_consent: dict[str, str] | None) -> dict:
+                app_consent: dict[str, str] | None, check_consent: dict[str, str] | None,
+                server_consent: list[str] | None = None) -> dict:
     """Start the update as a job: ``{job_id}``; 409 when the agent is not
     at ``from_version`` any more or an update is already running."""
     row = await asyncio.to_thread(agent_store.get_agent, agent_slug)
@@ -1154,7 +1244,8 @@ async def apply(agent_slug: str, by_sub: str, by_role: str, *, from_version: str
                     raise RuntimeError(f"the agent moved to {now_row.get('community_template_version') or 'another version'} "
                                        "before this update ran")
                 report = await _apply_now(agent_slug, template, by_sub, by_role,
-                                          app_consent=app_consent, check_consent=check_consent)
+                                          app_consent=app_consent, check_consent=check_consent,
+                                          server_consent=server_consent)
                 _jobs[agent_slug].update(status="done", report=report,
                                          finished_at=datetime.now(timezone.utc).isoformat())
                 await _notify_report(agent_slug, by_sub, report)
@@ -1171,7 +1262,8 @@ async def apply(agent_slug: str, by_sub: str, by_role: str, *, from_version: str
 
 
 async def _apply_now(agent_slug: str, template: CommunityAgentTemplate, by_sub: str, by_role: str, *,
-                     app_consent: dict[str, str] | None, check_consent: dict[str, str] | None) -> dict:
+                     app_consent: dict[str, str] | None, check_consent: dict[str, str] | None,
+                     server_consent: list[str] | None = None) -> dict:
     from services.community import (
         community_agent_installer as inst,
         template_app_seeder as seeder,
@@ -1189,7 +1281,7 @@ async def _apply_now(agent_slug: str, template: CommunityAgentTemplate, by_sub: 
     # entry: the same signature, the same person).
     new_data = template_to_persistable_dict(template, agent_slug=agent_slug)
     inst.stamp_core_mcps(new_data, template)
-    seeder.record_consent(new_data, template, app_consent, check_consent, by_sub)
+    seeder.record_consent(new_data, template, app_consent, check_consent, by_sub, servers=server_consent)
     old_consent = old_data.get("consent") or {}
     for kind in ("apps", "checks"):
         for key, entry in (old_consent.get(kind) or {}).items():
@@ -1238,21 +1330,26 @@ async def take(agent_slug: str, new_path: str, by_sub: str, by_role: str) -> dic
         if head == "user-apps" and not username:
             raise HTTPException(400, "you have no personal copy to replace")
         item = next((a for a in (template.apps if template else []) if a.slug == slug), None)
-        by, _why = seeder.admits(item, seeder.consent_entry(data, "apps", slug), agent_slug, username, by_sub) \
-            if item else ("", "")
+        entry = seeder.consent_entry(data, "apps", slug)
+        by, _why = await run_db(seeder.admits, item, entry, agent_slug, username, by_sub) if item else ("", "")
         if by and not await asyncio.to_thread(seeder.copy_matches, cast("AppItem", item), src):  # by is "" without an item
             by = ""
+        row = await asyncio.to_thread(task_store.get_app_by_slug, agent_slug, username, slug)
         res = await app_blueprints.import_folder(
             agent_slug, username, by_sub if username else None, slug, src,
             template_slug=str(data.get("slug") or ""), tasks=seeder._blueprint_tasks(src), cold=True,
-            approve_as=by, template_ref=seeder.template_ref(str(data.get("slug") or ""), slug),
+            approve_as=by, **seeder.consent_reach(item, entry, row),
+            template_ref=seeder.template_ref(str(data.get("slug") or ""), slug),
             triggers=seeder._blueprint_triggers(src),
             origin=(str(data.get("slug") or ""), str(data.get("version") or "")))
         return {"status": res.get("status"), "path": res.get("path")}
     if head == "checks" and len(rel.parts) >= 3:
         folder = src.parent
         try:
-            doc = json.loads(seeder.guard(agent_dir, folder / "check.json").read_text(encoding="utf-8"))
+            raw = _read(seeder.guard(agent_dir, folder / "check.json"))
+            if raw is None:
+                raise FileNotFoundError(folder / "check.json")
+            doc = json.loads(raw)
         except (OSError, ValueError) as exc:
             raise HTTPException(404, "the stored copy is gone") from exc
         script_name = (doc.get("script") or {}).get("run") if isinstance(doc.get("script"), dict) else None
@@ -1284,7 +1381,7 @@ async def take(agent_slug: str, new_path: str, by_sub: str, by_role: str) -> dic
         if d is not None and d.visibility != "agent":
             username = await asyncio.to_thread(task_store.get_username_by_sub, by_sub) or ""  # type: ignore[arg-type]  # mypy solves to_thread's result from the "or" context (str) and then refuses the str | None callable
             dest = layout.user_dir(agent_dir, username) / layout.WORKSPACE / "apps" / rel.parts[1]
-            if not username or not dest.is_file():
+            if not username or _piece_kind(dest) != "file":
                 raise HTTPException(400, "you have no personal copy to replace")
             commit = False
         else:
@@ -1293,8 +1390,12 @@ async def take(agent_slug: str, new_path: str, by_sub: str, by_role: str) -> dic
         raise HTTPException(400, "not a piece an update keeps")
     if not seeder.unlinked(dest, agent_dir):
         raise HTTPException(400, f"{dest.relative_to(agent_dir).as_posix()} is reached through a link")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(text, encoding="utf-8")
+    try:
+        await asyncio.to_thread(_write, dest, text)
+    except safe_fs.SafeFsError as exc:
+        raise HTTPException(400, f"{dest.relative_to(agent_dir).as_posix()} is reached through a link") from exc
+    except IsADirectoryError as exc:
+        raise HTTPException(400, f"{dest.relative_to(agent_dir).as_posix()} is a folder: remove it first") from exc
     if run is not None:
         _push(run, dest, commit=commit)
     return {"status": "replaced", "path": dest.relative_to(agent_dir).as_posix()}
@@ -1325,8 +1426,9 @@ def _report_words(report: dict) -> str:
 async def _notify_report(agent_slug: str, by_sub: str, report: dict) -> None:
     from services.notifications import notification_manager
     with contextlib.suppress(Exception):
+        label = await run_db(notification_manager.agent_label, agent_slug)
         await notification_manager.fire_notification(
-            title=f"{notification_manager.agent_label(agent_slug)} updated to {report.get('to_version')}",
+            title=f"{label} updated to {report.get('to_version')}",
             body=_report_words(report) + ".", severity="success", scope="user", target=by_sub,
             source="community_agent", source_id=agent_slug, href=f"/agents/{agent_slug}/config")
 
@@ -1334,8 +1436,9 @@ async def _notify_report(agent_slug: str, by_sub: str, report: dict) -> None:
 async def _notify_failed(agent_slug: str, by_sub: str, error: str) -> None:
     from services.notifications import notification_manager
     with contextlib.suppress(Exception):
+        label = await run_db(notification_manager.agent_label, agent_slug)
         await notification_manager.fire_notification(
-            title=f"The update of {notification_manager.agent_label(agent_slug)} failed",
+            title=f"The update of {label} failed",
             body=f"{error[:300]}. What was applied stands; press Update again to resume.",
             severity="warning", scope="user", target=by_sub,
             source="community_agent", source_id=agent_slug, href=f"/agents/{agent_slug}/config")
@@ -1372,13 +1475,16 @@ async def maybe_notify_updates() -> int:
             continue
         managers = [m["sub"] for m in await asyncio.to_thread(db_users.get_agent_users, slug)
                     if roles.can_manage(m.get("agent_role"))]
+        label = slug
+        with contextlib.suppress(Exception):
+            label = await run_db(notification_manager.agent_label, slug)
+        have = f" You have {found['installed_version']}." if found["installed_version"] else ""
         for sub in managers:
             with contextlib.suppress(Exception):
                 await notification_manager.fire_notification(
-                    title=f"Version {found['catalog_version']} of {notification_manager.agent_label(slug)}'s "
-                          f"template is available",
-                    body=f"Installed: {found['installed_version'] or 'unknown'}. Open the agent's Config tab "
-                         f"to see what the update changes and apply it.",
+                    title=f"A new version of {label} is ready",
+                    body=f"Version {found['catalog_version']}.{have} Open the agent's settings "
+                         f"to see what changes and to update.",
                     severity="info", scope="user", target=sub, source="community_agent",
                     source_id=slug, href=f"/agents/{slug}/config")
                 told += 1

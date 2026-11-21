@@ -1,0 +1,31 @@
+{
+  "ARCHITECTURE.md": {
+    "long-sentence": 2,
+    "version": 1
+  },
+  "VERSIONS.md": {
+    "dash": 47,
+    "long-sentence": 59,
+    "semicolon": 84
+  },
+  "rig/README.md": {
+    "long-sentence": 4,
+    "semicolon": 4
+  },
+  "satellite/PROTOCOL.md": {
+    "long-sentence": 126,
+    "semicolon": 74
+  },
+  "satellite/README.md": {
+    "long-sentence": 13,
+    "version": 7
+  },
+  "scripts/README.md": {
+    "dash": 6,
+    "long-sentence": 28,
+    "plain-words": 2,
+    "present-tense": 2,
+    "semicolon": 36,
+    "version": 13
+  }
+}

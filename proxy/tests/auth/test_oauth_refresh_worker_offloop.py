@@ -29,7 +29,7 @@ import pytest
 import config
 from auth.oauth_providers.base import OAuthTokenError, TokenSet, UserInfo
 from core.credentials import credential_locks
-from services.mcp import mcp_manifest_parse, mcp_registry
+from services.mcp import mcp_manifest_parse, mcp_manifest_store
 from services.oauth import (
     mcp_authorization as ma,
     oauth_account_store,
@@ -105,14 +105,14 @@ def registered(monkeypatch, person, tmp_path):
     ``extra``). Returns the file, the row and the fake vendor."""
     sub, username = person
     from tests.auth.test_oauth_mcp_authorization_flow import _manifest_data
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     from auth import oauth_providers
     oauth_providers.clear_manifest_cache()
     path = tmp_path / "m" / "manifest.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(_manifest_data()))
     m = mcp_manifest_parse._parse_manifest(path)
-    mcp_registry._manifests[m.name] = m
+    mcp_manifest_store._manifests[m.name] = m
     row = regs.insert(issuer=ISSUER, redirect_uri="https://dash.example/cb",
                       registration_endpoint=f"{ISSUER}/register", client_id="cid-live")
     ts = TokenSet(access_token="old-AT", refresh_token="RT-1", expires_in=60,
@@ -299,7 +299,7 @@ class TestRegisteredClientArm:
         data["credentials"]["oauth"]["authorization_server"]["issuer"] = other
         registered.manifest_path.write_text(json.dumps(data))
         m = mcp_manifest_parse._parse_manifest(registered.manifest_path)
-        mcp_registry._manifests[m.name] = m
+        mcp_manifest_store._manifests[m.name] = m
         raw = _raw(registered.file)
         raw["extra"]["issuer"] = other
         registered.file.write_text(json.dumps(raw))

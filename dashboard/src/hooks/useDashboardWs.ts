@@ -10,7 +10,7 @@ import { useRef, useState, useCallback, useEffect, useMemo, useLayoutEffect } fr
 import { useQueryClient } from '@tanstack/react-query'
 import type { ActiveChat, ChatList } from '../api/chats'
 
-import { useChatStore, getActiveChatIds } from '@/store/chatStore'
+import { useChatStore, targetMismatchOf } from '@/store/chatStore'
 import { cardKey } from '@/api/cards'
 import { toQueuedMessage } from '@/store/types'
 import { useInstallStore } from '@/store/installStore'
@@ -19,12 +19,14 @@ import { useMachineUpdateStore } from '@/store/machineUpdateStore'
 import { emitFileUpdate } from '../lib/fileUpdates'
 import { CATALOG_RESYNC, emitAppLive, releaseCatalogSender, resendCatalogSubscriptions, setCatalogSender } from '../lib/appLive'
 import { releaseFocusSender, resendFocus, setFocusSender } from '../lib/focus'
+import { markChatRead, readMarkConfirmed, releaseReadSender, setReadSender } from '../lib/chat/readMarks'
 import { noteServerBuild } from '../lib/buildId'
-import { noteServerVersion } from '../lib/session/serverInfo'
+import { noteServerUpdating, noteServerVersion } from '../lib/session/serverInfo'
 import type { RefusedSend, WsCallbacks } from './useDashboardWs.types'
 import { isTaskChatId } from '../lib/session/kind'
 import { CHAT_PHASE } from '../lib/status/chat'
-import { OUT, PER_CHAT_FRAMES, WIRE, isWireType, type WireFrame, type WireType } from '../api/wireEvents'
+import { OUT, WIRE, isWireType, type WireFrame, type WireType } from '../api/wireEvents'
+import { frameIsForShownChat, isForShownChat } from '../lib/chat/shownChat'
 import { callNative } from '../lib/nativeBridge'
 import { sessionStillValid } from '../api/auth'
 import { debugWarn, logError } from '../lib/debug/log'
@@ -32,12 +34,12 @@ import { isRecord } from '../lib/json/guards'
 import { isNativePlatform } from '../audio/types'
 import { noteFold } from '../lib/nativeBridge'
 import { AUTO_REVIEW_MODE } from '../lib/engines/modes'
-import { chatTargetsKey, type ChatTargets } from '../api/remoteMachines'
+import { chatTargetsKey, refreshMachinePlaces, type ChatTargets } from '../api/remoteMachines'
 
-// The frames, their per-chat flag (PER_CHAT_FRAMES is derived from the
-// catalogue's table: a frame carrying a chat_id different from the viewed
-// chat is dropped before dispatch, an untagged frame passes) and the
-// messages this hook sends are the wire catalogue's (api/wireEvents.ts).
+// The frames, their per-chat flag (a per-chat frame of another chat, or one
+// carrying words that name no chat, is dropped before dispatch by
+// lib/chat/shownChat.ts) and the messages this hook sends are the wire
+// catalogue's (api/wireEvents.ts).
 
 // A frame type the catalogue does not know warns ONCE per type per page:
 // an older bundle dropped it silently, this one says so and still hands it
@@ -52,6 +54,10 @@ export const WS_CLOSE_GATE = 4403
 // (signed out, the password changed, the person removed); the tab asks
 // /auth/me before it reconnects into the same refusal.
 export const WS_CLOSE_SESSION = 4001
+// How long after a machine's frame the page reads its places again: one
+// read for the burst of machines a platform restart brings back.
+const PLACES_REFRESH_MS = 300
+
 function warnUnknownFrame(type: unknown): void {
   const key = String(type)
   if (warnedFrameTypes.has(key)) return
@@ -190,6 +196,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   const titleInvalidatedIds = useRef<Set<string>>(new Set())
   const lastTitleInvalidateAt = useRef<Map<string, number>>(new Map())
   const taskChatsInvalidateTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const placesRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Track last reported IANA timezone so we can re-send on visibility change
   // when the user crosses time zones (laptop closed in Athens, opened in NYC).
   const lastSentTz = useRef<string | null>(null)
@@ -312,8 +319,10 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws/dashboard`)
     // This socket's senders for the per-connection module state (viewer
     // focus, catalog subscriptions): its close releases these and no other.
-    const sendFrame = (frame: Record<string, unknown>) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame))
+    const sendFrame = (frame: Record<string, unknown>): boolean => {
+      if (ws.readyState !== WebSocket.OPEN) return false
+      ws.send(JSON.stringify(frame))
+      return true
     }
 
     ws.onopen = () => {
@@ -355,6 +364,8 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       setCatalogSender(sendFrame)
       resendCatalogSubscriptions()
       emitAppLive({ type: CATALOG_RESYNC })
+      // The read marks made while no socket was open, or never echoed.
+      setReadSender(sendFrame)
       // Arm a fresh idle timer for this connection. Any user input will reset
       // it; after 5 min without input we'll switch to user_idle.
       armIdleTimer()
@@ -362,24 +373,23 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       // Start ping chain
       schedulePing(ws)
 
-      // On reconnect, re-resume every chat that has live state on the
-      // backend (in-flight warmup OR active stream). The backend uses
-      // resume_chat to attach this WS as a listener — for warming chats
-      // it pulls from the warmup_registry and replays history; for
-      // streaming chats it re-attaches to the active pump. The currently-
-      // displayed chat may not be in this set (e.g. it just finished),
-      // so resume it too if we know it.
+      // On reconnect, resume the chat on screen and no other: the socket
+      // shows the chat its last resume named, so resuming every live chat
+      // left it on another one (lib/chat/shownChat.ts). The other chats'
+      // dots come back with the connect's chat_status_snapshot. The new-chat
+      // view resumes nothing: a fresh socket shows no chat.
       if (reconnectedRef.current) {
         setStreaming(false)
-        const ids = new Set<string>(getActiveChatIds())
-        if (currentChatId.current) ids.add(currentChatId.current)
-        for (const cid of ids) {
-          ws.send(JSON.stringify({ type: OUT.RESUME_CHAT, chat_id: cid }))
-        }
+        autoAttachRef.current = null
+        const vc = callbacksRef.current.viewedChatId
+        const shown = vc !== undefined ? vc : currentChatId.current
+        if (shown) ws.send(JSON.stringify({ type: OUT.RESUME_CHAT, chat_id: shown }))
         // A title_updated missed across the gap leaves the Active-now widget
         // stale forever (it has no poll, unlike the history list) — refetch
         // the seed once per reconnect. One GET per tab; observers dedupe.
         queryClient.invalidateQueries({ queryKey: ['active-chats'] })
+        // A machine that came or went meanwhile told a socket that was gone.
+        refreshMachinePlaces(queryClient)
       }
       reconnectedRef.current = true
     }
@@ -402,6 +412,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
         wsRef.current = null
         releaseFocusSender(sendFrame)
         releaseCatalogSender(sendFrame)
+        releaseReadSender(sendFrame)
         if (pingTimer.current) {
           clearTimeout(pingTimer.current)
           pingTimer.current = null
@@ -416,6 +427,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       wsRef.current = null
       releaseFocusSender(sendFrame)
       releaseCatalogSender(sendFrame)
+      releaseReadSender(sendFrame)
       if (pingTimer.current) {
         clearTimeout(pingTimer.current)
         pingTimer.current = null
@@ -470,14 +482,10 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       const frameChat = isRecord(raw) ? raw.chat_id : undefined
       try {
         const cb = callbacksRef.current
-        // Per-chat stream frames for a chat this view is NOT showing are
-        // dropped (cross-chat contamination guard). viewedChatId === null
-        // means a brand-new chat with no id yet — every tagged stream frame
-        // is foreign until warmup_started mints the id.
-        if (cb.viewedChatId !== undefined && frameChat
-            && frameChat !== cb.viewedChatId && typeof frameType === 'string' && PER_CHAT_FRAMES.has(frameType)) {
-          return
-        }
+        // A per-chat frame reaches the view only when it belongs to the chat
+        // on screen (lib/chat/shownChat.ts): one naming another chat, or
+        // carrying words that name no chat, is dropped here.
+        if (!frameIsForShownChat(frameType, frameChat, cb.viewedChatId)) return
         // The parse boundary: a frame has the mirror's shape by its type
         // (api/wireEvents.ts, lock-step with the proxy's catalogue).
         const msg = raw as WireFrame
@@ -663,6 +671,9 @@ export function useDashboardWs(callbacks: WsCallbacks) {
           case WIRE.PRE_WARMUP_READY:
             cb.onPreWarmupReady?.(msg)
             break
+          case WIRE.PRE_WARMUP_REFUSED:
+            cb.onPreWarmupRefused?.(msg)
+            break
           case WIRE.WARMUP_READY:
             if (msg.chat_id) {
               useChatStore.getState().finishWarmup(msg.chat_id, {
@@ -673,14 +684,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
                 // Pin-vs-current-target mismatch (owner/admin frames only).
                 // null when the fields are absent so a stale mismatch clears
                 // — the fresh warmup after a successful move carries none.
-                target_mismatch: msg.pinned_target && msg.resolved_target
-                  ? {
-                      pinnedTarget: msg.pinned_target,
-                      pinnedLabel: msg.pinned_label || msg.pinned_target,
-                      resolvedTarget: msg.resolved_target,
-                      resolvedLabel: msg.resolved_label || msg.resolved_target,
-                    }
-                  : null,
+                target_mismatch: targetMismatchOf(msg),
               })
             }
             cb.onWarmupReady?.(msg)
@@ -721,7 +725,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             // live-state handling at a chat the user left.
             {
               const vc = cb.viewedChatId
-              if (vc === undefined || vc === null || vc === msg.chat_id) {
+              if (vc === undefined || vc === msg.chat_id || (vc === null && msg.new_chat === true)) {
                 currentChatId.current = msg.chat_id
               }
             }
@@ -850,8 +854,25 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             // transient 'satellite_updated'), + surfaces any in-flight update.
             useMachineUpdateStore.getState().reconcile(msg.inflight || [])
             break
+          case WIRE.MACHINE_LINK:
+            // A machine connected or left: the page reads every place it
+            // shows again, once for a burst (the first frame arms it), and
+            // asks again about the banner of the chat this socket is on.
+            if (!placesRefreshTimer.current) {
+              placesRefreshTimer.current = setTimeout(() => {
+                placesRefreshTimer.current = null
+                refreshMachinePlaces(queryClient)
+                if (wsRef.current?.readyState === WebSocket.OPEN) {
+                  wsRef.current.send(JSON.stringify({ type: OUT.TARGET_CHECK }))
+                }
+              }, PLACES_REFRESH_MS)
+            }
+            break
+          case WIRE.TARGET_MISMATCH:
+            useChatStore.getState().setTargetMismatch(msg.chat_id, targetMismatchOf(msg))
+            break
           case WIRE.MODE_CHANGED:
-            cb.onModeChanged?.(msg.mode)
+            cb.onModeChanged?.(msg.mode, msg.refusal)
             break
           case WIRE.MODEL_CHANGED:
             cb.onModelChanged?.(msg.model)
@@ -1000,9 +1021,12 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             // A server-initiated turn (bg-nudge review / delegate-result
             // synthesis) is now streaming on this chat. No user-send flipped the
             // generating state, so do it here — the timer shows + Send becomes
-            // Stop. The existing 'done'/'aborted' handlers clear it.
-            setStreaming(true)
-            cb.onServerTurnStart?.(msg)  // start the live turn timer (no user-send did)
+            // Stop. The existing 'done'/'aborted' handlers clear it. Only the
+            // view of that chat: another chat's turn lights its dot alone.
+            if (isForShownChat(msg.chat_id, cb.viewedChatId)) {
+              setStreaming(true)
+              cb.onServerTurnStart?.(msg)  // start the live turn timer (no user-send did)
+            }
             {
               const sChatId: string = msg.chat_id || currentChatId.current || ''
               if (sChatId) useChatStore.getState().setStreaming(sChatId)
@@ -1082,9 +1106,12 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             break
           }
           case WIRE.CHAT_READ:
-            // Someone (this user's other tab, or any user of a shared-only
-            // chat) opened the chat — drop the unread dot everywhere.
-            if (msg.chat_id) useChatStore.getState().setUnread(msg.chat_id, false)
+            // Someone (this tab, this user's other tab, or any user of a
+            // shared-only chat) opened the chat — drop the unread dot everywhere.
+            if (msg.chat_id) {
+              useChatStore.getState().setUnread(msg.chat_id, false)
+              readMarkConfirmed(msg.chat_id)
+            }
             break
           case WIRE.PLAN_STATUS:
             cb.onPlanStatus?.(msg)
@@ -1228,6 +1255,9 @@ export function useDashboardWs(callbacks: WsCallbacks) {
           case WIRE.SERVER_INFO:
             noteServerBuild(msg.build_id)
             noteServerVersion(msg.version)
+            // Sent at connect and again at every change: a frame without
+            // `updating` says the platform holds nothing.
+            noteServerUpdating(msg.updating)
             break
           default:
             if (!isWireType(frameType)) warnUnknownFrame(frameType)
@@ -1470,8 +1500,8 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // bound to — the previous chat, whose live session and row a pick made
   // right after "+ New Chat" used to change.
   const changeMode = useCallback(
-    (mode: string, chatId?: string | null) => {
-      send({ type: OUT.MODE_CHANGE, mode, ...(chatId ? { chat_id: chatId } : {}) })
+    (mode: string, chatId?: string | null, theme?: string) => {
+      send({ type: OUT.MODE_CHANGE, mode, ...(chatId ? { chat_id: chatId } : {}), ...(theme ? { theme } : {}) })
     },
     [send],
   )
@@ -1562,6 +1592,13 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     currentChatId.current = null
   }, [setStreaming])
 
+  // The view shows no chat any more (the new-chat view): the socket stops
+  // showing the chat it was on, so nothing of that chat is this view's.
+  const leaveChat = useCallback(() => {
+    currentChatId.current = null
+    send({ type: OUT.LEAVE_CHAT })
+  }, [send])
+
   const resumeChat = useCallback(
     (chatId: string, opts?: { delta?: boolean }) => {
       currentChatId.current = chatId
@@ -1573,17 +1610,6 @@ export function useDashboardWs(callbacks: WsCallbacks) {
         : { type: OUT.RESUME_CHAT, chat_id: chatId })
     },
     [send, setStreaming],
-  )
-
-  const sendChatRead = useCallback(
-    (chatId: string) => {
-      // Viewer actually saw the chat (open + focused) — clear the unread dot
-      // locally and persist the read marker server-side (which echoes
-      // chat_read to this user's other tabs / a shared chat's other users).
-      useChatStore.getState().setUnread(chatId, false)
-      send({ type: OUT.CHAT_READ, chat_id: chatId })
-    },
-    [send],
   )
 
   // By its id, with its index for a 1.7.0 proxy that reads only the index.
@@ -1743,6 +1769,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       if (pingTimer.current) clearTimeout(pingTimer.current)
       if (healthCheckTimer.current) clearTimeout(healthCheckTimer.current)
       if (taskChatsInvalidateTimer.current) clearTimeout(taskChatsInvalidateTimer.current)
+      if (placesRefreshTimer.current) clearTimeout(placesRefreshTimer.current)
       wsRef.current?.close()
     }
   }, [])
@@ -1778,7 +1805,9 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     probeLiveness,
     resetStreaming,
     resumeChat,
-    sendChatRead,
+    leaveChat,
+    // The viewer saw the chat (open and focused): its read mark.
+    sendChatRead: markChatRead,
     cancelQueued,
     cancelAllQueued,
     abort,
@@ -1815,7 +1844,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     probeLiveness,
     resetStreaming,
     resumeChat,
-    sendChatRead,
+    leaveChat,
     cancelQueued,
     cancelAllQueued,
     abort,

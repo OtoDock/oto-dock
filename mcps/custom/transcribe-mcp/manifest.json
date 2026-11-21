@@ -1,7 +1,7 @@
 {
   "name": "transcribe-mcp",
   "label": "Transcribe",
-  "description": "Transcribe audio/video files and URLs to text with word-level timing; generate SRT subtitles.",
+  "description": "Transcribe audio/video files and URLs to text with word-level timing, and generate SRT subtitles.",
   "version": "1.0.2",
   "category": "custom",
   "server": {

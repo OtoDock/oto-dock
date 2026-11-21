@@ -43,10 +43,8 @@ class TestLiveness:
         assert not session_state.session_is_held("")
 
     @pytest.mark.parametrize("registry", [
-        "core.layers.cli.session._persistent_sessions",
-        "core.layers.codex.session._codex_sessions",
         "core.layers.direct.session._direct_sessions",
-        "core.session.interactive_session._sessions",
+        "core.session.interactive_registry._sessions",
     ])
     def test_a_registry_entry_makes_the_id_held_and_live(self, registry):
         import importlib
@@ -199,11 +197,10 @@ class TestStartMarks:
     clears the mark in a ``finally``; the floor is the config's recorded
     mint."""
 
-    @pytest.mark.parametrize("kind", ["cli", "codex", "direct"])
     @pytest.mark.asyncio
-    async def test_a_local_start_is_live_throughout_and_sets_the_floor(self, kind, monkeypatch):
+    async def test_a_direct_llm_start_is_live_throughout_and_sets_the_floor(self, monkeypatch):
         from tests.execution.test_session_permission_cleanup import _config, _layer
-        layer = _layer(kind)
+        layer = _layer()
         sid = _sid()
         seen = {}
 
@@ -222,15 +219,14 @@ class TestStartMarks:
         finally:
             session_state.cleanup_session_permission_state(sid)
 
-    @pytest.mark.parametrize("kind", ["cli", "codex", "direct"])
     @pytest.mark.asyncio
-    async def test_a_failed_local_start_is_not_live(self, kind, monkeypatch):
+    async def test_a_failed_direct_llm_start_is_not_live(self, monkeypatch):
         from tests.execution.test_session_permission_cleanup import _config, _layer
-        layer = _layer(kind)
+        layer = _layer()
         sid = _sid()
 
         async def _boom(session_id, config):
-            raise RuntimeError("spawn failed")
+            raise RuntimeError("start failed")
 
         monkeypatch.setattr(layer, "_start_session_impl", _boom)
         with pytest.raises(RuntimeError):
@@ -252,7 +248,7 @@ class TestStartMarks:
         sid = _sid()
         seen = {}
 
-        async def _payload(session_id, config, execution_path):
+        async def _payload(session_id, config, execution_path, spawn=None):
             seen["ctx"] = session_state.get_session_security(session_id)
             seen["mode"] = session_state.get_session_mode(session_id)
             seen["live"] = session_state.session_is_live(session_id)
@@ -272,25 +268,17 @@ class TestStartMarks:
         assert not session_state.session_is_live(sid)
 
 
-    @pytest.mark.parametrize("kind,registry", [
-        ("cli", "core.layers.cli.session._persistent_sessions"),
-        ("codex", "core.layers.codex.session._codex_sessions"),
-        ("direct", "core.layers.direct.session._direct_sessions"),
-    ])
     @pytest.mark.asyncio
-    async def test_a_failed_re_warm_of_a_held_session_keeps_its_state(self, kind, registry, monkeypatch):
-        import importlib
-
+    async def test_a_failed_direct_llm_re_warm_of_a_held_session_keeps_its_state(self, monkeypatch):
+        from core.layers.direct.session import _direct_sessions as table
         from tests.execution.test_session_permission_cleanup import (
             _config,
             _ctx,
             _layer,
         )
-        layer = _layer(kind)
-        module_name, name = registry.rsplit(".", 1)
-        table = getattr(importlib.import_module(module_name), name)
+        layer = _layer()
         sid = _sid()
-        session_state.register_session_state(sid, "default", _ctx(), token_minted_at=500)
+        session_state.register_session_state(sid, "ask", _ctx(), token_minted_at=500)
         table[sid] = object()
 
         async def _boom(session_id, config):
@@ -342,10 +330,10 @@ class TestStartMarks:
         layer = RemoteExecutionLayer(cm)
         monkeypatch.setattr(session_manager, "_remote_layer", layer)
         sid = _sid()
-        session_state.register_session_state(sid, "default", _ctx(), token_minted_at=500)
+        session_state.register_session_state(sid, "ask", _ctx(), token_minted_at=500)
         layer._sessions[sid] = MagicMock()
 
-        async def _payload(session_id, config, execution_path):
+        async def _payload(session_id, config, execution_path, spawn=None):
             raise RuntimeError("payload failed")
 
         monkeypatch.setattr(layer, "_build_start_payload", _payload)
@@ -366,104 +354,6 @@ class TestClosingMarks:
     """Every registry pop marks the id closing, only when an entry was popped."""
 
     @pytest.mark.asyncio
-    async def test_cli_close_and_the_dead_drops(self):
-        from core.layers.cli import session as cli
-        from core.layers.cli.layer import CLIExecutionLayer
-
-        class _Fake:
-            is_alive = False
-            is_starting = False
-            proc = None
-
-            async def close(self):
-                pass
-
-        sid = _sid()
-        cli._persistent_sessions[sid] = _Fake()
-        assert await cli.close_persistent_session(sid)
-        assert session_state.session_is_live(sid) and not session_state.session_is_held(sid)
-        session_state.reset_liveness_for_tests()
-        assert not await cli.close_persistent_session(sid)
-        assert not session_state.session_is_live(sid)
-
-        cli._persistent_sessions[sid] = _Fake()
-        assert await cli.get_persistent_session(sid) is None
-        assert session_state.session_is_live(sid)
-        session_state.reset_liveness_for_tests()
-
-        cli._persistent_sessions[sid] = _Fake()
-        await CLIExecutionLayer().prepare_resume(sid)
-        assert session_state.session_is_live(sid)
-        session_state.reset_liveness_for_tests()
-        await CLIExecutionLayer().prepare_resume(sid)
-        assert not session_state.session_is_live(sid)
-
-        starting = _Fake()
-        starting.is_starting = True
-        cli._persistent_sessions[sid] = starting
-        assert await cli.abort_persistent_session(sid)
-        assert session_state.session_is_live(sid)
-
-    @pytest.mark.asyncio
-    async def test_cli_failed_start(self, monkeypatch):
-        from core.layers.cli import session as cli
-
-        async def boom(self):
-            raise OSError("spawn failed")
-
-        monkeypatch.setattr(cli.PersistentSession, "start", boom)
-        monkeypatch.setattr("core.concurrency.release_chat_slot", lambda sid: None)
-        monkeypatch.setattr("services.engines.subscription_pool.release_subscription",
-                            lambda sid: None)
-        sid = f"sess-{uuid.uuid4().hex[:12]}"
-        with pytest.raises(OSError):
-            await cli.get_or_create_persistent_session(
-                session_id=sid, agent_prompt=None, mcp_config_path=None,
-                model="claude-opus-5", agent_name="agent",
-            )
-        assert sid not in cli._persistent_sessions
-        assert session_state.session_is_live(sid)
-
-    @pytest.mark.asyncio
-    async def test_codex_close_the_closed_drop_and_a_failed_start(self, monkeypatch):
-        from core.layers.codex import session as codex
-
-        class _Fake:
-            is_alive = False
-            _closed = True
-            config_dir = ""
-
-            async def close(self):
-                pass
-
-        sid = _sid()
-        codex._codex_sessions[sid] = _Fake()
-        assert await codex.close_codex_session(sid)
-        assert session_state.session_is_live(sid)
-        session_state.reset_liveness_for_tests()
-        assert not await codex.close_codex_session(sid)
-        assert not session_state.session_is_live(sid)
-
-        codex._codex_sessions[sid] = _Fake()
-        await codex.get_codex_session(sid)   # a closed entry is dropped
-        assert sid not in codex._codex_sessions
-        assert session_state.session_is_live(sid)
-        session_state.reset_liveness_for_tests()
-
-        async def boom(self):
-            raise OSError("spawn failed")
-
-        async def quiet(self):
-            pass
-
-        monkeypatch.setattr(codex.CodexAppServerSession, "start", boom)
-        monkeypatch.setattr(codex.CodexAppServerSession, "close", quiet)
-        with pytest.raises(OSError):
-            await codex.create_codex_session(sid, "agent", "m")
-        assert sid not in codex._codex_sessions
-        assert session_state.session_is_live(sid)
-
-    @pytest.mark.asyncio
     async def test_direct_close_and_the_reaper(self, monkeypatch):
         import time
 
@@ -477,14 +367,14 @@ class TestClosingMarks:
         assert not await direct.close_direct_session(sid)
         assert not session_state.session_is_live(sid)
 
-        async def _reap_idle(timeout=0):
+        async def _reap_idle(timeout=0, *, keep=frozenset()):
             pass
 
         monkeypatch.setattr(direct.mcp_pool, "reap_idle", _reap_idle)
         monkeypatch.setattr("core.concurrency.release_chat_slot", lambda s: None)
         monkeypatch.setattr("services.engines.subscription_pool.release_subscription",
                             lambda s: None)
-        direct._direct_sessions[sid] = type("S", (), {"last_activity": time.monotonic() - 10**6})()
+        direct._direct_sessions[sid] = type("S", (), {"last_activity": time.monotonic() - 10**6, "mcp_manager": None})()
         await direct._reap_idle_direct_pass()
         assert sid not in direct._direct_sessions
         assert session_state.session_is_live(sid)
@@ -531,7 +421,7 @@ class TestClosingMarks:
         sid = f"appx-{uuid.uuid4().hex[:12]}"
         session_state.mark_headless_live(sid)
         assert session_state.session_is_held(sid)
-        await hx._dispose(hx._Entry(_Mgr(), sid, "", frozenset()))
+        await hx.close_manager(hx._Entry(_Mgr(), sid, "", frozenset()))
         assert not session_state.session_is_held(sid)
         assert session_state.session_is_live(sid)
 
@@ -602,10 +492,10 @@ class TestReadoptionMarks:
         minted = int(time.time()) - 3600  # the process's token, an hour old
         await layer.adopt_idle_session(machine_id="m1", session_id=sid, agent_name="pa",
                                        execution_path="claude-code-cli",
-                                       mode="default", token_floor=minted)
+                                       mode="ask", token_floor=minted)
         try:
             assert session_state.get_session_mode(sid) == "ask"
-            assert layer._sessions[sid].mode == "default"
+            assert layer._sessions[sid].mode == "ask"
             assert session_state.session_token_refusal({"sid": sid, "iat": minted}) == ""
             assert session_state.session_token_refusal({"sid": sid, "iat": minted - 10}) == "stale"
         finally:
@@ -682,12 +572,12 @@ class TestBuilderFloors:
         from auth.session_token import validate_session_token
         from core import placement
         from services.mcp import mcp_registry
-        from services.scheduler import delivery
+        from services.scheduler import wake_session
         monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [])
         vis = SimpleNamespace(mount_username="", memory_user_enabled=True,
                               memory_agent_enabled=True, effective_default_scope="agent",
                               available_scopes=("agent",), config_visible=False)
-        _cfg, env, _multi, minted_at = delivery._wake_credential_env(
+        _cfg, env, _multi, minted_at = wake_session._wake_credential_env(
             "pa", str(uuid.uuid4()), user_sub="", role="manager", vis=vis,
             where=placement.LOCAL_PLACEMENT, mcp_config=None, flat_env={},
             bash_env_keys=set(), mcp_format="json",

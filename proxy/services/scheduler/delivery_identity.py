@@ -46,13 +46,15 @@ def _shared_chat_person(chat: dict | None, created_by: str | None) -> str:
     Shared-only now. "" when no person is on record (a session without one
     records the agent's own slug) or the chat is of another kind (a chat
     left from before a mode change keeps the agent's identity: its
-    conversation lives where it was written). Synchronous: call it on the DB
+    conversation lives where it was written). Any agent's slug is nobody,
+    even one equal to a user's id. Synchronous: call it on the DB
     executor."""
     from core.session.visibility import is_shared_only, shared_chat_owner
+    from storage.agents import agent_store
     agent = (chat or {}).get("agent") or ""
     if (not agent or not created_by or created_by == agent
             or (chat or {}).get("user_sub") != shared_chat_owner(agent)
-            or not is_shared_only(agent)):
+            or not is_shared_only(agent) or agent_store.agent_exists(created_by)):
         return ""
     return created_by
 
@@ -113,9 +115,9 @@ async def resolve_delivery_person(chat_id: str | None, session_id: str,
         return DeliveryPerson(person, "", shared, True, target_chat, standing)
     # On a Shared-only chat the wake runs from the agent's own state, at the
     # role the person's own turn there runs at (their effective role).
-    # Elsewhere the creator's row alone (a viewer without one): the echo rung
-    # of an admin's task resolves its target as a viewer would, while the
-    # run's own session read the admin; aligning the two is left to the
-    # operator.
-    role = standing if shared else (row or roles.VIEWER)
+    # Elsewhere the role the dashboard reads for them (``acting_role_of``: a
+    # platform admin is admin on every agent, as in their own turn), so the
+    # team account's floor judges the wake as it judges the person.
+    from auth.providers import acting_role_of
+    role = standing if shared else await run_db(acting_role_of, person, agent)
     return DeliveryPerson(person, role, shared, False, target_chat, standing)

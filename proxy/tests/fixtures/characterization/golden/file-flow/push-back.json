@@ -1,0 +1,362 @@
+[
+ {
+  "fan_out": [],
+  "marks": {},
+  "ok": false,
+  "record": null,
+  "step": "a session the layer does not know",
+  "wire": []
+ },
+ {
+  "fan_out": [],
+  "marks": {},
+  "ok": false,
+  "record": null,
+  "step": "not canonical",
+  "wire": []
+ },
+ {
+  "fan_out": [],
+  "marks": {},
+  "ok": false,
+  "record": null,
+  "step": "no such file",
+  "wire": []
+ },
+ {
+  "fan_out": [
+   {
+    "agent": "flow-agent",
+    "exclude": "sat-one-0",
+    "marked": {
+     "sat-two-0": [
+      1,
+      2
+     ]
+    },
+    "path": "<agents>/flow-agent/workspace/pb.txt",
+    "rel": "workspace/pb.txt"
+   }
+  ],
+  "marks": {},
+  "ok": true,
+  "record": {
+   "exists": true,
+   "mtime_ns": 7000000000,
+   "size": 6
+  },
+  "step": "no record expects a live file; the ack records the commit",
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "edited",
+    "command_id": "<id>",
+    "expect": "live",
+    "hash": "sha256:1fb9f4097256db2d7b1e13aff79cee44339891a31c556b9cf6093885773b3618",
+    "path": "workspace/pb.txt",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   }
+  ]
+ },
+ {
+  "fan_out": [
+   {
+    "agent": "flow-agent",
+    "exclude": "sat-one-0",
+    "marked": {
+     "sat-two-0": [
+      1,
+      2
+     ]
+    },
+    "path": "<agents>/flow-agent/workspace/pb.txt",
+    "rel": "workspace/pb.txt"
+   }
+  ],
+  "marks": {},
+  "ok": true,
+  "record": {
+   "exists": true,
+   "mtime_ns": 7000000000,
+   "size": 6
+  },
+  "step": "the record is expected",
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "edited",
+    "command_id": "<id>",
+    "expect": {
+     "mtime_ns": 7000000000,
+     "size": 6
+    },
+    "hash": "sha256:1fb9f4097256db2d7b1e13aff79cee44339891a31c556b9cf6093885773b3618",
+    "path": "workspace/pb.txt",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   }
+  ]
+ },
+ {
+  "fan_out": [
+   {
+    "agent": "flow-agent",
+    "exclude": "sat-one-0",
+    "marked": {
+     "sat-two-0": [
+      1,
+      2
+     ]
+    },
+    "path": "<agents>/flow-agent/workspace/pb.txt",
+    "rel": "workspace/pb.txt"
+   }
+  ],
+  "marks": {
+   "sat-one-0|flow-agent|workspace/pb.txt": {
+    "in_flight_until": 0.0,
+    "machine": {
+     "exists": true,
+     "mtime_ns": 7000000000,
+     "size": 6
+    },
+    "mtime_ns": 900,
+    "retry_at": 0.0,
+    "size": 6,
+    "stale": false
+   }
+  },
+  "ok": false,
+  "record": null,
+  "step": "an ok that reports no written file is a refusal: marked, a probed baseline",
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "edited",
+    "command_id": "<id>",
+    "expect": {
+     "mtime_ns": 7000000000,
+     "size": 6
+    },
+    "hash": "sha256:1fb9f4097256db2d7b1e13aff79cee44339891a31c556b9cf6093885773b3618",
+    "path": "workspace/pb.txt",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   },
+   {
+    "agent_slug": "flow-agent",
+    "command_id": "<id>",
+    "path": "workspace/pb.txt",
+    "path_kind": "agent_tree",
+    "type": "file_stat"
+   }
+  ]
+ },
+ {
+  "fan_out": [
+   {
+    "agent": "flow-agent",
+    "exclude": "sat-one-0",
+    "marked": {
+     "sat-two-0": [
+      1,
+      2
+     ]
+    },
+    "path": "<agents>/flow-agent/workspace/pb.txt",
+    "rel": "workspace/pb.txt"
+   }
+  ],
+  "marks": {
+   "sat-one-0|flow-agent|workspace/pb.txt": {
+    "in_flight_until": 0.0,
+    "machine": {
+     "exists": true,
+     "mtime_ns": 7000000000,
+     "size": 6
+    },
+    "mtime_ns": 900,
+    "retry_at": 0.0,
+    "size": 6,
+    "stale": false
+   }
+  },
+  "ok": false,
+  "record": null,
+  "step": "a refusal marks with a probed baseline",
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "edited",
+    "command_id": "<id>",
+    "expect": {
+     "mtime_ns": 66,
+     "size": 6
+    },
+    "hash": "sha256:1fb9f4097256db2d7b1e13aff79cee44339891a31c556b9cf6093885773b3618",
+    "path": "workspace/pb.txt",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   },
+   {
+    "agent_slug": "flow-agent",
+    "command_id": "<id>",
+    "path": "workspace/pb.txt",
+    "path_kind": "agent_tree",
+    "type": "file_stat"
+   }
+  ]
+ },
+ {
+  "fan_out": [
+   {
+    "agent": "flow-agent",
+    "exclude": "sat-one-0",
+    "marked": {
+     "sat-two-0": [
+      1,
+      2
+     ]
+    },
+    "path": "<agents>/flow-agent/workspace/pb.txt",
+    "rel": "workspace/pb.txt"
+   }
+  ],
+  "marks": {
+   "sat-one-0|flow-agent|workspace/pb.txt": {
+    "in_flight_until": 0.0,
+    "machine": {
+     "exists": true,
+     "mtime_ns": 66,
+     "size": 6
+    },
+    "mtime_ns": 900,
+    "retry_at": 0.0,
+    "size": 6,
+    "stale": false
+   }
+  },
+  "ok": false,
+  "record": null,
+  "step": "no probe: the taken record is the baseline",
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "edited",
+    "command_id": "<id>",
+    "expect": {
+     "mtime_ns": 66,
+     "size": 6
+    },
+    "hash": "sha256:1fb9f4097256db2d7b1e13aff79cee44339891a31c556b9cf6093885773b3618",
+    "path": "workspace/pb.txt",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   },
+   {
+    "agent_slug": "flow-agent",
+    "command_id": "<id>",
+    "path": "workspace/pb.txt",
+    "path_kind": "agent_tree",
+    "type": "file_stat"
+   }
+  ]
+ },
+ {
+  "fan_out": [
+   {
+    "agent": "flow-agent",
+    "exclude": "sat-one-0",
+    "marked": {
+     "sat-two-0": [
+      1,
+      2
+     ]
+    },
+    "path": "<agents>/flow-agent/workspace/pb.txt",
+    "rel": "workspace/pb.txt"
+   }
+  ],
+  "marks": {
+   "sat-one-0|flow-agent|workspace/pb.txt": {
+    "in_flight_until": 0.0,
+    "machine": {
+     "exists": true,
+     "mtime_ns": 7000000000,
+     "size": 6
+    },
+    "mtime_ns": 900,
+    "retry_at": 0.0,
+    "size": 6,
+    "stale": true
+   }
+  },
+  "ok": false,
+  "record": null,
+  "step": "a stale answer holds, the ack's stat the baseline",
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "edited",
+    "command_id": "<id>",
+    "expect": "live",
+    "hash": "sha256:1fb9f4097256db2d7b1e13aff79cee44339891a31c556b9cf6093885773b3618",
+    "path": "workspace/pb.txt",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   }
+  ]
+ },
+ {
+  "fan_out": [
+   {
+    "agent": "flow-agent",
+    "exclude": "sat-one-0",
+    "marked": {
+     "sat-two-0": [
+      1,
+      2
+     ]
+    },
+    "path": "<agents>/flow-agent/workspace/pb.txt",
+    "rel": "workspace/pb.txt"
+   }
+  ],
+  "marks": {},
+  "ok": true,
+  "record": {
+   "exists": true,
+   "mtime_ns": 7000000000,
+   "size": 6
+  },
+  "step": "an ack clears the mark",
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "edited",
+    "command_id": "<id>",
+    "expect": "live",
+    "hash": "sha256:1fb9f4097256db2d7b1e13aff79cee44339891a31c556b9cf6093885773b3618",
+    "path": "workspace/pb.txt",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   }
+  ]
+ },
+ {
+  "fan_out": [],
+  "marks": {},
+  "ok": false,
+  "record": null,
+  "step": "a link at the name is not pushed",
+  "wire": []
+ }
+]

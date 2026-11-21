@@ -81,8 +81,11 @@ class Monitor:
     pixels* on X11 and DPI-aware Windows. ``left`` / ``top`` CAN BE NEGATIVE.
 
     ``phys_width`` / ``phys_height`` are the dimensions of the actual grabbed
-    pixel buffer for this monitor (Retina => 2x the logical width/height). The
-    per-axis device-pixel-ratio is derived from the two, so we never assume 1:1.
+    pixel buffer for this monitor. The per-axis device-pixel-ratio is derived
+    from the two, so we never assume 1:1. On macOS ``mss`` grabs one pixel per
+    point (its ``IMAGE_OPTIONS`` carry ``kCGWindowImageNominalResolution``), so
+    the ratio is 1 there too; only a zoom grabs at the backing scale
+    (``screen.Grabber.region``).
     """
 
     index: int                 # mss monitor index (1-based; 0 = all-monitors)
@@ -101,6 +104,32 @@ class Monitor:
     @property
     def dpr_y(self) -> float:
         return (self.phys_height / self.height) if self.height else 1.0
+
+
+def model_to_physical(model_x: float, model_y: float, *, scale: float) -> tuple[float, float]:
+    """A model-image point as a physical pixel of its monitor's grabbed frame
+    (the first step of :func:`model_to_input_coords`, which a click, the spot
+    under it and a zoom all share)."""
+    if scale <= 0:
+        scale = 1.0
+    return model_x / scale, model_y / scale
+
+
+# The spot checked under a click: a square of about this many model pixels a
+# side, cut into PATCH_CELLS x PATCH_CELLS blocks of whole physical pixels.
+PATCH_MODEL_PX = 48
+PATCH_CELLS = 12
+
+
+def patch_box(model_x: float, model_y: float, *, scale: float) -> tuple[int, int, int]:
+    """``(left, top, block)``: the square of :data:`PATCH_CELLS` blocks of
+    ``block`` physical pixels a side centred on a model point, in its
+    monitor's frame (it may reach past the frame's edges). Whole-pixel blocks
+    keep every changed pixel in exactly one block."""
+    px, py = model_to_physical(model_x, model_y, scale=scale)
+    block = max(1, round(PATCH_MODEL_PX / PATCH_CELLS / (scale if scale > 0 else 1.0)))
+    half = block * PATCH_CELLS / 2
+    return math.floor(px - half), math.floor(py - half), block
 
 
 def model_to_input_coords(
@@ -122,10 +151,7 @@ def model_to_input_coords(
 
     Returns floats; the caller rounds and clamps.
     """
-    if scale <= 0:
-        scale = 1.0
-    px = model_x / scale
-    py = model_y / scale
+    px, py = model_to_physical(model_x, model_y, scale=scale)
     lx = px / monitor.dpr_x
     ly = py / monitor.dpr_y
     return monitor.left + lx, monitor.top + ly

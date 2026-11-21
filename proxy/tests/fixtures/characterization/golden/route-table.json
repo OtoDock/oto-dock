@@ -1,0 +1,5842 @@
+[
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_list_users",
+  "path": "/v1/admin/users"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_user_agents",
+  "path": "/v1/admin/users/{sub}/agents"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_add_user_agent",
+  "path": "/v1/admin/users/{sub}/agents/{agent}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_update_role",
+  "path": "/v1/admin/users/{sub}/role"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "admin_delete_user",
+  "path": "/v1/admin/users/{sub}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_delete_user_post",
+  "path": "/v1/admin/users/{sub}/delete"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_create_user",
+  "path": "/v1/admin/users"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_reset_password",
+  "path": "/v1/admin/users/{sub}/reset-password"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_local_only",
+  "path": "/v1/admin/users/{sub}/local-only"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "csp_report",
+  "path": "/v1/csp-report"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "auth_config",
+  "path": "/auth/config"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "auth_login",
+  "path": "/auth/login"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "auth_oidc_url",
+  "path": "/auth/oidc-url"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "auth_confirm_oidc_url",
+  "path": "/auth/confirm/oidc-url"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "auth_login_local",
+  "path": "/auth/login/local"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "auth_login_2fa",
+  "path": "/auth/login/2fa"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "auth_callback_page",
+  "path": "/auth/callback"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "auth_callback",
+  "path": "/auth/callback"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "auth_logout",
+  "path": "/auth/logout"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_sign_out_everywhere",
+  "path": "/v1/admin/users/{sub}/sign-out-everywhere"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "auth_me",
+  "path": "/auth/me"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_my_profile",
+  "path": "/v1/users/me/profile"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_my_default_agent",
+  "path": "/v1/users/me/default-agent"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "change_my_password",
+  "path": "/v1/users/me/password"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "change_my_email",
+  "path": "/v1/users/me/email"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "totp_setup",
+  "path": "/v1/users/me/totp/setup"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "totp_verify",
+  "path": "/v1/users/me/totp/verify"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "totp_disable",
+  "path": "/v1/users/me/totp"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "forgot_password",
+  "path": "/auth/forgot-password"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "reset_password",
+  "path": "/auth/reset-password"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "accept_invite",
+  "path": "/auth/accept-invite"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_platform_settings",
+  "path": "/v1/admin/platform-settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_platform_settings",
+  "path": "/v1/admin/platform-settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "set_license",
+  "path": "/v1/admin/license"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "deactivate_license_binding",
+  "path": "/v1/admin/license/deactivate"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "recheck_license",
+  "path": "/v1/admin/license/recheck"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_forwarding_warnings",
+  "path": "/v1/admin/forwarding-warnings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_concurrency_stats",
+  "path": "/v1/admin/concurrency-stats"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_test_smtp",
+  "path": "/v1/admin/smtp/test"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_release_notice",
+  "path": "/v1/admin/release-notice"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "run_release_check",
+  "path": "/v1/admin/release-check"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_release_card",
+  "path": "/v1/users/me/release-card"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "mark_release_card_seen",
+  "path": "/v1/users/me/release-card/seen"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "passkey_confirm_options",
+  "path": "/auth/passkey/confirm/options"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "passkey_confirm_verify",
+  "path": "/auth/passkey/confirm/verify"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_passkeys",
+  "path": "/v1/users/me/passkeys"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "passkey_register_options",
+  "path": "/v1/users/me/passkeys/register/options"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "passkey_register_verify",
+  "path": "/v1/users/me/passkeys/register/verify"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "passkey_rename",
+  "path": "/v1/users/me/passkeys/{credential_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "passkey_delete",
+  "path": "/v1/users/me/passkeys/{credential_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "passkey_login_options",
+  "path": "/auth/passkey/options"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "passkey_login_verify",
+  "path": "/auth/passkey/verify"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "passkey_native_start",
+  "path": "/auth/passkey/native/start"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "passkey_native_exchange",
+  "path": "/auth/passkey/native/exchange"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "setup_first_user",
+  "path": "/auth/setup"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET",
+   "HEAD"
+  ],
+  "name": "health",
+  "path": "/health"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET",
+   "HEAD"
+  ],
+  "name": "health_ready",
+  "path": "/health/ready"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_health",
+  "path": "/v1/admin/health"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_models",
+  "path": "/v1/models"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_session_pending",
+  "path": "/v1/sessions/{session_id}/pending"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "abort_session_endpoint",
+  "path": "/v1/sessions/{session_id}/abort"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "close_session_endpoint",
+  "path": "/v1/sessions/{session_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_settings_catalog",
+  "path": "/v1/settings/catalog"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "draw_settings_card",
+  "path": "/v1/settings/card"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_settings_card",
+  "path": "/v1/settings/card/{setting}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "resolve_path",
+  "path": "/v1/hooks/resolve-path"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "resolve_tool_arg_paths",
+  "path": "/v1/hooks/resolve-tool-arg-paths"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_permission",
+  "path": "/v1/hooks/permission"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_codex_question",
+  "path": "/v1/hooks/codex-question"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_mcp_credentials",
+  "path": "/v1/hooks/mcp-credentials"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_cli_credential",
+  "path": "/v1/hooks/cli-credential"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_ssh_agent",
+  "path": "/v1/hooks/ssh-agent"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "hook_tool_listing",
+  "path": "/v1/hooks/tool-listing"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_tool_start",
+  "path": "/v1/hooks/tool-start"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_images",
+  "path": "/v1/hooks/images"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_image_generating",
+  "path": "/v1/hooks/image-generating"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_image_gen_failed",
+  "path": "/v1/hooks/image-gen-failed"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_url",
+  "path": "/v1/hooks/url"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_file",
+  "path": "/v1/hooks/file"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_media",
+  "path": "/v1/hooks/media"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_ui",
+  "path": "/v1/hooks/ui"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_pin",
+  "path": "/v1/hooks/apps/pin"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_unpin",
+  "path": "/v1/hooks/apps/unpin"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_rollback",
+  "path": "/v1/hooks/apps/rollback"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_push",
+  "path": "/v1/hooks/apps/push"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_state",
+  "path": "/v1/hooks/apps/state"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_open",
+  "path": "/v1/hooks/apps/open"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_list",
+  "path": "/v1/hooks/apps/list"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_file_pin",
+  "path": "/v1/hooks/files/pin"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_file_unpin",
+  "path": "/v1/hooks/files/unpin"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_deploy",
+  "path": "/v1/hooks/apps/deploy"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_check",
+  "path": "/v1/hooks/apps/check"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_screenshot",
+  "path": "/v1/hooks/apps/screenshot"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_status",
+  "path": "/v1/hooks/apps/status"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_preview",
+  "path": "/v1/hooks/apps/preview"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_logs",
+  "path": "/v1/hooks/apps/logs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_purge",
+  "path": "/v1/hooks/apps/purge"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_restart",
+  "path": "/v1/hooks/apps/restart"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_describe",
+  "path": "/v1/hooks/apps/describe"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_export",
+  "path": "/v1/hooks/apps/export"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_app_import",
+  "path": "/v1/hooks/apps/import"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_document_preview",
+  "path": "/v1/hooks/document-preview"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_tool_result",
+  "path": "/v1/hooks/tool-result"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_stop",
+  "path": "/v1/hooks/stop"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_start_context",
+  "path": "/v1/hooks/start-context"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_subagent",
+  "path": "/v1/hooks/subagent"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_file_written",
+  "path": "/v1/hooks/file-written"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "request_user_location",
+  "path": "/v1/location/request"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hook_usage_report",
+  "path": "/v1/hooks/usage-report"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_current_session",
+  "path": "/v1/session/current"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_scheduled_task",
+  "path": "/v1/tasks/scheduled"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_one_time_task",
+  "path": "/v1/tasks/one-time"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_tasks",
+  "path": "/v1/tasks"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_task",
+  "path": "/v1/tasks/{task_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "delete_task_post",
+  "path": "/v1/tasks/{task_id}/delete"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "pause_task",
+  "path": "/v1/tasks/{task_id}/pause"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "resume_task",
+  "path": "/v1/tasks/{task_id}/resume"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "edit_task",
+  "path": "/v1/tasks/{task_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "edit_task_post",
+  "path": "/v1/tasks/{task_id}/edit"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "update_task_on_complete",
+  "path": "/v1/tasks/{task_id}/on-complete"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "run_task_now",
+  "path": "/v1/tasks/{task_id}/run"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_runs",
+  "path": "/v1/tasks/runs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_run",
+  "path": "/v1/tasks/runs/{run_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_run_by_chat",
+  "path": "/v1/tasks/runs/by-chat/{chat_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "cancel_run",
+  "path": "/v1/tasks/runs/{run_id}/cancel"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_stats",
+  "path": "/v1/tasks/stats"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_task",
+  "path": "/v1/tasks/{task_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_task_session",
+  "path": "/v1/tasks/{task_id}/session"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_schedules",
+  "path": "/v1/schedules"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "stream_run_output",
+  "path": "/v1/tasks/runs/{run_id}/stream"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "spawn_delegate",
+  "path": "/v1/delegation/spawn"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "send_files",
+  "path": "/v1/delegation/send_files"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "attach_result_files",
+  "path": "/v1/delegation/attach_result_files"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "adopt_project",
+  "path": "/v1/delegation/adopt"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_delegation_sessions",
+  "path": "/v1/delegation/sessions"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "peek_delegation_session",
+  "path": "/v1/delegation/sessions/{chat_id}/peek"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_continuation",
+  "path": "/v1/continuations"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "fire_agent_trigger",
+  "path": "/v1/webhooks/agent/{agent}/{slug}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "fire_user_trigger",
+  "path": "/v1/webhooks/user/{username}/{slug}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_trigger_endpoint",
+  "path": "/v1/triggers"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_triggers_endpoint",
+  "path": "/v1/triggers"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_trigger_endpoint",
+  "path": "/v1/triggers/{trigger_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "edit_trigger_endpoint",
+  "path": "/v1/triggers/{trigger_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "edit_trigger_post",
+  "path": "/v1/triggers/{trigger_id}/edit"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_trigger_endpoint",
+  "path": "/v1/triggers/{trigger_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "pause_trigger_endpoint",
+  "path": "/v1/triggers/{trigger_id}/pause"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "resume_trigger_endpoint",
+  "path": "/v1/triggers/{trigger_id}/resume"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "fire_test_endpoint",
+  "path": "/v1/triggers/{trigger_id}/fire"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "receive_relay_webhook",
+  "path": "/v1/webhooks/relay/{provider_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "receive_relay_notice",
+  "path": "/v1/webhooks/relay/{provider_id}/account-removed"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "receive_app_webhook",
+  "path": "/v1/webhooks/{provider_id}/app"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET",
+   "POST"
+  ],
+  "name": "receive_webhook",
+  "path": "/v1/webhooks/{provider_id}/{subscription_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_subscription",
+  "path": "/v1/subscriptions"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_subscriptions",
+  "path": "/v1/subscriptions"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_subscription",
+  "path": "/v1/subscriptions/{subscription_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_subscription",
+  "path": "/v1/subscriptions/{subscription_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "renew_subscription",
+  "path": "/v1/subscriptions/{subscription_id}/renew"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_event_catalog",
+  "path": "/v1/mcps/{mcp_name}/webhook-event-catalog"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_subscription_signing_secret",
+  "path": "/v1/subscriptions/{subscription_id}/signing-secret"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_agent_key",
+  "path": "/v1/agents/{agent}/api-keys"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_agent_keys",
+  "path": "/v1/agents/{agent}/api-keys"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "revoke_agent_key",
+  "path": "/v1/agents/{agent}/api-keys/{key_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_user_key",
+  "path": "/v1/user-api-keys"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_user_keys",
+  "path": "/v1/user-api-keys"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "revoke_user_key",
+  "path": "/v1/user-api-keys/{key_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "me",
+  "path": "/v1/api/me"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "agents",
+  "path": "/v1/api/agents"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "description",
+  "path": "/v1/api/openapi.json"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "command",
+  "path": "/v1/api/otodock.py"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_chats",
+  "path": "/v1/api/chats"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_chat",
+  "path": "/v1/api/chats"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_chat",
+  "path": "/v1/api/chats/{chat_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "send_message",
+  "path": "/v1/api/chats/{chat_id}/messages"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_turn",
+  "path": "/v1/api/chats/{chat_id}/messages/{message_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_tasks",
+  "path": "/v1/api/tasks"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_task",
+  "path": "/v1/api/tasks"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "run_task",
+  "path": "/v1/api/tasks/{task_id}/run"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_run",
+  "path": "/v1/api/runs/{run_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "stream_run",
+  "path": "/v1/api/runs/{run_id}/stream"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "tree",
+  "path": "/v1/api/agents/{agent}/files"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_file",
+  "path": "/v1/api/agents/{agent}/files/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "write_file",
+  "path": "/v1/api/agents/{agent}/files/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "send",
+  "path": "/v1/api/notifications"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "inbox",
+  "path": "/v1/api/notifications"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_user_credits",
+  "path": "/v1/user/credits"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "connect_start",
+  "path": "/v1/account/connect/start"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "connect_callback",
+  "path": "/v1/account/connect/callback"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "relay_enable",
+  "path": "/v1/account/relay/enable"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "relay_disable",
+  "path": "/v1/account/relay/disable"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "disconnect",
+  "path": "/v1/account/disconnect"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_execution_layers",
+  "path": "/v1/execution-layers"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_agents",
+  "path": "/v1/agents"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_agent_info",
+  "path": "/v1/agents/{name}/info"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_agent_target_status",
+  "path": "/v1/agents/{name}/target-status"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "complete_agent_setup",
+  "path": "/v1/agents/{name}/complete-setup"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_delegation_targets",
+  "path": "/v1/agents/{name}/delegation-targets"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_agent_users",
+  "path": "/v1/agents/{name}/users"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_delegation_targets",
+  "path": "/v1/agents/{name}/delegation-targets"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_browser_origins",
+  "path": "/v1/agents/{name}/browser-origins"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_browser_origins",
+  "path": "/v1/agents/{name}/browser-origins"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_agent_files",
+  "path": "/v1/agents/{name}/files"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_agent_file",
+  "path": "/v1/agents/{name}/files/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_recover_bin",
+  "path": "/v1/agents/{name}/recover-bin"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "restore_recover_bin",
+  "path": "/v1/agents/{name}/recover-bin/restore"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "discard_recover_bin",
+  "path": "/v1/agents/{name}/recover-bin/discard"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "write_agent_file",
+  "path": "/v1/agents/{name}/files/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_agent_file",
+  "path": "/v1/agents/{name}/create-file"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_agent_directory",
+  "path": "/v1/agents/{name}/mkdir"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "delete_agent_path",
+  "path": "/v1/agents/{name}/delete"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "rename_agent_path",
+  "path": "/v1/agents/{name}/rename"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "move_agent_paths",
+  "path": "/v1/agents/{name}/move"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "copy_agent_paths",
+  "path": "/v1/agents/{name}/copy"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "zip_agent_paths",
+  "path": "/v1/agents/{name}/zip"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "request_zip_url",
+  "path": "/v1/agents/{name}/zip-url"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "zip_download",
+  "path": "/v1/agents/{name}/zip-download"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_user_context_files",
+  "path": "/v1/agents/{name}/user-context"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_user_context_file",
+  "path": "/v1/agents/{name}/user-context/{filename}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_user_context_file",
+  "path": "/v1/agents/{name}/user-context/{filename}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_user_context_file",
+  "path": "/v1/agents/{name}/user-context/{filename}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "agents_activity",
+  "path": "/v1/agents/activity"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "delegation_edges",
+  "path": "/v1/agents/delegation-edges"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_agent_conversations",
+  "path": "/v1/agents/{name}/conversations"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_agent_people",
+  "path": "/v1/agents/{name}/people"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_agent_person",
+  "path": "/v1/agents/{name}/people/{identity_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "request_person_export_url",
+  "path": "/v1/agents/{name}/people/{identity_id}/export-url"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "export_agent_person",
+  "path": "/v1/agents/{name}/people/{identity_id}/export"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "forget_agent_person",
+  "path": "/v1/agents/{name}/people/{identity_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "conversations_kind",
+  "path": "/v1/conversations/kind"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "tool_list_conversations",
+  "path": "/v1/conversations"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "tool_list_people",
+  "path": "/v1/conversations/people"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "tool_read_conversation",
+  "path": "/v1/conversations/{chat_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "record_conversation",
+  "path": "/v1/conversations/record"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_knowledge_libraries",
+  "path": "/v1/knowledge-libraries"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_knowledge_attachments",
+  "path": "/v1/agents/{name}/knowledge-attachments"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_knowledge_library",
+  "path": "/v1/agents/{name}/knowledge-library"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "attach_knowledge_library",
+  "path": "/v1/agents/{name}/knowledge-attachments"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "detach_knowledge_library",
+  "path": "/v1/agents/{name}/knowledge-attachments/{source}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_outside_people",
+  "path": "/v1/agents/{name}/outside"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_outside_people",
+  "path": "/v1/agents/{name}/outside"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "reload_session",
+  "path": "/v1/agents/{name}/reload-session"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_tool_limits",
+  "path": "/v1/agents/{name}/tool-limits"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_tool_limits",
+  "path": "/v1/agents/{name}/tool-limits"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_agent",
+  "path": "/v1/agents"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "update_agent",
+  "path": "/v1/agents/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_default_for_new_users",
+  "path": "/v1/admin/agents/{name}/default-for-new-users"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_agent",
+  "path": "/v1/agents/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_chat_detail",
+  "path": "/v1/chats/{chat_id}/detail"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_chats",
+  "path": "/v1/chats"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_active_chats",
+  "path": "/v1/chats/active"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "search_chats",
+  "path": "/v1/chats/search"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_chat",
+  "path": "/v1/chats/{chat_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_chat_project",
+  "path": "/v1/chats/{chat_id}/project"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_chat_pins",
+  "path": "/v1/chats/{chat_id}/pins"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "resolve_chat_path",
+  "path": "/v1/chats/{chat_id}/resolve-path"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_chat",
+  "path": "/v1/chats"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "update_chat",
+  "path": "/v1/chats/{chat_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "pin_chat",
+  "path": "/v1/chats/{chat_id}/pinned"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "unpin_chat",
+  "path": "/v1/chats/{chat_id}/pinned"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_chat",
+  "path": "/v1/chats/{chat_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "dismiss_preview",
+  "path": "/v1/chats/{chat_id}/dismiss-preview/{file_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "report_reply",
+  "path": "/v1/chats/{chat_id}/reports"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "my_reported_replies",
+  "path": "/v1/chats/{chat_id}/reports/mine"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "report_shared_reply",
+  "path": "/v1/shares/{share_id}/reports"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_reply_reports",
+  "path": "/v1/admin/reply-reports"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "mark_reply_report_handled",
+  "path": "/v1/admin/reply-reports/{report_id}/handled"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "dismiss_reply_report",
+  "path": "/v1/admin/reply-reports/{report_id}/dismiss"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "restore_reply_report",
+  "path": "/v1/admin/reply-reports/{report_id}/restore"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_reply_report",
+  "path": "/v1/admin/reply-reports/{report_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_departments",
+  "path": "/v1/departments"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_department",
+  "path": "/v1/departments"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "update_department",
+  "path": "/v1/departments/{department_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_department",
+  "path": "/v1/departments/{department_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_department_levels",
+  "path": "/v1/departments/{department_id}/levels"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_department_sets",
+  "path": "/v1/community/departments"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "preview_department_set",
+  "path": "/v1/community/departments/{slug}/preview"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "install_department_set",
+  "path": "/v1/community/departments/{slug}/install"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "department_set_install_status",
+  "path": "/v1/community/departments/installs/{job_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "draw_card",
+  "path": "/v1/cards"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "draw_list_card",
+  "path": "/v1/cards/list"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_card",
+  "path": "/v1/cards/{card_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "act_on_card",
+  "path": "/v1/cards/{card_id}/act"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_notification",
+  "path": "/v1/notifications"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_notifications",
+  "path": "/v1/notifications"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_unread_count",
+  "path": "/v1/notifications/unread-count"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "fire_notification_now",
+  "path": "/v1/notifications/{notification_id}/fire"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "pause_notification",
+  "path": "/v1/notifications/{notification_id}/pause"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "resume_notification",
+  "path": "/v1/notifications/{notification_id}/resume"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "edit_notification",
+  "path": "/v1/notifications/{notification_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "edit_notification_post",
+  "path": "/v1/notifications/{notification_id}/edit"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_notification",
+  "path": "/v1/notifications/{notification_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "mark_delivery_read",
+  "path": "/v1/notifications/deliveries/{delivery_id}/read"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "dismiss_delivery",
+  "path": "/v1/notifications/deliveries/{delivery_id}/dismiss"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "mark_all_read",
+  "path": "/v1/notifications/mark-all-read"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "dismiss_all",
+  "path": "/v1/notifications/dismiss-all"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "push_subscribe",
+  "path": "/v1/push/subscribe"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "app_identity",
+  "path": "/v1/app/identity"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "push_unsubscribe",
+  "path": "/v1/push/unsubscribe"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_vapid_public_key",
+  "path": "/v1/push/vapid-public-key"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "put_agent_account",
+  "path": "/v1/users/me/integrations/{mcp_name}/agent-accounts"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_agent_account",
+  "path": "/v1/users/me/integrations/{mcp_name}/agent-accounts/{agent_name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "put_agent_default_account",
+  "path": "/v1/users/me/integrations/{mcp_name}/agent-accounts/{agent_name}/default"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "add_service_account",
+  "path": "/v1/agents/{agent_name}/mcps/{mcp_name}/service-accounts"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_service_reach",
+  "path": "/v1/agents/{agent_name}/mcps/{mcp_name}/service-accounts/reach"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_service_default",
+  "path": "/v1/agents/{agent_name}/mcps/{mcp_name}/service-accounts/default"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "remove_service_account",
+  "path": "/v1/agents/{agent_name}/mcps/{mcp_name}/service-accounts"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_credential_schema",
+  "path": "/v1/mcp-credential-schema"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_my_integrations",
+  "path": "/v1/users/me/integrations"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_my_integration",
+  "path": "/v1/users/me/integrations/{mcp_name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_my_integration",
+  "path": "/v1/users/me/integrations/{mcp_name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_default_account",
+  "path": "/v1/users/me/integrations/{mcp_name}/default-account"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_agent_binding",
+  "path": "/v1/users/me/integrations/{mcp_name}/agent-binding"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_my_account_repositories",
+  "path": "/v1/users/me/integrations/{mcp_name}/repositories"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "remove_agent_binding",
+  "path": "/v1/users/me/integrations/{mcp_name}/agent-binding/{agent_name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_agent_service_account_options",
+  "path": "/v1/agents/{agent_name}/mcps/{mcp_name}/service-account-options"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_agent_service_repositories",
+  "path": "/v1/agents/{agent_name}/mcps/{mcp_name}/service-account-repositories"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_admin_integrations",
+  "path": "/v1/admin/integrations"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_infra_integration",
+  "path": "/v1/admin/integrations/infra/{mcp_name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_infra_integration",
+  "path": "/v1/admin/integrations/infra/{mcp_name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_email_server_config",
+  "path": "/v1/admin/integrations/email-server-config"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_client_registrations",
+  "path": "/v1/admin/oauth-client-registrations"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "forget_client_registration",
+  "path": "/v1/admin/oauth-client-registrations/{row_id}/forget"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_bearer_allowlist",
+  "path": "/v1/admin/oauth-bearer-allowlist"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "allow_mcp_hosts",
+  "path": "/v1/admin/oauth-bearer-allowlist/allow"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "add_bearer_allowlist",
+  "path": "/v1/admin/oauth-bearer-allowlist"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "remove_bearer_allowlist",
+  "path": "/v1/admin/oauth-bearer-allowlist/{row_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "remove_admin_bearer_rows",
+  "path": "/v1/admin/oauth-bearer-allowlist/admin-rows/remove"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "restore_bearer_allowlist_defaults",
+  "path": "/v1/admin/oauth-bearer-allowlist/restore-defaults"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE",
+   "GET",
+   "POST"
+  ],
+  "name": "gateway",
+  "path": "/v1/mcp-gateway/{mcp}/{rest:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "oauth_start",
+  "path": "/v1/oauth/claude/start"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "oauth_exchange",
+  "path": "/v1/oauth/claude/exchange"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "oauth_start",
+  "path": "/v1/oauth/openai/start"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "oauth_status",
+  "path": "/v1/oauth/openai/status"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "oauth_finish",
+  "path": "/v1/oauth/openai/finish"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "oauth_start",
+  "path": "/v1/oauth/{provider}/start"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "oauth_callback",
+  "path": "/v1/oauth/{provider}/callback"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "oauth_exchange",
+  "path": "/v1/oauth/{provider}/exchange"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_oauth_accounts",
+  "path": "/v1/oauth/{provider}/accounts"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "oauth_disconnect",
+  "path": "/v1/oauth/{provider}/disconnect"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "device_code_start",
+  "path": "/v1/oauth/{provider}/device-code/start"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "device_code_poll",
+  "path": "/v1/oauth/{provider}/device-code/poll"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "s2s_exchange",
+  "path": "/v1/oauth/{provider}/s2s/exchange"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "pat_save",
+  "path": "/v1/oauth/{provider}/pat/save"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_consent_start",
+  "path": "/v1/oauth/microsoft/admin-consent/start"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_consent_callback",
+  "path": "/v1/oauth/microsoft/admin-consent/callback"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "app_install_url",
+  "path": "/v1/oauth/{provider}/app/install-url"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "app_setup",
+  "path": "/v1/oauth/{provider}/app/setup"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "app_installations_refresh",
+  "path": "/v1/oauth/{provider}/app/installations/refresh"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_mcps",
+  "path": "/v1/admin/mcps"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "enable_mcp",
+  "path": "/v1/admin/mcps/{name}/enable"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "disable_mcp",
+  "path": "/v1/admin/mcps/{name}/disable"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_mcp_tool_filter",
+  "path": "/v1/admin/mcps/{name}/tool-filter"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_mcp_config",
+  "path": "/v1/admin/mcps/{name}/config"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_mcp_config",
+  "path": "/v1/admin/mcps/{name}/config"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_hosted_service_mode",
+  "path": "/v1/admin/mcps/{name}/hosted-service-mode"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_network_access",
+  "path": "/v1/admin/mcps/{name}/network-access"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "docker_start",
+  "path": "/v1/admin/mcps/{name}/docker/start"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "docker_stop",
+  "path": "/v1/admin/mcps/{name}/docker/stop"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "docker_restart",
+  "path": "/v1/admin/mcps/{name}/docker/restart"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "docker_status",
+  "path": "/v1/admin/mcps/{name}/docker/status"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_agent_mcps",
+  "path": "/v1/agents/{name}/mcps"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_agent_mcps",
+  "path": "/v1/agents/{name}/mcps"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_agent_ssh_hosts",
+  "path": "/v1/agents/{name}/ssh-hosts"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_agent_skills",
+  "path": "/v1/agents/{name}/skills"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "update_agent_skill",
+  "path": "/v1/agents/{name}/skills/{skill_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_ssh_keys",
+  "path": "/v1/admin/ssh/keys"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "upload_ssh_key",
+  "path": "/v1/admin/ssh/keys"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_ssh_key",
+  "path": "/v1/admin/ssh/keys/{key_name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_mcp_instances",
+  "path": "/v1/admin/mcps/{name}/instances"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_mcp_instance",
+  "path": "/v1/admin/mcps/{name}/instances"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_mcp_instance",
+  "path": "/v1/admin/mcps/{name}/instances/{instance_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_mcp_instance",
+  "path": "/v1/admin/mcps/{name}/instances/{instance_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_mcp",
+  "path": "/v1/admin/mcps/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "check_mcp_updates",
+  "path": "/v1/admin/mcps/check-updates"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_mcp_update_state",
+  "path": "/v1/admin/mcps/update-state"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "update_mcp_version",
+  "path": "/v1/admin/mcps/{name}/update"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "accept_mcp_source",
+  "path": "/v1/admin/mcps/{name}/accept-source"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "dismiss_mcp_source_change",
+  "path": "/v1/admin/mcps/{name}/source-change"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_mcp_auto_update_log",
+  "path": "/v1/admin/mcps/auto-update-log"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "install_mcp",
+  "path": "/v1/admin/mcps/install"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "install_skill_zip",
+  "path": "/v1/admin/skills/install"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "keep_running",
+  "path": "/v1/admin/mcps/{name}/docker/keep-running"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_community_mcps",
+  "path": "/v1/community/mcps"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_community_mcp",
+  "path": "/v1/community/mcps/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "install_community_mcp",
+  "path": "/v1/admin/community/mcps/{name}/install"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_catalog_installs",
+  "path": "/v1/admin/community/mcps/installs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_community_skills",
+  "path": "/v1/community/skills"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_community_skill",
+  "path": "/v1/community/skills/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "install_community_skill",
+  "path": "/v1/admin/community/skills/{name}/install"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_skill_catalog_installs",
+  "path": "/v1/admin/community/skills/installs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_mcp_request",
+  "path": "/v1/agents/{slug}/mcp-requests"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_agent_mcp_requests",
+  "path": "/v1/agents/{slug}/mcp-requests"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "cancel_mcp_request",
+  "path": "/v1/agents/{slug}/mcp-requests/{request_id}/cancel"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_admin_mcp_requests",
+  "path": "/v1/admin/mcp-requests"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "approve_mcp_request",
+  "path": "/v1/admin/mcp-requests/{request_id}/approve"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "reject_mcp_request",
+  "path": "/v1/admin/mcp-requests/{request_id}/reject"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_community_agents",
+  "path": "/v1/community/agents"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "plan_template_update",
+  "path": "/v1/agents/{agent_slug}/update-template/plan"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "apply_template_update",
+  "path": "/v1/agents/{agent_slug}/update-template"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "template_update_status",
+  "path": "/v1/agents/{agent_slug}/update-template/status"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "take_new_version",
+  "path": "/v1/agents/{agent_slug}/update-template/take"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_community_agent",
+  "path": "/v1/community/agents/{template_slug}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "preview_community_agent_install",
+  "path": "/v1/community/agents/{template_slug}/preview"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_reseed_template_items",
+  "path": "/v1/admin/agents/{slug}/reseed-template-items"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "install_from_community",
+  "path": "/v1/agents/install-from-community"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "mcp_icon",
+  "path": "/v1/mcps/{name}/icon.png"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "template_app_picture",
+  "path": "/v1/community/agents/{slug}/pictures/{app}.png"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "validate_local_package",
+  "path": "/v1/mcps/local-package/validate"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "local_template_building_blocks",
+  "path": "/v1/agents/local-template/building-blocks"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "validate_local_template",
+  "path": "/v1/agents/local-template/validate"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "install_from_local_template",
+  "path": "/v1/agents/install-from-local-template"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_list_layers",
+  "path": "/v1/admin/execution-layers"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_list_subscriptions",
+  "path": "/v1/admin/execution-layers/{layer}/subscriptions"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_layers_live",
+  "path": "/v1/admin/execution-layers/live"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_add_subscription",
+  "path": "/v1/admin/execution-layers/{layer}/subscriptions"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_update_subscription",
+  "path": "/v1/admin/execution-layers/{layer}/subscriptions/{sub_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "admin_delete_subscription",
+  "path": "/v1/admin/execution-layers/{layer}/subscriptions/{sub_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_add_local_endpoint",
+  "path": "/v1/admin/execution-layers/local-endpoints"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_local_endpoint_engine",
+  "path": "/v1/admin/execution-layers/local-endpoints/{group}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "admin_delete_local_endpoint",
+  "path": "/v1/admin/execution-layers/local-endpoints/{group}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_list_models",
+  "path": "/v1/admin/execution-layers/{layer}/models"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_add_model",
+  "path": "/v1/admin/execution-layers/{layer}/models"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_discover_models",
+  "path": "/v1/admin/execution-layers/{layer}/discover-models"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_bulk_add_models",
+  "path": "/v1/admin/execution-layers/{layer}/models/bulk"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_toggle_model",
+  "path": "/v1/admin/execution-layers/{layer}/models/{model_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "admin_delete_model",
+  "path": "/v1/admin/execution-layers/{layer}/models/{model_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_pool_status",
+  "path": "/v1/admin/execution-layers/pool-status"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_platform_auth",
+  "path": "/v1/admin/users/{user_sub}/platform-auth"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "user_list_layers",
+  "path": "/v1/users/me/execution-layers"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "user_layers_live",
+  "path": "/v1/users/me/execution-layers/live"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "user_add_subscription",
+  "path": "/v1/users/me/execution-layers/{layer}/subscriptions"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "user_update_subscription",
+  "path": "/v1/users/me/execution-layers/{layer}/subscriptions/{sub_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "user_delete_subscription",
+  "path": "/v1/users/me/execution-layers/{layer}/subscriptions/{sub_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "upload_file",
+  "path": "/v1/upload"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "reserve_upload_folder",
+  "path": "/v1/upload/folder"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "chunked_upload_init",
+  "path": "/v1/upload/chunked/init"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "chunked_upload_status",
+  "path": "/v1/upload/chunked/{upload_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "chunked_upload_chunk",
+  "path": "/v1/upload/chunked/{upload_id}/{index}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "chunked_upload_complete",
+  "path": "/v1/upload/chunked/{upload_id}/complete"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "chunked_upload_abort",
+  "path": "/v1/upload/chunked/{upload_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_temp_image_url",
+  "path": "/v1/images/temp"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "serve_temp_image",
+  "path": "/v1/images/temp/{token}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "serve_media",
+  "path": "/v1/media/{token}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "mint_media_token",
+  "path": "/v1/media/token"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "serve_ui",
+  "path": "/v1/ui/{token}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "serve_app",
+  "path": "/v1/apps/{app_id}/html"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "rollback_app",
+  "path": "/v1/apps/{app_id}/rollback"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "deploy_status",
+  "path": "/v1/apps/{app_id}/deploy/status"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "approve_deploy",
+  "path": "/v1/apps/{app_id}/deploy/approve"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "reject_deploy",
+  "path": "/v1/apps/{app_id}/deploy/reject"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_apps",
+  "path": "/v1/apps"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_app",
+  "path": "/v1/apps/{app_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_app_state",
+  "path": "/v1/apps/{app_id}/state"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hide_app_for_me",
+  "path": "/v1/apps/{app_id}/hide"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "unhide_app_for_me",
+  "path": "/v1/apps/{app_id}/unhide"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_catalog_feed",
+  "path": "/v1/apps/{app_id}/catalog/{feed}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "call_catalog_method",
+  "path": "/v1/apps/{app_id}/catalog/{method}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "warm_app",
+  "path": "/v1/apps/{app_id}/warm"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "reorder_apps",
+  "path": "/v1/apps/order"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "unpin_app",
+  "path": "/v1/apps/{app_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "purge_app",
+  "path": "/v1/apps/{app_id}/purge"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "take_release",
+  "path": "/v1/apps/{app_id}/follow/take"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "send_release_to_source",
+  "path": "/v1/apps/{app_id}/follow/send"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "stop_following",
+  "path": "/v1/apps/{app_id}/follow"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "approve_app",
+  "path": "/v1/apps/{app_id}/approve"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "run_app_actions_batch",
+  "path": "/v1/apps/{app_id}/actions/batch"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "run_app_action",
+  "path": "/v1/apps/{app_id}/actions/{action_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "OPTIONS"
+  ],
+  "name": "preflight_app_media",
+  "path": "/v1/apps/{app_id}/client/media"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET",
+   "HEAD"
+  ],
+  "name": "serve_app_media",
+  "path": "/v1/apps/{app_id}/client/media"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "OPTIONS"
+  ],
+  "name": "preflight_api",
+  "path": "/v1/apps/{app_id}/api/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE",
+   "GET",
+   "HEAD",
+   "PATCH",
+   "POST",
+   "PUT"
+  ],
+  "name": "proxy_api",
+  "path": "/v1/apps/{app_id}/api/{path:path}"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "proxy_ws_root",
+  "path": "/v1/apps/{app_id}/ws"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "proxy_ws",
+  "path": "/v1/apps/{app_id}/ws/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "mint_viewer_token",
+  "path": "/v1/apps/{app_id}/viewer-token"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "verify_render_token",
+  "path": "/v1/internal/render/verify"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "client_document",
+  "path": "/v1/apps/{app_id}/client/{sha}/"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "client_asset",
+  "path": "/v1/apps/{app_id}/client/{sha}/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_logs",
+  "path": "/v1/apps/{app_id}/logs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "OPTIONS"
+  ],
+  "name": "preflight_platform",
+  "path": "/v1/apps/{app_id}/platform/{method}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "platform_method",
+  "path": "/v1/apps/{app_id}/platform/{method}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "OPTIONS"
+  ],
+  "name": "preflight_twins",
+  "path": "/v1/apps/{app_id}/state"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "OPTIONS"
+  ],
+  "name": "preflight_twins",
+  "path": "/v1/apps/{app_id}/push"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "push_rest",
+  "path": "/v1/apps/{app_id}/push"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "state_rest",
+  "path": "/v1/apps/{app_id}/state"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_snapshot",
+  "path": "/v1/apps/{app_id}/bindings/{name}/snapshot/{snap}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE",
+   "GET",
+   "HEAD",
+   "PATCH",
+   "POST",
+   "PUT"
+  ],
+  "name": "broker",
+  "path": "/v1/apps/{app_id}/bindings/{name}/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "emit_event",
+  "path": "/v1/apps/{app_id}/events"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_secrets",
+  "path": "/v1/apps/{app_id}/secrets"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_secret",
+  "path": "/v1/apps/{app_id}/secrets/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_secret",
+  "path": "/v1/apps/{app_id}/secrets/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE",
+   "GET",
+   "HEAD",
+   "PATCH",
+   "POST",
+   "PUT"
+  ],
+  "name": "app_egress",
+  "path": "/v1/apps/{app_id}/egress/{host}/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "inbound",
+  "path": "/v1/apps/{app_id}/inbound/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_checks",
+  "path": "/v1/agents/{agent}/checks"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "put_check",
+  "path": "/v1/agents/{agent}/checks/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_check",
+  "path": "/v1/agents/{agent}/checks/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "put_user_check",
+  "path": "/v1/agents/{agent}/user-checks/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_user_check",
+  "path": "/v1/agents/{agent}/user-checks/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_verdicts",
+  "path": "/v1/agents/{agent}/check-verdicts"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_settings",
+  "path": "/v1/agents/{agent}/check-settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "patch_settings",
+  "path": "/v1/agents/{agent}/check-settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "attached",
+  "path": "/v1/checks/attached"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "attach",
+  "path": "/v1/checks/attach"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "run_now",
+  "path": "/v1/checks/run"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "detach",
+  "path": "/v1/checks/detach"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "post_entry",
+  "path": "/v1/delegation/notebook"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_entries",
+  "path": "/v1/delegation/notebook"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "agent_notebook",
+  "path": "/v1/notebook/agents/{name}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "department_notebook",
+  "path": "/v1/notebook/departments/{department_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_entry",
+  "path": "/v1/notebook/entries/{entry_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_shares",
+  "path": "/v1/shares"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_share",
+  "path": "/v1/shares"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "patch_share",
+  "path": "/v1/shares/{share_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "share_inbox_read",
+  "path": "/v1/shares/inbox"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "accept_share",
+  "path": "/v1/shares/{share_id}/accept"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "decline_share",
+  "path": "/v1/shares/{share_id}/decline"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "hide_share",
+  "path": "/v1/shares/{share_id}/hide"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "unhide_share",
+  "path": "/v1/shares/{share_id}/unhide"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_snapshot",
+  "path": "/v1/shares/{share_id}/snapshot"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_snapshot_media",
+  "path": "/v1/shares/{share_id}/media/{token}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "sharing_settings",
+  "path": "/v1/sharing/settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "user_directory",
+  "path": "/v1/users/directory"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_list_shares",
+  "path": "/v1/admin/shares"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "share_page",
+  "path": "/s/{token}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "share_unlock",
+  "path": "/s/{token}/unlock"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "share_html",
+  "path": "/s/{token}/html"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "share_viewer_token",
+  "path": "/s/{token}/viewer-token"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "share_session_set",
+  "path": "/s/{token}/session"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "share_session_clear",
+  "path": "/s/{token}/session"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "OPTIONS"
+  ],
+  "name": "share_api_preflight",
+  "path": "/s/{token}/api/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE",
+   "GET",
+   "HEAD",
+   "PATCH",
+   "POST",
+   "PUT"
+  ],
+  "name": "share_api",
+  "path": "/s/{token}/api/{path:path}"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "share_ws_root",
+  "path": "/s/{token}/ws"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "share_ws",
+  "path": "/s/{token}/ws/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "share_client_document",
+  "path": "/s/{token}/client/{sha}/"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "share_client_asset",
+  "path": "/s/{token}/client/{sha}/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "share_snapshot",
+  "path": "/s/{token}/snapshot"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "share_snapshot_ui",
+  "path": "/s/{token}/ui/{media_token}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "share_snapshot_media",
+  "path": "/s/{token}/media/{media_token}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "share_state",
+  "path": "/s/{token}/state"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "share_actions_batch",
+  "path": "/s/{token}/actions/batch"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "share_action",
+  "path": "/s/{token}/actions/{action_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE",
+   "GET",
+   "PATCH",
+   "POST",
+   "PUT"
+  ],
+  "name": "share_unknown",
+  "path": "/s/{token}/{rest:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "read_snapshot_ui",
+  "path": "/v1/shares/{share_id}/ui/{token}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "wopi_check_file_info",
+  "path": "/wopi/files/{file_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "wopi_get_file",
+  "path": "/wopi/files/{file_id}/contents"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "wopi_put_file",
+  "path": "/wopi/files/{file_id}/contents"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "wopi_lock_operations",
+  "path": "/wopi/files/{file_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "generate_wopi_url",
+  "path": "/v1/documents/wopi-url"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "generate_snapshot_wopi_url",
+  "path": "/v1/documents/snapshot-wopi-url"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "generate_preview_wopi_url",
+  "path": "/v1/documents/preview-wopi-url"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_chat_documents",
+  "path": "/v1/documents/chat-documents"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "verify_convert_token",
+  "path": "/v1/internal/convert/verify"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "prepare_download",
+  "path": "/v1/documents/download"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_my_pool_cap",
+  "path": "/v1/usage/me/pool-cap"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_my_pool_cap",
+  "path": "/v1/usage/me/pool-cap"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_get_pool_cap",
+  "path": "/v1/admin/usage/pool-cap"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_pool_cap",
+  "path": "/v1/admin/usage/pool-cap"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_my_usage",
+  "path": "/v1/usage/me"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "check_my_usage",
+  "path": "/v1/usage/me/check"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_my_limits",
+  "path": "/v1/usage/me/limits"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_my_limit",
+  "path": "/v1/usage/me/limits"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "delete_my_limit",
+  "path": "/v1/usage/me/limits/delete"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_usage_overview",
+  "path": "/v1/admin/usage/overview"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_get_limits",
+  "path": "/v1/admin/usage/limits"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_limit",
+  "path": "/v1/admin/usage/limits"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "admin_delete_limit",
+  "path": "/v1/admin/usage/limits"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_delete_limit_post",
+  "path": "/v1/admin/usage/limits/delete"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "admin_retention_run_now",
+  "path": "/v1/admin/retention/run-now"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_storage_usage",
+  "path": "/v1/admin/storage/usage"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "admin_list_offboarded",
+  "path": "/v1/admin/offboarded"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "admin_purge_offboarded",
+  "path": "/v1/admin/offboarded/{username}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_api_keys",
+  "path": "/v1/admin/api-keys"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_api_keys_switch",
+  "path": "/v1/admin/api-keys/settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "revoke_api_key",
+  "path": "/v1/admin/api-keys/{kind}/{key_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_meetings_endpoint",
+  "path": "/v1/meetings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_meeting",
+  "path": "/v1/meetings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "start_meeting_endpoint",
+  "path": "/v1/meetings/{meeting_id}/start"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_meeting_endpoint",
+  "path": "/v1/meetings/{meeting_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "end_meeting_endpoint",
+  "path": "/v1/meetings/{meeting_id}/end"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "leave_meeting_endpoint",
+  "path": "/v1/meetings/{meeting_id}/leave"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "propose_conclude_endpoint",
+  "path": "/v1/meetings/{meeting_id}/propose-conclude"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_transcript_endpoint",
+  "path": "/v1/meetings/{meeting_id}/transcript"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_phone_routes",
+  "path": "/v1/admin/phone/routes"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_phone_route",
+  "path": "/v1/admin/phone/routes"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_phone_route",
+  "path": "/v1/admin/phone/routes/{route_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_phone_route",
+  "path": "/v1/admin/phone/routes/{route_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_phone_route_pin",
+  "path": "/v1/admin/phone/routes/{route_id}/pin"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_phone_route_pin",
+  "path": "/v1/admin/phone/routes/{route_id}/pin"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "preview_route_mcps",
+  "path": "/v1/admin/phone/routes/mcp-preview"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_phone_call_log",
+  "path": "/v1/admin/phone/call-log"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_phone_servers",
+  "path": "/v1/admin/phone-servers"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_phone_server",
+  "path": "/v1/admin/phone-servers"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_phone_server",
+  "path": "/v1/admin/phone-servers/{server_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_phone_server",
+  "path": "/v1/admin/phone-servers/{server_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_phone_server_default",
+  "path": "/v1/admin/phone-servers/{server_id}/default"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_phone_server_ami_secret",
+  "path": "/v1/admin/phone-servers/{server_id}/ami-secret"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_phone_server_ami_secret",
+  "path": "/v1/admin/phone-servers/{server_id}/ami-secret"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_phone_server_twilio_auth_token",
+  "path": "/v1/admin/phone-servers/{server_id}/twilio-auth-token"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_phone_server_twilio_auth_token",
+  "path": "/v1/admin/phone-servers/{server_id}/twilio-auth-token"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_phone_server_bootstrap",
+  "path": "/v1/admin/phone-servers/{server_id}/bootstrap"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "verify_phone_server_bootstrap",
+  "path": "/v1/admin/phone-servers/{server_id}/bootstrap/verify"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "apply_phone_server_bootstrap",
+  "path": "/v1/admin/phone-servers/{server_id}/bootstrap/apply"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "check_phone_server_health",
+  "path": "/v1/admin/phone-servers/{server_id}/health"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_phone_settings",
+  "path": "/v1/admin/phone/settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_phone_prompt_defaults",
+  "path": "/v1/admin/phone/settings/defaults"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_phone_settings",
+  "path": "/v1/admin/phone/settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_external_data",
+  "path": "/v1/admin/phone/external-data"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_external_data",
+  "path": "/v1/admin/phone/external-data"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "forget_external_data",
+  "path": "/v1/admin/phone/external-data/forget"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "relay_make_call",
+  "path": "/v1/phone/calls"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "relay_call_status",
+  "path": "/v1/phone/calls/{call_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "relay_wait_for_call",
+  "path": "/v1/phone/calls/{call_id}/wait"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "relay_answer_question",
+  "path": "/v1/phone/calls/{call_id}/answer"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "call_control_endpoint",
+  "path": "/v1/phone/call-control"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "report_turn_classifier_usage",
+  "path": "/v1/phone/usage/turn-classifier"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "report_relisten_usage",
+  "path": "/v1/phone/usage/relisten"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "report_duplex_usage",
+  "path": "/v1/phone/usage/duplex"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_pin_failures",
+  "path": "/v1/phone/pin-failures"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "report_phone_call",
+  "path": "/v1/phone/calls/report"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "report_transfer_outcome",
+  "path": "/v1/phone/calls/transfer-outcome"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "relay_twilio_inbound",
+  "path": "/v1/twilio/inbound/{server_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "relay_twilio_status",
+  "path": "/v1/twilio/status/{server_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "relay_twilio_transfer",
+  "path": "/v1/twilio/transfer/{server_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_providers",
+  "path": "/v1/admin/audio/providers"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "known_providers",
+  "path": "/v1/admin/audio/known-providers"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "create_provider",
+  "path": "/v1/admin/audio/providers"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_provider",
+  "path": "/v1/admin/audio/providers/{provider_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_provider",
+  "path": "/v1/admin/audio/providers/{provider_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_provider_default",
+  "path": "/v1/admin/audio/providers/{provider_id}/default"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_provider_credential",
+  "path": "/v1/admin/audio/providers/{provider_id}/credential"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_provider_credential",
+  "path": "/v1/admin/audio/providers/{provider_id}/credential"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_turn_classifier",
+  "path": "/v1/admin/audio/turn-classifier"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_audio_policy",
+  "path": "/v1/admin/audio/policy"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_audio_policy",
+  "path": "/v1/admin/audio/policy"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_audio_settings",
+  "path": "/v1/admin/audio/settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_audio_settings",
+  "path": "/v1/admin/audio/settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_my_audio_prefs",
+  "path": "/v1/users/me/audio-prefs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_my_audio_prefs",
+  "path": "/v1/users/me/audio-prefs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_my_wake_keywords",
+  "path": "/v1/users/me/wake-keywords"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_my_ui_prefs",
+  "path": "/v1/users/me/ui-prefs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "update_my_ui_prefs",
+  "path": "/v1/users/me/ui-prefs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_audio_capability",
+  "path": "/v1/audio/capability"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "tts_synthesize",
+  "path": "/v1/audio/tts/synthesize"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "mint_stt_session",
+  "path": "/v1/audio/stt/session"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "mint_tts_session",
+  "path": "/v1/audio/tts/session"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "transcribe_audio",
+  "path": "/v1/audio/transcribe"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "tts_generate",
+  "path": "/v1/audio/tts/generate"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "tts_voices",
+  "path": "/v1/audio/tts/voices"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "tts_voices_search",
+  "path": "/v1/audio/tts/voices/search"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "tts_voices_add",
+  "path": "/v1/audio/tts/voices/add"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "mint_duplex_session",
+  "path": "/v1/duplex/session"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "duplex_prewarm",
+  "path": "/v1/duplex/prewarm"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_title_generation",
+  "path": "/v1/admin/title-generation"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "check_title_generation",
+  "path": "/v1/admin/title-generation/check"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "put_title_generation",
+  "path": "/v1/admin/title-generation"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "internal_fire_task",
+  "path": "/v1/internal/fire-task"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "internal_fire_notification",
+  "path": "/v1/internal/fire-notification"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "internal_work",
+  "path": "/v1/internal/work"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "internal_drain",
+  "path": "/v1/internal/drain"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "metrics",
+  "path": "/metrics"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "memory_op",
+  "path": "/v1/internal/memory/op"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "promote_endpoint",
+  "path": "/v1/internal/memory/promote"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_settings_endpoint",
+  "path": "/v1/internal/memory/settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "patch_settings_endpoint",
+  "path": "/v1/internal/memory/settings"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_agent_settings",
+  "path": "/v1/internal/memory/agent-settings/{agent}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PATCH"
+  ],
+  "name": "patch_agent_settings",
+  "path": "/v1/internal/memory/agent-settings/{agent}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "clear_all_endpoint",
+  "path": "/v1/internal/memory/clear-all"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "clear_agent_memory",
+  "path": "/v1/internal/memory/clear-agent-memory/{agent}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "clear_my_memory",
+  "path": "/v1/internal/memory/clear-my-memory"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "git_log",
+  "path": "/v1/internal/git/log"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "git_diff",
+  "path": "/v1/internal/git/diff"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "git_revert",
+  "path": "/v1/internal/git/revert"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "chat_targets_route",
+  "path": "/v1/chats/{chat_id}/targets"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "move_chat_route",
+  "path": "/v1/chats/{chat_id}/move"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "agent_run_targets",
+  "path": "/v1/agents/{name}/run-targets"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "agent_move",
+  "path": "/v1/chats/agent-move"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "compute_settings",
+  "path": "/v1/admin/remote-machines/compute"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "add_compute_machine",
+  "path": "/v1/admin/remote-machines/compute"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "pair_compute_machine_again",
+  "path": "/v1/admin/remote-machines/compute/{machine_id}/pair"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_compute_address_lock",
+  "path": "/v1/admin/remote-machines/compute/{machine_id}/address-lock"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "exchange_compute_pairing",
+  "path": "/v1/satellite/bootstrap"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "compute_host_answer",
+  "path": "/v1/satellite/compute-host"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "serve_bootstrap",
+  "path": "/v1/satellite/bootstrap"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "pair_machine",
+  "path": "/v1/admin/remote-machines/pair"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_machines",
+  "path": "/v1/admin/remote-machines"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "get_machine",
+  "path": "/v1/admin/remote-machines/{machine_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_machine",
+  "path": "/v1/admin/remote-machines/{machine_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "self_uninstall_notify",
+  "path": "/v1/satellite/{machine_id}/self-uninstall"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "sync_mcps_now",
+  "path": "/v1/admin/remote-machines/{machine_id}/sync-mcps"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_machine_auto_update",
+  "path": "/v1/admin/remote-machines/{machine_id}/auto-update"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_allow_full_fs",
+  "path": "/v1/admin/remote-machines/{machine_id}/allow-full-fs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_all_roles",
+  "path": "/v1/admin/remote-machines/{machine_id}/all-roles"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_max_sessions",
+  "path": "/v1/admin/remote-machines/{machine_id}/max-sessions"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "user_set_allow_full_fs",
+  "path": "/v1/users/me/remote-machines/{machine_id}/allow-full-fs"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_device_grants",
+  "path": "/v1/admin/remote-machines/{machine_id}/device-grants"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "user_set_device_grants",
+  "path": "/v1/users/me/remote-machines/{machine_id}/device-grants"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_browser_profile",
+  "path": "/v1/admin/remote-machines/{machine_id}/browser-profile"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "user_set_browser_profile",
+  "path": "/v1/users/me/remote-machines/{machine_id}/browser-profile"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_browser_mode",
+  "path": "/v1/admin/remote-machines/{machine_id}/browser-mode"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_browser_token",
+  "path": "/v1/admin/remote-machines/{machine_id}/browser-token"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "admin_clear_browser_token",
+  "path": "/v1/admin/remote-machines/{machine_id}/browser-token"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "admin_set_browser_unattended",
+  "path": "/v1/admin/remote-machines/{machine_id}/browser-unattended"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "user_set_browser_unattended",
+  "path": "/v1/users/me/remote-machines/{machine_id}/browser-unattended"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "user_set_browser_mode",
+  "path": "/v1/users/me/remote-machines/{machine_id}/browser-mode"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "user_set_browser_token",
+  "path": "/v1/users/me/remote-machines/{machine_id}/browser-token"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "user_clear_browser_token",
+  "path": "/v1/users/me/remote-machines/{machine_id}/browser-token"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "trigger_machine_update_now",
+  "path": "/v1/admin/remote-machines/{machine_id}/update-now"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "assign_agent",
+  "path": "/v1/admin/remote-machines/{machine_id}/agents"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "unassign_agent",
+  "path": "/v1/admin/remote-machines/{machine_id}/agents/{agent_slug}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_my_machines",
+  "path": "/v1/users/me/remote-machines"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "pair_my_machine",
+  "path": "/v1/users/me/remote-machines/pair"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "delete_my_machine",
+  "path": "/v1/users/me/remote-machines/{machine_id}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_my_machine_auto_update",
+  "path": "/v1/users/me/remote-machines/{machine_id}/auto-update"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "POST"
+  ],
+  "name": "trigger_my_machine_update_now",
+  "path": "/v1/users/me/remote-machines/{machine_id}/update-now"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET"
+  ],
+  "name": "list_my_remote_targets",
+  "path": "/v1/users/me/remote-targets"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "PUT"
+  ],
+  "name": "set_my_per_agent_target",
+  "path": "/v1/users/me/remote-targets/{agent_slug}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE"
+  ],
+  "name": "remove_my_per_agent_target",
+  "path": "/v1/users/me/remote-targets/{agent_slug}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "DELETE",
+   "GET",
+   "HEAD",
+   "OPTIONS",
+   "PATCH",
+   "POST",
+   "PUT"
+  ],
+  "name": "proxy_collabora_http",
+  "path": "/collabora/{path:path}"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "proxy_collabora_ws",
+  "path": "/collabora/{path:path}"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "ws_phone_handler",
+  "path": "/ws/phone"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "ws_dashboard_handler",
+  "path": "/ws/dashboard"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "ws_phone_management_handler",
+  "path": "/ws/phone-management"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "ws_satellite_handler",
+  "path": "/v1/satellite"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "ws_audio_stt_handler",
+  "path": "/ws/audio/stt"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "ws_audio_tts_handler",
+  "path": "/ws/audio/tts"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "ws_duplex_handler",
+  "path": "/ws/duplex"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "ws_duplex_engine_handler",
+  "path": "/ws/duplex-engine/{duplex_id}"
+ },
+ {
+  "kind": "APIWebSocketRoute",
+  "methods": [],
+  "name": "ws_twilio_media_relay",
+  "path": "/v1/twilio/media/{server_id}"
+ },
+ {
+  "kind": "Mount",
+  "methods": [],
+  "name": "Mount",
+  "path": "/kws-assets"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET",
+   "HEAD"
+  ],
+  "name": "dashboard_legacy_redirect",
+  "path": "/dashboard/{path:path}"
+ },
+ {
+  "kind": "APIRoute",
+  "methods": [
+   "GET",
+   "HEAD"
+  ],
+  "name": "spa_catchall",
+  "path": "/{path:path}"
+ }
+]

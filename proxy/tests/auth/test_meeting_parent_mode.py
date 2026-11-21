@@ -1,7 +1,7 @@
 """A meeting participant runs in its host chat's permission mode. When the
 host chat's session is gone (reaped idle, or the meeting started with none)
-the participant reads the chat's stored mode (a word from before 1.9 read as
-its current one), and ``ask`` when there is none: an unknown host never reads
+the participant reads the chat's stored mode, and ``ask`` when there is none
+or it is a word no release writes: an unknown host never reads
 as ``auto``, which let a participant write without asking
 (``api/hooks/permission._meeting_mode``)."""
 
@@ -46,13 +46,13 @@ def _clean():
 def test_an_unknown_session_records_no_mode_and_reads_auto_elsewhere():
     assert session_state.recorded_session_mode(HOST) == ""
     assert session_state.get_session_mode(HOST) == "auto"
-    session_state.set_session_mode(HOST, "acceptEdits")
+    session_state.set_session_mode(HOST, "autoReview")
     assert session_state.recorded_session_mode(HOST) == "autoReview"
 
 
 @pytest.mark.asyncio
 async def test_the_live_host_mode_wins(chat_row):
-    chat_row("default")
+    chat_row("ask")
     session_state.set_session_mode(HOST, "dontAsk")
     assert await permission._meeting_mode(_route()) == "dontAsk"
 
@@ -60,7 +60,7 @@ async def test_the_live_host_mode_wins(chat_row):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stored,reads", [
     ("dontAsk", "dontAsk"), ("ask", "ask"), ("autoReview", "autoReview"), ("plan", "plan"),
-    ("auto", "auto"), ("default", "ask"), ("acceptEdits", "autoReview"),
+    ("auto", "auto"), ("default", "ask"), ("acceptEdits", "ask"),
 ])
 async def test_a_gone_host_reads_the_chats_stored_mode(chat_row, stored, reads):
     chat_row(stored)
@@ -91,7 +91,7 @@ async def test_the_chat_row_is_read_on_the_fast_lane(chat_row, monkeypatch):
 
     monkeypatch.setattr(pg, "run_db_fast", _fast)
     monkeypatch.setattr(pg, "run_db", _bulk)
-    chat_row("acceptEdits")
+    chat_row("autoReview")
     assert await permission._meeting_mode(_route(parent="")) == "autoReview"
     assert reads == [db.get_chat]
 
@@ -126,8 +126,8 @@ async def _first_decision(sid: str, decide, monkeypatch) -> tuple[dict, list]:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("decide", [decide_tool_permission, session_events.pre_tool],
                          ids=["hook", "direct-llm"])
-async def test_a_gone_host_of_a_default_chat_asks_before_an_edit(chat_row, monkeypatch, decide):
-    chat_row("default")
+async def test_a_gone_host_of_an_ask_chat_asks_before_an_edit(chat_row, monkeypatch, decide):
+    chat_row("ask")
     _participant()
     result, queued = await _first_decision(PART, decide, monkeypatch)
     assert result["decision"] == "deny" and len(queued) == 1

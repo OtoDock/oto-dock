@@ -1,0 +1,43 @@
+{
+ "driven": [
+  {
+   "engine": "char",
+   "message": "hello",
+   "session": "s"
+  }
+ ],
+ "events": [
+  {
+   "data": {
+    "content": "hello"
+   },
+   "type": "text"
+  },
+  {
+   "data": {
+    "content": "the reason to continue"
+   },
+   "type": "text"
+  }
+ ],
+ "turns": [
+  {
+   "kwargs": {
+    "images": [
+     "i"
+    ],
+    "inject_time": true,
+    "settle_after_result": 2
+   },
+   "message": "hello",
+   "session": "s"
+  },
+  {
+   "kwargs": {
+    "settle_after_result": 2
+   },
+   "message": "the reason to continue",
+   "session": "s"
+  }
+ ]
+}

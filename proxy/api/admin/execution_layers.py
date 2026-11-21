@@ -7,6 +7,8 @@ execution layer.  User endpoints for connecting personal subscriptions.
 from __future__ import annotations
 
 import logging
+from collections import Counter
+from collections.abc import Collection
 from datetime import datetime, timezone
 from typing import cast
 
@@ -24,6 +26,7 @@ from auth.providers import (
     require_auth,
     require_user,
 )
+from core.config import spender
 from core.execution_layer import PROVIDER_LOCAL, LayerCapabilities, provider_entry
 from core.session.session_manager import (
     capabilities_for_path,
@@ -138,7 +141,7 @@ def _valid_layers() -> set[str]:
     """The registered engine ids — read per call, never frozen at import.
 
     Was a module-level literal that had to be kept in step with
-    ``session_manager._LAYERS`` by hand; registering a layer now makes its id
+    ``session_manager._ENGINES`` by hand; registering a layer now makes its id
     valid here by construction.
     """
     from core.session.session_manager import valid_execution_paths
@@ -208,13 +211,15 @@ async def _subscriptions_changed(*layers: str) -> None:
 
 def _attach_windows(subs: list[dict]) -> None:
     """Each OAuth row's effective 5-hour / weekly reading (``windows``), for
-    the bars on both AI Engines cards. Percentages only, so shared-by-another-
-    admin rows carry it too. Absent while the platform setting is off."""
+    the bars on both AI Engines cards, raised by a newer report of one of the
+    account's sessions (``subscription_windows.shown``). Percentages only, so
+    shared-by-another-admin rows carry it too. Absent while the platform
+    setting is off."""
     from services.engines import subscription_windows
     if not subscription_windows.is_enabled():
         return
     oauth = [s for s in subs if s.get("auth_type") == "oauth" and s.get("id")]
-    readings = subscription_windows.latest(oauth) if oauth else {}
+    readings = subscription_windows.shown(oauth) if oauth else {}
     for s in subs:
         if s.get("auth_type") != "oauth":
             continue
@@ -251,12 +256,72 @@ def _attach_login_expiry(subs: list[dict]) -> None:
                        "login expiry: the credential of %s could not be read", sub_id[:8])
 
 
+def _admin_kept_out(row: dict) -> bool:
+    """An account the agents' pool does not use (the admin's list): not
+    active, or not shared with agents (only one nobody owns is listed so)."""
+    return row.get("status") != subscription_status.ACTIVE or not row.get("contribute_platform")
+
+
+def _own_kept_out(row: dict) -> bool:
+    """An account the person's own chats do not use (their list)."""
+    return row.get("status") != subscription_status.ACTIVE or not row.get("use_personal")
+
+
+def _attach_live(rows: list[dict], caps: dict, *, viewer: str, admin: bool,
+                 working: Collection[str]) -> dict[str, int]:
+    """Each row's ``live``: the sessions working on it now (``working``, read
+    on the loop) and how many run each model, most first, as this list may
+    show them (``subscription_pool.sessions_on``); a session with no model is
+    counted and not named. In the admin's list another admin's account
+    carries no email and no label. Returns the bound counts by id, which
+    order the cards. Synchronous."""
+    running = subscription_pool.sessions_on(rows, viewer=viewer, admin=admin, working=working)
+    labels = {str(m.get("value") or ""): str(m.get("label") or "") for m in caps.get("models") or []}
+    for r in rows:
+        _bound, models = running.get(r.get("id") or "", (0, []))
+        per = Counter(labels.get(m) or m for m in models if m)
+        r["live"] = {"sessions": len(models),
+                     "per_model": [{"name": name, "sessions": n}
+                                   for name, n in sorted(per.items(), key=lambda kv: (-kv[1], kv[0]))]}
+        if admin and r.get("owner_sub") and r.get("owner_sub") != viewer:
+            r["oauth_email"], r["label"] = "", ""
+    return {i: c for i, (c, _m) in running.items()}
+
+
+def _as_cards(rows: list[dict], caps: dict, *, viewer: str, admin: bool,
+              working: Collection[str]) -> list[dict]:
+    """A list of accounts as both AI Engines cards show it: ``_attach_live``,
+    in the order the pool uses them (``display_order``). Synchronous."""
+    counts = _attach_live(rows, caps, viewer=viewer, admin=admin, working=working)
+    return subscription_pool.display_order(rows, sessions=counts,
+                                           kept_out=_admin_kept_out if admin else _own_kept_out)
+
+
+def _live_of(rows: list[dict], caps_by_layer: dict, *, viewer: str, admin: bool,
+             working: Collection[str]) -> dict:
+    """What the cards poll while a list is open: each row's ``live`` and
+    ``windows``, by id, never the order. Synchronous."""
+    _attach_windows(rows)
+    for layer, caps in caps_by_layer.items():
+        _attach_live([r for r in rows if r.get("layer") == layer], caps, viewer=viewer, admin=admin,
+                     working=working)
+    return {r["id"]: {"live": r.get("live"), "windows": r.get("windows")} for r in rows if r.get("id")}
+
+
+def _working_now() -> set[str]:
+    """The sessions working now (``lane_status.working_sessions``, sub-agents
+    included), read on the loop for a job that runs off it."""
+    from services.delegation import lane_status
+    return set(lane_status.working_sessions(sub_agents=True))
+
+
 @router.get("/v1/admin/execution-layers")
 async def admin_list_layers(user: UserContext = Depends(get_current_user)):
     """List all execution layers with subscriptions, models, and pool stats."""
     require_admin(user)
 
     capabilities = get_all_capabilities()
+    working = _working_now()
 
     def _job() -> dict:
         layers = []
@@ -274,6 +339,7 @@ async def admin_list_layers(user: UserContext = Depends(get_current_user)):
                 s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
             _attach_windows(platform_subs)
             _attach_login_expiry(platform_subs)
+            platform_subs = _as_cards(platform_subs, caps, viewer=user.sub, admin=True, working=working)
             # Count personal accounts (without exposing details)
             personal_subs = subscription_store.list_subscriptions(
                 layer=path, use_personal=True, include_disabled=True,
@@ -318,15 +384,33 @@ async def admin_list_subscriptions(
     if layer not in _valid_layers():
         raise HTTPException(400, f"Invalid layer: {layer}")
 
+    caps = get_all_capabilities().get(layer, {})
+    working = _working_now()
+
     def _job() -> list[dict]:
         subs = subscription_store.list_admin_managed(layer=layer)
         for s in subs:
             s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
         _attach_windows(subs)
         _attach_login_expiry(subs)
-        return subs
+        return _as_cards(subs, caps, viewer=user.sub, admin=True, working=working)
 
     return {"subscriptions": await run_db(_job)}
+
+
+@router.get("/v1/admin/execution-layers/live")
+async def admin_layers_live(user: UserContext = Depends(get_current_user)):
+    """What the admin's list polls while it is open: each account's sessions,
+    their models and its usage reading, by id. Never the order."""
+    require_admin(user)
+    caps = get_all_capabilities()
+    working = _working_now()
+
+    def _job() -> dict:
+        rows = [s for s in subscription_store.list_admin_managed() if s.get("auth_type") != "local_endpoint"]
+        return _live_of(rows, caps, viewer=user.sub, admin=True, working=working)
+
+    return {"accounts": await run_db(_job)}
 
 
 @router.post("/v1/admin/execution-layers/{layer}/subscriptions")
@@ -354,6 +438,10 @@ async def admin_add_subscription(
         raise HTTPException(400, "Connect an account through its login flow, not as a key")
     if req.auth_type not in caps.auth.auth_types:
         raise HTTPException(400, f"Invalid auth_type for {layer}: {req.auth_type}")
+    if req.auth_type == "local_endpoint" and config.OTODOCK_CLOUD:
+        # A vendor's provider with an address of the admin's choosing is a
+        # local endpoint too: none on hosted OtoDock.
+        raise HTTPException(400, _CLOUD_LOCAL_MSG)
 
     # Hosted Direct-LLM: a credential-less platform sub that routes this provider's
     # LLM calls through the OtoDock relay (credit-metered; the token is minted per
@@ -779,6 +867,8 @@ async def admin_discover_models(
         raise HTTPException(404, "Subscription not found")
     if sub["layer"] != layer:
         raise HTTPException(400, "Subscription does not belong to this layer")
+    if config.OTODOCK_CLOUD and sub.get("auth_type") == "local_endpoint":
+        raise HTTPException(400, _CLOUD_LOCAL_MSG)
 
     provider = sub["provider"]
 
@@ -930,6 +1020,7 @@ async def user_list_layers(user: UserContext | None = Depends(get_current_user))
     """List execution layers with user's own subscriptions and platform availability."""
     user = require_auth(user)
     capabilities = get_all_capabilities()
+    working = _working_now()
 
     def _job() -> list[dict]:
         allow_platform = subscription_store.get_user_allow_platform_auth(user.sub)
@@ -940,6 +1031,7 @@ async def user_list_layers(user: UserContext | None = Depends(get_current_user))
             )
             _attach_windows(user_subs)
             _attach_login_expiry(user_subs)
+            user_subs = _as_cards(user_subs, caps, viewer=user.sub, admin=False, working=working)
             # "Platform available" = the user may borrow a platform API credential here
             # (Platform Auth on AND a borrowable admin sub exists — NOT admin OAuth).
             platform_available = subscription_pool.borrowable_pool_available(path, user.sub)
@@ -957,21 +1049,26 @@ async def user_list_layers(user: UserContext | None = Depends(get_current_user))
                 # Server-computed "can this user run this engine" — the single
                 # predicate behind the chat-page engine/model filtering and the
                 # cross-engine switch options. Never re-derive client-side.
-                "can_run": subscription_pool.user_can_run(path, user.sub),
+                "can_run": spender.can_run(path, user.sub),
             })
         return layers
 
     return {"layers": await run_db(_job)}
 
 
-@router.put("/v1/users/me/preferred-engine")
-async def user_set_preferred_engine(user: UserContext | None = Depends(get_current_user)):
-    """Gone: the engines a person sees follow their use
-    (``services/engines/engine_resolution.py``). Answers 410 for a
-    dashboard loaded before the update; the route goes at the next minor."""
-    require_auth(user)
-    raise HTTPException(410, "The preferred engine setting is gone. The engine picker lists "
-                             "your engines by how much you use them on each agent.")
+@router.get("/v1/users/me/execution-layers/live")
+async def user_layers_live(user: UserContext | None = Depends(get_current_user)):
+    """What the person's list polls while it is open: their own accounts'
+    sessions (theirs only), models and usage readings, by id."""
+    user = require_auth(user)
+    caps = get_all_capabilities()
+    working = _working_now()
+
+    def _job() -> dict:
+        rows = subscription_store.list_subscriptions(owner_sub=user.sub, include_disabled=True)
+        return _live_of(rows, caps, viewer=user.sub, admin=False, working=working)
+
+    return {"accounts": await run_db(_job)}
 
 
 @router.post("/v1/users/me/execution-layers/{layer}/subscriptions")

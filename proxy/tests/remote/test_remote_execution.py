@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 
 def test_load_hook_scripts_loads_all_hooks():
     """Regression: after the core/ -> core/remote/ subpackage move,
@@ -26,10 +28,24 @@ def test_load_hook_scripts_loads_all_hooks():
 
     assert set(HOOK_SCRIPTS) == {"permission_gate.py", "tool_result_forwarder.py",
                                  "subagent_tracker.py", "stop_tracker.py",
-                                 "credential_helper.py"}
+                                 "credential_helper.py", "session_text.py",
+                                 "usage_report.py", "start_context.py"}
     for name in HOOK_SCRIPTS:
         assert name in scripts, f"hook script not loaded: {name}"
         assert scripts[name].strip(), f"hook script empty: {name}"
+
+
+def test_the_stop_script_a_machine_receives_reports_background_kinds():
+    """A machine's terminal reports its background work with the script the
+    start payload carries: no satellite change, no version gate."""
+    from core.remote import remote_start_payload as re
+
+    re._HOOK_SCRIPTS_CACHE = None
+    try:
+        script = re._load_hook_scripts()["stop_tracker.py"]
+    finally:
+        re._HOOK_SCRIPTS_CACHE = None
+    assert '"background_kinds"' in script and "def _background_kinds(" in script
 
 
 class TestRestoreAdoptedCredentials:
@@ -92,6 +108,38 @@ class TestRestoreAdoptedCredentials:
 
         RemoteExecutionLayer._restore_adopted_credentials("sess-b", "m", "pa", "claude-code-cli")
         assert calls["target"].dir_relative == "workspace/.claude"
+
+    @pytest.mark.parametrize("local_file", [False, True])
+    def test_a_session_in_its_own_home_is_targeted_there(self, monkeypatch, local_file):
+        """Rebuilt from the folder the binding was made with, never by the
+        formula: a session's home is its own (finding 6)."""
+        import os
+
+        import config as app_config
+        from core.remote.remote_execution import RemoteExecutionLayer
+        from core.session import session_state
+        from services.engines import subscription_pool, token_fanout
+        from storage.billing import subscription_store
+
+        sid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+        root = os.path.realpath(app_config.get_agent_dir("pa"))
+        calls = {}
+        monkeypatch.setattr(subscription_pool, "restore_session_binding", lambda s: "sub-1")
+        monkeypatch.setattr(subscription_pool, "bound_folder",
+                            lambda s: f"{root}/users/alice/.claude/own/{sid}")
+        monkeypatch.setattr(subscription_store, "get_credential_data",
+                            lambda sub_id: {"oauth_token": {"accessToken": "x"}})
+        monkeypatch.setattr(session_state, "get_session_security", lambda s: self._ctx("alice"))
+        monkeypatch.setattr(token_fanout, "register_session_target",
+                            lambda s, target: calls.__setitem__("target", target))
+        monkeypatch.setattr(subscription_pool, "fan_out_current_token", lambda sub_id: None)
+
+        RemoteExecutionLayer._restore_adopted_credentials(sid, "m", "pa", "claude-code-cli",
+                                                          local_file=local_file)
+        if local_file:
+            assert calls["target"].host_dir == f"{root}/users/alice/.claude/own/{sid}"
+        else:
+            assert calls["target"].dir_relative == f"users/alice/.claude/own/{sid}"
 
     def test_api_key_subscription_skips_registration(self, monkeypatch):
         from core.remote.remote_execution import RemoteExecutionLayer

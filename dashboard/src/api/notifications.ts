@@ -124,6 +124,15 @@ export interface NotificationDelivery {
   href?: string
 }
 
+/** Whether a row's button opens a page: its own href, its chat, or the
+ *  agent's Recover bin (a file conflict names the agent and no chat). The
+ *  bell's row and the toast ask the same question. */
+export function deliveryOpens(
+  d: Pick<NotificationDelivery, 'href' | 'agent_slug' | 'chat_id' | 'source'>,
+): boolean {
+  return !!d.href || !!(d.agent_slug && (d.chat_id || d.source === 'file_conflict'))
+}
+
 export async function fetchDeliveries(): Promise<NotificationDelivery[]> {
   const res = await apiFetch('/v1/notifications')
   const data = await res.json()

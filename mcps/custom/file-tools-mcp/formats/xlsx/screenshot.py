@@ -87,9 +87,11 @@ def prepare_for_screenshot(path: str, temp_dir: str) -> tuple[str, list[str]]:
     """A copy of the workbook at ``path`` in ``temp_dir``, laid out for a
     screenshot, and its sheet names in order. Raises for a file that is
     not a workbook package (an .xls); the caller then renders the
-    original."""
+    original. The workbook is read with ``shared.safe_open_read``."""
+    import shared
+
     out = os.path.join(temp_dir, Path(path).name)
-    with zipfile.ZipFile(path) as zin:
+    with shared.safe_open_read(path) as fh, zipfile.ZipFile(fh) as zin:
         targets = sheet_targets(zin)
         if not targets:
             raise ValueError(f"{Path(path).name} has no worksheets to lay out")

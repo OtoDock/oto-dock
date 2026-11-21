@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 import startup
+import startup_shutdown
 from core.session import session_state
 
 
@@ -55,9 +56,10 @@ async def test_a_recoverable_pump_is_marked_for_its_replay(monkeypatch):
     aborted: list[str] = []
 
     class Pump:
-        def __init__(self, sid, source_type="dashboard"):
+        def __init__(self, sid, source_type="dashboard", engine_turn=False):
             self.session_id = sid
             self.source_type = source_type
+            self.records_engine_turn = engine_turn
             self._task = None
 
         def abort(self):
@@ -65,13 +67,18 @@ async def test_a_recoverable_pump_is_marked_for_its_replay(monkeypatch):
 
     monkeypatch.setattr(stream_pump, "_active_pumps", {
         "chat-remote": Pump("sess-remote"), "chat-local": Pump("sess-local"),
-        "chat-run": Pump("sess-run", "task")})
-    monkeypatch.setattr(startup, "_active_pumps", stream_pump._active_pumps, raising=False)
+        "chat-run": Pump("sess-run", "task"),
+        # A turn the engine started by itself: what it wrote is kept now, the
+        # rest is read after the restart, nothing is replayed.
+        "chat-own": Pump("sess-own", engine_turn=True)})
+    monkeypatch.setattr(startup_shutdown, "_active_pumps", stream_pump._active_pumps, raising=False)
     monkeypatch.setattr(run_recovery, "is_recovery_eligible",
-                        lambda cid: cid in ("chat-remote", "chat-run"))
+                        lambda cid: cid in ("chat-remote", "chat-run", "chat-own"))
     try:
         await startup._flush_active_pumps(logging.getLogger("test"))
-        assert aborted == ["sess-local"]
+        assert aborted == ["sess-local", "sess-own"]
+        assert "chat-own" not in stream_pump._recovery_suppress_flush
+        assert session_state.take_recover_pending("sess-own") is False
         assert "chat-remote" in stream_pump._recovery_suppress_flush
         assert session_state.take_recover_pending("sess-remote") is True
         assert session_state.take_recover_pending("sess-local") is False

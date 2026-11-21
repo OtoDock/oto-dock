@@ -25,11 +25,14 @@ digits is treated as withheld rather than sanitised into a colliding slug.
 
 from __future__ import annotations
 
+import logging
+import os
 import re
-import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger("otodock")
 
 #: Agent-tree subdirectory holding every external caller space.
 EXTERNALS_DIRNAME = "externals"
@@ -174,6 +177,77 @@ def external_home(agent_dir: Path, ident: ExternalIdentity) -> Path | None:
     return Path(agent_dir) / EXTERNALS_DIRNAME / ident.channel / ident.slug
 
 
+def tree_of(agent_dir: Path, channel: str, slug: str) -> Path:
+    """Host path of an outside person's tree from their record's channel and
+    slug. A slug that is not one path component is refused (ValueError)."""
+    from auth.request_path import has_traversal
+    if not slug or "/" in slug or "\\" in slug or has_traversal(slug):
+        raise ValueError(f"not a tree name: {slug!r}")
+    return Path(agent_dir) / EXTERNALS_DIRNAME / _require_channel(channel) / slug
+
+
+def scratch_home(agent_dir: Path, channel: str, session_id: str) -> Path:
+    """The home of an outside session whose identity has no tree (a
+    Shared-only agent's caller, the route-less fallback): an ephemeral tree
+    keyed by the session id, where the engine keeps its state and nothing
+    durable lives, pruned at the session's end like a withheld number's."""
+    channel = _require_channel(channel)
+    try:
+        sid = _require_session_uuid(session_id)
+    except ValueError:
+        # A session id that is no UUID (a builder's own) becomes a path
+        # component through its digest, never as it came.
+        import hashlib
+        sid = hashlib.sha256(str(session_id).encode()).hexdigest()[:32]
+    home = Path(agent_dir) / EXTERNALS_DIRNAME / channel / EPHEMERAL_DIRNAME / sid
+    from services.infra import safe_fs
+    safe_fs.mkdirs_beneath(*_beneath(home))
+    return home
+
+
+def _beneath(home: str | Path) -> tuple[Path, str]:
+    """The agent's real folder and ``home``'s rel below it, from the path as
+    written (``core/agent_folder``): an agent folder that is the operator's
+    link is followed once, nothing below it ever is."""
+    from core import agent_folder
+    return agent_folder.beneath_agent(os.path.abspath(os.fspath(home)))
+
+
+def _ephemeral_rel(rel: str) -> bool:
+    """Whether an agent-relative ``rel`` names an ephemeral tree:
+    ``externals/<channel>/_ephemeral/<name>``, nothing more or less."""
+    parts = rel.split("/")
+    return len(parts) == 4 and parts[0] == EXTERNALS_DIRNAME and parts[2] == EPHEMERAL_DIRNAME
+
+
+def is_ephemeral_home(home: str | Path | None) -> bool:
+    """Whether ``home`` is a tree ``prune_ephemeral`` removes: one that ends
+    in ``externals/<channel>/_ephemeral/<name>``."""
+    if not home:
+        return False
+    parts = Path(home).parts
+    return len(parts) >= 4 and parts[-4] == EXTERNALS_DIRNAME and parts[-2] == EPHEMERAL_DIRNAME
+
+
+def touch_home(home: str) -> None:
+    """A caller tree's own time set to now (a call is activity, the retention
+    sweep keys on the newest time). Opened beneath the agent's real folder
+    with no link followed: a home that is missing or not a plain folder is
+    left as it is."""
+    from services.infra import safe_fs
+    try:
+        root, rel = _beneath(home)
+        fd = safe_fs.open_beneath(root, rel, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.utime(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def parse_claim(claim: str) -> tuple[str, str, str]:
     """``(channel, id, ephemeral_session_id)`` for a JWT ``ext`` value.
 
@@ -216,15 +290,62 @@ def external_home_of(ctx) -> str:
     return home if isinstance(home, str) else ""
 
 
+def caller_home_of(ctx) -> str:
+    """The person's tree that ``/caller`` names in a session: an outside
+    caller's own during a call, the tree of the person a wrap-up writes up
+    after it ("" for a session with neither)."""
+    home = external_home_of(ctx)
+    if home or not getattr(ctx, "wrapup", ""):
+        return home
+    home = getattr(ctx, "wrapup_home", "")
+    return home if isinstance(home, str) else ""
+
+
+def prune_session_scratch(agent_dir: Path, session_id: str) -> None:
+    """The scratch homes a session kept under the phone channel's
+    ``_ephemeral/`` (a call's, a wrap-up's engine state), gone with it. The
+    folder is listed beneath the agent's real folder: a link is never
+    entered, and a missing or refused folder holds none."""
+    if not session_id:
+        return
+    from services.infra import safe_fs
+    folder = Path(agent_dir) / EXTERNALS_DIRNAME / PHONE / EPHEMERAL_DIRNAME
+    try:
+        root, rel = _beneath(folder)
+        walk = safe_fs.walk_beneath(root, rel)
+        try:
+            names = [n for n in next(walk).dirs if n.startswith(session_id)]
+        finally:
+            walk.close()
+    except FileNotFoundError:
+        return
+    except (OSError, StopIteration):
+        logger.warning("Scratch homes of session %s not listed: %s", session_id[:8], folder, exc_info=True)
+        return
+    for name in names:
+        prune_ephemeral(folder / name)
+
+
 def prune_ephemeral(home: Path | None) -> bool:
-    """Remove an ephemeral caller tree at teardown. Refuses anything that is
-    not under ``_ephemeral/`` (a durable tree is only ever removed by the
-    retention sweep, with bookkeeping). Returns True when something was
-    removed."""
+    """Remove an ephemeral caller tree at teardown, beneath the agent's real
+    folder with no link followed at any part. Refuses anything that is not
+    ``externals/<channel>/_ephemeral/<name>`` (a durable tree is only ever
+    removed by the retention sweep, with bookkeeping). Returns True when the
+    tree was removed."""
     if home is None:
         return False
-    home = Path(home)
-    if EPHEMERAL_DIRNAME not in home.parts or not home.is_dir():
+    from services.infra import safe_fs
+    try:
+        root, rel = _beneath(home)
+    except OSError:
         return False
-    shutil.rmtree(home, ignore_errors=True)
+    if not _ephemeral_rel(rel):
+        return False
+    try:
+        safe_fs.rmtree_beneath(root, rel)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.warning("Ephemeral caller tree not removed: %s", home, exc_info=True)
+        return False
     return True

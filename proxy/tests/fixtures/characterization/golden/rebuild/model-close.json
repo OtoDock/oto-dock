@@ -1,0 +1,25 @@
+{
+ "a live session": {
+  "acquired": [
+   [
+    "sid-lane",
+    "task",
+    {
+     "blocking": true,
+     "target": "local"
+    }
+   ]
+  ],
+  "closed": true,
+  "closed_on_layer": [
+   "sid-lane"
+  ],
+  "locked_at_close": true
+ },
+ "a session nobody holds": {
+  "acquired": [],
+  "closed": false,
+  "closed_on_layer": [],
+  "locked_at_close": null
+ }
+}

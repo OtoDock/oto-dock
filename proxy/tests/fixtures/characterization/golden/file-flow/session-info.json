@@ -1,0 +1,27 @@
+{
+ "s-closed": {
+  "agent": "",
+  "machine": "",
+  "remote": false
+ },
+ "s-held": {
+  "agent": "held-agent",
+  "machine": "machine-held",
+  "remote": true
+ },
+ "s-local": {
+  "agent": "",
+  "machine": "",
+  "remote": false
+ },
+ "s-never": {
+  "agent": "",
+  "machine": "",
+  "remote": false
+ },
+ "s-survivor": {
+  "agent": "a-s",
+  "machine": "machine-survivor",
+  "remote": true
+ }
+}

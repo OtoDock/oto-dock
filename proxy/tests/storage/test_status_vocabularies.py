@@ -31,6 +31,7 @@ from storage.billing import subscription_status, subscription_store
 from storage.chat import meeting_status
 from storage.mcp import mcp_request_store
 from tests._paths import PROXY_DIR, REPO_ROOT
+from tests._pool_store import pool_store
 from ws import chat_phase
 
 _STATUS_DIR = REPO_ROOT / "dashboard" / "src" / "lib" / "status"
@@ -110,6 +111,7 @@ def test_the_meeting_vocabulary_its_sets_and_its_table():
     assert ms.STATUSES == {"pending", "active", "paused", "concluding", "concluded", "failed"}
     assert ms.LIVE == {"pending", "active", "concluding"}
     assert ms.TERMINAL == {"concluded", "failed"}
+    assert ms.RESTART_FAILS == {"pending", "active", "paused", "concluding"}
     assert ms.ROUND_STOPS == {"concluding", "failed"}
     assert ms.ENDABLE == {"active", "concluding", "paused"}
     assert ms.LEAVABLE == {"active", "paused"}
@@ -133,6 +135,22 @@ def test_update_meeting_refuses_a_word_outside_the_set():
     from storage.chat import db_meetings
     with pytest.raises(ValueError):
         db_meetings.update_meeting("m-1", status="cancelled")
+
+
+def test_the_restart_sweep_fails_every_meeting_that_has_not_ended(temp_db):
+    """No meeting's loop survives a restart. A paused one left as it was
+    could never end: every route refuses ``paused``, and nothing resumes it."""
+    from storage.chat import db_meetings
+    ms = meeting_status
+    for status in sorted(ms.STATUSES):
+        db_meetings.create_meeting(f"m-{status}", "topic", json.dumps(["a", "b"]), "a", "directed", 10,
+                                   f"chat-{status}", None, None, "user", "u-1")
+        if status != ms.PENDING:
+            db_meetings.update_meeting(f"m-{status}", status=status)
+    assert db_meetings.mark_orphaned_meetings_failed() == 4
+    after = {s: db_meetings.get_meeting(f"m-{s}")["status"] for s in ms.STATUSES}
+    assert after == {ms.PENDING: ms.FAILED, ms.ACTIVE: ms.FAILED, ms.PAUSED: ms.FAILED,
+                     ms.CONCLUDING: ms.FAILED, ms.CONCLUDED: ms.CONCLUDED, ms.FAILED: ms.FAILED}
 
 
 # ---------------------------------------------------------------------------
@@ -207,11 +225,10 @@ def test_the_engine_subscription_vocabulary_survives_a_mocked_store():
     """The suite stands a MagicMock in for ``subscription_store`` at more
     than a hundred sites; a reader must spell the leaf, which no such mock
     shadows."""
-    from unittest.mock import patch
 
     from services.engines import subscription_pool
 
-    with patch.object(subscription_pool, "subscription_store"):
+    with pool_store():
         assert subscription_pool.subscription_status.ACTIVE == "active"
     for path in ("api/admin/execution_layers.py", "services/engines/subscription_pool.py",
                  "services/infra/subscription_health.py", "services/infra/subscription_window_alerts.py",
@@ -268,7 +285,7 @@ def test_the_deploy_answer_and_the_deploy_state():
 def test_the_container_vocabulary():
     d = docker_manager
     assert d.STATUSES == {"running", "unhealthy", "starting", "stopped", "not_found", "error",
-                          "not_checked", "unknown"}
+                          "not_checked", "unknown", "sleeping", "did_not_start"}
     assert d.PRESENT == {"running", "starting", "unhealthy"}
     assert d.STARTED == {"running", "starting"}
     assert (d.ENABLE_STARTED, d.ENABLE_FAILED) == ("started", "failed")
@@ -358,7 +375,7 @@ def test_the_deploy_state_mirror():
 def test_the_docker_mirror():
     text = _mirror("docker.ts")
     words = _ts_const_strings(text, "DOCKER_STATUS")
-    assert set(words) == docker_manager.STATUSES and len(words) == 8
+    assert set(words) == docker_manager.STATUSES and len(words) == 10
     assert _ts_const_strings(text, "ENABLE_DOCKER") == [docker_manager.ENABLE_STARTED,
                                                         docker_manager.ENABLE_FAILED]
 

@@ -447,16 +447,7 @@ async def fire_notification_now(
 
     _check_notification_authority(notif, u)
 
-    deliveries = await notification_manager.fire_notification(
-        title=notif["title"],
-        body=notif["body"],
-        severity=notif["severity"],
-        scope=notif["scope"],
-        target=notif.get("target"),
-        source=notif["source"],
-        notification_id=notification_id,
-        audience=notif.get("audience"),
-    )
+    deliveries = await notification_manager.fire_stored_notification(notif)
     return {"status": "fired", "targets": len(deliveries)}
 
 

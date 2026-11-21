@@ -1,5 +1,6 @@
-"""The pre-turn MCP warm gate of the Codex app-server session
-(``app_server_client.wait_for_mcp_startup``, shared with the satellite twin).
+"""The pre-turn MCP warm gate of a Codex app-server session
+(``app_server_client.wait_for_mcp_startup``, vendored into the satellite,
+whose session picks the cap: ``satellite/tests/test_codex_warm_gate.py``).
 
 Codex sends the model the servers that are CONNECTED when a turn starts, so a
 gate that leaves while servers are still ``starting`` costs the first turn its
@@ -15,13 +16,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.layers.codex import session as codex_session
 from core.layers.codex.app_server_client import (
     MCP_STARTUP_METHOD,
     mcp_server_names_from_toml,
     wait_for_mcp_startup,
 )
-from core.layers.codex.session import CodexAppServerSession
 
 
 def _client():
@@ -151,35 +150,6 @@ async def test_daemon_exit_returns_at_once():
     assert elapsed < 0.05 and res.daemon_exited is True
 
 
-@pytest.mark.asyncio
-async def test_session_picks_the_cap_by_model_kind_and_logs(monkeypatch, caplog):
-    monkeypatch.setattr(codex_session, "_WARM_POLL_S", 0.05)
-    monkeypatch.setattr(codex_session, "_WARM_CAP_S", 0.2)
-    monkeypatch.setattr(codex_session, "_WARM_CAP_LOCAL_MODEL_S", 0.6)
-    monkeypatch.setattr(codex_session, "_WARM_NO_STATUS_S", 5.0)
-    assert codex_session._WARM_CAP_LOCAL_MODEL_S > codex_session._WARM_CAP_S
-
-    async def run(local_model):
-        s = CodexAppServerSession(
-            session_id="sess-warm", agent_name="a", model="m",
-            sandbox_mode="workspace-write", working_dir="", config_dir="",
-            mcp_server_names=["stuck"], local_model=local_model,
-        )
-        s._client = _client()
-        await s._client.notif_queue.put(_status("stuck", "starting"))
-        loop = asyncio.get_running_loop()
-        t0 = loop.time()
-        await s._warm_mcps()
-        return loop.time() - t0
-
-    assert 0.2 <= await run(False) < 0.5
-    assert 0.6 <= await run(True) < 0.9
-    assert any(
-        "hit the" in r.message and "stuck" in r.message and r.levelname == "WARNING"
-        for r in caplog.records
-    )
-
-
 def test_mcp_server_names_from_toml():
     toml = (
         "[features]\nplugins = false\n\n"
@@ -194,28 +164,3 @@ def test_mcp_server_names_from_toml():
     assert mcp_server_names_from_toml(toml) == ["task-mcp", "file.tools", "github"]
     assert mcp_server_names_from_toml("") == []
     assert mcp_server_names_from_toml("[memories]\nuse_memories = false\n") == []
-
-
-@pytest.mark.asyncio
-async def test_the_daemon_is_spawned_below_the_proxys_priority(monkeypatch):
-    """The Codex daemon (and every MCP it starts) runs niced; the
-    session's own sandbox prefix, which picks the cwd, is left untouched."""
-    from core.layers.codex import session as codex_session
-    from core.sandbox import pty_relay
-    seen = {}
-
-    class _Client:
-        def __init__(self, **kw):
-            seen.update(kw)
-
-        async def start(self, init):
-            return {}
-
-    monkeypatch.setattr(codex_session, "AppServerClient", _Client)
-    s = codex_session.CodexAppServerSession(
-        session_id="11111111-2222-4333-8444-555555555555", agent_name="a",
-        model="gpt-6", sandbox_mode="workspace-write", working_dir="",
-        config_dir="/tmp/codex-home", sandbox_cmd_prefix=["bwrap", "--x"])
-    await s._connect_with_retry({}, None)
-    assert seen["sandbox_cmd_prefix"] == [*pty_relay.nice_prefix(), "bwrap", "--x"]
-    assert s.sandbox_cmd_prefix == ["bwrap", "--x"]

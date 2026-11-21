@@ -6,10 +6,8 @@ sweepers on startup, and drains sessions + workers on shutdown.
 """
 
 import asyncio
-import contextlib
 import logging
 import os
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import cast
@@ -18,26 +16,29 @@ from fastapi import FastAPI
 
 import config
 from core.events.stream_pump import _active_pumps
-from core.layers.cli import reap_idle_sessions
-from core.layers.codex import reap_idle_codex_sessions
 from core.layers.direct import reap_idle_direct_sessions
 from core.session.session_state import set_pump_callbacks
 from services.notifications import notification_manager
 from services.scheduler import scheduler
+from startup_shutdown import (  # noqa: F401
+    _arm_exit_failsafe,
+    _bg_tasks,
+    _flush_active_pumps,
+    _shutdown_cleanup,
+    _shutdown_remote_sessions,
+    _shutdown_sessions,
+    _stop_workers,
+)
+from startup_sweeps import (  # noqa: F401
+    _purge_mcp_build_outputs,
+    _registry_sweep_loop,
+    _sweep_items,
+    _sweep_ticks,
+    run_sweep_items,
+)
 from storage import database as task_store, pg as pg_pool, schema as pg_schema
 
 logger = logging.getLogger("otodock")
-
-# Background tasks the lifespan owns — cancelled in ``_shutdown_cleanup`` so
-# their teardown never races the closed DB pool.
-_bg_tasks: list[asyncio.Task] = []
-
-# Hard-exit failsafe (armed as the LAST shutdown step): non-daemon threads —
-# asyncio's default-executor workers above all — are joined by the interpreter
-# AFTER uvicorn logs "Finished server process"; one blocked worker used to
-# hang every stop until docker's 10s SIGKILL (exit 137). Tests flip the flag.
-_ARM_EXIT_FAILSAFE = True
-_EXIT_FAILSAFE_GRACE_S = 3.0
 
 # Open descriptors the proxy asks for. The systemd and Docker default soft
 # limit is 1024 (hard 524288): about a thousand idle sockets, or a few dozen
@@ -113,49 +114,6 @@ def warm_routes(app: FastAPI) -> None:
             except Exception:  # noqa: BLE001  # Starlette's matcher on a synthetic scope may raise anything
                 logger.debug("route warm-up skipped %r", route, exc_info=True)
 
-_SWEEP_CONCURRENCY = 4
-_sweeps_running: dict[str, asyncio.Task] = {}
-
-
-async def run_sweep_items(items) -> list[str]:
-    """One tick of the 60 s sweep: every item not still running from the
-    last tick, ``_SWEEP_CONCURRENCY`` at a time, each failure logged on its
-    own. Returns the names that ran once they all ended (the loop does not
-    wait for that: a tick is its own task)."""
-    slot = asyncio.Semaphore(_SWEEP_CONCURRENCY)
-    ran: list[str] = []
-
-    async def _one(name: str, fn) -> None:
-        async with slot:
-            try:
-                await fn()
-            except Exception:
-                logger.exception("%s failed", name)
-
-    tasks = []
-    for name, fn in items:
-        previous = _sweeps_running.get(name)
-        if previous is not None and not previous.done():
-            logger.warning("%s still running from the last tick; skipped", name)
-            continue
-        ran.append(name)
-        task = asyncio.create_task(_one(name, fn))
-        _sweeps_running[name] = task
-        tasks.append(task)
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    return ran
-
-
-def _purge_mcp_build_outputs() -> None:
-    """The session MCP config build outputs are rebuilt per session; what an
-    earlier release left there carried vendor bearers inline, so the two
-    directories are emptied at every boot (the gateway descriptors beside
-    them are kept: a re-adoption reads them)."""
-    import shutil
-    for name in ("user-mcp-configs", "sse-mcp-configs"):
-        shutil.rmtree(config.SESSIONS_DIR / name, ignore_errors=True)
-
 
 # Register pump callbacks so scheduler / session_state can push events
 # and queue prompts on active pumps without circular imports.
@@ -202,7 +160,11 @@ def _inject_to_pump(chat_id: str, event) -> bool:
 # is (same behavior as a boot where docker was unavailable); the pull
 # progress itself is logged by docker_manager.
 async def _docker_mcp_bringup(docker_manager) -> None:
-    """The docker MCPs brought up off the loop, a failure logged."""
+    """The docker MCPs brought up off the loop, a failure logged. The server
+    sessions the tools' door held before this start are lost (their
+    sessions' next calls say so)."""
+    from services.containers import door
+    door.load_held()
     try:
         await asyncio.to_thread(docker_manager.startup_docker_mcps)
     except Exception:
@@ -220,18 +182,119 @@ def _prewarm_language_identifier() -> None:
         prewarm_language_identifier(None, audio_service.language_identify_threads())
 
 
-# Delegate wakes parked across the restart: redeliver once boot settles.
-# Delayed so satellites get their reconnect window first — a wake whose
-# machine is still offline just re-persists and the machine's own
-# reconnect pass (run_recovery.on_sessions_alive) retries it.
-async def _boot_wake_redelivery() -> None:
-    await asyncio.sleep(15)
+# What the last process left, once the boot settles, in this order: the
+# messages that waited in a chat's queue are armed, the turns it cut are
+# continued (``continue_pass``), the reloads and moves that waited are
+# settled, the runs that never started start, the wakes parked on chats are
+# redelivered (delayed so satellites get their reconnect window first: a
+# wake whose machine is still offline just re-persists and that machine's
+# own reconnect pass retries it), and what came due in the downtime fires.
+# The order is the rule: a wake or a fire must not start a session on a chat
+# whose cut turn the pass has not reached.
+_BOOT_SETTLE_S = 10.0
+_BOOT_WAKES_AFTER_S = 15.0
+
+
+async def _end_start_hold() -> None:
+    """Wait for a compute machine the reloaded sessions run on
+    (``compute_bootstrap.await_back``, bounded), then end the start's hold.
+    The continue's steps run after this, so what a door held goes out in the
+    boot's order."""
+    from core import drain
+    from services.remote import compute_bootstrap
+    if not drain.starting():
+        return
+    try:
+        await compute_bootstrap.await_back()
+    except BaseException:
+        drain.drop_start_hold()
+        raise
+    await drain.end_start_hold()
+
+
+async def _boot_continue() -> None:
+    from services.apps import link_upgrade
+    from services.mcp import mcp_venv_bootstrap, tool_listing
+    from services.phone import outside_upgrade, wrapup
+    from services.scheduler import continue_pass, run_recovery
+    await asyncio.sleep(_BOOT_SETTLE_S)
+    await _end_start_hold()
+    steps = (
+        ("the queued messages", continue_pass.arm_queues),
+        ("the continue pass", continue_pass.run_pending),
+        ("the runs not taken up again", run_recovery.report_failed_at_boot),
+        ("the waiting reloads and moves", continue_pass.settle_waiters),
+        ("the runs that never started", run_recovery.start_pending_runs),
+        ("the outside callers of the update", outside_upgrade.first_boot),
+        ("the earlier calls of the update", outside_upgrade.name_old_calls),
+        ("the conversations tool of the update", outside_upgrade.add_conversations_tool),
+        ("the shared links of the update", link_upgrade.first_boot),
+        ("the wrap-ups left open", wrapup.resume_after_boot),
+        ("the bundled tools of the update", tool_listing.relist_bundled_after_upgrade),
+        ("the tools whose environment is not built", mcp_venv_bootstrap.tell_admins),
+    )
+    for name, step in steps:
+        try:
+            done = await step()
+            if done:
+                logger.info("Startup, %s: %s", name, done)
+        except Exception:
+            logger.exception("Startup, %s: failed (continuing)", name)
+    await asyncio.sleep(max(0.0, _BOOT_WAKES_AFTER_S - _BOOT_SETTLE_S))
+    try:
+        held = await scheduler.fire_held()
+        if held:
+            logger.info("Startup: fired %d continuation(s) held while the platform started", held)
+    except Exception:
+        logger.exception("Startup: the held continuations failed")
     try:
         woken = await scheduler.redeliver_pending_wakes()
         if woken:
             logger.info("Startup wake redelivery: woke %d chat(s)", woken)
     except Exception:
         logger.exception("Startup wake redelivery sweep failed")
+    try:
+        fired = await scheduler.fire_downtime()
+        if fired:
+            logger.info("Startup: fired %d task(s) that came due while the platform was down",
+                        fired)
+    except Exception:
+        logger.exception("Startup: the downtime's fires failed")
+
+
+async def _alive_beat() -> None:
+    """Say the platform is alive (``platform_marks``), so the next boot
+    knows since when it was down."""
+    from services.infra import platform_marks
+    while True:
+        await asyncio.sleep(platform_marks.BEAT_S)
+        try:
+            await asyncio.to_thread(platform_marks.beat)
+        except Exception:  # noqa: BLE001  # a database outage: the next beat tries again
+            logger.debug("the alive beat failed", exc_info=True)
+
+
+def _note_stop_signal() -> None:
+    """The stop signal sets the platform's ending before uvicorn's own
+    handler runs: an engine that dies while the sockets drain (a unit that
+    signals the whole group) is then read as the platform's cut, and the
+    chats' queues freeze. Main thread only (``signal.signal``'s rule)."""
+    import signal
+    import threading
+
+    from core.events.stream_pump import note_platform_ending
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous = signal.getsignal(signum)
+        if not callable(previous):
+            continue
+
+        def _handler(sig, frame, _previous=previous) -> None:
+            note_platform_ending()
+            _previous(sig, frame)
+
+        signal.signal(signum, _handler)
 
 
 # One register per relay provider in use, once boot settles: an upgraded
@@ -244,153 +307,6 @@ async def _boot_relay_events() -> None:
         await relay_events.sync_all()
     except Exception:
         logger.exception("Startup relay events registration failed (non-fatal)")
-
-
-# The 60 s sweep's items, each isolated (one that raises is logged and
-# the next runs) and run concurrently, _SWEEP_CONCURRENCY at a time: a
-# slow one no longer pushes the rest back, and an item still running
-# from the last tick is skipped (a hung sweep holds one slot, never
-# four, and the fingerprint merge never runs twice). Every store touch
-# goes through run_db (storage/pg.py's event-loop rule): a periodic
-# DELETE + COMMIT on the loop is exactly what froze the proxy on
-# 2026-09-03 when the disk went slow; the two file sweeps run in a
-# worker thread for the same reason.
-
-async def _sweep_media():
-    from services.media import media_pipeline as _mp
-    from storage import database as _db
-    await asyncio.to_thread(_mp.sweep_host_media_cache)      # TTL satellite-host media
-    await pg_pool.run_db(_db.sweep_expired_media_tokens)  # reap expired workspace tokens
-
-
-async def _sweep_preview_snapshots():
-    # Version-pinned preview snapshots: reap dirs of deleted chats
-    # (internally throttled to hourly).
-    from services.media import preview_snapshots as _psnap
-    await asyncio.to_thread(_psnap.sweep_orphans)
-
-
-async def _sweep_recover_bin():
-    # Workspace Recover Bin: reap entries past their 7-day TTL
-    # (DB rows + on-disk bytes). Quick indexed delete, usually 0.
-    from storage.files import recover_bin_store as _rbstore
-    await pg_pool.run_db(_rbstore.delete_expired)
-
-
-async def _sweep_tombstones():
-    # File-sync delete tombstones: reap past their 30-day TTL (an
-    # offline satellite is assumed long-since caught up). Indexed delete.
-    from storage.files import file_tombstones_store as _tstore
-    await pg_pool.run_db(_tstore.delete_expired)
-
-
-async def _sweep_idle_fingerprints():
-    # Fingerprint-gated periodic idle sync — for each connected
-    # satellite whose agent tree changed OUT-OF-TURN (no active session),
-    # run the merge so it (and the dashboard) catches up without waiting
-    # for the next session. No-op for quiet / pre-0.5.32 satellites.
-    from core.session.session_manager import _get_remote_layer as _grl
-    _layer = _grl()
-    if _layer is not None:
-        await _layer.run_idle_fingerprint_sweep()
-
-
-async def _sweep_retention():
-    # Session retention + disk cleanup: ages out LOCAL chats' on-disk
-    # session files (admin knob; chats reseed from DB history via
-    # #11), reaps orphaned session files + Codex telemetry junk, and
-    # runs the MCP tarball-cache GC. Internally gated to once/24h.
-    from services.infra import retention as _retention
-    await _retention.maybe_run_daily()
-
-
-async def _sweep_quotas():
-    # Storage quotas: measure each agent's shared + per-user buckets
-    # and fire the 90/95/100% warning notifications (with hysteresis).
-    # Cheap when no limit is set (early-returns); uses the kernel quota
-    # report when enforcing, else a throttled tree walk.
-    from services.infra import quota_monitor as _qm
-    await _qm.check_quotas()
-
-
-async def _sweep_subscription_health():
-    # OAuth grant health: warn owners before a login grant's
-    # finite lifetime lapses (72h/24h out) and once when a row
-    # flips to expired. Self-throttled to 15 min; dedup stamps
-    # persist inside the credential blob.
-    from services.infra import subscription_health as _sub_health
-    await _sub_health.check_subscription_health()
-
-
-async def _sweep_window_alerts():
-    # Provider windows: tell an account's owner when a weekly
-    # window passes 90 % and when it is reached. Self-throttled
-    # to 5 min; dedup rows persist per window instance.
-    from services.infra import subscription_window_alerts as _win_alerts
-    await _win_alerts.check_window_alerts()
-
-
-async def _sweep_mcp_autoupdate():
-    # Automatic MCP updates: once a week in a low-traffic window,
-    # apply available community-MCP updates (deferring in-use docker
-    # MCPs). Persisted wall-clock gate; launches the run as its own
-    # task so the multi-hour defer loop never blocks this sweep.
-    from services.mcp import mcp_autoupdate as _mcp_autoupdate
-    await _mcp_autoupdate.maybe_run_weekly()
-
-
-async def _sweep_agent_updates():
-    # Community agent templates: once a day, the managers of an
-    # agent whose template has a newer catalog version hear it,
-    # once per version (the update itself is theirs to press).
-    from services.community import community_agent_updater as _agent_updater
-    await _agent_updater.maybe_notify_updates()
-
-
-async def _sweep_catalog_installs():
-    from core.credentials import (
-        catalog_install_registry as _catalog_install_registry,
-    )
-    await _catalog_install_registry.sweep_stale()
-
-
-def _sweep_items(_warmup_registry, _install_registry, _transfer_registry) -> list:
-    """The 60 s sweep's items: the registries' stale sweeps and the store and
-    disk sweeps above, in the order they run."""
-    sweep_items = [
-        ("warmup_registry sweep", _warmup_registry.sweep_stale),
-        ("install_registry sweep", _install_registry.sweep_stale),
-        ("transfer_registry sweep", _transfer_registry.sweep_stale),
-        ("catalog_install_registry sweep", _sweep_catalog_installs),
-        ("media cache sweep", _sweep_media),
-        ("preview snapshot sweep", _sweep_preview_snapshots),
-        ("recover-bin reap", _sweep_recover_bin),
-        ("tombstone reap", _sweep_tombstones),
-        ("idle fingerprint sweep", _sweep_idle_fingerprints),
-        ("retention sweep", _sweep_retention),
-        ("quota monitor sweep", _sweep_quotas),
-        ("subscription health sweep", _sweep_subscription_health),
-        ("subscription window alert sweep", _sweep_window_alerts),
-        ("mcp auto-update sweep", _sweep_mcp_autoupdate),
-        ("agent template update sweep", _sweep_agent_updates),
-    ]
-    return sweep_items
-
-
-# The 60 s sweep's ticks in flight: a tick holds itself here until it ends.
-_sweep_ticks: set[asyncio.Task] = set()
-
-
-async def _registry_sweep_loop(sweep_items: list, ticks: set[asyncio.Task]) -> None:
-    """One tick a minute, each its own task."""
-    # A tick is started, not awaited: an item that hangs is skipped at
-    # the next tick and holds nothing of it (each tick has its own
-    # slots), instead of holding every later tick back.
-    while True:
-        await asyncio.sleep(60)
-        tick = asyncio.create_task(run_sweep_items(sweep_items))
-        ticks.add(tick)
-        tick.add_done_callback(ticks.discard)
 
 
 # Hosted turn-classifier token refresh. When the Groq turn classifier runs
@@ -413,10 +329,34 @@ async def _phone_classifier_token_refresh_loop():
             logger.exception("phone classifier token refresh failed")
 
 
+def not_dumpable() -> bool:
+    """On bare metal the compute unit runs as the platform's own OS user: the
+    server takes itself out of that user's reach through ``/proc`` (its
+    environment holds config.env's secrets, its root and its open files lead
+    past the unit's walls), as ``prctl(PR_SET_DUMPABLE, 0)`` does. A container
+    is a boundary of its own, and an install that runs no compute machine of
+    its own keeps its core dumps and an inspector of the same user. True when
+    set."""
+    import config
+    from core import host_os
+    from services.remote import compute_bootstrap
+    if config.RUNNING_IN_DOCKER or host_os.host_os().name != host_os.LINUX or not compute_bootstrap.runs_own():
+        return False
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+            raise OSError(ctypes.get_errno(), "prctl")
+    except (OSError, AttributeError):
+        logger.warning("Startup: the server could not take itself out of reach of /proc", exc_info=True)
+        return False
+    return True
+
+
 def _boot_process() -> ThreadPoolExecutor:
     """The process: the SIGUSR1 dump, the nofile limit, the default executor,
-    the build outputs purged, the adapters, the pump callbacks, the sandbox
-    preflights, the agents directory, the storage quotas."""
+    the build outputs purged, the adapters, the pump callbacks, the agents
+    directory, the storage quotas."""
     # SIGUSR1 → all-thread stack dump on stderr; the field tool for shutdown
     # hangs ("Finished server process" logged but the process never exits).
     try:
@@ -427,6 +367,7 @@ def _boot_process() -> ThreadPoolExecutor:
         pass  # non-main thread or no SIGUSR1 on this platform
 
     raise_nofile_limit()
+    not_dumpable()
     default_executor = set_default_executor(asyncio.get_running_loop())
     _purge_mcp_build_outputs()
 
@@ -437,31 +378,7 @@ def _boot_process() -> ThreadPoolExecutor:
     register_adapter(PhoneAdapter())
     register_adapter(DashboardAdapter())
 
-
-
-
     set_pump_callbacks(_push_to_pump, _queue_on_pump, _inject_to_pump)
-
-    # Sandbox network-isolation preflight (isolation is mandatory): hard-fail
-    # boot if pasta/ip/bwrap/launcher are missing OR the host can't create an
-    # unprivileged user+net namespace (never silently run agents un-isolated),
-    # and materialize the stub-resolver resolv.conf swap so every later sandbox
-    # build is a pure argv transform.
-    from core.sandbox.sandbox import (
-        cli_version_preflight,
-        netns_preflight,
-        tmpfs_cap_preflight,
-    )
-    netns_preflight()
-
-    # CLI pin drift check (warn-only): if the proxy host's claude/codex differ
-    # from VERSIONS.md, log it so an operator can reconcile. Satellites self-heal
-    # on auth; the proxy host is fixed by re-running the installer.
-    cli_version_preflight()
-
-    # Per-sandbox /tmp cap: probe bwrap --size once and log the effective cap
-    # (or that this bubblewrap cannot cap), so it is visible in the boot log.
-    tmpfs_cap_preflight()
 
     # Fail fast with an actionable message if the agents dir isn't writable by
     # the runtime user. In the containerised (uid 1000) deployment the named
@@ -524,11 +441,50 @@ async def _boot_database() -> None:
         logger.exception("agent-tree credentials sweep failed (continuing)")
 
 
+#: Why each key of ``config.UNREAD_KEYS_SET`` does nothing now, said once at
+#: the boot.
+UNREAD_KEY_SENTENCES = {
+    "OTODOCK_COMPUTE_SESSIONS": "chats, tasks and calls run on a compute machine.",
+    "OTODOCK_CREDENTIAL_EXIT": "the credential exit always runs.",
+}
+
+
+def _boot_compute() -> None:
+    """The install's own compute machine: its row and its credential, minted
+    again when they do not verify (a restore onto a new host), and the
+    start's hold until it signed in. The platform runs no session itself, so
+    a start that has no compute machine to wait for says so: no silent
+    start."""
+    from core import drain
+    from services.remote import compute_bootstrap
+    for key in config.UNREAD_KEYS_SET:
+        logger.warning("Config: %s is set and does nothing since 2.0: %s Delete the line.", key,
+                       UNREAD_KEY_SENTENCES.get(key, ""))
+    if not compute_bootstrap.runs_own():
+        logger.warning("Compute: this install names no compute machine of its own "
+                       "(OTODOCK_COMPUTE_LINK_DIR is not set). Chats, tasks and calls cannot run until one signs in: "
+                       "use the compose file's otodock-compute service, or on an install from "
+                       "source run scripts/dev-setup.sh --service.")
+    try:
+        compute_bootstrap.ensure()
+    except Exception:
+        logger.exception("Compute: the compute machine's credential was not written. It cannot "
+                         "sign in, so chats, tasks and calls cannot run until this is fixed (continuing)")
+    # The addresses the compute machines on other servers signed in from: never
+    # the local network a person signs in from (``lan_check``).
+    try:
+        compute_bootstrap.load_addresses()
+    except Exception:
+        logger.exception("Compute: the compute machines' addresses were not read (continuing)")
+    if compute_bootstrap.expect_back():
+        drain.hold_for_start()
+
+
 async def _boot_registrations() -> None:
     """The registrations and the one-time passes: offboarding, the app
     lifecycle, the key canary, the timezone seed, the edge recompile, the
-    run recovery, the security index, the revocations, the persona
-    migration, the app releases, the catalog, the checks, the seeder, the
+    run recovery, the security index, the revocations, the histories'
+    move, the persona migration, the app releases, the catalog, the checks, the seeder, the
     app handlers, the license and phone seeds."""
     # The stores' post-commit steps (an agent's repo and quota, a person's
     # folders): installed before anything below can create an agent or
@@ -548,6 +504,8 @@ async def _boot_registrations() -> None:
     offboarding_bindings.register()
     from ws import dashboard as _dashboard_ws
     _dashboard_ws.register_offboarding()
+    from api.media import wopi as _wopi
+    _wopi.register_offboarding()
     from services.apps import app_lifecycle as _app_lifecycle
     _app_lifecycle.register()
     # Credential-key canary: one loud ERROR when stored secrets can't be
@@ -578,13 +536,38 @@ async def _boot_registrations() -> None:
             logger.warning("set install %s was cut off by the restart", job_id)
     except Exception:
         logger.exception("startup set-install interrupt failed (non-fatal)")
+    # What the last process left (``platform_marks``): whether the boot takes
+    # up what it finds, and how the last process stopped. Stamped below, once
+    # the answer is in the store.
+    from services.infra import platform_marks
+    marks = platform_marks.read_at_boot()
+    # Startup recovery: reload the persisted per-session SecurityContext
+    # index so a session that survived a proxy crash on a satellite (and its
+    # background sub-agents) keeps full path-policy enforcement at the permission
+    # gate instead of being denied as context-less. Contexts carry no secrets;
+    # closed sessions were cleared, so a replayed dead-session JWT stays denied.
+    # Before the records below: recovery reads a session's machine from its
+    # own context (``session_state.placed_on``), never from its chat's pin.
+    from core.session.session_state import load_session_security
+    load_session_security()
+    _boot_compute()
+    # The turns the last process cut become records (``cut_turns``): one the
+    # platform ran itself is the continue pass's once the boot settles, one
+    # on a machine waits for that machine's report.
+    from services.scheduler import cut_turns
+    cut = cut_turns.record_at_boot(clean_stop=marks.clean_stop, catches_up=marks.catches_up)
+    if cut["pending"] or cut["waiting"]:
+        logger.info("Startup recovery: %s cut turn(s) to continue, %s waiting for their machine",
+                    cut["pending"], cut["waiting"])
     # Startup recovery: PARK recovery-eligible in-flight runs (remote CLI,
-    # pinned target) for satellite re-adopt (Mode C) instead of blind-failing
-    # them; every other orphaned run + all orphaned meetings are failed so
-    # they don't appear stuck. Must run BEFORE the satellite heartbeat monitor
-    # (below) so a run is parked before its satellite can report it.
+    # pinned target) for satellite re-adopt (Mode C), keep the runs that are
+    # reopened, and fail every other orphaned run and all orphaned meetings
+    # so they don't appear stuck. Must run BEFORE the satellite heartbeat
+    # monitor (below) so a run is parked before its satellite can report it.
     from services.scheduler import run_recovery
-    parked_runs, orphaned_runs = run_recovery.defer_orphaned_runs()
+    parked_runs, orphaned_runs = run_recovery.defer_orphaned_runs(
+        catches_up=marks.catches_up, clean_stop=marks.clean_stop)
+    platform_marks.stamp_at_boot()
     orphaned_meetings = task_store.mark_orphaned_meetings_failed()
     if parked_runs or orphaned_runs or orphaned_meetings:
         logger.info(
@@ -593,23 +576,15 @@ async def _boot_registrations() -> None:
             "%s orphaned meeting(s) as failed",
             parked_runs, orphaned_runs, orphaned_meetings
         )
-    # The turns the last process cut: a closing row each now, or, for a turn
-    # its satellite may replay, when that machine reports (or the deadline).
-    from services.scheduler import cut_turns
-    waiting, closed = cut_turns.defer_at_boot(run_recovery.RECOVERY_DEADLINE_S)
-    if waiting or closed:
-        logger.info("Startup recovery: %s cut turn(s) closed, %s waiting for their machine",
-                    closed, waiting)
-    # Startup recovery: reload the persisted per-session SecurityContext
-    # index so a session that survived a proxy crash on a satellite (and its
-    # background sub-agents) keeps full path-policy enforcement at the permission
-    # gate instead of being denied as context-less. Contexts carry no secrets;
-    # closed sessions were cleared, so a replayed dead-session JWT stays denied.
-    from core.session.session_state import load_session_security
-    load_session_security()
     # The sign-ins a logout revoked survive a restart (auth/session_revocation.py).
     from auth import session_revocation
     await asyncio.to_thread(session_revocation.load)
+
+    # The histories an earlier release kept inside the tracked folders move
+    # into the proxy's own data, in the background: a folder's first use
+    # moves its own first (services/infra/history_move.py).
+    from services.infra import history_move
+    _bg_tasks.append(asyncio.create_task(asyncio.to_thread(history_move.run_pass)))
 
     # Converge pre-1.4 agents on the agent.md persona filename before any
     # session builds a prompt (readers accept both names; this makes disk,
@@ -631,6 +606,15 @@ async def _boot_registrations() -> None:
         _catalog.install()
     except Exception:
         logger.exception("Platform catalog install failed (continuing)")
+    # A session's own deletes: registered before the
+    # checks', whose continue would end the handler loop before it.
+    try:
+        from services.infra import file_bookkeeping as _bookkeeping
+        _bookkeeping.install_session_delete_watch()
+        _bg_tasks.append(asyncio.create_task(
+            asyncio.to_thread(_bookkeeping.prime_session_delete_watch)))
+    except Exception:
+        logger.exception("Session delete watch install failed (continuing)")
     # Checks (CHECKS.md): the one turn_end handler that judges a session's
     # work; nothing runs until a check is attached to an agent or a chat.
     try:
@@ -683,23 +667,48 @@ async def _boot_registrations() -> None:
 async def _boot_mcps() -> None:
     """The MCPs: the manifest scan, the bundled venvs, the docker bring-up."""
     # MCP Framework: discover manifests, seed DB, start Docker MCPs
-    from services.mcp import docker_manager, mcp_registry, mcp_venv_bootstrap
+    from services.mcp import docker_manager, mcp_registry, mcp_venv_bootstrap, tool_envs
     mcp_registry.scan_manifests()
-    # Ensure every bundled Python MCP has a current venv before any session
-    # tries to launch it. Idempotent — fast no-op when every venv is fresh.
-    # Closes the gap discovered with image-search-mcp where a freshly-pulled
-    # MCP had no venv on disk and silently failed to start.
+    # The browsers whose local network an admin opened: outside people's
+    # sessions never get one (``mcp_session_filter``).
     try:
-        venv_results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
-        built = [n for n, r in venv_results.items() if r == "ok"]
-        failed = [n for n, r in venv_results.items() if r in ("failed", "exception")]
-        if built:
-            logger.info("Bundled MCP venvs built: %s", built)
-        if failed:
-            logger.warning("Bundled MCP venv build failures: %s", failed)
+        from services.mcp import mcp_egress, mcp_session_filter
+        mcp_session_filter.note_open_exits(await asyncio.to_thread(lambda: [
+            m.name for m in mcp_registry.get_all_manifests().values()
+            if m.network_exit and mcp_egress.network_access_enabled(m)]))
     except Exception:
-        logger.exception("Bundled MCP venv bootstrap failed (non-fatal)")
-
+        logger.exception("The open browsers were not read (continuing)")
+    # The platform's own tools' hosts on the bearer allowlist, as a release
+    # declares them (a host a release adds would otherwise wait for nobody).
+    try:
+        from services.community import manifest_hosts
+        await asyncio.to_thread(manifest_hosts.seed_shipped)
+    except Exception:
+        logger.exception("The shipped tools' allowlist rows were not refreshed (continuing)")
+    try:
+        # What a failed rollback of an install left goes first.
+        from services.community import community_installer
+        asides = await asyncio.to_thread(community_installer.sweep_failed_asides)
+        if asides:
+            logger.info("Tool installs: %s left by a failed install swept", asides)
+    except Exception:
+        logger.exception("The tool install sweep failed (continuing)")
+    # The boot scans the bundled MCPs' environments and builds none: an image
+    # carries them, and an install from source builds them with its own
+    # setup script. An MCP the scan finds stale is left out of sessions
+    # (``tool_envs``), and admins are told once per start which ones and the script.
+    try:
+        plan = await asyncio.to_thread(mcp_venv_bootstrap.scan_bundled_venvs)
+        await asyncio.to_thread(mcp_venv_bootstrap.prune_unused_pythons)
+    except Exception:
+        logger.exception("Bundled MCP venv scan failed (non-fatal)")
+        plan = None
+    if plan is not None:
+        notice = mcp_venv_bootstrap.build_notice(plan) if plan.steps else ""
+        tool_envs.note_stale(plan.names, notice)
+        if notice:
+            # The admins' notification goes out once the start is over (``_boot_continue``).
+            logger.warning("%s", notice)
 
     _bg_tasks.append(asyncio.create_task(_docker_mcp_bringup(docker_manager)))
     # NOTE: there is deliberately NO boot backfill of core MCPs onto existing
@@ -716,7 +725,7 @@ async def _boot_mcps() -> None:
 
 def _boot_subscriptions() -> None:
     """The subscriptions: the hosted instances, the session counters, the
-    stale bindings, the model sync, the retired remaps."""
+    stale bindings, the usage-limit rests, the model sync, the retired remaps."""
     # Create/remove the platform-managed ("Hosted by OtoDock") system
     # instances to match the hosted-relay state — relay usable AND the master
     # toggle on AND connected (relay_client.system_relay_active()). Extracted so
@@ -754,6 +763,15 @@ def _boot_subscriptions() -> None:
             logger.info("Pruned %s orphan session-subscription binding(s)", orphans)
     except Exception:
         logger.exception("session-binding prune failed (non-fatal)")
+    # The usage-limit rests (subscription_rests): an account that reached its
+    # limit stays out of the selection across the restart.
+    try:
+        from services.engines import subscription_pool
+        rests = subscription_pool.load_rests()
+        if rests:
+            logger.info("Loaded %s usage-limit rest(s)", rests)
+    except Exception:
+        logger.exception("loading the usage-limit rests failed (non-fatal)")
     # Sync built-in models into execution_layer_models so the DB fallback in
     # config.resolve_agent_model() can find them without requiring admin to
     # visit Admin > Execution Layers first. Idempotent — builtin rows follow the
@@ -791,18 +809,11 @@ async def _boot_services() -> None:
     scheduler.start()
     # Initialize notification system (after scheduler so it can register jobs)
     notification_manager.start()
-    _bg_tasks.append(asyncio.create_task(reap_idle_sessions()))
-    logger.info(
-        "Persistent session reaper started "
-        "(timeout=%ss)", config.PERSISTENT_SESSION_TIMEOUT
-    )
     _bg_tasks.append(asyncio.create_task(reap_idle_direct_sessions()))
     logger.info(
         "Direct session reaper started "
         "(timeout=%ss)", config.DIRECT_SESSION_TIMEOUT
     )
-    _bg_tasks.append(asyncio.create_task(reap_idle_codex_sessions()))
-    logger.info("Codex session reaper started")
     from core.remote.remote_execution import reap_idle_remote_sessions
     _bg_tasks.append(asyncio.create_task(reap_idle_remote_sessions()))
     logger.info("Remote session reaper started")
@@ -813,6 +824,20 @@ async def _boot_services() -> None:
     _mcp_gateway.add_purge_hook(_mcp_gateway_push.on_purge)
     _bg_tasks.append(asyncio.create_task(_mcp_gateway_push.run_push_loop()))
     logger.info("MCP gateway push loop started")
+    # The SSH signer's sockets die with the session; those of an earlier
+    # process are swept. The credential exit runs on the machines, so the
+    # authority an earlier release kept here goes, and so do the private key
+    # files earlier releases wrote into the scopes' key dirs.
+    from core.credentials import (
+        credential_exit as _credential_exit,
+        ssh_signer as _ssh_signer,
+    )
+    _ssh_signer.register_purge_hook()
+    _ssh_signer.sweep_at_boot()
+    _credential_exit.register_purge_hook()
+    await asyncio.to_thread(_credential_exit.retire_platform_authority)
+    from core.sandbox import session_config_dir as _scd
+    await asyncio.to_thread(_scd.sweep_private_ssh_keys)
     # Task ("is_task") session-index entries are popped on run completion in
     # scheduler._run_task; this is the backstop for any that leak (pre-launch
     # failure / restart mid-run) so the index can't grow unbounded.
@@ -849,10 +874,28 @@ async def _boot_services() -> None:
     # re-adopts parked in-flight runs. Registered before the heartbeat monitor
     # starts so the first reconnect's report is handled.
     run_recovery.register(_sat_cm)
+    from services.remote import compute_bootstrap
+    compute_bootstrap.register()
+    from services.apps import app_compute
+    app_compute.register()
+    # After it by registration order: the terminals taken back at a report,
+    # and the sessions a machine came back without.
+    from services.remote import machine_sessions
+    machine_sessions.register()
+    # The update that waits for a busy machine to go idle.
+    from ws import satellite as satellite_ws
+    satellite_ws.register()
     _bg_tasks.append(asyncio.create_task(_sat_cm.heartbeat_monitor()))
     logger.info("Satellite heartbeat monitor started")
 
-    _bg_tasks.append(asyncio.create_task(_boot_wake_redelivery()))
+    # The planned stop's counters and hooks (``core.drain``).
+    import startup_drain
+    startup_drain.register()
+    _bg_tasks.append(asyncio.create_task(_boot_continue()))
+    _bg_tasks.append(asyncio.create_task(_alive_beat()))
+    from services.infra import health_parts
+    _bg_tasks.append(asyncio.create_task(health_parts.sample_loop()))
+    _bg_tasks.append(asyncio.create_task(startup_drain.activity_loop()))
     _bg_tasks.append(asyncio.create_task(_boot_relay_events()))
 
     # Start the HTTP-over-WS tunnel dispatcher (sweeps leaked streams,
@@ -961,6 +1004,8 @@ def _boot_arm(app: FastAPI, default_executor: ThreadPoolExecutor) -> None:
     except Exception:
         logger.exception("route warm-up failed (non-fatal)")
 
+    _note_stop_signal()
+
     # From here on, store calls made ON the loop thread use its private pool
     # (storage/pg.py LoopPool): a Postgres restart or freeze then costs the
     # loop one short wait, not the pool's timeout per call. Every boot step
@@ -982,50 +1027,10 @@ def _boot_arm(app: FastAPI, default_executor: ThreadPoolExecutor) -> None:
         )
 
 
-async def _stop_workers() -> None:
-    """The six workers stop in order, a failure logged and the next still
-    stopped."""
-    from services.billing import license_check_worker
-    from services.engines import token_fanout
-    from services.infra import release_check
-    from services.oauth import oauth_refresh_worker
-    from services.phone import phone_health_worker
-    from services.webhooks import subscription_renewer
-    # Cancel the refresh worker BEFORE _shutdown_sessions so a refresh
-    # never lands mid-drain.
-    try:
-        await oauth_refresh_worker.stop_worker()
-    except Exception:
-        logger.exception("OAuth refresh worker shutdown failed (continuing)")
-
-    try:
-        await subscription_renewer.stop_worker()
-    except Exception:
-        logger.exception("Subscription renewer shutdown failed (continuing)")
-
-    try:
-        await license_check_worker.stop_worker()
-    except Exception:
-        logger.exception("License check worker shutdown failed (continuing)")
-
-    try:
-        await release_check.stop_worker()
-    except Exception:
-        logger.exception("Release check worker shutdown failed (continuing)")
-
-    try:
-        await phone_health_worker.stop_worker()
-    except Exception:
-        logger.exception("Phone health worker shutdown failed (continuing)")
-
-    try:
-        await token_fanout.stop_worker()
-    except Exception:
-        logger.exception("Token-freshness worker shutdown failed (continuing)")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from core.events.stream_pump import note_platform_ending, note_platform_running
+    note_platform_running()
     default_executor = _boot_process()
     await _boot_database()
     await _boot_registrations()
@@ -1037,7 +1042,6 @@ async def lifespan(app: FastAPI):
     yield
     # ── Graceful Shutdown ──
     logger.info("Proxy shutdown starting...")
-    from core.events.stream_pump import note_platform_ending
     note_platform_ending()
     await _stop_workers()
 
@@ -1063,243 +1067,3 @@ async def lifespan(app: FastAPI):
 
     await _shutdown_cleanup(logger)
     logger.info("Proxy shutdown complete")
-
-
-async def _flush_active_pumps(logger) -> None:
-    """Flush still-open pumps' turn text before the process exits — the
-    lost-transcript class. Mode C-recoverable chats are SKIPPED: the satellite
-    replays their whole retained turn through a fresh recovery pump after the
-    restart, so a shutdown-time abort would stamp a stale interrupted marker
-    and duplicate the replayed rows."""
-    from services.scheduler import run_recovery
-    pumps = list(_active_pumps.items())
-    if not pumps:
-        return
-    from core.events.stream_pump import suppress_recovery_flush
-    from core.session import session_kind
-    from core.session.session_state import mark_recover_pending
-    waits = []
-    for chat_id, pump in pumps:
-        try:
-            if run_recovery.is_recovery_eligible(chat_id):
-                # Replayed after the restart whether it is still running or
-                # finished meanwhile: nothing of it is written now. A run is
-                # parked and recovered by its run id instead.
-                suppress_recovery_flush(chat_id)
-                if pump.source_type != session_kind.TASK.source_type:
-                    mark_recover_pending(pump.session_id)
-                continue
-            pump.abort()
-            task = getattr(pump, "_task", None)
-            if task is not None:
-                waits.append(task)
-        except Exception as e:  # noqa: BLE001  # the shutdown's per-pump step: one pump must not stop the rest
-            logger.warning("Shutdown: pump flush %s error: %s", chat_id[:8], e)
-    if waits:
-        with contextlib.suppress(Exception):
-            await asyncio.wait(waits, timeout=5)
-        logger.info("Shutdown: flushed %s open pump(s)", len(waits))
-
-
-def _arm_exit_failsafe() -> None:
-    """Guarantee process exit after clean shutdown. A clean exit beats the
-    timer (a daemon timer dies with the process); a blocked non-daemon thread
-    makes it fire — log + hard-exit with a DISTINCT code so the journal
-    distinguishes the failsafe from a clean stop."""
-    if not _ARM_EXIT_FAILSAFE:
-        return
-
-    def _fire() -> None:
-        from core import log_queue
-        logger.error(
-            "Shutdown failsafe fired after %.0fs — a non-daemon thread "
-            "blocked interpreter exit (SIGUSR1 dumps stacks next time); "
-            "hard-exiting with code 3", _EXIT_FAILSAFE_GRACE_S,
-        )
-        # A log writer that cannot drain in 2 s is wedged on the disk and
-        # holds the file handler's lock — logging.shutdown() would block on
-        # it and the exit below would never happen.
-        if log_queue.drain(2.0):
-            logging.shutdown()
-        os._exit(3)
-
-    timer = threading.Timer(_EXIT_FAILSAFE_GRACE_S, _fire)
-    timer.daemon = True
-    timer.start()
-
-
-async def _shutdown_cleanup(logger) -> None:
-    """The ordered shutdown tail. Order is load-bearing: everything that
-    writes the DB (pump flush, orphan cleanup) runs BEFORE the pool closes;
-    the failsafe arms LAST so a clean exit beats it."""
-    await _flush_active_pumps(logger)
-
-    # Safety net: mark any still-active DB records as failed.
-    # Handles both close failures and non-graceful prior crashes — but LEAVE
-    # recovery-eligible remote runs running (their CLI is still alive on the
-    # satellite; the next boot parks + re-adopts them). They're recognised by
-    # the same eligibility check the CancelledError handler used.
-    try:
-        from services.scheduler import run_recovery
-        keep = [
-            r["id"] for r in task_store.list_orphaned_runs()
-            if run_recovery.is_recovery_eligible(r.get("chat_id") or "")
-        ]
-        orphaned_runs = task_store.mark_orphaned_runs_failed(exclude_ids=keep)
-        orphaned_meetings = task_store.mark_orphaned_meetings_failed()
-        if orphaned_runs or orphaned_meetings or keep:
-            logger.info(
-                "Shutdown cleanup: marked %s run(s) and "
-                "%s meeting(s) as failed; "
-                "left %s recoverable run(s) running",
-                orphaned_runs, orphaned_meetings, len(keep)
-            )
-    except Exception as e:  # noqa: BLE001  # a shutdown step: a failure must not skip the steps after it
-        logger.error("Shutdown DB cleanup failed: %s", e)
-
-    # A Docker MCP build or pull still running (the boot's bring-up) ends
-    # with its process group: the worker threads it holds would keep the
-    # process alive until the build's own timeout.
-    try:
-        from services.mcp import docker_manager
-        ended = await asyncio.to_thread(docker_manager.end_running_compose)
-        if ended:
-            logger.info("Shutdown: ended %s Docker compose run(s)", ended)
-    except Exception as e:  # noqa: BLE001  # a shutdown step: a failure must not skip the steps after it
-        logger.error("Ending the Docker compose runs failed: %s", e)
-
-    # Cancel the lifespan's own background loops so their teardown doesn't
-    # race the closed pool below (asyncio.run would cancel them anyway —
-    # but only AFTER lifespan, with the pool already gone).
-    # Beside them, the fire-and-forget tasks started through
-    # core.background.spawn get a grace period to finish (most belong to the
-    # sessions closed above), then a cancel; both waits share the 3 s and the
-    # teardown still has the pool.
-    from core import background
-    for task in _bg_tasks:
-        task.cancel()
-
-    async def _wait_bg_tasks() -> None:
-        if _bg_tasks:
-            with contextlib.suppress(Exception):
-                await asyncio.wait(_bg_tasks, timeout=3)
-
-    waited = await asyncio.gather(
-        _wait_bg_tasks(), background.cancel_all(grace=2.0, timeout=1.0),
-        return_exceptions=True,
-    )
-    _bg_tasks.clear()
-    if isinstance(waited[1], BaseException):
-        logger.error("Shutdown: background task cancel failed (continuing): %r", waited[1])
-    elif waited[1]:
-        logger.info("Shutdown: cancelled %s background task(s) still running after 2 s", waited[1])
-
-    scheduler.stop()
-
-    # Satellite status/caps persists queued by the WS teardown (uvicorn
-    # closes sockets BEFORE lifespan shutdown) are still in flight on the DB
-    # executor — give them a bounded moment to land, then stop the executor
-    # (cancel what never started; a worker parked on a stalled commit is the
-    # exit failsafe's problem, not ours).
-    try:
-        from core.remote.satellite_connection import get_connection_manager
-        if not await get_connection_manager().drain_persists(timeout=2.0):
-            logger.warning("Shutdown: satellite status persists still pending after 2s")
-    except Exception:
-        logger.exception("Shutdown: persist drain failed (continuing)")
-    # Same for the per-chat writer lanes (turn rows queued by pumps that were
-    # still unwinding when the sockets closed).
-    try:
-        from core.events import chat_writer
-        if not await chat_writer.drain_all(timeout=3.0):
-            logger.warning("Shutdown: chat writer jobs still pending after 3s")
-    except Exception:
-        logger.exception("Shutdown: chat writer drain failed (continuing)")
-    # The session index is written behind; its last changes land now, on
-    # this thread (a write must not depend on a free executor thread here).
-    try:
-        from core.session import session_state
-        session_state.flush_session_index()
-    except Exception:
-        logger.exception("Shutdown: session index flush failed (continuing)")
-    # The watchdog reported stalls through the DB work above; stop it now
-    # (flag first, then the tick task — never a fake stall at shutdown).
-    from core import loop_watchdog
-    loop_watchdog.stop()
-    # The binding writer's queued seat releases land before the pools close,
-    # drained in a worker thread with a bound (30 s: a stalled database drops
-    # what is still queued, which the next boot's counter reset repairs); a
-    # write after this runs inline.
-    from services.engines import subscription_pool as _subscription_pool
-    try:
-        await asyncio.wait_for(
-            asyncio.to_thread(_subscription_pool.close_binding_writes),
-            _subscription_pool._BINDING_DRAIN_TIMEOUT_S + 5,
-        )
-    except (asyncio.TimeoutError, TimeoutError):
-        logger.warning("Shutdown: the binding writer did not close in time (continuing)")
-    except Exception:
-        logger.exception("Shutdown: binding writer close failed (continuing)")
-    pg_pool.shutdown_db_executor()
-
-    # From here down nothing may touch the DB.
-    pg_pool.close_pool()
-
-    from core.layers.direct.mcp import stop_mcp_thread
-    stop_mcp_thread()
-
-    _arm_exit_failsafe()
-
-
-async def _shutdown_sessions(logger):
-    """Close all active sessions across all layers (called with timeout)."""
-    # 1. Cancel running tasks and meetings first (they depend on sessions)
-    await scheduler.shutdown()
-    from services.meetings.meeting_orchestrator import shutdown_meetings
-    await shutdown_meetings()
-
-    # 2. Close all sessions.
-    # Every local engine, layer by layer, straight from the registry: the
-    # layer that HOLDS a session is the one that closes it, so shutdown needs
-    # neither the three private pool dicts nor the agent row (which it only
-    # ever read to work out which layer to ask — and which is gone for an
-    # agent deleted while its session ran, silently skipping the close).
-    from core.session.session_manager import get_all_layers
-
-    for path, layer in get_all_layers().items():
-        for sid in layer.local_session_ids():
-            try:
-                await layer.close_session(sid)
-            except Exception as e:  # noqa: BLE001  # a shutdown close: one session must not stop the rest
-                logger.warning("Shutdown: %s %s error: %s", path, sid[:8], e)
-
-    from core.session.session_manager import _remote_layer
-    if _remote_layer:
-        await _shutdown_remote_sessions(_remote_layer, logger)
-
-
-async def _shutdown_remote_sessions(remote_layer, logger) -> None:
-    """Remote sessions at shutdown. One whose engine takes a session back
-    after a restart (``readopts_idle_session``: Claude and Codex) is LEFT
-    OPEN, idle or mid-turn, with its security context: the satellite keeps
-    its process and reports it, and the new process re-adopts it (a Claude
-    turn in flight is replayed; a Codex one, with no replay, is closed by
-    that report). Closing it here could not reach the satellite anyway
-    (uvicorn closes the sockets before the lifespan's shutdown) and would
-    only drop the context, so the session came back with every hook refused.
-    Other engines close as before."""
-    from core.session.session_manager import get_layer_capabilities
-    for sid in remote_layer.local_session_ids():
-        info = remote_layer._sessions.get(sid)
-        caps = get_layer_capabilities(getattr(info, "execution_path", "") or "") if info else None
-        if caps is not None and caps.runtime.readopts_idle_session:
-            logger.info(
-                "Shutdown: leaving remote %s open for re-adoption "
-                "(%s)",
-                sid[:8], 'mid-turn' if getattr(info, 'turn_active', False) else 'idle'
-            )
-            continue
-        try:
-            await remote_layer.close_session(sid)
-        except Exception as e:  # noqa: BLE001  # a shutdown close: one session must not stop the rest
-            logger.warning("Shutdown: Remote %s error: %s", sid[:8], e)

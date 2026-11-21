@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react'
-import { safeHref } from '../../../lib/safeUrl'
+import { emitAppToast } from '../../../lib/appToasts'
+import { clickDownload } from '../../../lib/http/download'
 import FilePreviewPortal from '../../workspace/FilePreviewPortal'
 import {
   registerPaneLeave, registerPaneSave, useDocumentPaneStore, useDocumentPushStore, type PushedDocument,
 } from '../../../store/documentPaneStore'
-import DocumentFrame, { type DocumentFrameHandle } from './DocumentFrame'
+import DocumentFrame, { SEND_SAVE_TIMEOUT_MS, type DocumentFrameHandle } from './DocumentFrame'
+import DocumentPaneMenu from './DocumentPaneMenu'
 import DocumentVersionsMenu from './DocumentVersionsMenu'
+import { failureSentence, offeredConversions, prepareAndDownload, withName, type DownloadFormat } from './documentDownloads'
 import { useElementBox } from '../../../hooks/useElementBox'
+import { canPresent, popoverOpen } from '../../../lib/ui/topLayer'
 import { extensionBadge, useDocumentTabs } from './documentTabs'
 
 interface Props {
@@ -27,7 +31,6 @@ const NO_PUSHED: Record<string, PushedDocument> = {}
 // and never reloads. Without the popover API (iOS 16, Firefox before 125) a
 // fixed box inside the floating pane would paint under the portal, so
 // there is no Fullscreen.
-const canPresent = (): boolean => typeof HTMLElement !== 'undefined' && 'showPopover' in HTMLElement.prototype
 const BOX_RESET: CSSProperties = {
   display: 'block', inset: 'auto', margin: 0, padding: 0, border: 0, overflow: 'visible',
   background: 'transparent', color: 'inherit', maxWidth: 'none', maxHeight: 'none',
@@ -36,16 +39,13 @@ const IN_FLOW: CSSProperties = { ...BOX_RESET, position: 'relative', width: '100
 
 type Rect = { top: number; left: number; width: number; height: number }
 
-function popoverOpen(el: HTMLElement): boolean {
-  try { return el.matches(':popover-open') } catch { return false }
-}
-
 /**
  * The chat's document pane (FEATURES.md "Document pane"): one tab per
- * document pushed into the chat, newest first; Versions, Refresh, Download,
- * Fullscreen, Minimize and Close; the editor on the document on show, live
- * or a read-only version. A leave from a document with unsaved edits waits
- * for its save (`DocumentFrame.leave`); a refused save keeps it on show.
+ * document pushed into the chat, newest first; Versions, Fullscreen,
+ * Minimize, the options menu (Refresh and the downloads) and Close;
+ * the editor on the document on show, live or a read-only version. A leave
+ * from a document with unsaved edits waits for its save
+ * (`DocumentFrame.leave`); a refused save keeps it on show.
  */
 export default function DocumentPane({ chatId, placement, shown }: Props) {
   const { tabs, active, pane, listingFailed } = useDocumentTabs(chatId)
@@ -164,11 +164,36 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
   const closePane = () => { void afterLeave(() => store().close(chatId)) }
   const minimize = () => store().minimize(chatId)
 
-  const downloadUrl = active?.downloadUrl
-    ? `${active.downloadUrl}${active.downloadUrl.includes('?') ? '&' : '?'}fn=${encodeURIComponent(active.filename)}`
-    : ''
+  const downloadUrl = active?.downloadUrl ? withName(active.downloadUrl, active.filename) : ''
   const notLive = !!snapshotId
   const version = notLive ? versions.find((v) => v.snapshot_id === snapshotId) : undefined
+
+  // The menu's downloads: the live file as it is through its own link, the
+  // rest prepared by the proxy. A live document with unsaved edits is saved
+  // first (the send's bound), so the download holds what the person sees.
+  const [busy, setBusy] = useState(false)
+  const download = async (format: DownloadFormat) => {
+    if (!fileId || busy) return
+    const target = { chatId, fileId, snapshotId, format }
+    setBusy(true)
+    try {
+      if (!snapshotId && dirty) {
+        const saved = (await frameRef.current?.save(SEND_SAVE_TIMEOUT_MS)) ?? true
+        if (!saved) {
+          emitAppToast({ title: 'Download', body: "The document's last edits are not in the download.", severity: 'warning' })
+        }
+      }
+      if (!format && !snapshotId) {
+        if (downloadUrl) clickDownload(downloadUrl, active?.filename ?? '')
+        return
+      }
+      await prepareAndDownload(target)
+    } catch (e) {
+      emitAppToast({ title: 'Not downloaded', body: failureSentence(e, format), severity: 'warning' })
+    } finally {
+      setBusy(false)
+    }
+  }
   const iconBtn = 'p-1.5 rounded-control text-secondary transition-colors hover:bg-surface-hover hover:text-primary disabled:opacity-40'
 
   return (
@@ -224,19 +249,6 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
             <DocumentVersionsMenu versions={versions} current={snapshotId} failed={listingFailed}
               livePermissions={livePermissions} onPick={pickVersion} />
           )}
-          <button type="button" onClick={() => void afterLeave(() => frameRef.current?.refresh())} disabled={!fileId}
-            title="Refresh" aria-label="Refresh" className={iconBtn}>
-            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182M20.016 4.66v4.993" />
-            </svg>
-          </button>
-          {!notLive && downloadUrl && (
-            <a href={safeHref(downloadUrl)} download={active?.filename} title="Download" aria-label="Download" className={iconBtn}>
-              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
-              </svg>
-            </a>
-          )}
           {canPresent() && (
             <button type="button" onClick={() => setFullscreen(true)} disabled={!fileId}
               title="Fullscreen" aria-label="Fullscreen" className={iconBtn}>
@@ -250,6 +262,14 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
               <path strokeLinecap="round" d="M5 12h14" />
             </svg>
           </button>
+          <DocumentPaneMenu
+            hasDocument={!!fileId}
+            canDownload={notLive || !!downloadUrl}
+            conversions={offeredConversions(active?.doc?.downloads)}
+            busy={busy}
+            onRefresh={() => void afterLeave(() => frameRef.current?.refresh())}
+            onDownload={(format) => void download(format)}
+          />
           <button type="button" onClick={closePane} title="Close" aria-label="Close the document pane" className={iconBtn}>
             <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />

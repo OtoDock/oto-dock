@@ -66,8 +66,12 @@ def test_exec_v2_write_stdin_is_terminal_input_not_a_command():
     assert tn == "CodexTerminalInput"
     assert ti == {"command": "sudo apt-get install -y x", "cwd": "/work",
                   "reason": "the command waits for input", "approval_id": "a1"}
-    # The explicit default kind and a request without the field stay commands.
-    for params in ({"kind": "command", "command": "ls", "cwd": "/w"}, {"command": "ls", "cwd": "/w"}):
+    # The explicit default kind and a request without the field stay commands,
+    # and so does a kind the bridge does not know: Codex 0.169's "humanCommand"
+    # (a managed rule that wants a person, sent only to a client that declares
+    # the capability, which the platform does not) reaches the command gate.
+    for params in ({"kind": "command", "command": "ls", "cwd": "/w"}, {"command": "ls", "cwd": "/w"},
+                   {"kind": "humanCommand", "command": "ls", "cwd": "/w"}):
         assert approval_to_tool("item/commandExecution/requestApproval", params)[0] == "Bash"
     # The answer shape is the method's, not the tool's.
     assert build_response("item/commandExecution/requestApproval", {"kind": "writeStdin"}, True) == {"decision": "accept"}
@@ -158,12 +162,32 @@ def test_patch_v2_lean_uses_item_paths():
 
 
 def test_patch_v2_lean_without_correlation_is_pathless():
-    # No item_paths → empty file_path; decide_tool_permission then mode-gates
-    # (an escape write still prompts in default mode — the correct floor).
+    # No item_paths → empty file_path, which the path rule refuses (below).
     tn, ti = approval_to_tool("item/fileChange/requestApproval", {"itemId": "fc1"})
     assert tn == "Write"
     assert ti["file_path"] == ""
     assert ti["_codex_paths"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_change_with_no_path_to_it_is_declined_by_the_path_rule():
+    """A lean approval the platform holds no paths for (it arrived in a
+    replay's pause) names no file. The path rule refuses it for every
+    session, so no write passes with its path unchecked."""
+    from auth.path_policy import SecurityContext, check_tool_access
+    reasons: list[str] = []
+
+    async def decide(tool_name: str, tool_input: dict) -> dict:
+        ctx = SecurityContext(role="admin", username="alice", agent="personal-assistant",
+                              is_admin_agent=True)
+        decision, _ = check_tool_access(tool_name, tool_input, ctx)
+        reasons.append(decision.reason)
+        return {"decision": "allow" if decision.allowed else "deny"}
+
+    handler = make_server_request_handler(decide)
+    res = await handler("item/fileChange/requestApproval", {"itemId": "fc-unknown"})
+    assert res == {"decision": "decline"}
+    assert reasons == ["Write denied: this change names no file, so it cannot be checked. Try it again."]
 
 
 @pytest.mark.asyncio
@@ -528,29 +552,56 @@ async def test_request_user_input_ask_failure_never_hangs():
     assert await handler("item/tool/requestUserInput", {"questions": _QS}) == {"answers": {}}
 
 
-@pytest.mark.asyncio
-async def test_the_router_records_a_patchs_paths_before_its_approval_runs():
-    """A lean fileChange approval arriving in the same stdout chunk as its
-    item/started runs in its own task before the turn stream reads the item:
-    the paths must be recorded where the notification is first read, or the
-    decision sees a pathless Write (auto-allowed in acceptEdits)."""
-    import asyncio
-    from types import SimpleNamespace
+# ─────────────────────────────────────────────────────────────────────────
+# The network inside Codex's own box, on the platform's sandbox
+# ─────────────────────────────────────────────────────────────────────────
 
-    from core.layers.codex.session import CodexAppServerSession
-    s = CodexAppServerSession.__new__(CodexAppServerSession)
-    s._client = SimpleNamespace(notif_queue=asyncio.Queue())
-    s.thread_id = "T"
-    s._default_consumer = None
-    s._thread_consumers = {}
-    s._item_paths = {}
-    s.translator = None
-    s.last_activity = 0.0
-    q = s._client.notif_queue
-    q.put_nowait(("item/started", {"threadId": "T", "item": {
-        "type": "fileChange", "id": "fc1", "changes": [{"path": "/users/a/x.py"}]}}))
-    q.put_nowait(("item/started", {"threadId": "SUB", "item": {
-        "type": "fileChange", "id": "fc2", "changes": [{"path": "/users/a/y.py"}]}}))
-    q.put_nowait(("__daemon_exit__", {}))
-    await asyncio.wait_for(s._route_notifications(), timeout=5)
-    assert s._item_paths == {"fc1": ["/users/a/x.py"], "fc2": ["/users/a/y.py"]}
+def test_a_machines_policy_is_the_vendored_one_with_the_network_off():
+    """A machine's session takes ``build_sandbox_policy`` as the satellite
+    vendors it, the network off (each turn sends it:
+    ``satellite/tests/test_codex_session.py``, ``TestTurnParams``)."""
+    from tests._paths import PROXY_DIR
+    vendored = PROXY_DIR.parent / "satellite" / "_vendored" / "codex_approvals.py"
+    if not vendored.exists():
+        pytest.skip("the satellite is not in this tree")
+    assert vendored.read_text() == (
+        PROXY_DIR / "core" / "layers" / "codex" / "codex_approvals.py").read_text()
+    assert build_sandbox_policy("workspace-write", "/home/u/agent")["networkAccess"] is False
+
+
+@pytest.mark.parametrize("mode", ["ask", "autoReview", "plan", "dontAsk", "auto"])
+def test_a_codex_terminals_box_has_no_network_in_any_mode(mode):
+    """In a terminal the platform's hook does not judge a command and Codex
+    asks only when a command crosses its box. So the terminal's box keeps
+    the network off in every mode, Ask included, and the terminal's own
+    prompt judges a crossing. Read from the argv the terminal starts with."""
+    from core.layers.codex.helpers import permission_to_sandbox
+    from core.layers.codex.layer import _tui_flags
+    flags = _tui_flags(sandbox_mode=permission_to_sandbox(mode), cwd="/users/u", model="gpt-6.1-sol",
+                       permission_mode=mode, effort="high")
+    pairs = list(zip(flags, flags[1:], strict=False))
+    assert ("-c", "sandbox_workspace_write.network_access=false") in pairs
+    assert not [f for f in flags if "network_access=true" in f]
+    # The rest of the argv, as it was.
+    assert flags[:2] == ["--no-alt-screen", "-s"] and flags[2] == permission_to_sandbox(mode)
+    assert ("-C", "/users/u") in pairs and ("-m", "gpt-6.1-sol") in pairs
+    assert "--dangerously-bypass-hook-trust" in flags and "--no-daemon" in flags
+    reviewer = "auto_review" if mode == "autoReview" else "user"
+    assert ("-c", f'approvals_reviewer="{reviewer}"') in pairs
+    assert ("-c", 'model_reasoning_effort="high"') in pairs
+
+
+def test_a_codex_session_reads_how_to_cross_its_box_once():
+    """Left alone in Auto the model reported a blocked network call and
+    never asked to cross. The note tells it to ask, on every placement, and
+    is appended once however often the prompt is rebuilt."""
+    from core.layers.codex.helpers import BOX_NETWORK_NOTE, with_box_network_note
+    text = with_box_network_note("You are an agent.")
+    assert text.startswith("You are an agent.\n\n# Network in your shell")
+    assert "with escalated" in text and text.endswith(BOX_NETWORK_NOTE + "\n")
+    # Once, and a second failure is reported: a host that is down is not
+    # asked for twice.
+    assert "again, once," in text and text.rstrip().endswith("If it fails again, say so.")
+    assert with_box_network_note(text) == text
+    assert with_box_network_note("") == BOX_NETWORK_NOTE + "\n"
+

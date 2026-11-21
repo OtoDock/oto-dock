@@ -195,6 +195,7 @@ class TestS2SPersistSite:
         admin.role = "admin"
         admin.sub = "admin-1"
         admin.is_api_key = False
+        admin.api_key_id = ""
         admin.is_admin = True
 
         with patch(
@@ -250,6 +251,7 @@ class TestS2SPersistSite:
         admin.role = "admin"
         admin.sub = "admin-1"
         admin.is_api_key = False
+        admin.api_key_id = ""
         admin.is_admin = True
 
         with patch(

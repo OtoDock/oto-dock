@@ -16,7 +16,7 @@ Validates the contract:
 
 import pytest
 
-from services.mcp import mcp_registry
+from services.mcp import mcp_manifest_store
 from services.mcp.mcp_registry import (
     CredentialConfig,
     McpManifest,
@@ -73,7 +73,7 @@ def patched_manifest(monkeypatch):
     """Helper to install a synthetic google-workspace manifest into the registry."""
     def _install(oauth_dict):
         manifest = _make_manifest(oauth_dict)
-        monkeypatch.setattr(mcp_registry, "_manifests", {"google-workspace": manifest})
+        monkeypatch.setattr(mcp_manifest_store, "_manifests", {"google-workspace": manifest})
         return manifest
     return _install
 
@@ -155,7 +155,7 @@ def test_unknown_service_silently_dropped(patched_manifest):
 
 
 def test_returns_empty_when_manifest_missing(monkeypatch):
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     assert build_scopes(["gmail"]) == []
 
 

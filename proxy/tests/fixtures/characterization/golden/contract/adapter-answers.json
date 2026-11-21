@@ -1,0 +1,46 @@
+{
+ "answers": {
+  "adopt_state": {
+   "raised": "NotImplementedError",
+   "text": "_Adapter: this engine has no live re-adopt"
+  },
+  "close_state": null,
+  "compact": null,
+  "drain_bg_commands": false,
+  "forget_probe": null,
+  "note_interrupt": null,
+  "owns_event_queue": false,
+  "private_env_keys": [],
+  "probe_future": null,
+  "prompt_payload_keys": [
+   "system_prompt"
+  ],
+  "reenter_review": false,
+  "steer": false,
+  "turn_settled": false,
+  "with_unavailable_mcps": {
+   "catalog": {
+    "system_prompt": "Persona\n# Available Tools (MCPs)\n- **C** (`c-mcp`): tools\n---\nEnd\n\n\n---\n\n# Unavailable Tools\n\nThe following MCP servers are NOT available in this session:\n\n- **a-mcp**: no credentials\n- **b-mcp**: not installed\n\nDo not attempt to use tools from these servers. If the user asks about them, explain they need to be configured first."
+   },
+   "no_prompt": {
+    "other": 1
+   },
+   "no_reasons": {
+    "other_prompt": "untouched",
+    "system_prompt": "You are X."
+   },
+   "not_text": {
+    "system_prompt": 5
+   },
+   "prompt": {
+    "other_prompt": "untouched",
+    "system_prompt": "You are X.\n\n\n---\n\n# Unavailable Tools\n\nThe following MCP servers are NOT available in this session:\n\n- **a-mcp**: no credentials\n- **b-mcp**: not installed\n\nDo not attempt to use tools from these servers. If the user asks about them, explain they need to be configured first."
+   },
+   "two_keys": {
+    "other_prompt": "untouched\n\n\n---\n\n# Unavailable Tools\n\nThe following MCP servers are NOT available in this session:\n\n- **a-mcp**: no credentials\n- **b-mcp**: not installed\n\nDo not attempt to use tools from these servers. If the user asks about them, explain they need to be configured first.",
+    "system_prompt": "You are X.\n\n\n---\n\n# Unavailable Tools\n\nThe following MCP servers are NOT available in this session:\n\n- **a-mcp**: no credentials\n- **b-mcp**: not installed\n\nDo not attempt to use tools from these servers. If the user asks about them, explain they need to be configured first."
+   }
+  }
+ },
+ "uncovered": []
+}

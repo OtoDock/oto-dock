@@ -236,17 +236,18 @@ def test_the_card_never_draws_where_nobody_is_at_the_keyboard(temp_db, monkeypat
 
 
 def test_an_api_key_is_no_principal_and_a_task_runs_token_names_its_creator(temp_db):
-    """A person's ``otok_`` key never reaches these routes (401 before any
-    route runs). A user-scope task run's token names the task's creator: it
-    reads the rows, and draws no card in the run's own chat, where nobody
-    is at the keyboard."""
+    """A person's ``otok_`` key never reaches these routes (403 off the
+    key's list, before any route runs). A user-scope task run's token names
+    the task's creator: it reads the rows, and draws no card in the run's
+    own chat, where nobody is at the keyboard."""
     member = _cookie("user-viewer", "viewer@test.com", "Viewer User", roles.MEMBER)
-    r = member.post("/v1/user-api-keys", json={"name": "walk", "permissions": ["triggers"]})
+    r = member.post("/v1/user-api-keys", json={"name": "walk", "permissions": ["triggers"],
+                                                "expires_in_days": 7})
     assert r.status_code == 200, r.text
     key = r.json()["key"]
     assert key.startswith("otok_")
-    assert _bearer(key).get("/v1/settings/catalog").status_code == 401
-    assert _card(key, "sid-task-run", CARD_ROW["id"]).status_code == 401
+    assert _bearer(key).get("/v1/settings/catalog").status_code == 403
+    assert _card(key, "sid-task-run", CARD_ROW["id"]).status_code == 403
     task_store.create_chat("chat-task-run", "user-viewer", "pa",
                            source_type=session_kind.TASK.source_type)
     task_store.update_chat("chat-task-run", session_id="sid-task-run")

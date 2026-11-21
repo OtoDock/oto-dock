@@ -26,7 +26,7 @@ _ROOT = "/"
 # The floor's recursive-delete form, built from parts: the second word a
 # command hands the other host.
 _FLOOR_WORD = "r" + "m -r" + "f " + _ROOT
-_ADMIN_ONLY = ("requires platform admin role on local sandbox sessions (current role: {role}). "
+_ADMIN_ONLY = ("requires platform admin role in a compute machine's sandbox (current role: {role}). "
                "These commands touch host state outside the sandbox.")
 
 
@@ -94,7 +94,7 @@ def test_a_paired_machine_keeps_its_rule_for_any_host(name, admitted):
         d = _d(cmd, _matrix()[name])
         assert d.allowed is admitted, (name, cmd, d)
         if not admitted:
-            assert "restricted to manager / editor / admin roles on remote satellites" in d.reason
+            assert "restricted to manager / editor / admin roles on a paired remote machine" in d.reason
 
 
 def test_rsync_to_another_host_takes_scps_gate_and_a_local_copy_keeps_the_edit_tier():

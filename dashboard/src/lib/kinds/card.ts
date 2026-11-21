@@ -46,6 +46,13 @@ export const SET_MEMBER_WORDS: Record<SetMemberState, string> = {
   [SET_MEMBER.FAILED]: 'Not installed',
 }
 
+/** A member's word in an install's rows: an agent the install moved in
+ *  (the job member's `action`) says so, one used as it is says Used. */
+export function setMemberWord(m: { status: string; action?: string }): string {
+  if (m.status === SET_MEMBER.ADOPTED && m.action === 'move') return 'Moved'
+  return SET_MEMBER_WORDS[m.status as SetMemberState] ?? m.status
+}
+
 /** The kinds of list a list card shows (`status.LIST_KINDS`): the pages'
  *  own lists. */
 export const LIST_KIND = {

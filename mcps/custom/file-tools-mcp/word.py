@@ -11,6 +11,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+import shared
 import units
 from batch import WriteCall, batch_ops, handle_write_call, read_call
 from catalog import Catalog, KeySpec, OpSpec
@@ -747,7 +748,11 @@ def _op_add_image(job: _DocxJob, ctx: OpCtx, op: dict) -> None:
         width = None  # python-docx scales it from the picture and the height
     align = alignment(op["alignment"]) if op.get("alignment") is not None else None
     paragraph = cursor(job.book, ctx, op).paragraph()
-    picture = paragraph.add_run().add_picture(op["image_path"], width=width, height=height)
+    with shared.safe_open_read(op["image_path"]) as image:
+        picture = paragraph.add_run().add_picture(image, width=width, height=height)
+    # From a file object python-docx names the picture image.<ext>: it keeps
+    # its own file name, as it did when read by name.
+    picture._inline.graphic.graphicData.pic.nvPicPr.cNvPr.set("name", os.path.basename(op["image_path"]))
     # Word writes the four distances as 0; with none, LibreOffice and
     # Collabora space the picture 0.32 cm from the margin.
     for side in ("distT", "distB", "distL", "distR"):
@@ -1391,8 +1396,11 @@ def _run_docx(call: WriteCall) -> tuple[Any, _DocxJob, BatchOutcome, Any]:
                                 check_modules=call.check_modules,
                                 ops=[op.get("op") for _, op in call.ops if isinstance(op, dict)])
     if call.edit_existing:
-        preflight(call.path)
-    doc = open_document(call.path) if call.edit_existing else new_document()
+        with shared.safe_open_read(call.path) as fh:
+            preflight(fh)
+            doc = open_document(fh)
+    else:
+        doc = new_document()
     match_content_type_to_name(doc, call.path)
     job = _DocxJob(doc, Book.for_call(doc, call.ops))
     named = {"add_bookmark": "name", "add_caption": "bookmark"}

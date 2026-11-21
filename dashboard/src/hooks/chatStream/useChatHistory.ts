@@ -7,7 +7,8 @@ import { useCallback, useRef } from 'react'
 import { useChatStore } from '@/store/chatStore'
 import { continuesAbove, dbMessagesToDisplay, finishedBubble, latestCostBilled, toolFeesOf, withPlanRows } from '../../lib/messageBlocks'
 import { markRunningBackground, runningBackgroundOf } from '../../lib/chat/runningBackground'
-import { HOOK_ITEM, SYSTEM_SUBTYPE, type DbMessageRow, type LiveStateFrame, type MeetingRestore } from '../../api/wireEvents'
+import { isForShownChat } from '../../lib/chat/shownChat'
+import { HOOK_ITEM, SYSTEM_SUBTYPE, type ChatCostWire, type DbMessageRow, type LiveStateFrame, type MeetingRestore } from '../../api/wireEvents'
 import type { WsCallbacks } from '../useDashboardWs.types'
 import type { DisplayMessage } from '../../components/chat/types'
 import { buildLiveStateMessages } from './liveStateBuilder'
@@ -43,6 +44,17 @@ function withCarriedUserBubbles(prev: DisplayMessage[], displayMsgs: DisplayMess
   return fresh.length > 0 ? [...displayMsgs, ...fresh] : displayMsgs
 }
 
+/**
+ * The cost gauge's facts for a history frame: the server's word over the
+ * chat's whole history (`restore.cost`), since a page of a long turn's own
+ * steps holds no cost row. An older server sends none: the newest loaded
+ * turn's flag and the fee rows the window holds.
+ */
+function costOf(word: ChatCostWire | undefined, rows: DbMessageRow[]): ChatCostWire {
+  if (word) return { billed: word.billed, fees: Number(word.fees) || 0 }
+  return { billed: latestCostBilled(rows), fees: toolFeesOf(rows) }
+}
+
 // How long a history whose live attach was promised waits for its
 // live_state before it paints alone.
 const HELD_HISTORY_MS = 1500
@@ -67,10 +79,17 @@ export function useChatHistory(core: StreamCore, deps: {
   } = core
   const { resetSteers, applyMeetingRestore, noteLiveSpeaker, applyLiveStateMeeting } = deps
 
+  // The last history carried the server's cost word: a seed leaves the
+  // gauge to it and the live frames (each history sets it again, and a
+  // delta comes from the server that sent its base).
+  const costWordRef = useRef(false)
+
   // Every DB history seed (the interactive rich-view toggle, the persisted-
-  // rows nudge) re-derives the flag from the newest row, like onChatHistory.
+  // rows nudge) re-derives the flag from the newest row when the server gave
+  // no word for the chat (an older server), like onChatHistory.
   const seedDbHistory = useCallback((rows: DbMessageRow[], hasMore: boolean) => {
     seedDbRows(rows, hasMore)
+    if (costWordRef.current) return
     const billedNewest = latestCostBilled(rows)
     setCostBilled(billedNewest)
     // No chat total rides a seed: a metered chat keeps the money it showed,
@@ -124,10 +143,9 @@ export function useChatHistory(core: StreamCore, deps: {
 
   const callbacks: Pick<WsCallbacks, 'onChatHistory' | 'onChatHistoryDelta' | 'onLiveState'> = {
     onChatHistory: (data) => {
-      // Discard stale chat_history events from a previously-resumed chat/run.
-      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
-        return  // stale — belongs to a previous chat
-      }
+      // A history of another chat (a previous one, or any chat while the
+      // new-chat view shows none) is not this view's.
+      if (!isForShownChat(data.chat_id, chatIdRef.current)) return
       discardingRef.current = false  // Chat loaded — accept events for this chat
       // Page-owned restore (chat: chatActiveLayer + model from execution_path).
       options.onChatHistoryMeta?.(data)
@@ -201,13 +219,13 @@ export function useChatHistory(core: StreamCore, deps: {
       // Restore total cost from DB; the gauge follows the newest turn's flag
       // (reset on every load — a chat switch must not inherit the last one's)
       if (data.total_cost) setTotalCost(data.total_cost)
-      const billedNewest = latestCostBilled(dbMessages)
-      setCostBilled(billedNewest)
+      const cost = costOf(data.restore?.cost, dbMessages)
+      costWordRef.current = !!data.restore?.cost
+      setCostBilled(cost.billed)
       // The gauge's money: a metered chat's whole total (the row's), else
-      // the tool fees the loaded rows carry.
-      const fees = toolFeesOf(dbMessages)
-      setToolCost(fees)
-      setBilledCost(billedNewest ? data.total_cost || 0 : fees)
+      // the chat's tool fees.
+      setToolCost(cost.fees)
+      setBilledCost(cost.billed ? data.total_cost || 0 : cost.fees)
       if (data.context_used) setContextUsed(data.context_used)
       if (data.context_max) setContextMax(data.context_max)
       if (data.cache_write) setCacheStats({
@@ -245,7 +263,7 @@ export function useChatHistory(core: StreamCore, deps: {
       // state). Never the first frame of a view: the pagination cursor and
       // the discard guard are untouched, and a frame for another chat is
       // dropped.
-      if (!data.chat_id || !chatIdRef.current || data.chat_id !== chatIdRef.current) return
+      if (!chatIdRef.current || !isForShownChat(data.chat_id, chatIdRef.current, true)) return
       if (discardingRef.current) return
       options.onChatHistoryMeta?.(data)
       const incoming = Array.isArray(data.messages) ? data.messages : []
@@ -270,11 +288,10 @@ export function useChatHistory(core: StreamCore, deps: {
         setMessages((prev) => withCarriedUserBubbles(prev, displayMsgs))
       }
       if (data.total_cost) setTotalCost(data.total_cost)
-      const billedNewest = latestCostBilled(rows)
-      setCostBilled(billedNewest)
-      const fees = toolFeesOf(rows)
-      setToolCost(fees)
-      setBilledCost(billedNewest ? data.total_cost || 0 : fees)
+      const cost = costOf(data.restore?.cost, rows)
+      setCostBilled(cost.billed)
+      setToolCost(cost.fees)
+      setBilledCost(cost.billed ? data.total_cost || 0 : cost.fees)
       if (data.context_used) setContextUsed(data.context_used)
       if (data.context_max) setContextMax(data.context_max)
       if (data.cache_write) setCacheStats({

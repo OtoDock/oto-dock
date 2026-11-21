@@ -50,6 +50,7 @@ from services.webhooks.webhook_template import (
 from storage import database as task_store
 from storage.automation import webhook_subscription_store
 from storage.identity import oauth_app_kinds
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock.subscription-manager")
 
@@ -97,8 +98,9 @@ class VendorAPIError(SubscriptionError):
 # Public API
 # ---------------------------------------------------------------------------
 
-async def create_subscription(
+def _prepare_create(
     *,
+    webhooks_block: dict,
     user_sub: str,
     scope: str,
     agent: str | None,
@@ -106,68 +108,27 @@ async def create_subscription(
     account_label: str,
     vendor_target: str,
     selected_events: list[str],
-    selected_subevents: dict[str, list[str]] | None = None,
-    caller_is_admin: bool = False,
-    target_kind: str = "",
-) -> dict:
-    """End-to-end subscription create.
-
-    Flow:
-      1. Load manifest, validate ``selected_events`` are in event_catalog,
-         resolve the target kind (``vendor_target_spec.target_kinds``; the
-         flat spec when the manifest declares none).
-      2. Cross-check ``required_scopes`` — the events' plus the kind's —
-         against bound OAuth account's granted scopes → raise
-         ``SubscriptionScopeError`` if missing.
-      3. Insert DB row with status='creating' + freshly-minted signing secret.
-      4. Resolve OAuth token; render registration.create template.
-      5. POST to vendor with 30s timeout.
-      6. On success: UPDATE row to status='active', vendor_subscription_id,
-         expires_at (when manifest declares lifetime_seconds).
-      7. On vendor failure: UPDATE row to status='failed', last_error;
-         raise ``VendorAPIError``.
-
-    Returns the row dict (signing_secret_enc stripped). Raises one of the
-    ``SubscriptionError`` subclasses on failure.
-    """
-    manifest = mcp_registry.get_manifest(mcp_name)
-    if manifest is None:
-        raise SubscriptionError(f"unknown MCP: {mcp_name}", status=404)
-    webhooks_block = (manifest.credentials.webhooks or {}) if manifest.credentials else {}
-    if not webhooks_block.get("available", False):
-        raise SubscriptionError(
-            f"MCP {mcp_name!r} does not declare webhook receiver support", status=400,
-        )
-
+    caller_is_admin: bool,
+    target_kind: str,
+) -> tuple[str, str, dict, str]:
+    """A create's checks and the reads they make, one ``run_db`` job before the
+    row exists (a ``SubscriptionError`` crosses it). Returns the target as it
+    will be stored, the target kind, its entry and the effective registration
+    mode."""
     provider_id = webhooks_block.get("provider_id", "")
     catalog = webhooks_block.get("event_catalog", [])
 
-    # Service-scope subscriptions require an explicit agent binding — there is
-    # no platform service-account fallback. Reject early with a clear error.
+    # A service-scope subscription registers with one account of the agent's
+    # own set: every later step opens that account's lender's token dir at
+    # its label (scopes, extra, target tokens, effective mode). There is no
+    # platform service-account fallback.
     if scope == "service":
         if not agent:
             raise SubscriptionError(
                 "service-scope subscription requires an agent", status=400,
             )
-        from services.oauth import credential_resolver
-        ref = credential_resolver.pick_account(mcp_name, agent)
-        if ref is None:
-            raise SubscriptionError(
-                f"no account bound to agent {agent!r} for {mcp_name} — a "
-                f"manager must bind one in Agent Settings first",
-                status=400,
-            )
-        # Every later step opens the bound owner's token dir at the request's
-        # label (scopes, extra, target tokens, effective mode): a label other
-        # than the binding's would read another of that user's accounts.
-        if account_label != ref.label:
-            raise SubscriptionError(
-                f"account {account_label!r} is not the service account bound "
-                f"to agent {agent!r} for {mcp_name}: subscribe with the bound "
-                f"account {ref.label!r}",
-                status=400,
-                detail={"bound_account_label": ref.label},
-            )
+        if service_account(mcp_name, agent, account_label) is None:
+            raise SubscriptionError(not_in_the_set(mcp_name, account_label), status=400)
 
     # An installation of a GitHub-App account as the target: the app's own
     # webhook delivers, nothing is registered at the vendor, the app's
@@ -187,16 +148,11 @@ async def create_subscription(
                 f"installation {vendor_target!r} cannot be subscribed to: "
                 f"{_installation_sentence(standing, account_meta)}", status=400,
             )
-        if scope == "service":
-            bound = credential_resolver.pick_account(mcp_name, agent or "")
-            if bound is None or not oauth_app_kinds.binding_covers(
-                    bound.installation_id, account_meta, vendor_target):
-                raise SubscriptionError(
-                    f"installation {vendor_target!r} is not the identity bound to agent "
-                    f"{agent!r}: subscribe with the bound installation",
-                    status=400,
-                    detail={"bound_installation_id": bound.installation_id if bound else ""},
-                )
+        if scope == "service" and not service_row_covers(mcp_name, agent or "", account_label, vendor_target):
+            raise SubscriptionError(
+                f"This account of the agent does not cover installation {vendor_target}.",
+                status=400,
+            )
 
     # 1. Validate selected_events are in catalog.
     catalog_keys = {entry["key"] for entry in catalog}
@@ -317,7 +273,6 @@ async def create_subscription(
     # Effective registration mode: hosted installs with a relay-capable
     # manifest + a relay-exchanged account deliver events VIA the relay
     # (zero vendor-console steps).
-    reg_block = webhooks_block.get("registration", {})
     effective_mode = _effective_registration_mode(
         webhooks_block=webhooks_block, scope=scope,
         owner=user_sub, agent=agent, mcp_name=mcp_name,
@@ -329,6 +284,62 @@ async def create_subscription(
             "(the relay needs a reachable URL to forward events to)",
             status=400,
         )
+    return vendor_target, target_kind, kind_entry, effective_mode
+
+
+async def create_subscription(
+    *,
+    user_sub: str,
+    scope: str,
+    agent: str | None,
+    mcp_name: str,
+    account_label: str,
+    vendor_target: str,
+    selected_events: list[str],
+    selected_subevents: dict[str, list[str]] | None = None,
+    caller_is_admin: bool = False,
+    target_kind: str = "",
+) -> dict:
+    """End-to-end subscription create.
+
+    Flow:
+      1. Load manifest, validate ``selected_events`` are in event_catalog,
+         resolve the target kind (``vendor_target_spec.target_kinds``; the
+         flat spec when the manifest declares none).
+      2. Cross-check ``required_scopes`` — the events' plus the kind's —
+         against bound OAuth account's granted scopes → raise
+         ``SubscriptionScopeError`` if missing.
+      3. Insert DB row with status='creating' + freshly-minted signing secret.
+      4. Resolve OAuth token; render registration.create template.
+      5. POST to vendor with 30s timeout.
+      6. On success: UPDATE row to status='active', vendor_subscription_id,
+         expires_at (when manifest declares lifetime_seconds).
+      7. On vendor failure: UPDATE row to status='failed', last_error;
+         raise ``VendorAPIError``.
+
+    Returns the row dict (signing_secret_enc stripped). Raises one of the
+    ``SubscriptionError`` subclasses on failure.
+    """
+    manifest = mcp_registry.get_manifest(mcp_name)
+    if manifest is None:
+        raise SubscriptionError(f"unknown MCP: {mcp_name}", status=404)
+    webhooks_block = (manifest.credentials.webhooks or {}) if manifest.credentials else {}
+    if not webhooks_block.get("available", False):
+        raise SubscriptionError(
+            f"MCP {mcp_name!r} does not declare webhook receiver support", status=400,
+        )
+
+    provider_id = webhooks_block.get("provider_id", "")
+
+    vendor_target, target_kind, kind_entry, effective_mode = await run_db(
+        _prepare_create,
+        webhooks_block=webhooks_block, user_sub=user_sub, scope=scope, agent=agent,
+        mcp_name=mcp_name, account_label=account_label, vendor_target=vendor_target,
+        selected_events=selected_events, caller_is_admin=caller_is_admin,
+        target_kind=target_kind,
+    )
+    installation_target = target_kind == oauth_app_kinds.INSTALLATION_TARGET_KIND
+    reg_block = webhooks_block.get("registration", {})
 
     # 3. Generate signing secret + insert row. Per-vendor-secret model
     # routes via manifest.signature.per_subscription_secret. Relay rows
@@ -377,16 +388,19 @@ async def create_subscription(
             effective_mode = reg_block.get("mode", "manual")
     signing_secret = vendor_secret
     if row is None:
-        row = webhook_subscription_store.create_subscription(
+        row = await run_db(
+            webhook_subscription_store.create_subscription,
             **row_args, signing_secret=signing_secret, delivery_mode="vendor",
         )
 
     if effective_mode == "relay" or effective_mode == oauth_app_kinds.REGISTRATION_MODE_APP:
         # Relay delivery, or the app's own webhook: no vendor call, the row
-        # is ready to receive at once.
-        webhook_subscription_store.update_subscription_status(
+        # is ready to receive at once. Shielded: a cancel in the queue would
+        # leave it ``creating`` for good, delivering nothing, and a retry a 409.
+        await asyncio.shield(run_db(
+            webhook_subscription_store.update_subscription_status,
             row["id"], webhook_subscription_store.ACTIVE, clear_last_error=True,
-        )
+        ))
     elif effective_mode == "auto":
         try:
             vendor_id = await _vendor_create(
@@ -401,7 +415,8 @@ async def create_subscription(
                 expires_at_iso8601=expires_at or "",
             )
         except VendorAPIError as e:
-            webhook_subscription_store.update_subscription_status(
+            await run_db(
+                webhook_subscription_store.update_subscription_status,
                 row["id"], webhook_subscription_store.FAILED,
                 last_error=f"vendor {e.vendor_status}: {e.vendor_body[:200]}",
             )
@@ -416,7 +431,8 @@ async def create_subscription(
                 ) from e
             raise
         except Exception as e:
-            webhook_subscription_store.update_subscription_status(
+            await run_db(
+                webhook_subscription_store.update_subscription_status,
                 row["id"], webhook_subscription_store.FAILED, last_error=f"{type(e).__name__}: {e}",
             )
             # 500, not 502 — edge proxies (Cloudflare) replace origin 502
@@ -426,11 +442,15 @@ async def create_subscription(
                 status=500,
             ) from e
 
-        webhook_subscription_store.update_subscription_status(
+        # The vendor holds a hook now: without its id a delete would answer
+        # "no vendor-side state" for a hook that still posts, so a cancel
+        # cannot drop this write.
+        await asyncio.shield(run_db(
+            webhook_subscription_store.update_subscription_status,
             row["id"], webhook_subscription_store.ACTIVE,
             vendor_subscription_id=vendor_id,
             clear_last_error=True,
-        )
+        ))
     else:
         # Manual mode — no vendor API call (Slack/Zoom have no public
         # auto-register endpoint for v1). Flip to 'active' immediately so
@@ -440,11 +460,12 @@ async def create_subscription(
         # 'active' represents "ready to receive" rather than "vendor
         # confirmed". The dashboard SubscriptionsPanel surfaces the URL
         # (and the per-subscription secret if applicable) for paste.
-        webhook_subscription_store.update_subscription_status(
+        await run_db(
+            webhook_subscription_store.update_subscription_status,
             row["id"], webhook_subscription_store.ACTIVE, clear_last_error=True,
         )
 
-    return webhook_subscription_store.get_subscription(row["id"]) or row
+    return await run_db(webhook_subscription_store.get_subscription, row["id"]) or row
 
 
 def resolve_effective_registration_mode(
@@ -534,8 +555,9 @@ async def _create_relay_row(*, provider_id: str, row_args: dict[str, Any]) -> di
     return row
 
 
-async def delete_subscription(*, subscription_id: str) -> tuple[bool, bool]:
-    """Delete a subscription. Best-effort vendor DELETE first.
+async def delete_subscription(*, subscription_id: str, token_owner_sub: str = "") -> tuple[bool, bool]:
+    """Delete a subscription. Best-effort vendor DELETE first
+    (``token_owner_sub``: as in ``cleanup_account_subscriptions``).
 
     Authorization happens at the API layer (_can_manage_subscription) —
     this function performs no actor checks.
@@ -549,16 +571,16 @@ async def delete_subscription(*, subscription_id: str) -> tuple[bool, bool]:
     the kinds left, or switched off when nothing here uses the provider any
     more (``relay_events.provider_gone``).
     """
-    row = webhook_subscription_store.get_subscription(subscription_id)
+    row = await run_db(webhook_subscription_store.get_subscription, subscription_id)
     if not row:
         return False, True
     if row.get("delivery_mode") == "relay":
-        deleted = webhook_subscription_store.delete_subscription(subscription_id)
+        deleted = await run_db(webhook_subscription_store.delete_subscription, subscription_id)
         if deleted:
             relay_events.sync_provider_soon(row.get("provider_id", ""))
         return deleted, True
     try:
-        detached = await _vendor_delete(row) is not False
+        detached = await _vendor_delete(row, token_owner_sub=token_owner_sub) is not False
     except Exception as e:  # noqa: BLE001  # a vendor's delete raises whatever its client does, the row goes anyway
         detached = False
         logger.warning(
@@ -566,7 +588,7 @@ async def delete_subscription(*, subscription_id: str) -> tuple[bool, bool]:
             "Proceeding with DB delete (orphan-tolerant).",
             subscription_id, row.get("provider_id"), e,
         )
-    return webhook_subscription_store.delete_subscription(subscription_id), detached
+    return await run_db(webhook_subscription_store.delete_subscription, subscription_id), detached
 
 
 async def renew_subscription(subscription_id: str) -> dict | None:
@@ -576,7 +598,7 @@ async def renew_subscription(subscription_id: str) -> dict | None:
     Updates ``expires_at`` on success; flips to ``renew_failed`` on vendor
     rejection.
     """
-    row = webhook_subscription_store.get_subscription(subscription_id)
+    row = await run_db(webhook_subscription_store.get_subscription, subscription_id)
     if not row:
         return None
     manifest = mcp_registry.get_manifest(row["mcp_name"])
@@ -595,15 +617,8 @@ async def renew_subscription(subscription_id: str) -> dict | None:
     ).isoformat().replace("+00:00", "Z")
 
     try:
-        token = _resolve_token_or_raise(
-            provider_id=row["provider_id"],
-            scope=row["scope"],
-            owner=row["owner"] or "",
-            agent=row.get("agent"),
-            mcp_name=row["mcp_name"],
-            account_label=row["account_label"],
-        )
-        account_extra = _resolve_account_extra(
+        token, account_extra = await run_db(
+            _token_and_extra,
             provider_id=row["provider_id"],
             scope=row["scope"],
             owner=row["owner"] or "",
@@ -619,23 +634,26 @@ async def renew_subscription(subscription_id: str) -> dict | None:
             account_extra=account_extra,
         )
     except VendorAPIError as e:
-        webhook_subscription_store.update_subscription_status(
+        await run_db(
+            webhook_subscription_store.update_subscription_status,
             subscription_id, webhook_subscription_store.RENEW_FAILED,
             last_error=f"vendor {e.vendor_status}: {e.vendor_body[:200]}",
         )
         raise
     except Exception as e:
-        webhook_subscription_store.update_subscription_status(
+        await run_db(
+            webhook_subscription_store.update_subscription_status,
             subscription_id, webhook_subscription_store.RENEW_FAILED,
             last_error=f"{type(e).__name__}: {e}",
         )
         raise SubscriptionError(f"renew failed: {e}", status=502) from e
 
-    webhook_subscription_store.update_subscription_status(
+    await run_db(
+        webhook_subscription_store.update_subscription_status,
         subscription_id, webhook_subscription_store.ACTIVE,
         expires_at=new_expires, clear_last_error=True,
     )
-    return webhook_subscription_store.get_subscription(subscription_id)
+    return await run_db(webhook_subscription_store.get_subscription, subscription_id)
 
 
 # ---------------------------------------------------------------------------
@@ -644,12 +662,12 @@ async def renew_subscription(subscription_id: str) -> dict | None:
 
 async def cleanup_user_subscriptions(user_sub: str) -> int:
     """Delete all user-scope subscriptions for a user. Returns count deleted."""
-    rows = webhook_subscription_store.cleanup_user_subscriptions(user_sub)
+    rows = await run_db(webhook_subscription_store.cleanup_user_subscriptions, user_sub)
     return await _cleanup_rows(rows)
 
 
 async def cleanup_agent_subscriptions(agent: str) -> int:
-    rows = webhook_subscription_store.cleanup_agent_subscriptions(agent)
+    rows = await run_db(webhook_subscription_store.cleanup_agent_subscriptions, agent)
     return await _cleanup_rows(rows)
 
 
@@ -661,7 +679,8 @@ async def cleanup_account_subscriptions(
     longer stands (the offboarding subscriber): the vendor delete then reads
     the account's token through that person directly, where the binding
     lookup would answer nothing."""
-    rows = webhook_subscription_store.cleanup_account_subscriptions(
+    rows = await run_db(
+        webhook_subscription_store.cleanup_account_subscriptions,
         scope=scope, owner=owner, mcp_name=mcp_name, account_label=account_label,
         agent=agent,
     )
@@ -690,7 +709,7 @@ async def _cleanup_rows(rows: list[dict], *, token_owner_sub: str = "") -> int:
                 "cleanup: vendor delete failed for subscription %s (provider=%s): %s",
                 row["id"], row.get("provider_id"), e,
             )
-        if webhook_subscription_store.delete_subscription(row["id"]):
+        if await run_db(webhook_subscription_store.delete_subscription, row["id"]):
             count += 1
             if row.get("delivery_mode") == "relay":
                 relay_providers.add(str(row.get("provider_id") or ""))
@@ -730,15 +749,8 @@ async def _vendor_create(
             "manifest declares registration.mode=auto but no registration.create block",
             status=500,
         )
-    token = _resolve_token_or_raise(
-        provider_id=row["provider_id"],
-        scope=scope,
-        owner=owner,
-        agent=agent,
-        mcp_name=row["mcp_name"],
-        account_label=row["account_label"],
-    )
-    account_extra = _resolve_account_extra(
+    token, account_extra = await run_db(
+        _token_and_extra,
         provider_id=row["provider_id"],
         scope=scope,
         owner=owner,
@@ -829,16 +841,8 @@ async def _vendor_delete(row: dict, *, token_owner_sub: str = "") -> bool:
         # Row was never confirmed by the vendor (status='creating' that
         # never flipped). No vendor-side state to delete.
         return True
-    token = _resolve_token_or_raise(
-        provider_id=row["provider_id"],
-        scope=row["scope"],
-        owner=row["owner"] or "",
-        agent=row.get("agent"),
-        mcp_name=row["mcp_name"],
-        account_label=row["account_label"],
-        token_owner_sub=token_owner_sub,
-    )
-    account_extra = _resolve_account_extra(
+    token, account_extra = await run_db(
+        _token_and_extra,
         provider_id=row["provider_id"],
         scope=row["scope"],
         owner=row["owner"] or "",
@@ -946,29 +950,52 @@ def _username_for(owner_sub: str) -> str:
     return username
 
 
+def service_account(mcp_name: str, agent: str, account_label: str) -> credential_resolver.AccountRef | None:
+    """The account of the agent's own set a service subscription names by its
+    label: that row while its lender still manages the agent, else None,
+    never the set's default (``credential_resolver.pick_account`` with the
+    label as the choice). Synchronous store reads."""
+    if not account_label or not agent:
+        return None
+    return credential_resolver.pick_account(mcp_name, agent, account_choices={mcp_name: account_label})
+
+
+def service_row_covers(mcp_name: str, agent: str, account_label: str, installation_id: str) -> bool:
+    """Whether the agent's account of that label stands and covers the
+    installation: the installation it acts as, or on an account acting as
+    itself (hosted sign-in), any installation its owner owns. Synchronous."""
+    from storage.identity import credential_store
+    ref = service_account(mcp_name, agent, account_label)
+    if ref is None:
+        return False
+    meta = {} if ref.installation_id else credential_store.get_account_meta(
+        ref.owner_sub, mcp_name, account_label)
+    return oauth_app_kinds.binding_covers(ref.installation_id, meta, installation_id)
+
+
+def not_in_the_set(mcp_name: str, account_label: str) -> str:
+    """The refusal of a service subscription on an account the agent does not hold."""
+    tool = getattr(mcp_registry.get_manifest(mcp_name), "label", "") or mcp_name
+    return f"{account_label or 'That account'} is not one of this agent's accounts for {tool}."
+
+
 def _owner_username_for(
-    *, scope: str, owner: str, agent: str | None, mcp_name: str,
+    *, scope: str, owner: str, agent: str | None, mcp_name: str, account_label: str,
     token_owner_sub: str = "",
 ) -> str:
-    """Filesystem username whose token dir holds the bound account.
+    """Filesystem username whose token dir holds the subscription's account.
 
-    User scope → the subscription owner. Service scope → the agent's binding
-    points at a user's OWN account (no platform tier); return that user's
-    username, or the named lender's when the caller knows the binding no
-    longer stands. Raises when a service-scope subscription has no
-    resolvable binding.
+    User scope → the subscription owner. Service scope → the lender of the
+    agent's account the subscription names (``service_account``), or the
+    named lender's when the caller knows the row no longer stands. Raises
+    when that account is not one of the agent's.
     """
     if scope == "service" and token_owner_sub:
         return _username_for(token_owner_sub)
     if scope == "service":
-        from services.oauth import credential_resolver
-        ref = credential_resolver.pick_account(mcp_name, agent or "")
+        ref = service_account(mcp_name, agent or "", account_label)
         if ref is None:
-            raise SubscriptionError(
-                f"no account bound to agent {agent!r} for {mcp_name} — a "
-                f"manager must bind one in Agent Settings",
-                status=400,
-            )
+            raise SubscriptionError(not_in_the_set(mcp_name, account_label), status=400)
         return _username_for(ref.owner_sub)
     return _username_for(owner)
 
@@ -979,7 +1006,7 @@ def _resolve_token_or_raise(
 ) -> str:
     """Resolve the bound OAuth account's access_token. Raises on miss."""
     username = _owner_username_for(
-        scope=scope, owner=owner, agent=agent, mcp_name=mcp_name,
+        scope=scope, owner=owner, agent=agent, mcp_name=mcp_name, account_label=account_label,
         token_owner_sub=token_owner_sub,
     )
     token_dir = get_token_dir(username=username, provider_id=provider_id)
@@ -1033,7 +1060,7 @@ def _resolve_account_extra(
     """
     try:
         username = _owner_username_for(
-            scope=scope, owner=owner, agent=agent, mcp_name=mcp_name,
+            scope=scope, owner=owner, agent=agent, mcp_name=mcp_name, account_label=account_label,
             token_owner_sub=token_owner_sub,
         )
         token_dir = get_token_dir(username=username, provider_id=provider_id)
@@ -1051,6 +1078,12 @@ def _resolve_account_extra(
             provider_id, account_label, e,
         )
         return {}
+
+
+def _token_and_extra(**account: Any) -> tuple[str, dict]:
+    """What one vendor call sends, one ``run_db`` job right before it: a
+    token kept across another await may have been refreshed since."""
+    return _resolve_token_or_raise(**account), _resolve_account_extra(**account)
 
 
 def _read_granted_scopes(
@@ -1075,7 +1108,7 @@ def _read_granted_scopes(
     """
     try:
         username = _owner_username_for(
-            scope=scope, owner=owner, agent=agent, mcp_name=mcp_name,
+            scope=scope, owner=owner, agent=agent, mcp_name=mcp_name, account_label=account_label,
         )
         token_dir = get_token_dir(username=username, provider_id=provider_id)
         path = account_token_path(token_dir, account_label)
@@ -1105,7 +1138,7 @@ def _account_meta(*, scope: str, owner: str, agent: str | None, mcp_name: str, a
     try:
         owner_sub = owner
         if scope == "service":
-            ref = credential_resolver.pick_account(mcp_name, agent or "")
+            ref = service_account(mcp_name, agent or "", account_label)
             if ref is None:
                 return {}
             owner_sub = ref.owner_sub

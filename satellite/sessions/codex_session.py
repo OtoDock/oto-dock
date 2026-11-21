@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .. import config
-from .._vendored import layout
+from .._vendored import layout, session_text
 from .._vendored.app_server_client import (
     AppServerClient,
     AppServerError,
@@ -45,6 +45,21 @@ from ..config import (
 )
 from ..host import env_hygiene, path_translator
 from ..transport import file_sync
+from . import sandbox_host, session_homes, start_slots
+from .codex_files import (
+    CODEX_HEADLESS_ROOT_KEYS,
+    CODEX_MEMORIES_TABLE,
+    CODEX_TOOLS_TABLE,
+    LOCAL_PROVIDER,
+    _validate_config_toml,
+    chmod_private,
+    drop_store_leftovers,
+    features_table,
+    local_provider_toml,
+    runs_on_local_model,
+    write_or_drop_auth_json,
+    write_or_drop_model_catalog,
+)
 
 if TYPE_CHECKING:
     from ..config import SatelliteConfig
@@ -64,13 +79,34 @@ _WARM_POLL_S = 0.5
 _WARM_CAP_S = 15.0
 _WARM_CAP_LOCAL_MODEL_S = 90.0
 _WARM_NO_STATUS_S = 5.0
+# How long an interrupt that drew an error waits for the turn to end by
+# itself (its ``turn/completed`` was already on the way) before the daemon
+# is dropped.
+_INTERRUPT_SETTLE_S = 2.0
+# How long a Stop waits for the id of a turn that is inside its ``turn/start``.
+_TURN_ID_WAIT_S = 2.0
+# A daemon that exited inside a turn: how long its exit code is waited for,
+# and the most of its last stderr line the turn's end carries.
+_EXIT_CODE_WAIT_S = 2.0
+_LAST_LINE_MAX = 300
 
 
 def _format_time() -> str:
     return datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M")
 
 
-def _write_codex_hooks(codex_dir: Path) -> None:
+def session_text_mode(config: dict) -> bool:
+    """The platform's flag: the session's text is its own; none: ``AGENTS.md``."""
+    return bool(config.get("codex_session_text"))
+
+
+def session_text_of(config: dict) -> str:
+    """The session's text as the platform composed it (the notes included)."""
+    return str(config.get("agents_md_content", config.get("system_prompt", "")) or "")
+
+
+def _write_codex_hooks(codex_dir: Path, *, session_text_hook: bool = False, start_context: bool = False,
+                       scripts_dir: Path | None = None) -> None:
     """Write hooks.json for the Codex hook system.
 
     MUST match the schema the proxy's ``core/layers/codex/config_dir.build_hooks`` emits
@@ -87,13 +123,17 @@ def _write_codex_hooks(codex_dir: Path) -> None:
     chats too (``codex_attended_floor``), whose gate judges every call (the
     JSON-RPC approval bridge takes what crosses the sandbox). Uses ``codex_hook_command()`` — on Windows a
     quote-free .cmd wrapper, because Codex's cmd.exe /C hook runner cannot
-    re-parse the quoted two-token form (exit-1 on every call otherwise)."""
+    re-parse the quoted two-token form (exit-1 on every call otherwise).
+    ``codex_dir`` is the folder the engine reads (a session's home when it
+    has one); the scripts stay in ``scripts_dir``, the store."""
+    scripts = scripts_dir or codex_dir
+
     def _hook(script: str, timeout: int) -> dict:
         return {
             "matcher": "",
             "hooks": [{
                 "type": "command",
-                "command": codex_hook_command(codex_dir / script),
+                "command": codex_hook_command(scripts / script),
                 "timeout": timeout,
             }],
         }
@@ -111,7 +151,23 @@ def _write_codex_hooks(codex_dir: Path) -> None:
             "Stop": [_hook("stop_tracker.py", config.HOOK_WAIT_S)],
         },
     }
+    # The proxy's config_dir.session_start_hook: the thread's text and a terminal's start data, neither trimmed.
+    starts = [{**_hook(s, t)["hooks"][0], "additionalContextLimit": 0} for s, t, on in (
+        ("session_text.py", 10, session_text_hook), ("start_context.py", 20, start_context)) if on]
+    if starts:
+        hooks["hooks"]["SessionStart"] = [{"matcher": "", "hooks": starts}]
     write_if_changed(codex_dir / "hooks.json", (json.dumps(hooks, indent=2) + "\n").encode("utf-8"))
+
+
+def rewrite_codex_hooks(session) -> None:
+    """A live session's hooks again, as its start wrote them, after a push
+    of the store's file (``SessionManager._reapply_hooks_after_push``): in
+    the folder the engine reads (its home when it has one), naming the
+    store's scripts."""
+    cfg = getattr(session, "config", {})
+    codex_dir = session._codex_dir
+    _write_codex_hooks(getattr(session, "_engine_dir", None) or codex_dir, session_text_hook=session_text_mode(cfg),
+                       start_context=bool(cfg.get("start_context_parts")), scripts_dir=codex_dir)
 
 
 def _inject_display_env_toml(toml_content: str) -> str:
@@ -153,13 +209,35 @@ def _inject_display_env_toml(toml_content: str) -> str:
 
 
 # The bridges' hold while the platform cannot be reached (the permission
-# gate's twin, ``proxy/hooks/permission_gate.py``): retried with this backoff
-# for up to two minutes, then denied; a refused token gets a short ladder.
+# gate's twin, ``proxy/hooks/permission_gate.py``, held equal by the
+# vocabulary gate's twins): retried with this backoff for up to two minutes,
+# or as long as the link's 502 or 503 names when that is longer
+# (``_hold_named``, at most ``_HOLD_MAX_S``), then denied; a refused token
+# gets a short ladder.
 _HOOK_HOLD_S = 120.0
 _HOOK_BACKOFF = (2.0, 4.0, 8.0, 15.0)
 _HOOK_AUTH_LADDER = (2.0, 4.0, 8.0)
+_HOLD_MAX_S = 3600.0
 # A wait on a person streams a keepalive every 30 s.
 _HOOK_SOCK_READ_S = 150
+
+
+def _hold_named(body):
+    """The seconds a tunnel answer asks the call to be held for, 0 for none."""
+    value = body.get("hold_s")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return 0.0
+    return min(float(value), _HOLD_MAX_S)
+
+
+def _hold_seconds(text: str) -> float:
+    """``hold_s`` of the local link's 502 or 503 body (the platform said for
+    how long it stops), 0 when the body names none."""
+    try:
+        body = json.loads(text)
+    except ValueError:
+        return 0.0
+    return _hold_named(body) if isinstance(body, dict) else 0.0
 
 
 def _error_word(text: str) -> str:
@@ -205,191 +283,6 @@ def _summary_refused(params) -> bool:
     return _SUMMARY_PARAM in text and ("400" in text or err.get("codexErrorInfo") == "badRequest")
 
 
-def _validate_config_toml(text: str, path: Path) -> None:
-    """Best-effort TOML validation before handing a config to codex: the strict
-    TUI hard-exits (code 1, blank terminal) on invalid TOML and the app-server
-    silently "uses defaults" (drops every MCP) — both are hard to diagnose from
-    the outside, so make the corruption LOUD at the write site. Warn-only: the
-    proxy-side writer already fail-closes; here a visible ERROR beats killing
-    the spawn. The host floor (3.10) has no tomllib and parses with the
-    shipped tomli, the same parser."""
-    try:
-        import tomllib as toml
-    except ModuleNotFoundError:
-        try:
-            import tomli as toml  # type: ignore[no-redef]
-        except ModuleNotFoundError:
-            return
-    try:
-        toml.loads(text)
-    except toml.TOMLDecodeError as e:
-        logger.error("generated codex config.toml is INVALID (%s): %s", path, e)
-
-
-# File name of the per-session model catalog inside CODEX_HOME (twin of the
-# proxy's ``local_model_catalog.CATALOG_FILE_NAME``).
-MODEL_CATALOG_FILE_NAME = "models.json"
-
-# config.toml [tools] table every Codex session gets (twin of the proxy's
-# ``layer._CODEX_TOOLS_TABLE``): Codex 0.152.0 made the update_plan tool
-# opt-in (default off) — without it the daemon never emits turn/plan/updated
-# and the dashboard's TODO checklist silently disappears. Valid on older
-# Codex too (where on was the default).
-CODEX_TOOLS_TABLE = "[tools]\nupdate_plan = { enabled = true }"
-
-# Header every headless (app-server) remote Codex session gets — the twin of
-# the local ``layer._write_config_toml`` header and of the interactive
-# satellite writer (``codex_pty_session._build_codex_config_toml``). Before
-# 0.5.118 the headless writer emitted none of it, so a paired machine ran
-# Codex's defaults: the 32 KiB ``project_doc_max_bytes`` cap silently dropped
-# the tail of a platform AGENTS.md (persona + memory + skills + knowledge),
-# Codex's own memory subsystem ran next to otodock memory (the single source
-# of memory truth; there is no ``.codex/memories/`` wipe on a satellite), and
-# every daemon start cloned OpenAI's curated-plugins repo (``plugins`` below).
-# Root keys must precede every ``[table]`` header.
-CODEX_HEADLESS_ROOT_KEYS = "project_doc_max_bytes = 300000"
-CODEX_MEMORIES_TABLE = "[memories]\nuse_memories = false\ngenerate_memories = false"
-
-
-def features_table(hooks_floor: bool, mcp_toml: str) -> "tuple[str, str]":
-    """The ONE ``[features]`` table of a headless config.toml, plus the MCP
-    TOML with its own leading ``[features]`` block lifted out.
-
-    Returns ``(features_block, mcp_toml_rest)``. The block always carries
-    ``plugins = false`` (lean start, see ``CODEX_HEADLESS_ROOT_KEYS``), adds
-    ``hooks = true`` when this session runs the PreToolUse permission floor
-    (``codex_hooks_floor`` or ``codex_attended_floor`` in the start payload —
-    the key is default-on upstream, explicit on purpose), and keeps every key of a ``[features]``
-    block the proxy prepends to the MCP TOML (``default_mode_request_user_input``
-    for headless dashboard chats). Merging is what keeps the file valid: two
-    ``[features]`` tables are a duplicate key Codex rejects, after which the
-    app-server "uses defaults" and drops every MCP. Comments and blank lines
-    of the lifted block are dropped; a key already present is not repeated.
-    """
-    lines = mcp_toml.split("\n") if mcp_toml else []
-    keys: list[str] = ["plugins = false"]
-    rest = mcp_toml
-    if lines and lines[0].strip() == "[features]":
-        end = len(lines)
-        for i in range(1, len(lines)):
-            stripped = lines[i].strip()
-            if stripped.startswith("[") and stripped != "[features]":
-                end = i
-                break
-        for raw in lines[1:end]:
-            line = raw.strip()
-            if line and not line.startswith("#"):
-                keys.append(line)
-        rest = "\n".join(lines[end:]).strip() if end < len(lines) else ""
-    if hooks_floor:
-        keys.append("hooks = true")
-    seen: set[str] = set()
-    unique: list[str] = []
-    for key in keys:
-        name = key.split("=", 1)[0].strip()
-        if name in seen:
-            continue
-        seen.add(name)
-        unique.append(key)
-    return "[features]\n" + "\n".join(unique), rest
-
-
-def _esc_toml(v: str) -> str:
-    return v.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def local_provider_toml(local: "dict | None", codex_dir: "Path | None" = None) -> "tuple[str, str]":
-    """Codex config.toml lines for a local OpenAI-compatible endpoint the proxy
-    carried in the start payload (``local_model_provider``: ``base_url`` plus the
-    optional ``env_key`` naming the child-env variable that holds its bearer,
-    ``stream_idle_timeout_ms`` and the optional ``catalog_json``).
-
-    Returns ``(root_lines, table)``: ``model_provider = "oto_local"`` (and, with
-    a catalog, ``model_catalog_json = "<codex_dir>/models.json"`` — the file
-    ``write_or_drop_model_catalog`` writes) are ROOT keys and must precede every
-    ``[table]`` header; the ``[model_providers.oto_local]`` table may close the
-    file. Twin of the proxy's ``_write_config_toml`` provider block —
-    ``wire_api`` MUST be ``"responses"`` (codex-rs dropped the "chat" wire),
-    ``env_key`` is emitted ONLY when the endpoint is keyed (codex-rs refuses a
-    provider whose ``env_key`` names an unset variable) and the idle timeout
-    only when the proxy sent one (a local model prefills at CPU speed; Codex's
-    5-minute default killed a first turn before its first token). ``("", "")``
-    without an endpoint, so a hosted session never inherits a provider.
-    """
-    base_url = str((local or {}).get("base_url") or "").strip()
-    if not base_url:
-        return "", ""
-
-    root = ['model_provider = "oto_local"']
-    if codex_dir is not None and str((local or {}).get("catalog_json") or "").strip():
-        # Codex requires an ABSOLUTE path here (a relative agents_dir in
-        # satellite.conf would otherwise reject the whole config.toml).
-        catalog_path = os.path.abspath(str(Path(codex_dir) / MODEL_CATALOG_FILE_NAME))
-        root.append(f'model_catalog_json = "{_esc_toml(catalog_path)}"')
-    lines = [
-        "[model_providers.oto_local]",
-        'name = "Local"',
-        f'base_url = "{_esc_toml(base_url)}"',
-        'wire_api = "responses"',
-    ]
-    try:
-        idle_ms = int((local or {}).get("stream_idle_timeout_ms") or 0)
-    except (TypeError, ValueError):
-        idle_ms = 0
-    if idle_ms > 0:
-        lines.append(f"stream_idle_timeout_ms = {idle_ms}")
-    env_key = str((local or {}).get("env_key") or "").strip()
-    if env_key:
-        lines.append(f'env_key = "{_esc_toml(env_key)}"')
-    return "\n".join(root), "\n".join(lines)
-
-
-def write_or_drop_model_catalog(codex_dir: Path, local: "dict | None") -> None:
-    """``models.json`` follows the start payload exactly: write the proxy-built
-    per-session model catalog (``local_model_provider.catalog_json`` — the entry
-    that makes Codex defer its MCP tools on an Ollama model) owner-only, or
-    remove a previous session's file when this session carries none (CODEX_HOME
-    persists per agent and user; config.toml no longer points at it, so the
-    directory stays honest)."""
-    path = codex_dir / MODEL_CATALOG_FILE_NAME
-    text = str((local or {}).get("catalog_json") or "")
-    if text.strip():
-        path.write_text(text, encoding="utf-8")
-        chmod_private(path)
-        return
-    with contextlib.suppress(OSError):
-        path.unlink()
-
-
-def write_or_drop_auth_json(codex_dir: Path, auth_json: "dict | None") -> None:
-    """``auth.json`` follows the start payload exactly. With ``auth_json`` (a
-    ChatGPT OAuth session) write it owner-only; WITHOUT it (an API key or a
-    local endpoint) remove a previous session's file from this persistent
-    CODEX_HOME — Codex would otherwise load the stale, refresh-neutralized
-    token and loop on refreshing it every request ("Failed to refresh token:
-    400 … refresh_token: empty string", verified 2026-09-07 on a local-endpoint
-    session that followed a ChatGPT one)."""
-    auth_path = codex_dir / "auth.json"
-    if auth_json:
-        auth_path.write_text(json.dumps(auth_json, indent=2))
-        # Live OAuth tokens — keep them owner-only (the satellite host can be
-        # multi-user; default umask would leave them world-readable).
-        chmod_private(auth_path)
-        return
-    with contextlib.suppress(OSError):
-        auth_path.unlink()
-
-
-def chmod_private(path: Path) -> None:
-    """Owner-only for a config file that carries per-session bearers (MCP
-    cap-tokens, the session JWT, a local endpoint's URL) — the proxy locks its
-    own config.toml 0600 the same way. No-op on Windows (no POSIX bits)."""
-    if not config.HOST.posix:
-        return
-    with contextlib.suppress(OSError):
-        path.chmod(0o600)
-
-
 def _write_codex_hook_scripts(codex_dir: Path, scripts: dict[str, str]) -> None:
     """Write hook scripts sent by the proxy into the .codex/ dir (an
     unchanged one left alone, a changed one replaced whole:
@@ -432,9 +325,17 @@ class CodexSession:
         self._file_snapshot: dict[str, str] = {}
         self._cwd: Path | None = None
         self._codex_dir: Path | None = None
+        # The folder the engine reads: the session's home when the start asks
+        # for one (``session_homes``), else the store. A pushed sign-in for
+        # it reaches the start config a revive writes (``credentials_update``).
+        self._engine_dir: Path | None = None
         self._username: str = ""
         self._client: AppServerClient | None = None
         self._current_turn_id: str | None = None
+        # A ``turn/start`` is on its way and the turn has no id yet, and the
+        # event its answer sets (``_start_turn``).
+        self._turn_starting = False
+        self._turn_start_answered = asyncio.Event()
         # Serialize turns per session. The satellite dispatches every WS command
         # as an independent task (ws_client create_task) and the proxy drops its
         # session lock the instant a turn is aborted (its producer is cancelled),
@@ -462,6 +363,11 @@ class CodexSession:
         self._forward_event = None             # async callable: event_dict -> awaitable
         self._main_turn_done: asyncio.Event = asyncio.Event()
         self._stop_requested = False
+        # Why the turn's wait ended when the daemon did not end it itself
+        # (``take_turn_end``): the session manager puts it on the turn's end.
+        self._turn_end: dict = {}
+        # A drop in progress (``_drop_daemon``): a second Stop drops nothing.
+        self._dropping = False
         # The reasoning summary: whether the turn running asked for it, whether
         # the API refused it (no later turn asks), and whether the forwarder is
         # dropping a refused turn the turn method then runs again without it.
@@ -475,9 +381,11 @@ class CodexSession:
         # gate waits for each) and whether the model is a local endpoint (the
         # longer warm cap). Set by start() from the written config.
         self._mcp_server_names: list[str] = []
-        self._local_model: bool = bool(
-            ((config.get("local_model_provider") or {}).get("base_url") or "").strip()
-        )
+        self._local_model: bool = runs_on_local_model(config)
+        # A compute session (``sandbox_host``): the platform's files in the
+        # shared folder and its sandbox, nothing written or translated here.
+        self._compute = sandbox_host.is_compute(config)
+        self._own_copy = False
         # The proxy decides which sessions run permission_gate.py as the
         # app-server's PreToolUse hook (UNATTENDED client types: task / phone /
         # meeting / trigger / internal — helpers.codex_hooks_floor; satellite
@@ -494,6 +402,9 @@ class CodexSession:
         # sandbox. Read from the payload, never from this satellite's own
         # version.
         self._attended_floor: bool = bool(config.get("codex_attended_floor"))
+        # The session's own text and thread map (``session_text``); empty: AGENTS.md.
+        self._developer_instructions = ""
+        self._session_config: dict = {}
 
     @property
     def _hooks_on(self) -> bool:
@@ -548,8 +459,86 @@ class CodexSession:
     def _reviewer(self) -> str:
         return approvals_reviewer(self._platform_mode())
 
+    async def _start_compute(self) -> None:
+        """A session on a compute machine: the platform wrote the home's and
+        the session's own files into the shared folder and planned the spawn;
+        the daemon runs in the sandbox the plan describes, the thread in its
+        folder, the approval and question bridges on this machine's link."""
+        await self._stop_forwarder()
+        self._own_copy = await sandbox_host.ready_own_copy(self.config, self.sat_config,
+                                                           self.session_id, self.agent_dir)
+        if self._own_copy:
+            self._file_snapshot = await asyncio.to_thread(file_sync.snapshot_agent_dir, self.agent_dir)
+        # The session's own file the platform wrote (its text and thread map),
+        # in the session's home when it has one.
+        self._codex_dir = self.agent_dir / self.config["codex_dir_relative"]
+        self._engine_dir = session_homes.home_path(self._codex_dir, self.session_id,
+                                                   self.config.get("session_home"))
+        if session_text_mode(self.config):
+            session_text.remove_shared_text(self._codex_dir)
+            own = session_text.read_session(self._engine_dir, self.session_id)
+            if own is None:
+                logger.error("Codex compute session %s: its own file is missing", self.session_id[:8])
+                raise RuntimeError("the session's own file is missing")
+            self._developer_instructions, self._session_config = own["developer_instructions"], own["config"]
+        self._mcp_server_names = [str(n) for n in (self.config.get("mcp_server_names") or [])]
+        env = sandbox_host.spawn_env(self.config)
+        self._proxy_url = f"http://127.0.0.1:{int(self.config.get('tunnel_port') or 0)}"
+        self._proxy_api_key = env.get("PROXY_API_KEY", "")
+        # The session's SSH agent socket before the render: the description
+        # names it as a bind source. The plan's environment carries the
+        # sandbox's own SSH_AUTH_SOCK and OTO_SSH_KEY_DIR, so they win here.
+        from . import credential_exit, ssh_agent
+        agent_env = await asyncio.to_thread(ssh_agent.start, self.session_id, self.config)
+        await asyncio.to_thread(credential_exit.start, self.session_id, self.config)
+        prefix, codex_bin = await sandbox_host.sandbox_prefix(self.config, self.sat_config, "codex")
+        ssh_agent.merge_env(env, agent_env, self.config)
+        await self._connect_with_retry(env, prefix=prefix, codex_bin=codex_bin)
+        await self._open_thread()
+        await self._warm_mcps()
+        self._forwarder_task = asyncio.create_task(self._run_forwarder())
+        self.pid = self._client.proc.pid if self._client.proc else 0
+        logger.info("Codex compute session ready: session=%s, thread=%s, pid=%s",
+                    self.session_id, self.thread_id, self.pid)
+
+    async def _open_thread(self) -> None:
+        """Resume the thread the platform named, else start one; a refused
+        resume starts fresh and is reported in the ack."""
+        overrides = self._thread_overrides()
+        if self.thread_id:
+            # ``excludeTurns``: the history stays in the rollout, unread here
+            # (Codex deprecates hydrating it into the answer).
+            resume = {"threadId": self.thread_id, "excludeTurns": True}
+            if "model" in overrides and self._local_model:
+                # Codex 0.168 and later resumes a thread on the provider its
+                # rollout saved, whatever config.toml names (0.166 refused the
+                # change): a chat moved from a hosted model to a local one
+                # would run on the old provider. Naming the local provider
+                # makes every Codex refuse that change, and the refusal starts
+                # fresh below. Only beside a model: with none named, Codex
+                # reads the provider as a model override and stops restoring
+                # the thread's saved model and effort. A hosted session names
+                # none: Codex refuses a local thread there as not configured,
+                # and a computer whose own Codex config sets a provider keeps
+                # resuming the threads born on it.
+                resume["modelProvider"] = LOCAL_PROVIDER
+            try:
+                res = await self._client.request("thread/resume", {**resume, **overrides})
+                self._note_thread_settings(res)
+            except AppServerError as e:
+                logger.warning("Codex resume failed (%s); starting new thread", e)
+                self.thread_id = None
+                self.resume_refused = True
+        if not self.thread_id:
+            res = await self._client.request("thread/start", overrides)
+            self.thread_id = (res.get("thread") or {}).get("id") or ""
+            self._note_thread_settings(res)
+
     async def start(self) -> None:
         """Write config files, spawn the app-server daemon, open/resume thread."""
+        if self._compute:
+            await self._start_compute()
+            return
         # Cancel a stale forwarder from a prior (dead) client before re-warming.
         await self._stop_forwarder()
         # Honor an absolute work_cwd the same soft way cli_session does — a
@@ -572,13 +561,27 @@ class CodexSession:
         self._codex_dir = self.agent_dir / self.config["codex_dir_relative"]
         self._codex_dir.mkdir(parents=True, exist_ok=True)
         self._cwd.mkdir(parents=True, exist_ok=True)
+        # The session's home when the start asks for one: its settings, hooks,
+        # model catalog, text and sign-in there; the scripts, the rollouts
+        # and the databases the store's.
+        self._engine_dir = session_homes.open_home(self._codex_dir, self.session_id,
+                                                   self.config.get("session_home"))
+        in_home = self._engine_dir != self._codex_dir
+        if in_home:
+            drop_store_leftovers(self.agent_dir, self.config["codex_dir_relative"])
 
         # --- write the .codex/ config tree (unchanged from the exec model) ---
         _write_codex_hook_scripts(self._codex_dir, self.config.get("hook_scripts", {}))
         write_command_wrappers(self._codex_dir, self.config.get("command_wrappers", {}))
-        (self._codex_dir / "AGENTS.md").write_text(
-            self.config.get("agents_md_content", self.config.get("system_prompt", ""))
-        )
+        own_text = session_text_mode(self.config)
+        if own_text:  # the thread's developerInstructions, no shared file
+            self._developer_instructions = session_text_of(self.config)
+            session_text.remove_shared_text(self._codex_dir)
+            session_text.write_session_files(
+                self._engine_dir, self.session_id, text=self._developer_instructions, config={},
+                writer=write_if_changed)
+        else:
+            (self._codex_dir / "AGENTS.md").write_text(session_text_of(self.config))
         toml_content = self.config.get("mcp_config_toml", "")
         if toml_content:
             otodock_fwd = str(otodock_dir()).replace("\\", "/")
@@ -613,7 +616,7 @@ class CodexSession:
         # above, so their input is unchanged), the MCP sections, and the
         # provider table last (none of the MCP transforms sees it).
         local_provider = self.config.get("local_model_provider")
-        root_line, provider_table = local_provider_toml(local_provider, self._codex_dir)
+        root_line, provider_table = local_provider_toml(local_provider, self._engine_dir)
         features, mcp_sections = features_table(self._hooks_on, toml_content.strip())
         parts = [p for p in (
             CODEX_HEADLESS_ROOT_KEYS, root_line, CODEX_TOOLS_TABLE, CODEX_MEMORIES_TABLE,
@@ -621,14 +624,16 @@ class CodexSession:
         ) if p]
         config_text = "\n\n".join(parts) + "\n"
         self._mcp_server_names = mcp_server_names_from_toml(config_text)
-        config_path = self._codex_dir / "config.toml"
+        config_path = self._engine_dir / "config.toml"
         if config_text:
             _validate_config_toml(config_text, config_path)
-        write_or_drop_model_catalog(self._codex_dir, local_provider)
+        write_or_drop_model_catalog(self._engine_dir, local_provider)
         config_path.write_text(config_text)
         chmod_private(config_path)
-        write_or_drop_auth_json(self._codex_dir, self.config.get("auth_json"))
-        _write_codex_hooks(self._codex_dir)
+        write_or_drop_auth_json(self._engine_dir, self.config.get("auth_json"))
+        _write_codex_hooks(self._engine_dir, session_text_hook=own_text,
+                           start_context=bool(self.config.get("start_context_parts")),
+                           scripts_dir=self._codex_dir)
 
         # Off-thread — a big agent tree's hash walk must not stall the event
         # loop at session start (parity with CLISession).
@@ -644,7 +649,10 @@ class CodexSession:
         # overlay (which survives curation). Defense-in-depth — see env_hygiene.py.
         env = env_hygiene.curate_satellite_env(os.environ)
         env.update(self.config.get("env", {}))
-        env["CODEX_HOME"] = str(self._codex_dir)
+        env["CODEX_HOME"] = str(self._engine_dir)
+        if in_home:
+            # The databases stay the store's, as the rollouts do (its link).
+            env["CODEX_SQLITE_HOME"] = str(self._codex_dir)
         env["OTO_SESSION_ID"] = self.session_id
         # Interpreter for the Windows .cmd hook wrappers (codex_hook_command).
         env["OTO_HOOK_PY"] = sys.executable
@@ -663,15 +671,14 @@ class CodexSession:
         env.pop("OTO_HOOK_BRIDGED", None)
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
-        # Per-session secret files (SSH keys + OAuth token files) — see
-        # session_files.py; injects OTO_SSH_KEY_DIR and lands token files
-        # at their agent-tree target before spawn (mirrors cli_session).
-        # No-op without a payload token.
-        from . import session_files
-        env.update(await asyncio.to_thread(
-            session_files.materialize, self.config, self.session_id,
-            self.agent_dir,
-        ))
+        # The credential exit's door (the payload's ``exit`` block), and the
+        # session's SSH agent socket and public keys (the proxy signs).
+        from . import credential_exit, ssh_agent
+        await asyncio.to_thread(credential_exit.start, self.session_id, self.config)
+        ssh_agent.merge_env(
+            env, await asyncio.to_thread(ssh_agent.start, self.session_id, self.config),
+            self.config,
+        )
         env = path_translator.translate_env(
             env, agent_dir=self.agent_dir, username=self._username,
             session_id=self.session_id,
@@ -684,24 +691,7 @@ class CodexSession:
         self._proxy_api_key = env.get("PROXY_API_KEY", "")
 
         await self._connect_with_retry(env)
-
-        overrides = self._thread_overrides()
-        if self.thread_id:
-            # ``excludeTurns``: the history stays in the rollout, unread here
-            # (Codex deprecates hydrating it into the answer).
-            resume = {"threadId": self.thread_id, "excludeTurns": True}
-            try:
-                res = await self._client.request("thread/resume", {**resume, **overrides})
-                self._note_thread_settings(res)
-            except AppServerError as e:
-                logger.warning("Codex resume failed (%s); starting new thread", e)
-                self.thread_id = None
-                self.resume_refused = True
-        if not self.thread_id:
-            res = await self._client.request("thread/start", overrides)
-            self.thread_id = (res.get("thread") or {}).get("id") or ""
-            self._note_thread_settings(res)
-
+        await self._open_thread()
         await self._warm_mcps()
         # The forwarder now becomes the SOLE consumer of notif_queue (warm-up
         # drained the startup notifications itself, above).
@@ -731,10 +721,12 @@ class CodexSession:
         if (self._closed or self._client is None or not self._client.is_alive
                 or not self._current_turn_id):
             return False
-        # Chat uploads arrive as sandbox-virtual paths — translate like run_turn.
-        text = path_translator.translate_paths_in_text(
-            text, agent_dir=self.agent_dir, username=self._username,
-        )
+        # Chat uploads arrive as sandbox-virtual paths — translate like run_turn
+        # (a compute session runs in the sandbox, where they are right as sent).
+        if not self._compute:
+            text = path_translator.translate_paths_in_text(
+                text, agent_dir=self.agent_dir, username=self._username,
+            )
         try:
             await self._client.request("turn/steer", {
                 "threadId": self.thread_id,
@@ -906,10 +898,12 @@ class CodexSession:
 
         if inject_time:
             prompt = f"[Current time: {_format_time()}]\n{prompt}"
-        # Translate sandbox-virtual paths (chat photos/files) to satellite-absolute.
-        prompt = path_translator.translate_paths_in_text(
-            prompt, agent_dir=self.agent_dir, username=self._username,
-        )
+        # Translate sandbox-virtual paths (chat photos/files) to satellite-absolute;
+        # a compute session runs in the sandbox, where they are right as sent.
+        if not self._compute:
+            prompt = path_translator.translate_paths_in_text(
+                prompt, agent_dir=self.agent_dir, username=self._username,
+            )
 
         self._item_paths.clear()
         sandbox_mode = self.config.get("sandbox_mode", "workspace-write")
@@ -941,10 +935,10 @@ class CodexSession:
 
         self._main_turn_done.clear()
         self._stop_requested = False
+        self._turn_end = {}
         self._summary_this_turn = "summary" in turn_params
         self._summary_retry = False
-        res = await self._client.request("turn/start", turn_params)
-        self._current_turn_id = (res.get("turn") or {}).get("id")
+        await self._start_turn(turn_params)
         try:
             await self._main_turn_done.wait()
             if self._summary_retry and not self._stop_requested:
@@ -954,12 +948,26 @@ class CodexSession:
                 self._summary_this_turn = False
                 turn_params.pop("summary", None)
                 self._main_turn_done.clear()
-                res = await self._client.request("turn/start", turn_params)
-                self._current_turn_id = (res.get("turn") or {}).get("id")
+                await self._start_turn(turn_params)
                 await self._main_turn_done.wait()
         finally:
             self._summary_retry = False
             self._current_turn_id = None
+
+    async def _start_turn(self, turn_params: dict) -> None:
+        """``turn/start``, and the turn's id once the daemon answers. Until
+        then a Stop has no id to interrupt, so ``abort`` waits for it here.
+        An earlier turn's id is not this one's: it goes first."""
+        assert self._client is not None  # invariant: the turn method checked it
+        self._current_turn_id = None
+        self._turn_start_answered.clear()
+        self._turn_starting = True
+        try:
+            res = await self._client.request("turn/start", turn_params)
+            self._current_turn_id = (res.get("turn") or {}).get("id")
+        finally:
+            self._turn_starting = False
+            self._turn_start_answered.set()
 
     async def _run_forwarder(self) -> None:
         """Persistent SOLE consumer of the daemon's notif_queue. Forwards every
@@ -983,10 +991,14 @@ class CodexSession:
                 # must never stall the proxy-bound pipe.
                 sniffer.put_nowait((method, params))
             if method == "__daemon_exit__":
-                # Tell the proxy + release any waiting run_turn.
-                await self._forward({"method": "error", "params": {
-                    "error": {"message": "Codex app-server exited unexpectedly"},
-                }})
+                if self.turn_active:
+                    # A turn waits for this daemon: its end says the engine
+                    # exited (``take_turn_end``), and that is the one ending.
+                    self._turn_end = await self._exit_of(client)
+                else:
+                    await self._forward({"method": "error", "params": {
+                        "error": {"message": "Codex app-server exited unexpectedly"},
+                    }})
                 self._main_turn_done.set()
                 return
             if method == "item/started":
@@ -1047,39 +1059,120 @@ class CodexSession:
             self._forwarder_task = None
 
     async def abort(self) -> None:
-        """turn/interrupt the in-flight turn; the daemon stays warm."""
-        if self._client is None or not self._client.is_alive or not self._current_turn_id:
+        """turn/interrupt the in-flight turn; the daemon stays warm. A daemon
+        that does not take the interrupt (no answer in time, or an error
+        while the turn stays open) never sends the turn's end: the turn
+        would keep the session's lock and every later message, a Stop
+        included, would wait behind it. That daemon is dropped
+        (``_drop_daemon``). A turn inside its ``turn/start`` has no id yet:
+        the interrupt waits for it, at most ``_TURN_ID_WAIT_S``."""
+        if self._client is None or not self._client.is_alive:
             return
+        if self._turn_starting:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._turn_start_answered.wait(), _TURN_ID_WAIT_S)
+        if not self._current_turn_id:
+            return
+        turn_id = self._current_turn_id
         try:
             await self._client.request("turn/interrupt", {
-                "threadId": self.thread_id, "turnId": self._current_turn_id,
+                "threadId": self.thread_id, "turnId": turn_id,
             }, timeout=10.0)
         except AppServerError as e:
             logger.warning("Codex interrupt failed for %s: %s", self.session_id, e)
+            # An error for a turn that just completed: its end is already
+            # on the way and ends the wait by itself.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._main_turn_done.wait(), _INTERRUPT_SETTLE_S)
+            if self._current_turn_id == turn_id and not self._main_turn_done.is_set():
+                await self._drop_daemon()
         logger.info("Codex session aborted: %s", self.session_id)
+
+    async def _drop_daemon(self) -> None:
+        """End the turn a daemon no longer answers for, and the daemon with
+        it. The thread is kept: the next turn finds a dead client and
+        re-warms with ``thread/resume`` (``_run_turn_locked``). The order is
+        ``close()``'s but for the wait, which ends last, so that turn meets
+        a closed client and never a dying one: the forwarder first (the
+        daemon's exit is this session's own doing and no error for the
+        platform), then the client and its children. Two Stops on one
+        unanswered interrupt both reach here: the second drops nothing, or
+        the client it meets, closed and still dying, would end the wait
+        early and the first drop's end would end the next turn's."""
+        if self._dropping:
+            return
+        self._dropping = True
+        logger.warning("Codex %s: the daemon did not take the interrupt; dropping it, the thread is kept",
+                       self.session_id)
+        try:
+            self._turn_end = {"reason": "interrupted"}
+            await self._stop_forwarder()
+            await self._close_client()
+            self._main_turn_done.set()
+        finally:
+            self._dropping = False
+
+    @staticmethod
+    async def _exit_of(client) -> dict:
+        """A daemon's exit as a turn's end says it: its exit code, waited
+        for a moment when the process is not reaped yet, and the last line
+        it wrote to stderr."""
+        proc = client.proc
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(proc.wait(), _EXIT_CODE_WAIT_S)
+        code = proc.returncode if proc is not None else None
+        line = (getattr(client, "last_stderr_line", "") or "")[:_LAST_LINE_MAX]
+        return {"reason": "exited", **({"exit_code": code} if isinstance(code, int) else {}),
+                **({"last_line": line} if line else {})}
+
+    def take_turn_end(self) -> dict:
+        """What the turn that just ended adds to its end frame, once: the
+        reason its wait ended when the daemon did not end it itself."""
+        ended, self._turn_end = self._turn_end, {}
+        return ended
+
+    async def _close_client(self) -> None:
+        """Close the daemon and reap the children it leaves."""
+        if self._client is None:
+            return
+        # Snapshot the app-server's MCP child tree BEFORE shutting it down.
+        # On Windows a clean daemon exit does NOT cascade to its MCP children
+        # (no job/process group there); they then keep venv files locked →
+        # WinError 5 on the next MCP-update swap. Reap any survivors after
+        # close. POSIX is already covered by the daemon's process-group kill
+        # inside AppServerClient._kill_proc.
+        proc = self._client.proc
+        children = (
+            await asyncio.to_thread(snapshot_descendants, proc.pid)
+            if proc is not None and proc.returncode is None
+            else []
+        )
+        await self._client.close()
+        await asyncio.to_thread(reap_descendants, children, 5.0)
 
     async def close(self) -> None:
         self._closed = True
-        await self._stop_forwarder()
-        self._main_turn_done.set()  # release any run_turn still waiting
-        if self._client is not None:
-            # Snapshot the app-server's MCP child tree BEFORE shutting it down.
-            # On Windows a clean daemon exit does NOT cascade to its MCP children
-            # (no job/process group there); they then keep venv files locked →
-            # WinError 5 on the next MCP-update swap. Reap any survivors after
-            # close. POSIX is already covered by the daemon's process-group kill
-            # inside AppServerClient._kill_proc.
-            proc = self._client.proc
-            children = (
-                await asyncio.to_thread(snapshot_descendants, proc.pid)
-                if proc is not None and proc.returncode is None
-                else []
-            )
-            await self._client.close()
-            await asyncio.to_thread(reap_descendants, children, 5.0)
-        # Per-session secret files (SSH keys) die with the session.
-        from . import session_files
-        session_files.wipe(self.session_id)
+        from . import credential_exit, session_files, ssh_agent
+        try:
+            await self._stop_forwarder()
+            self._main_turn_done.set()  # release any run_turn still waiting
+            await self._close_client()
+            # The session's SSH agent socket and public keys die with the session.
+            await asyncio.to_thread(ssh_agent.stop, self.session_id)
+            credential_exit.stop(self.session_id)
+        finally:
+            # Whatever a step above raised: the home with its sign-in and the
+            # session's files go here or nowhere while this satellite runs.
+            if not self._compute:
+                # Per-session secret files (SSH keys) and own Codex files die with it.
+                session_files.wipe(self.session_id)
+                session_text.forget(self.session_id)
+                session_homes.close_home(self._codex_dir, self.session_id, self.config.get("session_home"))
+            elif self._own_copy:
+                await asyncio.to_thread(session_files.wipe_agent_files, self.session_id)
+                session_homes.close_home(self.agent_dir / self.config.get("codex_dir_relative", ""),
+                                         self.session_id, self.config.get("session_home"))
         logger.info("Codex session closed: %s", self.session_id)
 
     async def send_control_request(self, subtype: str, **kwargs) -> None:
@@ -1096,6 +1189,8 @@ class CodexSession:
                 self.config["permission_mode"] = kwargs["permission_mode"]
 
     def detect_file_changes(self) -> list[dict]:
+        if self._compute and not self._own_copy:
+            return []
         return file_sync.detect_changes(self.agent_dir, self._file_snapshot)
 
     @property
@@ -1140,13 +1235,18 @@ class CodexSession:
             overrides["model"] = self.config["model"]
         if self.config.get("effort"):
             overrides["effort"] = self.config["effort"]
-        if self._cwd is not None:
+        if self._compute:
+            # The sandbox's folder (the platform's ``thread_cwd``): the daemon
+            # runs inside the platform's sandbox, where that is the cwd.
+            overrides["cwd"] = str(self.config.get("cwd") or "/")
+        elif self._cwd is not None:
             # A resumed thread otherwise runs in the cwd its rollout recorded:
             # a thread moved here from the platform recorded the sandbox's
             # /users/<name>, which does not exist on this machine, and Codex
             # then fails every stdio MCP at spawn and runs commands there.
             # The platform's twin sends the sandbox's folder (``thread_cwd``).
             overrides["cwd"] = str(self._cwd)
+        thread_config = dict(self._session_config)
         if self._hooks_on:
             # Codex runs a user-layer hooks.json only when trusted; the
             # app-server has no CLI flag for it (the TUI's
@@ -1154,7 +1254,11 @@ class CodexSession:
             # the switch (codex-rs app-server/src/config_manager.rs). Sent on
             # thread/start AND thread/resume (same dict). The platform wrote
             # the hook it is trusting. Twin of the local _thread_overrides.
-            overrides["config"] = {"bypass_hook_trust": True}
+            thread_config["bypass_hook_trust"] = True
+        if thread_config:
+            overrides["config"] = thread_config
+        if self._developer_instructions:  # the platform's _thread_overrides twin
+            overrides["developerInstructions"] = self._developer_instructions
         return overrides
 
     async def _decide_permission_remote(self, tool_name: str, tool_input: dict) -> dict:
@@ -1201,13 +1305,15 @@ class CodexSession:
         the JSON last. While it cannot be reached (a connection error, the
         tunnel's 502/503/504, a body that ends before its JSON: a proxy restart,
         a dropped socket) the call is held and retried for up to
-        ``_HOOK_HOLD_S`` from the first failure (a prompt may wait days before
-        its stream drops); a refused token gets a short ladder (the satellite
+        ``_HOOK_HOLD_S`` from the first failure, or for the ``hold_s`` the link
+        names when that is longer (a prompt may wait days before its stream
+        drops); a refused token gets a short ladder (the satellite
         reports its sessions a moment after it reconnects). The parsed JSON,
         or None when the platform stayed unreachable or refused."""
         import aiohttp
         loop = asyncio.get_running_loop()
         deadline = None
+        hold = _HOOK_HOLD_S
         unreachable = auth = 0
         # The hold's last failure, named in its final warning: which link
         # failed (a refused loopback port, the tunnel's own 503) costs hours
@@ -1231,7 +1337,14 @@ class CodexSession:
                             status = 0  # the stream ended before its JSON
                             last = "the answer was cut off"
                         elif status in (502, 503, 504):
-                            last = f"HTTP {status} {_error_word(await resp.text())}".strip()
+                            text = await resp.text()
+                            last = f"HTTP {status} {_error_word(text)}".strip()
+                            # The platform said how long it is away: held that long.
+                            told = _hold_seconds(text)
+                            if told:
+                                hold = max(hold, told)
+                                if deadline is not None:
+                                    deadline = max(deadline, loop.time() + told)
             except Exception as e:  # noqa: BLE001  # fail closed: held, then refused
                 logger.info("Codex bridge: %s unreachable (%s)", path, e)
                 status = 0
@@ -1245,10 +1358,10 @@ class CodexSession:
                 return None
             wait = _HOOK_BACKOFF[min(unreachable, len(_HOOK_BACKOFF) - 1)]
             if deadline is None:
-                deadline = loop.time() + _HOOK_HOLD_S
+                deadline = loop.time() + hold
             if loop.time() + wait > deadline:
                 logger.warning("Codex bridge: %s unreachable for %.0fs (last: %s)",
-                               path, _HOOK_HOLD_S, last or "no answer")
+                               path, hold, last or "no answer")
                 return None
             await asyncio.sleep(wait)
             unreachable += 1
@@ -1267,8 +1380,12 @@ class CodexSession:
         if item_id and paths:
             self._item_paths[item_id] = paths
 
-    async def _connect_with_retry(self, env: dict) -> None:
+    async def _connect_with_retry(self, env: dict, *, prefix: list[str] | None = None,
+                                  codex_bin: str = "") -> None:
         """Spawn the daemon + initialize, resetting a stale state runtime once.
+        ``prefix`` and ``codex_bin`` are a compute session's rendered sandbox
+        and resolved binary (the daemon then runs with no cwd of this
+        machine's: bubblewrap changes into the sandbox's).
 
         ``codex app-server`` keeps SQLite runtime DBs directly under
         CODEX_HOME. A copy written by a different codex version — or one that
@@ -1277,14 +1394,16 @@ class CodexSession:
         failure we delete the runtime DBs (the thread rollouts in
         ``sessions/`` are untouched, so history survives) and retry once.
         """
-        from ..host.cli_versions import resolve_spawn_bin_async
-        codex_bin = await resolve_spawn_bin_async(
-            "codex", self.sat_config.bin_hint("codex"),
-        )
+        if not codex_bin:
+            from ..host.cli_versions import resolve_spawn_bin_async
+            codex_bin = await resolve_spawn_bin_async(
+                "codex", self.sat_config.bin_hint("codex"),
+            )
         last_err: Exception | None = None
         for attempt in (1, 2):
             self._client = AppServerClient(
-                env=env, cwd=str(self._cwd),
+                env=env, cwd=None if prefix else str(self._cwd),
+                sandbox_cmd_prefix=prefix or sandbox_host.paired_command([]),
                 codex_bin=codex_bin,
                 label=f"codex[{self.session_id[:8]}]",
             )
@@ -1295,39 +1414,21 @@ class CodexSession:
                 log=lambda m: logger.info("Codex [%s] %s", self.session_id[:8], m),
             ))
             try:
-                await self._client.start({
-                    "clientInfo": {"name": "otodock-satellite", "title": "OtoDock", "version": "1"},
-                    "capabilities": {"experimentalApi": True},
-                })
+                async with start_slots.slot():
+                    await self._client.start({
+                        "clientInfo": {"name": "otodock-satellite", "title": "OtoDock", "version": "1"},
+                        "capabilities": {"experimentalApi": True},
+                    })
                 return
             except AppServerError as e:
                 last_err = e
                 await self._client.close()
                 if attempt == 1:
-                    logger.warning(
-                        "Codex app-server init failed (%s); resetting state runtime + retrying",
-                        e
-                    )
-                    self._reset_codex_state()
+                    # Retried once as it is: the store's databases are every
+                    # session's (CODEX_SQLITE_HOME), and Codex 0.169 rebuilds a
+                    # damaged one itself.
+                    logger.warning("Codex app-server init failed (%s); retrying", e)
         raise last_err if last_err else RuntimeError("codex app-server init failed")
-
-    def _reset_codex_state(self) -> None:
-        """Delete codex's SQLite runtime DBs in CODEX_HOME (regenerable).
-
-        Every DB family the daemon keeps directly under CODEX_HOME (state,
-        logs, goals, memories, and whatever future releases add) can carry the
-        "migration … has been modified" poison, so wipe them all — thread
-        rollouts in ``sessions/`` survive. Matches ``_CODEX_RUNTIME_GLOBS`` in
-        transport/file_sync.py so the reset covers exactly what is excluded
-        from sync.
-        """
-        if not self._codex_dir:
-            return
-        for path in self._codex_dir.glob("*.sqlite*"):
-            try:
-                path.unlink()
-            except OSError as e:
-                logger.warning("Codex state reset: couldn't delete %s: %s", path.name, e)
 
     async def _warm_mcps(self) -> None:
         """Wait for the session's MCP servers (the ``[mcp_servers.*]`` this

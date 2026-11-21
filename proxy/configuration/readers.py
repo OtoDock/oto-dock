@@ -82,7 +82,8 @@ def _parse_float(key: str, raw: str, default: float, minimum: float | None = Non
 # Keys config.py reads that config.env.example does not document, with the
 # reason (tests/config/test_config_keys.py holds every other _cfg key to the
 # example): generated and persisted by the proxy itself, set by the compose
-# files for the container, or a developer's knob.
+# files for the container, a developer's knob, or set only on an install
+# OtoDock runs itself.
 INTERNAL_CONFIG_KEYS: frozenset[str] = frozenset({
     "OTODOCK_INSTALL_ID",       # generated once and persisted (_persist_secret)
     "PHONE_API_SECRET",         # generated once, shared with the phone daemon
@@ -98,6 +99,13 @@ INTERNAL_CONFIG_KEYS: frozenset[str] = frozenset({
     "SCHEDULER_SYNC_INTERVAL",
     "SCHEDULER_TIMEZONE",       # set by the compose file; the platform setting rules
     "ALLOWED_TOOLS",            # a developer's narrowing of the CLI's tool set
+    "OTODOCK_COMPUTE_LINK_FROM",  # set by the compose file: its compute service's own address
+    "OTODOCK_COMPUTE_LINK_DIR",   # set by the compose file or the bare-metal setup
+    "OTODOCK_PROXY_IMAGE",        # set by the compose file: the image this proxy runs (empty in the build overlay)
+    "OTODOCK_CREDENTIAL_EXIT",  # never released and no longer obeyed: read to say so once at boot
+    "OTODOCK_CLOUD",            # marks an install OtoDock runs itself; a self-hosted install never sets it
+    "OTODOCK_LICENSE_KEY",      # the license seed of an install OtoDock runs itself; elsewhere the dashboard takes the key
+    "OTODOCK_COMPUTE_SESSIONS",  # never released and no longer obeyed: read to say so once at boot
 })
 # Keys read after import, through a function, so _CFG_KEYS_READ misses them.
 LAZY_CONFIG_KEYS: frozenset[str] = frozenset({"CREDENTIAL_ENCRYPTION_KEY"})
@@ -124,6 +132,8 @@ FOREIGN_CONFIG_KEYS: frozenset[str] = frozenset({
     "OTODOCK_DB_ADMIN_PASSWORD", "OTODOCK_DB_APP_PASSWORD", "OTODOCK_DB_INIT_WAIT_S",
     "OTODOCK_ENV_FILE", "OTODOCK_FILETOOLS_COLLABORA_URL", "OTODOCK_FILETOOLS_MEM_LIMIT", "OTODOCK_INTERNAL_SUBNET",
     "OTODOCK_NETWORK_SUBNET", "OTODOCK_PROXY_MEM_LIMIT", "OTODOCK_PROXY_PIDS_LIMIT",
+    "OTODOCK_COMPUTE_ADDRESS", "OTODOCK_COMPUTE_MEM_LIMIT", "OTODOCK_COMPUTE_PIDS_LIMIT",
+    "OTODOCK_COMPUTE_PROXY_ADDRESS", "OTODOCK_COMPUTE_SUBNET",
     "OTODOCK_SOCKETPROXY_SUBNET", "OTODOCK_VERSION", "OTO_PHONE_BIND", "POSTGRES_DB",
     "POSTGRES_IMAGE", "POSTGRES_PASSWORD", "POSTGRES_USER", "PROXY_BIND_IP", "TZ", "WAIT",
     "PYTHON_IMAGE", "NODE_IMAGE",

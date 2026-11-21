@@ -53,7 +53,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -62,18 +61,28 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 import config
 from auth import roles
 from auth.providers import UserContext, acting_role_of, get_current_user, require_auth
-from core import layout
+from core import agent_folder, layout
+from core.session import external_identity
 from core.session.visibility import SCOPE_AGENT, SCOPE_USER
-from services.memory import memory_file, memory_nudge, memory_promote, memory_publish
+from services.infra import safe_fs
+from services.memory import (
+    memory_file,
+    memory_nudge,
+    memory_promote,
+    memory_publish,
+)
 from services.memory.memory_file import MemoryCapError, MemoryOpError, OpResult
 from services.memory.memory_promote import MemoryRoleError
 from storage import database as task_store
 from storage.agents import agent_store, memory_store
+from storage.pg import run_db_fast
 
 logger = logging.getLogger("otodock.memory-api")
 router = APIRouter(prefix="/v1/internal/memory")
 
 _AGENT_GONE = "This agent no longer exists."
+_LINKED_FOLDER = "Error: this memory folder is reached through a link, so nothing was written."
+_FOLDER_AWAY = "Error: the memory folder could not be opened, so nothing was written."
 _NO_SUCH_SETTING = "That memory setting does not exist."
 _NOT_A_PERSON = "Only a person signed in can share a memory topic."
 _NOT_YOUR_TIER = (
@@ -154,15 +163,8 @@ def _scope_enabled(scope: str, settings: dict[str, Any], toggles: dict[str, Any]
     return bool(settings.get(key) and toggles.get(key))
 
 
-def _scope_unavailable(scope: str, *, external: bool, username: str | None) -> str:
+def _scope_unavailable(scope: str, *, username: str | None) -> str:
     """Why a scope the session lacks is not there (the tool's text)."""
-    if external and scope == SCOPE_AGENT:
-        return (
-            "Shared agent memory is not available on external routes "
-            "— caller memories live under /memories/user/."
-        )
-    if external and scope == SCOPE_USER:
-        return "This route keeps no per-caller memory."
     if scope == SCOPE_USER and not username:
         return (
             "user-scope memory is not available in this session "
@@ -171,20 +173,74 @@ def _scope_unavailable(scope: str, *, external: bool, username: str | None) -> s
     return f"The {scope} memory scope is disabled for this agent."
 
 
-def _external_caller_home(agent: str, agent_dir: Path, claim: str) -> Path | None:
-    """The caller tree a session's signed ``ext`` claim points at, or None
-    when the session has no tree (shared mode / withheld without a tree) or
-    the agent's visibility mode offers no personal scope (Shared-only)."""
-    from core.session.external_identity import home_from_claim
-    from core.session.visibility import available_scopes_for
-    row = agent_store.get_agent(agent) or {}
-    if "user" not in available_scopes_for(
-            bool(row.get("collaborative", True)), row.get("default_scope") or "user"):
+def _op_context(
+    agent: str, user_sub: str,
+) -> tuple[str | None, str, dict[str, Any], dict[str, Any]] | None:
+    """Every store read of one memory call, as one job: None for an unknown
+    agent, else the acting username, the role, the settings and the agent's
+    toggles."""
+    if not agent_store.agent_exists(agent):
+        return None
+    username = task_store.get_username_by_sub(user_sub) if user_sub else None
+    role = _resolve_effective_role(user_sub, agent)
+    return (username, role, memory_store.get_settings(),
+            memory_store.get_agent_toggles(agent))
+
+
+async def _session_scopes(u: UserContext, agent: str, agent_dir: Path, username: str | None,
+                          settings: dict[str, Any], toggles: dict[str, Any], *,
+                          wrapup_chat: str, line: bool = False) -> dict[str, Path] | str:
+    """The memory scopes this session has, or the sentence why it has none.
+    The wrap-up after a conversation writes the memory of the one outside
+    person its token names, as its user scope, and no other. The agent's own
+    phone line has none: anyone who dials acts as the agent."""
+    scopes: dict[str, Path] = {}
+    if line:
+        return "The agent's memory is not open on its phone line."
+    if u.subject_id:
+        home = await run_db_fast(_subject_home, agent_dir, u.subject_id, agent)
+        if home is None:
+            return "This person is no longer on record."
+        if _scope_enabled("user", settings, toggles):
+            scopes["user"] = home / layout.CONTEXT / memory_file.MEMORY_DIRNAME
+    elif wrapup_chat:
+        return "No memory is written after this conversation."
+    else:
+        if _scope_enabled("agent", settings, toggles):
+            scopes["agent"] = memory_file.scope_root(agent_dir, "agent")
+        if username and _scope_enabled("user", settings, toggles):
+            scopes["user"] = memory_file.scope_root(agent_dir, "user", username)
+    return scopes or "Memory is disabled for this agent."
+
+
+def _line_of(u: UserContext) -> bool:
+    """Whether a session is the agent's own phone line, from its registered
+    context."""
+    if not u.session_id or u.acting_sub is not None:
+        return False
+    from core.session.session_state import get_session_security
+    return bool(getattr(get_session_security(u.session_id), "open_line", False))
+
+
+def _wrapup_chat_of(u: UserContext) -> str:
+    """The conversation a wrap-up session is for ("" for every other
+    session), from its registered context."""
+    if not u.session_id or u.acting_sub is not None:
+        return ""
+    from core.session.session_state import get_session_security
+    return getattr(get_session_security(u.session_id), "wrapup", "") or ""
+
+
+def _subject_home(agent_dir: Path, identity_id: str, agent: str) -> Path | None:
+    """The tree of the outside person a wrap-up's token names, None when the
+    person is no longer on record or is another agent's."""
+    from storage.identity import external_identity_store
+    row = external_identity_store.get_by_id(identity_id)
+    if row is None or row.get("agent") != agent or not row.get("slug"):
         return None
     try:
-        return home_from_claim(agent_dir, claim)
+        return external_identity.tree_of(agent_dir, row["channel"], row["slug"])
     except ValueError:
-        logger.error("memory: malformed external claim %r on agent %s", claim, agent)
         return None
 
 
@@ -242,8 +298,27 @@ async def memory_op(
     """
     u = require_auth(user)
     _require_mcp_caller(u, x_agent_name or "")
+    # An outside session (a caller who is not a platform user) has no
+    # memory tool and the middleware refuses it this route; behind that
+    # wall, the same answer: the person's memory is read into the prompt
+    # and written after the conversation, never during it.
+    if u.is_external:
+        return _err(
+            "Memory is not written during an outside conversation: what "
+            "matters is recorded for this person after it ends."
+        )
     agent = x_agent_name or ""
-    if not agent_store.agent_exists(agent):
+    # Identity is token-authoritative: a session-JWT caller's acting user comes
+    # from the token, NOT the client X-On-Behalf-Of header — so a no-user /
+    # phone session resolves to agent scope only and can never reach another
+    # user's per-user memory. Only the master key (trusted s2s, e.g. memory
+    # consolidation) may target a specific user via X-On-Behalf-Of.
+    if u.sub == "api-key":
+        user_sub = x_on_behalf_of or ""
+    else:
+        user_sub = u.acting_sub or ""
+    context = await run_db_fast(_op_context, agent, user_sub)
+    if context is None:
         raise HTTPException(404, f"agent not found: {agent}")
     _require_agent_match(u, agent)
 
@@ -257,50 +332,20 @@ async def memory_op(
             f"unknown command: {command!r} (expected one of {sorted(_COMMANDS)})"
         )
 
-    # Identity is token-authoritative: a session-JWT caller's acting user comes
-    # from the token, NOT the client X-On-Behalf-Of header — so a no-user /
-    # phone session resolves to agent scope only and can never reach another
-    # user's per-user memory. Only the master key (trusted s2s, e.g. memory
-    # consolidation) may target a specific user via X-On-Behalf-Of.
-    if u.sub == "api-key":
-        user_sub = x_on_behalf_of or ""
-    else:
-        user_sub = u.acting_sub or ""
-    username: str | None = None
-    if user_sub:
-        username = task_store.get_username_by_sub(user_sub)
-    role = _resolve_effective_role(user_sub, agent)
+    username, role, settings, toggles = context
+    if u.is_session and user_sub:
+        # A session acts at its principal's role, its cap included.
+        role = u.acting_role(agent)
     agent_dir = config.get_agent_dir(agent)
 
     # Scopes available to THIS session (existence is lazy — roots may not
     # exist on disk yet; that's fine for view/create).
-    #
-    # EXTERNAL session (a phone caller who is not a platform user): never
-    # the shared agent scope; the caller's own tree (from the signed token
-    # claim) is the user scope when the agent's mode has one and the route
-    # gave the caller a tree — same toggles as a user's memory.
-    external = u.is_external
-    settings = await asyncio.to_thread(memory_store.get_settings)
-    toggles = await asyncio.to_thread(memory_store.get_agent_toggles, agent)
     caps = memory_file.Caps.from_settings(settings)
-    scopes: dict[str, Path] = {}
-    if _scope_enabled("agent", settings, toggles) and not external:
-        scopes["agent"] = memory_file.scope_root(agent_dir, "agent")
-    if external:
-        role = "external"
-        caller_home = _external_caller_home(agent, agent_dir, u.external_claim)
-        if caller_home is not None and _scope_enabled("user", settings, toggles):
-            scopes["user"] = caller_home / "context" / "memory"
-    elif username and _scope_enabled("user", settings, toggles):
-        scopes["user"] = memory_file.scope_root(agent_dir, "user", username)
-    if not scopes:
-        if external:
-            return _err(
-                "Memory is not available on this line: shared agent memory "
-                "is never available on external routes, and this route keeps "
-                "no per-caller memory."
-            )
-        return _err("Memory is disabled for this agent.")
+    wrapup_chat = _wrapup_chat_of(u)
+    scopes = await _session_scopes(u, agent, agent_dir, username, settings, toggles,
+                                   wrapup_chat=wrapup_chat, line=_line_of(u))
+    if isinstance(scopes, str):
+        return _err(scopes)
 
     # rename carries two paths; both must land in the SAME scope.
     raw_path = body.get("old_path") if command == "rename" else body.get("path")
@@ -324,7 +369,10 @@ async def memory_op(
             return _ok(memory_file.view_root(scopes))
 
         if scope not in scopes:
-            return _err(_scope_unavailable(scope, external=external, username=username))
+            if u.subject_id:
+                return _err("After a conversation the agent writes only this person's "
+                            "memory, under /memories/user/.")
+            return _err(_scope_unavailable(scope, username=username))
 
         # Role gate: writes to agent scope need editor+ (or an agent-scope
         # service session); user scope is always the caller's own.
@@ -379,12 +427,10 @@ async def memory_op(
                 return _err(_NEW_PATH_SHAPE)
             if new_scope != scope:
                 # Across the scopes: a promotion, or nothing. The destination
-                # must be a scope this session has (an external caller or a
-                # session with no user never reaches the promotion).
+                # must be a scope this session has (a session with no user
+                # never reaches the promotion).
                 if new_scope not in scopes:
-                    return _err(_scope_unavailable(
-                        new_scope, external=external, username=username,
-                    ))
+                    return _err(_scope_unavailable(new_scope, username=username))
                 if scope == SCOPE_AGENT:
                     return _err(_DEMOTION)
                 new_rel = memory_file.validate_rel(new_rel, mutating=True)
@@ -411,17 +457,27 @@ async def memory_op(
         return _err(str(e))
     except MemoryOpError as e:
         return _err(str(e))
+    except safe_fs.SafeFsError:
+        return _err(_LINKED_FOLDER)
+    except (FileNotFoundError, NotADirectoryError):
+        # The agent's own folder is not there: nothing is made in its place.
+        return _err(_FOLDER_AWAY)
 
-    if result.changed or result.deleted:
+    if (result.changed or result.deleted) and u.subject_id:
+        # A person's tree is no repository and syncs nowhere: the card under
+        # the conversation names what the wrap-up wrote.
         _log_outcome(agent, scope, command, rel, result=result)
-        if not external:
-            # A caller's tree is not a git repo (no per-user context repo
-            # there) — the memory index + tombstones are its history.
-            writer = username or "agent-session"
-            await asyncio.to_thread(
-                memory_publish.commit, agent_dir, scope, username, result,
-                command, writer,
-            )
+        if wrapup_chat:
+            from storage.chat import conversation_store
+            await run_db_fast(conversation_store.add_wrote, wrapup_chat,
+                              {"kind": "memory", "name": rel})
+    elif result.changed or result.deleted:
+        _log_outcome(agent, scope, command, rel, result=result)
+        writer = username or "agent-session"
+        await asyncio.to_thread(
+            memory_publish.commit, agent_dir, scope, username, result,
+            command, writer,
+        )
         await memory_publish.publish_changes(
             agent, agent_dir, root, result,
             writer_slug=username, exclude_user_sub=user_sub,
@@ -457,7 +513,7 @@ async def promote_endpoint(
     username = await asyncio.to_thread(task_store.get_username_by_sub, sub)
     if not username:
         raise HTTPException(400, "Could not find your account. Sign out, sign in again and retry.")
-    role = await asyncio.to_thread(_resolve_effective_role, sub, agent)
+    role = u.acting_role(agent)  # the principal's role, a session's cap included
     raw_path = body.get("path")
     new_raw = body.get("new_path")
     if not raw_path or not isinstance(raw_path, str):
@@ -568,56 +624,52 @@ async def patch_agent_settings(
 # Danger zone — clear all + per-user self clear
 # ---------------------------------------------------------------------------
 
-def _clear_memory_dir(agent_slug: str, scope: str, username: str | None) -> int:
+def _clear_memory_dir(agent_slug: str, scope: str, username: str | None) -> list[str]:
     """Delete every file in one scope's memory dir (git-committed). Returns
-    the number of files removed. Tombstones are recorded by the caller."""
+    the scope-relative paths it removed: none when the folder is reached
+    through a link, so a refused clear publishes nothing. Tombstones are
+    recorded by the caller."""
     agent_dir = config.get_agent_dir(agent_slug)
     root = memory_file.scope_root(agent_dir, scope, username)
-    if not root.is_dir():
-        return 0
     files = [
-        p for p in root.rglob("*")
-        if p.is_file() and not p.is_symlink() and p.name != memory_file.LOCK_FILENAME
+        f for f in memory_file.files_below(root)
+        if f.rsplit("/", 1)[-1] != memory_file.LOCK_FILENAME
     ]
     if not files:
-        return 0
-    shutil.rmtree(root)
+        return []
+    try:
+        safe_fs.rmtree_beneath(*agent_folder.beneath_agent(root, agent_slug))
+    except OSError:
+        logger.warning("memory clear (%s scope) of %s refused", scope, agent_slug, exc_info=True)
+        return []
     try:
         from services.infra import git_writer
         repo = memory_file.git_repo_root(agent_dir, scope, username)
-        if (repo / ".git").exists():
-            git_writer.commit_paths(
-                repo, [root], f"memory: clear ({scope} scope)",
-            )
+        git_writer.commit_paths(
+            repo, [root], f"memory: clear ({scope} scope)",
+        )
     except (ImportError, OSError, ValueError) as exc:
         logger.debug("Git commit of memory clear (%s scope) failed: %s", scope, exc)
-    return len(files)
+    return files
 
 
 async def _clear_and_tombstone(
     agent_slug: str, scope: str, username: str | None,
 ) -> int:
     """Clear one scope dir + record per-file tombstones / fan out deletes so
-    idle satellites apply the wipe instead of resurrecting it."""
+    idle satellites apply the wipe instead of resurrecting it. Only what the
+    clear removed is published."""
     agent_dir = config.get_agent_dir(agent_slug)
     root = memory_file.scope_root(agent_dir, scope, username)
-    rels: list[str] = []
-    if root.is_dir():
-        rels = [
-            p.relative_to(root).as_posix()
-            for p in root.rglob("*")
-            if p.is_file() and not p.is_symlink()
-            and p.name != memory_file.LOCK_FILENAME
-        ]
-    count = await asyncio.to_thread(
+    removed = await asyncio.to_thread(
         _clear_memory_dir, agent_slug, scope, username,
     )
-    if rels:
-        fake = OpResult(output="", deleted=rels)
+    if removed:
+        fake = OpResult(output="", deleted=removed)
         await memory_publish.publish_changes(
             agent_slug, agent_dir, root, fake, writer_slug=username,
         )
-    return count
+    return len(removed)
 
 
 @router.post("/clear-all")

@@ -59,7 +59,7 @@ function Test-ResolvedCli {
     # After an install/upgrade, verify what the shell NOW resolves for the
     # bare name. The install placed the pinned copy in its own location, but
     # PATH may still resolve another install (e.g. a vendor's standalone
-    # installer) — the upgrade then silently changes nothing for anything
+    # installer) -- the upgrade then silently changes nothing for anything
     # that spawns the bare name. Warn with every resolvable copy.
     param([string]$Label, [string]$Bin, [string]$Want)
     $now = $null
@@ -89,7 +89,7 @@ function Invoke-Native {
     # plain strings, then print only on failure. Without this wrapper, the
     # naive ``... 2>&1 | Out-String | Write-Host`` pattern PowerShell uses
     # everywhere renders each stderr line from native commands (npm, pip,
-    # winget, etc.) as a scary multi-line ``NativeCommandError`` block —
+    # winget, etc.) as a scary multi-line ``NativeCommandError`` block --
     # even when the command's exit code was 0 and the stderr text was a
     # harmless info notice (e.g. pip's "A new release of pip is
     # available"). End-users running install.ps1 see red text and assume
@@ -125,7 +125,7 @@ function Get-RealPythonExe {
     # to the Microsoft Store "App execution alias" stubs (python.exe /
     # python3.exe under %LOCALAPPDATA%\Microsoft\WindowsApps). Those satisfy
     # Get-Command but, when no real Python is installed, print "Python was not
-    # found..." and exit 9009 — they are not a usable interpreter, and a naive
+    # found..." and exit 9009 -- they are not a usable interpreter, and a naive
     # "already present" check on them skips the real winget install (which then
     # breaks pipx and the satellite venv). So actually run `--version`, require
     # exit 0 + a "Python X.Y" (>=3.10) banner, and reject the stub's redirect
@@ -190,12 +190,12 @@ function Install-WingetPackage {
         # bar (downloaded MiB / total MiB - percent - speed - ETA) straight to
         # the screen. The direct `& winget ...` syntax instead pipes stdout
         # through PowerShell's stream machinery, which winget detects as "not
-        # a TTY" and silently downgrades to no-progress output — defeating
+        # a TTY" and silently downgrades to no-progress output -- defeating
         # the cyan header's intent.
         #
         # `-PassThru` returns the Process object so we can read `.ExitCode`
         # (LASTEXITCODE is not reliably set through Start-Process).
-        # `--disable-interactivity` blocks Y/N consent prompts only — it does
+        # `--disable-interactivity` blocks Y/N consent prompts only -- it does
         # NOT suppress progress bars (distinct from `--silent`, which we
         # intentionally don't pass).
         $proc = Start-Process winget `
@@ -257,7 +257,7 @@ if ($env:SKIP_TIER_1 -ne 'true') {
 # live in file-tools-mcp (Docker, on the proxy host); video work lives
 # in video-mcp. Bash-pipeline PDF / SQLite tooling on Windows is left
 # to the user since winget packages for poppler / sqlite are not
-# canonical — agents on Windows route through the MCPs.
+# canonical -- agents on Windows route through the MCPs.
 
 # ---- uv (Astral PowerShell installer) ---------------------------------
 
@@ -352,7 +352,7 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     # pnpm: absent or older than the pin is installed through npm, a newer
     # one is left alone. The version check is a local --version, so the slow
     # `npm install -g` registry round trip runs only when something moves.
-    # PINNED — keep PnpmVersion in sync with VERSIONS.md (PNPM_VERSION).
+    # PINNED -- keep PnpmVersion in sync with VERSIONS.md (PNPM_VERSION).
     # --allow-scripts: pnpm 12's install step puts its native binary at the
     # bin path; npm 12 skips it by default and leaves a shim that needs Node.
     $PnpmVersion = if ($env:PNPM_VERSION) { $env:PNPM_VERSION } else { '12.16.1' }
@@ -371,12 +371,12 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
         }
     }
 
-    # Pinned CLI versions — keep in sync with VERSIONS.md (CLAUDE_CODE_VERSION /
+    # Pinned CLI versions -- keep in sync with VERSIONS.md (CLAUDE_CODE_VERSION /
     # CODEX_VERSION). Mirrors install-baseline-tools.sh: the platform runs a
     # VERIFIED CLI (in-app auto-update disabled), so a mismatched install is
     # UPGRADED to the pin, not skipped.
-    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.312' }
-    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.166.0' }
+    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.325' }
+    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.170.0' }
 
     function Install-PinnedCli {
         # Install OR upgrade an npm-global CLI to the EXACT pinned version.

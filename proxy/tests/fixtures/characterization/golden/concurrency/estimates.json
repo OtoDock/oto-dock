@@ -1,0 +1,14 @@
+{
+ "a subprocess engine's config": 430,
+ "claude": 1000,
+ "codex": 1000,
+ "direct": 200,
+ "direct, eight stdio and two http": 620,
+ "direct, missing": 200,
+ "direct, not JSON": 200,
+ "direct, past HEAVY": 1000,
+ "direct, too large to be one": 200,
+ "direct, two stdio": 230,
+ "no path": 1000,
+ "unknown engine": 1000
+}

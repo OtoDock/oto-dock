@@ -10,7 +10,9 @@ truncation, skip sets) and the slash-command noise filter.
 """
 import base64
 import json
+import os
 import random
+from pathlib import Path
 
 import pytest
 
@@ -62,6 +64,16 @@ class _Captured(list):
 
 
 @pytest.fixture(autouse=True)
+def _agents_root(monkeypatch, tmp_path):
+    # The tailer opens a transcript only beneath an agent's folder, the
+    # agents root read at call time: each test's own folder is that root,
+    # and its files sit in the agent folder ``ag``.
+    import config
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    (tmp_path / "ag").mkdir()
+
+
+@pytest.fixture(autouse=True)
 def _capture(monkeypatch):
     rows = _Captured()
     rows.events = []
@@ -99,7 +111,7 @@ def _capture(monkeypatch):
 
 
 def _write(tmp_path, *lines: str):
-    p = tmp_path / "transcript.jsonl"
+    p = tmp_path / "ag" / "transcript.jsonl"
     p.write_text("".join(lines))
     return str(p)
 
@@ -160,7 +172,7 @@ def test_skips_tool_result_user_messages(tmp_path, _capture):
 
 
 def test_idempotent_append_only_retail(tmp_path, _capture):
-    path = tmp_path / "t.jsonl"
+    path = tmp_path / "ag" / "t.jsonl"
     path.write_text(_user("first"))
     assert T.tail_transcript("s3", "c3", str(path))["persisted"] == 1
     # Re-tail with no new lines → nothing.
@@ -173,7 +185,7 @@ def test_idempotent_append_only_retail(tmp_path, _capture):
 
 
 def test_task_spawn_then_result_drives_registry(tmp_path, _capture):
-    path = tmp_path / "t.jsonl"
+    path = tmp_path / "ag" / "t.jsonl"
     # Turn 1: a Task subagent is spawned (no result yet).
     path.write_text(_assistant([
         {"type": "tool_use", "id": "toolu_task1", "name": "Task",
@@ -343,14 +355,14 @@ def test_resolve_and_tail_discovers_transcript(tmp_path, _capture, monkeypatch):
     # <claude_dir>/projects/<hash>/<session_id>.jsonl via the session's
     # claude_dir, then tail it — the native TUI doesn't reliably fire Stop.
     sid = "sess-xyz"
-    proj = tmp_path / ".claude" / "projects" / "-users-dave"
+    proj = tmp_path / "ag" / ".claude" / "projects" / "-users-dave"
     proj.mkdir(parents=True)
     (proj / f"{sid}.jsonl").write_text(
         _user("from disk") + _assistant([{"type": "text", "text": "echoed"}])
     )
     monkeypatch.setattr(
         "core.session.session_state.get_session_claude_dir",
-        lambda s: str(tmp_path / ".claude") if s == sid else None,
+        lambda s: str(tmp_path / "ag" / ".claude") if s == sid else None,
     )
     assert T.resolve_transcript_path(sid) == str(proj / f"{sid}.jsonl")
     stats = T.resolve_and_tail(sid, "c-disk")
@@ -418,7 +430,7 @@ def test_a_photo_alone_leaves_a_terminal_chat_for_its_next_message(tmp_path, _ca
     # A photo alone typed into a live Claude terminal, as the TUI journals it:
     # no backfill write, no frame; the next real message titles the chat.
     titles, sent = _titles_recorder(monkeypatch)
-    p = tmp_path / "transcript.jsonl"
+    p = tmp_path / "ag" / "transcript.jsonl"
     p.write_text(_user(_PHOTO_LINE))
     assert T.tail_transcript("s-photo", "c-photo", str(p))["title_set"] is False
     assert titles == [] and sent == []
@@ -486,7 +498,7 @@ def test_seek_past_existing_skips_prior_history(tmp_path, _capture, monkeypatch)
     """Toggling interactive ON for a chat with headless turns reuses the same
     transcript file — the attach-time seek must position the cursor past the
     pre-existing history so only lines appended DURING the stint persist."""
-    path = tmp_path / "t.jsonl"
+    path = tmp_path / "ag" / "t.jsonl"
     path.write_text(
         _user("[Current time: Saturday, July 04, 2026 22:02 (10:02 PM)]\n\nDo you receive my message?")
         + _assistant([{"type": "text", "text": "Ναι, σε λαμβάνω κανονικά!"}])
@@ -543,7 +555,7 @@ def test_last_signal_end_turn_and_tool_use(tmp_path, _capture):
     )
     assert T.tail_transcript("sb2", "cb2", path)["last_signal"] == "end_turn"
 
-    path2 = tmp_path / "t2.jsonl"
+    path2 = tmp_path / "ag" / "t2.jsonl"
     path2.write_text(
         _user("go")
         + _assistant_sr([{"type": "tool_use", "id": "tb", "name": "Bash", "input": {}}], "tool_use")
@@ -708,7 +720,7 @@ def test_tool_rows_interleave_in_transcript_order(tmp_path, _capture):
 def test_tool_pairing_across_batches_and_dedupe(tmp_path, _capture):
     # tool_use in one tail batch, its result in the next: exactly one row, at
     # result time. The pending buffer carries the pair across the cursor.
-    path = tmp_path / "t.jsonl"
+    path = tmp_path / "ag" / "t.jsonl"
     path.write_text(_assistant([
         {"type": "tool_use", "id": "t_slow", "name": "Bash",
          "input": {"command": "sleep 99", "description": "wait a bit"}}]))
@@ -1353,7 +1365,7 @@ def test_send_persisted_prompt_is_skipped_once(tmp_path, _capture):
     assert stats["last_signal"] == "end_turn"
 
     # The note is one-shot: the same text typed again later persists normally.
-    p2 = tmp_path / "t2.jsonl"
+    p2 = tmp_path / "ag" / "t2.jsonl"
     p2.write_text(_user(prompt))
     T._offsets.pop("s-note2", None)
     assert T.tail_transcript("s-note2", "c-note", str(p2))["persisted"] == 1
@@ -1419,33 +1431,127 @@ def test_no_compaction_flag_on_plain_batches(tmp_path, _capture):
 # ---------------------------------------------------------------------------
 
 
-def test_api_error_row_triggers_limit_hook(tmp_path, _capture, monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        "services.engines.subscription_pool.throttle_from_cli_error",
-        lambda sid, text: calls.append((sid, text)))
+_LIMIT_ROW = Path(__file__).resolve().parents[1] / "fixtures" / "limits" / "claude-usage-limit-row.jsonl"
+
+
+def test_the_real_usage_limit_row_ends_the_turn_with_its_limit(_capture, monkeypatch):
+    """Claude Code's own row at a usage limit (2026-11-13 03:37 UTC, the folder cut) and the
+    ``turn_duration`` row after it: the batch ends the turn with the typed limit, its reset and type from the
+    row's ``rate_limit_info`` (a type that names no family: no window), no completion, no overload nudge, and
+    this type opens no limit menu. The row still lands in the chat: the person sees the engine's words."""
+    nudged = []
+    monkeypatch.setattr("services.engines.subscription_pool.nudge_from_cli_error",
+                        lambda sid, text: nudged.append(text))
+    r = T.tail_lines("s-lim", "c-lim", _LIMIT_ROW.read_text().splitlines())
+    assert r["ending"] == {"reason": "limit", "resets_at": "2026-11-18T06:00:00+00:00", "window": "",
+                           "detail": "You're out of usage credits. Run /usage-credits to keep using Fable 5.2 or "
+                                     "/model to switch models."}
+    assert r["last_signal"] == "end_turn" and r["turn_complete"] is False and r["limit_menu"] is False
+    assert nudged == []
+    assert ("assistant", r["ending"]["detail"]) in list(_capture)
+
+
+@pytest.mark.parametrize("version, opens", [
+    ("2.1.322", False), ("2.1.323", True), ("2.1.325", True), ("2.2.0", True), ("", True), ("next", True),
+])
+def test_the_limit_menu_at_fables_weekly_limit_follows_the_rows_cli_version(_capture, version, opens):
+    """Claude Code 2.1.322 opens no limit menu at Fable's weekly limit (``seven_day_overage_included``); from 2.1.323
+    it does. Each row carries its CLI's version, so the same capture read as a later version says the menu opened.
+    A version that cannot be read counts as new: an Escape too many before the continuation is harmless, a line
+    typed into an open menu is not."""
+    row, dur = [json.loads(line) for line in _LIMIT_ROW.read_text().splitlines()]
+    row["version"] = version
+    r = T.tail_lines(f"s-menu-{version}", "c-menu", [json.dumps(row), json.dumps(dur)])
+    assert r["limit_menu"] is opens
+
+
+@pytest.mark.parametrize("version, opens", [("2.1.322", False), ("2.1.325", True)])
+def test_the_limit_menu_at_a_credits_limit_follows_the_rows_cli_version(_capture, version, opens):
+    """Claude Code 2.1.322 opened no menu either when the vendor said credits are required
+    (``errorCode: "credits_required"``, which a row carries when the vendor's answer names it); 2.1.325 opens it
+    for that code with no type or ``overage``. Read in the two bundles, never run."""
+    row, dur = [json.loads(line) for line in _LIMIT_ROW.read_text().splitlines()]
+    row["version"] = version
+    info = row["apiErrorParams"]["rate_limit_info"]
+    info.pop("rateLimitType", None)
+    info.update(errorCode="credits_required", status="rejected", resetsAt=1794981600, isUsingOverage=False)
+    r = T.tail_lines(f"s-credits-{version}", "c-credits", [json.dumps(row), json.dumps(dur)])
+    assert r["limit_menu"] is opens
+
+
+def test_a_transient_rate_limit_row_is_no_limit_of_the_account(tmp_path, _capture):
+    """Claude Code marks a row it wrote for the vendor's brief throttle ``apiErrorIsTransient`` ("Server is
+    temporarily limiting requests (not your usage limit)"), also with ``error: "rate_limit"``: the turn ends
+    with an error, and the account is neither rested nor moved."""
+    path = _write(tmp_path, _line({
+        "type": "assistant", "uuid": "err-t", "isApiErrorMessage": True, "error": "rate_limit",
+        "apiErrorIsTransient": True,
+        "message": {"role": "assistant", "content": [{"type": "text", "text":
+                    "API Error: Server is temporarily limiting requests (not your usage limit)"}]},
+    }))
+    r = T.tail_transcript("s-transient", "c-transient", path)
+    assert r["ending"]["reason"] == "error"
+
+
+def test_a_terminal_row_refused_for_its_sign_in_ends_as_a_refused_sign_in(tmp_path, _capture):
+    """The terminal's twin of the stream's: the row's ``error`` names it."""
+    path = _write(tmp_path, _line({
+        "type": "assistant", "uuid": "err-a", "isApiErrorMessage": True, "error": "authentication_failed",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "Please run /login · API Error: 401"}]},
+    }))
+    r = T.tail_transcript("s-auth", "c-auth", path)
+    assert r["ending"]["reason"] == "error" and r["ending"]["sign_in"] is True
+
+
+def test_an_api_error_that_is_no_limit_ends_the_turn_with_an_error_and_nudges(tmp_path, _capture, monkeypatch):
+    nudged = []
+    monkeypatch.setattr("services.engines.subscription_pool.nudge_from_cli_error",
+                        lambda sid, text: nudged.append(text))
     path = _write(tmp_path, _line({
         "type": "assistant", "uuid": "err1", "isApiErrorMessage": True,
-        "message": {"role": "assistant", "content": [
-            {"type": "text", "text": "API Error: 429 rate limit exceeded"}]},
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "API Error: 529 Overloaded"}]},
     }))
-    T.tail_transcript("s-lim", "c-lim", path)
-    assert calls == [("s-lim", "API Error: 429 rate limit exceeded")]
-    # The error row still lands in chat history — the user must see it.
-    assert ("assistant", "API Error: 429 rate limit exceeded") in list(_capture)
+    r = T.tail_transcript("s-err", "c-err", path)
+    assert r["ending"] == {"reason": "error", "resets_at": "", "window": "", "detail": "API Error: 529 Overloaded"}
+    assert r["last_signal"] == "end_turn" and nudged == ["API Error: 529 Overloaded"]
 
 
-def test_prose_mentioning_limits_never_triggers_hook(tmp_path, _capture, monkeypatch):
+def test_a_menu_opening_limit_row_says_so(tmp_path, _capture):
+    """A rejected five-hour limit with a reset, not on overage: the terminal opens its own limit menu."""
+    path = _write(tmp_path, _line({
+        "type": "assistant", "uuid": "err2", "isApiErrorMessage": True, "error": "rate_limit",
+        "apiErrorParams": {"rate_limit_info": {"status": "rejected", "resetsAt": 1794981600,
+                                               "rateLimitType": "five_hour", "isUsingOverage": False}},
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "You've hit your session limit"}]},
+    }))
+    r = T.tail_transcript("s-menu", "c-menu", path)
+    assert r["ending"]["window"] == "five_hour" and r["limit_menu"] is True
+
+
+def test_a_clean_turn_after_a_limit_in_the_same_batch_folds_clean(tmp_path, _capture):
+    """One batch holds a limit's row and then a new turn that ends clean (a machine's forwarded lines, the
+    sweep): the last turn's end decides, so the batch carries no ending and no menu, and the turn completes."""
+    path = _write(tmp_path, _line({
+        "type": "assistant", "uuid": "err3", "isApiErrorMessage": True, "error": "rate_limit",
+        "apiErrorParams": {"rate_limit_info": {"status": "rejected", "resetsAt": 1794981600,
+                                               "rateLimitType": "five_hour", "isUsingOverage": False}},
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "You've hit your session limit"}]},
+    }), _user("try again"), _assistant_sr([{"type": "text", "text": "Done now."}], "end_turn"))
+    r = T.tail_transcript("s-two", "c-two", path)
+    assert "ending" not in r and "limit_menu" not in r
+    assert r["last_signal"] == "end_turn" and r["turn_complete"] is True
+
+
+def test_prose_mentioning_limits_never_ends_a_turn(tmp_path, _capture, monkeypatch):
     # Model PROSE discussing rate limits (a dev agent does this daily) must
-    # not rest the account — only CLI-marked error rows classify.
-    calls = []
-    monkeypatch.setattr(
-        "services.engines.subscription_pool.throttle_from_cli_error",
-        lambda sid, text: calls.append((sid, text)))
+    # not end the turn nor rest the account: only CLI-marked error rows classify.
+    nudged = []
+    monkeypatch.setattr("services.engines.subscription_pool.nudge_from_cli_error",
+                        lambda sid, text: nudged.append(text))
     path = _write(tmp_path, _assistant(
-        [{"type": "text", "text": "the 429 rate limit handling code looks fine"}]))
-    T.tail_transcript("s-prose", "c-prose", path)
-    assert calls == []
+        [{"type": "text", "text": "You've hit your usage limit: the 429 rate limit handling code looks fine"}]))
+    r = T.tail_transcript("s-prose", "c-prose", path)
+    assert "ending" not in r and nudged == []
 
 
 def test_redelivered_assistant_text_persists_once(tmp_path, _capture):
@@ -1573,7 +1679,7 @@ def test_two_queued_platform_prompts_give_two_cards_and_no_plain_row(tmp_path, _
     assert T.tail_transcript("s-two", "c-two", path)["persisted"] == 2
     assert _capture == [("assistant", "one"), ("assistant", "two")]
     # Both notes went with their lines: a third identical line is a person's.
-    p2 = tmp_path / "t3.jsonl"
+    p2 = tmp_path / "ag" / "t3.jsonl"
     p2.write_text(_user("first wake"))
     assert T.tail_transcript("s-two2", "c-two", str(p2))["persisted"] == 1
     assert ("user", "first wake") in _capture
@@ -1838,3 +1944,206 @@ def test_a_line_rewritten_with_its_stop_reason_keeps_its_first_row(_capture):
     T.tail_lines("s-rw", "c-rw", [first])
     T.tail_lines("s-rw", "c-rw", [again])
     assert _capture == [("assistant", "Checking.")] and _capture.data == [""]
+
+
+# ---------------------------------------------------------------------------
+# A model a person picks inside the terminal (``model_chosen``)
+# ---------------------------------------------------------------------------
+
+_MODEL_RECORD = ("<command-name>/model</command-name>\n"
+                 "            <command-message>model</command-message>\n"
+                 "            <command-args>claude-opus-5-5</command-args>")
+
+
+def _answer(mid: str, model: str) -> str:
+    return _assistant_usage(mid, {"type": "text", "text": "ok " + mid}, model=model, usage={})
+
+
+def test_the_first_answer_of_the_turn_after_a_model_command_names_the_pick(_capture):
+    T.forget("mp1")
+    got = T.tail_lines("mp1", "cmp1", [
+        _answer("m0", "claude-fable-5-2"),
+        _user(_MODEL_RECORD),
+        _user("<local-command-stdout>Set model to Opus 5.5</local-command-stdout>"),
+        _user("next question"),
+        _answer("m1", "claude-opus-5-5"),
+        _answer("m2", "claude-sonnet-5-5"),
+    ])
+    assert got["model_chosen"] == "claude-opus-5-5"
+
+
+def test_an_answer_on_another_model_with_no_command_is_no_pick(_capture):
+    """Claude Code's own fallback (Fable to Opus on a refusal) writes no
+    command record: the row keeps the model the person chose."""
+    T.forget("mp2")
+    got = T.tail_lines("mp2", "cmp2", [
+        _user("a question"), _answer("m1", "claude-fable-5-2"),
+        _user("another"), _answer("m2", "claude-opus-5-5"),
+    ])
+    assert "model_chosen" not in got
+
+
+def test_an_answer_in_flight_when_the_command_lands_is_no_pick(_capture):
+    T.forget("mp3")
+    first = T.tail_lines("mp3", "cmp3", [_user("long job"), _user(_MODEL_RECORD),
+                                         _answer("m1", "claude-fable-5-2")])
+    assert "model_chosen" not in first
+    second = T.tail_lines("mp3", "cmp3", [_user("now on the new one"), _answer("m2", "claude-opus-5-5")])
+    assert second["model_chosen"] == "claude-opus-5-5"
+
+
+def test_the_pick_outlives_a_batch_skips_a_synthetic_line_and_forget_drops_it(_capture):
+    T.forget("mp4")
+    assert "model_chosen" not in T.tail_lines("mp4", "cmp4", [_user(_MODEL_RECORD)])
+    synthetic = T.tail_lines("mp4", "cmp4", [_user("go"), _answer("m1", "<synthetic>")])
+    assert "model_chosen" not in synthetic
+    assert T.tail_lines("mp4", "cmp4", [_answer("m2", "claude-sonnet-5-5")])["model_chosen"] == "claude-sonnet-5-5"
+    # Consumed: the next turn names nothing.
+    assert "model_chosen" not in T.tail_lines("mp4", "cmp4", [_user("again"), _answer("m3", "claude-haiku-5-5")])
+    T.tail_lines("mp4", "cmp4", [_user(_MODEL_RECORD), _user("go")])
+    T.forget("mp4")
+    assert "model_chosen" not in T.tail_lines("mp4", "cmp4", [_answer("m4", "claude-opus-5-5")])
+
+
+# ---------------------------------------------------------------------------
+# The transcript is found and read beneath an agent's real folder only
+# ---------------------------------------------------------------------------
+
+_SID = "sess-beneath"
+
+
+def _store(tmp_path, monkeypatch):
+    """A session's engine folder under the agents root, mapped to ``_SID``,
+    and a folder beside the agent holding a stand-in transcript."""
+    store = tmp_path / "ag" / "users" / "u" / ".claude"
+    store.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "p").mkdir(parents=True)
+    (elsewhere / "p" / f"{_SID}.jsonl").write_text(_user("not this session's"))
+    monkeypatch.setattr("core.session.session_state.get_session_claude_dir",
+                        lambda s: str(store) if s == _SID else None)
+    return store, elsewhere
+
+
+def test_a_linked_projects_folder_is_not_searched(tmp_path, _capture, monkeypatch):
+    store, elsewhere = _store(tmp_path, monkeypatch)
+    (store / "projects").symlink_to(elsewhere)
+    assert T.resolve_transcript_path(_SID) is None
+    assert T.resolve_and_tail(_SID, "c")["persisted"] == 0
+    assert _capture == []
+
+
+def test_a_linked_project_folder_is_not_searched(tmp_path, _capture, monkeypatch):
+    store, elsewhere = _store(tmp_path, monkeypatch)
+    (store / "projects" / "real").mkdir(parents=True)
+    (store / "projects" / "p").symlink_to(elsewhere / "p")
+    assert T.transcript_files(str(store), _SID) == []
+    assert T.resolve_and_tail(_SID, "c")["persisted"] == 0
+    assert _capture == []
+
+
+def test_a_projects_folder_past_its_cap_is_not_taken_for_none(tmp_path, _capture, monkeypatch):
+    from services.infra import safe_fs
+    store, _ = _store(tmp_path, monkeypatch)
+    for i in range(4):
+        (store / "projects" / f"p{i}").mkdir(parents=True)
+    monkeypatch.setattr(T, "_PROJECTS_MAX_ENTRIES", 3)
+    with pytest.raises(safe_fs.TooManyEntries):
+        T.transcript_files(str(store), _SID)
+    assert T.resolve_transcript_path(_SID) is None
+    monkeypatch.setattr(T, "_PROJECTS_MAX_ENTRIES", 4)
+    assert T.transcript_files(str(store), _SID) == []
+
+
+def test_a_link_at_the_transcript_name_is_neither_found_nor_read(tmp_path, _capture, monkeypatch):
+    store, elsewhere = _store(tmp_path, monkeypatch)
+    (store / "projects" / "p").mkdir(parents=True)
+    link = store / "projects" / "p" / f"{_SID}.jsonl"
+    link.symlink_to(elsewhere / "p" / f"{_SID}.jsonl")
+    assert T.resolve_transcript_path(_SID) is None
+    assert T.tail_transcript(_SID, "c", str(link)) == {"persisted": 0, "reason": "no_file"}
+    assert T.seek_past_existing(_SID, "c") == 0
+    assert _capture == []
+
+
+def test_a_pipe_at_the_transcript_name_is_refused_at_once(tmp_path, _capture, monkeypatch):
+    import threading
+    store, _ = _store(tmp_path, monkeypatch)
+    (store / "projects" / "p").mkdir(parents=True)
+    pipe = store / "projects" / "p" / f"{_SID}.jsonl"
+    os.mkfifo(pipe)
+    out: list = []
+    th = threading.Thread(target=lambda: out.append(
+        (T.resolve_transcript_path(_SID), T.tail_transcript(_SID, "c", str(pipe)))), daemon=True)
+    th.start()
+    th.join(5)
+    assert out == [(None, {"persisted": 0, "reason": "no_file"})]
+
+
+def test_a_transcript_outside_the_agents_root_is_not_read(tmp_path, _capture, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    path = _write(tmp_path, _user("outside the tree"))
+    assert T.tail_transcript("s-out", "c", path) == {"persisted": 0, "reason": "no_file"}
+    assert _capture == []
+
+
+def test_the_honest_transcript_of_a_store_is_found_and_tailed(tmp_path, _capture, monkeypatch):
+    store, _ = _store(tmp_path, monkeypatch)
+    (store / "projects" / "-users-u").mkdir(parents=True)
+    path = store / "projects" / "-users-u" / f"{_SID}.jsonl"
+    path.write_text(_user("hello") + _assistant([{"type": "text", "text": "hi"}]))
+    assert T.resolve_transcript_path(_SID) == str(path)
+    assert T.resolve_and_tail(_SID, "c")["persisted"] == 2
+    assert _capture == [("user", "hello"), ("assistant", "hi")]
+
+
+def test_a_torn_last_record_waits_for_its_newline(tmp_path, _capture):
+    path = tmp_path / "ag" / "t.jsonl"
+    whole = _user("written in two parts")
+    path.write_text(whole[:20])
+    assert T.tail_transcript("s-torn", "c", str(path))["persisted"] == 0
+    path.write_text(whole)
+    assert T.tail_transcript("s-torn", "c", str(path))["persisted"] == 1
+    assert _capture == [("user", "written in two parts")]
+
+
+def test_a_record_over_the_cap_is_read_past_and_counted(tmp_path, _capture, monkeypatch):
+    monkeypatch.setattr(T, "_RECORD_MAX_BYTES", 200)
+    monkeypatch.setattr(T, "_SKIP_CHUNK", 16)
+    path = _write(tmp_path, _user("x" * 400), _user("short"), _user("y" * 300))
+    with open(path, "a") as fh:
+        fh.write("z" * 500)   # an over-long record still being written
+    out = T.tail_transcript("s-cap", "c", path)
+    assert out["persisted"] == 1 and out["to_line"] == 3
+    assert _capture == [("user", "short")]
+    monkeypatch.setattr(T, "resolve_transcript_path", lambda sid: path)
+    assert T.seek_past_existing("s-cap2", "c") == 3
+
+
+def test_an_agent_whose_folder_is_a_link_is_found_and_tailed(tmp_path, _capture, monkeypatch):
+    """The operator may move an agent's folder and leave a link in its place:
+    the transcript is found and read beneath the real folder, by either
+    name of the engine folder, and a link below it is still not followed."""
+    import config
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    real = tmp_path / "disk2" / "moved"
+    (real / "users" / "u" / ".claude" / "projects" / "p").mkdir(parents=True)
+    (agents / "moved").symlink_to(real)
+    (real / "users" / "u" / ".claude" / "projects" / "p" / f"{_SID}.jsonl").write_text(
+        _user("hello") + _assistant([{"type": "text", "text": "hi"}]))
+    for store in (agents / "moved" / "users" / "u" / ".claude", real / "users" / "u" / ".claude"):
+        assert T.transcript_files(str(store), _SID) == [str(store / "projects" / "p" / f"{_SID}.jsonl")]
+    store = agents / "moved" / "users" / "u" / ".claude"
+    monkeypatch.setattr("core.session.session_state.get_session_claude_dir",
+                        lambda s: str(store) if s == _SID else None)
+    assert T.resolve_and_tail(_SID, "c")["persisted"] == 2
+    assert _capture == [("user", "hello"), ("assistant", "hi")]
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "p").mkdir(parents=True)
+    (elsewhere / "p" / "other.jsonl").write_text(_user("not this agent's"))
+    (real / "users" / "u" / ".claude" / "projects" / "q").symlink_to(elsewhere / "p")
+    assert T.transcript_files(str(store), "other") == []

@@ -26,21 +26,28 @@ services:
         - PYTHON_IMAGE
         - NODE_IMAGE
         - OTODOCK_VERSION
+    environment:
+      # A build of this tree is not the published image of its version: a
+      # compute machine on another server then runs the image
+      # OTODOCK_REMOTE_COMPUTE_IMAGE names.
+      OTODOCK_PROXY_IMAGE: ""
 
-  # Reuses the proxy image. The base file gives this one-shot no build
-  # config, so without this block Compose tries to PULL the GHCR proxy tag
-  # for it — which fails on a machine that has never had the image (fresh
-  # source install). Declaring the same build resolves it to the image the
-  # proxy service just built (pure cache hit, built once).
+  # Runs on the image the proxy service just built. Never pulled: without
+  # this, Compose first tries the GHCR proxy tag for it, which a fresh source
+  # install may not find and should never take. No build of its own: a second
+  # build of the same image is cached but still exported and unpacked again,
+  # the whole image on a first build. Compose builds before it creates any
+  # container, so the image is there by the time this one-shot runs.
   otodock-agents-init:
-    pull_policy: build
-    build:
-      context: .
-      dockerfile: proxy/Dockerfile
-      args:
-        - PYTHON_IMAGE
-        - NODE_IMAGE
-        - OTODOCK_VERSION
+    pull_policy: never
+
+  # The tools' hand-over to the compute service: the same image, never pulled.
+  otodock-tools-copy:
+    pull_policy: never
+
+  # The compute service runs the same image, never pulled either.
+  otodock-compute:
+    pull_policy: never
 
   file-tools:
     pull_policy: build

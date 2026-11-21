@@ -34,6 +34,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from services.infra import archive_read
 from services.mcp import mcp_manifest_types as _mt
 
 logger = logging.getLogger("otodock.community-catalog")
@@ -71,6 +72,14 @@ README_CACHE_TTL_SECONDS = 300
 # rarely > 10KB). A 10s timeout is generous; anything slower means GitHub
 # itself is degraded and we should fall back to the stale cached entry.
 HTTP_TIMEOUT_SECONDS = 10.0
+
+# A catalog's repository archive (``get_archive``) and what its unpack may
+# hold (``archive_read``): a catalog is a few MB of a few hundred files, so
+# the caps leave it room and stop an archive built to exhaust memory.
+CATALOG_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
+CATALOG_UNPACKED_MAX_BYTES = 128 * 1024 * 1024
+CATALOG_MAX_MEMBERS = 10_000
+CATALOG_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 
 
 def platform_version_ok(required: str | None) -> bool:
@@ -165,6 +174,23 @@ def load_refusal(what: str, url: str, exc: BaseException) -> str:
     if isinstance(exc, ValueError):
         return f"The {what} could not be read. Try again in a minute."
     return f"Could not load the {what}. Try again in a minute."
+
+
+async def get_archive(client: httpx.AsyncClient, url: str, **kwargs: Any) -> bytes:
+    """A catalog's repository archive at ``url``, streamed through
+    ``client`` (``kwargs`` go to the request). An error status raises
+    ``httpx.HTTPStatusError``. A body past ``CATALOG_ARCHIVE_MAX_BYTES``
+    raises ``archive_read.ArchiveTooLarge`` (a ``ValueError``) as soon as it
+    passes, never read whole."""
+    body = bytearray()
+    async with client.stream("GET", url, **kwargs) as resp:
+        resp.raise_for_status()
+        async for chunk in resp.aiter_bytes():
+            body += chunk
+            if len(body) > CATALOG_ARCHIVE_MAX_BYTES:
+                raise archive_read.ArchiveTooLarge(
+                    f"The catalog's download is larger than {CATALOG_ARCHIVE_MAX_BYTES // (1024 * 1024)} MB.")
+    return bytes(body)
 
 
 async def _http_get_json(url: str, etag: str | None) -> tuple[Any | None, str | None, int]:
@@ -387,7 +413,7 @@ def normalized_manifest_hash(manifest: dict) -> str:
 
     node/python community MCPs are unpinned in the catalog; on install the proxy
     pins ``version`` + ``server.source`` into the LOCAL manifest (the ONLY two
-    fields it mutates — see ``mcp_updater.pin_local_manifest``). Dropping exactly
+    fields it mutates — see ``mcp_pin.pin_manifest``). Dropping exactly
     those two makes a freshly-installed manifest hash-equal to its catalog source,
     so any OTHER catalog edit (args, oauth, skills, version_constraint, …) shows up
     as a changed hash → a detectable "integration update".

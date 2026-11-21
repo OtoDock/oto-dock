@@ -1,0 +1,71 @@
+{
+ "_boot_arm": {
+  "order": [
+   "_boot_process",
+   "_boot_database",
+   "_boot_registrations",
+   "_boot_mcps",
+   "_boot_subscriptions",
+   "_boot_services",
+   {
+    "args": [
+     "app",
+     "executor"
+    ],
+    "step": "_boot_arm"
+   }
+  ],
+  "raised": "_boot_arm failed"
+ },
+ "_boot_database": {
+  "order": [
+   "_boot_process",
+   "_boot_database"
+  ],
+  "raised": "_boot_database failed"
+ },
+ "_boot_mcps": {
+  "order": [
+   "_boot_process",
+   "_boot_database",
+   "_boot_registrations",
+   "_boot_mcps"
+  ],
+  "raised": "_boot_mcps failed"
+ },
+ "_boot_process": {
+  "order": [
+   "_boot_process"
+  ],
+  "raised": "_boot_process failed"
+ },
+ "_boot_registrations": {
+  "order": [
+   "_boot_process",
+   "_boot_database",
+   "_boot_registrations"
+  ],
+  "raised": "_boot_registrations failed"
+ },
+ "_boot_services": {
+  "order": [
+   "_boot_process",
+   "_boot_database",
+   "_boot_registrations",
+   "_boot_mcps",
+   "_boot_subscriptions",
+   "_boot_services"
+  ],
+  "raised": "_boot_services failed"
+ },
+ "_boot_subscriptions": {
+  "order": [
+   "_boot_process",
+   "_boot_database",
+   "_boot_registrations",
+   "_boot_mcps",
+   "_boot_subscriptions"
+  ],
+  "raised": "_boot_subscriptions failed"
+ }
+}

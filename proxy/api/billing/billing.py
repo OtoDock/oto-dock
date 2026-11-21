@@ -16,6 +16,7 @@ import logging
 from fastapi import APIRouter, Depends
 
 from auth.providers import UserContext, get_current_user, require_auth, require_user
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock.billing")
 # No route here takes an anonymous caller (auth.providers.require_user).
@@ -48,7 +49,7 @@ async def get_user_credits(user: UserContext = Depends(get_current_user)):
 
     # Only fetch a balance when this install is actually connected to an OtoDock
     # account (token present); otherwise there's no account to bill → zero stub.
-    if relay_client.is_available() and relay_client.is_connected():
+    if await run_db(lambda: relay_client.is_available() and relay_client.is_connected()):
         try:
             return await relay_client.relay_credits(user.sub)
         except Exception:  # noqa: BLE001  # the relay balance read falls back to unknown, the page must not fail

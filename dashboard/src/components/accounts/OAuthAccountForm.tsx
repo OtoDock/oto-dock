@@ -404,11 +404,15 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
     const label = account.display_email || account.account_label
     const target = `${label} from ${integration.display_name}`
     // The person's own repositories and Read only per agent live on the
-    // account's choices, which go with it.
+    // account's choices, which go with it. An agent may use several
+    // accounts: one left with another keeps it (the server promotes it to
+    // the default when this one was), one left with none takes the
+    // person's default account.
     const narrowed = (account.agent_reaches ?? []).some((r) => r.repositories.length > 0 || r.read_only)
     if (!(await dialogs.confirm({
       title: `Disconnect ${target}?`,
-      body: 'Agents bound to this account fall back to the default account.' +
+      body: 'An agent that also has another of your accounts keeps working on that one. ' +
+        'An agent that had only this account goes back to your default account.' +
         (narrowed ? ' The repositories and Read only you chose for them with it are cleared.' : ''),
       confirmLabel: 'Disconnect',
       tone: 'danger',

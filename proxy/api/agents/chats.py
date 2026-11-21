@@ -23,11 +23,11 @@ from auth.providers import (
     get_current_user,
     require_agent_access,
     require_auth,
+    require_human,
     require_user,
 )
 from core import layout, placement
 from core.events import chat_writer
-from core.execution_layer import ASK_MODE, AUTO_REVIEW_MODE, entry_mode
 from core.session import session_kind, visibility as _vis
 from core.session.visibility import (
     _run_for_chat,
@@ -36,6 +36,7 @@ from core.session.visibility import (
     is_task_chat_owner,
 )
 from storage import database as task_store
+from storage.chat import chat_pins
 from storage.pg import run_db
 from ws import chat_phase
 
@@ -142,12 +143,33 @@ def _task_scope_sub(u: UserContext) -> str | None:
     return None if u.is_service else (u.acting_sub or "")
 
 
+def _pin_owner(u: UserContext) -> str:
+    """Whose pins a request reads: a dashboard sign-in's own, the principal
+    ``require_human`` lets through. An API key and a session have none, so
+    their pinned view is empty and their rows carry no pin."""
+    return "" if u.is_api_key or u.api_key_id else u.sub
+
+
+def _pinned_view(u: UserContext, agent: str | None, kind: str, pinned: bool) -> str | None:
+    """The pin owner the pinned view filters by, None for the plain list.
+    The view is the chat history's, of one agent."""
+    if not pinned:
+        return None
+    if kind == "tasks":
+        raise HTTPException(status_code=400, detail="Task runs cannot be pinned.")
+    if not agent:
+        raise HTTPException(status_code=400, detail="agent parameter required")
+    return _pin_owner(u)
+
+
 def _list_chats_sync(u: UserContext, agent: str | None, kind: str,
-                     limit: int, before: tuple[str, str] | None = None) -> list[dict]:
+                     limit: int, before: tuple[str, str] | None = None,
+                     pinned: bool = False) -> list[dict]:
     """The listing as ONE executor job: the access checks, the store reads
     and the flag stamping together, so the 30 s poll of every open
     dashboard costs the loop a hand-off and a JSON render, nothing more.
     A refusal raised here is answered exactly as before."""
+    pinned_by = _pinned_view(u, agent, kind, pinned)
     # kind=tasks → the sidebar's task mode: the agent's task-run chats joined
     # with their latest run, gated by the run rules (see _task_scope_sub).
     if kind == "tasks":
@@ -169,17 +191,17 @@ def _list_chats_sync(u: UserContext, agent: str | None, kind: str,
         # The pool's delegated workers are the agent's own work.
         hide = not u.sees_agent_automations(cast("str", agent))
     chats = task_store.list_chats(owner, agent=agent, limit=limit, hide_agent_runs=hide,
-                                  before=before)
+                                  before=before, pinned_by=pinned_by)
     _stamp_mutation_flags(u, chats)
     return chats
 
 
 def _list_page_sync(u: UserContext, agent: str | None, kind: str, limit: int,
-                    before: tuple[str, str] | None) -> bytes:
+                    before: tuple[str, str] | None, pinned: bool = False) -> bytes:
     """One page of the listing and whether older rows remain: the store is
     asked one row more than the page (the messages page's idiom), and the
     extra row is dropped before the flags are stamped on the rest."""
-    rows = _list_chats_sync(u, agent, kind, limit + 1, before)
+    rows = _list_chats_sync(u, agent, kind, limit + 1, before, pinned)
     has_more = len(rows) > limit
     return json_body({"chats": rows[:limit], "has_more": has_more})
 
@@ -198,18 +220,20 @@ async def list_chats(
     limit: int = Query(50, ge=1, le=200),
     before_updated_at: Annotated[str | None, Query(pattern=_CURSOR_AT)] = None,
     before_chat_id: Annotated[str | None, Query(pattern=_CURSOR_ID)] = None,
+    pinned: Annotated[bool, Query()] = False,
     user: UserContext | None = Depends(get_current_user),
 ):
     """The sidebar's lists, newest first, a page at a time: the first page
     without a cursor, then the rows after ``before_updated_at`` and
     ``before_chat_id`` (the last row shown). ``has_more`` says whether older
-    rows remain."""
+    rows remain. ``pinned`` is the chat history's pinned view: the same
+    list, only the person's pinned chats."""
     u = require_auth(user)
     if (before_updated_at is None) != (before_chat_id is None):
         raise HTTPException(status_code=400,
                             detail="Send before_updated_at and before_chat_id together.")
     before = (before_updated_at, before_chat_id) if before_updated_at and before_chat_id else None
-    return json_response(await run_db(_list_page_sync, u, agent, kind, limit, before))
+    return json_response(await run_db(_list_page_sync, u, agent, kind, limit, before, pinned))
 
 
 def _chats_body(rows_of, *args) -> bytes:
@@ -228,11 +252,18 @@ def _stamp_mutation_flags(u: UserContext, rows: list[dict]) -> None:
     (uuid delegate-worker chats live in plain lists). ``can_delete`` judges
     the RUN (delete removes the chat's history entry), and ``can_rename``
     equals it on every row: a task row's rename edits its run's chat too
-    (``PATCH /v1/chats``), never the task definition."""
+    (``PATCH /v1/chats``), never the task definition.
+
+    ``can_pin`` and ``pinned`` (a person's pinned chats): the row is a chat
+    of this person's history they may open, the gate of ``PUT .../pinned``
+    on the run already resolved, and it is among their pins (one read per
+    page). A task row carries neither."""
     if not rows:
         return
     need_lookup = [r.get("id", "") for r in rows if "run_id" not in r]
     runs_by_chat = task_store.get_runs_for_chats(need_lookup) if need_lookup else {}
+    pin_owner = _pin_owner(u)
+    pinned = chat_pins.pinned_ids(pin_owner, need_lookup)
     for r in rows:
         if "run_id" in r:
             run = ({"scope": r.get("run_scope"),
@@ -246,6 +277,9 @@ def _stamp_mutation_flags(u: UserContext, rows: list[dict]) -> None:
         # chat, editor and above on a shared-only agent's chat, never a task
         # run — the same rule the share routes apply.
         r["can_share"] = run is None and can_share_chat(u, r)
+        history = "run_id" not in r and _vis.in_chat_history(r, pin_owner)
+        r["can_pin"] = history and can_access_chat(u, r, run=run)
+        r["pinned"] = history and r.get("id", "") in pinned
 
 
 def can_share_chat(u: UserContext, chat: dict) -> bool:
@@ -427,10 +461,10 @@ async def _active_entry(u: UserContext) -> tuple[list[dict], bytes]:
     that navigates away cancels nobody's."""
     from datetime import datetime, timedelta, timezone
 
-    from core.session import interactive_session, warmup_registry
-    from core.session.session_state import streaming_chat_ids as pump_streaming
+    from core.session import warmup_registry
+    from services.delegation import lane_status
 
-    streaming = list(pump_streaming()) + list(interactive_session.streaming_chat_ids())
+    streaming = lane_status.working_chat_ids()
     warming = list(warmup_registry.inflight_chat_ids())
     since = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
     key = (u.sub, u.acting_sub, u.role, u.kind, u.agent, u.is_api_key,
@@ -570,6 +604,7 @@ async def search_chats(
     agent: str | None = Query(None),
     kind: str = Query("chats", pattern="^(chats|tasks)$"),
     limit: int = Query(50, ge=1, le=100),
+    pinned: Annotated[bool, Query()] = False,
     user: UserContext | None = Depends(get_current_user),
 ):
     """FTS over chat titles + content, newest first (every word of ``q`` as a
@@ -577,15 +612,17 @@ async def search_chats(
     kind=chats scopes to the viewer's history owner and excludes task-run
     chats; kind=tasks searches the agent's task-run chats under the run
     permission rules (same gating as the kind=tasks listing). One executor
-    job, like the listing."""
+    job, like the listing. ``pinned`` searches the pinned view."""
     u = require_auth(user)
     if not agent:
         raise HTTPException(status_code=400, detail="agent parameter required")
-    return json_response(await run_db(_chats_body, _search_chats_sync, u, agent, kind, q, limit))
+    return json_response(await run_db(_chats_body, _search_chats_sync, u, agent, kind, q, limit,
+                                      pinned))
 
 
 def _search_chats_sync(u: UserContext, agent: str, kind: str, q: str,
-                       limit: int) -> list[dict]:
+                       limit: int, pinned: bool = False) -> list[dict]:
+    pinned_by = _pinned_view(u, agent, kind, pinned)
     if kind == "tasks":
         require_agent_access(u, agent)
         results = task_store.search_task_chats(agent, q, _task_scope_sub(u), limit=limit,
@@ -598,7 +635,8 @@ def _search_chats_sync(u: UserContext, agent: str, kind: str, q: str,
     if owner != u.sub:
         require_agent_access(u, agent)
         hide = not u.sees_agent_automations(agent)
-    results = task_store.search_chats(owner, agent, q, limit=limit, hide_agent_runs=hide)
+    results = task_store.search_chats(owner, agent, q, limit=limit, hide_agent_runs=hide,
+                                      pinned_by=pinned_by)
     _stamp_mutation_flags(u, results)
     return results
 
@@ -1005,14 +1043,11 @@ async def create_chat(
 
 def _create_chat_sync(u: UserContext, agent: str, permission_mode: str) -> dict:
     # Shared-only agents collapse into ONE shared chat list (synthetic owner).
+    from core.session.chat_rebuild import new_chat_mode
     from core.session.visibility import chat_history_owner
     owner = chat_history_owner(agent, u.sub)
-    if _vis.is_shared_chat_owner(owner) and not roles.can_edit(u.acting_role(agent)):
-        # The shared chat runs as the agent (editor tier and up): a caller
-        # below it never leaves a pick of its own on the shared row.
-        permission_mode = ASK_MODE
     return task_store.create_chat(str(uuid.uuid4()), owner, agent,
-                                  entry_mode(permission_mode or AUTO_REVIEW_MODE))
+                                  new_chat_mode(agent, owner, u.acting_role(agent), permission_mode))
 
 
 def _mutable_chat(u: UserContext, chat_id: str, action: str) -> dict:
@@ -1072,6 +1107,47 @@ async def update_chat(
     return {"status": "ok", "title": updates.get("title")}
 
 
+# A person's pinned chats (storage/chat/chat_pins.py). Who may pin is who may
+# open the chat (can_access_chat), and only a chat of their own history.
+_NOT_A_HISTORY_CHAT = "Only a chat in your chat history can be pinned."
+
+
+def _pin_sync(u: UserContext, chat_id: str) -> None:
+    """A chat that does not exist and one the person may not open get the
+    same answer."""
+    chat = task_store.get_chat(chat_id)
+    if not chat or not can_access_chat(u, chat):
+        raise HTTPException(status_code=404, detail="Chat not found")
+    if not _vis.in_chat_history(chat, u.sub):
+        raise HTTPException(status_code=400, detail=_NOT_A_HISTORY_CHAT)
+    if not chat_pins.pin(u.sub, chat_id):
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+
+@router.put("/v1/chats/{chat_id}/pinned")
+async def pin_chat(
+    chat_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Pin a chat for this person alone. Pinning twice keeps the first."""
+    u = require_human(user)
+    await run_db(_pin_sync, u, chat_id)
+    return {"pinned": True}
+
+
+@router.delete("/v1/chats/{chat_id}/pinned")
+async def unpin_chat(
+    chat_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Remove this person's own pin. It needs no access to the chat, so a pin
+    is never stuck after its person lost the chat, and the answer says
+    nothing of the chat."""
+    u = require_human(user)
+    await run_db(chat_pins.unpin, u.sub, chat_id)
+    return {"pinned": False}
+
+
 # The engine switch (ws/dashboard_dispatch.py) refuses the same window with
 # its own sentence; a session still starting is registered nowhere a close
 # can reach, so the delete waits for it to exist.
@@ -1079,52 +1155,6 @@ _STILL_STARTING = "This chat is still starting. Wait a moment, then delete it."
 # A meeting runs on its parent chat's pump: a delete under it would end the
 # meeting mid-round. One that has ended has a done pump and deletes as usual.
 _MEETING_RUNNING = "A meeting is running on this chat. Stop it first, then delete the chat."
-
-
-async def _close_chat_terminal(chat_id: str) -> None:
-    """Close a deleted chat's live interactive terminal, so the person's
-    session count and the subscription seat are freed with the chat instead
-    of at the idle reap. The queued server prompts are dropped, never handed
-    back: the chat is going. Bounded re-read: a respawn race can leave two
-    live sessions on one chat for a moment. Best-effort, like the pooled
-    close below."""
-    from core.session import interactive_session
-    for _ in range(4):
-        live = interactive_session.find_live_for_chat(chat_id)
-        if live is None:
-            return
-        try:
-            await interactive_session.close_session(
-                live.session_id, reason="chat_deleted", drop_queued=True)
-        except Exception:  # noqa: BLE001  # closing a deleted chat's terminal, the next round re-reads
-            # The next round re-reads: a close that raised may have left
-            # this session registered, or a respawn's twin behind it.
-            logger.warning("Chat delete: closing terminal %s failed",
-                           live.session_id[:8], exc_info=True)
-
-
-async def _close_chat_session(chat: dict) -> None:
-    """Close a deleted chat's live pooled session on whichever layer holds it
-    (the engine switch calls this too, with a bare session_id/agent dict).
-
-    Without this, deleting a chat leaves its warm CLI/daemon running headless
-    (holding a subscription seat + satellite/local slot) until the idle
-    reaper — or longer, when background work keeps extending the reaper's
-    leash. Registry membership, not resolution, picks the layer: the chat's
-    stored execution_path may be stale relative to where the session actually
-    lives. Best-effort — an absent/dead session is fine."""
-    session_id = chat.get("session_id") or ""
-    if not session_id:
-        return
-    try:
-        from core.session.session_manager import find_layer_for_session
-        layer = find_layer_for_session(session_id)
-        if layer is None:
-            return
-        await layer.close_session(session_id)
-    except Exception:  # noqa: BLE001  # closing a deleted chat's live session on whatever layer holds it
-        logger.warning("Chat delete: closing live session %s failed",
-                       session_id[:8], exc_info=True)
 
 
 @router.delete("/v1/chats/{chat_id}")
@@ -1146,51 +1176,21 @@ async def delete_chat(
     from core.events import input_queue
     from core.events.stream_pump import _active_pumps
     from core.session import session_delivery, warmup_registry
-    meeting_pump = _active_pumps.get(chat_id)
-    if (meeting_pump is not None and not meeting_pump.is_done
-            and meeting_pump.source_type == session_kind.MEETING.source_type):
+    pump = _active_pumps.get(chat_id)
+    live_pump = pump is not None and not pump.is_done
+    if pump is not None and live_pump and pump.source_type == session_kind.MEETING.source_type:
         raise HTTPException(status_code=409, detail=_MEETING_RUNNING)
     # The hold (its first turn enqueued, not started) counts as starting
-    # too: the kick would run on a deleted chat.
+    # too: the kick would run on a deleted chat. A one-shot (a wake, a turn
+    # continued after a restart) starts until its turn's pump is on the
+    # chat: from then its session is in its layer and the close below ends
+    # it, a plan review it waits on included.
     if warmup_registry.get(chat_id) is not None \
-            or session_delivery.oneshot_inflight(chat_id) is not None \
+            or (session_delivery.oneshot_inflight(chat_id) is not None and not live_pump) \
             or input_queue.getting_ready(chat_id):
         raise HTTPException(status_code=409, detail=_STILL_STARTING)
-    # A deleted chat must never be woken — cancel its pending continuations
-    # (row + APScheduler job) before the row goes.
-    from services.scheduler import scheduler
-    for cont in await run_db(task_store.list_continuations_for_chat, chat_id):
-        await scheduler.remove_dynamic_task(cont["id"])
-    # From here to the row delete landing, nothing starts on the chat and
-    # no delivery runs on it; its pump ends first (its rows and turn-end
-    # job queue on the lane ahead of the delete), then the session goes.
-    # The mark outlives a landed delete a while (a slow viewer's loop asks
-    # after its ``done``) and is lifted by a failed one, whose queue is
-    # reloaded from the rows the cascade never took.
-    input_queue.mark_deleting(chat_id)
-    try:
-        pump = _active_pumps.get(chat_id)
-        if pump is not None:
-            await pump.end_for_delete()
-        await _close_chat_terminal(chat_id)
-        await _close_chat_session(chat)
-        # The chat's share rows cascade with it; their snapshot copies do not
-        # (SHARING.md): take them first, remove them after. The row delete
-        # rides the chat's writer lane so it lands behind any row job of the
-        # chat still queued (a turn ending right now) instead of racing it.
-        from services.sharing import chat_snapshot
-        from storage.sharing import share_store
-        doomed = await run_db(share_store.list_target_shares, "chat", chat_id)
-        await chat_writer.submit(
-            chat_id, functools.partial(task_store.delete_chat, chat_id), label="delete")
-    except BaseException:
-        input_queue.unmark_deleting(chat_id, landed=False)
-        raise
-    input_queue.unmark_deleting(chat_id, landed=True)
-    for share in doomed:
-        await asyncio.to_thread(chat_snapshot.remove, share)
-    from services.media import preview_snapshots
-    await asyncio.to_thread(preview_snapshots.delete_chat_dir, chat_id)
+    from services.agents import chat_removal
+    await chat_removal.remove_chat(chat)
     return {"status": "ok"}
 
 

@@ -17,7 +17,6 @@ to a ``DashboardConnection`` (``ws/dashboard_dispatch.py`` keeps the calls):
 
 from __future__ import annotations
 
-import functools
 import logging
 import time
 import uuid
@@ -26,7 +25,7 @@ from typing import TYPE_CHECKING
 
 from auth import roles
 from core import placement
-from services.remote import chat_move
+from services.remote import chat_move, chat_reload
 from storage import database as task_store, move_schema
 from storage.pg import run_db
 from ws import wire_events as wire
@@ -113,10 +112,22 @@ async def place_new_chat(conn: DashboardHost, agent: str, msg: dict, exec_path: 
                           "reason": wire.REASON_TARGET_UNAVAILABLE})
         return None
     if place:
-        from core.session.session_manager import get_execution_layer
-        conn.layer = await run_db(functools.partial(
-            get_execution_layer, agent, execution_path=msg.get("execution_path", ""),
-            user_sub=conn.user_sub, role=role, execution_target=place))
+        from core.session.session_manager import (
+            compute_placement_for,
+            get_execution_layer,
+            resolve_execution_path,
+        )
+
+        def _layer():
+            # Before the config exists: for the platform's place, the layer
+            # the builders would build now (refused with no compute machine).
+            path = msg.get("execution_path", "")
+            built = (compute_placement_for(resolve_execution_path(agent, path), agent=agent)
+                     if placement.is_local(place) else None)
+            return get_execution_layer(
+                agent, execution_path=path, user_sub=conn.user_sub, role=role,
+                execution_target=place, **({"placement_built": built} if built else {}))
+        conn.layer = await run_db(_layer)
     return place, label, default
 
 
@@ -152,6 +163,11 @@ def voice_attached(chat_id: str) -> str:
     """A spoken conversation holds the chat: it stays where it runs."""
     from ws import duplex
     return chat_move.VOICE_IN_USE if duplex.live_for_chat(chat_id) is not None else ""
+
+
+# The continuation after a usage limit waits behind a voice conversation, as
+# the reload does (its ``blocked``).
+chat_reload.voice_holds.append(voice_attached)
 
 
 async def handle_move_chat(conn: DashboardHost, msg: dict) -> None:

@@ -37,6 +37,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
+from services.mcp import mcp_manifest_store
 from tests._paths import PROXY_DIR
 
 _proxy_root = str(PROXY_DIR)
@@ -98,8 +99,7 @@ def _manager_ctx(agent: str = "test-agent"):
 
 class TestUnauthorizedRegistryListing:
     def _patched_manifests(self, manifests: dict):
-        from services.mcp import mcp_registry
-        return patch.object(mcp_registry, "_manifests", manifests)
+        return patch.object(mcp_manifest_store, "_manifests", manifests)
 
     def test_explicit_without_instance_is_listed(self, temp_db):
         from services.mcp import mcp_registry
@@ -170,46 +170,48 @@ class TestPlatformAttachedMode:
         }
 
     def test_the_shipped_call_control_manifest_is_platform_attached(self):
-        from services.mcp import mcp_manifest_types as mt
+        from services.mcp import (
+            mcp_manifest_types as mt,
+        )
         real, _ = self._manifests()
         assert real.assignment_mode == mt.ASSIGNMENT_PLATFORM
 
     def test_it_is_not_a_core_mcp_every_agent_gets(self):
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_store, mcp_registry
         _, manifests = self._manifests()
-        with patch.object(mcp_registry, "_manifests", manifests):
+        with patch.object(mcp_manifest_store, "_manifests", manifests):
             assert mcp_registry.core_mcp_names() == ["schedules-like"]
 
     def test_it_is_neither_visible_nor_requestable(self, temp_db):
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_store, mcp_registry
         from storage.mcp import mcp_store
         _, manifests = self._manifests()
         mcp_store.set_mcp_enabled("call-control-mcp", True)
         mcp_store.set_mcp_enabled("schedules-like", True)
-        with patch.object(mcp_registry, "_manifests", manifests):
+        with patch.object(mcp_manifest_store, "_manifests", manifests):
             visible = [m.name for m in mcp_registry.get_visible_mcps_for_agent("a1")]
             requestable = mcp_registry.get_unauthorized_explicit_mcps_for_agent("a1")
         assert visible == ["schedules-like"]
         assert requestable == []
 
     def test_a_stray_agent_row_never_loads_it(self, temp_db):
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_store, mcp_registry
         from storage.mcp import mcp_store
         _, manifests = self._manifests()
         _seed_agent("a1")
         mcp_store.set_mcp_enabled("call-control-mcp", True)
         mcp_store.add_agent_mcp("a1", "call-control-mcp")
-        with patch.object(mcp_registry, "_manifests", manifests):
+        with patch.object(mcp_manifest_store, "_manifests", manifests):
             assert [m.name for m in mcp_registry.get_agent_mcps("a1")] == []
 
     def test_a_call_session_still_attaches_it_by_name(self):
         from core.placement import LOCAL_PLACEMENT
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_store, mcp_session_config
         real, manifests = self._manifests()
         assigned: list = []
         reasons: dict = {}
-        with patch.object(mcp_registry, "_manifests", manifests):
-            mcp_registry._force_include(assigned, ["call-control-mcp"], reasons, LOCAL_PLACEMENT)
+        with patch.object(mcp_manifest_store, "_manifests", manifests):
+            mcp_session_config._force_include(assigned, ["call-control-mcp"], reasons, LOCAL_PLACEMENT)
         assert assigned == [real] and reasons == {}
 
 
@@ -221,7 +223,9 @@ class TestPlatformAttachedRequests:
     def test_the_request_route_refuses_it(self, temp_db):
         _seed_agent()
         from api.mcp.community import CreateRequestBody, create_mcp_request
-        from services.mcp import mcp_manifest_types as mt
+        from services.mcp import (
+            mcp_manifest_types as mt,
+        )
         from storage.mcp import mcp_request_store
 
         with patch(
@@ -241,7 +245,9 @@ class TestPlatformAttachedRequests:
     def test_an_old_request_is_not_approved(self, temp_db):
         _seed_agent()
         from services.community import community_installer
-        from services.mcp import mcp_manifest_types as mt
+        from services.mcp import (
+            mcp_manifest_types as mt,
+        )
         from storage.mcp import mcp_request_store, mcp_store
 
         row = mcp_request_store.create_request("call-control-mcp", "test-agent", REQUESTER_SUB)
@@ -340,6 +346,54 @@ class TestRequestInstalledMcp:
         assert row["assignment_mode"] == "explicit"
         assert row["needs_instance"] is True
         assert row["instance_count"] == 0
+
+    def test_a_capped_session_queues_its_request_and_an_admins_own_approves(self, temp_db):
+        """A session acts at the role it was built with: a capped session's
+        request is queued for an admin, an uncapped admin's own is approved."""
+        import uuid
+
+        from starlette.requests import Request
+
+        from api.mcp.community import CreateRequestBody, create_mcp_request
+        from auth.path_policy import SecurityContext
+        from auth.providers import _resolve_principal
+        from core.session import session_state
+        from services.community import community_installer
+        from tests.conftest import live_session_token
+
+        _seed_agent()
+
+        def _principal(role: str):
+            sid = str(uuid.uuid4())
+            token = live_session_token(sid, "test-agent", "user-admin")
+            session_state.set_session_security(sid, SecurityContext(
+                role=role, username="admin", agent="test-agent", is_admin_agent=False))
+            return asyncio.run(_resolve_principal(Request({
+                "type": "http", "method": "POST", "path": "/", "query_string": b"",
+                "headers": [(b"authorization", f"Bearer {token}".encode())]})))
+
+        approved: list[str] = []
+
+        async def _approve(rid, by, **kw):
+            approved.append(rid)
+            return {"id": rid, "mcp_name": "zip-mcp", "status": "installed"}
+
+        with patch(
+            "services.mcp.mcp_registry.get_manifest",
+            side_effect=lambda n: _stub_manifest("zip-mcp", "explicit") if n == "zip-mcp" else None,
+        ), patch.object(community_installer, "approve_request", new=_approve), patch(
+            "services.notifications.notification_manager.fire_notification", new=AsyncMock(),
+        ):
+            capped = asyncio.run(create_mcp_request(
+                "test-agent", CreateRequestBody(mcp_name="zip-mcp", reason="by phone"),
+                user=_principal("manager")))
+            assert capped["status"] == "pending" and approved == []
+            from storage.mcp import mcp_request_store
+            mcp_request_store.update_status(capped["id"], "rejected", resolved_by="user-admin")
+            asyncio.run(create_mcp_request(
+                "test-agent", CreateRequestBody(mcp_name="zip-mcp", reason="mine"),
+                user=_principal("admin")))
+        assert len(approved) == 1
 
     def test_unknown_everywhere_404s(self, temp_db):
         _seed_agent()

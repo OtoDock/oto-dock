@@ -1,0 +1,257 @@
+{
+ "chats": [
+  {
+   "agent": "warm-prewarm",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "other-model",
+   "pending_history_seed": "",
+   "permission_mode": "dontAsk",
+   "rows": [],
+   "session_id": "<id2>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  },
+  {
+   "agent": "warm-prewarm",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "other-model",
+   "pending_history_seed": "",
+   "permission_mode": "plan",
+   "rows": [],
+   "session_id": "<id5>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  },
+  {
+   "agent": "warm-prewarm",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "other-model",
+   "pending_history_seed": "",
+   "permission_mode": "plan",
+   "rows": [],
+   "session_id": "sid-detached",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  {
+   "message": "Agent name required",
+   "type": "error"
+  },
+  {
+   "message": "Agent 'no-such-agent' no longer exists",
+   "type": "error"
+  },
+  {
+   "session_id": "<id1>",
+   "type": "pre_warmup_ready"
+  },
+  {
+   "session_id": "<id1>",
+   "type": "pre_warmup_ready"
+  },
+  {
+   "session_id": "<id2>",
+   "type": "pre_warmup_ready"
+  },
+  {
+   "agent": "warm-prewarm",
+   "chat_id": "<id3>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "",
+   "new_chat": true,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id3>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "fallback_reason": null,
+   "interactive": false,
+   "mode": "dontAsk",
+   "model": "other-model",
+   "offline_machine_name": "",
+   "session_id": "<id2>",
+   "type": "warmup_ready"
+  },
+  {
+   "agent": "warm-prewarm",
+   "chat_id": "<id4>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "",
+   "new_chat": true,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id4>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "fallback_reason": null,
+   "interactive": false,
+   "mode": "plan",
+   "model": "other-model",
+   "offline_machine_name": "",
+   "session_id": "<id5>",
+   "type": "warmup_ready"
+  },
+  {
+   "agent": "warm-prewarm",
+   "chat_id": "<id6>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "",
+   "new_chat": true,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id6>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "fallback_reason": null,
+   "interactive": false,
+   "mode": "plan",
+   "model": "other-model",
+   "offline_machine_name": "",
+   "session_id": "sid-detached",
+   "type": "warmup_ready"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  }
+ ],
+ "layer": {
+  "closed": [
+   "<id1>"
+  ],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [
+   [
+    "<id2>",
+    "dontAsk"
+   ],
+   [
+    "sid-detached",
+    "plan"
+   ]
+  ],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [],
+  "started": [
+   {
+    "agent": "warm-prewarm",
+    "chat_id": "",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "",
+    "mode": "ask",
+    "model": "test-model",
+    "resume": false,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id1>",
+    "user_sub": "user-admin",
+    "username": ""
+   },
+   {
+    "agent": "warm-prewarm",
+    "chat_id": "",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "",
+    "mode": "autoReview",
+    "model": "other-model",
+    "resume": false,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id2>",
+    "user_sub": "user-admin",
+    "username": ""
+   },
+   {
+    "agent": "warm-prewarm",
+    "chat_id": "<id4>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "plan",
+    "model": "other-model",
+    "resume": false,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id5>",
+    "user_sub": "user-admin",
+    "username": ""
+   }
+  ]
+ },
+ "slots": {
+  "acquired": [
+   [
+    "<id1>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "speculative": true,
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "<id2>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "speculative": true,
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "<id5>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": [
+   "<id1>",
+   "sid-detached-dead"
+  ]
+ }
+}

@@ -1,0 +1,164 @@
+{
+ "chats": [
+  {
+   "agent": "warm-queued-fresh",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "autoReview",
+   "rows": [
+    [
+     "event",
+     ""
+    ],
+    [
+     "user",
+     "typed while it was gone"
+    ],
+    [
+     "assistant",
+     "Hello there!"
+    ]
+   ],
+   "session_id": "<id3>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  {
+   "agent": "warm-queued-fresh",
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "",
+   "new_chat": true,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "fallback_reason": null,
+   "interactive": false,
+   "mode": "autoReview",
+   "model": "test-model",
+   "offline_machine_name": "",
+   "session_id": "<id2>",
+   "type": "warmup_ready"
+  },
+  {
+   "chat_id": "<id1>",
+   "status": "streaming",
+   "type": "chat_status"
+  },
+  {
+   "chat_id": "<id1>",
+   "message_ids": "<volatile>",
+   "queue_ids": [
+    "q-dead"
+   ],
+   "text": "typed while it was gone",
+   "type": "queue_sent"
+  },
+  {
+   "chat_id": "<id1>",
+   "status": "ready",
+   "type": "chat_status"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  }
+ ],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [
+   [
+    "<id3>",
+    "typed while it was gone",
+    {
+     "inject_time": true
+    }
+   ]
+  ],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [
+   "<id2>"
+  ],
+  "reconnect_waits": [
+   "<id2>"
+  ],
+  "started": [
+   {
+    "agent": "warm-queued-fresh",
+    "chat_id": "<id1>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "autoReview",
+    "model": "test-model",
+    "resume": false,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id2>",
+    "user_sub": "user-admin",
+    "username": "admin"
+   },
+   {
+    "agent": "warm-queued-fresh",
+    "chat_id": "<id1>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "autoReview",
+    "model": "test-model",
+    "resume": false,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id3>",
+    "user_sub": "user-admin",
+    "username": "admin"
+   }
+  ]
+ },
+ "slots": {
+  "acquired": [
+   [
+    "<id2>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "<id3>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": [
+   "<id2>"
+  ]
+ }
+}

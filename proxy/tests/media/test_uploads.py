@@ -463,6 +463,22 @@ def test_upload_refuses_landing_dir_symlinked_out_of_agent(app_with_router, tmp_
     assert list(outside.rglob("*")) == []
 
 
+def test_an_agent_folder_that_is_a_link_to_another_agents_lands_nothing(app_with_router):
+    """The landing rel starts with the agent's own name, never with where
+    its folder resolves: an agent folder swapped for a link to another
+    agent's folder refuses the upload and the folder reservation, and
+    nothing lands in the other agent's folder."""
+    app, agents_dir = app_with_router
+    other = agents_dir / "other-agent" / "users" / "alice" / "workspace"
+    other.mkdir(parents=True)
+    os.symlink(agents_dir / "other-agent", agents_dir / "test-agent")
+    client = TestClient(app)
+    assert _post_file(client).status_code == 403
+    r = client.post("/v1/upload/folder", json={"agent": "test-agent", "name": "pics"})
+    assert r.status_code == 403, r.text
+    assert list(other.rglob("*")) == []
+
+
 # ---------------------------------------------------------------------------
 # The single-shot write: off the loop, floored, never through a planted link
 # ---------------------------------------------------------------------------
@@ -926,3 +942,137 @@ def test_folder_name_rules(raw, expected):
         assert exc.value.status_code == 400
     else:
         assert _folder_name(raw) == expected
+
+
+# ---------------------------------------------------------------------------
+# The landing folder is authorized where it resolves (stand-in folders only)
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_landing_is_judged_where_it_lands(app_with_router):
+    """A link at the person's own ``uploads`` folder to another person's
+    folder refuses the upload: the folder is judged where it resolves."""
+    app, agents_dir = app_with_router
+    mine = agents_dir / "test-agent" / "users" / "alice" / "workspace"
+    theirs = agents_dir / "test-agent" / "users" / "bob" / "workspace"
+    mine.mkdir(parents=True)
+    theirs.mkdir(parents=True)
+    (mine / "uploads").symlink_to(theirs)
+    resp = _post_file(TestClient(app))
+    assert resp.status_code == 403
+    assert list(theirs.rglob("*")) == []
+
+
+def test_a_linked_name_never_moves_the_landing_folder(app_with_router):
+    """A link holding the file's name in the target folder never makes its
+    landing place the folder the link's target sits in: the file lands in
+    the target folder itself, under the next free name."""
+    app, agents_dir = app_with_router
+    inbox = agents_dir / "test-agent" / "users" / "alice" / "workspace" / "inbox"
+    shared = agents_dir / "test-agent" / "workspace"
+    inbox.mkdir(parents=True)
+    shared.mkdir(parents=True)
+    (inbox / "note.txt").symlink_to(shared)
+    resp = TestClient(app).post(
+        "/v1/upload", files={"file": ("note.txt", BytesIO(b"hello"))},
+        data={"agent": "test-agent", "target_dir": "users/alice/workspace/inbox"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["filename"] == "note_1.txt"
+    assert (inbox / "note_1.txt").read_bytes() == b"hello"
+    assert not list((agents_dir / "test-agent").glob("note*"))
+
+
+def test_a_name_the_files_api_reserves_stays_refused(app_with_router):
+    app, agents_dir = app_with_router
+    (agents_dir / "test-agent" / "users" / "alice").mkdir(parents=True)
+    resp = TestClient(app).post(
+        "/v1/upload", files={"file": (".claude", BytesIO(b"x"))},
+        data={"agent": "test-agent", "target_dir": "users/alice"})
+    assert resp.status_code == 403
+    assert not (agents_dir / "test-agent" / "users" / "alice" / ".claude").exists()
+
+
+def _post_into(client, target_dir: str, name: str):
+    return client.post("/v1/upload", files={"file": (name, BytesIO(b"x"))},
+                       data={"agent": "test-agent", "target_dir": target_dir})
+
+
+def test_a_name_that_would_become_a_library_mirror_folder_is_refused(app_with_router):
+    """The name is judged by the library-mirror rule as text: a manager may
+    write knowledge, never a new `knowledge/shared` of their own."""
+    app, agents_dir = app_with_router
+    (agents_dir / "test-agent" / "knowledge").mkdir(parents=True)
+    resp = _post_into(TestClient(app), "knowledge", "shared")
+    assert resp.status_code == 403
+    assert not (agents_dir / "test-agent" / "knowledge" / "shared").exists()
+
+
+def test_a_name_that_would_become_the_credentials_folder_is_refused(app_with_router):
+    app, agents_dir = app_with_router
+    (agents_dir / "test-agent" / "users" / "alice").mkdir(parents=True)
+    resp = _post_into(TestClient(app), "users/alice", ".credentials")
+    assert resp.status_code == 403
+    assert not (agents_dir / "test-agent" / "users" / "alice" / ".credentials").exists()
+
+
+def test_a_read_only_library_mirror_is_no_upload_target(app_with_router, monkeypatch):
+    from storage.knowledge import db_knowledge_libraries
+    app, agents_dir = app_with_router
+    mirror = agents_dir / "test-agent" / "knowledge" / "shared" / "source-agent"
+    mirror.mkdir(parents=True)
+    monkeypatch.setattr(db_knowledge_libraries, "attachment_covering",
+                        lambda src, agent, sub: {"writable": False})
+    resp = _post_into(TestClient(app), "knowledge/shared/source-agent", "note.txt")
+    assert resp.status_code == 403
+    assert list(mirror.iterdir()) == []
+
+
+@pytest.mark.parametrize("read_only", [False, True], ids=["workspace-tier", "read-only"])
+def test_a_no_person_session_is_judged_by_its_grant(app_with_router, monkeypatch, read_only):
+    """An agent-scope run that uploads (a session with no person) lands in
+    the shared workspace's uploads at the workspace tier, and a read-only
+    one (a check's judge) writes nothing."""
+    from auth.path_policy import SecurityContext
+    from auth.providers import UserContext, get_current_user
+    from core.session import session_state, visibility
+    app, agents_dir = app_with_router
+    sid = "sess-no-person"
+    monkeypatch.setattr(visibility, "is_shared_only", lambda agent: True)
+    monkeypatch.setitem(session_state._session_security, sid, SecurityContext(
+        role="editor", username="", agent="test-agent", is_admin_agent=False,
+        session_scope="agent", read_only=read_only))
+    session_user = UserContext(sub=f"session:{sid}", email="", name="", role="service", is_api_key=True,
+                               session_id=sid, agent="test-agent", agents=["test-agent"],
+                               agent_roles={"test-agent": "editor"})
+
+    async def _as_session():
+        return session_user
+    app.dependency_overrides[get_current_user] = _as_session
+    resp = _post_file(TestClient(app))
+    landing = agents_dir / "test-agent" / "workspace" / "uploads" / "files"
+    if read_only:
+        assert resp.status_code == 403
+        assert not landing.exists() or list(landing.iterdir()) == []
+    else:
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["path"] == "workspace/uploads/files/note.txt"
+        assert (landing / "note.txt").read_bytes() == b"hello"
+
+
+def test_a_name_of_the_platforms_own_trees_is_refused_at_the_agents_root(app_with_router, monkeypatch):
+    """An admin may write the agent's root, never a name the platform keeps
+    for itself there."""
+    from auth.providers import UserContext, get_current_user
+    app, agents_dir = app_with_router
+    (agents_dir / "test-agent").mkdir(parents=True, exist_ok=True)
+    (agents_dir / "test-agent" / "workspace").mkdir(exist_ok=True)
+    (agents_dir / "test-agent" / "workspace" / "root").symlink_to(agents_dir / "test-agent")
+    admin = UserContext(sub="user-test-sub", email="alice@test.com", name="Alice", role="admin",
+                        agents=["test-agent"])
+
+    async def _as_admin():
+        return admin
+    app.dependency_overrides[get_current_user] = _as_admin
+    resp = _post_into(TestClient(app), "workspace/root", "shares")
+    assert resp.status_code == 403
+    assert not (agents_dir / "test-agent" / "shares").exists()

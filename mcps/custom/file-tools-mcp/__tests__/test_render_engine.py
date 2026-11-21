@@ -294,6 +294,12 @@ def _pdf(tmp_path, source: Path) -> str:
     return asyncio.run(render_engine.to_pdf(str(source), out_dir=str(tmp_path / "out")))
 
 
+def _private_copy_of(handed: str, source: Path) -> bool:
+    """Whether the engine was handed the call's private copy of ``source``
+    (same name, in a folder of the call's own in the output folder)."""
+    return Path(handed).name == source.name and Path(handed).parent.name.startswith("private-")
+
+
 def test_collabora_is_off_without_the_setting(fake_lo, monkeypatch):
     tmp_path, run = fake_lo
     monkeypatch.delenv(render_engine.URL_SETTING, raising=False)
@@ -561,7 +567,9 @@ def test_a_file_that_is_not_a_package_or_too_big_or_a_link_stays_here(cool, monk
     monkeypatch.setattr(render_engine, "SEND_MAX_UNCOMPRESSED", 256 * 1024 * 1024)
     link = tmp_path / "in" / "link.docx"
     link.symlink_to(_docx(tmp_path, "target.docx"))
-    _pdf(tmp_path, link)
+    # A link at a person's file reaches no engine: its private copy is refused.
+    with pytest.raises(PermissionError, match="Cannot read"):
+        _pdf(tmp_path, link)
     assert not fake.posts()
 
 
@@ -722,7 +730,7 @@ def test_a_package_that_stays_inside_needs_no_copy_and_a_hyperlink_gets_one(fake
     inside = LINKED.replace('Target="http://10.0.0.5/theme.png" TargetMode="External"', 'Target="media/a.png"')
     source = _docx(tmp_path, "r.docx", {"word/_rels/document.xml.rels": inside})
     _pdf(tmp_path, source)
-    assert run.argv[-1] == str(source)
+    assert _private_copy_of(run.argv[-1], source)
     hyperlink = LINKED.replace("relationships/image", "relationships/hyperlink")
     linked = _docx(tmp_path, "h.docx", {"word/_rels/document.xml.rels": hyperlink})
     _pdf(tmp_path, linked)
@@ -735,7 +743,7 @@ def test_a_document_with_a_part_in_another_format_stays_with_libreoffice(cool):
         'Target="http://10.0.0.5/theme.png" TargetMode="External"', 'Target="afchunk.htm"')
     source = _docx(tmp_path, "r.docx", {"word/_rels/document.xml.rels": chunk, "word/afchunk.htm": "<p>x</p>"})
     out = _pdf(tmp_path, source)
-    assert Path(out).read_bytes() == b"made" and run.argv[-1] == str(source) and not fake.posts()
+    assert Path(out).read_bytes() == b"made" and _private_copy_of(run.argv[-1], source) and not fake.posts()
 
 
 def test_a_package_whose_links_cannot_be_removed_is_not_rendered(fake_lo):

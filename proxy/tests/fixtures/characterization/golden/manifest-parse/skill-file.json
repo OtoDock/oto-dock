@@ -1,0 +1,110 @@
+{
+ "resolve_skill_file": [
+  [
+   "skills/ok.md",
+   "<tmp>/mcp/skills/ok.md"
+  ],
+  [
+   "skills/inner.md",
+   "<tmp>/mcp/skills/ok.md"
+  ],
+  [
+   "skills/link.md",
+   null
+  ],
+  [
+   "skills/dir.md",
+   null
+  ],
+  [
+   "skills/none.md",
+   null
+  ],
+  [
+   "../secret.md",
+   null
+  ],
+  [
+   "<tmp>/secret.md",
+   null
+  ],
+  [
+   "",
+   null
+  ]
+ ],
+ "skill_file_error": [
+  [
+   "''",
+   "must be a non-empty string"
+  ],
+  [
+   "None",
+   "must be a non-empty string"
+  ],
+  [
+   "3",
+   "must be a non-empty string"
+  ],
+  [
+   "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "is longer than 512 characters"
+  ],
+  [
+   "'a\\tb.md'",
+   "carries a control character"
+  ],
+  [
+   "'a\\\\b.md'",
+   "carries a backslash"
+  ],
+  [
+   "'/abs.md'",
+   "is absolute"
+  ],
+  [
+   "'C:/x.md'",
+   "is absolute"
+  ],
+  [
+   "'c:x.md'",
+   "is absolute"
+  ],
+  [
+   "'../x.md'",
+   "is not a plain relative path"
+  ],
+  [
+   "'a/../b.md'",
+   "is not a plain relative path"
+  ],
+  [
+   "'a//b.md'",
+   "is not a plain relative path"
+  ],
+  [
+   "'./a.md'",
+   "is not a plain relative path"
+  ],
+  [
+   "'a/'",
+   "is not a plain relative path"
+  ],
+  [
+   "'.'",
+   "is not a plain relative path"
+  ],
+  [
+   "'skills/ok.md'",
+   null
+  ],
+  [
+   "'skills/.hidden.md'",
+   null
+  ],
+  [
+   "'a b.md'",
+   null
+  ]
+ ]
+}

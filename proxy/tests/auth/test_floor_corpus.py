@@ -19,10 +19,13 @@ credential folders are pinned to the one the bundled manifests declare; the
 working directory and ``HOME`` are pinned too. A case that names the test
 process's own descriptors (``/proc/self``, ``/dev/stderr``) is compared only
 when pytest captures by descriptor (its default): those paths resolve to
-where pytest points the streams. A case that names the home of an account
+where pytest points the streams. Commands are asked with the stream on a
+file under ``/tmp``, where pytest put it when the corpus was recorded: pytest
+makes that file in the temporary folder, which a run may move. A case that names the home of an account
 this machine has (``~name``) is never compared: the record was made where
 that account did not exist."""
 import asyncio
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -31,10 +34,11 @@ import json
 import os
 import pwd
 import re
+import tempfile
 
 import pytest
 
-from api.hooks import permission, routing
+from api.hooks import permission, questions, routing
 from auth import path_policy, path_shell, roles
 from auth.path_policy import PathDecision, SecurityContext
 from core.permission_modes import terminal_mode
@@ -49,7 +53,7 @@ OWN = "alice"
 OTHER = "bob"
 _PROTECTED_CREDENTIAL_DIRS = frozenset({"google-tokens"})
 _PROCESS_RELATIVE = ("/proc/self", "/proc/thread-self", "/dev/std", "/dev/fd/")
-_FLAG_NAMES = ("is_remote", "depth", "dangerous_only", "remote_host", "host_asks")
+_FLAG_NAMES = ("native_paths", "depth", "dangerous_only", "remote_host", "host_asks")
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +393,20 @@ def floor(monkeypatch, request):
     return request.config.getoption("capture") == "fd"
 
 
+@contextlib.contextmanager
+def _stderr_under_tmp():
+    """The process's stderr on a file under ``/tmp`` for the block (in the
+    test's call, where pytest's capture does not point it back)."""
+    saved = os.dup(2)
+    with tempfile.TemporaryFile(dir="/tmp") as stream:
+        os.dup2(stream.fileno(), 2)
+        try:
+            yield
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+
+
 def _err(exc: Exception) -> str:
     return _plain(f"{type(exc).__name__}: {exc}")
 
@@ -444,7 +462,8 @@ def test_commands_under_every_context_as_recorded(floor):
     book = _Book("bash", list(matrix))
     for entry in _inputs()["commands"]:
         cmd = _real(entry["command"])
-        answers = [_answer(path_shell._check_bash, cmd, ctx) for ctx in matrix.values()]
+        with _stderr_under_tmp():
+            answers = [_answer(path_shell._check_bash, cmd, ctx) for ctx in matrix.values()]
         book.add(entry["command"], answers, optional=_descriptor_relative(cmd),
                  skip=_home_present(cmd))
     book.check(compare_optional=floor)
@@ -532,9 +551,11 @@ _MCP_TIERS = {"notes": "open", "crm": "standard", "mail": "sensitive", "bank": "
 _DEVICE_CAPS = {"computer": "computer", "browser": "browser", "blender": "app"}
 _CLIENTS = (session_kind.DASHBOARD.name, session_kind.TASK.name, session_kind.PHONE.name,
             "", session_kind.APP.name, session_kind.MEETING.name)
-# The words before 1.9 (``default``, ``acceptEdits``) stay: a released
-# install's stored row still reads as its current mode.
-_MODES = ("default", "acceptEdits", "ask", "autoReview", "plan", "dontAsk", "auto", "judge")
+# The words before 1.9 (``default``, ``acceptEdits``) stay as words no release
+# writes now (2.0 rewrote the stored rows): each answers no more than Ask
+# (``test_a_word_no_release_writes_allows_no_more_than_ask``).
+_UNKNOWN_MODES = ("default", "acceptEdits")
+_MODES = (*_UNKNOWN_MODES, "ask", "autoReview", "plan", "dontAsk", "auto", "judge")
 _LIVE_MODES = ("default", "acceptEdits", "plan", "bypassPermissions", "auto", "dontAsk", "sideways")
 
 
@@ -672,7 +693,8 @@ class _Layer:
             return "mcp__meetings-mcp__" + tool_name[len("mcp__meetings_mcp__"):]
         return tool_name
 
-    def capabilities_for(self, session_id):
+    @property
+    def capabilities(self):
         nonblocking = ("AskUserQuestion",) if self.kind == "nonblocking-question" else ()
         behaviour = type("B", (), {"nonblocking_question_tools": nonblocking})()
         return type("C", (), {"behaviour": behaviour})()
@@ -725,6 +747,7 @@ def decide(floor, monkeypatch):
     monkeypatch.setattr(permission, "recorded_session_mode",
                         lambda sid: "default" if sid == "parent" else state["mode"])
     monkeypatch.setattr(permission, "get_session_client_type", lambda sid: state["client"])
+    monkeypatch.setattr(questions, "get_session_client_type", lambda sid: state["client"])
     monkeypatch.setattr(permission, "get_session_security", lambda sid: state["ctx_obj"])
     monkeypatch.setattr(permission, "_is_interactive_session", lambda sid: state["interactive"])
     monkeypatch.setattr(permission, "_park_interactive_on_dialog",
@@ -735,6 +758,7 @@ def decide(floor, monkeypatch):
     monkeypatch.setattr(permission, "remember_session_tool_allow",
                         lambda sid, tool: effects.append(["remember", tool]))
     monkeypatch.setattr(permission, "get_permission_queue", _queue)
+    monkeypatch.setattr(questions, "get_permission_queue", _queue)
     monkeypatch.setattr(permission, "wait_for_permission", _wait)
     monkeypatch.setattr(permission, "watch_prompt", lambda request_id: None)
     monkeypatch.setattr(permission, "took_no_answer", lambda request_id: False)
@@ -758,12 +782,15 @@ def decide(floor, monkeypatch):
     from core.session import engine_prompts
     monkeypatch.setattr(engine_prompts, "queue_has_reader", lambda queue: True)
     monkeypatch.setattr(session_config_dir, "attached_ssh_hosts", lambda agent: SSH_HOSTS)
-    # Every call answers alone: the terminal's last word and an Allow kept
-    # for the engine's repeat request never carry over to the next.
+    # Every call answers alone: the terminal's last word, its follow record
+    # (the chat's ceiling) and an Allow kept for the engine's repeat request
+    # never carry over to the next.
     live_words: dict = {}
     allowed_calls: dict = {}
+    follows: dict = {}
     monkeypatch.setattr(session_state, "_live_words", live_words)
     monkeypatch.setattr(permission, "_ALLOWED_CALLS", allowed_calls)
+    monkeypatch.setattr(permission, "_FOLLOWS", follows)
 
     async def _decide(sc: dict, tool: str, tool_input: dict) -> str:
         ctx = matrix[sc["ctx"]] if sc["ctx"] else None
@@ -777,6 +804,7 @@ def decide(floor, monkeypatch):
         pumps.clear()
         live_words.clear()
         allowed_calls.clear()
+        follows.clear()
         if sc["interactive"]:
             # The terminal was spawned in the stored mode (its registration).
             live_words["s"] = terminal_mode(sc["mode"])
@@ -823,3 +851,33 @@ async def test_permission_by_live_mode_as_recorded(decide):
 @pytest.mark.asyncio
 async def test_permission_one_dimension_at_a_time_as_recorded(decide):
     await _permission_family(decide, "permission-special", _special_scenarios())
+
+
+#: How much a decision lets through: a refusal, the person's card, the
+#: engine's own judgement, a run.
+_LETS_THROUGH = {"deny": 0, "ask": 1, "defer": 2, "allow": 3}
+
+
+@pytest.mark.parametrize("family,scenarios", [
+    ("permission-modes", _mode_scenarios), ("permission-live", _live_scenarios),
+    ("permission-special", _special_scenarios),
+])
+def test_a_word_no_release_writes_allows_no_more_than_ask(family, scenarios):
+    """On every recorded case, a stored mode no release writes lets no call
+    further than the same case in Ask."""
+    rec = json.loads((DATA / f"verdicts-{family}.json").read_text())
+    got = {cid: [rec["verdicts"][i] for i in row] for cid, row in rec["cases"].items()}
+
+    def through(verdict: str) -> int:
+        result = json.loads(verdict).get("result") or {}
+        return _LETS_THROUGH.get(result.get("decision", ""), 0)
+
+    compared = 0
+    for sc in scenarios():
+        if sc["mode"] not in _UNKNOWN_MODES:
+            continue
+        unknown, ask = got[_case_id(sc)], got[_case_id({**sc, "mode": "ask"})]
+        for tool, (a, b) in enumerate(zip(unknown, ask, strict=True)):
+            assert through(a) <= through(b), (sc, tool, a, b)
+            compared += 1
+    assert compared > 0

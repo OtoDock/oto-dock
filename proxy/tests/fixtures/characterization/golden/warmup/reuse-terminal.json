@@ -1,0 +1,93 @@
+{
+ "chats": [
+  {
+   "agent": "warm-terminal",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "<id1>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  },
+  {
+   "agent": "warm-terminal",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "<id3>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  {
+   "chat_id": "<id2>",
+   "execution_path": "claude-code-cli",
+   "interactive": true,
+   "mode": "ask",
+   "model": "test-model",
+   "session_id": "<id1>",
+   "turn_open": false,
+   "type": "warmup_ready"
+  },
+  {
+   "chat_id": "<id4>",
+   "execution_path": "claude-code-cli",
+   "interactive": true,
+   "mode": "plan",
+   "model": "test-model",
+   "session_id": "<id3>",
+   "turn_open": true,
+   "type": "warmup_ready"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  }
+ ],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [],
+  "started": []
+ },
+ "slots": {
+  "acquired": [
+   [
+    "<id1>",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "<id3>",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": []
+ }
+}

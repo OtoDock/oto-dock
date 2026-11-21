@@ -12,18 +12,23 @@ Architecture:
 """
 
 import asyncio
+import functools
 import json
 import logging
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import config
 from core.events.common_events import NOTE_MARK
-from core.layers.direct import builtins as direct_builtins, tool_catalog
-from core.layers.direct.mcp import TOOL_CALL_TIMEOUT, AgentMCPManager, mcp_pool
+from core.layers.direct import (
+    builtins as direct_builtins,
+    files as direct_files,
+    tool_catalog,
+)
+from core.layers.direct.mcp import TOOL_CALL_TIMEOUT_CHAT, AgentMCPManager, mcp_pool
 from core.layers.providers import (
     ProviderAdapter,
     ProviderError,
@@ -39,6 +44,7 @@ from core.session.session_state import (
     mark_closing,
     wait_for_permission,
 )
+from storage.pg import run_db, run_db_fast
 
 if TYPE_CHECKING:
     from core.sandbox.sandbox import SandboxConfig
@@ -47,6 +53,25 @@ logger = logging.getLogger("direct-runner")
 
 # Safety limit: max tool-use loop iterations per request
 MAX_TOOL_LOOPS = 20
+
+
+def _agent_model_or_empty(agent_name: str) -> str:
+    """The agent's model, ``""`` when none is resolvable yet (the first turn
+    then fails on it). Store reads."""
+    try:
+        return config.get_agent_model(agent_name)
+    except RuntimeError:
+        return ""
+
+
+def _granted(name: str, limits: dict[str, set]) -> bool:
+    """Whether a namespaced tool (``mcp__<server>__<tool>``) is one an outside
+    session was picked: a server with no limit keeps all of its tools."""
+    for server, names in limits.items():
+        prefix = f"mcp__{server}__"
+        if name.startswith(prefix):
+            return name[len(prefix):] in names
+    return True
 
 
 class DirectSession:
@@ -60,17 +85,15 @@ class DirectSession:
         mcp_manager: AgentMCPManager | None = None,
         provider: str = "anthropic",
         endpoint_url: str | None = None,
+        model: str | None = None,
+        web_tools: bool = True,
+        tool_grants: tuple = (),
     ):
         self.session_id = session_id
         self.agent_name = agent_name
-        # Model is almost always set explicitly by DirectLLMExecutionLayer.start_session
-        # via config.model — resolve here as a defensive fallback. Catch RuntimeError
-        # so the constructor doesn't fail if no model is resolvable yet; callers that
-        # need an actual model will set session.model afterward or fail at first turn.
-        try:
-            self.model = config.get_agent_model(agent_name)
-        except RuntimeError:
-            self.model = ""
+        # ``create_direct_session`` always hands the model in: this runs on the
+        # event loop, so the read is only for a construction that gives none.
+        self.model = _agent_model_or_empty(agent_name) if model is None else model
         self.system_prompt = system_prompt
         self.mcp_manager = mcp_manager
         self.provider = provider
@@ -94,18 +117,28 @@ class DirectSession:
         # Set by an accepted end_call / transfer_call builtin: the tool loop
         # ends the turn after the tool result instead of calling the model.
         self.line_closing: bool = False
+        # Messages typed during a running turn (``layer.steer``), read at its
+        # next tool boundary. The door is open only while the turn can still
+        # read one, so an accepted text is delivered exactly once.
+        self.steers: list[str] = []
+        self.steer_open: bool = False
 
-        # Populate tools from MCP manager
+        # Populate tools from MCP manager; an outside session is offered, of
+        # an attached server, only the functions its pick names.
         if mcp_manager:
-            self.tools = mcp_manager.get_tools()
+            limits = {key: set(names) for key, names in (tool_grants or ()) if names is not None}
+            self.tools = [t for t in mcp_manager.get_tools() if _granted(t.get("name") or "", limits)]
 
-        # Client-side builtins (Read / Glob / Write / Edit / Delete / Skill —
-        # executed in-process, gated inline; core/layers/direct/builtins.py).
+        # Client-side builtins (Read / Glob / Write / Edit / Delete / Skill:
+        # core/layers/direct/builtins.py). Each is gated inline and its handler
+        # runs in-process. A file tool's handler hands the file work to the file
+        # program in the session's sandbox.
         self.tools.extend(direct_builtins.client_tool_defs())
 
-        # Add provider-specific built-in tools (e.g., Anthropic web_search/web_fetch)
+        # Add provider-specific built-in tools (e.g., Anthropic web_search/web_fetch).
+        # An outside session gets them only when its managers picked the web.
         adapter = get_adapter(provider)
-        builtin = adapter.get_builtin_tools()
+        builtin = adapter.get_builtin_tools() if web_tools else []
         if builtin:
             self.tools.extend(builtin)
             logger.info(
@@ -208,60 +241,64 @@ async def create_direct_session(
     credential_env: dict[str, str] | None = None,
     system_prompt: str = "",
     sandbox_builder=None,
-    enable_http_transport: bool = False,
-    tool_timeout: int = TOOL_CALL_TIMEOUT,
-    external: bool = False,
+    tool_timeout: int = TOOL_CALL_TIMEOUT_CHAT,
     call_tools: bool = False,
     call_ask_back: bool = False,
-    user_role: str = "",
-    scope: str = "user",
     excluded_mcps: set[str] | None = None,
+    model: str = "",
+    web_tools: bool = True,
+    tool_grants: tuple = (),
+    prebuilt_config: tuple | None = None,
+    machine_id: str = "",
 ) -> DirectSession:
     """Create a new direct session with MCP servers started.
 
     Args:
+        model: The session's model (``AgentConfig.model``). Empty: the agent's
+            own, read in a worker thread.
         system_prompt: Pre-built prompt from config_builder (includes user context,
             permissions, MCP skills, dynamic context, etc.). If empty, falls back
             to building a basic prompt from the agent's agent.md persona.
-        enable_http_transport / tool_timeout: the MCP policy for this session
-            (``layer.direct_mcp_policy``) — sidecar HTTP MCPs + the chat
-            call cap for chats, tasks and meetings; stdio-only + 60 s for
-            phone calls.
+        tool_timeout: the per-call cap of the session's tools, the chat's
+            for every kind (a call's too: what a chat connects, a call does).
         call_ask_back: a phone session on an outbound call another agent
             placed: the ask tool joins the call tools.
-        excluded_mcps: the ``mcpServers`` keys the session's builder left
-            out (``AgentConfig.excluded_mcps`` mapped by the layer): the
-            pool starts none of them.
-        user_role / scope: the person's role on the agent and the scope the
-            MCP build judges the manifests' audience with
-            (``layer.audience_gate``), as the session's builder did.
+        excluded_mcps: the ``mcpServers`` keys the pool does not start
+            (``AgentConfig.excluded_mcps`` mapped by the layer).
+        prebuilt_config: the builder's ``(config path, secret bundles)``.
+        machine_id: the compute machine its stdio servers' processes run on.
     """
     if not system_prompt:
         # A caller that passes no prompt gets the agent's basic one (no
         # person, no permission context), built in a worker thread like the
         # builders' prompts.
-        basic_prompt = await asyncio.to_thread(config.build_agent_prompt, agent_name)
+        basic_prompt = await asyncio.to_thread(
+            functools.partial(config.build_agent_prompt, agent_name, session_id=session_id))
         if not basic_prompt:
             raise ValueError(f"Unknown agent: {agent_name}")
         system_prompt = basic_prompt
 
-    # Add datetime context (same as CLI path). The system-prompt time is the
-    # baseline; per-turn injection in run_direct_stream() refreshes it on each
-    # user message so long-lived sessions don't show stale time.
-    _initial_user_tz = get_session_user_tz(session_id)
-    system_prompt = f"Current date and time: {config.format_current_time(_initial_user_tz)}\n\n{system_prompt}"
+    session_model = model or await run_db(_agent_model_or_empty, agent_name)
+
+    # The text carries no time: it would change at every start. The time
+    # rides on the first turn (``start_context.prelude``), and the turns that
+    # take the time line carry it as the other engines' do. The history is
+    # rebuilt from the chat's rows, which hold no riding part: this session
+    # holds none of it.
+    from core.session import start_context
+    start_context.reset(session_id)
 
     # Start MCP servers (pass credential_env so MCPs get their API keys)
     mcp_manager = await mcp_pool.get_or_create(
         session_id, agent_name, phone_mode=phone_mode,
         credential_env=credential_env,
         sandbox_builder=sandbox_builder,
-        enable_http_transport=enable_http_transport,
         tool_timeout=tool_timeout,
-        external=external,
-        user_role=user_role,
-        scope=scope,
         excluded_mcps=excluded_mcps,
+        prebuilt_config=prebuilt_config,
+        machine_id=machine_id,
+        # The programs of the platform's own the session carries.
+        programs=(direct_files.PROGRAM,),
     )
 
     session = DirectSession(
@@ -271,6 +308,9 @@ async def create_direct_session(
         mcp_manager=mcp_manager,
         provider=provider,
         endpoint_url=endpoint_url,
+        model=session_model,
+        web_tools=web_tools,
+        tool_grants=tool_grants,
     )
     if api_key:
         session.api_key = api_key
@@ -410,7 +450,11 @@ async def _reap_idle_direct_pass() -> None:
 
     async with _direct_sessions_lock:
         for sid, session in list(_direct_sessions.items()):
-            if now - session.last_activity > idle_timeout and not has_pending_prompt(sid):
+            # A session whose relayed tools went with their machine goes at
+            # this tick, once no turn holds it.
+            lost = (session.mcp_manager is not None and not session.lock.locked()
+                    and session.mcp_manager.tools_lost())
+            if (now - session.last_activity > idle_timeout or lost) and not has_pending_prompt(sid):
                 to_reap.append(sid)
                 del _direct_sessions[sid]
                 mark_closing(sid)
@@ -421,8 +465,10 @@ async def _reap_idle_direct_pass() -> None:
         # The slot and the seat go with it (this bypasses layer.close_session).
         await reap_session(sid, mcp_pool.close_session)
 
-    # Also reap orphaned MCP managers
-    await mcp_pool.reap_idle(timeout=idle_timeout)
+    # Also reap orphaned MCP managers: one whose session lives is no orphan.
+    async with _direct_sessions_lock:
+        live = frozenset(_direct_sessions)
+    await mcp_pool.reap_idle(timeout=idle_timeout, keep=live)
 
 
 async def reap_idle_direct_sessions() -> None:
@@ -433,6 +479,19 @@ async def reap_idle_direct_sessions() -> None:
             await _reap_idle_direct_pass()
         except Exception as e:  # noqa: BLE001  # the reaper's per-tick step: one failure must not end the reaper
             logger.error("Direct session reaper error: %s", e)
+
+
+def _take_steers(session: DirectSession) -> bool:
+    """The texts typed during this turn join the history as one user message,
+    list-shaped on every provider: the branches that drop a trailing bare
+    user string (an abort, a provider error) must never remove it, while its
+    row stands in the chat. Whether anything was taken."""
+    if not session.steers:
+        return False
+    text = "\n\n".join(session.steers)
+    session.steers.clear()
+    session.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
+    return True
 
 
 _BINARY_PLACEHOLDER_RE = re.compile(r"^\[binary data: [^\]\n]*\]\n?", re.M)
@@ -485,16 +544,17 @@ async def _append_user_message(
     if barge_in_chars is not None and barge_in_chars > 0:
         session.annotate_barge_in(barge_in_chars)
 
-    # Optional per-turn datetime injection (mirrors CLI/Codex). The system
-    # prompt's date is set at session start and goes stale on long sessions.
-    user_text = prompt
+    # The time line where the turn takes it (mirrors CLI/Codex), else the
+    # time rides with the start's data on the first turn.
+    from core.session import start_context
+    user_text = start_context.fence_turn(prompt)
+    now = await run_db_fast(config.format_current_time, get_session_user_tz(session.session_id))
     if inject_time:
-        user_tz = get_session_user_tz(session.session_id)
-        user_text = f"[Current time: {config.format_current_time(user_tz)}]\n\n{prompt}"
-        from core.session import sibling_awareness
-        sibling_line = await sibling_awareness.prelude_line(session.session_id)
-        if sibling_line:
-            user_text = f"{sibling_line}\n\n{user_text}"
+        user_text = f"[Current time: {now}]\n\n{user_text}"
+    start = await start_context.prelude(
+        session.session_id, parallel=inject_time, time_line="" if inject_time else now)
+    if start.prefix:
+        user_text = f"{start.prefix}\n\n{user_text}"
 
     # Build the user message content. With images, attach as content blocks
     # (provider-specific format via adapter); without, keep plain string for
@@ -509,6 +569,7 @@ async def _append_user_message(
         session.messages.append({"role": "user", "content": content_blocks})
     else:
         session.messages.append({"role": "user", "content": user_text})
+    start.started()
 
 
 @dataclass
@@ -518,6 +579,36 @@ class _DirectUsage:
     total: ProviderUsage = field(default_factory=ProviderUsage)
     # Track last API call's usage (for context gauge — avoids double-counting prompt)
     last_call: ProviderUsage = field(default_factory=ProviderUsage)
+
+
+class _TurnCost:
+    """A turn's cost, one stretch per model it ran on. The long-context line
+    stays judged on the whole turn's tokens across its calls, as it has been:
+    judging it per call or per model would change what people are billed, a
+    decision of its own."""
+
+    def __init__(self, adapter: ProviderAdapter) -> None:
+        self._adapter = adapter
+        self._stretches: list[tuple[str, tuple[float, float, float, float], ProviderUsage]] = []
+        self._counted = ProviderUsage()
+
+    def close_stretch(self, model: str, rates: tuple[float, float, float, float],
+                      total: ProviderUsage) -> None:
+        """What ``total`` added since the last stretch ran on ``model``."""
+        was = self._counted
+        self._stretches.append((model, rates, ProviderUsage(
+            input_tokens=total.input_tokens - was.input_tokens,
+            output_tokens=total.output_tokens - was.output_tokens,
+            cache_write_tokens=total.cache_write_tokens - was.cache_write_tokens,
+            cache_read_tokens=total.cache_read_tokens - was.cache_read_tokens,
+            web_search_requests=total.web_search_requests - was.web_search_requests,
+        )))
+        self._counted = replace(total)
+
+    def total(self, turn: ProviderUsage) -> float:
+        line = turn.input_tokens + turn.cache_write_tokens + turn.cache_read_tokens
+        return sum(self._adapter.calculate_cost(model, usage, rates=rates, line_tokens=line)
+                   for model, rates, usage in self._stretches)
 
 
 @dataclass
@@ -669,12 +760,23 @@ async def _stream_call(
             )
         else:
             msg = f"{session.provider} API error: {e.message}"
+        # The relay refuses with its code as the body's `detail` (a vendor's
+        # own error passed through carries `error`); the SDK's error is the
+        # adapter's chained cause. A code with no sentence keeps the text above.
+        from core.layers.providers.openai_adapter import _relay_prefix
+        relay = _relay_prefix()
+        body = getattr(e.__cause__, "body", None)
+        code = body.get("detail") if isinstance(body, dict) else None
+        if relay and (session.endpoint_url or "").startswith(relay) and isinstance(code, str):
+            from services.billing import relay_client
+            msg = relay_client.relay_error_message(code, msg)
         yield {"type": "error", "data": {"message": msg}}
         # Remove dangling user message if no response was generated
         if call.raw_content is None and session.messages and session.messages[-1]["role"] == "user":
             last_content = session.messages[-1].get("content")
             if isinstance(last_content, str):
                 session.messages.pop()
+                _lost_start(session.session_id, last_content)
         call.ended = True
         return
 
@@ -776,9 +878,9 @@ async def _execute_tool_calls(
         )
         results.append({"tool_use_id": tc["id"], "content": content})
         logger.info(
-            "Builtin %s ran in %.2fs "
+            "Builtin %s ran in %.1f ms "
             "(session %s)",
-            tc['name'], time.monotonic() - _t0, session.session_id[:8]
+            tc['name'], (time.monotonic() - _t0) * 1000, session.session_id[:8]
         )
     if approved_calls and session.mcp_manager:
         _t0 = time.monotonic()
@@ -831,6 +933,14 @@ async def _execute_tool_calls(
     return results
 
 
+def _lost_start(session_id: str, content: str) -> None:
+    """A first turn removed unanswered (a provider error, a barge-in) took
+    the start's block with it: the next turn carries every section."""
+    from core.session import start_context
+    if content.startswith(start_context.OPEN):
+        start_context.reset(session_id)
+
+
 def _truncate_context(session: DirectSession, context_used: int, context_window: int) -> int:
     """Drop the oldest messages once the context nears its limit; the
     number dropped (0: nothing)."""
@@ -870,8 +980,17 @@ def _truncate_context(session: DirectSession, context_used: int, context_window:
             session.session_id[:8], dropped, CONTEXT_KEEP_MESSAGES, context_used,
             context_window, context_used * 100 // context_window
         )
+        # The first turn's riding part went with the dropped messages: the
+        # next turn carries it again.
+        from core.session import start_context
+        start_context.reset(session.session_id)
         return dropped
     return 0
+
+
+def _turn_numbers(model: str, provider: str) -> tuple[tuple[float, float, float, float], int]:
+    """A turn's rates and its model's context window. Store reads."""
+    return config.get_model_pricing(model, provider), config.get_model_context_window(model)
 
 
 async def run_direct_stream(
@@ -905,6 +1024,7 @@ async def run_direct_stream(
     turn_start = time.monotonic()
 
     await _append_user_message(session, adapter, prompt, barge_in_chars, inject_time, images)
+    session.steer_open = True
 
     # Emit session event
     yield {"type": "session", "data": {"session_id": session.session_id}}
@@ -931,9 +1051,21 @@ async def run_direct_stream(
     try:
         loop_count = 0
         usage = _DirectUsage()
+        # Read here, never at the turn's end: an await before the metadata
+        # lets a barge-in lose a finished turn's cost and its truncation.
+        turn_model = session.model
+        rates, context_window = await run_db_fast(_turn_numbers, turn_model, adapter.provider_name)
+        costed = _TurnCost(adapter)
 
         while loop_count < MAX_TOOL_LOOPS:
             loop_count += 1
+
+            # A model picked during the tool loop takes effect at this call:
+            # what ran so far is priced at the model that ran it.
+            if session.model != turn_model:
+                costed.close_stretch(turn_model, rates, usage.total)
+                turn_model = session.model
+                rates, context_window = await run_db_fast(_turn_numbers, turn_model, adapter.provider_name)
 
             # Stream via provider adapter
             call = _DirectCall(call_started=time.monotonic())
@@ -989,7 +1121,8 @@ async def run_direct_stream(
                 # Client-side builtins (Read / Write / … — builtins.py) run the
                 # CLI hook's two-pass gate inline: path policy, then the
                 # builtin tier × mode table (Delete asks in Ask, like `rm`).
-                # They execute in-process, never via the MCP manager.
+                # Their handlers run in-process, never via the MCP manager's
+                # batch, and a file tool's handler asks the file program.
                 perm_mode = get_session_mode(session.session_id) or "auto"
                 approved_calls, builtin_calls, denied_calls = await _gate_tool_calls(
                     session, call.tool_calls, perm_mode,
@@ -1018,19 +1151,28 @@ async def run_direct_stream(
                     # the tool result would only be transcript.
                     session.line_closing = False
                     break
+                # A message typed during this call is read here, as the CLI
+                # engines read one at their next tool boundary.
+                _take_steers(session)
                 call.tool_calls = []
                 continue
 
-            # No tool use — done
+            # A message typed after this call's last tool: the next call of
+            # the same turn. No await between this check and the door's
+            # closing below, so an accepted text is never left behind.
+            if _take_steers(session):
+                continue
             break
+
+        session.steer_open = False
 
         # Emit metadata with cost + context + cache stats (per-turn delta)
         # Cost uses accumulated totals across all API calls in the tool loop.
         # Context uses only the LAST API call's tokens — that represents the
         # actual context window usage (system prompt + tools + full history).
         # Accumulated totals would double-count the system prompt on each tool loop.
-        cost_usd = adapter.calculate_cost(session.model, usage.total)
-        context_window = config.get_model_context_window(session.model)
+        costed.close_stretch(turn_model, rates, usage.total)
+        cost_usd = costed.total(usage.total)
         context_used = (
             usage.last_call.input_tokens
             + usage.last_call.cache_read_tokens
@@ -1068,10 +1210,12 @@ async def run_direct_stream(
 
     except asyncio.CancelledError:
         # Barge-in: generator was cancelled
+        session.steers.clear()
         if session.messages and session.messages[-1]["role"] == "user":
             last_content = session.messages[-1].get("content")
             if isinstance(last_content, str):
                 session.messages.pop()
+                _lost_start(session.session_id, last_content)
         raise
 
     except Exception as e:
@@ -1079,4 +1223,8 @@ async def run_direct_stream(
         yield {"type": "error", "data": {"message": str(e)}}
 
     finally:
+        # Every exit shuts the door. What it left waiting (the tool loop's
+        # cap, a provider error) is read with the next turn.
+        session.steer_open = False
+        _take_steers(session)
         session.touch()

@@ -1,4 +1,4 @@
-<p class="muted">A section only some roles see. Mark it with the lowest role that may use it. The page hides it from everyone below, with one line that says so. Use it for an owner's settings on a public page, or a manager's view inside a team app. Hiding is a courtesy to the reader. The platform still refuses a call the role may not make. The app's own code checks the role on every change too. A link visitor is always a viewer, so the page asks nothing there.</p>
+<p class="muted">A section only some roles see. Mark it with the lowest role that may use it. The page hides it from everyone below, with one line that says so. Use it for an owner's settings on a public page, or a manager's view inside a team app. Hiding is a courtesy to the reader. The platform still refuses a call the role may not make. The app's own code checks the role on every change too. A link visitor is an outside person and sees no role section, so the page asks nothing there.</p>
 
 <div class="card">
   <h3>Bookings</h3>
@@ -42,8 +42,8 @@
     if (lowest !== null) note.textContent = 'More appears here for ' + WORDS[RANK[lowest]] + ' of this agent.'
   }
   // The viewer's role comes from the platform when the page is opened as an
-  // app. A link visitor and a page outside an app count as a viewer, and
-  // a link page never asks the platform.
+  // app. A link visitor (an outside person, below every member) and a page
+  // outside an app see the least, and a link page never asks the platform.
   if (window.otodock && typeof otodock.platform === 'function' && !otodock.sharedLink) {
     otodock.platform('viewer.me').then(function (me) { apply(me && me.role ? String(me.role) : 'viewer') }, function () { apply('viewer') })
   } else {

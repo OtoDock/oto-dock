@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 
 import config
 from auth.providers import UserContext, get_current_user
-from services.mcp import mcp_manifest_parse, mcp_registry
+from services.mcp import mcp_manifest_parse, mcp_manifest_store, mcp_registry
 from services.oauth import (
     credential_resolver,
     mcp_authorization as ma,
@@ -104,7 +104,7 @@ def rig(monkeypatch, tmp_path, person):
     sub, username = person
     monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", DASH)
     monkeypatch.setattr(config, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     from auth import oauth_providers
     oauth_providers.clear_manifest_cache()
     ma.clear_caches()
@@ -146,7 +146,7 @@ def rig(monkeypatch, tmp_path, person):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data))
         m = mcp_manifest_parse._parse_manifest(path)
-        mcp_registry._manifests[m.name] = m
+        mcp_manifest_store._manifests[m.name] = m
         oauth_providers.clear_manifest_cache()
         return m
     manifest = install(_manifest_data())

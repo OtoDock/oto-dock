@@ -202,7 +202,7 @@ def test_verify_bearer_updates_last_used(temp_db):
 
 def test_create_user_key_returns_raw(temp_db):
     from services.infra import api_key_manager as akm
-    row, raw = akm.create_user_key(
+    row, raw = akm.create_user_key(expires_in_days=30, 
         user_sub="user-test", name="Personal", permissions=["triggers"],
     )
     assert raw.startswith("otok_")
@@ -212,7 +212,7 @@ def test_create_user_key_returns_raw(temp_db):
 def test_verify_bearer_for_user_accepts_valid(temp_db):
     from services.infra import api_key_manager as akm
     _seed_user_with_username("user-alice", "alice")
-    _, raw = akm.create_user_key(
+    _, raw = akm.create_user_key(expires_in_days=30, 
         user_sub="user-alice", name="Personal", permissions=["triggers"],
     )
     matched = akm.verify_bearer_for_user(f"Bearer {raw}", username="alice")
@@ -223,7 +223,7 @@ def test_verify_bearer_for_user_rejects_wrong_username(temp_db):
     from services.infra import api_key_manager as akm
     _seed_user_with_username("user-alice", "alice")
     _seed_user_with_username("user-bob", "bob")
-    _, raw = akm.create_user_key(
+    _, raw = akm.create_user_key(expires_in_days=30, 
         user_sub="user-alice", name="Personal", permissions=["triggers"],
     )
     with pytest.raises(akm.KeyMismatch) as e:
@@ -243,7 +243,7 @@ def test_verify_bearer_for_user_rejects_master(temp_db):
 def test_verify_bearer_for_user_rejects_unknown_username(temp_db):
     """User key for nonexistent username → scope mismatch (don't leak user-existence)."""
     from services.infra import api_key_manager as akm
-    _, raw = akm.create_user_key(
+    _, raw = akm.create_user_key(expires_in_days=30, 
         user_sub="user-alice", name="P", permissions=["triggers"],
     )
     with pytest.raises(akm.KeyMismatch) as e:
@@ -262,8 +262,8 @@ def test_verify_bearer_for_user_accepts_a_display_name_address(temp_db):
     with get_conn() as conn:
         conn.execute("UPDATE users SET name='alice' WHERE sub='user-bob'")
         conn.commit()
-    _, bob_raw = akm.create_user_key(user_sub="user-bob", name="P", permissions=["triggers"])
-    _, alice_raw = akm.create_user_key(user_sub="user-alice", name="P", permissions=["triggers"])
+    _, bob_raw = akm.create_user_key(expires_in_days=30, user_sub="user-bob", name="P", permissions=["triggers"])
+    _, alice_raw = akm.create_user_key(expires_in_days=30, user_sub="user-alice", name="P", permissions=["triggers"])
     assert akm.verify_bearer_for_user(f"Bearer {bob_raw}", username="alice")["user_sub"] == "user-bob"
     assert akm.verify_bearer_for_user(f"Bearer {alice_raw}", username="alice")["user_sub"] == "user-alice"
     with pytest.raises(akm.KeyMismatch) as e:
@@ -287,7 +287,7 @@ def test_agent_key_does_not_authorize_user_webhook(temp_db):
 def test_user_key_does_not_authorize_agent_webhook(temp_db):
     """Reverse: user key on agent URL must reject."""
     from services.infra import api_key_manager as akm
-    _, user_raw = akm.create_user_key(
+    _, user_raw = akm.create_user_key(expires_in_days=30, 
         user_sub="user-alice", name="P", permissions=["triggers"],
     )
     with pytest.raises(akm.KeyMismatch) as e:
@@ -306,12 +306,10 @@ def test_validate_user_permissions_rejects_unknown(temp_db):
         akm.validate_user_permissions(["triggers", "made-up"])
 
 
-def test_validate_user_permissions_rejects_disabled_in_v1(temp_db):
+def test_validate_user_permissions_takes_every_scope_of_2_0(temp_db):
     from services.infra import api_key_manager as akm
-    # 'chat' is in ALL_USER_PERMISSIONS but not ENABLED_USER_PERMISSIONS_V1
-    with pytest.raises(ValueError) as e:
-        akm.validate_user_permissions(["chat"])
-    assert "v1" in str(e.value).lower() or "supported" in str(e.value).lower()
+    assert akm.validate_user_permissions(["chat", "tasks", "files", "notifications", "triggers"]) \
+        == ["chat", "tasks", "files", "notifications", "triggers"]
 
 
 def test_validate_user_permissions_canonicalises(temp_db):
@@ -404,7 +402,7 @@ def test_a_webhook_address_carries_the_username_and_the_display_name_still_resol
         conn.commit()
     assert notification_store.resolve_sub_to_display_name("sub-dev-admin") == "Dimi"
     assert notification_store.resolve_sub_to_username("sub-dev-admin") == "dev-admin"
-    _row, raw = akm.create_user_key(user_sub="sub-dev-admin", name="hook", permissions=["triggers"])
+    _row, raw = akm.create_user_key(expires_in_days=30, user_sub="sub-dev-admin", name="hook", permissions=["triggers"])
     assert akm.verify_bearer_for_user(f"Bearer {raw}", username="dev-admin")["user_sub"] == "sub-dev-admin"
     assert akm.verify_bearer_for_user(f"Bearer {raw}", username="Dev Admin")["user_sub"] == "sub-dev-admin"
 
@@ -446,14 +444,86 @@ def test_user_key_routes_run_off_the_loop(temp_db, monkeypatch):
     app.dependency_overrides[get_current_user] = _me
     try:
         client = TestClient(app)
-        created = client.post("/v1/user-api-keys", json={"name": "Personal"})
+        created = client.post("/v1/user-api-keys", json={"name": "Personal", "expires_in_days": 30})
         assert created.status_code == 200, created.text
         key_id = created.json()["id"]
         listed = client.get("/v1/user-api-keys")
         assert [k["id"] for k in listed.json()["keys"]] == [key_id]
         assert client.delete(f"/v1/user-api-keys/{key_id}").json() == {
-            "status": "revoked", "id": key_id}
+            "status": "revoked", "id": key_id, "created": [], "created_total": 0}
         assert client.delete(f"/v1/user-api-keys/{key_id}").json()["status"] == "already_revoked"
         assert client.delete("/v1/user-api-keys/no-such-key").status_code == 404
     finally:
         app.dependency_overrides.pop(get_current_user, None)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# A key's standing on the webhook fire
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _past(seconds: int) -> str:
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+
+
+def test_an_expired_key_and_the_switch_stop_a_fire_and_a_pre_2_0_key_lives_on(temp_db):
+    from services.infra import api_key_manager as akm
+    from storage import database as task_store
+    from storage.identity import api_key_store
+    from storage.pg import get_conn
+    _seed_user_with_username("user-alice", "alice")
+    _, raw = akm.create_user_key(expires_in_days=30, user_sub="user-alice", name="P",
+                                 permissions=["triggers"])
+    auth = f"Bearer {raw}"
+    assert akm.verify_bearer_for_user(auth, username="alice")["user_sub"] == "user-alice"
+    with get_conn() as conn:
+        conn.execute("UPDATE user_api_keys SET expires_at=%s", (_past(1),))
+    with pytest.raises(akm.KeyMismatch) as e:
+        akm.verify_bearer_for_user(auth, username="alice")
+    assert e.value.code == "standing"
+
+    # A key from before keys had an expiry: no expiry, and a password change
+    # does not end it. The install's switch does.
+    raw2, prefix = akm._generate_raw_key()
+    api_key_store.create_user_api_key(user_sub="user-alice", name="old", prefix=prefix,
+                                      key_hash=akm._hash_key(raw2), permissions=["triggers"])
+    task_store.set_user_password("user-alice", "x")
+    assert akm.verify_bearer_for_user(f"Bearer {raw2}", username="alice")
+    task_store.set_platform_setting(akm.KEYS_OFF_SETTING, "1")
+    akm.clear_keys_off_cache()
+    try:
+        with pytest.raises(akm.KeyMismatch):
+            akm.verify_bearer_for_user(f"Bearer {raw2}", username="alice")
+    finally:
+        task_store.set_platform_setting(akm.KEYS_OFF_SETTING, "0")
+        akm.clear_keys_off_cache()
+
+
+def test_a_new_keys_row_says_what_it_reaches_and_its_expiry(temp_db):
+    from services.infra import api_key_manager as akm
+    from storage.identity import api_key_store
+    row, _ = akm.create_user_key(user_sub="user-x", name="P", permissions=["chat"],
+                                 agents=["b", "a", "a"], expires_in_days=2,
+                                 run_without_asking=True)
+    assert api_key_store.parse_agents(row["agents"]) == ["a", "b"]
+    assert row["expires_at"] > datetime.now(timezone.utc).isoformat()
+    assert row["run_without_asking"] is True
+    with pytest.raises(ValueError):
+        akm.create_user_key(user_sub="user-x", name="P", permissions=["chat"], expires_in_days=0)
+    with pytest.raises(ValueError):
+        akm.create_user_key(user_sub="user-x", name=" ", permissions=["chat"], expires_in_days=1)
+
+
+def test_a_deleted_persons_keys_take_their_requests_and_what_they_made(temp_db):
+    from services.infra import api_key_manager as akm
+    from storage.identity import api_key_store
+    row, _ = akm.create_user_key(user_sub="user-x", name="P", permissions=["chat"],
+                                 expires_in_days=2)
+    assert api_key_store.claim_key_request(row["id"], "r1", "c1") is None
+    assert api_key_store.claim_key_request(row["id"], "r1", "c1")["chat_id"] == "c1"
+    api_key_store.record_key_created(row["id"], "chat", "c1", label="A chat", agent="a")
+    assert api_key_store.key_created(row["id"])[1] == 1
+    assert api_key_store.cleanup_user_api_keys("user-x") == 1
+    assert api_key_store.key_created(row["id"]) == ([], 0)
+    assert api_key_store.claim_key_request(row["id"], "r1", "c1") is None

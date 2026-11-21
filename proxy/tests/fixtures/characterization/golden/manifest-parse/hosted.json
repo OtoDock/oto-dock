@@ -1,0 +1,49 @@
+{
+ "absent": {
+  "parsed": null
+ },
+ "bad oauth mode": {
+  "refused": "char-mcp: invalid hosted block — hosted.oauth_app.default_mode must be 'self_managed' or 'hosted', got 'disabled'"
+ },
+ "bad relay mode": {
+  "refused": "char-mcp: invalid hosted block — hosted.api_key_relay.default_mode must be 'self_managed' or 'hosted', got 'x'"
+ },
+ "both": {
+  "parsed": {
+   "api_key_relay": {
+    "available": true,
+    "billing_setup_url": "https://billing.test",
+    "default_mode": "self_managed",
+    "min_balance_to_enable_usd": 5.0,
+    "relay_path": "/relay/char"
+   },
+   "oauth_app": {
+    "available": true
+   }
+  }
+ },
+ "empty": {
+  "parsed": null
+ },
+ "neither block": {
+  "parsed": null
+ },
+ "not an object": {
+  "refused": "char-mcp: invalid hosted block — hosted must be an object, got str"
+ },
+ "oauth not an object": {
+  "refused": "char-mcp: invalid hosted block — hosted.oauth_app must be an object"
+ },
+ "relay file delivery": {
+  "refused": "char-mcp: invalid hosted block — hosted.api_key_relay is only supported for MCPs whose instances use delivery='env' (config_file would write raw field_values to disk and bypass the relay)"
+ },
+ "relay no instances": {
+  "refused": "char-mcp: invalid hosted block — hosted.api_key_relay is only supported for MCPs whose instances use delivery='env' (config_file would write raw field_values to disk and bypass the relay)"
+ },
+ "relay no path": {
+  "refused": "char-mcp: invalid hosted block — hosted.api_key_relay.available requires a non-empty relay_path"
+ },
+ "relay not an object": {
+  "refused": "char-mcp: invalid hosted block — hosted.api_key_relay must be an object"
+ }
+}

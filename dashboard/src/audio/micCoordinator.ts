@@ -8,11 +8,15 @@
 // wake stream during duplex would double-capture the room.
 //
 // Duplex and dictation register here while active; the wake listener
-// subscribes and pauses whenever any owner is present.
+// subscribes and pauses whenever any owner is present. The wake listener
+// notes its own capture instead (noteCapture): it never owns the mic, and
+// the playback session (playbackSession.ts) must still know a microphone
+// is open or opening.
 
 type Listener = () => void
 
 const owners = new Set<string>()
+const captures = new Set<string>()
 const listeners = new Set<Listener>()
 let lastReleased = ''
 
@@ -43,6 +47,20 @@ export function lastReleasedMicOwner(): string {
 
 export function micBusy(): boolean {
   return owners.size > 0
+}
+
+/** A capture that runs without owning the mic: noted from just before its
+ * microphone opens until its tracks stop. */
+export function noteCapture(name: string, live: boolean): void {
+  if (captures.has(name) === live) return
+  if (live) captures.add(name)
+  else captures.delete(name)
+  emit()
+}
+
+/** A microphone is open or opening: an owner holds it, or a capture is noted. */
+export function captureLive(): boolean {
+  return owners.size > 0 || captures.size > 0
 }
 
 export function subscribeMic(cb: Listener): () => void {

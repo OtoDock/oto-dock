@@ -1,0 +1,185 @@
+{
+ "chats": [
+  {
+   "agent": "warm-reapply-edges",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "dontAsk",
+   "rows": [],
+   "session_id": "sid-edge",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  },
+  {
+   "agent": "warm-reapply-edges",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "plan",
+   "rows": [],
+   "session_id": "sid-refused",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [
+   [
+    "sid-edge",
+    "plan"
+   ],
+   [
+    "sid-edge",
+    "dontAsk"
+   ]
+  ],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [],
+  "started": []
+ },
+ "reapplied": {
+  "another_chats_pick": {
+   "left": [
+    "ask",
+    "",
+    "another-chat"
+   ],
+   "row": {
+    "model": "test-model",
+    "permission_mode": "dontAsk"
+   },
+   "sent": []
+  },
+  "engine_refuses": {
+   "left": [
+    "",
+    "",
+    ""
+   ],
+   "row": {
+    "model": "test-model",
+    "permission_mode": "plan"
+   },
+   "sent": [
+    {
+     "mode": "plan",
+     "type": "mode_changed"
+    },
+    {
+     "model": "test-model",
+     "type": "model_changed"
+    }
+   ]
+  },
+  "foreign_model_dropped": {
+   "left": [
+    "",
+    "",
+    ""
+   ],
+   "row": {
+    "model": "test-model",
+    "permission_mode": "ask"
+   },
+   "sent": []
+  },
+  "new_chat_pick_on_a_turn_start": {
+   "left": [
+    "dontAsk",
+    "",
+    ""
+   ],
+   "row": {
+    "model": "test-model",
+    "permission_mode": "ask"
+   },
+   "sent": []
+  },
+  "new_chat_pick_on_a_warmup": {
+   "left": [
+    "",
+    "",
+    ""
+   ],
+   "row": {
+    "model": "test-model",
+    "permission_mode": "dontAsk"
+   },
+   "sent": [
+    {
+     "mode": "dontAsk",
+     "type": "mode_changed"
+    }
+   ]
+  },
+  "not_the_bound_chat": {
+   "left": [
+    "ask",
+    "",
+    "<id1>"
+   ],
+   "row": {
+    "model": "test-model",
+    "permission_mode": "dontAsk"
+   },
+   "sent": []
+  },
+  "own_chat_pick": {
+   "left": [
+    "",
+    "",
+    ""
+   ],
+   "row": {
+    "model": "test-model",
+    "permission_mode": "plan"
+   },
+   "sent": [
+    {
+     "mode": "plan",
+     "type": "mode_changed"
+    }
+   ]
+  },
+  "own_chat_pick_the_row_moved_since": {
+   "left": [
+    "",
+    "",
+    ""
+   ],
+   "row": {
+    "model": "test-model",
+    "permission_mode": "ask"
+   },
+   "sent": []
+  },
+  "session_dead": {
+   "left": [
+    "ask",
+    "",
+    "<id1>"
+   ],
+   "row": {
+    "model": "test-model",
+    "permission_mode": "dontAsk"
+   },
+   "sent": []
+  }
+ },
+ "slots": {
+  "acquired": [],
+  "released": []
+ }
+}

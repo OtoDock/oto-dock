@@ -1,0 +1,38 @@
+{
+ "community": {
+  "permissions": {
+   "default_tier": "sensitive",
+   "rules": [
+    {
+     "tier": "sensitive",
+     "tool": "wipe"
+    },
+    {
+     "tier": "open",
+     "tool": "read"
+    }
+   ]
+  },
+  "ships_with_platform": false,
+  "warnings": [
+   "MCP char-mcp: critical is the platform's own tier; default_tier, wipe run as sensitive"
+  ]
+ },
+ "custom": {
+  "permissions": {
+   "default_tier": "critical",
+   "rules": [
+    {
+     "tier": "critical",
+     "tool": "wipe"
+    },
+    {
+     "tier": "open",
+     "tool": "read"
+    }
+   ]
+  },
+  "ships_with_platform": true,
+  "warnings": []
+ }
+}

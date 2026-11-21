@@ -30,6 +30,7 @@ from services.cards.actions import (
     quoted,
     sentence,
 )
+from services.departments import assignment
 from storage.agents import db_departments
 
 CREATORS_ONLY = "Only admins and creators create departments."
@@ -102,9 +103,8 @@ CREATE_DEPARTMENT = Action(
 
 def _may_set(u, dept: dict) -> bool:
     # The route's rule (assignment.can_edit_department) refuses a session
-    # bearer outright; the draw spells it on the person the bearer names.
-    return bool(u.is_admin or (roles.is_creator_or_above(u.role) and dept.get("created_by_sub")
-                               and dept["created_by_sub"] == (u.acting_sub or "")))
+    # bearer outright; the draw reads it on the person the bearer names.
+    return assignment.created_department(u, dept)
 
 
 async def _set_words(params: dict[str, Any], u) -> dict[str, str]:

@@ -108,7 +108,7 @@ class TestManifestSanity:
         assert tiers["search_community_agents"] == tiers["list_departments"] == tiers["check_card"] == "open"
         assert tiers["propose_install"] == tiers["propose_department_install"] == tiers["propose_move"] == "standard"
         assert "create_agent" not in tiers and manifest["permissions"]["default_tier"] == "sensitive"
-        assert manifest["version"] == "1.3.2"
+        assert manifest["version"] == "1.3.4"
 
 
 class TestCards:
@@ -343,14 +343,14 @@ class TestEngines:
     hand only, the model ids with their tiers and never the empty System
     Default; an engines read that fails leaves the rest of the listing."""
 
-    _LAYERS = {
+    _ENGINES = {
         "direct-llm": {"configured": True, "identity": {"role": "supporting", "sort_order": 30},
                        "models": [{"value": "", "label": "System Default"},
                                   {"value": "claude-haiku-5-5", "tier_label": "fast"}]},
         "codex-cli": {"configured": False, "identity": {"role": "coding", "sort_order": 20},
                       "models": [{"value": ""}, {"value": "gpt-6.1-sol", "tier_label": "strong"}]},
         "claude-code-cli": {"configured": True, "identity": {"role": "coding", "sort_order": 10},
-                            "models": [{"value": ""}, {"value": "claude-fable-5-1", "tier_label": "frontier"},
+                            "models": [{"value": ""}, {"value": "claude-fable-5-2", "tier_label": "frontier"},
                                        {"value": "claude-opus-5-5"}]},
     }
 
@@ -359,13 +359,13 @@ class TestEngines:
         retries = TestRetries()
         mod = retries._mod()
         calls = retries._serve(monkeypatch, mod, (200, {"mcps": [], "agent_slugs": ["a"]}),
-                               (200, self._LAYERS))
+                               (200, self._ENGINES))
         text = asyncio.run(mod._tool_list_building_blocks())
         assert calls[1].endswith("/v1/execution-layers")
         section = text.split("# Engines a task pin may name", 1)[1].split("# Slugs already taken")[0]
         rows = [line for line in section.splitlines() if line.startswith("| `")]
         assert rows == [
-            "| `claude-code-cli` | yes | yes | `claude-fable-5-1` (frontier), `claude-opus-5-5` |",
+            "| `claude-code-cli` | yes | yes | `claude-fable-5-2` (frontier), `claude-opus-5-5` |",
             "| `codex-cli` | yes | no | `gpt-6.1-sol` (strong) |",
             "| `direct-llm` | no — enabled by hand only | yes | `claude-haiku-5-5` (fast) |",
         ]

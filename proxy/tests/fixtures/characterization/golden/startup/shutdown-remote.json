@@ -1,0 +1,26 @@
+{
+ "logged": [
+  [
+   "info",
+   "Shutdown: leaving remote claude-i open for re-adoption (idle)"
+  ],
+  [
+   "info",
+   "Shutdown: leaving remote claude-t open for re-adoption (mid-turn)"
+  ],
+  [
+   "info",
+   "Shutdown: leaving remote codex-id open for re-adoption (idle)"
+  ],
+  [
+   "warning",
+   "Shutdown: Remote fails-1 error: the close failed"
+  ]
+ ],
+ "order": [
+  "close direct-1",
+  "close other-1",
+  "close unrecorded",
+  "close fails-1"
+ ]
+}

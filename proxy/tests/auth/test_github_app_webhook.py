@@ -6,8 +6,11 @@ refusals before the body, the signature against the app secret and its
 re-read after a rotation, the routing by installation, the dedup by
 delivery id, every lifecycle action with its confirmation, the forwarded
 path (OtoDock's hosted app) re-listing the accounts a delivery touches
-instead of applying its body, subscribing on an installation with no
-vendor call, the catalog's answer, and the route matrix.
+instead of applying its body, an installation deleted at GitHub taking the
+rows of agents' own sets that act as it out through the one remover,
+subscribing on an installation with no vendor call, a service subscription
+resolving through its own account of the agent's set, the catalog's answer,
+and the route matrix.
 
 Uses the connect rig (tests/auth/test_github_app_connect.py) with its
 webhooks block and the connected GitHub-App account.
@@ -28,7 +31,11 @@ from services.oauth import github_apps
 from services.webhooks import subscription_manager, webhook_dispatcher
 from storage import database as task_store
 from storage.automation import trigger_store, webhook_subscription_store
-from storage.identity import credential_store, oauth_app_kinds as kinds
+from storage.identity import (
+    credential_store,
+    oauth_app_kinds as kinds,
+    service_account_set,
+)
 from storage.pg import get_conn
 from tests.auth.test_github_app_connect import (  # noqa: F401 (fixtures)
     MCP,
@@ -107,17 +114,77 @@ def _meta(hook):
     return credential_store.get_account_meta(hook.sub, MCP, "alice")
 
 
-def _bind_hosted_agent(env, monkeypatch, *, subscribe=True) -> str:
-    """The hosted account bound as the agent's identity (the account
-    itself: hosted sign-in has no installation identity), and with
-    ``subscribe`` the agent's subscription on installation 10."""
+async def _background_done(owner: str = "github-app") -> None:
+    """The background work a delivery left behind it, finished."""
+    from core import background
+    await asyncio.gather(*background.running(owner))
+
+
+def _notes(chat_id: str) -> list[str]:
+    return [json.loads(m["event_data"]).get("message", "") for m in task_store.get_chat_messages(chat_id)
+            if m.get("event_type") == "system"]
+
+
+def _add_svc(env, **body):
+    """Add one of the person's accounts (``alice`` unless named) to the
+    agent's own set, through the set's add route."""
+    return env.client.put(f"/v1/agents/{AGENT}/mcps/{MCP}/service-accounts",
+                          json={"account_label": "alice", **body})
+
+
+def _set_of() -> list[tuple[str, str, bool]]:
+    return [(r.account_label, r.installation_id, r.is_default)
+            for r in service_account_set.list_service_agent_set(MCP, AGENT, standing_only=False)]
+
+
+def _manage(env, monkeypatch) -> None:
+    """The person manages the agent (the set's routes see an admin) and the
+    tool is visible to it."""
     env.holder["role"] = "admin"
     task_store.add_user_agent(env.sub, AGENT, "manager", "test")
     from services.mcp import mcp_registry
     manifest = mcp_registry.get_manifest(MCP)
     monkeypatch.setattr(mcp_registry, "get_visible_mcps_for_agent", lambda agent: [manifest])
-    resp = env.client.put(f"/v1/agents/{AGENT}/mcps/{MCP}/service-binding",
-                          json={"account_label": "alice", "installation_id": ""})
+
+
+def _tool() -> str:
+    from services.mcp import mcp_registry
+    return getattr(mcp_registry.get_manifest(MCP), "label", "") or MCP
+
+
+@pytest.fixture
+def bob(hook):
+    """A second person who manages the agent and holds ``bob``, a GitHub-App
+    account that owns installation 10."""
+    from types import SimpleNamespace
+    sub = f"test-user-{uuid.uuid4().hex[:12]}"
+    name = f"u{uuid.uuid4().hex[:8]}"
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO users (sub, email, name, username, role, auth_provider, created_at, last_login) "
+            "VALUES (%s, %s, 'Bob', %s, 'creator', 'local', NOW()::text, NOW()::text)",
+            (sub, f"{name}@test.example", name))
+        conn.commit()
+    credential_store.set_user_credentials(sub, MCP, {"GITHUB_EMAIL": "bob"}, account_label="bob")
+    credential_store.set_account_meta(sub, MCP, "bob", {
+        "kind": kinds.KIND_GITHUB_APP, "login": "bob", "user_id": 2,
+        "installations": [{**_inst(10), "admin": True, "repositories": []}]})
+    task_store.add_user_agent(sub, AGENT, "manager", "test")
+    yield SimpleNamespace(sub=sub, username=name)
+    with get_conn() as conn:
+        conn.execute("DELETE FROM service_agent_bindings WHERE account_owner_sub=%s", (sub,))
+        conn.execute("DELETE FROM user_credentials WHERE user_sub=%s", (sub,))
+        conn.execute("DELETE FROM user_credential_accounts WHERE user_sub=%s", (sub,))
+        conn.execute("DELETE FROM users WHERE sub=%s", (sub,))
+        conn.commit()
+
+
+def _add_hosted_to_agent(env, monkeypatch, *, subscribe=True) -> str:
+    """The hosted account added to the agent's own set as the account
+    itself (hosted sign-in has no installation identity), and with
+    ``subscribe`` the agent's subscription on installation 10 through it."""
+    _manage(env, monkeypatch)
+    resp = _add_svc(env, installation_id="")
     assert resp.status_code == 200, resp.text
     if not subscribe:
         return ""
@@ -254,8 +321,7 @@ class TestLifecycle:
         monkeypatch.setattr(mcp_registry, "get_visible_mcps_for_agent", lambda agent: [manifest])
         hook.fake.routes[("POST", "/app/installations/10/access_tokens")] = (201, {
             "token": "ghs_x", "expires_at": "2099-01-01T00:00:00Z"})
-        assert hook.client.put(f"/v1/agents/{AGENT}/mcps/{MCP}/service-binding",
-                               json={"account_label": "alice", "installation_id": "10"}).status_code == 200
+        assert _add_svc(hook, installation_id="10").status_code == 200
         assert _subscribe(hook).status_code == 200
         assert _subscribe(hook, scope="service", agent=AGENT).status_code == 200
         path = github_apps.installation_file(PROVIDER, 10)
@@ -265,11 +331,55 @@ class TestLifecycle:
         _deliver(hook, "installation", {"action": "deleted", "installation": _inst(10), "sender": {"id": 1}}, delivery_id="x-1")
         assert [i["id"] for i in _meta(hook)["installations"]] == [10]
         del hook.fake.routes[("GET", "/app/installations/10")]      # the fake's default: 404
-        _deliver(hook, "installation", {"action": "deleted", "installation": _inst(10), "sender": {"id": 1}}, delivery_id="x-2")
+        # One loop across the delivery: the agent's row goes behind the answer.
+        with hook.client as client:
+            _deliver(hook, "installation", {"action": "deleted", "installation": _inst(10), "sender": {"id": 1}},
+                     delivery_id="x-2")
+            client.portal.call(_background_done)
         assert _meta(hook)["installations"] == []
         assert credential_store.get_service_agent_binding(MCP, AGENT) is None
         assert webhook_subscription_store.list_subscriptions(mcp_name=MCP) == []
         assert not path.exists()
+
+    def test_a_deleted_installation_takes_its_row_out_through_the_remover(self, hook, monkeypatch):
+        """The set's default acts as installation 10, a second account as
+        itself. GitHub's deletion names the agent's set for the remover,
+        which takes the row of 10 out: the chat that chose it is told, the
+        other account becomes the default and stays."""
+        from services.mcp import mcp_registry
+        from services.oauth import github_app_lifecycle
+        from services.remote import chat_reload
+        _manage(hook, monkeypatch)
+        hook.fake.routes[("POST", "/app/installations/10/access_tokens")] = (201, {
+            "token": "ghs_x", "expires_at": "2099-01-01T00:00:00Z"})
+        _connect(hook, label="work")
+        assert _add_svc(hook, installation_id="10").status_code == 200
+        assert _add_svc(hook, account_label="work").status_code == 200
+        chat = str(uuid.uuid4())
+        task_store.create_chat(chat, hook.sub, AGENT)
+        try:
+            assert service_account_set.set_chat_service_choice(chat, AGENT, MCP, "alice")
+            calls: list[tuple] = []
+            real = chat_reload.remove_service_account
+
+            async def remover(mcp_name, agent_name, **kw):
+                calls.append((mcp_name, agent_name, kw))
+                return await real(mcp_name, agent_name, **kw)
+            monkeypatch.setattr(chat_reload, "remove_service_account", remover)
+            detached: list[tuple[str, str]] = []
+            body = {"action": "deleted", "installation": _inst(10), "sender": {"id": 1}}
+            assert github_app_lifecycle.apply(
+                PROVIDER, mcp_registry.get_manifest(MCP), "installation", body, installation_id="10", confirm=True,
+                detached=detached) == github_app_lifecycle.APPLIED
+            assert detached == [(MCP, AGENT)] and calls == []
+            assert _set_of() == [("alice", "10", True), ("work", "", False)]     # left to the remover
+            asyncio.run(webhook_dispatcher._take_out_detached(detached, "10"))
+            assert calls == [(MCP, AGENT, {"installation_id": "10"})]
+            assert _set_of() == [("work", "", True)]
+            assert service_account_set.get_chat_service_choices(chat) == {}
+            assert [n for n in _notes(chat) if "was removed from the agent" in n and "now uses work" in n]
+        finally:
+            task_store.delete_chat(chat)
 
     def test_a_revoked_authorization_marks_the_token_file(self, hook):
         _deliver(hook, "github_app_authorization", {"action": "revoked", "sender": {"id": 1, "login": "alice"}}, delivery_id="a-1")
@@ -509,7 +619,7 @@ class TestForwarded:
         monkeypatch.setattr(webhook_subscription_store, "list_subscriptions", lambda **kw: [])
         order: list[tuple[str, int]] = []
 
-        def apply(provider_id, manifest, event_type, body, *, installation_id, confirm):
+        def apply(provider_id, manifest, event_type, body, *, installation_id, confirm, detached=None):
             assert confirm is False
             order.append(("start", body["n"]))
             time.sleep(0.3 if body["n"] == 1 else 0)
@@ -590,41 +700,74 @@ class TestSubscribing:
         assert resp.json()["fired"] == 0 and len(hook.fired) == 1
         assert resp.json()["results"][0]["skipped"] == kinds.INSTALLATION_NOT_OWNED
 
-    def test_a_service_row_stops_with_its_binding(self, hook, monkeypatch):
-        hook.holder["role"] = "admin"
-        task_store.add_user_agent(hook.sub, AGENT, "manager", "test")
-        from services.mcp import mcp_registry
-        manifest = mcp_registry.get_manifest(MCP)
-        monkeypatch.setattr(mcp_registry, "get_visible_mcps_for_agent", lambda agent: [manifest])
+    def test_a_service_row_stops_with_its_account(self, hook, monkeypatch):
+        _manage(hook, monkeypatch)
         hook.fake.routes[("POST", "/app/installations/10/access_tokens")] = (201, {"token": "ghs_x", "expires_at": "2099-01-01T00:00:00Z"})
-        assert hook.client.put(f"/v1/agents/{AGENT}/mcps/{MCP}/service-binding",
-                               json={"account_label": "alice", "installation_id": "10"}).status_code == 200
+        assert _add_svc(hook, installation_id="10").status_code == 200
         row = _subscribe(hook, "10", scope="service", agent=AGENT).json()
         _trigger_for(monkeypatch, row["id"])
         assert _deliver(hook, "issues", _issue_body(10)).json()["fired"] == 1
         credential_store.remove_service_agent_binding(MCP, AGENT)
         resp = _deliver(hook, "issues", _issue_body(10))
-        assert resp.json()["fired"] == 0 and resp.json()["results"][0]["skipped"] == "not the agent's bound installation"
+        assert resp.json()["fired"] == 0 and resp.json()["results"][0]["skipped"] == "not covered by the agent's account"
 
-    def test_a_service_subscription_is_tied_to_the_binding(self, hook, monkeypatch):
-        hook.holder["role"] = "admin"
-        task_store.add_user_agent(hook.sub, AGENT, "manager", "test")
-        from services.mcp import mcp_registry
-        manifest = mcp_registry.get_manifest(MCP)
-        monkeypatch.setattr(mcp_registry, "get_visible_mcps_for_agent", lambda agent: [manifest])
+    def test_a_service_subscription_is_tied_to_its_account(self, hook, monkeypatch):
+        """A service subscription names one account of the agent's set and
+        takes only the installation that account acts as; another account
+        of the set takes its own; taking one out takes its subscriptions
+        alone."""
+        _manage(hook, monkeypatch)
         hook.fake.installations = [_inst(10), _inst(12)]
         hook.client.post(f"/v1/oauth/{PROVIDER}/app/installations/refresh", json={"mcp_name": MCP, "account_label": "alice"})
+        _connect(hook, label="work")
         hook.fake.routes[("POST", "/app/installations/10/access_tokens")] = (201, {"token": "ghs_x", "expires_at": "2099-01-01T00:00:00Z"})
         hook.fake.routes[("POST", "/app/installations/12/access_tokens")] = (201, {"token": "ghs_y", "expires_at": "2099-01-01T00:00:00Z"})
-        assert hook.client.put(f"/v1/agents/{AGENT}/mcps/{MCP}/service-binding",
-                               json={"account_label": "alice", "installation_id": "10"}).status_code == 200
+        assert _add_svc(hook, installation_id="10").status_code == 200
         resp = _subscribe(hook, "12", scope="service", agent=AGENT)
-        assert resp.status_code == 400 and resp.json()["detail"]["bound_installation_id"] == "10"
+        assert resp.status_code == 400 and resp.json()["detail"] == {
+            "message": "This account of the agent does not cover installation 12."}
+        resp = _subscribe(hook, "12", scope="service", agent=AGENT, label="work")
+        assert resp.status_code == 400 and resp.json()["detail"] == {
+            "message": f"work is not one of this agent's accounts for {_tool()}."}
         assert _subscribe(hook, "10", scope="service", agent=AGENT).status_code == 200
-        # A rebind to another installation drops the old installation's rows.
-        assert hook.client.put(f"/v1/agents/{AGENT}/mcps/{MCP}/service-binding",
-                               json={"account_label": "alice", "installation_id": "12"}).status_code == 200
-        assert webhook_subscription_store.list_subscriptions(mcp_name=MCP, scope="service") == []
+        assert _add_svc(hook, account_label="work", installation_id="12").status_code == 200
+        assert _subscribe(hook, "12", scope="service", agent=AGENT, label="work").status_code == 200
+        resp = hook.client.delete(f"/v1/agents/{AGENT}/mcps/{MCP}/service-accounts", params={"account_label": "alice"})
+        assert resp.status_code == 200, resp.text
+        assert [(r["account_label"], r["vendor_target"]) for r in webhook_subscription_store.list_subscriptions(
+            mcp_name=MCP, scope="service")] == [("work", "12")]
+
+    def test_a_subscription_on_an_account_beside_the_default_resolves_its_own_lender(
+            self, hook, monkeypatch, bob):
+        """The agent's default is the person's account; a second person's
+        account acting as installation 10 is beside it. A subscription on
+        the second reads that person's token folder, never the default's,
+        fires on its own account and outlives the default moving either way."""
+        _manage(hook, monkeypatch)
+        assert _add_svc(hook, installation_id="").status_code == 200
+        assert service_account_set.add_service_account_to_agent(
+            MCP, AGENT, account_label="bob", owner_sub=bob.sub, installation_id="10") == ""
+        assert _set_of() == [("alice", "", True), ("bob", "10", False)]
+        resp = _subscribe(hook, "10", scope="service", agent=AGENT, label="bob")
+        assert resp.status_code == 200, resp.text
+        sid = resp.json()["id"]
+        _trigger_for(monkeypatch, sid)
+
+        def lender_of(label: str) -> str:
+            return subscription_manager._owner_username_for(
+                scope="service", owner="", agent=AGENT, mcp_name=MCP, account_label=label)
+
+        assert (lender_of("bob"), lender_of("alice")) == (bob.username, hook.username)
+        assert _deliver(hook, "issues", _issue_body(10)).json()["fired"] == 1
+        for label in ("bob", "alice"):
+            resp = hook.client.put(f"/v1/agents/{AGENT}/mcps/{MCP}/service-accounts/default",
+                                   json={"account_label": label})
+            assert resp.status_code == 200, resp.text
+            assert [r["id"] for r in webhook_subscription_store.list_subscriptions(
+                mcp_name=MCP, scope="service")] == [sid]
+            assert lender_of("bob") == bob.username
+            assert _deliver(hook, "issues", _issue_body(10)).json()["fired"] == 1
+        assert len(hook.fired) == 3
 
     def test_an_older_client_without_a_kind_means_the_installation(self, hook):
         resp = _subscribe(hook, "10", kind="")
@@ -675,46 +818,49 @@ class TestSubscribing:
         # No account asked: not known either.
         assert hook.client.get(f"/v1/mcps/{MCP}/webhook-event-catalog").json()["granted_scopes"] is None
 
-    def test_an_agents_catalog_shows_the_bound_scopes_to_its_managers_alone(self, hook, monkeypatch):
+    def test_an_agents_catalog_shows_an_accounts_scopes_to_its_managers_alone(self, hook, monkeypatch):
         _mark(hook, kinds.KIND_OAUTH_APP)
         _connect_with_services(hook)
-        hook.holder["role"] = "admin"
-        task_store.add_user_agent(hook.sub, AGENT, "manager", "test")
-        from services.mcp import mcp_registry
-        manifest = mcp_registry.get_manifest(MCP)
-        monkeypatch.setattr(mcp_registry, "get_visible_mcps_for_agent", lambda agent: [manifest])
-        assert hook.client.put(f"/v1/agents/{AGENT}/mcps/{MCP}/service-binding",
-                               json={"account_label": "alice"}).status_code == 200
+        _manage(hook, monkeypatch)
+        assert _add_svc(hook).status_code == 200
         params = {"account_label": "alice", "scope": "service", "agent": AGENT}
         assert hook.client.get(f"/v1/mcps/{MCP}/webhook-event-catalog", params=params).json()["granted_scopes"] == ["repo"]
-        # A member of the agent who cannot manage it reads the catalog, not the scopes.
+        # An account the agent does not hold is refused in words.
+        resp = hook.client.get(f"/v1/mcps/{MCP}/webhook-event-catalog", params={**params, "account_label": "ghost"})
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == f"ghost is not one of this agent's accounts for {_tool()}."
+        # A member of the agent who cannot manage it reads the catalog, never an account's view.
         from auth.providers import UserContext
         monkeypatch.setattr(UserContext, "can_manage_agent", lambda self, agent: False)
-        body = hook.client.get(f"/v1/mcps/{MCP}/webhook-event-catalog", params=params).json()
+        resp = hook.client.get(f"/v1/mcps/{MCP}/webhook-event-catalog", params=params)
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "Only a manager of this agent can subscribe it to events."
+        body = hook.client.get(f"/v1/mcps/{MCP}/webhook-event-catalog",
+                               params={"scope": "service", "agent": AGENT}).json()
         assert body["granted_scopes"] is None and body["event_catalog"]
 
-    def test_the_catalog_for_an_agent_offers_its_bound_installation_alone(self, hook, monkeypatch):
-        hook.holder["role"] = "admin"
-        task_store.add_user_agent(hook.sub, AGENT, "manager", "test")
-        from services.mcp import mcp_registry
-        manifest = mcp_registry.get_manifest(MCP)
-        monkeypatch.setattr(mcp_registry, "get_visible_mcps_for_agent", lambda agent: [manifest])
+    def test_the_catalog_for_an_agent_offers_each_accounts_own_installation(self, hook, monkeypatch):
+        _manage(hook, monkeypatch)
         hook.fake.installations = [_inst(10), _inst(12)]
         hook.client.post(f"/v1/oauth/{PROVIDER}/app/installations/refresh", json={"mcp_name": MCP, "account_label": "alice"})
-        params = {"account_label": "alice", "scope": "service", "agent": AGENT}
-        assert hook.client.put(f"/v1/agents/{AGENT}/mcps/{MCP}/service-binding",
-                               json={"account_label": "alice", "installation_id": ""}).status_code == 200
-        spec = hook.client.get(f"/v1/mcps/{MCP}/webhook-event-catalog", params=params).json()["vendor_target_spec"]
-        assert spec["static_options"] == []
-        assert spec["help_text"] == "First pick an installation as this agent's GitHub account in Agent Settings, MCPs."
-        hook.fake.routes[("POST", "/app/installations/12/access_tokens")] = (201, {"token": "ghs_y", "expires_at": "2099-01-01T00:00:00Z"})
-        assert hook.client.put(f"/v1/agents/{AGENT}/mcps/{MCP}/service-binding",
-                               json={"account_label": "alice", "installation_id": "12"}).status_code == 200
-        spec = hook.client.get(f"/v1/mcps/{MCP}/webhook-event-catalog", params=params).json()["vendor_target_spec"]
-        assert [o["value"] for o in spec["static_options"]] == ["12"]
+        _connect(hook, label="work")
 
-    def test_a_hosted_account_bound_to_an_agent_subscribes_its_owned_installations(self, fwd, monkeypatch):
-        sid = _bind_hosted_agent(fwd, monkeypatch)
+        def spec_of(label: str) -> dict:
+            params = {"account_label": label, "scope": "service", "agent": AGENT}
+            return hook.client.get(f"/v1/mcps/{MCP}/webhook-event-catalog", params=params).json()["vendor_target_spec"]
+
+        assert _add_svc(hook, installation_id="").status_code == 200
+        spec = spec_of("alice")
+        assert spec["static_options"] == []
+        assert spec["help_text"] == ("First add an installation as one of this agent's GitHub accounts in "
+                                     "Agent Settings, MCPs.")
+        hook.fake.routes[("POST", "/app/installations/12/access_tokens")] = (201, {"token": "ghs_y", "expires_at": "2099-01-01T00:00:00Z"})
+        assert _add_svc(hook, account_label="work", installation_id="12").status_code == 200
+        assert [o["value"] for o in spec_of("work")["static_options"]] == ["12"]
+        assert spec_of("alice")["static_options"] == []
+
+    def test_a_hosted_account_of_an_agent_subscribes_its_owned_installations(self, fwd, monkeypatch):
+        sid = _add_hosted_to_agent(fwd, monkeypatch)
         row = webhook_subscription_store.get_subscription(sid)
         assert row["status"] == "active" and row["target_kind"] == kinds.INSTALLATION_TARGET_KIND
         assert row["agent"] == AGENT and row["delivery_mode"] == "relay"
@@ -730,7 +876,7 @@ class TestSubscribing:
             assert resp.status_code == 400 and words in resp.text, (target, resp.text)
 
     def test_a_hosted_agents_catalog_lists_every_owned_installation(self, fwd, monkeypatch):
-        _bind_hosted_agent(fwd, monkeypatch, subscribe=False)
+        _add_hosted_to_agent(fwd, monkeypatch, subscribe=False)
         params = {"account_label": "alice", "scope": "service", "agent": AGENT}
         spec = fwd.client.get(f"/v1/mcps/{MCP}/webhook-event-catalog", params=params).json()["vendor_target_spec"]
         assert [o["value"] for o in spec["static_options"]] == ["10"]
@@ -741,16 +887,20 @@ class TestSubscribing:
         assert spec["help_text"] == "Install the app on GitHub first. You can subscribe only to an installation you own."
 
     def test_a_forwarded_delivery_fires_the_hosted_agents_row(self, fwd, monkeypatch):
-        sid = _bind_hosted_agent(fwd, monkeypatch)
+        sid = _add_hosted_to_agent(fwd, monkeypatch)
         _trigger_for(monkeypatch, sid)
         resp = _forward(fwd, "issues", _issue_body(10), delivery_id="ha-1")
         assert resp.json()["fired"] == 1 and len(fwd.fired) == 1
-        # The binding moved to another of the person's accounts: the row stops.
+        # Another of the person's accounts made the default: the row fires on its own account.
         credential_store.set_user_credentials(fwd.sub, MCP, {"GITHUB_EMAIL": "x"}, account_label="other")
-        assert credential_store.set_service_agent_binding(MCP, AGENT, account_label="other", owner_sub=fwd.sub)
+        assert _add_svc(fwd, account_label="other", make_default=True).status_code == 200
         resp = _forward(fwd, "issues", _issue_body(10), delivery_id="ha-2")
+        assert resp.json()["fired"] == 1 and len(fwd.fired) == 2
+        # Its account gone from the set, the row left behind: the row stops.
+        assert credential_store.remove_service_agent_binding(MCP, AGENT, owner_sub=fwd.sub, account_label="alice")
+        resp = _forward(fwd, "issues", _issue_body(10), delivery_id="ha-3")
         assert resp.json()["fired"] == 0
-        assert resp.json()["results"][0]["skipped"] == "not the agent's bound installation"
+        assert resp.json()["results"][0]["skipped"] == "not covered by the agent's account"
 
     def test_a_hosted_oauth_app_repository_subscription_stays_vendor(self, hook, monkeypatch):
         from services.billing import relay_client

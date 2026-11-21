@@ -6,15 +6,20 @@ import { onFileUpdate } from '../../lib/fileUpdates'
 import { onAppDeployed, onAppPush, onAppState, onCatalog, subscribeCatalog, unsubscribeCatalog } from '../../lib/appLive'
 import { appMounted, appUnmounted } from '../../lib/focus'
 import { emitIframeSwipe } from '../../lib/iframeGestures'
+import { sendPaced } from '../../lib/sendPaced'
 import { hasStrictUserActivation, hasUserActivation, openExternalUrl, validateBridgedUrl } from '../../lib/openExternal'
 import { buildOpenTarget, SETTINGS_KINDS } from '../../lib/openTarget'
-import { callPlatformMethod, fetchCatalogFeed, fireAppActions, mintViewerToken, useAppState, warmApp, type AppActionCall, type AppActionResult, type AppState, type PinnedApp } from '../../api/apps'
+import { callPlatformMethod, fetchCatalogFeed, fireAppActions, mintViewerToken, useAppState, warmApp, type AppActionCall, type AppActionResult, type AppPromptAction, type AppState, type PinnedApp } from '../../api/apps'
+import { MEDIA_STAYS, carriesMediaSecret, fileCanWrite, rememberMediaSecrets } from '../../lib/appMedia'
+import { useAuth } from '../../contexts/AuthContext'
+import FilePreviewBody from '../workspace/FilePreviewBody'
 import { meetsFloor } from '../../lib/permissions'
 import { appKind } from '../../lib/kinds/app'
 import { useActiveChats } from '../../hooks/useActiveChats'
 import { onIdle as speechIdle } from '../../audio/speechActivity'
 import { APP_SERVER_STATE, FRAME_STATE, type AppServerState, type FrameState } from '../../lib/status/appServer'
 import { claimKey, heldClaim, holdClaim } from './appFrameClaims'
+import { holdBack } from '../../lib/ui/backLayer'
 import { useTheme } from '../../contexts/useTheme'
 import { isRecord } from '../../lib/json/guards'
 import Button from '../ui/Button'
@@ -50,6 +55,13 @@ import { CARD, POPOVER } from '../ui/classes'
  * builds the route (lib/openTarget) and moves the viewer through the router
  * behind the same gates as an external link — approval, a real user
  * gesture, the burst window — plus a first-use chip for the settings kinds.
+ * A workspace file opens OVER the app in the platform's own preview, by the
+ * viewer's own right to it, and closing it leaves the app as it was.
+ *
+ * Media links (`files.media`): the host remembers the secret of every link
+ * it handed this frame and passes on no page text that carries one — an
+ * address to open, a button's arguments, a platform call's. A link is an
+ * address that needs no sign-in, so it stays in the app (lib/appMedia).
  */
 
 interface Props {
@@ -57,7 +69,7 @@ interface Props {
   agent: string
   /** send_prompt router (current chat / new chat / PTY) — wired by the host
       page. Absent on surfaces with no chat context → acks unavailable. */
-  onSendPrompt?: (app: PinnedApp, action: { id: string; label: string; prompt: string }, args: unknown) => Promise<{ status: string; reason?: string }>
+  onSendPrompt?: (app: PinnedApp, action: AppPromptAction, args: unknown) => Promise<{ status: string; reason?: string }>
   /** Viewer-scoped rows for the `project_lanes` feed — wired by the Dock
       overlay only. */
   projectLanes?: unknown[]
@@ -93,10 +105,11 @@ const AUTO_HEIGHT_MAX = 8000
 const OPEN_URL_BURST = 3
 const OPEN_URL_WINDOW_MS = 10_000
 
-// The server accepts one batch per second per (app, viewer) and at most 16
-// calls in one; calls inside the window wait for the next batch.
+// The server accepts one batch per second per (app, viewer) and at most 32
+// calls in one (an app's actions at most); calls inside the window wait for
+// the next batch.
 const BATCH_MIN_INTERVAL_MS = 1000
-const BATCH_MAX_CALLS = 16
+const BATCH_MAX_CALLS = 32
 // A viewed dashboard asks the platform to keep its tools warm; the server
 // dedups per (app, viewer) inside its own window.
 const WARM_EVERY_MS = 10 * 60 * 1000
@@ -130,10 +143,8 @@ type PendingOpen =
   | { kind: 'settings'; win: Window; path: string }
 
 interface QueuedCall {
-  win: Window
   call: AppActionCall
-  actionId: string
-  isTool: boolean
+  done: (r: AppActionResult) => void
 }
 
 const CLIENT_FEEDS = ['active_chats', 'project_lanes']
@@ -161,6 +172,14 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   const { resolvedTheme } = useTheme()
   const navigate = useNavigate()
   const qc = useQueryClient()
+  const { user } = useAuth()
+  // A workspace file shown over the app (`otodock.open`, kind `file`).
+  const [filePreview, setFilePreview] = useState<{ agent: string; path: string } | null>(null)
+  // Back closes the file's preview, not the app under it: the browser's and
+  // the phone apps' (lib/ui/backLayer, as the image viewer does).
+  useEffect(() => (filePreview ? holdBack(() => setFilePreview(null)) : undefined), [filePreview])
+  // The media links this frame was handed: a link stays in the app.
+  const mediaSecretsRef = useRef<Set<string>>(new Set())
   const [initialTheme] = useState(resolvedTheme)
   // Nonce bumps on file_updated → full reload (the served content is
   // no-store; re-setting src re-runs the app's scripts on fresh HTML).
@@ -556,20 +575,16 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
       return
     }
     const chunk = queue.splice(0, BATCH_MAX_CALLS)
+    const before = lastBatchAtRef.current
     lastBatchAtRef.current = now
     const byId = new Map(chunk.map((q) => [q.call.call_id, q]))
     const appId = appRef.current.id
     void fireAppActions(appId, chunk.map((q) => q.call), (callId, r: AppActionResult) => {
-      const q = byId.get(callId)
-      if (!q) return
-      postTo(q.win, { type: 'action_ack', status: r.status, call_id: callId, ...(r.reason ? { reason: r.reason } : {}) })
-      if (q.isTool) {
-        postTo(q.win, {
-          type: 'action_result', id: q.actionId, call_id: callId,
-          ok: r.status === 'done' || r.status === 'sent',
-          result: r.result ?? r.reason ?? r.status,
-        })
-      }
+      byId.get(callId)?.done(r)
+    }).then((paced) => {
+      // A batch refused whole ran nothing: the next one is spaced from the
+      // batch before it, so its calls leave as the platform's wait ends.
+      if (paced && lastBatchAtRef.current === now) lastBatchAtRef.current = before
     })
     if (queue.length) batchTimerRef.current = setTimeout(flushBatch, BATCH_MIN_INTERVAL_MS)
   }, [])
@@ -651,6 +666,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         if (!appRef.current.actions_approved) {
           return openAckTo(win, 'denied', 'actions not approved', callId)
         }
+        if (carriesMediaSecret(mediaSecretsRef.current, d.url)) return openAckTo(win, 'denied', MEDIA_STAYS, callId)
         const v = validateBridgedUrl(d.url)
         if ('error' in v) return openAckTo(win, 'denied', v.error, callId)
         if (!hasUserActivation()) return openAckTo(win, 'denied', 'no user gesture', callId)
@@ -676,10 +692,21 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         if (!appRef.current.actions_approved) {
           return openTargetAckTo(win, 'denied', 'actions not approved')
         }
+        // A target's id or path reaches the dashboard's own address and a
+        // files request, where a log keeps it as a path.
+        if (carriesMediaSecret(mediaSecretsRef.current, d.target)) return openTargetAckTo(win, 'denied', MEDIA_STAYS)
         const route = buildOpenTarget(d.target, agentRef.current)
         if ('error' in route) return openTargetAckTo(win, 'denied', route.error)
         if (!hasStrictUserActivation()) return openTargetAckTo(win, 'denied', 'no user gesture')
         if (!burstAllows()) return openTargetAckTo(win, 'denied', 'rate limited')
+        if (route.file) {
+          // The platform's own preview, over the app: nothing navigates, so
+          // closing it returns the person to the app as they left it. Focus
+          // leaves the frame, so an Escape reaches the preview.
+          iframeRef.current?.blur()
+          setFilePreview(route.file)
+          return openTargetAckTo(win, 'opened')
+        }
         if (!SETTINGS_KINDS.has(route.kind)) return deliverOpenTarget(win, route.path)
         const consent = readOpenConsent(openSettingsConsentKey(appRef.current.id))
         if (consent === 'blocked') return openTargetAckTo(win, 'blocked')
@@ -733,16 +760,28 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         const callId = typeof d.call_id === 'string' ? d.call_id.slice(0, 64) : ''
         const method = String(d.method || '')
         const current = appRef.current
-        const reply = (ok: boolean, result?: unknown, reason?: string) =>
-          postTo(win, { type: 'platform_result', call_id: callId, ok, ...(ok ? { result } : { reason }) })
+        const reply = (ok: boolean, result?: unknown, reason?: string, retryAfterMs?: number) =>
+          postTo(win, {
+            type: 'platform_result', call_id: callId, ok,
+            ...(ok ? { result } : { reason, ...(retryAfterMs ? { retry_after_ms: retryAfterMs } : {}) }),
+          })
         const declared = current.actions.find((a) => a.type === 'platform' && a.method === method)
         if (!declared) return reply(false, undefined, 'not declared by this app')
         if (!current.actions_approved) return reply(false, undefined, 'actions not approved')
         if (readOnlyRef.current) return reply(false, undefined, 'not available in this view')
         if (!meetsFloor(declared, current.viewer_role)) return reply(false, undefined, `needs the ${declared.min_role} role`)
+        // The rendered check has no media links: answered here, so the
+        // refused request is not a finding against the page.
+        if (renderRef.current && method === 'files.media') return reply(false, undefined, 'not available in the rendered check')
+        if (carriesMediaSecret(mediaSecretsRef.current, d.args)) return reply(false, undefined, MEDIA_STAYS)
         void callPlatformMethod(current.id, method, d.args).then(
-          (r) => reply(!!r.ok, r.result, r.reason),
-          () => reply(false, undefined, 'network error'),
+          (r) => {
+            // A frame that navigated since is no longer the page that asked.
+            if (navigatedAwayRef.current) return
+            if (method === 'files.media' && r.ok) rememberMediaSecrets(mediaSecretsRef.current, r.result)
+            reply(!!r.ok, r.result, r.reason, r.retry_after_ms)
+          },
+          () => { if (!navigatedAwayRef.current) reply(false, undefined, 'network error') },
         )
         return
       }
@@ -781,6 +820,11 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
           postResult(false, reason)
           continue
         }
+        if (carriesMediaSecret(mediaSecretsRef.current, raw.args)) {
+          ack('denied', MEDIA_STAYS, callId)
+          postResult(false, MEDIA_STAYS)
+          continue
+        }
         if (renderRef.current) {
           // A render never fires a task, a tool or a prompt: the platform
           // would refuse the call anyway (the render confinement), but a
@@ -795,11 +839,20 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         if (action.type === 'send_prompt') {
           // Global 1s across the frame — every delivery costs an agent turn.
           if (now - lastSendAtRef.current < 1000) { ack('denied', 'rate limited', callId); continue }
-          lastSendAtRef.current = now
           const send = onSendPromptRef.current
           if (!send) { ack('unavailable', 'not available in this view', callId); continue }
-          void send(current, { id: action.id, label: action.label, prompt: action.prompt || '' }, raw.args)
-            .then((r) => ack(r.status, r.reason, callId))
+          // A button that starts a new chat moves the person and costs a
+          // turn in a chat of its own: it takes what a move takes, a real
+          // click and the burst window (the server counts the presses too).
+          if (action.new_chat) {
+            if (!hasStrictUserActivation()) { ack('denied', 'no user gesture', callId); continue }
+            if (!burstAllows()) { ack('denied', 'rate limited', callId); continue }
+          }
+          lastSendAtRef.current = now
+          void send(current, {
+            id: action.id, label: action.label, prompt: action.prompt || '',
+            ...(action.new_chat ? { new_chat: true } : {}),
+          }, raw.args).then((r) => ack(r.status, r.reason, callId))
           continue
         }
         // mcp_tool / fire_task: rate per ACTION+ARGS so a data panel fires
@@ -820,12 +873,27 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         // Args ride to the server's user-approved schema gate (client sends
         // them verbatim; validation is never client-side). The batch answers
         // per call: an ack, and for mcp_tool the tool's output as
-        // action_result → the in-page `otodock:action-result` event.
-        enqueue({
-          win,
-          call: { call_id: callId || `h${now}${Math.random().toString(36).slice(2, 8)}`, action_id: action.id, args: raw.args ?? null },
-          actionId: action.id,
-          isTool: action.type === 'mcp_tool',
+        // action_result → the in-page `otodock:action-result` event. A call
+        // whose refusal names a wait goes once more first (`sendPaced`): the
+        // platform names one for a tool call inside its gap and for every
+        // call of a batch refused whole, never for a task pressed twice. Not
+        // when the page that asked reloaded, navigated or closed meanwhile.
+        const isTool = action.type === 'mcp_tool'
+        const call = { call_id: callId || `h${now}${Math.random().toString(36).slice(2, 8)}`, action_id: action.id, args: raw.args ?? null }
+        let answer: AppActionResult | null = null
+        const send = () => new Promise<AppActionResult>((done) => {
+          if (answer && (win !== iframeRef.current?.contentWindow || navigatedAwayRef.current)) return done(answer)
+          enqueue({ call, done: (r) => done((answer = r)) })
+        })
+        void sendPaced(send, (r) => Number(r.retry_after_ms) || 0).then((r) => {
+          postTo(win, { type: 'action_ack', status: r.status, call_id: call.call_id, ...(r.reason ? { reason: r.reason } : {}) })
+          if (isTool) {
+            postTo(win, {
+              type: 'action_result', id: action.id, call_id: call.call_id,
+              ok: r.status === 'done' || r.status === 'sent',
+              result: r.result ?? r.reason ?? r.status,
+            })
+          }
         })
       }
     }
@@ -914,6 +982,14 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     {openChip}
     {serverBanner}
     {awayNotice}
+    {filePreview && (
+      <FilePreviewBody
+        agent={filePreview.agent}
+        node={{ path: filePreview.path, name: filePreview.path.split('/').pop() || filePreview.path, type: 'file', size: 0, modified: '' }}
+        canWrite={fileCanWrite(user, filePreview.agent, filePreview.path)}
+        onClose={() => setFilePreview(null)}
+      />
+    )}
     <iframe
       key={src}
       ref={iframeRef}

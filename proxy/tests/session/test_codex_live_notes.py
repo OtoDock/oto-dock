@@ -3,10 +3,7 @@ asks for, their parts and their completed-item fallback, and a commentary
 message (the preamble between steps) streamed as a progress note: TEXT with
 ``note``, still text for every reader of the agent's words."""
 
-import asyncio
 import logging
-
-import pytest
 
 from core.events.bg_command_state import _bg_command_registries
 from core.events.common_events import (
@@ -16,8 +13,7 @@ from core.events.common_events import (
     THINKING,
     is_note_mark,
 )
-from core.layers.codex.helpers import REASONING_SUMMARY
-from core.layers.codex.session import CodexAppServerSession, CodexEvent
+from core.layers.codex.events import CodexEvent
 from core.layers.codex.translator import CodexEventTranslator
 
 MAIN = "thread-MAIN"
@@ -37,73 +33,6 @@ def _feed(tr, method, **params):
 def _shape(events):
     return [(e.type, e.data.get("phase"), e.data.get("text", e.data.get("content")),
              e.data.get("note", False)) for e in events]
-
-
-# --- the request -------------------------------------------------------------
-
-class _Client:
-    def __init__(self):
-        self.requests: list[tuple[str, dict]] = []
-        self.is_alive = True
-
-    async def request(self, method, params=None, *, timeout=None):
-        self.requests.append((method, dict(params or {})))  # the session reuses its dict
-        return {"turn": {"id": "turn-1"}} if method == "turn/start" else {}
-
-    async def close(self):
-        self.is_alive = False
-
-
-@pytest.mark.asyncio
-async def test_every_turn_asks_for_the_reasoning_summary_and_keeps_the_effort():
-    s = CodexAppServerSession(
-        session_id="s1", agent_name="a", model="gpt-6.1-sol",
-        sandbox_mode="workspace-write", working_dir="/tmp",
-        config_dir="/tmp/.codex", thread_id="thr-1", effort="high",
-    )
-    s._started = True
-    s._client = _Client()
-
-    async def feed():
-        await asyncio.sleep(0.05)
-        s._default_consumer.put_nowait(("turn/completed", {"threadId": "thr-1",
-                                        "turn": {"status": "completed"}}))
-    feeder = asyncio.create_task(feed())
-    async for _ev in s.send_message("hello"):
-        pass
-    await feeder
-    starts = [p for m, p in s._client.requests if m == "turn/start"]
-    assert len(starts) == 1
-    assert starts[0]["summary"] == REASONING_SUMMARY == "auto"
-    assert starts[0]["effort"] == "high"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode,sandbox,word", [
-    ("plan", "read-only", "plan"), ("autoReview", "workspace-write", "default")])
-async def test_every_turn_sends_its_collaboration_mode_where_codex_reads_it(mode, sandbox, word):
-    # turn/start has no `settings` key (Codex 0.163 and 0.166): the mode is
-    # the experimental top-level field, with the model it requires.
-    s = CodexAppServerSession(
-        session_id="s1", agent_name="a", model="gpt-6.1-sol",
-        sandbox_mode=sandbox, working_dir="/tmp", permission_mode=mode,
-        config_dir="/tmp/.codex", thread_id="thr-1", effort="high",
-    )
-    s._started = True
-    s._client = _Client()
-
-    async def feed():
-        await asyncio.sleep(0.05)
-        s._default_consumer.put_nowait(("turn/completed", {"threadId": "thr-1",
-                                        "turn": {"status": "completed"}}))
-    feeder = asyncio.create_task(feed())
-    async for _ev in s.send_message("hello"):
-        pass
-    await feeder
-    start = next(p for m, p in s._client.requests if m == "turn/start")
-    assert "settings" not in start
-    assert start["collaborationMode"] == {"mode": word, "settings": {
-        "model": "gpt-6.1-sol", "reasoning_effort": "high", "developer_instructions": None}}
 
 
 # --- reasoning summaries -----------------------------------------------------
@@ -265,69 +194,23 @@ def test_reasoning_and_note_deltas_light_an_open_command_as_a_text_delta_does():
     _bg_command_registries.clear()
 
 
-# --- an API that refuses the summary -------------------------------------------
+# --- a message the model sends during its turn ---------------------------------
 
-_REFUSAL = {"message": "unexpected status 400 Bad Request: Your organization must be verified to "
-                       "generate reasoning summaries.", "codexErrorInfo": "badRequest"}
-
-
-class _RefusingClient(_Client):
-    """The first turn is refused (an ``error`` then a failed
-    ``turn/completed``); every later turn completes."""
-
-    def __init__(self, session_ref: list, *, error_first: bool = True):
-        super().__init__()
-        self._session = session_ref
-        self._error_first = error_first
-
-    async def request(self, method, params=None, *, timeout=None):
-        res = await super().request(method, params, timeout=timeout)
-        if method == "turn/start":
-            s = self._session[0]
-            n = sum(1 for m, _ in self.requests if m == "turn/start")
-            q = s._default_consumer
-            if n == 1:
-                if self._error_first:
-                    q.put_nowait(("error", {"threadId": "thr-1", "error": _REFUSAL, "willRetry": False}))
-                q.put_nowait(("turn/completed", {"threadId": "thr-1",
-                                                 "turn": {"status": "failed", "error": _REFUSAL}}))
-            else:
-                q.put_nowait(("item/agentMessage/delta", {"threadId": "thr-1", "itemId": "m1", "delta": "Hi."}))
-                q.put_nowait(("turn/completed", {"threadId": "thr-1", "turn": {"status": "completed"}}))
-        return res
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error_first", [True, False])
-async def test_a_refused_summary_runs_the_turn_again_without_it_once_for_the_session(caplog, error_first):
-    ref: list = []
-    s = CodexAppServerSession(
-        session_id="s-ref", agent_name="a", model="gpt-6.1-sol",
-        sandbox_mode="workspace-write", working_dir="/tmp",
-        config_dir="/tmp/.codex", thread_id="thr-1", effort="medium",
-    )
-    ref.append(s)
-    s._started = True
-    s._client = _RefusingClient(ref, error_first=error_first)
-    with caplog.at_level(logging.WARNING, logger="codex-session"):
-        events = [e async for e in s.send_message("hello")]
-    # The refused turn never reaches the chat; the retried one does.
-    assert [e.type for e in events] == ["item/agentMessage/delta", "turn/completed"]
-    starts = [p for m, p in s._client.requests if m == "turn/start"]
-    assert [("summary" in p) for p in starts] == [True, False]
-    assert s.summary_refused is True
-    assert sum("refused the reasoning summary" in r.message for r in caplog.records) == 1
-    # The next turn does not ask again.
-    events = [e async for e in s.send_message("again")]
-    starts = [p for m, p in s._client.requests if m == "turn/start"]
-    assert "summary" not in starts[-1]
-
-
-def test_only_the_refusal_words_count_as_a_refused_summary():
-    from core.layers.codex.helpers import summary_refused
-    assert summary_refused({"error": _REFUSAL})
-    assert summary_refused({"turn": {"status": "failed", "error": {
-        "message": "400 Bad Request: invalid value for reasoning.summary"}}})
-    assert not summary_refused({"error": {"message": "usage limit reached", "codexErrorInfo": "usageLimitExceeded"}})
-    assert not summary_refused({"error": {"message": "reasoning.summary is great"}})
-    assert not summary_refused(None)
+def test_a_message_sent_during_the_turn_is_its_own_paragraph():
+    """GPT-6.2's send_message_to_user_async: Codex shows the message as an
+    agentMessage with delivery async and no deltas, and the turn goes on. The
+    text that follows must not run on into it (the pump appends a turn's text
+    to one block)."""
+    tr = _tr()
+    out = _feed(tr, "item/started", item={"type": "agentMessage", "id": "m0", "text": "", "phase": None})
+    out += _feed(tr, "item/agentMessage/delta", itemId="m0", delta="Starting.")
+    out += _feed(tr, "item/completed", item={"type": "agentMessage", "id": "m0", "text": "Starting.", "phase": None})
+    out += _feed(tr, "item/started", item={"type": "agentMessage", "id": "call_1", "text": "",
+                                            "phase": "final_answer", "delivery": "async"})
+    out += _feed(tr, "item/completed", item={"type": "agentMessage", "id": "call_1",
+                                              "text": "The build needs a key.", "phase": "final_answer",
+                                              "delivery": "async"})
+    out += _feed(tr, "item/started", item={"type": "agentMessage", "id": "m2", "text": "", "phase": None})
+    out += _feed(tr, "item/agentMessage/delta", itemId="m2", delta="Done.")
+    text = "".join(e.data["content"] for e in out if e.type == TEXT)
+    assert text == "Starting.\n\nThe build needs a key.\n\nDone."

@@ -18,6 +18,7 @@ import { Input, Select } from '../../components/ui/Field'
 import { BADGE_BASE, BADGE_TONE, CARD, POPOVER } from '../../components/ui/classes'
 import { PAGE_TITLE } from '../../components/ui/classes'
 import InfoTip from '../../components/ui/InfoTip'
+import { copyOrSay } from '../../lib/copyText'
 
 interface UserRecord {
   sub: string
@@ -430,7 +431,7 @@ export default function UsersPage() {
         <p className="text-xs text-status-warning-fg mb-2">New temporary password. Copy it now. It won't be shown again.</p>
         <div className="flex gap-2 mb-3">
           <code className="flex-1 px-3 py-2 text-sm font-mono bg-surface-card border border-subtle rounded-control text-primary select-all">{password}</code>
-          <Button size="sm" onClick={() => navigator.clipboard.writeText(password)}>Copy</Button>
+          <Button size="sm" onClick={() => void copyOrSay(password)}>Copy</Button>
         </div>
         <Button variant="primary" size="xs" onClick={dismissResetResult}>Dismiss</Button>
       </div>
@@ -462,7 +463,9 @@ export default function UsersPage() {
                 </div>
                 <PlatformAuthToggle user={u} run={run} />
               </div>
-              {isLocal && (
+              {/* A hosted install has no local network: the switch shows
+                  only while an account still has it on, to turn it off. */}
+              {isLocal && (!authConfig?.cloud || !!u.local_only) && (
                 <div className="flex items-center justify-between gap-3 max-w-[15rem]">
                   <div className="min-w-0">
                     <span className="text-xs text-secondary">LAN only</span>
@@ -596,7 +599,7 @@ export default function UsersPage() {
                 <label className="block text-xs text-secondary mb-1">Temporary password. Copy it now. It won't be shown again.</label>
                 <div className="flex gap-2">
                   <code className="flex-1 px-3 py-2 text-sm font-mono bg-surface-sunken rounded-control text-primary select-all">{tempPasswordResult}</code>
-                  <Button variant="secondary" size="xs" onClick={() => navigator.clipboard.writeText(tempPasswordResult)}>Copy</Button>
+                  <Button variant="secondary" size="xs" onClick={() => void copyOrSay(tempPasswordResult)}>Copy</Button>
                 </div>
               </div>
               <Button variant="primary" size="xs" onClick={() => { setShowAddUser(false); setTempPasswordResult('') }}>Done</Button>
@@ -610,7 +613,7 @@ export default function UsersPage() {
                 <label className="block text-xs text-secondary mb-1">Invite link. Copy it now: it won't be shown again. It expires in 48 hours.</label>
                 <div className="flex gap-2">
                   <code className="flex-1 px-3 py-2 text-sm font-mono bg-surface-sunken rounded-control text-primary select-all break-all">{inviteResult.url}</code>
-                  <Button variant="secondary" size="xs" onClick={() => navigator.clipboard.writeText(inviteResult.url)}>Copy</Button>
+                  <Button variant="secondary" size="xs" onClick={() => void copyOrSay(inviteResult.url)}>Copy</Button>
                 </div>
               </div>
               <Button variant="primary" size="xs" onClick={() => { setShowAddUser(false); setInviteResult(null) }}>Done</Button>

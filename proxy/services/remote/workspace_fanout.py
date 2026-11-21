@@ -30,9 +30,9 @@ Source exclusion
 Pass ``None`` for platform-origin writes (dashboard / upload) — they have no source
 machine, so the file goes to every *allowed* active machine.
 
-Local sessions are a no-op — their workspace is a bwrap bind-mount of the platform
-dir (same inode), so there is nothing to push and they never appear in the remote
-layer's session registry.
+A session on a compute machine beside the platform is a no-op: its workspace is a
+bwrap bind-mount of the platform dir (same inode), so there is nothing to push
+(``_shared_compute_machine_ids``, ``files_synced``).
 
 Downstream of the write-back guard
 -----------------------------------
@@ -49,17 +49,13 @@ raises (the file reconciles at that machine's next session start).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import errno
-import hashlib
 import logging
-import os
+import stat
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import cast
-
-import psycopg
 
 import config
 from core import layout, placement
@@ -70,8 +66,10 @@ from storage.pg import run_db
 
 logger = logging.getLogger("otodock.workspace-fanout")
 
-# A tracked push's progress rows move at most this often.
-_PROGRESS_EVERY_S = 0.5
+# (machine, agent) → (expires, identity or None): who an idle machine is for
+# an agent (``idle_connected_targets``), kept this long.
+_IDLE_IDENTITY_S = 5.0
+_idle_identities: dict[tuple[str, str], tuple[float, tuple[str | None, str] | None]] = {}
 
 
 def _interactive_remote_sessions(agent_slug: str) -> list[tuple[str, str, str, str]]:
@@ -89,13 +87,27 @@ def _interactive_remote_sessions(agent_slug: str) -> list[tuple[str, str, str, s
     except ImportError:
         return []
     out: list[tuple[str, str, str, str]] = []
+    compute = _shared_compute_machine_ids()
     for sid, s in list(getattr(_isess, "_sessions", {}).items()):
         try:
-            if s.agent_name == agent_slug and s.alive and not placement.is_local(s.target):
+            if (s.agent_name == agent_slug and s.alive and not placement.is_local(s.target)
+                    and s.target not in compute):
                 out.append((sid, s.target, s.username or "", s.role or ""))
         except AttributeError:
             continue
     return out
+
+
+def _shared_compute_machine_ids() -> frozenset[str]:
+    """The connected compute machines beside the platform: they read its
+    folder itself, so no file is pushed to them. One on another host has its
+    own copy and takes the pushes, as a paired machine."""
+    try:
+        from core.remote.satellite_connection import get_connection_manager
+        cm = get_connection_manager()
+        return frozenset(m for m in cm.compute_machine_ids() if cm.shares_folders(m))
+    except ImportError:
+        return frozenset()
 
 
 def fanout_targets(
@@ -150,6 +162,8 @@ def fanout_targets(
     for sid, info in list(sessions.items()):
         if info.agent_name != agent_slug or not getattr(info, "alive", False):
             continue
+        if not getattr(info, "files_synced", True):
+            continue  # a compute machine reads the platform's folder itself
         mid = info.machine_id
         if mid in machines:
             continue  # already cleared by another session on the same machine
@@ -195,7 +209,8 @@ def _active_machine_ids(agent_slug: str) -> set[str]:
     sessions = getattr(layer, "_sessions", None) or {}
     out: set[str] = set()
     for info in list(sessions.values()):
-        if getattr(info, "agent_name", None) == agent_slug and getattr(info, "alive", False):
+        if (getattr(info, "agent_name", None) == agent_slug and getattr(info, "alive", False)
+                and getattr(info, "files_synced", True)):
             out.add(info.machine_id)
     # Remote interactive (PTY) sessions count as ACTIVE too: they have no
     # per-turn scan, but the fingerprint sweep treating their machine as idle
@@ -257,6 +272,42 @@ async def shared_only_of(agent_slug: str, rel_path: str) -> bool | None:
     return await run_db(is_shared_only, agent_slug)
 
 
+async def _machine_identity(layer, machine_id: str, agent_slug: str):
+    """Who a machine is for an agent, from its pairing: ``(username, role)``,
+    or None when it never ran the agent (no target: a partial tree is never
+    seeded) or is paired no more. It changes rarely and costs several store
+    reads, so it is kept a few seconds: a tree write asks once per machine, not
+    once per file and machine."""
+    from storage.files import sync_state_store
+    now = time.monotonic()
+    kept = _idle_identities.get((machine_id, agent_slug))
+    if kept is not None and kept[0] > now:
+        return kept[1]
+    agents = await run_db(sync_state_store.agents_for_machine, machine_id)
+    ident = (await layer.resolve_machine_sync_identity(machine_id, agent_slug)
+             if agent_slug in agents else None)
+    for key, (expires, _i) in list(_idle_identities.items()):
+        if expires <= now:
+            del _idle_identities[key]
+    _idle_identities[(machine_id, agent_slug)] = (now + _IDLE_IDENTITY_S, ident)
+    return ident
+
+
+async def machine_may_hold(machine_id: str, agent_slug: str, rel_path: str) -> bool:
+    """Whether ``machine_id`` may receive ``rel_path`` now: the fan-out's rule
+    judged again, for a name that waited for a machine that was away. A session
+    of the agent on it that may see the file, or its pairing's identity."""
+    from core.remote.file_sync import should_sync_to_target
+    from core.session.session_manager import _get_remote_layer
+    shared_only = await shared_only_of(agent_slug, rel_path)
+    if machine_id in fanout_targets(agent_slug, rel_path, shared_only=shared_only):
+        return True
+    if shared_only or rel_path.startswith("externals/"):
+        return False
+    ident = await _machine_identity(_get_remote_layer(), machine_id, agent_slug)
+    return ident is not None and should_sync_to_target(rel_path, ident[0], ident[1])
+
+
 async def idle_connected_targets(
     agent_slug: str, rel_path: str, *, exclude_machine_id: str | None = None,
     shared_only: bool | None = None,
@@ -279,7 +330,6 @@ async def idle_connected_targets(
         from core.remote.file_sync import should_sync_to_target
         from core.remote.satellite_connection import get_connection_manager
         from core.session.session_manager import _get_remote_layer
-        from storage.files import sync_state_store
 
         # Same shared-only users/ exclusion as fanout_targets.
         if layout.is_personal(rel_path):
@@ -296,20 +346,16 @@ async def idle_connected_targets(
         if not connected:
             return []
         active = _active_machine_ids(agent_slug)
-        out: list[str] = []
-        for mid in connected:
-            if mid == exclude_machine_id or mid in active:
-                continue  # excluded source, or already covered by the active fan-out
-            agents = await asyncio.to_thread(sync_state_store.agents_for_machine, mid)
-            if agent_slug not in agents:
-                continue  # machine has never run this agent → don't seed a partial tree
-            ident = await layer.resolve_machine_sync_identity(mid, agent_slug)
-            if ident is None:
-                continue
-            target_username, target_role = ident
-            if should_sync_to_target(rel_path, target_username, target_role):
-                out.append(mid)
-        return out
+        candidates = [mid for mid in connected
+                      if mid != exclude_machine_id and mid not in active]
+        if not candidates:
+            return []
+
+        idents = await asyncio.gather(*(_machine_identity(layer, mid, agent_slug) for mid in candidates))
+        return [
+            mid for mid, ident in zip(candidates, idents, strict=True)
+            if ident is not None and should_sync_to_target(rel_path, ident[0], ident[1])
+        ]
     except Exception:  # noqa: BLE001  # the idle fan-out is best effort, the active machines got the write
         logger.debug(
             "idle_connected_targets failed for %s/%s", agent_slug, rel_path,
@@ -358,29 +404,41 @@ async def fan_out_write(
     transfer_kind: str = "sync", transfer_id: str | None = None,
     origin_user_sub: str = "", only_machine_id: str | None = None,
     marked: dict[str, tuple[int, int]] | None = None,
+    holds_turns: bool | None = None,
 ) -> None:
-    """Push a file at ``rel_path`` to every OTHER machine running ``agent_slug``
-    that is allowed to receive it (``only_machine_id``: to that one machine,
-    when it is one of them). Best-effort; never raises.
+    """Hand the file at ``rel_path`` to every OTHER machine running
+    ``agent_slug`` that is allowed to receive it (``only_machine_id``: to
+    that one machine, when it is one of them), and return. Never waits for
+    a machine and never raises: each target's lane
+    (``core/remote/machine_push_lane``) pushes the platform copy as it is
+    when its turn comes. ``only_machine_id`` names the machine that asked:
+    its push is waited for, for as long as it moves.
 
     ``marked``: the machines the caller marked in flight before it
-    (``mark_fan_out_targets``). Each one this fan-out does not push to (it
-    left the targets meanwhile, the fan-out ended early or raised) gets the
+    (``mark_fan_out_targets``). Each one that is no target now gets the
     failure's rules instead of a window no push will end
-    (``remote_file_flow.end_in_flight``)."""
-    pushed: list[str] = []
+    (``remote_file_flow.end_in_flight``).
+
+    ``holds_turns``: whether a turn on a target waits for this file (the
+    turn barrier). A write a person or a platform tool made does (the
+    default with ``include_idle``), a fan-out that started on a machine does
+    not."""
+    handed: list[str] = []
     try:
-        pushed = await _fan_out_write(
+        handed = await _fan_out_write(
             agent_slug, rel_path, source, exclude_machine_id=exclude_machine_id,
             include_idle=include_idle, transfer_kind=transfer_kind,
             transfer_id=transfer_id, origin_user_sub=origin_user_sub,
             only_machine_id=only_machine_id,
+            holds_turns=include_idle if holds_turns is None else holds_turns,
         )
+    except Exception:  # noqa: BLE001  # the fan-out is best effort: the write stands, the next merge settles
+        logger.warning("fan_out_write %s/%s failed", agent_slug, rel_path, exc_info=True)
     finally:
         if marked:
             from core.remote import remote_file_flow
             for mid, stat in marked.items():
-                if mid not in pushed:
+                if mid not in handed:
                     remote_file_flow.end_in_flight(mid, agent_slug, rel_path, stat)
 
 
@@ -388,29 +446,27 @@ async def _fan_out_write(
     agent_slug: str, rel_path: str, source: bytes | Path, *,
     exclude_machine_id: str | None, include_idle: bool,
     transfer_kind: str, transfer_id: str | None,
-    origin_user_sub: str, only_machine_id: str | None,
+    origin_user_sub: str, only_machine_id: str | None, holds_turns: bool,
 ) -> list[str]:
-    """``fan_out_write``'s body; returns the machines it pushed to (acked or
-    not).
+    """``fan_out_write``'s body; returns the machines the name was handed to.
 
-    ``source`` is either the file's bytes (small in-memory payloads — WOPI,
-    hooks) or its platform filesystem ``Path`` — the streaming mode all
-    large-file callers use: ``push_file`` reads one chunk at a time from disk, so a
-    1GB file fanning out to N machines costs O(N × chunk) memory, never
-    N × the file.
+    ``source`` says what was written: the bytes (small in-memory payloads —
+    WOPI, hooks: the caller wrote them to the platform copy first) or the
+    platform copy's ``Path``. Either way a lane pushes the platform copy
+    itself, opened beneath the agents root when its turn comes: nothing is
+    held per write, so a 1GB file fanning out to N machines costs N names.
 
     Targets active-session machines (``fanout_targets``); when ``include_idle`` is set
     — platform-origin dashboard/upload writes — ALSO connected-but-idle machines that
     hold the agent (``idle_connected_targets``), so a dashboard edit reaches a
     connected satellite even with no live session and its next session start stays
-    light. Pushes run concurrently; per-push failures are logged, not raised.
+    light.
 
     Progress tracking (Feature E): when ``transfer_id`` is supplied (dashboard
     uploads — always tracked) or the payload exceeds one chunk, the transfer
     is registered in ``core/remote/transfer_registry`` with one row per
-    target machine and live byte progress (``push_file``'s progress_cb), so
-    the workspace toolbar popup shows per-machine state. Registry calls are
-    best-effort — a registry failure never affects the push.
+    target machine, and each lane moves and ends its own row. Registry calls
+    are best-effort — a registry failure never affects the push.
     """
     shared_only = await shared_only_of(agent_slug, rel_path)
     machines = _targets(agent_slug, rel_path, exclude_machine_id, shared_only)
@@ -422,7 +478,7 @@ async def _fan_out_write(
             machines = list(set(machines) | set(idle))
     if only_machine_id is not None:
         machines = [m for m in machines if m == only_machine_id]
-    from core.remote import transfer_registry
+    from core.remote import machine_push_lane, transfer_registry
     from core.remote.file_sync import MAX_CHUNK_SIZE
 
     async def _empty_terminal(size: int) -> None:
@@ -440,46 +496,29 @@ async def _fan_out_write(
     # A source Path is the platform copy of ``rel_path`` or nothing: neither
     # the size probe below nor a push ever touches another file.
     from_path = not isinstance(source, (bytes, bytearray))
-    rel = ""
-    if from_path:
-        try:
-            if not config.is_safe_agent_name(agent_slug):
-                raise PathOutsideRoot(agent_slug)
-            rel = f"{agent_slug}/{normalize_rel_path(rel_path)}"
-            if safe_fs.rel_under(cast("Path", source), config.AGENTS_DIR) != rel:
-                raise safe_fs.EscapeRefused(errno.EXDEV, "not the platform copy", str(source))
-        except (OSError, PathOutsideRoot) as exc:
-            logger.warning(
-                "fan_out_write %s/%s: source refused (%s)", agent_slug, rel_path,
-                type(exc).__name__,
-            )
-            await _empty_terminal(0)
-            return []
-    if not machines:
-        size = 0
-        if not from_path:
-            size = len(cast("bytes", source))
-        else:
-            with contextlib.suppress(OSError):
-                size = (await asyncio.to_thread(
-                    safe_fs.lstat_beneath, config.AGENTS_DIR, rel)).st_size
-        await _empty_terminal(size)
+    try:
+        if not config.is_safe_agent_name(agent_slug):
+            raise PathOutsideRoot(agent_slug)
+        rel = f"{agent_slug}/{normalize_rel_path(rel_path)}"
+        if from_path and safe_fs.rel_under(cast("Path", source), config.AGENTS_DIR) != rel:
+            raise safe_fs.EscapeRefused(errno.EXDEV, "not the platform copy", str(source))
+    except (OSError, PathOutsideRoot) as exc:
+        logger.warning(
+            "fan_out_write %s/%s: source refused (%s)", agent_slug, rel_path,
+            type(exc).__name__,
+        )
+        await _empty_terminal(0)
         return []
-
-    # The bytes every push reads are that platform copy, opened ONCE beneath
-    # the agents root with no link followed; ``push_file`` receives the
-    # descriptor's own path, so a swap of any name meanwhile changes nothing
-    # it sends, and the merge base recorded below is the hash of what was
-    # read from that same descriptor (D3: taken before the pushes, never
-    # after). Every push sends that hash as the frame's hash: a writer that
-    # changes the inode in place after the hash makes the satellite refuse
-    # the push, so no base names bytes the target never got.
-    src_fd: int | None = None
-    base_mtime = 0.0
-    if from_path:
+    size = 0
+    if not from_path:
+        size = len(cast("bytes", source))
+    else:
+        # The copy the lanes will push: a regular file reached beneath the
+        # agents root with no component followed, or nothing is handed on.
         try:
-            src_fd, st = await asyncio.to_thread(
-                safe_fs.open_regular_for_read, config.AGENTS_DIR, rel)
+            st = await asyncio.to_thread(safe_fs.lstat_beneath, config.AGENTS_DIR, rel)
+            if not stat.S_ISREG(st.st_mode):
+                raise safe_fs.EscapeRefused(errno.EINVAL, "not a regular file", rel)
         except OSError as exc:
             logger.warning(
                 "fan_out_write %s/%s: source refused (%s)", agent_slug, rel_path,
@@ -487,54 +526,10 @@ async def _fan_out_write(
             )
             await _empty_terminal(0)
             return []
-        size, base_mtime = st.st_size, st.st_mtime
-        platform_stat: tuple[int, int] | None = (st.st_size, st.st_mtime_ns)
-        content_hash = await asyncio.to_thread(_hash_fd, cast("int", src_fd))
-        source = Path(safe_fs.fd_path(cast("int", src_fd)))
-    else:
-        size = len(cast("bytes", source))
-        content_hash = "sha256:" + hashlib.sha256(cast("bytes", source)).hexdigest()
-        # The platform copy these bytes were written to (the callers write
-        # it first, under the path lock they still hold).
-        try:
-            pst = await asyncio.to_thread(
-                safe_fs.lstat_beneath, config.AGENTS_DIR,
-                f"{agent_slug}/{normalize_rel_path(rel_path)}")
-            platform_stat = (pst.st_size, pst.st_mtime_ns)
-        except (OSError, PathOutsideRoot):
-            platform_stat = None
-    try:
-        await _fan_out_pushes(
-            agent_slug, rel_path, source, machines, size, content_hash, base_mtime,
-            transfer_kind=transfer_kind, transfer_id=transfer_id,
-            origin_user_sub=origin_user_sub, max_chunk=MAX_CHUNK_SIZE,
-            platform_stat=platform_stat,
-        )
-    finally:
-        if src_fd is not None:
-            os.close(src_fd)
-    return machines
-
-
-def _hash_fd(fd: int) -> str:
-    h = hashlib.sha256()
-    for chunk in safe_fs.iter_fd(fd):
-        h.update(chunk)
-    return "sha256:" + h.hexdigest()
-
-
-async def _fan_out_pushes(
-    agent_slug: str, rel_path: str, source: bytes | Path, machines: list[str],
-    size: int, content_hash: str, base_mtime: float, *,
-    transfer_kind: str, transfer_id: str | None, origin_user_sub: str, max_chunk: int,
-    platform_stat: tuple[int, int] | None = None,
-) -> None:
-    from core.remote import transfer_registry
-    from core.remote.satellite_connection import get_connection_manager
-    from services.path_policy_v2 import PathRef
-    cm = get_connection_manager()
-    ref = PathRef("agent_tree", rel_path)
-    MAX_CHUNK_SIZE = max_chunk
+        size = st.st_size
+    if not machines:
+        await _empty_terminal(size)
+        return []
 
     tid: str | None = None
     if transfer_id is not None or size > MAX_CHUNK_SIZE:
@@ -543,202 +538,57 @@ async def _fan_out_pushes(
             machine_ids=list(machines), transfer_id=transfer_id,
             origin_user_sub=origin_user_sub,
         )
+    asked = 0
+    for mid in machines:
+        asked = machine_push_lane.mark(
+            mid, agent_slug, rel_path, holds_turns=holds_turns,
+            transfer=(tid, size) if tid else None)
+    if only_machine_id is not None and machines:
+        # The machine that asked: its copy is waited for while it moves.
+        await machine_push_lane.settled(only_machine_id, agent_slug, upto=asked,
+                                        idle_s=float(config.PUSH_STALL_S))
+    return machines
 
-    from core.remote import transfer_gate
 
-    # The targets whose push the machine refused as stale, with the stat
-    # their ack reported (the mark's baseline below, no probe), and the
-    # record each push took (a missed target's fallback baseline).
-    stale_by_machine: dict[str, dict] = {}
-    records: dict[str, dict | None] = {}
-
-    async def _push_one(mid: str) -> bool:
-        cb = None
-        on_state = None
-        if tid:
-            # A push reports every acked chunk: the row moves at most every
-            # _PROGRESS_EVERY_S (its terminal goes out below regardless).
-            last = {"t": 0.0}
-
-            async def cb(sent: int, total: int, _mid=mid):
-                now = time.monotonic()
-                if sent < total and now - last["t"] < _PROGRESS_EVERY_S:
-                    return
-                last["t"] = now
-                await transfer_registry.progress(tid, _mid, sent, total)
-
-            # The gate drives the queued→active lifecycle for tracked rows
-            # (rows are born 'queued' in the registry).
-            async def on_state(state: str, _mid=mid):
-                await transfer_registry.set_state(tid, _mid, state)
-
-        # The machine's outbound gate (Feature F): only ≥threshold pushes contend;
-        # a machine waiting on a slot shows 'queued' in the progress popup.
-        stale: dict = {}
-        async with transfer_gate.slot(
-            mid, agent_slug, rel_path, size, on_state=on_state,
-        ):
-            if platform_stat is not None:
-                # The in-flight mark counts from the slot, not the queue.
-                remote_file_flow.note_platform_ahead(mid, agent_slug, rel_path, *platform_stat,
-                                                     in_flight_s=in_flight_s)
-            # The push expects the copy last pulled, probed or pushed there
-            # (the record goes first; the ack re-records the committed copy).
-            records[mid] = remote_file_flow.take_push_record(mid, agent_slug, rel_path)
-            ok = await cm.push_file(
-                mid, ref, source, agent_slug=agent_slug, progress_cb=cb,
-                content_hash=content_hash,
-                expect=remote_file_flow.push_expectation_of(records[mid]), stale_out=stale,
-            )
-        if stale:
-            stale_by_machine[mid] = stale
-        if tid:
-            if ok:
-                await transfer_registry.progress(tid, mid, size, size)
-                await transfer_registry.set_state(tid, mid, "done")
-            else:
-                await transfer_registry.set_state(
-                    tid, mid, "failed",
-                    error=("The file is being changed on the machine. It was left as it is."
-                           if stale
-                           else "push failed (machine offline?) — retries at next sync"),
-                )
-        return ok
-
-    # Until its push lands, each target holds older bytes than the platform
-    # copy: a read there meanwhile serves the platform copy (this fan-out
-    # runs outside the path lock, so a read could otherwise pull the older
-    # bytes over it). Marked now, and again when the push gets its transfer
-    # slot, for as long as the push may run (its ceiling): a mark that
-    # outlives a push which never answers turns into a failure's rules.
-    from core.remote import remote_file_flow
-    from core.remote.satellite_file_transfer import push_ceiling_s
-    in_flight_s = push_ceiling_s(size)
-    if platform_stat is not None:
-        for mid in machines:
-            remote_file_flow.note_platform_ahead(mid, agent_slug, rel_path, *platform_stat,
-                                                 in_flight_s=in_flight_s)
-    results = await asyncio.gather(
-        *(_push_one(mid) for mid in machines),
-        return_exceptions=True,
-    )
-    if tid:
-        # A raised (not returned-False) push never hit _push_one's outcome
-        # code — close its row defensively so the item can complete.
-        for mid, res in zip(machines, results, strict=False):
-            if isinstance(res, Exception):
-                await transfer_registry.set_state(
-                    tid, mid, "failed", error=f"push error: {res}",
-                )
-    # Advance each successfully-pushed machine's merge base so it stays converged:
-    # a later live edit there isn't mis-flagged as clobbering an unseen change, and
-    # the next session-start merge sees in-sync. The hash and the mtime were
-    # taken from the source before the pushes (a Path source: from the very
-    # descriptor the pushes read), so the base names the bytes each target got.
-    acked = [
-        mid for mid, res in zip(machines, results, strict=False)
-        if not isinstance(res, Exception) and res is not False
-    ]
-    if acked:
-        from storage.files import sync_state_store
-        if isinstance(source, (bytes, bytearray)):
-            try:
-                base_mtime = (await asyncio.to_thread(
-                    safe_fs.lstat_beneath, config.AGENTS_DIR,
-                    f"{agent_slug}/{normalize_rel_path(rel_path)}")).st_mtime
-            except (OSError, PathOutsideRoot):
-                base_mtime = 0.0
-        if content_hash:
-            for mid in acked:
-                try:
-                    await asyncio.to_thread(
-                        sync_state_store.record_one, mid, agent_slug, rel_path,
-                        content_hash, base_mtime,
-                    )
-                except psycopg.Error:
-                    logger.debug("fan_out_write base-advance failed for %s", mid[:8])
-    for mid, res in zip(machines, results, strict=False):
-        if isinstance(res, Exception):
-            logger.warning(
-                "fan_out_write %s -> %s failed: %s", rel_path, mid[:8], res,
-            )
-        elif res is False and mid in stale_by_machine:
-            logger.info(
-                "fan_out_write %s -> %s held: the file is being changed there",
-                rel_path, mid[:8],
-            )
-        elif res is False:
-            logger.debug(
-                "fan_out_write %s -> %s not acked (offline?)", rel_path, mid[:8],
-            )
-    # Each target that missed the bytes holds an older copy than the
-    # platform's: a read there must not pull it over them
-    # (remote_file_flow's platform-ahead marker). An acked push clears it.
-    # A target changing the file told its stat in the stale ack: that is
-    # the mark's baseline, no probe.
-    missed = [mid for mid, res in zip(machines, results, strict=False) if isinstance(res, Exception) or res is False]
-    for mid in acked:
-        remote_file_flow.clear_platform_ahead(mid, agent_slug, rel_path, stat=platform_stat)
-    if missed and platform_stat is not None:
-        for mid in missed:
-            if mid in stale_by_machine:
-                remote_file_flow.note_platform_ahead(
-                    mid, agent_slug, rel_path, *platform_stat,
-                    machine=remote_file_flow.stale_machine_stat(stale_by_machine[mid]),
-                    stale=True)
-        await asyncio.gather(*(
-            remote_file_flow.note_push_failed(cm, mid, agent_slug, rel_path, *platform_stat,
-                                              fallback=records.get(mid))
-            for mid in missed if mid not in stale_by_machine
-        ), return_exceptions=True)
+async def drain_fan_outs(timeout: float = 30.0) -> bool:
+    """Wait until every connected machine holds what the fan-outs handed it
+    (tests)."""
+    from core.remote import machine_push_lane
+    return await machine_push_lane.drain(timeout)
 
 
 async def fan_out_delete(
     agent_slug: str, rel_path: str, *,
     exclude_machine_id: str | None = None, include_idle: bool = False,
 ) -> None:
-    """Broadcast a delete for ``rel_path`` to every OTHER machine running
-    ``agent_slug`` that is allowed to receive it. Fire-and-forget; never raises.
+    """Hand a delete of ``rel_path`` to every OTHER machine running
+    ``agent_slug`` that is allowed to receive it. Never waits for a machine
+    and never raises.
 
     Targets active-session machines; when ``include_idle`` is set — a dashboard
     delete — ALSO connected-but-idle machines that hold the agent, so the file is
     removed there immediately rather than only via the tombstone at the idle
-    machine's next sync. Uses the same ``file_push`` / ``action: "delete"`` envelope
-    the dashboard file-API delete has always used (``path_kind`` defaults to
-    ``agent_tree`` on the satellite).
+    machine's next sync. The delete takes its place in each machine's lane
+    with the path's writes, so a write still waiting never lands after it.
+    The lane sends the same ``file_push`` / ``action: "delete"`` envelope the
+    dashboard file-API delete has always used (``path_kind`` defaults to
+    ``agent_tree`` on the satellite) and drops the machine's merge base.
     """
-    shared_only = await shared_only_of(agent_slug, rel_path)
-    machines = _targets(agent_slug, rel_path, exclude_machine_id, shared_only)
-    if include_idle:
-        idle = await idle_connected_targets(
-            agent_slug, rel_path, exclude_machine_id=exclude_machine_id, shared_only=shared_only,
-        )
-        if idle:
-            machines = list(set(machines) | set(idle))
-    if not machines:
-        return
-    from core.remote.satellite_connection import get_connection_manager
-    from storage.files import sync_state_store
-    cm = get_connection_manager()
-    for mid in machines:
-        try:
-            await cm.send_fire_and_forget(mid, {
-                "type": "file_push",
-                "agent_slug": agent_slug,
-                "action": "delete",
-                "path": rel_path,
-            })
-            # The machine no longer holds this file → drop its merge base so the
-            # next session-start merge doesn't treat it as a divergence. (The
-            # tombstone — written at the delete source — drives the actual delete
-            # for idle machines.)
-            await asyncio.to_thread(
-                sync_state_store.clear_one, mid, agent_slug, rel_path,
+    try:
+        shared_only = await shared_only_of(agent_slug, rel_path)
+        machines = _targets(agent_slug, rel_path, exclude_machine_id, shared_only)
+        if include_idle:
+            idle = await idle_connected_targets(
+                agent_slug, rel_path, exclude_machine_id=exclude_machine_id,
+                shared_only=shared_only,
             )
-        except Exception as e:  # noqa: BLE001  # one machine's delete push must not stop the others
-            logger.warning(
-                "fan_out_delete %s -> %s failed: %s", rel_path, mid[:8], e,
-            )
+            if idle:
+                machines = list(set(machines) | set(idle))
+        from core.remote import machine_push_lane
+        for mid in machines:
+            machine_push_lane.mark(mid, agent_slug, rel_path, deleted=True)
+    except Exception as e:  # noqa: BLE001  # the delete's fan-out is best effort: the tombstone settles it
+        logger.warning("fan_out_delete %s failed: %s", rel_path, e)
 
 
 async def _atomic_write_agent_file(
@@ -821,6 +671,7 @@ async def _save_fan_out(key: tuple[str, str, str | None], entry: dict) -> None:
             await fan_out_write(
                 agent_slug, rel_path, config.AGENTS_DIR / agent_slug / rel_path,
                 exclude_machine_id=exclude_machine_id, marked=entry["marked"],
+                holds_turns=True,
             )
     except Exception:
         logger.exception("the fan-out of a save of %s/%s failed", agent_slug, rel_path)

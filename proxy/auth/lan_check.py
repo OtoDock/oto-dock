@@ -28,13 +28,16 @@ from typing import Literal
 from starlette.requests import HTTPConnection
 
 import config
+from core.config import deployment
 
 logger = logging.getLogger("otodock")
 
-# The request headers an edge adds. Only X-Forwarded-For ever resolves a
-# client; the others only tell the detector that an edge is in front.
+# Only X-Forwarded-For ever resolves a client; the other edge headers only
+# tell a reader that an edge is in front.
 _XFF = b"x-forwarded-for"
-_EDGE_SIGNALS = frozenset({
+#: The request headers an edge adds, the one list every reader of "is a
+#: forwarder in front" compares against (the detector, the compute link).
+EDGE_SIGNALS = frozenset({
     _XFF, b"forwarded", b"x-real-ip", b"x-forwarded-proto", b"x-forwarded-host",
 })
 _LOOPBACK_HOPS = ("127.0.0.1", "::1")
@@ -200,6 +203,19 @@ def _docker_gateway() -> str:
 
 # --- parsing ----------------------------------------------------------------
 
+def address_is_shared(addr: str) -> bool:
+    """Whether every client behind ``addr`` reaches this server from it, the
+    two cases ``resolve`` reads as shared for one peer: a trusted hop, or in
+    a container its gateway. Such an address proves nothing about who sent
+    a request (a compute machine's address lock cannot hold on it)."""
+    addr = _unmap(addr or "")
+    if not addr:
+        return True
+    if _is_hop(addr):
+        return True
+    return bool(config.RUNNING_IN_DOCKER) and addr == _docker_gateway()
+
+
 def _unmap(ip_str: str) -> str:
     try:
         addr = ipaddress.ip_address(ip_str)
@@ -252,7 +268,7 @@ def resolve(scope) -> ClientAddress:
         for name, value in scope.get("headers") or ():
             if name == _XFF:
                 xff.append(value)
-            if name in _EDGE_SIGNALS:
+            if name in EDGE_SIGNALS:
                 signals = True
         if _is_hop(peer):
             if not xff:
@@ -379,7 +395,7 @@ def stamp_scope(scope) -> ClientAddress:
     if resolved.case:
         _note(resolved.peer, resolved.case)
     elif scope.get("headers") and not _on_internal_listener(scope) and not _is_hop(resolved.peer):
-        if any(name in _EDGE_SIGNALS for name, _ in scope["headers"]):
+        if any(name in EDGE_SIGNALS for name, _ in scope["headers"]):
             logger.debug("Forwarding headers from the public address %s ignored", resolved.peer)
     if client:
         scope["client"] = (resolved.client, client[1])
@@ -447,7 +463,11 @@ def check_local_auth_allowed(conn: HTTPConnection, user_row: dict) -> bool:
     if not bool(user_row.get("local_only", 0)):
         return True
     r = resolve(conn.scope)
-    if r.internal:
+    if config.OTODOCK_CLOUD:
+        # A hosted install has no network of the customer's: a private peer
+        # there is the platform's own (an ingress), never the person's LAN.
+        reason = "a hosted install has no local network"
+    elif r.internal:
         reason = ("the request came through the internal listener (an agent sandbox, "
                   "an app server or a script, or the satellite tunnel), not the local network")
     elif r.case == "untrusted_forwarder":
@@ -456,6 +476,10 @@ def check_local_auth_allowed(conn: HTTPConnection, user_row: dict) -> bool:
         reason = f"the trusted proxy {r.peer} sent no X-Forwarded-For"
     elif config.RUNNING_IN_DOCKER and r.client and r.client == _docker_gateway():
         reason = f"the client is the container's gateway {r.client}"
+    elif config.OTODOCK_COMPUTE_LINK_FROM and r.client == config.OTODOCK_COMPUTE_LINK_FROM:
+        reason = "the client is the install's compute machine, not the local network"
+    elif deployment.is_compute_address(r.client):
+        reason = f"the client {r.client} is an address a compute machine signed in from, not the local network"
     elif is_private_ip(r.client):
         return True
     else:

@@ -22,7 +22,8 @@ import { useEffect, useRef, useState } from 'react'
 import Dialog from './ui/Dialog'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '../contexts/AuthContext'
-import { ICON_PATHS, highlightsFor, type Highlight, type IconName } from '../release/highlights'
+import { highlightsFor, type Highlight } from '../release/highlights'
+import FeatureList from './common/FeatureList'
 import { apiJson, apiOk, withMessage } from '../lib/http/apiJson'
 import Button from './ui/Button'
 import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, DIALOG_PANEL } from './ui/classes'
@@ -56,33 +57,6 @@ function shouldShow(card: ReleaseCard): boolean {
 async function markSeen(version: string): Promise<void> {
   await apiOk('/v1/users/me/release-card/seen', { method: 'POST', body: JSON.stringify({ version }) })
     .catch(withMessage('Failed to mark the release seen'))
-}
-
-function Icon({ name }: { name: string }) {
-  const d = ICON_PATHS[name as IconName] ?? ICON_PATHS.sparkle
-  return (
-    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d={d} />
-    </svg>
-  )
-}
-
-function Cards({ items }: { items: Highlight[] }) {
-  return (
-    <ul className="space-y-3">
-      {items.map((h, i) => (
-        <li key={i} className="flex items-start gap-3">
-          <span className="w-9 h-9 rounded-full bg-surface-muted text-secondary flex items-center justify-center shrink-0">
-            <Icon name={h.icon} />
-          </span>
-          <div className="min-w-0">
-            <p className="text-sm font-semibold text-primary">{h.title}</p>
-            <p className="text-sm text-secondary">{h.text}</p>
-          </div>
-        </li>
-      ))}
-    </ul>
-  )
 }
 
 export function ReleaseDialog() {
@@ -150,13 +124,13 @@ export function ReleaseDialog() {
             {cards.everyone.length > 0 && (
               <section>
                 {both && <p className="text-2xs font-semibold uppercase tracking-wider text-tertiary mb-2">For everyone</p>}
-                <Cards items={cards.everyone} />
+                <FeatureList items={cards.everyone} />
               </section>
             )}
             {cards.admins.length > 0 && (
               <section>
                 {both && <p className="text-2xs font-semibold uppercase tracking-wider text-tertiary mb-2">For admins</p>}
-                <Cards items={cards.admins} />
+                <FeatureList items={cards.admins} />
               </section>
             )}
           </div>

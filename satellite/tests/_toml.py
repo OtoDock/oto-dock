@@ -2,7 +2,7 @@
 
 The satellite runs on the host floor (``PYTHON_MIN_VERSION`` in VERSIONS.md,
 3.10), where the standard library has no ``tomllib``; the runtime parses
-there with the shipped ``tomli`` (``sessions/codex_session._validate_config_toml``).
+there with the shipped ``tomli`` (``sessions/codex_files._validate_config_toml``).
 A test that parses a composed config.toml must not be a bare
 ``import tomllib``: on the floor's CI leg that is an ImportError, not a
 verdict. ``tomli`` (installed on that leg) is the same parser; without

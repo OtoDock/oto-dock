@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from auth import oauth_providers
 from auth.oauth_providers.generic import GenericOAuthProvider
+from services.mcp import mcp_manifest_store
 
 
 class TestManifestCacheClear:
@@ -38,7 +39,6 @@ class TestManifestCacheClear:
         Lighter-weight than mocking — scan_manifests is idempotent enough
         to call in a test.
         """
-        from services.mcp import mcp_registry
 
         oauth_providers._MANIFEST_CACHE["sentinel"] = GenericOAuthProvider(
             provider_id="sentinel",
@@ -46,7 +46,7 @@ class TestManifestCacheClear:
             token_url="https://x/token",
         )
 
-        mcp_registry.scan_manifests()
+        mcp_manifest_store.scan_manifests()
 
         assert "sentinel" not in oauth_providers._MANIFEST_CACHE
 
@@ -58,7 +58,7 @@ class TestManifestCacheClear:
         import threading
         import time
 
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_store, mcp_registry
         runs: list[tuple[int, float, float]] = []
 
         def fake_scan():
@@ -67,7 +67,7 @@ class TestManifestCacheClear:
             runs.append((threading.get_ident(), t0, time.monotonic()))
             return {}
 
-        monkeypatch.setattr(mcp_registry, "scan_manifests", fake_scan)
+        monkeypatch.setattr(mcp_manifest_store, "scan_manifests", fake_scan)
 
         async def two():
             await asyncio.gather(mcp_registry.rescan(), mcp_registry.rescan())

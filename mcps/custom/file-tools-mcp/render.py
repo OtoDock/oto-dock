@@ -63,13 +63,14 @@ def render_available() -> bool:
         return False
 
 
-async def _verify(bearer: str) -> bool:
-    """The proxy says whether this render token is live."""
+async def _verify(bearer: str, path: str = "/v1/internal/render/verify") -> bool:
+    """The proxy says whether this bearer is live: a render token here, a
+    conversion token for ``convert_route``."""
     if not bearer or not PROXY_URL:
         return False
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"{PROXY_URL}/v1/internal/render/verify",
+            r = await client.get(f"{PROXY_URL}{path}",
                                  headers={"Authorization": f"Bearer {bearer}"})
         return r.status_code == 204
     except httpx.HTTPError:

@@ -6,22 +6,49 @@ input coordinates. Both heavy deps are imported **lazily inside functions** so
 the module imports on a headless box (and in the test suite) without a display
 or the capture deps installed; failures become actionable
 :class:`environment.DeviceUnavailable` errors rather than import-time crashes.
+
+A call grabs through one :class:`Grabber` (one ``mss`` instance, so one display
+connection of its own on X11, never pyautogui's) and keeps :class:`Frame`
+objects: the raw pixels of a monitor, compared as bytes by the still wait and
+the spot check, and encoded into the picture the model sees only once.
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import geometry
 from environment import DeviceUnavailable, os_kind
 
 
 @dataclass
+class Frame:
+    """One grab of a monitor at its physical pixels: the raw BGRA bytes and the
+    monitor measured from them. Compared as bytes. Turned into a Pillow image
+    once, when something needs its pixels."""
+
+    monitor: geometry.Monitor
+    raw: bytes
+    width: int
+    height: int
+    _image: Any = field(default=None, repr=False, compare=False)
+
+    def image(self):
+        if self._image is None:
+            from PIL import Image
+
+            self._image = Image.frombuffer("RGB", (self.width, self.height), self.raw, "raw", "BGRX", 0, 1)
+        return self._image
+
+
+@dataclass
 class Capture:
-    """The result of a screenshot: the PNG to hand the model plus everything
-    needed to map a click on it back to a physical/OS coordinate."""
+    """The picture handed to the model plus everything needed to map a click on
+    it back to a physical/OS coordinate."""
 
     png_b64: str                 # base64 PNG, downscaled to model space
     model_width: int             # width of the image actually sent
@@ -30,13 +57,17 @@ class Capture:
     monitor: geometry.Monitor    # the captured monitor's geometry
     monitor_count: int           # total individual monitors detected
     saved_path: str | None = None  # abs path of the full-res PNG, if save was requested
+    frame: Frame | None = None   # the grab it was made from
 
 
-def _ensure_windows_dpi_aware() -> None:
+def ensure_dpi_aware() -> None:
     """Make the process per-monitor-DPI-aware on Windows so ``mss`` and
     ``pyautogui`` report the SAME (physical) coordinate space. Without this,
     Windows virtualizes coordinates inconsistently between capture and input on
-    scaled displays. No-op off Windows and idempotent/safe to call repeatedly.
+    scaled displays. It must run before pyautogui's import, which sets a
+    process-wide awareness that cannot be changed afterwards
+    (``executor._gui`` calls it first). No-op off Windows and idempotent/safe
+    to call repeatedly.
     """
     if os_kind() != "windows":
         return
@@ -60,8 +91,9 @@ def list_monitors() -> list[geometry.Monitor]:
     all-monitors virtual screen — is skipped). ``phys_*`` come from a real grab
     so the DPR is measured, not assumed. Raises
     :class:`environment.DeviceUnavailable` if the screen subsystem can't init.
+    A call reads it once and passes the list on.
     """
-    _ensure_windows_dpi_aware()
+    ensure_dpi_aware()
     try:
         import mss
     except Exception as e:  # pragma: no cover - import guard
@@ -100,104 +132,119 @@ def list_monitors() -> list[geometry.Monitor]:
     return monitors
 
 
-def select_monitor(display: int | None) -> tuple[geometry.Monitor, int]:
+def select_monitor(display: int | None, monitors: list[geometry.Monitor] | None = None) -> tuple[geometry.Monitor, int]:
     """Resolve a 1-based ``display`` index (``None`` => primary) to a
     :class:`geometry.Monitor`, returning ``(monitor, total_count)``. An
     out-of-range index falls back to the primary so a bad arg never crashes."""
-    monitors = list_monitors()
+    monitors = monitors if monitors is not None else list_monitors()
     count = len(monitors)
     if display is None or display < 1 or display > count:
         return monitors[0], count
     return monitors[display - 1], count
 
 
-def resolve_target(display: int | None, coord_mode: str) -> tuple[geometry.Monitor, float]:
-    """Return ``(monitor, scale)`` for ``display`` WITHOUT keeping the image —
-    used by input actions to convert a model-space click into an OS coordinate.
-    The selected monitor's ``phys_*`` are measured from a real grab (so the DPR
-    is correct on Retina/HiDPI), and ``scale`` matches exactly what a
-    screenshot of the same display+mode would have used (capture is
-    deterministic), so cached state is unnecessary."""
-    monitor, _count = select_monitor(display)
-    scale = geometry.compute_scale(monitor.phys_width, monitor.phys_height, coord_mode)
-    return monitor, scale
+def _rect(monitor: geometry.Monitor) -> dict:
+    return {"left": monitor.left, "top": monitor.top, "width": monitor.width, "height": monitor.height}
 
 
-def capture(display: int | None, coord_mode: str, *, save_path: str | None = None) -> Capture:
-    """Grab ``display`` (1-based; ``None`` => primary), downscale per
-    ``coord_mode``, and return a :class:`Capture`. Raises
-    :class:`environment.DeviceUnavailable` on any capture failure (callers turn
-    it into an actionable error result).
+class Grabber:
+    """One ``mss`` instance for one call."""
 
-    ``save_path`` (set only for a DELIBERATE ``screenshot(save=true)``) writes
-    the FULL-resolution PNG to that path for dashboard viewing — never the
-    downscaled model frame, and never into a ``.screenshots`` tree (the caller
-    picks a normal workspace path; see ``server._alloc_save_path``). A save
-    failure is non-fatal: ``saved_path`` stays ``None`` and the inline image is
-    still returned."""
-    try:
-        import mss
-        from PIL import Image
-    except Exception as e:  # pragma: no cover - import guard
-        raise DeviceUnavailable(
-            f"Screen-capture dependencies are not available: {e}"
-        ) from e
-
-    monitor, count = select_monitor(display)
-    mon_dict = {
-        "left": monitor.left,
-        "top": monitor.top,
-        "width": monitor.width,
-        "height": monitor.height,
-    }
-    try:
-        with mss.mss() as sct:
-            shot = sct.grab(mon_dict)
-            img = Image.frombytes("RGB", shot.size, shot.rgb)
-    except Exception as e:
-        raise DeviceUnavailable(
-            "Screen capture failed. On Wayland this is expected (capture is "
-            "blocked); otherwise the session may be locked or asleep. "
-            f"({e})"
-        ) from e
-
-    phys_w, phys_h = img.width, img.height
-
-    # Deliberate save: persist the FULL-resolution frame before downscaling.
-    saved_path = None
-    if save_path:
+    def __init__(self) -> None:
         try:
-            img.save(save_path, format="PNG", optimize=False, compress_level=6)
-            saved_path = save_path
-        except (OSError, ValueError):
-            saved_path = None  # non-fatal — inline image is still returned
+            import mss
+        except Exception as e:  # pragma: no cover - import guard
+            raise DeviceUnavailable(f"Screen-capture dependencies are not available: {e}") from e
+        try:
+            self._sct = mss.mss()
+        except Exception as e:
+            raise DeviceUnavailable(
+                "Could not read the display configuration. The session may be "
+                f"locked, asleep, or headless. ({e})"
+            ) from e
 
-    scale = geometry.compute_scale(phys_w, phys_h, coord_mode)
-    model_w, model_h = geometry.scaled_size(phys_w, phys_h, scale)
-    model_img = img.resize((model_w, model_h), Image.LANCZOS) if (model_w, model_h) != (phys_w, phys_h) else img
+    def grab(self, monitor: geometry.Monitor) -> Frame:
+        try:
+            shot = self._sct.grab(_rect(monitor))
+        except Exception as e:
+            raise DeviceUnavailable(
+                "Screen capture failed. On Wayland this is expected (capture is "
+                "blocked); otherwise the session may be locked or asleep. "
+                f"({e})"
+            ) from e
+        measured = geometry.Monitor(
+            index=monitor.index, left=monitor.left, top=monitor.top,
+            width=monitor.width, height=monitor.height,
+            phys_width=int(shot.width), phys_height=int(shot.height),
+            is_primary=monitor.is_primary,
+        )
+        return Frame(measured, bytes(shot.raw), int(shot.width), int(shot.height))
 
+    def region(self, rect: dict):
+        """A region of the desktop (in the OS input space, as a monitor's
+        bounds are) at the screen's full sharpness, as a Pillow image. On
+        macOS ``mss`` grabs one pixel per point unless its options lose the
+        nominal-resolution flag, which this does for the one grab (mss's own
+        note on ``IMAGE_OPTIONS``, its issue 257)."""
+        from PIL import Image
+
+        try:
+            if os_kind() == "darwin":
+                import mss.darwin as mss_darwin
+
+                saved = mss_darwin.IMAGE_OPTIONS
+                mss_darwin.IMAGE_OPTIONS = saved & ~mss_darwin.kCGWindowImageNominalResolution
+                try:
+                    shot = self._sct.grab(rect)
+                finally:
+                    mss_darwin.IMAGE_OPTIONS = saved
+            else:
+                shot = self._sct.grab(rect)
+        except Exception as e:
+            raise DeviceUnavailable(f"Screen capture failed. ({e})") from e
+        return Image.frombuffer("RGB", (int(shot.width), int(shot.height)), bytes(shot.raw), "raw", "BGRX", 0, 1)
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):  # closing a display connection must never fail a call
+            self._sct.close()
+
+
+def open_grabber() -> Grabber:
+    return Grabber()
+
+
+def png_b64(img, coord_mode: str) -> tuple[str, int, int, float]:
+    """``(base64 PNG, width, height, scale)`` of ``img`` shrunk to the mode's
+    screenshot limit, never enlarged: the one encoder of every picture."""
+    from PIL import Image
+
+    scale = geometry.compute_scale(img.width, img.height, coord_mode)
+    w, h = geometry.scaled_size(img.width, img.height, scale)
+    small = img.resize((w, h), Image.LANCZOS) if (w, h) != (img.width, img.height) else img
     buf = io.BytesIO()
-    model_img.save(buf, format="PNG", optimize=False, compress_level=6)
-    png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    small.save(buf, format="PNG", optimize=False, compress_level=6)
+    return base64.b64encode(buf.getvalue()).decode("ascii"), w, h, scale
 
-    # Refresh the captured monitor's measured physical size from the actual
-    # grab (handles the Retina/HiDPI case where the monitor dict is logical).
-    measured = geometry.Monitor(
-        index=monitor.index,
-        left=monitor.left,
-        top=monitor.top,
-        width=monitor.width,
-        height=monitor.height,
-        phys_width=phys_w,
-        phys_height=phys_h,
-        is_primary=monitor.is_primary,
-    )
+
+def save_png(img, path: str) -> str | None:
+    """Write ``img`` at full sharpness. A failure is non-fatal: ``None``."""
+    try:
+        img.save(path, format="PNG", optimize=False, compress_level=6)
+        return path
+    except (OSError, ValueError):
+        return None
+
+
+def encode(frame: Frame, coord_mode: str, *, monitor_count: int, save_path: str | None = None) -> Capture:
+    """The picture of ``frame`` the model sees. ``save_path`` (a DELIBERATE
+    save only) writes the FULL-resolution frame there for dashboard viewing,
+    never into a ``.screenshots`` tree (the caller picks a normal workspace
+    path; see ``server._alloc_save_path``)."""
+    img = frame.image()
+    saved_path = save_png(img, save_path) if save_path else None
+    data, w, h, scale = png_b64(img, coord_mode)
     return Capture(
-        png_b64=png_b64,
-        model_width=model_w,
-        model_height=model_h,
-        scale=scale,
-        monitor=measured,
-        monitor_count=count,
-        saved_path=saved_path,
+        png_b64=data, model_width=w, model_height=h, scale=scale,
+        monitor=frame.monitor, monitor_count=monitor_count,
+        saved_path=saved_path, frame=frame,
     )

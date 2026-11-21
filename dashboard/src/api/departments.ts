@@ -42,6 +42,11 @@ export interface Department {
   members: DepartmentMember[]
   /** Computed server-side: admin, or creator who created this department. */
   can_edit: boolean
+  /** Computed server-side for this person: whether they may place an agent
+   * in it. The dashboard offers only these and never spells the rule. */
+  can_place?: boolean
+  /** The server's sentence when they may not, else empty. */
+  place_refusal?: string
 }
 
 export interface AgentActivity {

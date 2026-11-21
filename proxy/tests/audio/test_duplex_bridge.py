@@ -408,7 +408,11 @@ async def test_interactive_state_resolves_once(temp_db, monkeypatch):
     bridge.engine_ws = FakeWebSocket()
 
     class _FakeIsess:
+        is_remote = False
         prompts: list = []
+
+        def limit_ending(self):
+            return None
 
         def may_drive(self, sender_sub):
             return True
@@ -431,6 +435,169 @@ async def test_interactive_state_resolves_once(temp_db, monkeypatch):
     assert len(isess.prompts) == 2
     assert "SPOKEN RULES" in isess.prompts[0]
     assert "SPOKEN RULES" not in isess.prompts[1]  # context injected ONCE
+    duplex_attach._interactive_feeds.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pin, serves, said", [
+    ("local", False, "OtoDock's compute machine is not connected, so this cannot run now. Try again in a few minutes."),
+    ("local", True, "The machine running this chat is not connected. Try again in a few minutes."),
+    ("m-paired", False, "The machine running this chat is not connected. Try again in a few minutes."),
+])
+async def test_a_voice_turn_on_a_terminal_whose_machine_is_away_hears_a_sentence_and_types_nothing(
+        temp_db, monkeypatch, pin, serves, said):
+    """A terminal whose machine is away stays live for the machine's return.
+    Words queued in it would be typed in then, however late: a spoken turn
+    is refused in words instead, and nothing is queued."""
+    from types import SimpleNamespace
+
+    from core.remote import satellite_connection, satellite_link
+    from storage import database as task_store
+    from tests._compute import serve, serve_none
+    task_store.create_chat("chat-t", "user-a", "agent-a", "auto")
+    task_store.update_chat("chat-t", session_id="sid-t1", execution_target=pin)
+    bridge = _bridge(chat_id="chat-t")
+    bridge.engine_ws = FakeWebSocket()
+
+    class _AwayTerminal:
+        is_remote, target = True, "c-1" if pin == "local" else pin
+        prompts: list = []
+
+        def limit_ending(self):
+            return None
+
+        def may_drive(self, sender_sub):
+            return True
+
+        def queue_prompt(self, text, source, **ctx):
+            self.prompts.append(text)
+            return True
+
+    isess = _AwayTerminal()
+    monkeypatch.setattr("core.session.interactive_session.find_live_for_chat", lambda chat_id, **kw: isess)
+    away = {"is": True}
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", lambda: SimpleNamespace(
+        is_pty_in_grace=lambda mid: away["is"] and mid == isess.target, is_compute=lambda mid: False,
+        is_connected=lambda mid: False, exit_state=lambda mid: (0, False), exit_report=lambda mid: {},
+        links=satellite_link.MachineLinks(None)))
+    (serve if serves else serve_none)(monkeypatch)
+
+    await duplex_attach.run_utterance(bridge, {"turn": 3, "text": "are you there"})
+
+    assert isess.prompts == []
+    assert bridge.engine_ws.sent == [{"type": "error", "turn": 3, "data": {"message": said, "say": said}}]
+    assert duplex_attach._states["dx-1"].active_turn is None
+    # The machine is back: the same terminal takes the next words.
+    away["is"] = False
+    await duplex_attach.run_utterance(bridge, {"turn": 4, "text": "and now"})
+    assert len(isess.prompts) == 1 and "and now" in isess.prompts[0]
+    duplex_attach._interactive_feeds.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_voice_turn_into_a_terminal_at_its_limit_is_refused_at_once(temp_db, monkeypatch):
+    """A terminal whose turn ended at its usage limit holds the words the
+    server queues until its reset. A spoken turn never waits in a queue: it
+    hears the limit's sentence at once, and nothing is queued. Once the
+    reset has passed, the same terminal takes the next words."""
+    import time
+
+    from core.events import turn_ending
+    from core.session.interactive_queue import InteractiveQueueMixin
+    from core.session.interactive_turn import LimitMark
+    from storage import database as task_store
+    task_store.create_chat("chat-l", "user-a", "agent-a", "auto")
+    task_store.update_chat("chat-l", session_id="sid-l1")
+    bridge = _bridge(chat_id="chat-l")
+    bridge.engine_ws = FakeWebSocket()
+
+    class _TerminalAtLimit:
+        is_remote = False
+        session_id = "sid-l1"
+        _served_at = 0.0
+        prompts: list = []
+        limit_mark = LimitMark.of(turn_ending.TurnEnding(
+            reason=turn_ending.LIMIT, resets_at="2099-01-01T00:00:00+00:00"))
+        limit_ending = InteractiveQueueMixin.limit_ending
+
+        def clear_limit_mark(self, why):
+            self.limit_mark = None
+
+        def may_drive(self, sender_sub):
+            return True
+
+        def queue_prompt(self, text, source, **ctx):
+            self.prompts.append(text)
+            return True
+
+    isess = _TerminalAtLimit()
+    monkeypatch.setattr("core.session.interactive_session.find_live_for_chat", lambda chat_id, **kw: isess)
+
+    await duplex_attach.run_utterance(bridge, {"turn": 5, "text": "carry on"})
+
+    said = "This chat's AI account has reached its usage limit. Try again after it resets, or type in the chat."
+    assert isess.prompts == []
+    assert bridge.engine_ws.sent == [{"type": "error", "turn": 5, "data": {"message": said, "say": said}}]
+    assert duplex_attach._states["dx-1"].active_turn is None
+    # Its reset passed: the mark no longer holds, and the words are queued.
+    isess.limit_mark.until = time.time() - 1
+    await duplex_attach.run_utterance(bridge, {"turn": 6, "text": "and now"})
+    assert len(isess.prompts) == 1 and "and now" in isess.prompts[0]
+    duplex_attach._interactive_feeds.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_voice_turn_into_a_terminal_whose_account_rests_is_refused_at_once(temp_db, monkeypatch):
+    """A terminal with no limit of its own whose account rests on a window
+    (another chat filled it, or the server restarted and the rest was
+    loaded): its server prompts wait, so a spoken turn is refused at once
+    by the session's one reading of its limit (``limit_ending``). A plain
+    cooldown on the account refuses nothing."""
+    import time
+
+    from core.session.interactive_queue import InteractiveQueueMixin
+    from services.engines import pool_rests, subscription_pool
+    from storage import database as task_store
+    task_store.create_chat("chat-r", "user-a", "agent-a", "auto")
+    task_store.update_chat("chat-r", session_id="sid-r1")
+    bridge = _bridge(chat_id="chat-r")
+    bridge.engine_ws = FakeWebSocket()
+
+    class _TerminalOnARestingAccount:
+        is_remote = False
+        session_id = "sid-r1"
+        limit_mark = None
+        _served_at = 0.0
+        prompts: list = []
+        limit_ending = InteractiveQueueMixin.limit_ending
+
+        def clear_limit_mark(self, why):
+            self.limit_mark = None
+
+        def may_drive(self, sender_sub):
+            return True
+
+        def queue_prompt(self, text, source, **ctx):
+            self.prompts.append(text)
+            return True
+
+    isess = _TerminalOnARestingAccount()
+    monkeypatch.setattr("core.session.interactive_session.find_live_for_chat", lambda chat_id, **kw: isess)
+    monkeypatch.setitem(subscription_pool._session_subscriptions, "sid-r1", "sub-r")
+    monkeypatch.setitem(pool_rests._throttled_until, "sub-r", time.time() + 3600)
+    monkeypatch.setattr(pool_rests, "_throttled_hard", {"sub-r"})
+    monkeypatch.setitem(pool_rests._window_rests, "sub-r", ("seven_day", time.time()))
+
+    await duplex_attach.run_utterance(bridge, {"turn": 7, "text": "carry on"})
+
+    said = duplex_attach.LIMIT_SENTENCE
+    assert isess.prompts == []
+    assert bridge.engine_ws.sent == [{"type": "error", "turn": 7, "data": {"message": said, "say": said}}]
+    assert duplex_attach._states["dx-1"].active_turn is None
+    # A plain cooldown (no window behind the rest): the words are queued.
+    pool_rests._window_rests.pop("sub-r")
+    await duplex_attach.run_utterance(bridge, {"turn": 8, "text": "and now"})
+    assert len(isess.prompts) == 1 and "and now" in isess.prompts[0]
     duplex_attach._interactive_feeds.clear()
 
 
@@ -600,6 +767,7 @@ async def test_a_voice_never_speaks_into_a_colleagues_terminal(temp_db, monkeypa
     task_store.add_user_agent("user-a", "agent-a", "editor", "test")
 
     class _ColleaguesTerminal:
+        is_remote = False
         prompts: list = []
 
         def may_drive(self, sender_sub):
@@ -723,6 +891,9 @@ async def test_a_failed_voice_turn_sends_nothing_more_into_its_session(temp_db, 
         async def session_lock(self, _sid):
             yield
 
+        async def record_waiting_turns(self, _sid):
+            return None
+
         async def send_message(self, _sid, text, **_kw):
             sent.append(text)
             _active_pumps["chat-f"].queue_message(TurnInput("typed meanwhile"))
@@ -750,6 +921,100 @@ async def test_a_failed_voice_turn_sends_nothing_more_into_its_session(temp_db, 
 
 
 @pytest.mark.asyncio
+async def test_a_voice_turn_reads_the_engines_unread_turn_before_the_spoken_words(monkeypatch):
+    """A turn the engine ran by itself that nobody read is recorded before
+    the spoken words' row, so it lands above them in the chat."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from core.events.common_events import DONE, CommonEvent
+    from core.events.stream_pump import _active_pumps
+
+    order: list[str] = []
+
+    class FakeLayer:
+        def capabilities_for(self, _sid):
+            return SimpleNamespace(behaviour=SimpleNamespace(rebuilds_history_from_db=True))
+
+        @asynccontextmanager
+        async def session_lock(self, _sid):
+            yield
+
+        async def record_waiting_turns(self, sid):
+            order.append(f"waiting {sid}")
+
+        async def send_message(self, _sid, text, **_kw):
+            yield CommonEvent(type=DONE, data={})
+
+    async def _no_focus(_bridge):
+        return ""
+
+    monkeypatch.setattr(duplex_attach, "_focus_for", _no_focus)
+    monkeypatch.setattr(duplex_attach.task_store, "add_chat_message",
+                        lambda cid, role, text, **k: order.append(f"{role} {text}"))
+    monkeypatch.setattr(duplex_attach, "_start_forward", lambda *a, **k: None)
+    bridge = _bridge(chat_id="chat-o")
+    st = duplex_attach._AttachState(chat_id="chat-o", session_id="s-o", layer=FakeLayer())
+    st.context_injected = True
+    try:
+        await duplex_attach._run_new_turn(bridge, st, 1, "say it", None)
+        await asyncio.wait_for(st.pump._task, timeout=5)
+        assert order[:2] == ["waiting s-o", "user say it"]
+    finally:
+        _active_pumps.pop("chat-o", None)
+
+
+@pytest.mark.asyncio
+async def test_a_voice_turn_arms_the_monitors_for_the_work_it_leaves(monkeypatch):
+    """A spoken turn that leaves a background command running gets its
+    monitors when its pump ends, as a typed turn does."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from core.events import pump_bg_monitors
+    from core.events.common_events import DONE, CommonEvent
+    from core.events.stream_pump import _active_pumps
+
+    armed: list[tuple] = []
+    monkeypatch.setattr(pump_bg_monitors, "arm_bg_monitors",
+                        lambda layer, sid, cid: armed.append((sid, cid)))
+
+    class FakeLayer:
+        def capabilities_for(self, _sid):
+            return SimpleNamespace(behaviour=SimpleNamespace(rebuilds_history_from_db=True))
+
+        @asynccontextmanager
+        async def session_lock(self, _sid):
+            yield
+
+        async def record_waiting_turns(self, _sid):
+            return None
+
+        async def send_message(self, _sid, text, **_kw):
+            yield CommonEvent(type=DONE, data={})
+
+    async def _no_focus(_bridge):
+        return ""
+
+    monkeypatch.setattr(duplex_attach, "_focus_for", _no_focus)
+    monkeypatch.setattr(duplex_attach.task_store, "add_chat_message", lambda *a, **k: None)
+    monkeypatch.setattr(duplex_attach, "_start_forward", lambda *a, **k: None)
+    bridge = _bridge(chat_id="chat-arm")
+    st = duplex_attach._AttachState(chat_id="chat-arm", session_id="s-arm", layer=FakeLayer())
+    st.context_injected = True
+    try:
+        await duplex_attach._run_new_turn(bridge, st, 1, "start the job", None)
+        await asyncio.wait_for(st.pump._task, timeout=5)
+        for _ in range(50):
+            if armed:
+                break
+            await asyncio.sleep(0.01)
+        assert armed == [("s-arm", "chat-arm")]
+    finally:
+        _active_pumps.pop("chat-arm", None)
+
+
+@pytest.mark.asyncio
 async def test_a_voice_turn_left_wake_is_stored_for_the_bridge_person(temp_db, monkeypatch):
     """A delegated result queued on a voice turn's pump that the producer
     never sends (the turn yielded an ERROR) is stored as the chat's wake for
@@ -769,6 +1034,9 @@ async def test_a_voice_turn_left_wake_is_stored_for_the_bridge_person(temp_db, m
         @asynccontextmanager
         async def session_lock(self, _sid):
             yield
+
+        async def record_waiting_turns(self, _sid):
+            return None
 
         async def send_message(self, _sid, text, **_kw):
             _active_pumps["chat-w"].system_queue.append("a delegated result")

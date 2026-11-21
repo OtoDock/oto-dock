@@ -125,6 +125,14 @@ def build_session_env(
     # satellite CLI spawns (cli_session/pty_session).
     env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
 
+    # Claude Code connects its stdio tools a few at a time (3 by default) and
+    # holds the first turn until all are connected. A stand-in answers in
+    # milliseconds, but a program that really starts (nothing saved: the
+    # first session after an update, a call's first) takes a second or more:
+    # twice the cores, 3 to 16, start together. Mirrored on satellite CLI
+    # spawns (cli_session/pty_session); a stand-in's fingerprint leaves it out.
+    env["MCP_SERVER_CONNECTION_BATCH_SIZE"] = str(min(16, max(3, 2 * (os.cpu_count() or 1))))
+
     # Standard OTO_* platform env vars (incl. OTO_SESSION_ID) — community MCPs
     # read these for scope-aware paths without per-manifest declarations.
     from core.sandbox.oto_env import build_oto_env, resolve_memory_and_scope
@@ -156,6 +164,8 @@ def build_session_env(
         external_channel=(getattr(ext_ctx, "external_channel", "") or "") if is_external else "",
         external_id=(getattr(ext_ctx, "external_id", "") or "") if is_external else "",
         external_verified=bool(getattr(ext_ctx, "external_verified", False)) if is_external else False,
+        wrapup=bool(getattr(ext_ctx, "wrapup", "")),
+        wrapup_person=bool(getattr(ext_ctx, "wrapup_home", "")),
     ))
 
     # Per-user/infra MCP credentials from credential_resolver +

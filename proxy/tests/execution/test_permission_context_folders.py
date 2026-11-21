@@ -286,6 +286,144 @@ def test_building_agents_skipped_for_agent_scope(temp_db):
     assert "# Building Agents" not in text
 
 
+# ---------------------------------------------------------------------------
+# When a tool or a skill is missing: the order, and only what the session holds
+# ---------------------------------------------------------------------------
+
+_MCPS_TOOLS = {
+    "list_enabled_mcps", "list_available_mcps", "list_community_mcps", "list_community_skills",
+    "request_mcp_install", "request_mcp_access", "request_skill_install",
+    "disable_mcp_for_agent", "get_request_status", "cancel_my_request", "validate_mcp_package",
+}
+_MISSING = "**When a tool or a skill is missing.**"
+
+
+def _missing_block(text: str) -> str:
+    return text.split(_MISSING)[1].split("\n\n")[0] if _MISSING in text else ""
+
+
+def _session_tools(scope: str, role: str) -> set[str]:
+    """The tool set the tools manager gives a session of this scope and
+    role with a person driving it, from the module itself."""
+    import os
+
+    from auth import roles
+    from tests._paths import CUSTOM_MCPS, load_mcp_server
+    saved = {k: v for k, v in os.environ.items() if k.startswith("OTO_")}
+    for key in saved:
+        os.environ.pop(key)
+    os.environ.update({
+        "OTO_AGENT_NAME": "pa", "OTO_SCOPE": scope, "OTO_ROLE": role,
+        "OTO_CAN_MANAGE_AGENT": "true" if roles.can_manage(role) else "false",
+        "OTO_CAN_EDIT_AGENT": "true" if roles.can_edit(role) else "false",
+        "OTO_USER_SUB": "sub-alice",
+    })
+    try:
+        return set(load_mcp_server(CUSTOM_MCPS / "mcps-mcp").ENABLED_TOOLS)
+    finally:
+        for key in [k for k in os.environ if k.startswith("OTO_")]:
+            os.environ.pop(key)
+        os.environ.update(saved)
+
+
+def test_the_missing_tool_block_names_only_what_the_session_holds(temp_db):
+    """Scope, role and whether the tools manager is enabled: every tool the
+    block names is in the set the MCP gives that session, and every skill
+    it names admits that role."""
+    import json
+    import re
+
+    from services.mcp.mcp_session_filter import audience_admits
+    from tests._paths import CUSTOM_MCPS
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    skills = {s["id"]: s.get("audience", "") for s in json.loads(
+        (CUSTOM_MCPS / "mcps-mcp" / "manifest.json").read_text())["skills"]}
+    seen = 0
+    for scope in ("user", "agent"):
+        for role in ("admin", "manager", "editor", "contributor", "viewer"):
+            for enabled in (("mcps-mcp",), ()):
+                ctx = SecurityContext(role=role, username="alice", agent="pa", is_admin_agent=False,
+                                      session_scope=scope)
+                block = _missing_block(build_permission_context(
+                    ctx, assigned_mcp_names=enabled, execution_path="claude-code-cli"))
+                if role in ("contributor", "viewer"):
+                    assert not block, (scope, role, enabled)
+                    continue
+                assert block, (scope, role, enabled)
+                seen += 1
+                named = set(re.findall(r"`([a-z_-]+)`", block))
+                tools = named & _MCPS_TOOLS
+                assert tools <= (_session_tools(scope, role) if enabled else set()), (scope, role, enabled, tools)
+                for skill in named & set(skills):
+                    assert enabled, (scope, role, skill)
+                    assert audience_admits(skills[skill], role), (scope, role, skill)
+                assert not named - _MCPS_TOOLS - set(skills), named
+    assert seen == 12
+
+
+def test_a_manager_reads_the_three_steps_in_order(temp_db):
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    text = build_permission_context(
+        _ctx(role="manager", username="alice"),
+        assigned_mcp_names=("agent-config-mcp", "mcps-mcp"), execution_path="claude-code-cli")
+    block = _missing_block(text.split("# Building Agents")[1])
+    order = [block.index(word) for word in (
+        "list_available_mcps", "request_mcp_access", "list_community_mcps", "request_mcp_install",
+        "mcp-authoring", "validate_mcp_package", "platform admin")]
+    assert order == sorted(order)
+    assert "list_community_skills" in block and "skill-creator" in block
+    assert "# Missing Tools" not in text
+
+
+def test_an_editor_reads_the_build_step_and_no_managing_tool(temp_db):
+    """The section stays a manager's: an editor reads the order alone, and
+    of the tools manager only the check tool it holds."""
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    text = build_permission_context(
+        _ctx(role="editor", username="alice"),
+        assigned_mcp_names=("agent-config-mcp", "mcps-mcp"), execution_path="claude-code-cli")
+    assert "# Building Agents" not in text
+    block = _missing_block(text.split("# Missing Tools")[1])
+    assert "validate_mcp_package" in block and "mcp-authoring" in block
+    assert "ask a manager" in block
+    assert "list_available_mcps" not in block and "request_mcp" not in block
+
+
+def test_a_shared_only_chat_names_the_list_and_check_tools_and_sends_the_rest_to_the_dashboard(temp_db):
+    """A Shared-only agent's chat mounts the agent's scope with a person
+    driving it: the list tools, the build step with the check tool, and the
+    dashboard for enabling. No request tool, here or in the manager's
+    Building Agents lines."""
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    for role, who in (("manager", "this person does"), ("editor", "a manager of this agent does")):
+        ctx = SecurityContext(role=role, username="alice", agent="pa", is_admin_agent=False,
+                              session_scope="agent")
+        text = build_permission_context(
+            ctx, assigned_mcp_names=("mcps-mcp",), execution_path="claude-code-cli")
+        block = _missing_block(text)
+        assert "list_available_mcps" in block and "list_community_skills" in block
+        assert "validate_mcp_package" in block and "mcp-authoring" in block
+        assert "request_" not in block
+        assert who in block
+        if role == "manager":
+            building = text.split("# Building Agents")[1].split(_MISSING)[0]
+            assert "validate_mcp_package" in building
+            assert "request additional" not in building and "request_" not in building
+
+
+def test_a_member_and_a_session_with_no_person_read_no_missing_tool_block(temp_db):
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    for ctx in (
+        _ctx(role="viewer", username="alice"),
+        _ctx(role="contributor", username="alice"),
+        SecurityContext(role="manager", username="", agent="pa", is_admin_agent=False,
+                        session_scope="agent"),
+    ):
+        text = build_permission_context(ctx, assigned_mcp_names=("mcps-mcp",),
+                                        execution_path="claude-code-cli")
+        assert _MISSING not in text and "# Missing Tools" not in text
+
+
 def test_folders_ro_library_row_claims_no_bulletin(temp_db):
     """The RO library row names the library and its source; since 1.9.1 no
     bulletin loads into the context, so the row promises none (the
@@ -382,8 +520,8 @@ def test_bash_block_omitted_on_direct_llm(temp_db):
 
 
 def test_bash_block_admin_callout_for_admin(temp_db):
-    """Admins see host-touching commands as available; non-admins on local
-    sandbox see them as denied. On remote satellites the gating flips
+    """Admins see host-touching commands as available; non-admins in a
+    compute machine's sandbox see them as denied. On remote satellites the gating flips
     (admin + manager + editor get them) — covered by environment tests
     below."""
     agent_store.create_agent("pa", "PA", default_scope="user")
@@ -398,7 +536,8 @@ def test_bash_block_admin_callout_for_admin(temp_db):
         execution_path="claude-code-cli",
     )
     assert "available to you as platform admin" in admin_text
-    assert "not available on local sandbox sessions" in manager_text
+    assert "not available to your role in a compute machine's sandbox" in manager_text
+    assert "On a paired remote machine, managers and editors get every" in manager_text
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +552,9 @@ def test_env_local_sandbox_block(temp_db):
         execution_path="claude-code-cli",
     )
     assert "# Execution Environment" in text
-    assert "local bwrap kernel sandbox" in text
+    assert "inside a **sandbox** on one of the platform's compute machines" in text
+    assert "platform host" not in text
+    assert "is the sandbox on a compute machine and the OS user's permissions on a paired remote machine" in text
 
 
 def test_env_admin_remote_block(temp_db):
@@ -479,7 +620,7 @@ def test_admin_tier_blocked_locally_for_manager(temp_db):
         "Bash", {"command": "docker compose up -d"}, ctx,
     )
     assert not decision.allowed
-    assert "local sandbox sessions" in decision.reason
+    assert "in a compute machine's sandbox" in decision.reason
 
 
 def test_admin_tier_blocked_for_viewer_on_remote(temp_db):

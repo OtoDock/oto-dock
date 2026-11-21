@@ -1,6 +1,6 @@
 /**
  * One labeled account row (minimized = identity + ⭐ default toggle + Edit;
- * expanded = full credentials form + per-agent override list).
+ * expanded = full credentials form + the agents that may use the account).
  *
  * When the MCP declares a `credentials.webhooks` block, an
  * "Active subscriptions" sub-panel appears below the identity row with
@@ -108,10 +108,11 @@ export function AccountCard({
                   {account.connected_services.length === 1 ? '' : 's'}
                 </span>
               )}
+              {/* The agents whose set of accounts holds this one (an agent
+                  may use several). */}
               {overridesCount > 0 && (
                 <span className="text-status-info-fg">
-                  Used for {overridesCount} agent
-                  {overridesCount === 1 ? '' : 's'}
+                  {overridesCount === 1 ? '1 agent may use it' : `${overridesCount} agents may use it`}
                 </span>
               )}
               {account.missing_scopes.length > 0 && (

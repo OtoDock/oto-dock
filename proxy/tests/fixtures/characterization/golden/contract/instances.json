@@ -1,0 +1,160 @@
+{
+ "agent_config": {
+  "account_choices": {},
+  "agent_name": "a",
+  "chat_id": "",
+  "client_type": "",
+  "credential_env": {},
+  "default_execution_mode": "",
+  "effort": "",
+  "excluded_mcps": [],
+  "execution_path": "",
+  "execution_target": "local",
+  "extra_env": {},
+  "fallback_reason": null,
+  "interactive": false,
+  "interactive_first_prompt": "",
+  "interactive_theme": "",
+  "mcp_config_path": "",
+  "mcp_secret_bundles": {},
+  "model": "",
+  "multi_value_envs": {},
+  "permission_mode": "ask",
+  "placement_sub": null,
+  "resume": false,
+  "resume_handle": "",
+  "sandbox_host_claude_dir": "",
+  "security_context": null,
+  "session_home": "",
+  "subscription_id": "",
+  "subscription_user_sub": null,
+  "system_prompt": "",
+  "term": "",
+  "token_minted_at": 0,
+  "use_native_permissions": false,
+  "user_sub": "",
+  "work_cwd": ""
+ },
+ "dicts_not_shared": true,
+ "frozen": {
+  "CredentialFileSpec": {
+   "raised": "FrozenInstanceError",
+   "text": "cannot assign to field 'dirname'"
+  },
+  "OAuthRefresh": {
+   "raised": "FrozenInstanceError",
+   "text": "cannot assign to field 'status'"
+  },
+  "WindowSpec": {
+   "raised": "FrozenInstanceError",
+   "text": "cannot assign to field 'role'"
+  }
+ },
+ "groups_not_shared": true,
+ "oauth_refresh": {
+  "body": null,
+  "error": "",
+  "extra": {},
+  "oauth_token": null,
+  "refresh_token_expires_in": null,
+  "status": 0
+ },
+ "remote_start_context": {
+  "cm": null,
+  "config": {
+   "account_choices": {},
+   "agent_name": "a",
+   "chat_id": "",
+   "client_type": "",
+   "credential_env": {},
+   "default_execution_mode": "",
+   "effort": "",
+   "excluded_mcps": [],
+   "execution_path": "",
+   "execution_target": "local",
+   "extra_env": {},
+   "fallback_reason": null,
+   "interactive": false,
+   "interactive_first_prompt": "",
+   "interactive_theme": "",
+   "mcp_config_path": "",
+   "mcp_secret_bundles": {},
+   "model": "",
+   "multi_value_envs": {},
+   "permission_mode": "ask",
+   "placement_sub": null,
+   "resume": true,
+   "resume_handle": "",
+   "sandbox_host_claude_dir": "",
+   "security_context": null,
+   "session_home": "",
+   "subscription_id": "",
+   "subscription_user_sub": null,
+   "system_prompt": "",
+   "term": "",
+   "token_minted_at": 0,
+   "use_native_permissions": false,
+   "user_sub": "",
+   "work_cwd": ""
+  },
+  "env": {
+   "E": "1"
+  },
+  "gateway": {
+   "mcp": {}
+  },
+  "machine_id": "m",
+  "proxy_api_key": "jwt",
+  "sat_port": 7,
+  "scope_root": "workspace",
+  "secret_bundle_keys": [
+   "bundle"
+  ],
+  "session_id": "s",
+  "spawn": null,
+  "target_os": "linux"
+ },
+ "remote_start_plan": {
+  "credential_file_delivered": false,
+  "payload": {
+   "k": 1
+  },
+  "start_timeout_s": 60.0
+ },
+ "required": {
+  "AgentConfig": {
+   "raised": "TypeError",
+   "text": "AgentConfig.__init__() missing 1 required positional argument: 'agent_name'"
+  },
+  "Windows_no_specs": {
+   "raised": "TypeError",
+   "text": "Windows.__init__() missing 1 required keyword-only argument: 'specs'"
+  },
+  "Windows_positional": {
+   "raised": "TypeError",
+   "text": "Windows.__init__() takes 1 positional argument but 2 were given"
+  }
+ },
+ "scoped": {
+  "active": false,
+  "key": "opus",
+  "label": "Opus",
+  "pct": 90.0,
+  "resets_at": null
+ },
+ "subscription_handle": {
+  "api_key": null,
+  "auth_type": "oauth",
+  "credential": {},
+  "endpoint_url": null,
+  "layer": "lay",
+  "oauth_access_token": "tok",
+  "oauth_expires_at_ms": 0,
+  "provider": "prov",
+  "subscription_id": "sub"
+ },
+ "window": {
+  "pct": 12.5,
+  "resets_at": null
+ }
+}

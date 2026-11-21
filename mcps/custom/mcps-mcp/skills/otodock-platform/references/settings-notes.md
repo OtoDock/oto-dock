@@ -23,10 +23,11 @@ feature is enabled on the install.
   that agent's Configuration section)*; Departments tab *(admin/creator)*. What others shared
   with you is under **Shared with you** at the top of the notifications panel (the bell on
   the chat page) *(any)*.
-- **Browse Community → Department sets** *(admin/creator)* installs a whole department
+- **Browse Community** *(admin/creator)* shows departments and agents in one list, with
+  **All**, **Departments** and **Agents** above it. A department installs a whole team
   in one step: its agents at their levels, the head's shared library and the paused
-  schedules. The Departments tab links to it with **Browse the department sets**. A
-  template's card also lists the apps it brings and the set it belongs to.
+  schedules. For each agent the person picks one they already have or a new one. The
+  Departments tab links to the list with **Browse the departments**.
 - **Avatar menu** → User Settings *(any)* · Agent Settings *(any with access — sections
   vary)* · App Settings *(the Android and iOS apps only: their **Installations**, the servers
   they hold, and on Android **Alarms on this phone** while the phone may hold alarms back)*
@@ -53,27 +54,33 @@ The sections' settings are in the map, one table per section.
 - **Overview** *(any with access)*: description, tool chips, recent activity; managers
   also see visibility mode + assigned users with roles (on a Shared only agent a viewer or
   contributor kept from an older install is marked "no chat access").
-- **MCPs** *(manager)*: per-tool enable checkboxes; service-account binding per capable
-  tool (one of the manager's own connected accounts or, for a GitHub account connected
-  through a GitHub App, one of its installations the manager owns, so the agent's git and
-  gh reach only that installation's repositories); beneath a binding, **Subscribe to
-  events for this agent** and the agent's own event subscriptions (what agent-scope
+- **MCPs** *(manager)*: per-tool enable checkboxes; the agent's own **Accounts** per
+  capable tool: any number of the managers' own connected accounts (for a GitHub account
+  connected through a GitHub App, the account itself or one of its installations the
+  manager owns, so the agent's git and gh reach only that installation's repositories),
+  one the **Default**, with **Make default** and **Remove**; beneath each account,
+  **Subscribe to events** and that account's event subscriptions (what agent-scope
   triggers and shared apps need); **Browse Community**.
-  Beneath a GitHub binding, **GitHub reach** holds the repositories the agent's own
-  GitHub account reaches, and **Read only**: the agent's own work keeps to it, a person's
-  chats keep to their own.
+  Beneath each GitHub account, **GitHub reach** holds the repositories the agent reaches
+  through it, and **Read only**, changed by the person who added it: the agent's own work
+  keeps to it, a person's chats keep to their own.
 - **Skills** *(manager)*: per-skill toggles for installed packages; bundled-with-MCP
   list; Browse community skills.
 - **Configuration** *(manager; some rows gated higher)*: name/description/color · AI
   Engines (the engines the agent may run on, all on for a new agent, with **Only allow
   local models** under a ticked card of an engine that can run local models, such as
   Codex or Direct LLM) · **Execution Target** *(admin, remote machines)* · **Department
-  + Level** *(admin/creator)* · Default Model (Auto = the engine's default by tier) /
+  + Level** *(admin, the department's creator, or a creator who manages all its agents)* ·
+  Default Model (Auto = the engine's default by tier) /
   Session Mode (headless vs interactive) / Effort · Visibility & workspace mode (switching
   to Shared only lists the viewers and contributors who lose their assignment, to confirm)
-  · Admin Only + Default-for-new-users *(admin; editor or manager on a Shared only agent)* ·
-  **Memory** card (scope toggles, clear agent memory) · **Delegation Targets**
-  (hand-ticked targets; the department's show locked) ·
+  · **Use the agent's own accounts in every chat** with **From this role** *(Personal +
+  shared and Shared + personal)* · Admin Only + Default-for-new-users *(admin; editor or manager on a Shared only agent)* ·
+  **Memory** card (scope toggles, clear agent memory) · **History** (**Delete old
+  history** and **Days to keep history**: *admin*, managers read it) · **Delegation Targets**
+  (hand-ticked targets; the department's show locked) · **External identities** (what a
+  caller who is not a member gets: tools, their own files, web search, knowledge folders,
+  apps; the wrap-up after a conversation) ·
   **Shared Knowledge** (share/attach libraries — *mutations admin/creator*) · a
   **Template** row naming the community template and the installed version, and a
   **template update banner** when the community catalog carries a newer version of the
@@ -81,7 +88,8 @@ The sections' settings are in the map, one table per section.
   Delete Agent *(admin)*.
 - **Checks** *(any with access)*: the offered and mandatory checks and the verdicts you
   may see; create, edit, remove, mark mandatory and the daily cap *(manager)*.
-- **Monitoring** group: **Conversations** *(manager — external phone/webhook sessions)*
+- **Monitoring** group: **Conversations** *(editor and manager: outside people's
+  conversations, the people who called, the agent's own line)*
   · **Scheduled Tasks** *(any with access, the agent's own tasks shown to editor+ only,
   actions role-gated per row, the row's **Settings**: name, machine, mode, who is told)*
   · **Triggers** *(any; the agent's own shown to editor+ only, agent-scope triggers
@@ -108,11 +116,12 @@ The sections' settings are in the map, one table per section.
   an admin for a department's)* · **Send this release to the source** *(a copied app:
   owner; editor+ for a shared app, here and on the source; asks first)* · **Stop
   following** *(a copied app: owner; editor+ for a shared app; asks first)*.
-  Logs, View the working copy, Settings and Delete appear only on an app with a server,
-  Roll back once there is an earlier release. Admins hold the same authority on every
+  Logs, View the working copy, Settings and Delete appear only on a folder app, Roll back
+  once there is an earlier release. Admins hold the same authority on every
   app.
 - **A chat's row in the chat history** → **Share** *(its owner; editor+ on a Shared only
-  agent)*.
+  agent)* · **Pin chat** *(any, on a chat of their history, never a task run: the pin is
+  theirs alone, and the pin button above the history shows their pinned chats)*.
 
 ## Admin area (avatar menu → Admin, or /admin; a section at /admin/<section>) — all *(admin)*
 
@@ -143,7 +152,9 @@ The sections' settings are in the map, one table per section.
   GitHub MCP's app credentials card offers the application kind (an OAuth App or a
   GitHub App: a GitHub App takes its private key and shows the callback, setup and
   webhook addresses to paste on GitHub). Meeting Rooms carries **Max parallel meeting
-  participants per user** (four by default, and 0 turns meetings off since 1.9.0).
+  participants per user** (four by default, and 0 turns meetings off since 1.9.0). The
+  browser tool's row carries **Let the browser open pages on your local network**, off by
+  default.
 - **Skills**: installed skill packages; Check Updates / Update / Delete; **Browse
   Community Skills**; ZIP install (a package ahead of the catalog is left alone and shows
   a revert).
@@ -152,8 +163,10 @@ The sections' settings are in the map, one table per section.
   covers the agent.
 - **Remote Machines**: platform machine pairing + cards (capabilities, CLI versions,
   capacity, max sessions, auto-update, filesystem/device grants, who runs here: Every
-  role of its agents runs here); the list of user-paired machines, each removable by
-  an admin (the owner is told).
+  role of its agents runs here). **Compute machines**: the machines the platform runs
+  itself. **Add a compute machine** adds one on another server, which then shows **Pair
+  again** while it is offline and **Remove**. The list
+  of user-paired machines, each removable by an admin (the owner is told).
 - **Shares**: every share on the install, to people, agents and departments with its
   standing, and every link (target, creator, password or none, Buttons, opens,
   expiry); kind, agent and standing filters; each revocable, notifying nobody.
@@ -201,9 +214,10 @@ The sections' settings are in the map, one table per section.
     keeps titling while its provider is configured) · **Automatic MCP Updates** (weekly,
     includes skill packages; takes a release once it is seven days old; never applies a
     catalog source change, which waits for an admin's Switch, and never moves an install
-    back) · **Notebook** (how much of it loads into a prompt) · **Mobile apps** (whether
-    the Android and iOS apps ask each person for a store rating, twice at most, and the days
-    before the second ask).
+    back) · **Notebook** (how much of it loads into a prompt). The Android and iOS apps ask
+    each person for a store rating, twice at most. No card turns that off: the server's
+    admin adds `OTODOCK_FORCED_SETTINGS={"store_review_enabled": false}` to `config.env` (the
+    `.env` file on Docker) and restarts OtoDock.
 
 ## Quick answers to frequent "where/who" questions
 
@@ -215,10 +229,11 @@ The sections' settings are in the map, one table per section.
 | Let a user borrow platform credentials | Admin → Users → Platform API *(admin)* |
 | Give an agent a tool | Agent Settings → MCPs *(manager)*; install first via Admin → MCP Servers *(admin)* |
 | Enable a skill | Agent Settings → Skills *(manager)*; package install *(admin)* |
-| Create a department / move an agent | Agents page → Departments *(admin/creator)*; Agent Settings → Configuration → Department *(admin/creator)* |
+| Create a department / move an agent | Agents page → Departments *(admin/creator)*; Agent Settings → Configuration → Department *(a manager of the agent who is an admin, the department's creator, or a creator who manages all its agents)* |
 | Share knowledge between agents | Agent Settings → Configuration → Shared Knowledge *(admin/creator)* |
 | Pair my laptop | User Settings → Remote Machines *(any, unless disabled)* |
 | Pair a team server | Admin → Remote Machines *(admin)* |
+| Add a server that runs chats for everyone | Admin → Remote Machines → Compute machines → **Add a compute machine** *(admin, only an install in Docker)* |
 | Run a chat on my laptop | the chat's **Runs on** pill *(who can continue the chat)* |
 | A task's name, machine, mode or who is told | Agent Settings → Monitoring → Scheduled Tasks → the row's **Settings** *(who may edit the task, Who is told on a shared task that notifies)* |
 | Who a shared trigger tells | Agent Settings → Monitoring → Triggers → the trigger's form → **Who is told** *(who may edit the trigger)* |
@@ -229,7 +244,9 @@ The sections' settings are in the map, one table per section.
 | Set up phone numbers | Setup → Phone *(admin)* |
 | Turn on the wake word | User Settings → General → Wake word *(any)* |
 | Mint a webhook key | User Settings → Integrations *(any)* or Agent Settings → Monitoring → Triggers *(manager)* |
-| Let an agent react to GitHub/Slack/… events | Agent Settings → MCPs → the MCP → Subscribe to events for this agent *(manager)*, or Connected Accounts → Subscribe to events → Subscribe as: the agent |
+| Let an agent use another of my accounts (a second mailbox) | User Settings → Integrations → the account → Use this account for specific agents: tick the agent, **Make default** for the one its chats start on *(any)*. In a chat, ask the agent to switch: the chat reloads on that account |
+| A tool just enabled is missing in this chat | Ask the agent to reload its chat: it continues by itself with a note *(who can continue the chat)* |
+| Let an agent react to GitHub/Slack/… events | Agent Settings → MCPs → the MCP → one of its accounts → Subscribe to events *(manager)*, or Connected Accounts → Subscribe to events → Subscribe as: the agent |
 | Approve an agent's tool/skill request | Admin → MCP Requests *(admin)* |
 | Approve an app | its approval card, on the app *(its owner; editor+ for a shared app, a manager when its scripts receive the agent's accounts; admin)* |
 | Share an app or a chat, make a link | the app's ⋯ menu → Share, or the chat's row → Share *(owner; editor+ for a shared app or a Shared only agent's chat; with an agent: editor+ on it too; with a department: admin)* |
@@ -250,6 +267,9 @@ The sections' settings are in the map, one table per section.
 | An account card says **Reconnect needed** | **Edit** on the card under User Settings → Integrations, then **Reconnect** *(the account's owner, who for an agent's service account is the manager who bound it)*. The open card says why: its access expired, the vendor ended the grant, or the vendor no longer accepts its access. Until then a new session goes without the tools that use it |
 | Allow the sign-in addresses an MCP needs | **Allow these addresses** in the MCP's row under Admin → MCP Servers, or Setup → Security → OAuth Bearer Allowlist *(admin)*. An MCP from the catalog adds its own server's address. One installed before 1.9.1 does so at its next catalog update or when switched off and on |
 | See the running version, or whether a newer release is out | Setup → OtoDock *(admin)* |
+| Whether now is a good moment to update | `otodock-admin.sh status` on the server: "Idle. A good moment to update." or what is busy *(whoever runs the server, since 2.0)* |
+| A chat shows "Continued after a restart" | the platform restarted and the chat went on by itself, so nobody has to do anything *(any)* |
+| A chat says "The reply was cut short when the platform restarted" | it did not continue by itself (a restore, more than a day down, three continues in a row): **Resume**, or send a message *(the chat's author)* |
 | Back up or restore the install | `backup.sh` and `restore.sh` on the server *(admin)* |
 | Let an agent transfer a caller, follow the caller's language, or ask for a PIN | Setup → Phone → the route *(admin)* |
 | Upload a whole folder | drop it on the chat or the workspace *(any)* |
@@ -257,7 +277,7 @@ The sections' settings are in the map, one table per section.
 | Nobody can sign in (a lost admin password, a lost authenticator) | `otodock-admin.sh` for the running release, from the install folder: `user reset-password <email>` or `user disable-2fa <email>` *(whoever runs the server, since 1.9.0)* |
 | Limit or turn off meetings | Admin → MCP Servers → Meeting Rooms → Max parallel meeting participants per user *(admin; 0 turns meetings off)* |
 | Report a reply, or read what people reported | the flag under the reply, **Report this reply** *(any)*, read under Admin → Reports *(admin)* |
-| Narrow which repositories an agent reaches, or make it read only | for the agent's own work, Agent Settings → MCPs → beneath the GitHub service account, **GitHub reach** *(manager)*. For your own chats, User Settings → Integrations → the GitHub account → beneath the agent *(any)* |
+| Narrow which repositories an agent reaches, or make it read only | for the agent's own work, Agent Settings → MCPs → beneath one of the agent's GitHub accounts, **GitHub reach** *(manager)*. For your own chats, User Settings → Integrations → the GitHub account → beneath the agent *(any)* |
 | Let an agent's people use an SSH host | Admin → MCP Servers → **SSH** → an instance per host, given to the agent *(admin)*. Its managers and editors then reach it |
 | Why a setting is there | the small round **i** beside its label *(any)* |
 | Let an agent act on chosen GitHub repositories only | connect GitHub through the GitHub App and **Install on GitHub** under User Settings → Integrations *(any)*, then pick that installation as the agent's identity on Agent Settings → MCPs *(manager)*; an admin registers the GitHub App first under Admin → MCP Servers |

@@ -1,0 +1,16 @@
+{
+ "a dead terminal under the id": false,
+ "a live terminal on the chat": true,
+ "a live terminal under the id": true,
+ "a starter holding the chat": true,
+ "a turn ended": false,
+ "a turn streaming": true,
+ "a wake giving up releases": [
+  "11111111-2222-3333-4444-555555555555"
+ ],
+ "a warmup on the chat": true,
+ "and with no chat named": false,
+ "its slot is kept": [],
+ "no ids": false,
+ "nothing live": false
+}

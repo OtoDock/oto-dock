@@ -132,7 +132,7 @@ async def _smoke_copy(row: dict, source: Path) -> dict:
     try:
         return await app_supervisor.smoke(row, tree)
     finally:
-        await asyncio.to_thread(shutil.rmtree, tree, True)
+        await asyncio.to_thread(releases.remove_tree, tree)
 
 
 @router.post("/v1/hooks/apps/check")
@@ -368,7 +368,7 @@ async def hook_app_describe(req: HookDescribeRequest, authorization: str | None 
 
     def _resolve() -> tuple[dict | None, bool, dict | None]:
         from storage.sharing import share_store
-        own, person_sub = placement_identity(ctx)
+        own, person_sub = placement_identity(ctx, req.session_id)
         reach = app_bindings.reachable_agents(ctx.agent, ctx.username or "")
         row = task_store.get_app_by_slug(agent, "", slug) if agent in reach else None
         via_placement = False

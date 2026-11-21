@@ -1,13 +1,15 @@
-"""Path policy for external sessions (a phone caller who is not a platform
-user): their own tree under /caller, the shared dirs read-only (the builder
-always makes a caller a viewer; the role cases below are defence in depth),
-never the shared memory, never another caller, never users/ or config/.
+"""Path policy for an outside session (a caller who is not a platform
+user): their own tree under /caller, written only with the files pick at
+Read and write; of the knowledge the folders a manager picked; never the
+shared workspace, never the shared memory, never another caller, never
+users/ or config/. The role cases below are defence in depth.
 """
 
 from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,14 +31,62 @@ def tree(tmp_path, monkeypatch):
     return agent_dir.resolve()
 
 
-def _ctx(tree: Path, *, role="viewer", home=True, knowledge_rw=False) -> SecurityContext:
+def _ctx(tree: Path, *, role="viewer", home=True, knowledge_rw=False, files_write=True,
+         knowledge=("faq",)) -> SecurityContext:
     return SecurityContext(
         role=role, username="", agent="support", is_admin_agent=False,
         session_scope="agent", config_visible=False, knowledge_rw=knowledge_rw,
         principal="external", external_channel="phone", external_id="+302101234567",
         external_home=str(tree / "externals" / "phone" / "302101234567") if home else "",
         external_claim="phone:+302101234567",
+        outside_files_write=files_write, outside_knowledge=tuple(knowledge),
     )
+
+
+class TestThePicks:
+    def test_reads_follow_the_knowledge_picks_and_never_the_workspace(self, tree):
+        (tree / "knowledge" / "faq").mkdir()
+        (tree / "knowledge" / "prices").mkdir()
+        ctx = _ctx(tree)
+        assert _read(ctx, "/knowledge/faq/a.md").allowed
+        d = _read(ctx, "/knowledge/prices/a.md")
+        assert not d.allowed and "not open to outside people" in d.reason
+        d = _read(ctx, "/workspace/a.md")
+        assert not d.allowed and "shared workspace" in d.reason
+        assert not _read(ctx, "/knowledge/memory/MEMORY.md").allowed
+        # Nothing picked: no knowledge at all.
+        assert not _read(_ctx(tree, knowledge=()), "/knowledge/faq/a.md").allowed
+        # A pick with a dot segment grants nothing.
+        assert not _read(_ctx(tree, knowledge=("../workspace",)), "/workspace/a.md").allowed
+
+    def test_a_subfolder_pick_reads_that_folder_alone(self, tree):
+        for sub in ("projects/alpha/specs", "projects/beta", "shared/lib-a/docs/api"):
+            (tree / "knowledge" / sub).mkdir(parents=True)
+        ctx = _ctx(tree, knowledge=("projects/alpha", "shared/lib-a/docs/api"))
+        assert _read(ctx, "/knowledge/projects/alpha/specs/a.md").allowed
+        assert _read(ctx, "/knowledge/shared/lib-a/docs/api/x.md").allowed
+        for denied in ("/knowledge/projects/beta/a.md", "/knowledge/projects/a.md",
+                       "/knowledge/projects/alpha-old/a.md", "/knowledge/shared/lib-a/docs/b.md"):
+            assert not _read(ctx, denied).allowed, denied
+
+    def test_a_pick_the_rule_refuses_opens_nothing(self, tree):
+        """A context carrying a pick no route stores (a hand-written row, a
+        context built elsewhere): the memory, the credentials, the
+        libraries' root and a pick that is not canonical open nothing."""
+        (tree / "knowledge" / ".credentials").mkdir()
+        (tree / "knowledge" / "faq").mkdir()
+        (tree / "knowledge" / "shared" / "lib-a").mkdir(parents=True)
+        ctx = _ctx(tree, knowledge=("memory", "memory/topics", ".credentials", "shared", "/faq", "faq/"))
+        for denied in ("/knowledge/memory/MEMORY.md", "/knowledge/.credentials/token.json",
+                       "/knowledge/shared/lib-a/a.md", "/knowledge/faq/a.md"):
+            assert not _read(ctx, denied).allowed, denied
+
+    def test_writes_follow_the_files_pick(self, tree):
+        assert _write(_ctx(tree), "/caller/workspace/notes.md").allowed
+        d = _write(_ctx(tree, files_write=False), "/caller/workspace/notes.md")
+        assert not d.allowed and "not open to outside people" in d.reason
+        # The memory is never written in the conversation, pick or no pick.
+        assert not _write(_ctx(tree), "/caller/context/memory/x.md").allowed
 
 
 def _read(ctx, path):
@@ -53,8 +103,10 @@ class TestReads:
         assert _read(ctx, "/caller/workspace/a.txt").allowed
         assert _read(ctx, "/caller/context/notes.md").allowed
         assert _read(ctx, "workspace/a.txt").allowed          # relative → the caller cwd
-        assert _read(ctx, "/workspace/shared.txt").allowed
-        assert _read(ctx, "/knowledge/faq.md").allowed
+        # The shared workspace never; of the knowledge the picked folder.
+        assert not _read(ctx, "/workspace/shared.txt").allowed
+        assert _read(ctx, "/knowledge/faq/a.md").allowed
+        assert not _read(ctx, "/knowledge/other.md").allowed
 
     def test_denials(self, tree):
         ctx = _ctx(tree)
@@ -69,7 +121,7 @@ class TestReads:
     def test_shared_mode_has_no_caller_root(self, tree):
         ctx = _ctx(tree, home=False)
         assert not _read(ctx, "/caller/workspace/a.txt").allowed
-        assert _read(ctx, "/workspace/shared.txt").allowed
+        assert not _read(ctx, "/workspace/shared.txt").allowed
         assert not _read(ctx, "/knowledge/memory/MEMORY.md").allowed
         own = tree / "externals" / "phone" / "302101234567" / "workspace" / "x"
         assert not _read(ctx, str(own)).allowed   # no tree on this session
@@ -87,19 +139,17 @@ class TestWrites:
         other = tree / "externals" / "phone" / "999" / "workspace" / "x.txt"
         assert not _write(ctx, str(other)).allowed
 
-    def test_shared_dirs_follow_the_route_role(self, tree):
-        viewer = _ctx(tree, role="viewer")
-        assert not _write(viewer, "/workspace/shared.txt").allowed
-        assert not _write(viewer, "/knowledge/faq.md").allowed
-        editor = _ctx(tree, role="editor")
-        assert _write(editor, "/workspace/shared.txt").allowed
-        assert not _write(editor, "/knowledge/faq.md").allowed
-        manager = _ctx(tree, role="manager", knowledge_rw=True)
-        assert _write(manager, "/workspace/shared.txt").allowed
-        assert _write(manager, "/knowledge/faq.md").allowed
-        assert not _write(manager, "/knowledge/memory/x.md").allowed
-        assert not _write(manager, "/config/agent.md").allowed
-        assert not _write(manager, "/users/alice/workspace/x.txt").allowed
+    def test_nothing_shared_is_written_whatever_the_role_word(self, tree):
+        """A legacy context carrying a member's role word writes nothing of
+        the agent: an outside session has no shared workspace."""
+        for role, rw in (("viewer", False), ("editor", False), ("manager", True)):
+            ctx = _ctx(tree, role=role, knowledge_rw=rw)
+            assert not _write(ctx, "/workspace/shared.txt").allowed
+            assert not _write(ctx, "/knowledge/faq/a.md").allowed
+            assert not _write(ctx, "/knowledge/memory/x.md").allowed
+            assert not _write(ctx, "/config/agent.md").allowed
+            assert not _write(ctx, "/users/alice/workspace/x.txt").allowed
+            assert _write(ctx, "/caller/workspace/a.txt").allowed
 
     def test_memory_file_rule_covers_caller_trees(self, tree):
         p = tree / "externals" / "phone" / "302101234567" / "context" / "memory" / "t.md"
@@ -116,7 +166,13 @@ def test_the_floored_shell_tools():
     from core.layers.cli.layer import CLIExecutionLayer
     layer = CLIExecutionLayer()
     assert set(layer.capabilities.behaviour.tools["shell"]) == {"Bash", "Monitor", "PowerShell"}
-    assert layer.session_denied_tools(external=True, read_only=False) == ["Bash", "Monitor", "PowerShell"]
+    denied = layer.session_denied_tools(external=True, read_only=False)
+    assert denied[:3] == ["Bash", "Monitor", "PowerShell"]
+    # Without a pick the web and the write tools are denied too; a pick lifts them.
+    assert {"WebFetch", "WebSearch", "Write", "Edit"} <= set(denied)
+    picked = SimpleNamespace(outside_web=True, outside_files_write=True)
+    assert not {"WebFetch", "WebSearch", "Write"} & set(
+        layer.session_denied_tools(external=True, read_only=False, ctx=picked))
     assert set(tool_roles.names_of(tool_roles.SHELL)) == {"Bash", "Monitor", "PowerShell"}
     assert tool_roles.role_of("WebFetch") != tool_roles.SHELL
     assert tool_roles.role_of("WebSearch") != tool_roles.SHELL

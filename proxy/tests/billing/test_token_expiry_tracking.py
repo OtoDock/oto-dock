@@ -14,7 +14,12 @@ from unittest.mock import patch
 
 from core.execution_layer import OAuthRefresh
 from core.layers.cli import oauth as claude_oauth
-from services.engines import subscription_pool as pool, token_fanout
+from services.engines import (
+    pool_env,
+    pool_tokens,
+    subscription_pool as pool,
+    token_fanout,
+)
 
 _REFRESH = "core.layers.cli.layer.CLIExecutionLayer.refresh_oauth"
 
@@ -33,6 +38,7 @@ def _row(sub_id: str) -> dict:
 
 def _clean():
     pool._issued_token_expiry.clear()
+    pool._start_token_expiry.clear()
     pool._session_token_expiry.clear()
     pool._session_subscriptions.clear()
     pool._refresh_backoff.clear()
@@ -95,7 +101,7 @@ class TestResolveReportsExpiry:
         exp = int(time.time() * 1000) + 90 * 60 * 1000  # 1h30m left
         cred = {"oauth_token": {"accessToken": "tok", "refreshToken": "r", "expiresAt": exp}}
         with patch.object(pool.subscription_store, "get_credential_data", return_value=cred), \
-             patch.object(pool, "_refresh_oauth_token", return_value=(None, False)):
+             patch.object(pool_tokens, "_refresh_oauth_token", return_value=(None, False)):
             tok, got = pool._resolve_oauth_access_token(
                 {"id": "sub-failsoft", "provider": "anthropic"}, cred["oauth_token"],
             )
@@ -110,7 +116,7 @@ class TestResolveReportsExpiry:
         # First read: under-lock re-check; second read: post-refresh expiry.
         with patch.object(pool.subscription_store, "get_credential_data",
                           side_effect=[before, after]), \
-             patch.object(pool, "_refresh_oauth_token", return_value=("new", False)):
+             patch.object(pool_tokens, "_refresh_oauth_token", return_value=("new", False)):
             tok, got = pool._resolve_oauth_access_token(
                 {"id": "sub-refresh", "provider": "anthropic"}, before["oauth_token"],
             )
@@ -128,7 +134,7 @@ class TestResolveReportsExpiry:
         # 3 h of runway: below the 2 h spawn threshold? No — above it, but the
         # point is the 45-min override must NOT refresh a 3 h token.
         exp = int(time.time() * 1000) + 3 * 3600 * 1000
-        with patch.object(pool, "_refresh_oauth_token") as refresh:
+        with patch.object(pool_tokens, "_refresh_oauth_token") as refresh:
             tok, got = pool._resolve_oauth_access_token(
                 {"id": "sub-turn", "provider": "anthropic"},
                 {"accessToken": "tok", "refreshToken": "r", "expiresAt": exp},
@@ -222,7 +228,7 @@ class TestIssueStamping:
 
     def test_resolve_env_stamps_issued_expiry_and_emits_file_blob(self):
         import json
-        with patch.object(pool, "acquire_subscription", return_value=self._handle(777)):
+        with patch.object(pool_env, "acquire_subscription", return_value=self._handle(777)):
             sub_id, env = pool.resolve_subscription_env("claude-code-cli", None)
         assert sub_id == "sub-9"
         # OAuth never rides env — the layer writes the blob to
@@ -234,9 +240,23 @@ class TestIssueStamping:
         assert blob["expiresAt"] == 777
         assert pool._issued_token_expiry["sub-9"] == 777
 
+    def test_two_starts_of_one_account_each_keep_their_own_stamp(self):
+        """Start A takes the stored token; start B of the same account renews
+        before A binds. A's file holds the older token, so A's snapshot must
+        say so (the next call then repairs it), never B's expiry."""
+        home_a, home_b = "local:/s/own/aaaaaaaa", "local:/s/own/bbbbbbbb"
+        with patch.object(pool_env, "acquire_subscription", return_value=self._handle(111)):
+            pool.resolve_subscription_env("claude-code-cli", None, sticky_scope=home_a)
+        with patch.object(pool_env, "acquire_subscription", return_value=self._handle(222)):
+            pool.resolve_subscription_env("claude-code-cli", None, sticky_scope=home_b)
+        pool.bind_session("aaaaaaaa", "sub-9", scope_key=home_a)
+        pool.bind_session("bbbbbbbb", "sub-9", scope_key=home_b)
+        assert pool.session_token_expiry_ms("aaaaaaaa") == 111
+        assert pool.session_token_expiry_ms("bbbbbbbb") == 222
+
     def test_resolve_env_clears_stamp_for_non_expiring_credential(self):
         pool._issued_token_expiry["sub-9"] = 111
-        with patch.object(pool, "acquire_subscription", return_value=self._handle(0)):
+        with patch.object(pool_env, "acquire_subscription", return_value=self._handle(0)):
             pool.resolve_subscription_env("claude-code-cli", None)
         assert "sub-9" not in pool._issued_token_expiry
 
@@ -328,7 +348,7 @@ class TestEnsureFreshAndFanOut:
                           return_value=self._sub()), \
              patch.object(pool.subscription_store, "get_credential_data",
                           return_value=cred), \
-             patch.object(pool, "_refresh_oauth_token") as refresh:
+             patch.object(pool_tokens, "_refresh_oauth_token") as refresh:
             assert pool.ensure_fresh_and_fan_out("sub-e") is True
         refresh.assert_not_called()
 
@@ -341,7 +361,7 @@ class TestEnsureFreshAndFanOut:
                           return_value=self._sub()), \
              patch.object(pool.subscription_store, "get_credential_data",
                           side_effect=[before, before, after]), \
-             patch.object(pool, "_refresh_oauth_token", return_value=("new", False)) as refresh:
+             patch.object(pool_tokens, "_refresh_oauth_token", return_value=("new", False)) as refresh:
             assert pool.ensure_fresh_and_fan_out("sub-e") is True
         refresh.assert_called_once()
 
@@ -352,7 +372,7 @@ class TestEnsureFreshAndFanOut:
                           return_value=self._sub()), \
              patch.object(pool.subscription_store, "get_credential_data",
                           return_value=cred), \
-             patch.object(pool, "_refresh_oauth_token", return_value=(None, False)):
+             patch.object(pool_tokens, "_refresh_oauth_token", return_value=(None, False)):
             assert pool.ensure_fresh_and_fan_out("sub-e") is False
 
     def test_non_expiring_credential_is_fresh(self):
@@ -366,6 +386,82 @@ class TestEnsureFreshAndFanOut:
         with patch.object(pool.subscription_store, "get_subscription",
                           return_value=None):
             assert pool.ensure_fresh_and_fan_out("sub-gone") is False
+
+    def test_every_session_that_missed_a_renewal_gets_the_stored_token_at_the_next_call(self):
+        """A folder per session: a renewal pushed to the others reaches no
+        folder whose push failed. Every call (the five-minute worker's, a
+        turn's) pushes the fresh stored token to the account's sessions whose
+        file is older, and to them alone; a session the platform knows no
+        expiry of is left as it is."""
+        now = int(time.time() * 1000)
+        stored = now + 8 * 3600 * 1000
+        cred = {"oauth_token": {"accessToken": "fresh", "refreshToken": "", "expiresAt": stored}}
+        for sid, held in (("s-missed", now + 100 * 60 * 1000), ("s-task", now + 20 * 60 * 1000),
+                          ("s-current", stored)):
+            pool._session_subscriptions[sid] = "sub-e"
+            pool._session_token_expiry[sid] = held
+        pool._session_subscriptions["s-unknown"] = "sub-e"
+        pool._session_subscriptions["s-other"] = "sub-x"
+        pool._session_token_expiry["s-other"] = now
+        pushed: list[list[str]] = []
+
+        def _fan(sids, **kw):
+            pushed.append(sorted(sids))
+            for sid in sids:
+                kw["on_written"](sid)
+        with patch.object(pool.subscription_store, "get_subscription", return_value=self._sub()), \
+             patch.object(pool.subscription_store, "get_credential_data", return_value=cred), \
+             patch.object(token_fanout, "fan_out", side_effect=_fan), \
+             patch.object(pool_tokens, "_refresh_oauth_token") as refresh:
+            assert pool.ensure_fresh_and_fan_out("sub-e") is True
+            assert pushed == [["s-missed", "s-task"]]
+            assert pool._session_token_expiry["s-missed"] == pool._session_token_expiry["s-task"] == stored
+            # Their files are current now: the next tick pushes nothing.
+            assert pool.ensure_fresh_and_fan_out("sub-e") is True
+        assert pushed == [["s-missed", "s-task"]]
+        refresh.assert_not_called()
+
+    def test_a_session_the_fan_out_owes_rides_the_rounds_one_list(self):
+        """A push that failed while its machine stayed signed in is owed, and
+        no sign-in comes to pay it. Its file looks current to the stamp, or
+        has none. The worker's round names those sessions: each gets the
+        stored token in the one list with the ones that are behind, once,
+        and no other account's session does."""
+        now = int(time.time() * 1000)
+        stored = now + 8 * 3600 * 1000
+        cred = {"oauth_token": {"accessToken": "fresh", "refreshToken": "", "expiresAt": stored}}
+        for sid, held in (("s-owed", stored), ("s-both", now + 20 * 60 * 1000), ("s-current", stored)):
+            pool._session_subscriptions[sid] = "sub-e"
+            pool._session_token_expiry[sid] = held
+        pool._session_subscriptions["s-adopted"] = "sub-e"
+        pool._session_subscriptions["s-other"] = "sub-x"
+        pool._session_token_expiry["s-other"] = stored
+        owed = frozenset({"s-owed", "s-both", "s-adopted", "s-other"})
+        pushed: list[list[str]] = []
+        lists: list[list[str]] = []
+        push_the_list = pool_tokens._fan_out_rotated_token
+
+        def _fan(sids, **kw):
+            pushed.append(sorted(sids))
+            for sid in sids:
+                kw["on_written"](sid)
+
+        def _listed(sub, only=None):
+            lists.append(sorted(only or []))
+            push_the_list(sub, only)
+        with patch.object(pool.subscription_store, "get_subscription", return_value=self._sub()), \
+             patch.object(pool.subscription_store, "get_credential_data", return_value=cred), \
+             patch.object(token_fanout, "fan_out", side_effect=_fan), \
+             patch.object(pool_tokens, "_fan_out_rotated_token", side_effect=_listed), \
+             patch.object(pool_tokens, "_refresh_oauth_token") as refresh:
+            assert pool.ensure_fresh_and_fan_out("sub-e", owed=owed) is True
+            assert pushed == [["s-adopted", "s-both", "s-owed"]]
+            # Paid: the next round names nobody, and nothing is sent.
+            assert pool.ensure_fresh_and_fan_out("sub-e", owed=frozenset()) is True
+        assert pushed == [["s-adopted", "s-both", "s-owed"]]
+        # The round made one list, of this account's sessions alone.
+        assert lists == [["s-adopted", "s-both", "s-owed"]]
+        refresh.assert_not_called()
 
 
 class TestConcurrentBindDuringFanOut:
@@ -416,3 +512,122 @@ class TestConcurrentBindDuringFanOut:
             stop.set()
             t.join()
         assert not errors, f"bind/release raised under fan-out: {errors[0]!r}"
+
+
+class TestRepairSignIn:
+    """A turn the vendor refused for its sign-in (``pool_tokens.repair_sign_in``):
+    a session whose file missed a renewal gets the stored token; otherwise the
+    account renews once and every live session gets the new token, at most
+    once per account in ``SIGN_IN_RENEW_GAP_S``."""
+
+    def setup_method(self):
+        _clean()
+        pool_tokens._sign_in_renewed_at.clear()
+
+    def _sub(self):
+        return {"id": "sub-x", "provider": "openai", "layer": "codex-cli", "auth_type": "oauth"}
+
+    def _cred(self, exp):
+        return {"oauth_token": {"accessToken": "stored", "refreshToken": "r", "expiresAt": exp}}
+
+    def test_a_session_that_missed_a_renewal_gets_the_stored_token(self):
+        stored = int(time.time() * 1000) + 8 * 3600 * 1000
+        pool._session_subscriptions["s-1"] = "sub-x"
+        pool._session_token_expiry["s-1"] = stored - 3600 * 1000
+        with patch.object(pool.subscription_store, "get_subscription", return_value=self._sub()), \
+             patch.object(pool.subscription_store, "get_credential_data", return_value=self._cred(stored)), \
+             patch.object(pool_tokens, "_fan_out_rotated_token") as push, \
+             patch.object(pool_tokens, "_refresh_oauth_token") as refresh:
+            assert pool_tokens.repair_sign_in("s-1") == "pushed"
+        push.assert_called_once_with(self._sub(), ["s-1"])
+        refresh.assert_not_called()
+
+    def test_a_session_on_the_stored_token_renews_the_account_once(self):
+        stored = int(time.time() * 1000) + 8 * 3600 * 1000
+        for sid in ("s-1", "s-2"):
+            pool._session_subscriptions[sid] = "sub-x"
+            pool._session_token_expiry[sid] = stored
+        with patch.object(pool.subscription_store, "get_subscription", return_value=self._sub()), \
+             patch.object(pool.subscription_store, "get_credential_data", return_value=self._cred(stored)), \
+             patch.object(pool_tokens, "_refresh_oauth_token", return_value=("renewed", False)) as refresh:
+            assert pool_tokens.repair_sign_in("s-1") == "renewed"
+            # The other session refused by the same revoked token waits for it.
+            assert pool_tokens.repair_sign_in("s-2") == "recent"
+        refresh.assert_called_once()
+
+    def test_the_current_sign_in_goes_to_the_named_sessions_alone(self, tmp_path):
+        """``fan_out_current_token(only=)``: what a machine's sign-in asks
+        for the sessions it missed. Every other session of the account keeps
+        its file as it is."""
+        from services.engines import token_fanout
+        stored = int(time.time() * 1000) + 8 * 3600 * 1000
+        dirs = {}
+        for sid in ("s-1", "s-2"):
+            dirs[sid] = tmp_path / sid
+            dirs[sid].mkdir()
+            pool._session_subscriptions[sid] = "sub-x"
+            pool._session_token_expiry[sid] = stored - 1000
+            token_fanout.register_session_target(sid, token_fanout.CredentialFileTarget(
+                layer="claude-code-cli", host_dir=str(dirs[sid])))
+        try:
+            row = {"id": "sub-x", "provider": "anthropic", "layer": "claude-code-cli", "auth_type": "oauth"}
+            with patch.object(pool.subscription_store, "get_subscription", return_value=row), \
+                 patch.object(pool.subscription_store, "get_credential_data", return_value=self._cred(stored)):
+                pool_tokens.fan_out_current_token("sub-x", only=["s-2"])
+            assert not (dirs["s-1"] / ".credentials.json").exists()
+            assert (dirs["s-2"] / ".credentials.json").is_file()
+            assert pool._session_token_expiry["s-1"] == stored - 1000
+            assert pool._session_token_expiry["s-2"] == stored
+        finally:
+            for sid in ("s-1", "s-2"):
+                token_fanout.unregister_session_target(sid)
+
+    def test_a_renewal_that_was_not_made_keeps_no_stamp(self):
+        """A passing failure renews nothing, so the next refused turn may
+        ask again: the vendor is asked only past the resolver's own back-off,
+        and the 30 minutes start at a renewal that was made."""
+        stored = int(time.time() * 1000) + 8 * 3600 * 1000
+        pool._session_subscriptions["s-1"] = "sub-x"
+        pool._session_token_expiry["s-1"] = stored
+        with patch.object(pool.subscription_store, "get_subscription", return_value=self._sub()), \
+             patch.object(pool.subscription_store, "get_credential_data", return_value=self._cred(stored)), \
+             patch.object(pool_tokens, "_refresh_oauth_token", return_value=(None, False)) as refresh:
+            assert pool_tokens.repair_sign_in("s-1") == "failed"
+            assert "sub-x" not in pool_tokens._sign_in_renewed_at
+            # Inside the back-off the vendor is not asked, and nothing is stamped.
+            assert pool_tokens.repair_sign_in("s-1") == "failed"
+            assert refresh.call_count == 1
+            # Past it the vendor is asked again.
+            failed_at, attempts = pool._refresh_backoff["sub-x"]
+            pool._refresh_backoff["sub-x"] = (failed_at - 3600, attempts)
+            refresh.return_value = ("renewed", False)
+            assert pool_tokens.repair_sign_in("s-1") == "renewed"
+            assert refresh.call_count == 2
+            assert pool_tokens.repair_sign_in("s-1") == "recent"
+
+    def test_the_repair_waits_on_no_database_worker(self, monkeypatch):
+        """A renewal may wait on the vendor: the repair runs on a thread of
+        its own, as the freshness worker's does, never on the database's."""
+        import asyncio
+        import threading
+        ran_on: list[str] = []
+        monkeypatch.setattr(pool_tokens, "repair_sign_in",
+                            lambda _sid: ran_on.append(threading.current_thread().name))
+
+        async def _ask():
+            pool_tokens.repair_sign_in_soon("s-1")
+            for _ in range(200):
+                if ran_on:
+                    return
+                await asyncio.sleep(0.01)
+
+        asyncio.run(_ask())
+        assert ran_on and not ran_on[0].startswith("db")
+
+    def test_an_unbound_session_or_a_key_repairs_nothing(self):
+        assert pool_tokens.repair_sign_in("s-none") == "unbound"
+        pool._session_subscriptions["s-1"] = "sub-x"
+        with patch.object(pool.subscription_store, "get_subscription", return_value=self._sub()), \
+             patch.object(pool.subscription_store, "get_credential_data", return_value={"api_key": "k"}):
+            assert pool_tokens.repair_sign_in("s-1") == "no sign-in"
+

@@ -30,6 +30,9 @@ from core.session.visibility import is_synthetic_owner
 from services.scheduler import scheduler, task_kinds
 from storage import database as task_store
 
+#: The task list's source word for a chat's own continuation (``listed_model``).
+CHATS_OWN_MODEL = "the chat's"
+
 logger = logging.getLogger("otodock.continuations")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
@@ -169,3 +172,25 @@ async def create_continuation(
         "max_runs": max_runs,
         "until": req.until,
     }
+
+
+def listed_model(t, chats: dict[str, dict], agent_path: str) -> dict:
+    """What the task list says a chat's own continuation runs on: the chat's
+    model, whatever a pin or a default says, since its wake runs the chat's own
+    session (``wake_session``); none when the chat has none. ``chats`` is the
+    listing's memo of the chats it read."""
+    import psycopg
+
+    import config
+    cid = getattr(t, "target_chat_id", None) or ""
+    if cid not in chats:
+        try:
+            chats[cid] = (task_store.get_chat(cid) if cid else None) or {}
+        except psycopg.Error:
+            chats[cid] = {}
+    chat = chats[cid]
+    model = config.live_model_id(chat.get("model") or "")
+    tier, tier_label, _good_at = config.get_model_tier(model) if model else (None, "", "")
+    return {"effective_model": model, "effective_execution_path": chat.get("execution_path") or agent_path,
+            "effective_model_source": CHATS_OWN_MODEL, "effective_model_tier": tier,
+            "tier_label": tier_label, "pin_warnings": []}

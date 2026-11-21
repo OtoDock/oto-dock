@@ -2,7 +2,8 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import type { MutableRefObject } from 'react'
 import type { DisplayMessage, MessageBlock } from '../components/chat/types'
 import { dbMessagesToDisplay, withPlanRows } from '../lib/messageBlocks'
-import { markRunningBackground, NO_RUNNING_BACKGROUND, runningFor, withRunningInView, type RunningBackground } from '../lib/chat/runningBackground'
+import { endedDelegations } from '../lib/chat/delegateRows'
+import { markRunningBackground, NO_RUNNING_BACKGROUND, runningFor, withRunningInView, type RunningBackground, type RunningKind } from '../lib/chat/runningBackground'
 import { fetchOlderMessages } from '../api/chats'
 import { WIRE, type DbMessageRow, type DbPlanRow } from '../api/wireEvents'
 import { BG_COMMAND_BLOCK } from '../lib/kinds/block'
@@ -83,16 +84,17 @@ export function useChatMessages(args: {
   // running before the rebuild is kept.
   const committedRef = useRef<DisplayMessage[]>([])
   useEffect(() => { committedRef.current = messages }, [messages])
-  /** The chat's running list with what the view shows running added, saved
-   *  for the status bar (a spawn older than a refetched page keeps its badge). */
-  const runningWithView = useCallback((chatId: string | null): RunningBackground => {
+  /** The chat's running list with what the view shows running added and the
+   *  delegations `rows` report ended taken out, saved for the status bar (a
+   *  spawn older than a refetched page keeps its badge). */
+  const runningWithView = useCallback((chatId: string | null, rows: DbMessageRow[]): RunningBackground => {
     const mine = runningFor(runningBackgroundRef.current, chatId)
-    const combined = withRunningInView(mine, committedRef.current)
+    const combined = withRunningInView(mine, committedRef.current, endedDelegations(rows))
     if (combined !== mine) setRunningBackground(combined, chatId)
     return combined
   }, [setRunningBackground])
-  /** Background work that ended: one spawn by id, or every one of a kind. */
-  const dropRunning = useCallback((kind: 'agents' | 'commands', toolId?: string) => {
+  /** Work that ended: one entry by id, or every one of a kind. */
+  const dropRunning = useCallback((kind: RunningKind, toolId?: string) => {
     const cur = runningBackgroundRef.current
     const kept = toolId ? cur[kind].filter((e) => e.id !== toolId) : []
     if (kept.length === cur[kind].length) return
@@ -132,7 +134,7 @@ export function useChatMessages(args: {
     loadingOlderRef.current = false
     setLoadingOlder(false)
     setHasMoreOlder(hasMore)
-    const running = runningWithView(chatIdRef.current)
+    const running = runningWithView(chatIdRef.current, rows)
     setMessages(markRunningBackground(withPlanRows(dbMessagesToDisplay(rows, agents), planRowsRef.current), running))
   }, [agents, resetWindow, runningWithView, chatIdRef])
 
@@ -153,7 +155,7 @@ export function useChatMessages(args: {
       if (older.length) {
         rawRowsRef.current = [...older, ...rawRowsRef.current]
         oldestLoadedIdRef.current = rawRowsRef.current[0]?.id ?? beforeId
-        const running = runningWithView(cid)
+        const running = runningWithView(cid, rawRowsRef.current)
         setMessages((prev) => {
           const tail = prev.filter((m) => !m.id.startsWith('db-'))
           const rebuilt = withPlanRows(dbMessagesToDisplay(rawRowsRef.current, agents), planRowsRef.current)

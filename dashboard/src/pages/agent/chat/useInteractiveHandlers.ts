@@ -31,7 +31,10 @@ export function useInteractiveHandlers({
   setEditText: Stream['setEditText']
 }) {
   // The members the handlers call (the bundle is rebuilt every render).
-  const { toggle, performSwitch, setSessionInteractive, showRichView, setShowRichView } = interactive
+  const {
+    toggle, performSwitch, setSessionInteractive, showRichView, setShowRichView, sessionInteractive,
+    restartInMode, restarting,
+  } = interactive
   const dialogs = useDialogs()
   // What the switch reads after its confirm: the turn may have ended, or the
   // page moved to another chat, while the dialog was open.
@@ -81,11 +84,23 @@ export function useInteractiveHandlers({
   // (the message list never synced the terminal's turns) — and the lazy
   // warmup_ready clears sessionId so the next send re-warms + RESUMES the session
   // (routeSend cold-start).
+  // The exit of a terminal a switch or a mode pick closed is part of it: its
+  // own history and warm-up follow, so a resume here would run a second one.
   const handleTerminalExit = useCallback(() => {
-    if (!chatId) return
+    if (!chatId || restarting(chatId)) return
     setSessionInteractive(false)
     ws.resumeChat(chatId)
-  }, [chatId, setSessionInteractive, ws])
+  }, [chatId, setSessionInteractive, ws, restarting])
+
+  // A mode pick on the viewed chat's live terminal starts it again in that
+  // mode (the server does it, from the pick the page sends). The mode it
+  // already shows starts nothing: the menu reports a pick of its own value.
+  const handleLiveModePick = useCallback((picked: string, shown: string): 'same' | 'restart' | null => {
+    if (!chatId || !sessionInteractive) return null
+    if (picked === shown) return 'same'
+    restartInMode(chatId, shown)
+    return 'restart'
+  }, [chatId, sessionInteractive, restartInMode])
 
   // View toggle: flip the live terminal ⇄ the DB rich
   // conversation history WITHOUT touching the session. Turning ON fetches a
@@ -162,5 +177,8 @@ export function useInteractiveHandlers({
     [queuedMessages, ws, draftKey, chatId, setEditText],
   )
 
-  return { handleInteractiveToggle, handleTerminalExit, handleToggleRichView, handleCancelQueued, handleEditQueued }
+  return {
+    handleInteractiveToggle, handleTerminalExit, handleToggleRichView, handleCancelQueued, handleEditQueued,
+    handleLiveModePick,
+  }
 }

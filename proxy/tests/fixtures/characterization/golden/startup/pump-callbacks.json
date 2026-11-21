@@ -1,0 +1,39 @@
+{
+ "inject": {
+  "done": false,
+  "live": true,
+  "none": false
+ },
+ "injected": {
+  "done": 0,
+  "live": 1
+ },
+ "push": {
+  "done": true,
+  "live": true,
+  "none": false
+ },
+ "pushed": [
+  {
+   "to": "live"
+  },
+  {
+   "to": "done"
+  }
+ ],
+ "queue": {
+  "a person's message, a consumer": false,
+  "a person's message, no consumer": false,
+  "a pump that ended": false,
+  "a system prompt, a consumer": true,
+  "a system prompt, no consumer": false,
+  "no pump": false
+ },
+ "queued": {
+  "consumer": [
+   "t"
+  ],
+  "done": [],
+  "live": []
+ }
+}

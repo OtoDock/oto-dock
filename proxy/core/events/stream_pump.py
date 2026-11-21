@@ -26,6 +26,7 @@ from typing import Any, cast
 
 import psycopg
 
+from core import drain
 from core.events import (
     artifact_events,
     chat_writer,
@@ -40,6 +41,7 @@ from core.events.pump_event_handlers import (  # _GOAL_UNSET and the cost map ar
     PumpEventHandlers,
     _session_cumulative_cost,
 )
+from core.events.replay_overlap import ReplayOverlap
 from services.notifications import notification_manager
 from storage import database as task_store
 from storage.automation import run_status
@@ -167,6 +169,9 @@ _active_pumps: dict[str, "ChatStreamPump"] = {}  # chat_id -> pump
 # the partial turn's blocks or cost — the recovery replay re-persists the
 # full turn, so a shutdown flush would duplicate content + double-count cost.
 _recovery_suppress_flush: set[str] = set()  # chat_id
+# Chats whose cut turn the continue pass takes (``the_pass_takes_it``): their
+# lost ending writes no card, which would tell the person to send again.
+_pass_takes: set[str] = set()  # chat_id
 
 # The platform is ending (the lifespan's shutdown began): a turn whose pump
 # ends now without its engine's result or a typed ending was cut by the
@@ -175,9 +180,36 @@ _platform_ending = False
 
 
 def note_platform_ending() -> None:
-    """The first step of the graceful shutdown (``startup.lifespan``)."""
+    """The platform is stopping: called at its stop signal and again as the
+    first step of the graceful shutdown (``startup``). From here a turn the
+    stop cuts keeps its open-turn record, and nothing new starts
+    (``core.drain``)."""
     global _platform_ending
     _platform_ending = True
+    drain.note_stopping()
+
+
+def note_platform_running() -> None:
+    """The platform starts (the lifespan's first step): nothing is ending."""
+    global _platform_ending
+    _platform_ending = False
+    drain.note_running()
+
+
+def _open_turn_row(chat_id: str, token: str, session_id: str, kind: str, run_id: str,
+                   plan: str) -> None:
+    """The turn's open-turn row with what a continue of it needs: who the
+    session runs as (its own security context, never a caller's word), its
+    mode and its machine. Synchronous: the chat's lane."""
+    from core.session import session_state
+    ctx = session_state.get_session_security(session_id) if session_id else None
+    username = getattr(ctx, "username", "") or ""
+    open_turns.open_turn(
+        chat_id, token, session_id, kind=kind, run_id=run_id, plan=plan,
+        person=(task_store.get_user_sub_by_username(username) or "") if username else "",
+        mode=session_state.recorded_session_mode(session_id) if session_id else "",
+        machine_id=getattr(getattr(ctx, "placement", None), "machine_id", "") or "",
+    )
 
 
 def pending_preview_snapshot(chat_id: str, file_id: str) -> str | None:
@@ -190,6 +222,13 @@ def pending_preview_snapshot(chat_id: str, file_id: str) -> str | None:
         return None
     evt = pump._pending_previews.get(file_id)
     return (evt or {}).get("snapshot_id") or None
+
+
+def the_pass_takes_it(chat_id: str) -> None:
+    """The chat's open turn ends lost and the continue pass carries it on
+    (a machine that came back without its session): its pump writes the
+    turn's rows and no card. The mark goes with the pump's end."""
+    _pass_takes.add(chat_id)
 
 
 def suppress_recovery_flush(chat_id: str) -> None:
@@ -252,6 +291,19 @@ def shelve_undelivered(chat_id: str, items: "list[TurnInput]", *,
                 "kept as an undelivered-input card", chat_id[:8], len(items))
 
 
+def _card_frame(ending: turn_ending.TurnEnding, err_msg: str,
+                typed: turn_ending.TurnEnding | None) -> dict:
+    """The error frame a turn's card goes out with: the engine's own words for
+    a typed ending, the ending's line otherwise, and the line a caller on the
+    phone hears when it has one."""
+    frame = {"pump_type": wire.PUMP_ERROR,
+             "message": err_msg if typed else ending.line(),
+             "reason": ending.reason, "resets_at": ending.resets_at}
+    if ending.spoken():
+        frame["say"] = ending.spoken()
+    return frame
+
+
 def turn_ended_block(ending: "turn_ending.TurnEnding") -> dict:
     """The ``system`` block of a turn's typed ending (subtype
     ``turn_ended``): the reason, the line the card shows, the engine's
@@ -273,6 +325,21 @@ _stored_wake_chats: set[str] = set()
 def note_stored_wake(chat_id: str) -> None:
     """A wake was stored on ``chat_id``: its next pump end replays it."""
     _stored_wake_chats.add(chat_id)
+
+
+def stored_wakes_noted() -> bool:
+    """Whether any chat holds a wake stored in this process: the word a
+    caller asks before a lookup it would otherwise spend on nothing."""
+    return bool(_stored_wake_chats)
+
+
+def take_stored_wake(chat_id: str) -> bool:
+    """Whether ``chat_id`` held a stored wake, its mark taken: one replay
+    takes it (a pump's end or the release of a session)."""
+    if chat_id not in _stored_wake_chats:
+        return False
+    _stored_wake_chats.discard(chat_id)
+    return True
 
 
 async def _replay_stored_wakes(chat_id: str) -> None:
@@ -466,7 +533,9 @@ class ChatStreamPump(PumpEventHandlers):
         chat_owner: str = "",
         chat_agent: str = "",
         driver_tells_parked: bool = False,
+        turn_kind: str = "",
     ):
+        self.turn_kind = turn_kind   # the open-turn row's kind, when the source does not tell it
         self.chat_id = chat_id
         self.session_id = session_id
         self.producer = producer
@@ -509,6 +578,28 @@ class ChatStreamPump(PumpEventHandlers):
         # a limit, an error, an exit, a silence, a loss); the runner and the
         # delegator read it.
         self.last_ending: turn_ending.TurnEnding | None = None
+        # The platform's own stop ended the turn: its open-turn record stays
+        # and the chat gets neither a card nor abort flags here. What the
+        # chat reads is the continue pass's to write after the restart
+        # (``services/scheduler/continue_pass.py``).
+        self.cut_by_platform = False
+        # The task run that drives this pump ("" for a chat's own turn), for
+        # the turn's record.
+        self.run_id = ""
+        # A usage limit cut the turn and another account takes it on: no
+        # limit card, the queue not handed back; a chat's turn continues once
+        # through the reload (``chat_reload.schedule_for_limit``), a run's in
+        # its next round (``TaskRun._limit_round``).
+        self.limit_continues = False
+        # A truncated replay's walk against the rows the turn saved before
+        # the cut (``core/events/replay_overlap.py``), set by the recovery.
+        self.replay_overlap: ReplayOverlap | None = None
+        # The turn ended lost and the continue pass carries it on (its
+        # machine came back without the session, ``the_pass_takes_it``): no
+        # card, and a run that drives it is left for the pass to reopen.
+        self.cut_by_machine = False
+        # The run already took its one round after a limit (``TaskRun``).
+        self.limit_round_taken = False
 
         # Spoken utterances and the plan's implement message (never a typed
         # message: those wait in the chat's own queue, input_queue.py), shared
@@ -566,6 +657,11 @@ class ChatStreamPump(PumpEventHandlers):
         # as one (the dashboard and duplex turns): a system prompt left on
         # the queue at close is stored as their wake. "" stores no person.
         self.wake_person: str = ""
+        # A turn the platform itself started with no socket (a delegated
+        # result, a wake): the person its session was started for and what
+        # started it (``lanes._run_echo_turn_pumped``). Both empty otherwise.
+        self.driven_for: str = ""
+        self.driven_by: str = ""
         # Artifact-interaction queue (shared with producer closure) — pending
         # otodock.send payloads from display_ui artifacts, delivered as their
         # own framed turn(s) at the boundary (ws/artifact_interactions.py).
@@ -687,6 +783,9 @@ class ChatStreamPump(PumpEventHandlers):
         # treats None as "queue-only", so an interrupt can never destroy a
         # turn whose queued message nothing would deliver.
         self.stop_and_send: dict | None = None
+        # The pump records a turn the engine started by itself
+        # (``wake_capture``): no driven turn to replay after a restart.
+        self.records_engine_turn = False
 
     # Tools that have dedicated events (task_spawn, plan_mode, the delegate
     # pill) — skip tool persistence: by ROLE, plus the platform's own
@@ -805,6 +904,22 @@ class ChatStreamPump(PumpEventHandlers):
         else:
             # No more pending — clear reconnect storage
             _pending_permissions.pop(self.session_id, None)
+            self._note_card(None)
+
+    def _note_card(self, perm_data: dict | None) -> None:
+        """The card this turn waits on, on its open-turn record, so a turn
+        the stop cuts while it waits is continued knowing it. Under the stop
+        nothing clears it: a hook request the closing sockets cancelled
+        retires its card here, and the person never answered."""
+        if not self._turn_token or (perm_data is None and drain.stopping()):
+            return
+        card = "" if perm_data is None else json.dumps({
+            "tool": perm_data.get("tool_name") or "",
+            "request_id": perm_data.get("request_id") or "",
+            "event_type": perm_data.get("event_type") or "",
+        })
+        chat_writer.submit(self.chat_id, functools.partial(
+            open_turns.set_card, self.chat_id, self._turn_token, card), label="turn_card")
 
     async def _retire_prompt(self, request_id: str, *, caller_gone: bool) -> None:
         """A prompt's wait ended with no answer (``api/hooks/permission``
@@ -857,6 +972,7 @@ class ChatStreamPump(PumpEventHandlers):
         live = _chat_streaming_state.get(self.chat_id)
         if live:
             live["pending_permission"] = perm_data
+        self._note_card(perm_data)
 
         evt_type = perm_data.get("event_type", "")
         if evt_type == wire.ITEM_PLAN_REVIEW:
@@ -1254,6 +1370,7 @@ class ChatStreamPump(PumpEventHandlers):
             self._turn_blocks.clear()
             return None
         checkpoint = upto is not None
+        todo = self._todo_block
         if not checkpoint:
             # The segment ends here, saved or already checkpointed: a
             # checklist after it is a new block.
@@ -1268,9 +1385,23 @@ class ChatStreamPump(PumpEventHandlers):
                 chat_writer.submit(self.chat_id, functools.partial(
                     task_store.rebuild_chat_search, self.chat_id), label="search_row")
             return None
-        rows = _serialize_turn_rows(saved)
+        # A truncated replay writes only what the chat does not hold: the
+        # rows and the checklist's reference read ``written``, everything
+        # that follows the turn's blocks (the open tools' positions, the live
+        # blocks' trim, the twins) reads ``saved``.
+        written = saved
+        if self.replay_overlap is not None:
+            written, todo_row = self.replay_overlap.keep(
+                saved, _serialize_turn_rows, todo_block=todo, early=early or checkpoint)
+            if todo_row and todo is not None:
+                # The checklist's row is the one saved before the cut.
+                held = turn_checkpoint.RowRef(id=todo_row)
+                if checkpoint:
+                    self._todo_ref = held
+                self._rewrite_row(held, todo)
+        rows = _serialize_turn_rows(written)
         self._turn_blocks[:len(prefix)] = [b for b in prefix if not turn_checkpoint.rowed(b)] if checkpoint else []
-        ref = turn_checkpoint.todo_ref(saved, self._todo_block) if checkpoint else None
+        ref = turn_checkpoint.todo_ref(written, self._todo_block) if checkpoint else None
         if ref is not None:
             self._todo_ref = ref[1]
         # A tool still open is not in these rows: its live block stays, and
@@ -1449,9 +1580,12 @@ class ChatStreamPump(PumpEventHandlers):
         # pump's session is never a satellite's: none recorded.
         if _active_pumps.get(chat_id) is self:
             self._turn_token = uuid.uuid4().hex
+            kind = self.turn_kind or next((k.name for k in session_kind.KINDS
+                                           if k.source_type and k.source_type == self.source_type), "")
             chat_writer.submit(chat_id, functools.partial(
-                open_turns.open_turn, chat_id, self._turn_token,
-                "" if self.source_type == session_kind.MEETING.source_type else session_id),
+                _open_turn_row, chat_id, self._turn_token,
+                "" if self.source_type == session_kind.MEETING.source_type else session_id,
+                kind, self.run_id, self.implementing_plan),
                 label="turn_open")
         if session_kind.is_task_chat_id(chat_id) and self.source_type != session_kind.TASK.source_type:
             # Dashboard-RESUMED task conversation (the scheduler's own runs are
@@ -1832,41 +1966,46 @@ class ChatStreamPump(PumpEventHandlers):
             # The shutdown closing the session is what ended the engine.
             ending = turn_ending.TurnEnding(reason=turn_ending.RESTARTED, detail=ending.detail)
             typed = None
+            self.cut_by_platform = not (self.stopped or self.deleting)
         self.last_ending = ending
-        # Failover: a turn that died on a provider limit or overload
-        # rests this session's subscription so the next chat or turn
-        # picks another: a typed limit ending until the window it
-        # names resets (account-wide, or for that model family only),
-        # else the usual cooldown; a transient overload (529) only a
-        # brief nudge, so an immediate retry isn't blocked
-        # (subscription_pool.rest_after_limit).
-        try:
-            from services.engines import subscription_pool as _subpool
-            _subpool.rest_after_limit(self.session_id, typed, err_msg)
-        except Exception:  # noqa: BLE001  # resting the account spans the pool and layers: the error frame goes on
-            pass
-        # Closed before the viewer sees the error: the session
-        # may be dead, and a message sent from here on waits in
-        # the chat's queue for the next turn.
+        if self.chat_id in _pass_takes and ending.reason == turn_ending.LOST:
+            # Its machine came back without the session: the pass carries the
+            # turn on. Set before the first await below, for the run's reader.
+            self.cut_by_machine = not (self.stopped or self.deleting)
+        # What follows (``pool_limits.follow_ending``, the one owner a
+        # terminal's limit shares): the subscription rested by what ended the
+        # turn (a typed limit until the window it names resets, account-wide or
+        # for that model family only; a limit it did not fully name by the
+        # account's reading; a transient overload only a brief nudge), the
+        # queue closed before any await and before the viewer sees the error
+        # (a message sent from here on waits in the chat's queue for the next
+        # turn), then the turn's continuation on another account with no card
+        # (the queue kept and held for the waiter), else the card.
+        from services.engines import subscription_pool as _subpool
+        self.limit_continues = await _subpool.follow_ending(self, ending, typed, event.data, err_msg)
+        if self.limit_continues:
+            self._flush_pending_text()
+
+    def close_turn(self) -> None:
+        """``follow_ending``'s close of a pump's turn: the queue."""
         self.close_queue()
-        frame = {"pump_type": wire.PUMP_ERROR,
-                 "message": err_msg if typed else ending.line(),
-                 "reason": ending.reason, "resets_at": ending.resets_at}
+
+    async def show_card(self, ending: turn_ending.TurnEnding, frame: dict) -> None:
+        """``follow_ending``'s card on a pump: the error frame, then the
+        ending as the chat's ``turn_ended`` row after the turn's text so far
+        (a reload shows the card where the live frame showed it; this loop
+        BREAKS on ERROR, and the ``finally`` saves the blocks in order), the
+        flags a lost partial turn needs on the same lane, and what was queued
+        until now goes back to its authors at the pump's end (a message sent
+        after it is the next turn)."""
+        self.last_ending = ending
         await self._forward(frame)
-        # The ending is the chat's ``turn_ended`` row, after the
-        # turn's text so far: a reload shows the card where the
-        # live frame showed it. This loop BREAKS on ERROR (the
-        # trailing DONE never flows through the pump), and the
-        # `finally` saves the blocks in order. The flags a lost
-        # partial turn needs ride the same lane, before the row's
-        # save.
         self._flush_pending_text()
-        self._turn_blocks.append(self._stamp_speaker(turn_ended_block(ending)))
-        stamps = ending.abort_stamps()
-        if stamps:
-            self._submit_chat_update("abort_flags", **stamps)
-        # What was queued until now goes back to its authors at
-        # the pump's end; a message sent after it is the next turn.
+        if not self.cut_by_platform and self.chat_id not in _pass_takes:
+            self._turn_blocks.append(self._stamp_speaker(turn_ended_block(ending)))
+            stamps = ending.abort_stamps()
+            if stamps:
+                self._submit_chat_update("abort_flags", **stamps)
         self._return_upto = input_queue.get(self.chat_id).seq
 
     async def _on_producer_done(self) -> None:
@@ -1912,6 +2051,9 @@ class ChatStreamPump(PumpEventHandlers):
         # have landed: "done" means "persisted" to the queue drain
         # and the resume re-send.
         self._completed = True
+        if not self.run_id:
+            from services.remote import chat_reload
+            chat_reload.limit_turn_ended(self.chat_id)
 
     async def _on_accept_event(self, event: CommonEvent) -> None:
         """A queued turn or a steer the engine accepted: its row and its
@@ -2070,7 +2212,10 @@ class ChatStreamPump(PumpEventHandlers):
             shelve_undelivered(self.chat_id, self._leftover_messages)
             self._leftover_messages = []
 
-        if self.implementing_plan:
+        if self.implementing_plan and not self.cut_by_platform and not (
+                _platform_ending and not self._completed):
+            # (a turn the stop cut did not implement its plan: the continue
+            # marks it when it ends)
             chat_writer.submit(
                 self.chat_id,
                 functools.partial(
@@ -2158,15 +2303,18 @@ class ChatStreamPump(PumpEventHandlers):
                     _chat_streaming_state.pop(self.chat_id, None)
             if still_active:
                 del _active_pumps[self.chat_id]
+                _pass_takes.discard(self.chat_id)
                 # What the chat's queue still holds: what was queued
                 # before a failure goes back to its authors, the rest
                 # goes out as the next turn (an attached viewer drains its
                 # own on its loop's way out first). A pump that ended
-                # without its result and without a Stop failed too. A
-                # superseded pump leaves it to the pump that owns the
-                # chat now.
+                # without its result and without a Stop failed too, except
+                # a chat's turn a limit cut that continues: its queue waits
+                # for the continuation's waiter. A superseded pump leaves it
+                # to the pump that owns the chat now.
                 if (self._return_upto is None and not self._completed
-                        and not self.stopped):
+                        and not self.stopped
+                        and not (self.limit_continues and not self.run_id)):
                     self._return_upto = input_queue.get(self.chat_id).seq
                 # A deleted chat's queue goes with the chat: nothing is
                 # returned or delivered, no wake is replayed.
@@ -2175,8 +2323,7 @@ class ChatStreamPump(PumpEventHandlers):
                         self.chat_id, return_upto=self._return_upto,
                         viewers=self.has_viewers,
                     )
-                    if self.chat_id in _stored_wake_chats:
-                        _stored_wake_chats.discard(self.chat_id)
+                    if take_stored_wake(self.chat_id):
                         _spawn_replay(self.chat_id)
 
             # Signal any remaining subscribers (a later attach gets it too)
@@ -2236,13 +2383,17 @@ class ChatStreamPump(PumpEventHandlers):
 
     def _keeps_open_turn(self) -> bool:
         """The turn's open-turn record outlives the pump: the replay writes
-        this turn (it takes the record), or the platform is ending and the
-        turn got neither its engine's result nor a typed ending, and nobody
-        stopped or deleted it (the boot writes its closing row)."""
+        this turn (it takes the record), or the platform's stop cut it (its
+        engine ended under the stop, or the pump was aborted with neither
+        the engine's result nor a typed ending) and nobody stopped or
+        deleted it. The boot turns the record into the cut turn's
+        (``services/scheduler/cut_turns.py``)."""
         if self.chat_id in _recovery_suppress_flush:
             return True
-        return (_platform_ending and not self._engine_done and self.last_ending is None
-                and not self.stopped and not self.deleting)
+        if self.stopped or self.deleting:
+            return False
+        return self.cut_by_platform or (
+            _platform_ending and not self._engine_done and self.last_ending is None)
 
     def _fire_end_of_turn(self, chat: dict | None, in_meeting: bool,
                           agent_label: str) -> None:
@@ -2495,7 +2646,7 @@ class ChatStreamPump(PumpEventHandlers):
             plan_content = perm_data.get("plan", "")
             plan_tool_input = perm_data.get("tool_input", {})
             # Nothing waits on a Codex plan's card (its mark,
-            # ``codex.layer.PLAN_BETWEEN_TURNS``): the turn ends with it.
+            # ``codex.plan_review.PLAN_BETWEEN_TURNS``): the turn ends with it.
             if plan_tool_input.get("between_turns"):
                 self._plan_waits = True
             plan_filename = ""
@@ -2546,3 +2697,4 @@ from core.events.pump_bg_monitors import (  # noqa: F401
     bg_command_monitor_running,
     bg_monitor_running,
 )
+

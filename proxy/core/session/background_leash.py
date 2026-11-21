@@ -6,10 +6,30 @@ frame (commands) and a Stop hook (subagents). The idle reapers and the RAM
 evictor read the two registries through here so a running job keeps its
 session, up to ``BACKGROUND_WORK_CEILING_S``: past the ceiling the session
 goes anyway, because a job that never ends must not pin a slot forever.
-Reads never create a registry entry.
+Reads never create a registry entry. A terminal has no stream to feed the
+registries: its Stop hook's list of background work is read instead
+(``names_terminal_work``, the terminal reaper's ``background-pending``).
 """
 
 import config
+
+#: The kinds a Claude terminal's Stop lists in ``background_tasks`` (the
+#: CLI's own labels) that are work the agent started and whose end wakes the
+#: terminal with a turn of its own. An allow-list: the CLI also lists its
+#: housekeeping (``dream``, ``auto-mode scan``, ``memory import``), which
+#: ends with no wake and no Stop, and kinds with no end this terminal waits on
+#: (``teammate``, in the CLI's own process, and ``cloud session``, which runs
+#: elsewhere); a kind a later CLI adds counts for nothing until it is read
+#: here. Rare producers of these labels that need no agent action: an observer
+#: sub-agent from an agent definition (the platform writes none) and the
+#: Artifact tools' live monitors (denied).
+TERMINAL_WORK_KINDS: frozenset[str] = frozenset(
+    {"shell", "subagent", "workflow", "monitor", "MCP task"})
+
+
+def names_terminal_work(kinds: list[str]) -> bool:
+    """Whether a terminal's Stop report names background work it waits on."""
+    return any(kind in TERMINAL_WORK_KINDS for kind in kinds)
 
 
 def pending_background(session_id: str) -> tuple[int, int]:

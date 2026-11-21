@@ -1,0 +1,1637 @@
+{
+ "components": {
+  "schemas": {
+   "AgentView": {
+    "properties": {
+     "agent": {
+      "title": "Agent",
+      "type": "string"
+     },
+     "description": {
+      "title": "Description",
+      "type": "string"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "role": {
+      "title": "Role",
+      "type": "string"
+     },
+     "shared_chats": {
+      "title": "Shared Chats",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "agent",
+     "name",
+     "description",
+     "role",
+     "shared_chats"
+    ],
+    "title": "AgentView",
+    "type": "object"
+   },
+   "AgentsAnswer": {
+    "properties": {
+     "agents": {
+      "items": {
+       "$ref": "#/components/schemas/AgentView"
+      },
+      "title": "Agents",
+      "type": "array"
+     }
+    },
+    "required": [
+     "agents"
+    ],
+    "title": "AgentsAnswer",
+    "type": "object"
+   },
+   "ChatAnswer": {
+    "properties": {
+     "chat": {
+      "$ref": "#/components/schemas/ChatView"
+     },
+     "has_more": {
+      "title": "Has More",
+      "type": "boolean"
+     },
+     "messages": {
+      "items": {
+       "$ref": "#/components/schemas/MessageView"
+      },
+      "title": "Messages",
+      "type": "array"
+     }
+    },
+    "required": [
+     "chat",
+     "messages",
+     "has_more"
+    ],
+    "title": "ChatAnswer",
+    "type": "object"
+   },
+   "ChatView": {
+    "properties": {
+     "agent": {
+      "title": "Agent",
+      "type": "string"
+     },
+     "id": {
+      "title": "Id",
+      "type": "string"
+     },
+     "permission_mode": {
+      "title": "Permission Mode",
+      "type": "string"
+     },
+     "shared": {
+      "title": "Shared",
+      "type": "boolean"
+     },
+     "title": {
+      "title": "Title",
+      "type": "string"
+     },
+     "updated_at": {
+      "title": "Updated At",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "agent",
+     "title",
+     "permission_mode",
+     "updated_at",
+     "shared"
+    ],
+    "title": "ChatView",
+    "type": "object"
+   },
+   "ChatsAnswer": {
+    "properties": {
+     "chats": {
+      "items": {
+       "$ref": "#/components/schemas/ChatView"
+      },
+      "title": "Chats",
+      "type": "array"
+     }
+    },
+    "required": [
+     "chats"
+    ],
+    "title": "ChatsAnswer",
+    "type": "object"
+   },
+   "Delivery": {
+    "properties": {
+     "body": {
+      "title": "Body",
+      "type": "string"
+     },
+     "created_at": {
+      "title": "Created At",
+      "type": "string"
+     },
+     "id": {
+      "title": "Id",
+      "type": "string"
+     },
+     "read": {
+      "title": "Read",
+      "type": "boolean"
+     },
+     "severity": {
+      "title": "Severity",
+      "type": "string"
+     },
+     "title": {
+      "title": "Title",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "title",
+     "body",
+     "severity",
+     "created_at",
+     "read"
+    ],
+    "title": "Delivery",
+    "type": "object"
+   },
+   "FileNode": {
+    "properties": {
+     "children": {
+      "items": {
+       "$ref": "#/components/schemas/FileNode"
+      },
+      "title": "Children",
+      "type": "array"
+     },
+     "modified": {
+      "title": "Modified",
+      "type": "string"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     },
+     "size": {
+      "title": "Size",
+      "type": "integer"
+     },
+     "type": {
+      "description": "file or dir",
+      "title": "Type",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name",
+     "type",
+     "path",
+     "size",
+     "modified",
+     "children"
+    ],
+    "title": "FileNode",
+    "type": "object"
+   },
+   "FileWrite": {
+    "properties": {
+     "content": {
+      "description": "The file's text (UTF-8)",
+      "title": "Content",
+      "type": "string"
+     }
+    },
+    "required": [
+     "content"
+    ],
+    "title": "FileWrite",
+    "type": "object"
+   },
+   "HTTPValidationError": {
+    "properties": {
+     "detail": {
+      "items": {
+       "$ref": "#/components/schemas/ValidationError"
+      },
+      "title": "Detail",
+      "type": "array"
+     }
+    },
+    "title": "HTTPValidationError",
+    "type": "object"
+   },
+   "Inbox": {
+    "properties": {
+     "notifications": {
+      "items": {
+       "$ref": "#/components/schemas/Delivery"
+      },
+      "title": "Notifications",
+      "type": "array"
+     }
+    },
+    "required": [
+     "notifications"
+    ],
+    "title": "Inbox",
+    "type": "object"
+   },
+   "KeyView": {
+    "properties": {
+     "agents": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Agents",
+      "type": "array"
+     },
+     "expires_at": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Expires At"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "run_without_asking": {
+      "title": "Run Without Asking",
+      "type": "boolean"
+     },
+     "scopes": {
+      "items": {
+       "type": "string"
+      },
+      "title": "Scopes",
+      "type": "array"
+     }
+    },
+    "required": [
+     "name",
+     "scopes",
+     "agents",
+     "expires_at",
+     "run_without_asking"
+    ],
+    "title": "KeyView",
+    "type": "object"
+   },
+   "MeAnswer": {
+    "properties": {
+     "email": {
+      "title": "Email",
+      "type": "string"
+     },
+     "key": {
+      "$ref": "#/components/schemas/KeyView"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name",
+     "email",
+     "key"
+    ],
+    "title": "MeAnswer",
+    "type": "object"
+   },
+   "MessageView": {
+    "properties": {
+     "author_sub": {
+      "title": "Author Sub",
+      "type": "string"
+     },
+     "content": {
+      "title": "Content",
+      "type": "string"
+     },
+     "created_at": {
+      "title": "Created At",
+      "type": "string"
+     },
+     "id": {
+      "title": "Id",
+      "type": "integer"
+     },
+     "role": {
+      "title": "Role",
+      "type": "string"
+     },
+     "sent_with_key": {
+      "title": "Sent With Key",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "role",
+     "content",
+     "created_at",
+     "author_sub",
+     "sent_with_key"
+    ],
+    "title": "MessageView",
+    "type": "object"
+   },
+   "NewChat": {
+    "properties": {
+     "agent": {
+      "title": "Agent",
+      "type": "string"
+     },
+     "mode": {
+      "default": "ask",
+      "description": "ask or plan. autoReview and dontAsk take a key made to run without asking",
+      "title": "Mode",
+      "type": "string"
+     }
+    },
+    "required": [
+     "agent"
+    ],
+    "title": "NewChat",
+    "type": "object"
+   },
+   "NewNotification": {
+    "properties": {
+     "agent": {
+      "default": "",
+      "title": "Agent",
+      "type": "string"
+     },
+     "body": {
+      "default": "",
+      "maxLength": 4000,
+      "title": "Body",
+      "type": "string"
+     },
+     "severity": {
+      "default": "info",
+      "enum": [
+       "info",
+       "success",
+       "warning",
+       "danger"
+      ],
+      "title": "Severity",
+      "type": "string"
+     },
+     "title": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+     }
+    },
+    "required": [
+     "title"
+    ],
+    "title": "NewNotification",
+    "type": "object"
+   },
+   "NewTask": {
+    "properties": {
+     "agent": {
+      "title": "Agent",
+      "type": "string"
+     },
+     "layer": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Layer"
+     },
+     "model": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Model"
+     },
+     "name": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+     },
+     "notification_mode": {
+      "default": "none",
+      "enum": [
+       "auto",
+       "manual",
+       "none"
+      ],
+      "title": "Notification Mode",
+      "type": "string"
+     },
+     "prompt": {
+      "maxLength": 100000,
+      "minLength": 1,
+      "title": "Prompt",
+      "type": "string"
+     },
+     "run_now": {
+      "default": true,
+      "title": "Run Now",
+      "type": "boolean"
+     },
+     "scope": {
+      "default": "user",
+      "enum": [
+       "user",
+       "agent"
+      ],
+      "title": "Scope",
+      "type": "string"
+     },
+     "timeout_seconds": {
+      "default": 600,
+      "maximum": 7200.0,
+      "minimum": 30.0,
+      "title": "Timeout Seconds",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "agent",
+     "name",
+     "prompt"
+    ],
+    "title": "NewTask",
+    "type": "object"
+   },
+   "RunView": {
+    "properties": {
+     "agent": {
+      "title": "Agent",
+      "type": "string"
+     },
+     "chat_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Chat Id"
+     },
+     "completed_at": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Completed At"
+     },
+     "error_message": {
+      "title": "Error Message",
+      "type": "string"
+     },
+     "id": {
+      "title": "Id",
+      "type": "string"
+     },
+     "output_text": {
+      "title": "Output Text",
+      "type": "string"
+     },
+     "started_at": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Started At"
+     },
+     "status": {
+      "title": "Status",
+      "type": "string"
+     },
+     "task_id": {
+      "title": "Task Id",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "task_id",
+     "agent",
+     "status",
+     "started_at",
+     "completed_at",
+     "output_text",
+     "error_message",
+     "chat_id"
+    ],
+    "title": "RunView",
+    "type": "object"
+   },
+   "Saved": {
+    "properties": {
+     "path": {
+      "title": "Path",
+      "type": "string"
+     },
+     "status": {
+      "title": "Status",
+      "type": "string"
+     }
+    },
+    "required": [
+     "status",
+     "path"
+    ],
+    "title": "Saved",
+    "type": "object"
+   },
+   "Send": {
+    "properties": {
+     "request_id": {
+      "default": "",
+      "description": "Sends once per request id",
+      "maxLength": 128,
+      "title": "Request Id",
+      "type": "string"
+     },
+     "text": {
+      "maxLength": 100000,
+      "minLength": 1,
+      "title": "Text",
+      "type": "string"
+     },
+     "wait_seconds": {
+      "default": 55,
+      "maximum": 120.0,
+      "minimum": 0.0,
+      "title": "Wait Seconds",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "text"
+    ],
+    "title": "Send",
+    "type": "object"
+   },
+   "Sent": {
+    "properties": {
+     "id": {
+      "title": "Id",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "title": "Sent",
+    "type": "object"
+   },
+   "Started": {
+    "properties": {
+     "run_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Run Id"
+     },
+     "task_id": {
+      "title": "Task Id",
+      "type": "string"
+     }
+    },
+    "required": [
+     "task_id",
+     "run_id"
+    ],
+    "title": "Started",
+    "type": "object"
+   },
+   "TaskView": {
+    "properties": {
+     "agent": {
+      "title": "Agent",
+      "type": "string"
+     },
+     "id": {
+      "title": "Id",
+      "type": "string"
+     },
+     "kind": {
+      "title": "Kind",
+      "type": "string"
+     },
+     "name": {
+      "title": "Name",
+      "type": "string"
+     },
+     "runs_without_asking": {
+      "title": "Runs Without Asking",
+      "type": "boolean"
+     },
+     "schedule": {
+      "title": "Schedule",
+      "type": "string"
+     },
+     "scope": {
+      "title": "Scope",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "name",
+     "agent",
+     "scope",
+     "kind",
+     "schedule",
+     "runs_without_asking"
+    ],
+    "title": "TaskView",
+    "type": "object"
+   },
+   "TasksAnswer": {
+    "properties": {
+     "tasks": {
+      "items": {
+       "$ref": "#/components/schemas/TaskView"
+      },
+      "title": "Tasks",
+      "type": "array"
+     }
+    },
+    "required": [
+     "tasks"
+    ],
+    "title": "TasksAnswer",
+    "type": "object"
+   },
+   "Tree": {
+    "properties": {
+     "tree": {
+      "items": {
+       "$ref": "#/components/schemas/FileNode"
+      },
+      "title": "Tree",
+      "type": "array"
+     }
+    },
+    "required": [
+     "tree"
+    ],
+    "title": "Tree",
+    "type": "object"
+   },
+   "TurnAnswer": {
+    "properties": {
+     "answer": {
+      "title": "Answer",
+      "type": "string"
+     },
+     "chat_id": {
+      "title": "Chat Id",
+      "type": "string"
+     },
+     "detail": {
+      "title": "Detail",
+      "type": "string"
+     },
+     "message_id": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Message Id"
+     },
+     "request_id": {
+      "title": "Request Id",
+      "type": "string"
+     },
+     "state": {
+      "description": "done, running, no_answer or not_sent",
+      "title": "State",
+      "type": "string"
+     },
+     "waiting_for_you": {
+      "title": "Waiting For You",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "chat_id",
+     "message_id",
+     "request_id",
+     "state",
+     "answer",
+     "waiting_for_you",
+     "detail"
+    ],
+    "title": "TurnAnswer",
+    "type": "object"
+   },
+   "ValidationError": {
+    "properties": {
+     "ctx": {
+      "title": "Context",
+      "type": "object"
+     },
+     "input": {
+      "title": "Input"
+     },
+     "loc": {
+      "items": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "title": "Location",
+      "type": "array"
+     },
+     "msg": {
+      "title": "Message",
+      "type": "string"
+     },
+     "type": {
+      "title": "Error Type",
+      "type": "string"
+     }
+    },
+    "required": [
+     "loc",
+     "msg",
+     "type"
+    ],
+    "title": "ValidationError",
+    "type": "object"
+   }
+  },
+  "securitySchemes": {
+   "key": {
+    "description": "A personal API key (otok_...)",
+    "scheme": "bearer",
+    "type": "http"
+   }
+  }
+ },
+ "info": {
+  "description": "Use your OtoDock from outside with a personal API key: your agents, chats, tasks, files and notifications. A key acts as you, on the agents it names, with the permissions you gave it, and never does more than you can. Make a key in your settings. Send it as `Authorization: Bearer otok_...`.",
+  "title": "OtoDock API",
+  "version": "1.0"
+ },
+ "openapi": "3.1.0",
+ "paths": {
+  "/v1/api/agents": {
+   "get": {
+    "description": "The agents the key reaches, with the person's role on each.",
+    "operationId": "agents_v1_api_agents_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AgentsAnswer"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Agents",
+    "tags": [
+     "key"
+    ]
+   }
+  },
+  "/v1/api/agents/{agent}/files": {
+   "get": {
+    "description": "The agent's files the key reaches, as a tree.",
+    "operationId": "tree_v1_api_agents__agent__files_get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "agent",
+      "required": true,
+      "schema": {
+       "title": "Agent",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Tree"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Tree",
+    "tags": [
+     "files"
+    ]
+   }
+  },
+  "/v1/api/agents/{agent}/files/{path}": {
+   "get": {
+    "description": "A file's content: text as JSON, or the bytes with ``download``.",
+    "operationId": "read_file_v1_api_agents__agent__files__path__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "agent",
+      "required": true,
+      "schema": {
+       "title": "Agent",
+       "type": "string"
+      }
+     },
+     {
+      "in": "path",
+      "name": "path",
+      "required": true,
+      "schema": {
+       "title": "Path",
+       "type": "string"
+      }
+     },
+     {
+      "in": "query",
+      "name": "download",
+      "required": false,
+      "schema": {
+       "default": false,
+       "title": "Download",
+       "type": "boolean"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "The file: JSON with its text, or its bytes"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Read File",
+    "tags": [
+     "files"
+    ]
+   },
+   "put": {
+    "description": "Write a text file in your own folder or the workspace.",
+    "operationId": "write_file_v1_api_agents__agent__files__path__put",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "agent",
+      "required": true,
+      "schema": {
+       "title": "Agent",
+       "type": "string"
+      }
+     },
+     {
+      "in": "path",
+      "name": "path",
+      "required": true,
+      "schema": {
+       "title": "Path",
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/FileWrite"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Saved"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Write File",
+    "tags": [
+     "files"
+    ]
+   }
+  },
+  "/v1/api/chats": {
+   "get": {
+    "description": "The person's chats on the agents the key reaches, newest first.",
+    "operationId": "list_chats_v1_api_chats_get",
+    "parameters": [
+     {
+      "in": "query",
+      "name": "agent",
+      "required": false,
+      "schema": {
+       "default": "",
+       "title": "Agent",
+       "type": "string"
+      }
+     },
+     {
+      "in": "query",
+      "name": "limit",
+      "required": false,
+      "schema": {
+       "default": 50,
+       "maximum": 200,
+       "minimum": 1,
+       "title": "Limit",
+       "type": "integer"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ChatsAnswer"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Chats",
+    "tags": [
+     "chat"
+    ]
+   },
+   "post": {
+    "description": "A new chat on the agent, on the engine and model the person's new\nchat there takes. In Ask unless a mode is named; Auto and Don't Ask take\na key made to run without asking.",
+    "operationId": "create_chat_v1_api_chats_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/NewChat"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ChatView"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Create Chat",
+    "tags": [
+     "chat"
+    ]
+   }
+  },
+  "/v1/api/chats/{chat_id}": {
+   "get": {
+    "description": "The chat and a page of its messages (the person's and the agent's),\nnewest last.",
+    "operationId": "read_chat_v1_api_chats__chat_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "chat_id",
+      "required": true,
+      "schema": {
+       "title": "Chat Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "query",
+      "name": "before_id",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "minimum": 1,
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Before Id"
+      }
+     },
+     {
+      "in": "query",
+      "name": "limit",
+      "required": false,
+      "schema": {
+       "default": 50,
+       "maximum": 200,
+       "minimum": 1,
+       "title": "Limit",
+       "type": "integer"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ChatAnswer"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Read Chat",
+    "tags": [
+     "chat"
+    ]
+   }
+  },
+  "/v1/api/chats/{chat_id}/messages": {
+   "post": {
+    "description": "Send a message as the person and wait, at most ``wait_seconds``, for\nthe end of its turn. A key not made to run without asking sends only\ninto a chat in Ask or Plan. A turn that needs approval waits for the\nperson in the dashboard. Past the bound the answer says the turn still runs; read\nit with ``GET /v1/api/chats/{chat_id}/messages/{message_id}``. While\nOtoDock cannot take it (it is updating, or its compute machine is not\nconnected) the answer is 503 with ``Retry-After``: send the request\nagain with the same ``request_id``.",
+    "operationId": "send_message_v1_api_chats__chat_id__messages_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "chat_id",
+      "required": true,
+      "schema": {
+       "title": "Chat Id",
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/Send"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/TurnAnswer"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     },
+     "503": {
+      "description": "OtoDock cannot take it now (it is starting, it is updating or its compute machine is not connected): nothing was sent. Send the same request again after Retry-After"
+     }
+    },
+    "summary": "Send Message",
+    "tags": [
+     "chat"
+    ]
+   }
+  },
+  "/v1/api/chats/{chat_id}/messages/{message_id}": {
+   "get": {
+    "description": "The state of a message this key sent, and its answer once its turn\nended. ``wait_seconds`` waits for the end first.",
+    "operationId": "read_turn_v1_api_chats__chat_id__messages__message_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "chat_id",
+      "required": true,
+      "schema": {
+       "title": "Chat Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "path",
+      "name": "message_id",
+      "required": true,
+      "schema": {
+       "title": "Message Id",
+       "type": "integer"
+      }
+     },
+     {
+      "in": "query",
+      "name": "wait_seconds",
+      "required": false,
+      "schema": {
+       "default": 0,
+       "maximum": 120,
+       "minimum": 0,
+       "title": "Wait Seconds",
+       "type": "integer"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/TurnAnswer"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Read Turn",
+    "tags": [
+     "chat"
+    ]
+   }
+  },
+  "/v1/api/me": {
+   "get": {
+    "description": "Who the key acts as, and what it may do.",
+    "operationId": "me_v1_api_me_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MeAnswer"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Me",
+    "tags": [
+     "key"
+    ]
+   }
+  },
+  "/v1/api/notifications": {
+   "get": {
+    "description": "Your newest notifications. A key that names its agents reads theirs,\nand those of no agent.",
+    "operationId": "inbox_v1_api_notifications_get",
+    "parameters": [
+     {
+      "in": "query",
+      "name": "limit",
+      "required": false,
+      "schema": {
+       "default": 50,
+       "maximum": 200,
+       "minimum": 1,
+       "title": "Limit",
+       "type": "integer"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Inbox"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Inbox",
+    "tags": [
+     "notifications"
+    ]
+   },
+   "post": {
+    "description": "A notification to yourself, now.",
+    "operationId": "send_v1_api_notifications_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/NewNotification"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Sent"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Send",
+    "tags": [
+     "notifications"
+    ]
+   }
+  },
+  "/v1/api/runs/{run_id}": {
+   "get": {
+    "description": "A run's state and, once it ended, its result.",
+    "operationId": "read_run_v1_api_runs__run_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "run_id",
+      "required": true,
+      "schema": {
+       "title": "Run Id",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RunView"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Read Run",
+    "tags": [
+     "tasks"
+    ]
+   }
+  },
+  "/v1/api/runs/{run_id}/stream": {
+   "get": {
+    "description": "The run's output as server-sent events, to its end.",
+    "operationId": "stream_run_v1_api_runs__run_id__stream_get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "run_id",
+      "required": true,
+      "schema": {
+       "title": "Run Id",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       },
+       "text/event-stream": {}
+      },
+      "description": "Server-sent events, to the run's end"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Stream Run",
+    "tags": [
+     "tasks"
+    ]
+   }
+  },
+  "/v1/api/tasks": {
+   "get": {
+    "description": "The tasks the key may run.",
+    "operationId": "list_tasks_v1_api_tasks_get",
+    "parameters": [
+     {
+      "in": "query",
+      "name": "agent",
+      "required": false,
+      "schema": {
+       "default": "",
+       "title": "Agent",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/TasksAnswer"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "List Tasks",
+    "tags": [
+     "tasks"
+    ]
+   },
+   "post": {
+    "description": "A task that runs when asked, run now unless ``run_now`` is false.",
+    "operationId": "create_task_v1_api_tasks_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/NewTask"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Started"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Create Task",
+    "tags": [
+     "tasks"
+    ]
+   }
+  },
+  "/v1/api/tasks/{task_id}/run": {
+   "post": {
+    "description": "Run a task now.",
+    "operationId": "run_task_v1_api_tasks__task_id__run_post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "task_id",
+      "required": true,
+      "schema": {
+       "title": "Task Id",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Started"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Run Task",
+    "tags": [
+     "tasks"
+    ]
+   }
+  }
+ },
+ "security": [
+  {
+   "key": []
+  }
+ ]
+}

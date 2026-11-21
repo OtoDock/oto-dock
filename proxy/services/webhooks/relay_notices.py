@@ -227,8 +227,10 @@ def _accounts_naming(user_sub: str, label: str, provider_id: str) -> list[str]:
 
 
 def _mark(match: _Match, mcp_names: list[str], notice: Notice) -> None:
-    """The rows say the account was removed at the vendor; the agent
-    choices that named it end, as a disconnect ends them."""
+    """The rows say the account was removed at the vendor; the account
+    leaves every agent's set that holds it, as a disconnect takes it out
+    (the rest of each set stays, its oldest promoted when the account was
+    the default)."""
     from storage.identity import credential_store
     mark = {"reason": notice.reason, "at": int(notice.removed_at)}
     for mcp_name in mcp_names:
@@ -236,7 +238,8 @@ def _mark(match: _Match, mcp_names: list[str], notice: Notice) -> None:
             match.user_sub, mcp_name, match.label, lambda meta: {**meta, REMOVED_REASON: mark})
         for row in credential_store.list_agent_account_bindings(match.user_sub, mcp_name):
             if row.get("account_label") == match.label:
-                credential_store.remove_account_agent_binding(match.user_sub, mcp_name, row["agent_name"])
+                credential_store.remove_account_agent_binding(
+                    match.user_sub, mcp_name, row["agent_name"], match.label)
 
 
 def clear_mark(user_sub: str, provider_id: str, label: str) -> None:
@@ -367,6 +370,7 @@ async def _after(notice: Notice, done: list[tuple[_Match, list[str]]]) -> None:
     from core.remote import mcp_gateway_push
     from services.mcp import mcp_registry
     from services.notifications import notification_manager
+    from services.remote import chat_reload
     from services.webhooks import subscription_manager
     from storage.identity import credential_store
     for match, mcp_names in done:
@@ -376,13 +380,9 @@ async def _after(notice: Notice, done: list[tuple[_Match, list[str]]]) -> None:
                     scope="user", owner=match.user_sub, mcp_name=mcp_name, account_label=match.label)
                 for b in await asyncio.to_thread(credential_store.list_service_agent_bindings, mcp_name):
                     if b.get("account_owner_sub") == match.user_sub and b.get("account_label") == match.label:
-                        agent = str(b.get("agent_name") or "")
-                        await subscription_manager.cleanup_account_subscriptions(
-                            scope="service", owner=match.user_sub, mcp_name=mcp_name,
-                            account_label=match.label, agent=agent)
-                        await asyncio.to_thread(
-                            credential_store.remove_service_agent_binding, mcp_name, agent,
-                            owner_sub=match.user_sub, account_label=match.label)
+                        await chat_reload.remove_service_account(
+                            mcp_name, str(b.get("agent_name") or ""), owner_sub=match.user_sub,
+                            account_label=match.label)
             except Exception:
                 logger.exception("relay notice: the cleanup of %s's subscriptions failed", mcp_name)
         labels = [getattr(mcp_registry.get_manifest(n), "label", n) for n in mcp_names]

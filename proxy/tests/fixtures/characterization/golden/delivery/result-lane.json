@@ -1,0 +1,65 @@
+{
+ "layer": [
+  [
+   "is_session_alive",
+   "s-parent"
+  ],
+  [
+   "send_message",
+   "s-parent",
+   "[The worker ended without a report: it went silent and was ended. Its last message below is not the outcome. Continue the lane with delegate(continue_id=\"c-worker\") to get the report.]\n\n[status=failed task=t-lane name=the-worker chat=c-worker agent=char-peer]\nthe answer\n\n[User interjected]: also check Y\n\n[Check answer did not pass after 3 round(s): no json]\n\n[The worker's engine went silent past the ceiling and was ended. Its session resumes where it left off: continue it with delegate(continue_id=\"c-worker\").]\n\n[The worker's run ended with 1 background job(s) still running; their results are not in this report. Continue the worker with delegate(continue_id=\"c-worker\") to collect them.]"
+  ]
+ ],
+ "rows": [
+  {
+   "content": "",
+   "event_data": {
+    "agent": "char-peer",
+    "background_pending": 1,
+    "output_text": "the answer\n\n[User interjected]: also check Y",
+    "reason": "silent",
+    "report_missing": true,
+    "resets_at": "",
+    "status": "failed",
+    "task_id": "t-lane",
+    "task_name": "the-worker",
+    "verdict": {
+     "check": "answer",
+     "findings": [],
+     "ran_on": "local",
+     "round": 3,
+     "summary": "no json"
+    },
+    "worker_chat_id": "c-worker"
+   },
+   "event_type": "delegate_result",
+   "role": "event"
+  },
+  {
+   "content": "ECHO TEXT",
+   "event_data": null,
+   "event_type": "",
+   "role": "assistant"
+  }
+ ],
+ "worker_rows": [
+  {
+   "content": "do the work",
+   "event_data": null,
+   "event_type": "",
+   "role": "user"
+  },
+  {
+   "content": "the answer",
+   "event_data": null,
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "content": "also check Y",
+   "event_data": null,
+   "event_type": "",
+   "role": "user"
+  }
+ ]
+}

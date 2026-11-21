@@ -17,8 +17,11 @@ _ROUTED = (
     "api/hooks/lifecycle.py",
     "configuration/prompts.py",
     "core/remote/remote_file_flow.py",
+    "core/remote/remote_file_cache.py",
     "core/remote/satellite_file_transfer.py",
+    "core/remote/satellite_file_verbs.py",
     "core/remote/remote_workspace_sync.py",
+    "core/remote/remote_workspace_apply.py",
 )
 
 

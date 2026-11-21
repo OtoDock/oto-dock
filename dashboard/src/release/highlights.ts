@@ -21,8 +21,9 @@ export type ReleaseHighlights = Record<Audience, Highlight[]>
 export const HIGHLIGHT_LIMITS = { title: 40, text: 160, cards: 6 } as const
 export const VERSION_RE = /^\d+\.\d+\.\d+$/
 
-// The dashboard has no icon library: a dozen outline shapes, one path each
-// (24 x 24, stroked). A card names one by its key.
+// The dashboard has no icon library: a set of outline shapes, one path each
+// (24 x 24, stroked). A release card and a community template's highlight
+// name one by its key.
 export const ICON_PATHS = {
   chat: 'M8 10h8M8 14h5M21 12c0 4.4-4 8-9 8a9.7 9.7 0 0 1-4-.9L3 20l1.3-3.6A7.5 7.5 0 0 1 3 12c0-4.4 4-8 9-8s9 3.6 9 8z',
   picture: 'M4 5h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zM3 17l5-5 4 4 3-3 6 6M15.5 9.5h.01',
@@ -37,7 +38,15 @@ export const ICON_PATHS = {
   bell: 'M6 16v-5a6 6 0 0 1 12 0v5l1.5 2h-15zM10 20a2 2 0 0 0 4 0',
   key: 'M15 9a1 1 0 1 0 0-2 1 1 0 0 0 0 2zM14 3a7 7 0 0 0-6.6 9.3L3 16.8V21h4.2l4.5-4.5A7 7 0 1 0 14 3z',
   sparkle: 'M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3zM19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16z',
+  video: 'M4 6h11a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1zM16 10l5-3v10l-5-3',
+  shorts: 'M8 3h8a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zM11 9.5v5l4-2.5z',
+  mic: 'M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3M9 21h6',
+  mail: 'M4 6h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1zM3 7l9 6 9-6',
 } as const
+
+/** The mark drawn for an icon name this dashboard does not know: a newer
+ *  catalog may name one, and an older install must still draw the card. */
+export const UNKNOWN_ICON_PATH = 'M9 12a3 3 0 1 0 6 0 3 3 0 1 0-6 0'
 
 export type IconName = keyof typeof ICON_PATHS
 export const ICON_NAMES = Object.keys(ICON_PATHS) as IconName[]

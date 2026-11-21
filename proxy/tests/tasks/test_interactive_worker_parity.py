@@ -18,6 +18,7 @@ import pytest
 from core.session import interactive_session
 from services.scheduler import interactive, scheduler
 from storage import database as task_store
+from tests._compute import serve
 
 
 class _FakeInteractiveSession:
@@ -166,7 +167,8 @@ def test_delivery_payload_matches_headless(temp_db):
 
 class _BorrowedTerminal:
     """The slice a borrowed round drives on a LIVE interactive session: the
-    prompt queue with its injection hook, the turn-end waiters, liveness."""
+    prompt queue with its injection hook, the turn-end waiters, liveness, and
+    the limit it may be at (none here)."""
 
     def __init__(self, chat_id="chat-b", session_id="sid-borrowed", *, inject_now=True,
                  user_sub=""):
@@ -180,6 +182,12 @@ class _BorrowedTerminal:
         self.queued: list[dict] = []
         self.cancelled: list[dict] = []
         self.waiters: list = []
+        self.limit_mark = None
+        self.last_ending = None
+        self.resting = None
+
+    def limit_ending(self):
+        return self.resting
 
     def may_drive(self, sender_sub):
         return not self.user_sub or not sender_sub or sender_sub == self.user_sub
@@ -309,11 +317,25 @@ class TestBorrowedTerminalTurn:
         asyncio.run(_run())
 
 
-def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch):
+class _RealRuleTerminal(_BorrowedTerminal):
+    """A chat-surface lane's live terminal (a plain uuid chat, the run's
+    unattended word recorded) judged by the real drive rule."""
+
+    from core.session.interactive_output import InteractiveOutputMixin as _M
+    may_drive = _M.may_drive
+    runs_for_nobody = _M.runs_for_nobody
+    sole_driver = _M.sole_driver
+    chat_is_lane = True
+
+
+@pytest.mark.parametrize("real_rule", [False, True])
+def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch, real_rule):
     """The runner's borrowed round end to end: no config build, no layer, no
     spawn; the follow-up goes to the terminal, the tailer's rows are the
     output, the report lands, the terminal is neither closed nor stamped a
-    task session, and the chat's hold is released."""
+    task session, and the chat's hold is released. With the real drive rule
+    on a chat-surface lane (its chat's id a plain uuid, its session in the
+    unattended word), the lane's own person's round still borrows it."""
     from contextlib import asynccontextmanager
 
     from core import concurrency
@@ -327,7 +349,15 @@ def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch):
     task_store.create_chat(chat_id, "u", "agent-x", "auto", origin="delegated",
                            execution_mode="interactive")
     task_store.update_chat(chat_id, session_id=sid)
-    term = _BorrowedTerminal(chat_id=chat_id, session_id=sid)
+    if real_rule:
+        chat_id = "3c1d2e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f"
+        task_store.create_chat(chat_id, "u", "agent-x", "auto", origin="delegated",
+                               execution_mode="interactive")
+        task_store.update_chat(chat_id, session_id=sid)
+        term = _RealRuleTerminal(chat_id=chat_id, session_id=sid, user_sub="u")
+        monkeypatch.setitem(session_state._session_modes, sid, "auto")
+    else:
+        term = _BorrowedTerminal(chat_id=chat_id, session_id=sid)
     monkeypatch.setitem(interactive_session._sessions, sid, term)
     closed: list[str] = []
 
@@ -344,6 +374,8 @@ def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch):
     monkeypatch.setattr(session_manager, "get_execution_layer",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no layer")))
     monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
+    # The round's slot is taken on the compute machine that serves.
+    serve(monkeypatch)
 
     @asynccontextmanager
     async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):
@@ -354,8 +386,9 @@ def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch):
 
     task = shared.TaskDefinition(
         id="t-borrow", name="follow", agent="agent-x", prompt="also this",
-        scope="agent", notification_mode="none", continue_session=sid,
-        target_chat_id=chat_id,
+        scope="user" if real_rule else "agent", notification_mode="none",
+        continue_session=sid, target_chat_id=chat_id,
+        created_by="u" if real_rule else None,
     )
     run_id = "run-borrow"
     task_store.create_run(run_id, task.id, task.agent, "manual", None, task.prompt,
@@ -401,6 +434,72 @@ def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch):
     assert entry_after == {"client_type": "dashboard"}
 
 
+def test_a_continue_round_onto_a_terminal_whose_account_rests_ends_at_once_with_the_limit(temp_db, monkeypatch):
+    """A follow-up round borrows a live terminal with no limit of its own whose
+    account rests on a window (``limit_ending`` answers the rest). Nothing is
+    typed, the round does not wait for the backstop, and the run fails with
+    the limit and the rest's end."""
+    from contextlib import asynccontextmanager
+
+    from core import concurrency
+    from core.config import task_config_builder
+    from core.events import turn_ending
+    from core.session import session_manager, session_state
+    from services.remote import remote_status
+    from services.scheduler import runner, shared
+
+    chat_id = "worker-resting"
+    sid = "44444444-4444-4444-8444-444444444444"
+    task_store.create_chat(chat_id, "u", "agent-x", "auto", origin="delegated", execution_mode="interactive")
+    task_store.update_chat(chat_id, session_id=sid)
+    term = _BorrowedTerminal(chat_id=chat_id, session_id=sid)
+    term.resting = turn_ending.TurnEnding(reason=turn_ending.LIMIT, resets_at="2099-01-01T06:00:00+00:00",
+                                          window="seven_day")
+    monkeypatch.setitem(interactive_session._sessions, sid, term)
+
+    async def _no_build(*a, **k):
+        raise AssertionError("a borrowed round never builds a config")
+    monkeypatch.setattr(task_config_builder, "build_task_agent_config", _no_build)
+    monkeypatch.setattr(task_config_builder, "resolve_task_identity",
+                        lambda *a, **k: task_config_builder.TaskIdentity("", "manager", "agent", None))
+    monkeypatch.setattr(session_manager, "get_execution_layer",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no layer")))
+    monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
+    serve(monkeypatch)
+
+    @asynccontextmanager
+    async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):
+        yield
+    monkeypatch.setattr(concurrency, "task_slot", _instant_slot)
+    monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
+    session_state._sessions[sid] = {"client_type": "dashboard", "is_task": True}
+
+    task = shared.TaskDefinition(
+        id="t-resting", name="follow", agent="agent-x", prompt="also this", scope="agent",
+        notification_mode="none", continue_session=sid, target_chat_id=chat_id,
+    )
+    run_id = "run-resting"
+    task_store.create_run(run_id, task.id, task.agent, "manual", None, task.prompt, "one-time", task.scope, None)
+    shared._active_task_ids[task.id] = run_id
+
+    async def _run():
+        t = asyncio.get_running_loop().create_task(
+            runner._run_task(run_id, sid, task, task.prompt, "manual", None, 1))
+        shared._running_tasks[run_id] = t
+        t.add_done_callback(lambda _: shared._running_tasks.pop(run_id, None))
+        await asyncio.wait_for(t, timeout=20)
+
+    try:
+        asyncio.run(_run())
+    finally:
+        session_state._sessions.pop(sid, None)
+        interactive._terminal_locks.pop(chat_id, None)
+    run = task_store.get_run(run_id)
+    assert term.queued == []
+    assert run["status"] == "failed"
+    assert "Usage limit reached, resets" in (run.get("error_message") or run.get("output_text") or "")
+
+
 def test_a_continue_round_never_drives_another_persons_terminal(temp_db, monkeypatch):
     """A terminal runs as whoever warmed it: a round created by someone
     else fails with a clear reason, types nothing into it, spawns nothing
@@ -436,6 +535,8 @@ def test_a_continue_round_never_drives_another_persons_terminal(temp_db, monkeyp
     monkeypatch.setattr(session_manager, "get_execution_layer",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no layer")))
     monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
+    # The round's slot is taken on the compute machine that serves.
+    serve(monkeypatch)
 
     @asynccontextmanager
     async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -66,7 +67,7 @@ def _patches():
 def _template(root: Path, version: str, *, persona="# P v1", notes="notes v1", extra=None,
               setup="setup v1", user_setup="user setup v1", daily_prompt="p1", weekly=False,
               monthly_body="b1", home_html="<p>v1</p>", lint_rubric="Is it tidy?", style=False,
-              home_doc=None, daily_extra=None):
+              home_doc=None, daily_extra=None, home_server=None):
     tasks = [dict(DAILY, prompt=daily_prompt, **(daily_extra or {}))]
     if weekly:
         tasks.append({"slug": "weekly", "description": "Weekly", "scope": "agent", "prompt": "w",
@@ -80,14 +81,16 @@ def _template(root: Path, version: str, *, persona="# P v1", notes="notes v1", e
     d = _write_template(
         root, slug="uptpl", tasks=tasks, notifications=[dict(MONTHLY, body=monthly_body)],
         setup_md=setup, user_setup_md=user_setup, context_files=context,
-        user_apps={"home": dict(home_doc or HOME, _files={"client/index.html": home_html})}, checks=checks,
+        user_apps={"home": dict(home_doc or HOME, _files={"client/index.html": home_html,
+                                                          **({"server/index.ts": home_server} if home_server else {})})},
+        checks=checks,
         agent_json_extra={"collaborative": False, "default_scope": "user", "version": version},
     )
     (d / "agent.md").write_text(persona)
     return d
 
 
-def _install_v1(tmp_path, **kw) -> None:
+def _install_v1(tmp_path, servers=None, **kw) -> None:
     from services.community.community_agent_installer import (
         install_from_extracted_template,
     )
@@ -103,7 +106,8 @@ def _install_v1(tmp_path, **kw) -> None:
         out = asyncio.run(install_from_extracted_template(
             template=template, target_slug=AGENT, installer_user_sub=ADMIN_SUB, installer_role="admin",
             source_label="uptpl", app_consent={a.slug: a.sig for a in template.apps},
-            check_consent={c.name: c.sig for c in template.checks}, consent_by=ADMIN_SUB))
+            check_consent={c.name: c.sig for c in template.checks}, consent_by=ADMIN_SUB,
+            server_consent=servers))
     assert out["seeded_apps"]["user"] == ["home"] and out["seeded_checks"]["consented"] == ["lint"]
     from services.community import community_agent_installer as inst
     from storage import database as db
@@ -120,14 +124,15 @@ def _v2(tmp_path, sub="v2", **kw):
     return load_template_from_dir(_template(tmp_path / sub, "2.0.0", **defaults))
 
 
-def _apply(template, *, consent=True, by=ADMIN_SUB, role="admin"):
+def _apply(template, *, consent=True, by=ADMIN_SUB, role="admin", servers=None):
     from services.community import community_agent_updater as upd
     p = _patches()
     with p[0], p[1], p[2], p[3]:
         return asyncio.run(upd._apply_now(
             AGENT, template, by, role,
             app_consent={a.slug: a.sig for a in template.apps} if consent else None,
-            check_consent={c.name: c.sig for c in template.checks} if consent else None))
+            check_consent={c.name: c.sig for c in template.checks} if consent else None,
+            server_consent=servers))
 
 
 def _agent_dir() -> Path:
@@ -224,6 +229,149 @@ def test_edited_pieces_are_kept_with_the_new_version_beside_and_taken_on_request
     with pytest.raises(HTTPException) as e:
         asyncio.run(upd.take(AGENT, "config/context/notes.md", ADMIN_SUB, "admin"))
     assert e.value.status_code == 400
+
+
+SERVER = 'Bun.serve({ port: Number(process.env.PORT), hostname: "0.0.0.0", fetch: () => new Response("ok") });\n'
+
+
+def test_taking_the_new_version_onto_a_copy_its_owner_removed_waits_for_its_server(tmp_path, temp_db):
+    """"Take the new version" over a copy its owner opted out of is a restore
+    of an app the owner removed: the recorded consent still approves its
+    manifest, and the server the new version brings waits on the card."""
+    from services.apps import app_deploy, app_lifecycle, app_supervisor
+    from services.community import community_agent_updater as upd
+    from storage import database as db
+    _install_v1(tmp_path)
+    d = _agent_dir()
+    admin = db.get_username_by_sub(ADMIN_SUB)
+    (d / "users" / admin / "workspace" / "apps" / "home" / "client" / "index.html").write_text("<p>mine</p>")
+    report = _apply(_v2(tmp_path, home_server=SERVER))
+    kept = {k["what"]: k for k in report["kept"]}
+    assert kept[f"the app 'home' of {admin}"]["new_path"] == "config/community/2.0.0/user-apps/home", report
+    assert asyncio.run(app_lifecycle.purge(db.get_app_by_slug(AGENT, admin, "home")))["opted_out"] is True
+    p = _patches()
+    with p[0], p[1], p[2], p[3], patch.object(app_supervisor, "start",
+                                              side_effect=AssertionError("nothing starts")):
+        out = asyncio.run(upd.take(AGENT, "config/community/2.0.0/user-apps/home", ADMIN_SUB, "admin"))
+    assert out["status"] == app_deploy.RESULT_PENDING_APPROVAL, out
+    row = db.get_app_by_slug(AGENT, admin, "home")
+    assert db.app_actions_approved(row) and not row["release_path"] and app_deploy.status(row)["adds_server"]
+
+
+def test_the_update_dialog_says_which_app_the_new_version_gives_a_server(tmp_path, temp_db):
+    """The plan's consent lines carry each app's server and say it adds one
+    only where the installed version has none."""
+    from services.community import community_agent_updater as upd
+    from services.community.community_agent_template_store import (
+        load_template_from_dict,
+    )
+    from storage.agents import agent_store
+    _install_v1(tmp_path)
+    old = load_template_from_dict(agent_store.get_community_template_data(AGENT))
+    (home,) = upd.consent_lines(AGENT, _v2(tmp_path, home_server=SERVER), old)["apps"]
+    assert home["adds_server"] is True and home["row"]["has_server"] is True, home
+    (home,) = upd.consent_lines(AGENT, _v2(tmp_path, sub="v2-plain"), old)["apps"]
+    assert home["adds_server"] is False and home["row"]["has_server"] is False, home
+
+
+def test_an_update_dialog_says_nothing_new_of_a_server_the_installed_version_has(tmp_path, temp_db):
+    from services.community import community_agent_updater as upd
+    from services.community.community_agent_template_store import (
+        load_template_from_dict,
+    )
+    from storage.agents import agent_store
+    _install_v1(tmp_path, home_server=SERVER)
+    old = load_template_from_dict(agent_store.get_community_template_data(AGENT))
+    (home,) = upd.consent_lines(AGENT, _v2(tmp_path, home_server=SERVER.replace("ok", "ok v2")), old)["apps"]
+    assert home["adds_server"] is False and home["row"]["has_server"] is True, home
+
+
+def _two_live_copies(tmp_path) -> tuple[str, str]:
+    """v1 with no server, the installer's copy and a member's, both live."""
+    from services.community import template_app_seeder
+    from storage import database as db
+    _install_v1(tmp_path)
+    assert asyncio.run(template_app_seeder.seed_user_copy(AGENT, MEMBER_SUB, "home"))[0] == "seeded"
+    return db.get_username_by_sub(ADMIN_SUB), db.get_username_by_sub(MEMBER_SUB)
+
+
+def _copy(username: str) -> dict:
+    from storage import database as db
+    return db.get_app_by_slug(AGENT, username, "home")
+
+
+def test_one_consent_in_the_update_dialog_gives_every_copy_its_server(tmp_path, temp_db):
+    """The admin's yes in the update dialog, which showed the server, counts
+    for every copy it reaches: both copies take release 2 live with its
+    server, with no card and nothing started."""
+    from services.apps import app_supervisor, releases
+    admin, member = _two_live_copies(tmp_path)
+    with patch.object(app_supervisor, "start", side_effect=AssertionError("an update never starts a server")):
+        report = _apply(_v2(tmp_path, home_server=SERVER), servers=["home"])
+    assert not [p for p in report["pending_apps"] if p.startswith("home")], report
+    for user in (admin, member):
+        row = _copy(user)
+        assert row["release_path"].endswith("/2") and not row["pending_release"], row
+        assert releases.live_runs_server(row), user
+
+
+def test_an_update_whose_dialog_did_not_show_the_server_waits_on_each_copy(tmp_path, temp_db):
+    """A consent posted without the server (an older tab, an API caller)
+    approves the manifest and leaves each copy's server on its card."""
+    from services.apps import app_deploy
+    admin, member = _two_live_copies(tmp_path)
+    report = _apply(_v2(tmp_path, home_server=SERVER))
+    assert {f"home ({admin})", f"home ({member})"} <= set(report["pending_apps"]), report
+    for user in (admin, member):
+        row = _copy(user)
+        assert row["release_path"].endswith("/1") and row["pending_release"] == 2, row
+        assert app_deploy.status(row)["adds_server"] is True
+
+
+def test_a_managers_consent_reaches_their_own_copy_and_no_one_elses(tmp_path, temp_db):
+    """Who may run the update is a manager; their consent covers what they
+    may approve (their own copy), so each other member's copy waits."""
+    from services.apps import releases
+    from storage import database as db
+    admin, member = _two_live_copies(tmp_path)
+    _make_user("mgr-sub", "mgr@test.com", "member")
+    db.add_user_agent("mgr-sub", AGENT, "manager", assigned_by=ADMIN_SUB)
+    report = _apply(_v2(tmp_path, home_server=SERVER), by="mgr-sub", role="member", servers=["home"])
+    for user in (admin, member):
+        assert f"home ({user})" in report["pending_apps"], (user, report)
+    own = db.get_app_by_slug(AGENT, db.get_username_by_sub("mgr-sub"), "home")
+    assert own and own["release_path"].endswith("/1") and releases.live_runs_server(own)
+
+
+def test_a_take_with_a_consent_that_never_showed_the_server_waits(tmp_path, temp_db):
+    """An entry recorded with no server flag (an install before the dialogs
+    said it) covers a first copy alone: "Take the new version" that brings
+    the server back to a live copy without one waits on the card."""
+    import shutil
+
+    from services.apps import app_deploy
+    from services.community import community_agent_updater as upd
+    from storage import database as db
+    _install_v1(tmp_path, home_server=SERVER)
+    admin = db.get_username_by_sub(ADMIN_SUB)
+    folder = _agent_dir() / "users" / admin / "workspace" / "apps" / "home"
+    shutil.rmtree(folder / "server")
+    out = asyncio.run(app_deploy.deploy_folder(AGENT, admin, ADMIN_SUB, "home", folder,
+                                               f"users/{admin}/workspace/apps/home"))
+    assert out["status"] == "ok", out
+    report = _apply(_v2(tmp_path, home_server=SERVER, home_html="<p>v1</p>"))
+    kept = {k["what"]: k for k in report["kept"]}
+    assert kept[f"the app 'home' of {admin}"]["new_path"], report
+    p = _patches()
+    with p[0], p[1], p[2], p[3]:
+        out = asyncio.run(upd.take(AGENT, kept[f"the app 'home' of {admin}"]["new_path"], ADMIN_SUB, "admin"))
+    assert out["status"] == app_deploy.RESULT_PENDING_APPROVAL, out
+
+
+def test_the_install_records_the_server_its_dialog_showed(tmp_path, temp_db):
+    from storage.agents import agent_store
+    _install_v1(tmp_path, servers=["home"], home_server=SERVER)
+    assert agent_store.get_community_template_data(AGENT)["consent"]["apps"]["home"]["server"] is True
 
 
 def test_an_install_without_a_baseline_keeps_everything_and_adds(tmp_path, temp_db):
@@ -350,10 +498,11 @@ def test_an_update_enables_the_core_mcps_the_platform_gained_since(tmp_path, tem
     migration to a new core tool), leaves one a manager disabled alone,
     and a record from before the rule treats every core MCP not enabled
     as new."""
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_manifest_store, mcp_registry
     from storage.agents import agent_store
     from storage.mcp import mcp_store
     core = ["memory-mcp"]
+    monkeypatch.setattr(mcp_manifest_store, "core_mcp_names", lambda: list(core))
     monkeypatch.setattr(mcp_registry, "core_mcp_names", lambda: list(core))
     _install_v1(tmp_path)
     assert agent_store.get_community_template_data(AGENT)["core_mcps"] == ["memory-mcp"]
@@ -534,7 +683,12 @@ def test_the_daily_sweep_tells_the_managers_once_per_version(tmp_path, temp_db):
                new=AsyncMock(return_value={"agents": [{"slug": "uptpl", "version": "2.0.0"}]})), \
             patch("services.notifications.notification_manager.fire_notification", new=fired):
         assert asyncio.run(upd.maybe_notify_updates()) == 1
-        assert fired.call_args.kwargs["target"] == ADMIN_SUB and "2.0.0" in fired.call_args.kwargs["title"]
+        assert fired.call_args.kwargs["target"] == ADMIN_SUB
+        # Plain words: what is new, what the person has, where to act.
+        assert fired.call_args.kwargs["title"] == "A new version of Uptpl is ready"
+        assert fired.call_args.kwargs["body"] == ("Version 2.0.0. You have 1.0.0. Open the agent's settings "
+                                                  "to see what changes and to update.")
+        assert fired.call_args.kwargs["href"] == f"/agents/{AGENT}/config"
         assert agent_store.get_community_template_data(AGENT)["update_notified"] == "2.0.0"
         upd._last_notify_sweep = float("-inf")
         assert asyncio.run(upd.maybe_notify_updates()) == 0
@@ -543,8 +697,6 @@ def test_the_daily_sweep_tells_the_managers_once_per_version(tmp_path, temp_db):
 def test_the_first_sweep_after_a_reboot_runs_at_once(tmp_path, temp_db):
     # The sweep's clock is time.monotonic(), which counts from boot: a host
     # up five minutes must not wait a day for its first sweep.
-    from types import SimpleNamespace
-
     from services.community import community_agent_updater as upd
     _install_v1(tmp_path)
     with patch("services.community.community_agents_catalog.fetch_registry",
@@ -1048,6 +1200,49 @@ def test_an_update_moves_an_untouched_pin_and_keeps_an_edited_one(tmp_path, temp
     assert report["task_pins_dropped"] == []
 
 
+def test_an_update_moves_an_untouched_mode_and_timeout_and_keeps_each_changed_one(tmp_path, temp_db):
+    from storage.automation import db_tasks
+    _install_v1(tmp_path)
+    db_tasks.update_dynamic_task(_daily_rows()[MEMBER_SUB]["id"], {"timeout_seconds": 900})
+    report = _apply(_v2(tmp_path, daily_prompt="p1",
+                        daily_extra={"permission_mode": "autoReview", "timeout_seconds": 1800}))
+    rows = _daily_rows()
+    assert rows[ADMIN_SUB]["permission_mode"] == "autoReview" and rows[ADMIN_SUB]["timeout_seconds"] == 1800
+    # The groups are apart: their own timeout stays, the mode still moves.
+    assert rows[MEMBER_SUB]["permission_mode"] == "autoReview" and rows[MEMBER_SUB]["timeout_seconds"] == 900
+    assert any(k["what"] == "the task 'daily'" and k["reason"] == "edited locally" for k in report["kept"])
+
+
+def test_a_template_auto_stays_off_a_row_pinned_to_an_engine_with_no_reviewer(tmp_path, temp_db):
+    from storage.automation import db_tasks
+    _install_v1(tmp_path)
+    db_tasks.update_dynamic_task(_daily_rows()[MEMBER_SUB]["id"],
+                                 {"override_execution_path": "direct-llm"})
+    with patch("services.scheduler.task_fields.mode_problem",
+               lambda agent, layer, mode: ("no reviewer" if mode and layer == "direct-llm" else "")):
+        report = _apply(_v2(tmp_path, daily_prompt="p1", daily_extra={"permission_mode": "autoReview"}))
+    rows = _daily_rows()
+    assert rows[ADMIN_SUB]["permission_mode"] == "autoReview"
+    assert rows[MEMBER_SUB]["permission_mode"] == ""
+    assert any(k["what"] == "the task 'daily'" for k in report["kept"])
+
+
+def test_a_row_the_old_record_never_named_is_judged_without_a_baseline(temp_db):
+    from services.community import community_agent_updater as upd
+    from services.community.community_agent_template_store import TaskItem
+    report = {"kept": []}
+    run = SimpleNamespace(apply=False, agent=AGENT, report=report,
+                          replaced=lambda what: None, same=lambda: None)
+    item = TaskItem(slug="daily", description="Daily", scope="agent", prompt="p", schedule_kind="cron",
+                    cron="0 8 * * *", interval_seconds=None, run_at=None, default_state="paused",
+                    auto_create_for_new_users=True, roles=None)
+    row = {"id": "t1", "prompt": "mine", "name": "Mine", "schedule": "0 9 * * *", "interval_seconds": None,
+           "run_at": None, "override_model": "", "override_execution_path": "",
+           "notification_mode": "manual", "permission_mode": "", "timeout_seconds": 600}
+    upd._merge_task_row(run, row, item, None, "the task 'daily'")
+    assert report["kept"] == [{"what": "the task 'daily'", "reason": "edited locally", "path": "", "new_path": ""}]
+
+
 def test_a_new_pin_the_agent_cannot_run_is_reported_and_left_out(tmp_path, temp_db):
     _install_v1(tmp_path)
     report = _apply(_v2(tmp_path, daily_extra={"override_model": "no-such-model"}))
@@ -1070,3 +1265,232 @@ def test_a_retired_pin_the_boot_walk_moved_is_not_an_edit(tmp_path, temp_db, mon
     rows = _daily_rows()
     assert {r["prompt"] for r in rows.values()} == {"p2"}
     assert {r["override_model"] for r in rows.values()} == {"pin-new"}
+
+
+def _with_board(tmp_path, sub, html):
+    """The next version with one shared dashboard, ``board``."""
+    from services.community.community_agent_template_store import load_template_from_dir
+    src = _template(tmp_path / sub, "2.0.0", persona="# P v2")
+    # A shared dashboard is offered by a collaborative template only.
+    manifest = json.loads((src / "agent.json").read_text())
+    manifest["collaborative"] = True
+    (src / "agent.json").write_text(json.dumps(manifest))
+    (src / "dashboards.json").write_text(json.dumps(
+        {"dashboards": [{"slug": "board", "file": "board.html", "visibility": "agent"}]}))
+    (src / "dashboards").mkdir(exist_ok=True)
+    (src / "dashboards" / "board.html").write_text(html)
+    return load_template_from_dir(src)
+
+
+def _dashboards_run(template, *, apply: bool):
+    """The update's dashboards, alone."""
+    import config
+    from services.community import community_agent_updater as upd
+    from storage.agents import agent_store
+    old_data = agent_store.get_community_template_data(AGENT) or {}
+    run = upd._Run(agent=AGENT, agent_dir=config.get_agent_dir(AGENT), new=template,
+                   old=upd._load_old(old_data), old_data=old_data, baseline=old_data.get("baseline") or {},
+                   apply=apply, by_sub=ADMIN_SUB, by_role="admin", loop=None)
+    upd._layer_dashboards(run)
+    return run.report
+
+
+def test_a_new_or_replaced_dashboard_is_never_written_through_a_link(tmp_path, temp_db):
+    # The shared workspace is the agent's sessions' to write: a link at a
+    # dashboard's name is never written through, and the dry run and the
+    # apply say the same thing about it.
+    _install_v1(tmp_path)
+    d = _agent_dir()
+    apps = d / "workspace" / "apps"
+    apps.mkdir(parents=True, exist_ok=True)
+    away = d / "workspace" / "made-here.html"
+    (apps / "board.html").symlink_to(away)
+    template = _with_board(tmp_path, "v2", "<h1>Board</h1>")
+    dry = _dashboards_run(template, apply=False)
+    report = _apply(template)
+    assert not away.exists() and (apps / "board.html").is_symlink()
+    assert "the dashboard 'board'" not in report["added"]
+    assert [k["what"] for k in report["kept"] if "board" in k["what"]] == ["the dashboard 'board'"]
+    assert [k["what"] for k in dry["kept"] if "board" in k["what"]] == ["the dashboard 'board'"]
+
+
+@pytest.fixture
+def linked_agent(tmp_path, temp_db):
+    """v1 installed, then its folder moved outside the stand-in agents
+    folder with a link at its name (an operator's layout,
+    ``core/agent_folder.py``). The link goes at the end: the next test's
+    agents folder holds none."""
+    _install_v1(tmp_path)
+    d = _agent_dir()
+    real = tmp_path / "disk2" / AGENT
+    real.parent.mkdir()
+    d.rename(real)
+    d.symlink_to(real)
+    yield real
+    d.unlink(missing_ok=True)
+
+
+def test_a_linked_agents_folder_takes_the_new_dashboard(tmp_path, linked_agent):
+    report = _dashboards_run(_with_board(tmp_path, "v2", "<h1>Board</h1>"), apply=True)
+    assert report["added"] == ["the dashboard 'board'"]
+    assert (linked_agent / "workspace" / "apps" / "board.html").read_text() == "<h1>Board</h1>"
+
+
+def test_a_link_below_a_linked_agents_folder_keeps_the_dashboard_out(tmp_path, linked_agent):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (linked_agent / "workspace" / "apps").mkdir(parents=True, exist_ok=True)
+    (linked_agent / "workspace" / "apps").rmdir()
+    (linked_agent / "workspace" / "apps").symlink_to(elsewhere)
+    report = _dashboards_run(_with_board(tmp_path, "v2", "<h1>Board</h1>"), apply=True)
+    assert [k["what"] for k in report["kept"]] == ["the dashboard 'board'"]
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_a_members_guide_reached_through_a_link_is_neither_read_nor_written(tmp_path, temp_db):
+    """A member's copy of the per-user guide is read and replaced beneath
+    the agent's real folder with no link followed: a context folder that is
+    a link to a file holding the installed text is left alone."""
+    import shutil
+    _install_v1(tmp_path)
+    d = _agent_dir()
+    member = next(p.name for p in (d / "users").iterdir() if p.is_dir())
+    stand_in = tmp_path / "stand-in"
+    stand_in.mkdir()
+    (stand_in / "user-setup.md").write_text("user setup v1")
+    shutil.rmtree(d / "users" / member / "context")
+    (d / "users" / member / "context").symlink_to(stand_in)
+    report = _apply(_v2(tmp_path))
+    assert (stand_in / "user-setup.md").read_text() == "user setup v1"
+    assert report["members"]["user_setup_replaced"] <= 1
+
+
+# --- A piece that is there but cannot be read as text is kept ------------
+
+
+def _kept_reasons(report: dict) -> dict:
+    return {k["what"]: k["reason"] for k in report["kept"]}
+
+
+@pytest.mark.parametrize("local", [
+    pytest.param("x" * (9 * 1024 * 1024), id="past-the-cap"),
+    pytest.param("σημειώσεις του διαχειριστή".encode("cp1253"), id="not-utf8"),
+])
+def test_a_piece_that_cannot_be_read_as_text_is_kept_with_the_new_version_beside(tmp_path, temp_db, local):
+    """An admin's edit the update cannot read as text (past the cap, or saved
+    in another encoding) is kept as it is, never taken for missing."""
+    _install_v1(tmp_path)
+    notes = _agent_dir() / "config" / "context" / "notes.md"
+    data = local.encode() if isinstance(local, str) else local
+    notes.write_bytes(data)
+    report = _apply(_v2(tmp_path))
+    assert notes.read_bytes() == data
+    assert "context/notes.md" not in report["added"]
+    assert _kept_reasons(report)["context/notes.md"] == "not a plain text file"
+    beside = _agent_dir() / "config" / "community" / "2.0.0" / "context" / "notes.md"
+    assert beside.read_text() == "notes v2"
+
+
+def test_a_link_at_a_pieces_name_is_kept_and_never_written_through(tmp_path, temp_db):
+    _install_v1(tmp_path)
+    notes = _agent_dir() / "config" / "context" / "notes.md"
+    stand_in = tmp_path / "stand-in.md"
+    stand_in.write_text("theirs")
+    notes.unlink()
+    notes.symlink_to(stand_in)
+    report = _apply(_v2(tmp_path))
+    assert notes.is_symlink() and stand_in.read_text() == "theirs"
+    assert "context/notes.md" not in report["added"]
+    assert _kept_reasons(report)["context/notes.md"] == "not a plain text file"
+
+
+def test_a_dashboard_past_the_cap_is_kept_never_reported_removed(tmp_path, temp_db):
+    """A dashboard the installed version had, edited past the cap (an HTML
+    page with its pictures inlined), is kept with the new version beside,
+    never taken for one the manager removed."""
+    import config
+    from services.community import community_agent_updater as upd
+    _install_v1(tmp_path)
+    board = _agent_dir() / "workspace" / "apps" / "board.html"
+    board.parent.mkdir(parents=True, exist_ok=True)
+    big = b"<p>" + b"x" * (9 * 1024 * 1024) + b"</p>"
+    board.write_bytes(big)
+    old = _with_board(tmp_path, "old", "<h1>Board</h1>")
+    new = _with_board(tmp_path, "v2", "<h1>Board v2</h1>")
+    run = upd._Run(agent=AGENT, agent_dir=config.get_agent_dir(AGENT), new=new, old=old, old_data={},
+                   baseline={}, apply=True, by_sub=ADMIN_SUB, by_role="admin", loop=None)
+    upd._layer_dashboards(run)
+    assert board.read_bytes() == big
+    assert _kept_reasons(run.report)["the dashboard 'board'"] == "not a plain file"
+    beside = _agent_dir() / "config" / "community" / "2.0.0" / "dashboards" / "board.html"
+    assert beside.read_text() == "<h1>Board v2</h1>"
+
+
+def test_an_agent_behind_the_operators_link_takes_the_new_pieces(tmp_path, linked_agent):
+    """The update's file pieces on an agent folder an admin moved behind a
+    link: untouched pieces are replaced in the real folder, an edited one is
+    kept with the new version beside, as on any other agent. (The apps'
+    layer roots at the agents folder with the agent's name first, as 1.9.1
+    did, so the whole update is not run here.)"""
+    import config
+    from services.community import community_agent_updater as upd
+    from storage.agents import agent_store
+    (linked_agent / "config" / "context" / "notes.md").write_text("my notes")
+    old_data = agent_store.get_community_template_data(AGENT) or {}
+    run = upd._Run(agent=AGENT, agent_dir=config.get_agent_dir(AGENT), new=_v2(tmp_path),
+                   old=upd._load_old(old_data), old_data=old_data, baseline=old_data.get("baseline") or {},
+                   apply=True, by_sub=ADMIN_SUB, by_role="admin", loop=None)
+    for layer in (upd._layer_persona, upd._layer_context, upd._layer_setup, upd._layer_user_setup):
+        layer(run)
+    assert (linked_agent / "config" / "agent.md").read_text() == "# P v2"
+    assert "the persona (config/agent.md)" in run.report["replaced"]
+    assert (linked_agent / "config" / "context" / "notes.md").read_text() == "my notes"
+    assert _kept_reasons(run.report)["context/notes.md"] == "edited locally"
+    assert (linked_agent / "config" / "community" / "2.0.0" / "context" / "notes.md").read_text() == "notes v2"
+
+
+@pytest.mark.parametrize("shape", ["folder", "dangling-link"])
+def test_a_known_context_name_that_is_not_a_plain_file_is_kept_not_removed(tmp_path, temp_db, shape):
+    """A context file the installed version knew, where a folder or a link
+    now sits: kept with the new version beside, never listed as removed."""
+    _install_v1(tmp_path)
+    notes = _agent_dir() / "config" / "context" / "notes.md"
+    notes.unlink()
+    if shape == "folder":
+        notes.mkdir()
+    else:
+        notes.symlink_to(tmp_path / "nowhere.md")
+    report = _apply(_v2(tmp_path))
+    assert _kept_reasons(report)["context/notes.md"] == "not a plain text file"
+    assert (_agent_dir() / "config" / "community" / "2.0.0" / "context" / "notes.md").read_text() == "notes v2"
+    assert notes.is_dir() if shape == "folder" else notes.is_symlink()
+
+
+def test_a_setup_guide_that_is_a_folder_is_kept_not_called_completed(tmp_path, temp_db):
+    _install_v1(tmp_path)
+    setup = _agent_dir() / "config" / "context" / "setup.md"
+    setup.unlink()
+    setup.mkdir()
+    report = _apply(_v2(tmp_path))
+    assert _kept_reasons(report)["the setup guide (setup.md)"] == "not a plain text file"
+    assert not report.get("notes")
+    assert setup.is_dir()
+
+
+def test_taking_the_new_version_over_a_folder_answers_with_a_sentence(tmp_path, temp_db):
+    """"Take the new version" where a folder now sits at the piece's name
+    answers 400 with one plain sentence, and the folder stays."""
+    from fastapi import HTTPException
+
+    from services.community import community_agent_updater as upd
+    _install_v1(tmp_path)
+    d = _agent_dir()
+    (d / "config" / "context" / "notes.md").write_text("my notes")
+    _apply(_v2(tmp_path))
+    (d / "config" / "context" / "notes.md").unlink()
+    (d / "config" / "context" / "notes.md").mkdir()
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(upd.take(AGENT, "config/community/2.0.0/context/notes.md", ADMIN_SUB, "admin"))
+    assert e.value.status_code == 400
+    assert e.value.detail == "config/context/notes.md is a folder: remove it first"
+    assert (d / "config" / "context" / "notes.md").is_dir()

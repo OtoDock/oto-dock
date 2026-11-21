@@ -14,7 +14,6 @@ every worker child re-runs this file before it starts its job.
 
 import asyncio
 import importlib
-import os
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,6 +27,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
+import convert_route
 import docx_tool
 import pdf_tool
 import pptx_tool
@@ -40,6 +40,7 @@ from shared import (
     _resolve_path,
     _to_agents_relative,
     logger,
+    safe_kind,
     set_request_context,
 )
 
@@ -301,7 +302,7 @@ HANDLER_TARGETS = _handler_targets()
 
 async def _handle_read_document(args: dict) -> str:
     path = await _resolve_path(args["path"])
-    if not await asyncio.to_thread(os.path.exists, path):
+    if (await asyncio.to_thread(safe_kind, path)).kind == "missing":
         return f"Error: File not found: {args['path']}"
 
     ext = Path(path).suffix.lower()
@@ -327,7 +328,7 @@ async def _handle_read_document(args: dict) -> str:
 
 async def _handle_preview_document(args: dict) -> str:
     path = await _resolve_path(args["path"])
-    if not await asyncio.to_thread(os.path.exists, path):
+    if (await asyncio.to_thread(safe_kind, path)).kind == "missing":
         return f"Error: File not found: {args['path']}"
     await _push_preview(path)
     return f"Preview pushed for: {_to_agents_relative(path)}"
@@ -443,6 +444,9 @@ starlette_app = Starlette(
         # The app checks' render (APPS.md "Deploy pipeline"): the proxy
         # alone calls it, with the render token it minted as the bearer.
         Route("/render", endpoint=render.handle_render, methods=["POST"]),
+        # The document pane's downloads (convert_route.py): the proxy alone
+        # calls it, with a one-shot token as the bearer.
+        Route("/convert", endpoint=convert_route.handle_convert, methods=["POST"]),
     ],
     lifespan=lifespan,
 )

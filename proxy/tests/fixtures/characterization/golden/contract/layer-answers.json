@@ -1,0 +1,66 @@
+{
+ "answers": {
+  "answer_engine_prompt": null,
+  "canonical_tool_name": "Bash",
+  "capabilities_for": "char-layer",
+  "chat_session_files": [],
+  "compact": null,
+  "credential_file_from_env": null,
+  "credential_file_payload": null,
+  "drain_bg_commands": false,
+  "engine_for": "char",
+  "engine_name": "char",
+  "engine_reviews": false,
+  "forget_resume_probe": null,
+  "hook_can_ask": false,
+  "interrupt_for_queued": false,
+  "is_session_grace_held": false,
+  "iter_session_files": [],
+  "local_session_ids": [],
+  "on_subscriptions_changed": null,
+  "parse_usage": null,
+  "pinned_cli_version": "",
+  "prepare_config_dir": {
+   "raised": "NotImplementedError",
+   "text": "_Layer declares no config dir builder (ExecutionLayer.prepare_config_dir)"
+  },
+  "probe_session_process_dead": true,
+  "record_usage_event": null,
+  "record_waiting_turns": null,
+  "reenter_review": false,
+  "refresh_oauth": {
+   "raised": "NotImplementedError",
+   "text": "_Layer takes no OAuth login to refresh"
+  },
+  "remote_adapter": null,
+  "remote_stream_severed": false,
+  "resume_machine_reach": "MachineReach.LOCAL",
+  "resume_probe_future": null,
+  "resumes_interactive": [
+   false,
+   true
+  ],
+  "session_file_companions": [],
+  "session_idle_seconds": null,
+  "session_self_wakes": false,
+  "steer": false,
+  "subscription_env": {
+   "raised": "NotImplementedError",
+   "text": "_Layer does not map a subscription to a session env"
+  },
+  "supports_permissions": false,
+  "supports_plan_mode": true,
+  "supports_resume": true,
+  "terminal_reports_mode": false,
+  "transcript_tailer": null,
+  "usage_request": null,
+  "usage_scope_key": "",
+  "wait_session_reconnect": false
+ },
+ "uncovered": [
+  "parse_usage_report",
+  "prepare_spawn",
+  "send_message",
+  "wait_for_bg_subagents"
+ ]
+}

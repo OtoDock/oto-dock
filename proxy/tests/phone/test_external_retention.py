@@ -251,6 +251,30 @@ def test_forget_all_removes_everything_but_busy(temp_db):
     assert result["call_log_rows_deleted"] == 2
 
 
+@pytest.mark.parametrize("how", ["the window", "forget all"])
+def test_a_forgotten_callers_saved_tool_answers_go_with_their_tree(temp_db, how):
+    """The answers their sessions' tools gave are kept under the caller's
+    channel and number: when their tree goes (the window, or "Forget all"),
+    so do they; another caller's stay."""
+    from services.mcp import tool_listing
+    from storage.agents import agent_store
+    from storage.identity import external_identity_store
+    agent_store.create_agent(AGENT, "Support")
+    listing = {"initialize": {}, "lists": {"tools/list": [{"name": "echo"}]}}
+    for number, days in (("302101234567", 100), ("302109999999", 10)):
+        _tree(number, age_days=days)
+        external_identity_store.touch(AGENT, "phone", f"+{number}", number)
+        assert tool_listing.keep((AGENT, tool_listing.outside_person("phone", f"+{number}")), "x-mcp", "fp", listing)
+    if how == "forget all":
+        er.forget_all({str(_tree("busy").resolve())}, set(), set())
+        assert tool_listing.saved((AGENT, tool_listing.outside_person("phone", "+302109999999")), "x-mcp", "fp") is None
+    else:
+        _sweep()
+        assert tool_listing.saved((AGENT, tool_listing.outside_person("phone", "+302109999999")), "x-mcp", "fp")
+    assert tool_listing.saved((AGENT, tool_listing.outside_person("phone", "+302101234567")), "x-mcp", "fp") is None
+    assert external_identity_store.get(AGENT, "phone", "302101234567") is None
+
+
 # ---------------------------------------------------------------------------
 # Settings + usage + API
 # ---------------------------------------------------------------------------
@@ -370,3 +394,148 @@ def test_an_aged_phone_chat_takes_its_reports(temp_db):
     with get_conn() as conn:
         rows = conn.execute("SELECT chat_id FROM reply_reports").fetchall()
     assert [r["chat_id"] for r in rows] == [fresh_chat]
+
+
+# ---------------------------------------------------------------------------
+# The callers' folders, reached beneath the agent's real folder
+# ---------------------------------------------------------------------------
+
+def _outside(tmp_path: Path) -> Path:
+    """A stand-in folder beside the agents folder, holding an old tree."""
+    out = tmp_path / "outside"
+    (out / "p" / "workspace").mkdir(parents=True)
+    (out / "p" / "workspace" / "keep.md").write_text("kept")
+    _age(out, 400)
+    return out
+
+
+def test_a_channel_that_is_a_link_is_never_listed(temp_db, tmp_path, caplog):
+    out = _outside(tmp_path)
+    base = Path(config.AGENTS_DIR) / AGENT / "externals"
+    base.mkdir(parents=True)
+    (base / "phone").symlink_to(out, target_is_directory=True)
+    honest = _tree("302101234567", age_days=100, channel="web")
+    with caplog.at_level("WARNING"):
+        assert [h for *_r, h in er.iter_caller_homes()] == [honest]
+    assert "not listed" not in caplog.text  # a link is passed over, never tried
+    stats = _sweep()
+    assert (out / "p" / "workspace" / "keep.md").read_text() == "kept"
+    assert not honest.exists() and stats["callers_forgotten"] == 1
+
+
+def test_a_link_at_externals_skips_that_agent_and_the_rest_go_on(temp_db, tmp_path):
+    out = _outside(tmp_path)
+    linked = Path(config.AGENTS_DIR) / "linked-agent"
+    linked.mkdir(parents=True)
+    (linked / "externals").symlink_to(out, target_is_directory=True)
+    honest = _tree("302101234567", age_days=100)
+    assert [h for *_r, h in er.iter_caller_homes()] == [honest]
+    assert [h for _a, h in er.iter_ephemeral_homes()] == []
+    stats = _sweep()
+    assert not honest.exists() and stats["callers_forgotten"] == 1
+    assert (out / "p" / "workspace" / "keep.md").read_text() == "kept"
+
+
+def test_a_home_that_is_a_link_is_never_walked_for_its_age_or_size(temp_db, tmp_path):
+    out = tmp_path / "outside"
+    (out / "big").mkdir(parents=True)
+    (out / "big" / "fresh.bin").write_bytes(b"x" * 4096)
+    base = Path(config.AGENTS_DIR) / AGENT / "externals" / "phone"
+    base.mkdir(parents=True)
+    home = base / "302101234567"
+    home.symlink_to(out / "big", target_is_directory=True)
+    old = time.time() - 400 * 86400
+    os.utime(home, (old, old), follow_symlinks=False)
+    assert er._tree_bytes(home) == 0
+    assert er.newest_mtime(home) == pytest.approx(old, abs=1)
+
+
+def test_a_tree_swapped_for_a_link_after_its_check_is_not_removed(temp_db, tmp_path, monkeypatch):
+    """The removal opens the tree it was given beneath the agent's real
+    folder: a channel swapped for a link between the check and the removal
+    refuses it."""
+    out = _outside(tmp_path)
+    home = _tree("p", age_days=100)
+    channel = home.parent
+
+    def swap(_home):
+        channel.rename(channel.with_name("phone-moved"))
+        channel.symlink_to(out, target_is_directory=True)
+        return 0
+    monkeypatch.setattr(er, "_tree_bytes", swap)
+    stats = {"errors": 0, "caller_bytes_freed": 0}
+    assert er.remove_home(AGENT, home, stats, dry_run=False) is False
+    assert (out / "p" / "workspace" / "keep.md").read_text() == "kept"
+    assert stats["errors"] == 1
+
+
+def test_a_tree_of_any_other_shape_is_refused(temp_db):
+    deep = _tree("p")
+    inner = deep / "workspace"
+    stats = {"errors": 0, "caller_bytes_freed": 0}
+    assert er.remove_home(AGENT, inner, stats, dry_run=False) is False
+    assert inner.is_dir() and stats["errors"] == 1
+    own = Path(config.AGENTS_DIR) / AGENT / "users" / "p" / "workspace"
+    own.mkdir(parents=True)
+    (own / "notes.md").write_text("a person's own file")
+    assert er.remove_home(AGENT, own, stats, dry_run=False) is False
+    assert (own / "notes.md").is_file() and stats["errors"] == 2
+
+
+def _starved(monkeypatch, *names):
+    """``newest_mtime`` with each named look of ``safe_fs`` failing as a
+    process with no descriptor left fails."""
+    import errno
+
+    from services.infra import safe_fs
+    real = er.newest_mtime
+
+    def no_descriptor(*_args, **_kwargs):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    def starved(path):
+        with monkeypatch.context() as patch:
+            for name in names:
+                patch.setattr(safe_fs, name, no_descriptor)
+            return real(path)
+    monkeypatch.setattr(er, "newest_mtime", starved)
+
+
+def test_a_tree_whose_age_cannot_be_read_is_kept(temp_db, monkeypatch, caplog):
+    """A look that fails for a reason other than a missing tree never reads
+    as an old tree: the tree waits for the next pass, and the refusal is
+    logged. A caller's data never goes to the recover bin."""
+    home = _tree("302101234567")
+    _starved(monkeypatch, "lstat_beneath", "walk_beneath")
+    with caplog.at_level("WARNING"):
+        stats = _sweep()
+    assert (home / "workspace" / "notes.md").is_file()
+    assert stats["callers_forgotten"] == 0
+    assert "could not be read" in caplog.text
+
+
+def test_a_tree_whose_files_cannot_be_read_is_kept(temp_db, monkeypatch):
+    """The tree's own time is old and a file inside is new: a walk that
+    fails never leaves the old time as the tree's age."""
+    home = _tree("302101234567", age_days=100)
+    (home / "workspace" / "fresh.md").write_text("written today")
+    _starved(monkeypatch, "walk_beneath")
+    stats = _sweep()
+    assert (home / "workspace" / "fresh.md").is_file()
+    assert stats["callers_forgotten"] == 0
+
+
+def test_an_agent_folder_behind_the_operators_link_keeps_its_retention(temp_db, tmp_path):
+    """An agent folder the admin moved behind a link: its callers age out
+    and are forgotten as before."""
+    real = tmp_path / "disk2" / "moved-agent"
+    (real / "externals" / "phone" / "302101234567" / "workspace").mkdir(parents=True)
+    (real / "externals" / "phone" / "302101234567" / "workspace" / "notes.md").write_text("hi")
+    _age(real, 100)
+    (Path(config.AGENTS_DIR) / "moved-agent").symlink_to(real, target_is_directory=True)
+    homes = [h for *_r, h in er.iter_caller_homes()]
+    assert homes == [Path(config.AGENTS_DIR) / "moved-agent" / "externals" / "phone" / "302101234567"]
+    assert er._tree_bytes(homes[0]) == 2
+    stats = _sweep()
+    assert stats["callers_forgotten"] == 1 and stats["errors"] == 0
+    assert not (real / "externals" / "phone" / "302101234567").exists()

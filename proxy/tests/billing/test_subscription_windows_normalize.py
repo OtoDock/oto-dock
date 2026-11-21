@@ -160,13 +160,13 @@ class TestClaudeNormalizers:
         assert claude_usage.from_event(CLAUDE_EVENT, {}) is None    # nothing declared
 
     def test_model_family_is_the_scope_key(self):
-        assert claude_usage.model_family("claude-fable-5-1") == "fable"
+        assert claude_usage.model_family("claude-fable-5-2") == "fable"
         assert claude_usage.model_family("claude-opus-5") == "opus"
         assert claude_usage.model_family("Claude Sonnet 5 (1M)") == "sonnet"
         assert claude_usage.model_family("gpt-5.6-sol") == ""
         assert claude_usage.model_family("") == ""
         # The engines answer the same question through the contract.
-        assert get_layer_by_path("claude-code-cli").usage_scope_key("claude-fable-5-1") == "fable"
+        assert get_layer_by_path("claude-code-cli").usage_scope_key("claude-fable-5-2") == "fable"
         assert get_layer_by_path("codex-cli").usage_scope_key("gpt-5.6-sol") == ""
         assert get_layer_by_path("direct-llm").usage_scope_key("claude-opus-5") == ""
 
@@ -289,11 +289,11 @@ class TestRowsAndEffective:
 
     def test_stale_sample_is_unknown_per_window(self):
         w = _W(five=sw.Window(95.0, NOW + timedelta(hours=1)),
-               seven=sw.Window(96.0, NOW + timedelta(days=3)),
+               seven=sw.Window(98.5, NOW + timedelta(days=3)),
                observed_at=NOW - timedelta(hours=6))
         e = sw.effective(w, NOW)
         assert "five_hour" not in e.windows          # older than a session window
-        assert e.windows["seven_day"].pct == 96.0    # still inside a week
+        assert e.windows["seven_day"].pct == 98.5    # still inside a week
         assert sw.exhausted(e)
 
     def test_scoped_reset_clears_active(self):
@@ -330,10 +330,11 @@ class TestPoolQuestions:
         )
 
     def test_overall_thresholds_follow_the_role_spill_marks(self):
-        assert sw.SPILL_PCT == {"session": 90.0, "quota": 95.0}
-        assert not sw.exhausted(self._w(89.9, 94.9))
+        assert sw.SPILL_PCT == {"session": 90.0, "quota": 98.0}
+        assert not sw.exhausted(self._w(89.9, 97.9))
+        assert not sw.exhausted(self._w(10.0, 97.0))     # a week at 97 % is still taken
         assert sw.exhausted(self._w(90.0, 10.0))
-        assert sw.exhausted(self._w(10.0, 95.0))
+        assert sw.exhausted(self._w(10.0, 98.0))
         assert sw.exhausted(self._w(reached="seven_day"))
         assert sw.exhausted_overall(self._w(reached="five_hour"))
 
@@ -409,10 +410,11 @@ class TestRecording:
         reb.assert_not_called()
 
     def test_record_for_session_resolves_the_binding(self):
-        w = _W(seven=sw.Window(1.0, NOW + timedelta(days=3)), observed_at=NOW)
+        w = _W(seven=sw.Window(1.0, NOW + timedelta(days=3)), observed_at=NOW, source="claude_event")
         with patch.object(sw, "is_enabled", return_value=True), \
              patch(f"{_STORE}.latest_window_samples", return_value={}), \
              patch(f"{_STORE}.insert_window_sample", return_value=True) as ins, \
+             patch(f"{_STORE}.get_subscription", return_value={"id": "sub-9", "layer": "claude-code-cli"}), \
              patch(f"{_POOL}.schedule_rebalance"), \
              patch(f"{_POOL}.get_session_subscription", return_value="sub-9") as bound:
             assert sw.record_for_session("sess", w)
@@ -453,9 +455,11 @@ class TestRecording:
     def test_headroom_is_below_the_spill_mark_and_not_reached(self):
         fable = sw.Scoped("fable", "Fable", 40.0, NOW + timedelta(days=3))
         w = _W(five=sw.Window(89.0, NOW + timedelta(hours=1)),
-               seven=sw.Window(95.0, NOW + timedelta(days=3)), scoped=[fable], observed_at=NOW)
+               seven=sw.Window(98.5, NOW + timedelta(days=3)), scoped=[fable], observed_at=NOW)
         assert sw.has_headroom(w, "five_hour")
         assert not sw.has_headroom(w, "seven_day")
+        w.windows["seven_day"] = sw.Window(97.0, NOW + timedelta(days=3))
+        assert sw.has_headroom(w, "seven_day")
         assert sw.has_headroom(w, "scoped:fable")
         assert not sw.has_headroom(w, "scoped:opus")      # not in the reading
         assert not sw.has_headroom(w, "an_unknown_window")
@@ -544,7 +548,8 @@ class TestPollRequests:
         assert sw.poll_request({"id": "x", "layer": "acme-cli"}, _CLAUDE_CRED) is None
 
     def test_specs_come_from_the_engines_declaration(self):
-        assert list(sw.window_specs("claude-code-cli")) == ["five_hour", "seven_day"]
+        assert list(sw.window_specs("claude-code-cli")) == ["five_hour", "seven_day", "seven_day_model"]
+        assert list(sw.account_specs(sw.window_specs("claude-code-cli"))) == ["five_hour", "seven_day"]
         assert list(sw.window_specs("codex-cli")) == ["five_hour", "seven_day"]
         assert sw.window_specs("direct-llm") == {}
         assert sw.window_specs("acme-cli") == {}          # unregistered: nothing, no raise

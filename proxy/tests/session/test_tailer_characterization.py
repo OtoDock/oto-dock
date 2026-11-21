@@ -132,7 +132,7 @@ def store(monkeypatch):
     monkeypatch.setattr(usage_service, "record_turn_usage", st.usage.extend)
     monkeypatch.setattr(subscription_pool, "get_session_subscription", lambda sid: None)
     monkeypatch.setattr(subscription_pool, "get_session_payer_sub", lambda sid: None)
-    monkeypatch.setattr(subscription_pool, "throttle_from_cli_error",
+    monkeypatch.setattr(subscription_pool, "nudge_from_cli_error",
                         lambda sid, text: st.throttles.append(text))
     monkeypatch.setattr(notification_manager, "broadcast_chat_title",
                         lambda sub, cid, title, agent="": st.titles.append([sub, cid, title, agent]))
@@ -202,14 +202,17 @@ def test_claude_line_by_line(store, fname):
 
 
 @pytest.mark.parametrize("fname", CLAUDE_FILES)
-def test_claude_file_cuts(store, tmp_path, fname):
+def test_claude_file_cuts(store, tmp_path, monkeypatch, fname):
     """The local file through the cursor, appended in cuts: one between a
     tool_use line and its result, the rest at thirds."""
+    import config
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)   # read beneath an agent's folder only
+    (tmp_path / "ag").mkdir()
     sid = "sid-char-cf"
     lines = _lines(fname)
     tool_use_at = next((i for i, ln in enumerate(lines) if '"tool_use"' in ln), 0)
     cuts = sorted({tool_use_at + 1, len(lines) // 3, 2 * len(lines) // 3, len(lines)})
-    path = tmp_path / "transcript.jsonl"
+    path = tmp_path / "ag" / "transcript.jsonl"
     results = []
     start = 0
     for cut in cuts:
@@ -218,21 +221,24 @@ def test_claude_file_cuts(store, tmp_path, fname):
         start = cut
         results.append(T.tail_transcript(sid, CHAT, str(path)))
     results.append(T.tail_transcript(sid, CHAT, str(path)))   # nothing new
-    results.append(T.tail_transcript(sid, CHAT, str(tmp_path / "missing.jsonl")))
+    results.append(T.tail_transcript(sid, CHAT, str(tmp_path / "ag" / "missing.jsonl")))
     check_golden(f"tailer-claude-file-cuts-{fname.split('.')[0]}", _result(sid, T, store, results))
 
 
 @pytest.mark.parametrize("fname", CLAUDE_FILES)
-def test_claude_replay_guard(store, tmp_path, fname):
+def test_claude_replay_guard(store, tmp_path, monkeypatch, fname):
     """A resume re-warm's transcript replays the earlier lines as copies with
     their original stamps: the attach-time guard skips what is older than
     the attach, which here sits two seconds after the file's middle line."""
+    import config
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)   # read beneath an agent's folder only
+    (tmp_path / "ag").mkdir()
     sid = "sid-char-cg"
     lines = _lines(fname)
     stamped = [json.loads(ln) for ln in lines if ln.strip() and ln.lstrip().startswith("{")]
     times = [t for t in (T.line_time(o) for o in stamped) if t is not None]
     T._attach_ts[sid] = times[len(times) // 2] + 2.0
-    path = tmp_path / "transcript.jsonl"
+    path = tmp_path / "ag" / "transcript.jsonl"
     path.write_text("\n".join(lines) + "\n")
     results = [T.tail_transcript(sid, CHAT, str(path))]
     check_golden(f"tailer-claude-replay-guard-{fname.split('.')[0]}", _result(sid, T, store, results))

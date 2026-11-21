@@ -27,7 +27,7 @@
     "PROXY_TASK_SCOPE": "${session.task_scope}"
   },
 
-  "exclude_from": [],
+  "exclude_from": ["external"],
 
   "skills": [
     {

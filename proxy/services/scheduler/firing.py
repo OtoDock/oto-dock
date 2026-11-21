@@ -31,11 +31,16 @@ from ws import wire_events as wire
 logger = logging.getLogger("otodock.scheduler")
 
 
-# Continuation coalescing: chat_id → the chat's last message id right after a
-# wake was delivered. A new wake is SKIPPED while that id hasn't advanced —
-# the previous wake is still unprocessed in the chat (queued behind a turn /
-# gate), and stacking wake prompts would burn turns on stale pings. In-memory
-# only: a restart forgets the cursor, worst case one extra wake (documented).
+# Continuation coalescing: chat_id → the id of the newest wake's own row. A
+# recurring wake is SKIPPED while no row follows it: the previous wake is still
+# unprocessed in the chat (queued behind a turn or a gate, or stored for the
+# chat's next turn), and stacking wake prompts would burn turns on stale pings.
+# The wake's own row, never the chat's last row after the delivery: a rung that
+# runs the wake's turn before it returns (an idle or a dead session, a closed
+# terminal warmed again) has written the turn's rows by then, and an idle chat
+# then wrote nothing after them for as long as nobody typed. A one-shot wake is
+# never skipped. In-memory only: a restart forgets the cursor, worst case one
+# extra wake (documented).
 _continuation_cursors: dict[str, int] = {}
 # Consecutive coalesce-skips per continuation task id. A recurring continuation
 # bounded only by max_runs on a permanently-dead chat never increments
@@ -202,7 +207,7 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
     Guards, in order: chat gone → self-cancel; past ``until_at`` → self-cancel;
     coalesce (previous wake unprocessed → skip). Post-fire: one-shot rows
     auto-delete; recurring rows count fires and self-cancel at ``max_runs``."""
-    from core.session.session_delivery import deliver_prompt
+    from core.session import chat_rebuild
 
     # the registry API; a module import would cycle with the facade
     from services.scheduler import scheduler as _api
@@ -230,15 +235,22 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
 
     last_id = await asyncio.to_thread(task_store.get_last_chat_message_id, chat_id)
     prev = _continuation_cursors.get(chat_id)
-    if prev is not None and last_id <= prev:
+    recurring = bool(task.schedule) or task.interval_seconds is not None
+    if prev is not None and last_id <= prev and not recurring:
+        # A one-shot carries its own words and has no next run: it goes down
+        # the ladder like a delegate result, behind the wake in front of it.
+        logger.info(
+            "Continuation %s: previous wake still unprocessed on chat %s, "
+            "this one-shot wake is delivered behind it", task.id, chat_id[:8]
+        )
+    elif prev is not None and last_id <= prev:
         skips = _continuation_skip_counts.get(task.id, 0) + 1
         _continuation_skip_counts[task.id] = skips
         logger.info(
             "Continuation %s: previous wake still unprocessed on "
             "chat %s — coalesced (skipped ×%s)", task.id, chat_id[:8], skips
         )
-        recurring = bool(task.schedule) or task.interval_seconds is not None
-        if recurring and task.max_runs and skips > _SKIP_AGING_GRACE:
+        if task.max_runs and skips > _SKIP_AGING_GRACE:
             new_count = await asyncio.to_thread(
                 task_store.increment_dynamic_task_run_count, task.id,
             )
@@ -278,6 +290,7 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
     wake_prompt = task.prompt
     wake_event_data = json.dumps({"prompt": wake_prompt, "task_id": task.id})
     persisted: list[str] = []
+    wake_row: list[asyncio.Future] = []
 
     def _persist_wake(target_chat_id: str) -> None:
         # On the chat's lane, off the loop, ahead of the wake turn's rows; the
@@ -285,13 +298,13 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
         # carry no socket of their own; the socket's rung sends it itself).
         persisted.append(target_chat_id)
         if target_chat_id:
-            chat_writer.submit(
+            wake_row.append(chat_writer.submit(
                 target_chat_id,
                 functools.partial(task_store.add_chat_message, target_chat_id, "event", "",
                                   event_type=wire.PERSISTED_SCHEDULE_WAKE,
                                   event_data=wake_event_data),
                 label="schedule_wake",
-            )
+            ))
             broadcast_chat_frame(target_chat_id, {
                 "type": wire.SCHEDULE_WAKE, "chat_id": target_chat_id,
                 "prompt": wake_prompt, "task_id": task.id,
@@ -303,9 +316,10 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
     if person:
         deliver_user_sub: str | None = person
         # On a Shared-only chat the person's effective role, the one their
-        # own turn there runs at; elsewhere the creator's row alone (see
-        # delivery.py: the operator's call).
-        deliver_role = standing if shared_person else (row or roles.VIEWER)
+        # own turn there runs at; elsewhere the role the dashboard reads
+        # (``acting_role_of``), as the wake's own build reads it again.
+        from auth.providers import acting_role_of
+        deliver_role = standing if shared_person else await run_db(acting_role_of, person, task.agent)
     else:
         deliver_user_sub = None
         # A person who scheduled a wake from a shared chat never wakes it
@@ -362,14 +376,18 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
             from core.session import session_state as _state_mod
             _state_mod._save_pending_result(outcome.session_id, outcome.response)
 
+    # A person's own chat wakes as the chat, any other as nobody's.
+    woken = await run_db(chat_rebuild.wake_build, chat, deliver_user_sub, deliver_role)
     try:
-        outcome = await deliver_prompt(
+        outcome = await chat_rebuild.rebuild_and_resume(
             chat_id, wake_prompt,
             source="schedule_wake",
             session_id=chat.get("session_id") or "",
             agent=task.agent,
-            user_sub=deliver_user_sub,
+            person=deliver_user_sub,
             role=deliver_role,
+            mode=woken.mode, kind=woken.kind, build=woken.build,
+            spawns=spawns,
             notify_payload={
                 "type": wire.NOTIFY_CONTINUATION_PROMPT,
                 "session_id": chat.get("session_id") or "",
@@ -379,8 +397,6 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
                 "prompt": wake_prompt,
             },
             persist_event=_persist_wake,
-            persistent_fn=delivery._deliver_via_persistent,
-            oneshot_fn=delivery._deliver_via_oneshot if spawns else None,
             on_outcome=_save_echo,
         )
         logger.info("Continuation %s fired via %s: chat=%s", task.id, outcome.path, chat_id[:8])
@@ -394,14 +410,37 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
             _persist_wake(chat_id)
         await _save_echo(DeliveryOutcome("none", chat_id=chat_id,
                                          session_id=chat.get("session_id") or ""))
-    # A lane job, so the cursor counts the wake's own row written above.
-    _continuation_cursors[chat_id] = await chat_writer.submit(
+    mark = await _handed_over_at(chat_id, wake_row)
+    _continuation_cursors[chat_id] = max(mark, _continuation_cursors.get(chat_id, 0))
+
+    await _end_fired_row(task)
+    return ""
+
+
+async def _handed_over_at(chat_id: str, wake_row: list[asyncio.Future]) -> int:
+    """The row a fired wake is judged by, for the cursor: its own row, which
+    the ladder writes before any rung runs the wake's turn. The socket's rung
+    writes the row itself after it returns, before the turn it starts: the
+    chat's last row now, a lane job. A row that failed marks nothing (0), so
+    the next wake is never held back by a turn's own rows."""
+    from core.events import chat_writer
+    if wake_row:
+        try:
+            return int(await wake_row[0])
+        except psycopg.Error:
+            logger.warning("Continuation wake row failed on chat %s", chat_id[:8], exc_info=True)
+            return 0
+    return await chat_writer.submit(
         chat_id, functools.partial(task_store.get_last_chat_message_id, chat_id),
         label="wake_cursor",
     )
 
-    await _end_fired_row(task)
-    return ""
+
+def wake_skips(task_id: str) -> int:
+    """How many times in a row a recurring continuation's wake was skipped
+    because the chat had not taken the previous one (0 after a delivery and
+    after a restart)."""
+    return _continuation_skip_counts.get(task_id, 0)
 
 
 async def _end_fired_row(task: shared.TaskDefinition) -> None:

@@ -21,28 +21,32 @@ export interface SetDefaultVars {
   mcpName: string
   accountLabel: string
 }
-export interface SetBindingVars {
+export interface AddAgentAccountVars {
   mcpName: string
   agentName: string
   accountLabel: string
   /** The person's own GitHub reach for the agent; absent keeps it. */
   repositories?: string[]
   readOnly?: boolean
+  makeDefault?: boolean
 }
-export interface RemoveBindingVars {
+/** One account of one agent's set: taken out of it, or made its default. */
+export interface AgentAccountVars {
   mcpName: string
   agentName: string
+  accountLabel: string
 }
 
 export interface AccountsOps {
   setIntegration: UseMutationResult<unknown, Error, SetIntegrationVars, unknown>
   deleteIntegration: UseMutationResult<unknown, Error, DeleteIntegrationVars, unknown>
   setDefault: UseMutationResult<unknown, Error, SetDefaultVars, unknown>
-  /** Per-agent override hooks are user-side only — they pin which of the
-   * user's accounts the agent uses in *user-scope* chats. Service-side
-   * (admin) bindings live in Agent Settings → MCPs via the new
-   * ``ServiceAccountBindingDropdown``, NOT in this card. Optional so
+  /** Each agent's set of accounts is user-side only: which of the user's
+   * accounts the agent may use in *user-scope* chats, and the one it starts
+   * on. The agent's own accounts live in Agent Settings → MCPs
+   * (``AgentAccounts``), NOT in this card. Optional so
    * service-side ops can omit them entirely. */
-  setBinding?: UseMutationResult<unknown, Error, SetBindingVars, unknown>
-  removeBinding?: UseMutationResult<unknown, Error, RemoveBindingVars, unknown>
+  addAgentAccount?: UseMutationResult<unknown, Error, AddAgentAccountVars, unknown>
+  removeAgentAccount?: UseMutationResult<unknown, Error, AgentAccountVars, unknown>
+  setAgentDefault?: UseMutationResult<unknown, Error, AgentAccountVars, unknown>
 }

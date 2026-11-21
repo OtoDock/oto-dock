@@ -80,7 +80,7 @@ FRAME_NAMES = frozenset(wire.FRAMES)
 KNOWN_SENDER_LITERALS: dict[str, dict[str, int]] = {
     # The Direct layer's native chunk dicts (``{"type": "text", "data": …}``),
     # translated into CommonEvents at the layer's edge — not wire frames.
-    "proxy/core/layers/direct/session.py": {"text": 3, "thinking": 5, "tool_start": 1, "tool_end": 2,
+    "proxy/core/layers/direct/session.py": {"text": 4, "thinking": 5, "tool_start": 1, "tool_end": 2,
                                             "done": 1, "error": 4, "metadata": 1, "context_compact": 1},
     # The task-run SSE stream (``api/tasks/tasks.py``): an HTTP stream read by
     # schedules-mcp's ``run_task(wait=true)`` (nothing in the dashboard reads
@@ -97,10 +97,16 @@ KNOWN_SENDER_LITERALS: dict[str, dict[str, int]] = {
     # own ``pong`` (``core/remote/satellite_connection.py``).
     "proxy/core/remote/satellite_grace.py": {"error": 1},
     "proxy/core/remote/satellite_connection.py": {"pong": 1},
-    # The vendor APIs' content blocks (``text`` / ``tool_result``) and the
-    # Codex app-server's input items (``text``).
+    # The vendor APIs' content blocks (``text`` / ``tool_result``).
     "proxy/core/layers/providers/anthropic_adapter.py": {"text": 3, "tool_result": 1},
-    "proxy/core/layers/codex/session.py": {"text": 2},
+    # A tool result's content block (``text``) the stand-in answers a call with.
+    "proxy/core/stdio_path_interceptor.py": {"text": 1},
+    # A tool result's content block (``text``) a program of the platform's own
+    # answers a call with, inside a session's sandbox.
+    "proxy/core/layers/direct/sandbox_program_runtime.py": {"text": 1},
+    # A tool result's content blocks (``text``) a Docker tool's door answers a
+    # call with: a sentence of its own, or the note in front of the tool's.
+    "proxy/services/containers/door.py": {"text": 2},
     # The file tree's entry kind (``file`` / ``dir``), not the artifact frame.
     "proxy/api/agents/files.py": {"file": 2},
 }
@@ -252,7 +258,6 @@ KNOWN_TS_SITES: dict[str, dict[str, int]] = {
     # The STT / TTS backends' own protocol (``nativeStt.ts``: the speech
     # plugin's end reason).
     "dashboard/src/audio/backends/platformStt.ts": {"error": 1},
-    "dashboard/src/audio/backends/platformTts.ts": {"error": 1},
     "dashboard/src/audio/backends/nativeStt.ts": {"error": 1},
     # ``system`` as a theme and as an MCP instance scope.
     "dashboard/src/contexts/ThemeContext.tsx": {"system": 2},

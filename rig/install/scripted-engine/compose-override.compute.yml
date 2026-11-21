@@ -1,0 +1,5 @@
+  # Appended by fresh.sh and the upgrade run where the install's compose file
+  # has the compute service, which runs the sessions: the wrapper for it too.
+  otodock-compute:
+    volumes:
+      - ./rig-bin:/opt/rig-bin:ro

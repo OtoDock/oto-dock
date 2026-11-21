@@ -86,25 +86,21 @@ async def test_pending_endpoint_own_session_passes_binding(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_plan_endpoints_reject_foreign_or_absent_session(temp_db):
-    """Plan list/read are session-bound: a session JWT must name its own
-    session — foreign session_id → 403, missing session_id → 400."""
-    from api.sessions.sessions import get_plan_file, list_plans
+async def test_the_session_verifier_refuses_a_foreign_or_absent_session(temp_db):
+    """A session token must name its own session: a foreign session id is
+    refused 403, a missing one 400."""
+    from api.sessions.sessions import verify_session_match_async
     from auth.session_token import create_session_token
 
     token = create_session_token("session-A", "agent-1")
 
     with pytest.raises(HTTPException) as exc:
-        await list_plans(f"Bearer {token}", session_id="session-B")
+        await verify_session_match_async(f"Bearer {token}", "session-B")
     assert exc.value.status_code == 403
 
     with pytest.raises(HTTPException) as exc:
-        await list_plans(f"Bearer {token}", session_id=None)
+        await verify_session_match_async(f"Bearer {token}", "")
     assert exc.value.status_code == 400
-
-    with pytest.raises(HTTPException) as exc:
-        await get_plan_file("x.md", f"Bearer {token}", session_id="session-B")
-    assert exc.value.status_code == 403
 
 
 def test_user_sub_round_trips_through_jwt(temp_db):
@@ -125,27 +121,3 @@ def test_user_sub_round_trips_through_jwt(temp_db):
     legacy_payload = validate_session_token(legacy)
     assert legacy_payload is not None
     assert legacy_payload.get("user_sub") == ""
-
-
-@pytest.mark.asyncio
-async def test_plan_file_is_confined_to_the_plans_dir(temp_db, tmp_path, monkeypatch):
-    """A plan filename is a single segment, but a symlink dropped in the plans
-    dir could still point outside it — the read resolves the path and refuses
-    that with the same 404 as a missing plan."""
-    from api.sessions import sessions
-    from auth.session_token import create_session_token
-
-    plans = tmp_path / "plans"
-    plans.mkdir()
-    (plans / "ok.md").write_text("# plan")
-    secret = tmp_path / "secret.md"
-    secret.write_text("private")
-    (plans / "evil.md").symlink_to(secret)
-    monkeypatch.setattr(sessions, "_get_plans_dir", lambda sid: plans)
-    token = create_session_token("session-A", "agent-1")
-
-    out = await sessions.get_plan_file("ok.md", f"Bearer {token}", session_id="session-A")
-    assert out == {"content": "# plan", "filename": "ok.md"}
-    with pytest.raises(HTTPException) as exc:
-        await sessions.get_plan_file("evil.md", f"Bearer {token}", session_id="session-A")
-    assert exc.value.status_code == 404

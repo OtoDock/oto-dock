@@ -34,7 +34,6 @@ from audio.providers.vad.silero import SileroVad
 from audio.streaming.lang import base_lang
 
 import config
-from background import spawn
 from config_manager import ConfigManager, PhoneRoute, RouteSettings
 from fillers import filler_cache
 from pipeline.core import CallPipeline
@@ -87,6 +86,10 @@ class DuplexSession(CallPipeline):
     _language_switch_at = LEAN
     _language_lean_at_take = False
     _heard_follows_switch = False
+    # The browser cancels the agent's own voice before the microphone's
+    # audio leaves it, and soft speech under the VAD's bar is this surface's
+    # live-hit case: an orphan final needs no loud line here.
+    _orphan_needs_loud_line = False
 
     # Deliberately does NOT call CallPipeline.__init__: that constructor is
     # route-resolution (call defaults, ambience, outbound) — this one wires
@@ -196,8 +199,9 @@ class DuplexSession(CallPipeline):
         # Mid-utterance provider finals push straight to the composer —
         # they sit in the provider's internal queue until dispatch, so the
         # sampled ``latest_interim`` overlay alone made the caption reset
-        # to each newest phrase (R4.6).
-        self.stt.on_partial_final = self._on_stt_partial_final
+        # to each newest phrase (R4.6). The same callback starts the sweep
+        # for a final no speech end drains (pipeline/turn.py).
+        self._watch_stt_finals()
 
     def _speech_usage_reports(self, *, streamed: float, relistened: float, session_id: str) -> list:
         """The conversation's speech is the speaker's usage: the stream's
@@ -473,79 +477,12 @@ class DuplexSession(CallPipeline):
                 last = partial
                 self.conn.send_event({"type": "interim", "text": partial})
 
-    def _on_stt_partial_final(self, text: str) -> None:
-        """A final landed in the provider's queue mid-utterance — forward
-        it as an accumulate chunk. Skipped while held (composer owns the
-        draft) and during the STT echo window (TTS playing without early
-        unmute: the provider is being fed silence, so any final is echo
-        or stale — the pipeline discards it, the composer must too)."""
-        text = (text or "").strip()
-        if not text or self.conn.is_closed or self.conn.is_muted:
-            return
-        if (self.state._tts_playing and not self.state._stt_early_unmuted
-                and not self.state._playback_paused):
-            # Echo window (TTS audibly playing, provider fed silence) — but a
-            # PAUSED playback feeds the live mic and its finals are the
-            # barge-in commit evidence, never echo.
-            return
+    def _on_final_landed(self, text: str) -> None:
+        """A final landed in the provider's queue mid-utterance: forward it
+        as an accumulate chunk. The shared callback already skipped a held
+        or muted line (the composer owns the draft) and the STT echo window
+        (the pipeline discards that final, the composer must too)."""
         self.conn.send_event({"type": "interim_final", "text": text})
-        # Orphan sweep: a final can land with NO VAD speech cycle to drain
-        # it — soft speech under Silero's threshold that Deepgram still
-        # transcribed (live-hit 2026-08-11 09:17: the sentence tail showed
-        # in the composer but sat in the provider queue until discarded as
-        # echo), or a final arriving just after the turn dispatched. The
-        # sweep gives every VAD-driven consumer time to take it; whatever
-        # is still queued afterwards would otherwise never dispatch.
-        spawn(self._sweep_orphan_final(), name="sweep_orphan_final", owner="duplex")
-
-    async def _sweep_orphan_final(self) -> None:
-        """Dispatch provider finals no VAD speech cycle ever drained (see
-        ``_on_stt_partial_final``). VAD-driven consumers are parked on the
-        transcript-ready event and take finals within milliseconds, so a
-        non-empty queue after the delay is genuinely orphaned. No-ops
-        whenever the normal machinery owns the text: user audibly
-        speaking, a turn timer pending, playback running, or held."""
-        await asyncio.sleep(0.6)
-        if self.conn.is_closed or self.conn.is_muted:
-            return
-        if not self.state._user_silent.is_set():
-            return
-        if self.state._turn_timer and not self.state._turn_timer.done():
-            return
-        if self.state._tts_playing and not self.state._playback_paused:
-            return  # audible playback owns the floor; a PAUSE is eligible —
-            # its orphaned final is exactly the commit evidence
-        text = self.stt.drain_transcript()
-        if not text:
-            return
-        if self._is_interim_fallback_dup(text):
-            logger.info(
-                "[%s] Orphan final duplicates the "
-                "interim-dispatched tail — dropped: %s", self.conn.peer_addr, text)
-            return
-        busy = (
-            (self.state._utterance_task and not self.state._utterance_task.done())
-            or (self._typed_turn and not self._typed_turn.done())
-        )
-        if busy:
-            if text in self.state._queued_speech:
-                return
-            logger.info(
-                "[%s] Orphan STT final while turn busy "
-                "— queuing: %s", self.conn.peer_addr, text)
-            self._note_turn_taken()
-            self.state._queued_speech.append(text)
-            self._interrupt_for_queued_speech()
-            return
-        logger.info(
-            "[%s] Orphan STT final — dispatching "
-            "through the turn machinery: %s", self.conn.peer_addr, text)
-        self._append_turn_segment(text)
-        joined = " ".join(self.state._turn_segments)
-        self._cancel_turn_timer()
-        self.state._turn_timer = asyncio.create_task(
-            self._turn_timeout_handler(joined)
-        )
 
     def _on_language_replace(self, text: str) -> None:
         """The identifier moved the shown transcript to another language:

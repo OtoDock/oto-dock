@@ -531,6 +531,26 @@ def list_admin_shares(scope: str, *, agent: str = "", standing: str = "",
         return [dict(r) for r in rows]
 
 
+def live_app_links(app_id: str = "") -> list[dict]:
+    """The live link shares of apps (``scope = 'external'``), each with its
+    app's ``agent``, ``slug``, ``title``, ``username`` and ``owner_sub``;
+    ``app_id`` keeps that app's alone. Read with one clock."""
+    where = f"s.scope = 'external' AND s.target_kind = 'app' AND {_live_clause()}"
+    params: list = [_now()]
+    if app_id:
+        where += " AND s.app_id = %s"
+        params.append(app_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT s.id, s.app_id, s.allow_actions, a.agent, a.slug, a.title,
+                       a.username, a.owner_sub
+                FROM shares s JOIN pinned_apps a ON a.id = s.app_id
+                WHERE {where} ORDER BY a.agent, a.title, s.created_at""",
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def count_live_shares_by(user_sub: str, scope: str | None = None,
                          target_kind: str | None = None) -> int:
     with get_conn() as conn:

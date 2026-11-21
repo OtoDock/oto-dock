@@ -46,6 +46,7 @@ from fastapi import HTTPException
 
 import config
 from services.community.community_installer import (
+    BackupFailed,
     ProgressCb,
     _apply_extracted_files,
     _emit,
@@ -208,6 +209,8 @@ async def install_skill_package_from_extracted(
             # Fresh install → platform-enabled, like an explicit MCP install;
             # per-agent enablement stays a manager decision (Skills tab).
             await asyncio.to_thread(mcp_store.set_mcp_enabled, name, True)
+    except BackupFailed:
+        raise  # nothing of the folder was replaced: there is nothing to roll back
     except Exception:
         if backup_dir is not None and backup_dir.exists():
             await asyncio.to_thread(

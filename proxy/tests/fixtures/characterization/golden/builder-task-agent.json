@@ -12,9 +12,14 @@
      "char-agent",
      "char-peer"
     ],
+    "limits": null,
     "mcp_config_format": "json",
     "only_mcps": null,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "session_id": "s-task",
     "shared_chat": false,
     "target_browser": {},
@@ -117,7 +122,11 @@
     ],
     "meetings_access": [],
     "nouser_reads": true,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "trigger_payload": null,
     "user_role": "manager",
     "user_sub": ""
@@ -134,11 +143,17 @@
     "excluded_mcps": null,
     "execution_path": "claude-code-cli",
     "mount_shared": true,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "read_only": false,
     "role": "manager",
     "sandboxed": true,
+    "session_id": "s-task",
     "shared_chat": false,
+    "tool_limits": [],
     "username": ""
    }
   },
@@ -149,8 +164,22 @@
      "config_visible": false,
      "is_admin_agent": false,
      "knowledge_rw": true,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
      "role": "manager",
      "session_scope": "agent",
+     "tool_limits": [
+      [
+       "agent-config-mcp",
+       [
+        "reload_session",
+        "switch_account"
+       ]
+      ]
+     ],
      "username": ""
     }
    ],
@@ -203,9 +232,12 @@
      "execution_path": "claude-code-cli",
      "execution_paths": "",
      "execution_target": "local",
+     "history_retention_days": 0,
      "local_only_engines": "",
      "setup_completed_at": null,
      "slug": "char-agent",
+     "team_account": false,
+     "team_account_floor": "editor",
      "updated_at": "<stamp>"
     },
     "model": "claude-char-1",
@@ -239,8 +271,22 @@
    "config_visible": false,
    "is_admin_agent": false,
    "knowledge_rw": true,
+   "placement": {
+    "kind": "compute",
+    "label": "Compute",
+    "machine_id": "compute-0123456789ab"
+   },
    "role": "manager",
    "session_scope": "agent",
+   "tool_limits": [
+    [
+     "agent-config-mcp",
+     [
+      "reload_session",
+      "switch_account"
+     ]
+    ]
+   ],
    "username": ""
   },
   "subscription_id": "sub-char",

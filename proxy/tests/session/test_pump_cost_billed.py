@@ -228,6 +228,37 @@ async def test_mcp_fee_frame_is_billed(temp_db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_the_cost_engine_reads_the_tools_answer(temp_db, monkeypatch):
+    """A rule may price by the model the tool's answer names (``result_has``),
+    so the pump hands the engine the answer with the arguments."""
+    from core.events.common_events import TOOL_RESULT, TOOL_USE
+    from services.mcp import mcp_cost_engine
+
+    temp_db.create_chat("cb10", "user-admin", "a1")
+    _bill(monkeypatch, {"sess-cb10": True})
+    monkeypatch.setattr(
+        mcp_cost_engine, "find_costs_block_for_tool",
+        lambda name: ("video-gen-mcp", "generate_transition", object()),
+    )
+    seen = {}
+
+    def fake_evaluate(mcp_name, tool_name, tool_input, costs_block, tool_result=None):
+        seen["answer"] = tool_result
+
+    monkeypatch.setattr(mcp_cost_engine, "evaluate", fake_evaluate)
+    pump = _mk_pump("cb10")
+    try:
+        pump.attach()
+        tool = {"name": "mcp__video-gen-mcp__generate_transition", "tool_id": "t1"}
+        await pump._process_event(CommonEvent(type=TOOL_USE, data=dict(tool)))
+        await pump._process_event(CommonEvent(type=TOOL_RESULT, data={
+            **tool, "result_content": "Generated 6s transition with Gemini Omni Flash."}))
+        assert seen == {"answer": "Generated 6s transition with Gemini Omni Flash."}
+    finally:
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
 async def test_mcp_fee_is_persisted_in_its_own_row(temp_db, monkeypatch):
     """A reload adds the fees back up from their rows: the metadata row holds
     the model's cost only, so the fee gets a row of its own kind."""

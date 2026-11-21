@@ -115,24 +115,29 @@ def op_blacks(job: Any, ctx: OpCtx, op: dict) -> None:
 
 
 def op_whites(job: Any, ctx: OpCtx, op: dict) -> None:
+    """The white point. Positive lifts the bright tones toward white and
+    clips the top first, negative brings the brightest down; a gain that
+    grows from the mid tones to white, so the shadows stay and no tone
+    passes another (level 100 moves the white point by a fifth)."""
     import numpy as np
     from PIL import Image
 
-    level = float(op.get("level", 0))
+    level = max(-100.0, min(100.0, float(op.get("level", 0))))
+    if level == 0:
+        return
     arr = np.array(job.img, dtype=np.float32) / 255.0
+    # An alpha channel is no tone: it keeps its value. The mode names it
+    # (RGBA, LA): a CMYK picture's fourth channel is an ink.
+    tones = arr[..., :-1] if job.img.getbands()[-1] in ("A", "a") else arr
+    t = np.clip((tones - 0.35) / 0.65, 0, 1)
+    weight = t * t * (3 - 2 * t)
+    point = 1.0 - abs(level) / 100.0 * 0.2
     if level > 0:
-        power = 1.0 - level / 100.0 * 0.15
-        mask = np.clip((arr - 0.6) / 0.4, 0, 1)
-        arr = arr * (1 - mask) + (arr**power) * mask
-    elif level < 0:
-        compress = 1.0 - abs(level) / 100.0 * 0.15
-        arr = np.where(
-            arr > compress,
-            compress + (arr - compress) * 0.3,
-            arr,
-        )
+        tones *= 1 + (1 / point - 1) * weight
+    else:
+        tones *= 1 - (1 - point) * weight
     job.img = Image.fromarray(
-        np.clip(arr * 255, 0, 255).astype(np.uint8), job.img.mode
+        np.clip(np.rint(arr * 255), 0, 255).astype(np.uint8), job.img.mode
     )
 
 

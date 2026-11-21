@@ -9,9 +9,9 @@ decides between an EXTERNAL principal (``core/session/external_identity.py``)
 and a session tied to a platform user, and it binds the route to the agent:
 a daemon that names a route of another agent gets nothing from it.
 
-An external principal always runs with the **viewer** role
-(:data:`EXTERNAL_ROUTE_ROLE`): it reads the agent's shared space and writes
-only its own tree. The ``phone_routes.role`` column is a leftover of the
+An external principal always runs with the role **external**
+(:data:`EXTERNAL_ROUTE_ROLE`, ``auth/roles.py``): below every floor, it gets
+what a manager picked for outside people and its own tree. The ``phone_routes.role`` column is a leftover of the
 per-route role selector (removed 2026-09-08) and is ignored here.
 
 Every fallback is loud (WARNING / ERROR) and lands on the safest identity —
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 from auth import roles
 from core.session import external_identity
-from core.session.visibility import available_scopes_for
+from core.session.visibility import SCOPE_AGENT, available_scopes_for
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.phone import phone_route_store
@@ -34,15 +34,20 @@ from storage.phone import phone_route_store
 logger = logging.getLogger("otodock")
 
 #: The role of every external principal on a phone line (a caller who is not
-#: a platform user): viewer of the agent's shared space, writer only of its
-#: own tree. Not a setting — a trusted line is a route tied to a platform
-#: user, whose own per-agent role applies (capped below).
-EXTERNAL_ROUTE_ROLE = roles.VIEWER
+#: a platform user): ``external``, below every floor; it gets the tools and
+#: folders a manager picked for outside people and its own tree. Not a
+#: setting — a trusted line is a route tied to a platform user, whose own
+#: per-agent role applies (capped below).
+EXTERNAL_ROUTE_ROLE = roles.EXTERNAL
 #: A route's ``identity_mode``: the caller's own external identity, or the
 #: platform user the route is tied to (``identity_user_sub``). Named here,
 #: once; ``shared`` is the retired spelling that resolves as ``caller``.
 IDENTITY_MODE_CALLER = "caller"
 IDENTITY_MODE_USER = "user"
+IDENTITY_MODE_AGENT = "agent"
+#: The route-less fallback (no route, a disabled one, another agent's): the
+#: id-less external principal in the shared space.
+IDENTITY_MODE_SHARED = "shared"
 
 #: The tied user's per-agent role is capped here: a phone line never runs the
 #: unrestricted admin policy (admin-on-admin-agent fast paths, admin bash tier).
@@ -53,7 +58,7 @@ USER_ROUTE_ROLE_CAP = roles.MANAGER
 class RouteIdentity:
     """The resolved identity of one call."""
 
-    mode: str                                   # caller | shared | user
+    mode: str                                   # caller | shared | user | agent
     #: The external principal's role — always :data:`EXTERNAL_ROUTE_ROLE`
     #: (informational on a user route, whose session role is ``user_role``).
     role: str
@@ -68,6 +73,8 @@ class RouteIdentity:
     caller_claim: str = ""
     #: Why the resolver fell back from the route's configured mode ("" = none).
     fallback_reason: str = ""
+    #: The agent's own line: the management tools the route ticks open.
+    line_tools: tuple[str, ...] = ()
 
     @property
     def is_external(self) -> bool:
@@ -78,13 +85,15 @@ class RouteIdentity:
         """Call-log identity label."""
         if self.external is not None:
             return self.external.label
+        if self.mode == IDENTITY_MODE_AGENT:
+            return IDENTITY_MODE_AGENT
         return f"user:{(self.user or {}).get('username') or ''}"
 
 
 def _agent_has_personal_scope(agent: str) -> bool:
     """Whether the agent's visibility mode offers a personal scope — a caller
     gets a private tree only then (on a Shared-only agent the caller keeps
-    their id but works in the shared space with no per-caller memory)."""
+    their id and gets no folder of their own)."""
     row = agent_store.get_agent(agent) or {}
     return "user" in available_scopes_for(
         bool(row.get("collaborative", True)), row.get("default_scope") or "user",
@@ -115,13 +124,23 @@ def effective_user_role(user: dict, agent: str) -> str:
 
 
 def route_identity_mode(route: dict) -> str:
-    """The route's identity mode as one of the two named members: the
+    """The route's identity mode as one of the three named members: the
     retired ``shared`` spelling (removed 2026-09-07) resolves as ``caller``,
-    because per-caller on a Shared-only agent IS the shared space with no
-    per-caller memory, and ``remember_callers`` off covers "no memory"
+    because per-caller on a Shared-only agent keeps the caller's id and gives
+    no folder of their own, and ``remember_callers`` off covers "no memory"
     everywhere else."""
     mode = route.get("identity_mode") or IDENTITY_MODE_CALLER
-    return IDENTITY_MODE_USER if mode == IDENTITY_MODE_USER else IDENTITY_MODE_CALLER
+    return mode if mode in (IDENTITY_MODE_USER, IDENTITY_MODE_AGENT) else IDENTITY_MODE_CALLER
+
+
+def agent_line_problem(agent: str) -> str:
+    """Why a route on ``agent`` cannot run as the agent itself ("" = fine):
+    a Personal-only agent has no shared space for it."""
+    row = agent_store.get_agent(agent) or {}
+    if SCOPE_AGENT not in available_scopes_for(
+            bool(row.get("collaborative", True)), row.get("default_scope") or ""):
+        return "the agent has no shared space"
+    return ""
 
 
 def pin_allowed(route: dict) -> bool:
@@ -131,7 +150,7 @@ def pin_allowed(route: dict) -> bool:
     the API refuses a PIN there and the config push carries none."""
     from adapters.phone import is_outbound
     return (not is_outbound(route.get("direction"))
-            or route_identity_mode(route) == IDENTITY_MODE_USER)
+            or route_identity_mode(route) in (IDENTITY_MODE_USER, IDENTITY_MODE_AGENT))
 
 
 def resolve_route_identity(
@@ -153,12 +172,13 @@ def resolve_route_identity(
       the caller keeps their id but gets no tree (this IS the "shared" line;
       a stored legacy ``shared`` value resolves the same way).
     - ``pin_verified`` counts only when the route actually has a PIN.
-    - An external call ALWAYS runs in the local sandbox on the server, on
-      every engine: the external principal's role is :data:`EXTERNAL_ROUTE_ROLE`
-      (viewer) and ``remote_status.resolve_execution_target`` keeps a
-      session below the owner tier with no person (an external identity) on
-      the platform host (a satellite has no bwrap isolation), whatever the
-      agent's execution target and the machine's every-role switch say.
+    - An external call ALWAYS runs in the platform's place, the sandbox on
+      one of its compute machines, on every engine: the external principal's
+      role is :data:`EXTERNAL_ROUTE_ROLE` (``external``, below every floor)
+      and ``remote_status.resolve_execution_target`` keeps a session below
+      the owner tier with no person (an external identity) in the platform's
+      place (a paired machine has no bwrap isolation), whatever the agent's
+      execution target and the machine's every-role switch say.
       Codex takes external calls there like every other engine (no shell
       tool + the PreToolUse floor). Only a ``user`` route (the caller IS a
       platform user) can run on a remote machine, with that user's capped
@@ -201,6 +221,24 @@ def resolve_route_identity(
         logger.error(
             "Phone route %s is tied to user %s but %s — running as an external "
             "caller instead", route.get("id"), sub[:12], problem,
+        )
+        mode, fallback = "caller", problem
+
+    if mode == IDENTITY_MODE_AGENT:
+        problem = agent_line_problem(agent)
+        if not problem:
+            audit = external_identity.resolve(
+                external_identity.PHONE, caller_phone, session_id=session_id,
+                verified=verified, tree=False,
+            )
+            return RouteIdentity(
+                mode=IDENTITY_MODE_AGENT, role=EXTERNAL_ROUTE_ROLE, external=None,
+                user_role=roles.MANAGER, caller_claim=audit.claim,
+                line_tools=tuple(route.get("line_tools") or ()),
+            )
+        logger.error(
+            "Phone route %s runs as the agent itself but %s — running as an "
+            "external caller instead", route.get("id"), problem,
         )
         mode, fallback = "caller", problem
 

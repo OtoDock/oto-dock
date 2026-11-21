@@ -6,6 +6,7 @@ import type { AgentRole, EffectiveRole } from '../lib/permissions'
 import type { PairingScope } from '../lib/placement'
 import type { MachineState } from '../lib/status/machine'
 import { apiJson, withMessage } from '../lib/http/apiJson'
+import { clickDownload } from '../lib/http/download'
 
 export interface AgentSummary {
   name: string
@@ -15,6 +16,8 @@ export interface AgentSummary {
   execution_paths: string[]
   // The engines of the allowlist on which the agent runs local models only.
   local_only_engines?: string[]
+  // Days the agent keeps its history; 0 keeps it for ever.
+  history_retention_days?: number
   // Engines resolve per person: the engine and model the caller's new chat
   // takes on this agent ('' when nothing of theirs runs here) and, per
   // engine of the allowlist, whether they may run it, and the allowlist in
@@ -73,8 +76,8 @@ export interface KnowledgeLibrary {
   subdir: string
   name: string
   consumers: KnowledgeConsumer[]
-  // A source-resident bulletin/<name>.md exists — its content is injected
-  // into every attached agent's context.
+  // A source-resident bulletin/<name>.md exists. It is a file of the
+  // library alone: no agent's context carries it.
   has_bulletin: boolean
 }
 
@@ -119,6 +122,8 @@ export interface AgentInfo {
   execution_path: string
   execution_paths: string[]
   // The engines of the allowlist on which the agent runs local models only.
+  // Days the agent keeps its history; 0 keeps it for ever.
+  history_retention_days?: number
   local_only_engines?: string[]
   // Engines resolve per person: the engine and model the caller's new chat
   // takes on this agent ('' when nothing of theirs runs here) and, per
@@ -134,6 +139,10 @@ export interface AgentInfo {
   // Visibility mode column. Together with `default_scope` it maps to one of the
   // four modes — see `lib/visibility.ts`.
   collaborative: boolean
+  // The team account: people's chats on a collaborative agent run on the
+  // agent's own accounts, from the floor role up (`AgentConfig.teamAccount`).
+  team_account?: boolean
+  team_account_floor?: AgentRole
   default_model: string
   // v3: per-agent default scope for memory / tasks / notifications /
   // triggers / meetings. Drives the OTO_DEFAULT_SCOPE env var.
@@ -180,7 +189,9 @@ export interface FileNode {
 // agents map's admin scope toggle flips `all` after ui-prefs land — without
 // this the data drops to [] for a beat and every 3D chip rebuilds). Only
 // the map opts in; other consumers keep the default loading semantics.
-export const useAgents = (opts?: { all?: boolean; keepPrevious?: boolean }) =>
+// `enabled: false` reads the cache the pages fill without fetching (the
+// tab's title follows the list this way, AgentGuard's own query fills it).
+export const useAgents = (opts?: { all?: boolean; keepPrevious?: boolean; enabled?: boolean }) =>
   useQuery({
     queryKey: ['agents', opts?.all ?? false],
     queryFn: async (): Promise<AgentSummary[]> => {
@@ -190,6 +201,7 @@ export const useAgents = (opts?: { all?: boolean; keepPrevious?: boolean }) =>
       return data.agents ?? []
     },
     refetchInterval: 60_000,
+    enabled: opts?.enabled ?? true,
     ...(opts?.keepPrevious ? { placeholderData: keepPreviousData } : {}),
   })
 
@@ -505,10 +517,7 @@ export const useZipAgentPaths = () => {
         { method: 'POST', json: { paths } },
         'Could not prepare the download',
       )
-      const a = document.createElement('a')
-      a.href = download_url
-      a.download = filename
-      a.click()
+      clickDownload(download_url, filename)
       return { filename }
     },
   })
@@ -771,7 +780,8 @@ export interface RecoverBinEntry {
   entry_id: string
   rel_path: string
   original_name: string
-  reason: 'deleted' | 'reconciled' | 'overwritten'
+  /** The server's two reasons (recover_bin_store.VALID_REASONS). */
+  reason: 'deleted' | 'conflict'
   scope: 'user' | 'shared'
   size: number
   binned_at: string

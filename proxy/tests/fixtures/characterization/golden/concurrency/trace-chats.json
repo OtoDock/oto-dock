@@ -1,0 +1,538 @@
+[
+ {
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 0,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 0,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 5,
+    "fit_light": 25,
+    "reserved_mb": 0,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "empty"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 1,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 1,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 4,
+    "fit_light": 20,
+    "reserved_mb": 1000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a chat"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 1,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 1,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 4,
+    "fit_light": 20,
+    "reserved_mb": 1000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "the same id again"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 1,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 1,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 4,
+    "fit_light": 20,
+    "reserved_mb": 1000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a chat on a machine"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 2,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 3,
+    "fit_light": 19,
+    "reserved_mb": 1200,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "an in-process engine's chat"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 14,
+    "reserved_mb": 2200,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a phone call"
+ },
+ {
+  "parked": 0,
+  "result": true,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 14,
+    "reserved_mb": 2200,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "may a pre-warm start"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 9,
+    "reserved_mb": 3200,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a pre-warm with room for two"
+ },
+ {
+  "parked": 0,
+  "result": false,
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 9,
+    "reserved_mb": 3200,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "may another start"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "speculative",
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 9,
+    "reserved_mb": 3200,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a pre-warm without"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 9,
+    "reserved_mb": 3200,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "the pre-warm's id again"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 4,
+    "reserved_mb": 4200,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a chat that fits"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "busy",
+   "user_message": "Too many active sessions. The platform is busy. Try again shortly, or close an idle chat."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 4,
+    "reserved_mb": 4200,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "one that does not"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 6,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 3,
+    "reserved_mb": 4400,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a light one still fits"
+ },
+ {
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 8,
+    "reserved_mb": 3400,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "released"
+ },
+ {
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 8,
+    "reserved_mb": 3400,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "released again"
+ },
+ {
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 8,
+    "reserved_mb": 3400,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a release of what was never tracked"
+ },
+ {
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 13,
+    "reserved_mb": 2400,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "the chat slot's release"
+ }
+]

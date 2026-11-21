@@ -1,0 +1,39 @@
+{
+ "Engine": [
+  "can_resume_session",
+  "capabilities"
+ ],
+ "ExecutionLayer": [
+  "_send_turn",
+  "abort",
+  "can_resume_session",
+  "capabilities",
+  "change_mode",
+  "change_model",
+  "close_session",
+  "get_session",
+  "is_session_alive",
+  "is_session_process_dead",
+  "owns_session",
+  "prepare_resume",
+  "respond_permission",
+  "send_control_request",
+  "session_lock",
+  "start_session"
+ ],
+ "RemoteEngineAdapter": [
+  "begin_turn",
+  "can_resume",
+  "control_request",
+  "init_session",
+  "mcp_names",
+  "soft_interrupt_frame",
+  "start_payload",
+  "stream_turn",
+  "without_mcps"
+ ],
+ "refused": {
+  "ExecutionLayer": "TypeError",
+  "RemoteEngineAdapter": "TypeError"
+ }
+}

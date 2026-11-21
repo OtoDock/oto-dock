@@ -1,7 +1,7 @@
 import { Fragment, useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { useAgentInfo, useUpdateAgent, useDeleteAgent, useDelegationTargets, useSetDelegationTargets, useExecutionLayers, useSetDefaultForNewUsers, useKnowledgeAttachments, useKnowledgeLibraries, useSetKnowledgeLibrary, useAttachKnowledgeLibrary, useDetachKnowledgeLibrary, useAgentFiles, useAgentUsers, AgentUpdateError, type AgentInfo, type AgentUser, type SharedOnlySwitchResult, type KnowledgeLibrary, type FileNode } from '../../api/agents'
+import { useAgentInfo, useUpdateAgent, useDeleteAgent, useDelegationTargets, useSetDelegationTargets, useExecutionLayers, useSetDefaultForNewUsers, useKnowledgeAttachments, useKnowledgeLibraries, useSetKnowledgeLibrary, useAttachKnowledgeLibrary, useDetachKnowledgeLibrary, useAgentFiles, useAgentUsers, AgentUpdateError, type AgentInfo, type AgentUser, type SharedOnlySwitchResult, type KnowledgeLibrary } from '../../api/agents'
 import { LOCAL_LABEL, placePhrase, useRemoteMachines } from '../../api/remoteMachines'
 import { PAIRING_SCOPE, TARGET_LOCAL, isLocalTarget } from '../../lib/placement'
 import { MACHINE_STATE, machineStateWord } from '../../lib/status/machine'
@@ -36,7 +36,12 @@ import { SaveState, SettingRow } from '../../components/ui/SettingsControls'
 import { useSaveState } from '../../hooks/useSaveState'
 import { BADGE_BASE, BADGE_TONE, CARD, CARD_BORDERED, FIELD, FIELD_BORDER, FIELD_REGULAR } from '../../components/ui/classes'
 import { MemorySection } from './AgentConfig.memory'
-import { HEAD } from '../../lib/layout/tree'
+import { HistorySection } from './AgentConfig.history'
+import { ExternalIdentitiesSection } from './AgentConfig.outside'
+import { ToolLimitsSection } from './AgentConfig.limits'
+import { TeamAccountSwitch } from './AgentConfig.teamAccount'
+import { knowledgeFolders } from '../../lib/layout/knowledgeFolders'
+import FolderTree from '../../components/common/FolderTree'
 import { COLOR_PRESETS } from './AgentConfig.presets'
 
 // ---------------------------------------------------------------------------
@@ -271,23 +276,7 @@ export default function AgentConfig() {
   // segments are excluded — the server rejects them; hiding beats a 400.
   // Only fetched while the form is open (the tree GET is manager-tier).
   const { data: shareFileTree } = useAgentFiles(shareFormOpen ? name! : '')
-  const knowledgeFolders = useMemo(() => {
-    const root = (shareFileTree ?? []).find(
-      (n) => n.type === 'dir' && n.name === HEAD.KNOWLEDGE)
-    const out: { path: string; depth: number }[] = []
-    const walk = (nodes: FileNode[], prefix: string, depth: number) => {
-      for (const n of nodes) {
-        if (n.type !== 'dir') continue
-        if (depth === 0 && n.name === 'shared') continue
-        if (n.name === 'memory') continue
-        const rel = prefix ? `${prefix}/${n.name}` : n.name
-        out.push({ path: rel, depth })
-        if (n.children) walk(n.children, rel, depth + 1)
-      }
-    }
-    if (root?.children) walk(root.children, '', 0)
-    return out
-  }, [shareFileTree])
+  const shareFolders = useMemo(() => knowledgeFolders(shareFileTree), [shareFileTree])
   // A folder is un-shareable when an existing library already covers it or
   // would be covered by it (the server enforces disjoint subtrees). '' (the
   // whole folder) overlaps everything.
@@ -309,7 +298,7 @@ export default function AgentConfig() {
   // covers the current pick, fall to the first free folder once the tree
   // loads (in render; a pick that is free stays, so this converges).
   if (shareFormOpen && renamingSubdir === null && shareOverlap(librarySubdirDraft)) {
-    const free = ['', ...knowledgeFolders.map((f) => f.path)]
+    const free = ['', ...shareFolders.map((f) => f.path)]
       .find((p) => !shareOverlap(p)) ?? ''
     if (free !== librarySubdirDraft) setLibrarySubdirDraft(free)
   }
@@ -442,8 +431,8 @@ export default function AgentConfig() {
   // What "Auto" runs: the PRIMARY engine's resolved default as the catalog
   // serves it (`auto_model` — the declared default, or the fall-down when it
   // is disabled or the pool cannot serve it), with its display name. Rendered,
-  // never re-derived: the old "first model of the first engine" guess said
-  // "Fable 5.1" for an agent that ran Opus 5. The served list's row supplies
+  // never re-derived: the old "first model of the first engine" guess named
+  // the top tier for an agent that ran Opus 5. The served list's row supplies
   // the XHigh/ultra flags when it carries the model; a model the list
   // filtered out (the catalog's provider filter is not the resolver's) still
   // gets its name and no flags.
@@ -568,44 +557,18 @@ export default function AgentConfig() {
           ) : (
             // Folder picker: the agent's knowledge tree, browsed and picked
             // like the workspace list.
-            <div
-              role="listbox"
-              aria-label="Library subfolder"
-              className="max-h-44 overflow-y-auto rounded-card border border-subtle divide-y divide-subtle"
-            >
-              {[{ path: '', depth: 0 }, ...knowledgeFolders].map(({ path, depth }) => {
+            <FolderTree
+              label="Library subfolder"
+              rows={[{ path: '', depth: 0 }, ...shareFolders]}
+              rootLabel="Whole knowledge folder"
+              selected={(path) => librarySubdirDraft === path}
+              onPick={setLibrarySubdirDraft}
+              refusal={(path) => {
                 const overlap = shareOverlap(path)
-                const selected = librarySubdirDraft === path
-                return (
-                  <button
-                    key={path || '(root)'}
-                    type="button"
-                    role="option"
-                    aria-selected={selected}
-                    disabled={!!overlap}
-                    onClick={() => setLibrarySubdirDraft(path)}
-                    title={overlap ? `Overlaps the shared library “${overlap}”` : undefined}
-                    style={{ paddingLeft: `${0.75 + depth * 1.1}rem` }}
-                    className={`w-full flex items-center gap-2 py-1.5 pr-3 text-sm text-left transition-colors ${
-                      selected ? 'bg-action-subtle text-link' : 'text-primary hover:bg-surface-hover'
-                    } disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer`}
-                  >
-                    <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                            d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-                    </svg>
-                    <span className={path ? 'font-mono' : ''}>
-                      {path || 'Whole knowledge folder'}
-                    </span>
-                    {overlap && (
-                      // aria-hidden: the option's accessible name
-                      // stays the bare path (the title carries why).
-                      <span aria-hidden="true" className="ml-auto text-3xs text-tertiary shrink-0">shared</span>
-                    )}
-                  </button>
-                )
-              })}
-            </div>
+                return overlap ? `Overlaps the shared library “${overlap}”` : null
+              }}
+              tag={(path) => (shareOverlap(path) ? 'shared' : null)}
+            />
           )}
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
             <Input
@@ -814,7 +777,7 @@ export default function AgentConfig() {
               <div>
                 <p className="text-sm font-medium text-primary">
                   AI Engines
-                  <InfoTip label="AI Engines">The engines this agent may run on. Each person's chats and tasks use their own engine among these.</InfoTip>
+                  <InfoTip label="AI Engines">The engines this agent may run on. Each person's chats, the chats delegated from them and their own tasks use their own engine among these.</InfoTip>
                   <SaveState state={stateOf('execution_paths')} />
                 </p>
               </div>
@@ -1023,7 +986,9 @@ export default function AgentConfig() {
                 className="max-w-max sm:w-auto"
               >
                 <option value="">None</option>
-                {(departments ?? []).map((d) => (
+                {/* The departments this person may place an agent in (the
+                    server's answer), and the one it is in already. */}
+                {(departments ?? []).filter((d) => d.can_place !== false || d.id === departmentId).map((d) => (
                   <option key={d.id} value={d.id}>{d.name}</option>
                 ))}
               </Select>
@@ -1031,7 +996,7 @@ export default function AgentConfig() {
                 <Select
                   aria-label="Level"
                   value={departmentLevelId}
-                  disabled={isReadOnly}
+                  disabled={isReadOnly || assignedDept?.can_place === false}
                   onChange={(e) => saveDepartment(departmentId, e.target.value)}
                   className="max-w-max sm:w-auto"
                 >
@@ -1206,6 +1171,7 @@ export default function AgentConfig() {
                 {switchNotice && <p className="text-xs text-status-warning-fg">{switchNotice}</p>}
               </>
             )}
+            {info && <TeamAccountSwitch name={name!} info={info} mode={mode} canManage={canManage} />}
           </div>
 
           {/* Admin Only — admin users only */}
@@ -1303,6 +1269,9 @@ export default function AgentConfig() {
 
       {/* Memory — managers + admins. Rows gate on the mode's available scopes. */}
       <MemorySection name={name!} mode={mode} />
+
+      {/* How long the agent keeps its history: an admin's, shown to managers. */}
+      <HistorySection name={name!} />
 
 
       {/* Delegation Targets */}
@@ -1403,6 +1372,10 @@ export default function AgentConfig() {
           </div>
         </div>
       )}
+
+      {/* External identities — managers; near the end, never the last card
+          (Shared Knowledge follows for every manager). */}
+      <ExternalIdentitiesSection name={name!} />
 
       {/* Shared knowledge — promote this agent's knowledge folder as an
           installation-wide library and/or attach other agents' libraries.
@@ -1638,6 +1611,9 @@ export default function AgentConfig() {
           </div>
         </div>
       )}
+
+      {/* What the agent may use: the last card, collapsed; managers only. */}
+      <ToolLimitsSection name={name!} />
 
       {/* Danger Zone — admin only */}
       {isAdmin && (

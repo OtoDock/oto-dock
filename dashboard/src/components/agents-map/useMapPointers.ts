@@ -214,6 +214,12 @@ export function useMapPointers({
     }
     const dept = departments.find((d) => d.id === departmentId)
     if (!dept) return
+    if (dept.can_place === false) {
+      // The server's own sentence: nothing is sent.
+      setMoveFrom(null)
+      setNotice(dept.place_refusal || null)
+      return
+    }
     const levels = [...dept.levels].sort((a, b) => a.rank - b.rank)
     if (levels.length === 0) {
       setMoveFrom(null)

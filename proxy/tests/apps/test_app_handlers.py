@@ -14,8 +14,9 @@ during shutdown.
 from __future__ import annotations
 
 import asyncio
+import http.server
 import json
-import shutil
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -37,8 +38,8 @@ from services.apps import (
     app_sandbox,
     app_supervisor,
     app_tokens,
+    call_rate,
     catalog,
-    releases,
 )
 from services.scheduler import runner, scheduler, shared
 from storage import database as task_store, db_app_deliveries as deliveries
@@ -50,12 +51,9 @@ client = TestClient(app)
 AGENT = "handlers-agent"
 SID_SHARED = "sess-handlers-shared"
 
-_needs_runtime = pytest.mark.skipif(
-    not (shutil.which("pasta") and shutil.which("bwrap") and app_sandbox.bun_binary()),
-    reason="requires pasta + bwrap + Bun on this host",
-)
-
 # A server whose handlers record what the fire brought and answer as told.
+# The compute machine runs it: ``_OnTheMachine`` answers the same way where
+# the platform dials.
 HANDLER_SERVER = """
 const port = Number(process.env.PORT || 3000);
 let flaky = 0;
@@ -80,6 +78,52 @@ Bun.serve({ port, hostname: "0.0.0.0", async fetch(req) {
 """
 
 
+class _OnTheMachine(http.server.BaseHTTPRequestHandler):
+    """``HANDLER_SERVER`` as the machine's relay answers for it."""
+    seen: dict = {}
+    flaky = 0
+
+    def _answer(self, status: int, text: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(text)))
+        self.end_headers()
+        self.wfile.write(text)
+
+    def do_GET(self):
+        self._answer(200, b"ok" if self.path == "/_health" else b"hello")
+
+    def do_POST(self):
+        cls = type(self)
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+        cls.seen = {"path": self.path, "claim": self.headers.get("x-otodock-viewer"),
+                    "basis": self.headers.get("x-otodock-basis"),
+                    "delivery": self.headers.get("x-otodock-delivery-id"), "body": body}
+        if self.path == "/_handler/bad":
+            return self._answer(400, b"no such thing")
+        if self.path == "/_handler/flaky":
+            cls.flaky += 1
+            if cls.flaky == 1:
+                return self._answer(500, b"not yet")
+        return self._answer(200, b"pong")
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def on_the_machine(placed):
+    """The app's server behind the machine's relay: every start's ack names
+    its port, so the health probe and the fire are real requests."""
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _OnTheMachine)
+    _OnTheMachine.seen, _OnTheMachine.flaky = {}, 0
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    answers = placed.answer
+    placed.answer = lambda msg: {**answers(msg), "host_port": srv.server_address[1]}
+    yield _OnTheMachine
+    srv.shutdown()
+    srv.server_close()
+
+
 def _user(sub: str = "alice-sub", agent_roles: dict[str, str] | None = None) -> UserContext:
     roles = {AGENT: "manager"} if agent_roles is None else agent_roles
     return UserContext(sub=sub, email=f"{sub}@test.com", name=sub, role="member",
@@ -101,23 +145,14 @@ def _clean(monkeypatch):
     app_proxy._buckets.clear()
     app_supervisor._client = None
     catalog._loop = None
-    catalog._app_subs.clear()
     app_handlers._drains.clear()
     app_handlers._drain_locks.clear()
     app_handlers._index_lock = None  # bound to the loop that first waits on it
     app_handlers.mark_dirty()
-    monkeypatch.setattr(app_proxy, "PLATFORM_RATE", 1000.0)
+    monkeypatch.setattr(call_rate, "RESERVE", 1000.0)
     yield
     app.dependency_overrides.pop(get_current_user, None)
     shared._shutting_down = False
-    import contextlib
-    import os
-    import signal
-    for inst in list(app_supervisor._instances.values()):
-        proc = inst.proc
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(Exception):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     app_supervisor._instances.clear()
     app_supervisor._locks.clear()
     app_handlers._drains.clear()
@@ -486,11 +521,35 @@ def test_platform_events_wake_the_rows_that_asked_in_their_slice(agent_tree, mon
     assert app_handlers.has_subscribers(AGENT) and not app_handlers.has_subscribers("nobody")
 
 
+def test_a_change_marked_during_a_build_leaves_the_index_stale(monkeypatch):
+    # A department's members change in a worker thread while the index is
+    # being built: that build must not count as fresh after it.
+    real = app_handlers._build_index
+    builds: list[int] = []
+
+    def building():
+        builds.append(1)
+        if len(builds) == 1:
+            app_handlers.mark_dirty()
+        return real()
+
+    monkeypatch.setattr(app_handlers, "_build_index", building)
+    app_handlers.mark_dirty()
+    asyncio.run(app_handlers._ensure_index())
+    assert app_handlers._stale() and app_handlers.has_subscribers("nobody")
+    asyncio.run(app_handlers._ensure_index())
+    assert len(builds) == 2 and not app_handlers._stale()
+    # A department's recompile marks it stale: its members' bindings may
+    # reach other agents now.
+    from services.departments import edge_compiler
+    edge_compiler.recompile()
+    assert app_handlers._stale()
+
+
 # ── the fire ────────────────────────────────────────────────────────────────
 
 
-@_needs_runtime
-def test_the_fire_carries_the_claim_and_reads_the_verdict(agent_tree, monkeypatch):
+def test_the_fire_carries_the_claim_and_reads_the_verdict(agent_tree, on_the_machine, monkeypatch):
     monkeypatch.setattr(deliveries, "RETRY_DELAYS_S", (0.2, 0.2, 0.2, 0.2, 0.2))
     manifest = {"title": "Flow", "handlers": {"on_trigger": ["ping", "flaky", "bad"]}}
     source = _folder(agent_tree, "flow", manifest, HANDLER_SERVER)
@@ -501,14 +560,14 @@ def test_the_fire_carries_the_claim_and_reads_the_verdict(agent_tree, monkeypatc
         row = task_store.get_app(out["app_id"])
         await app_deploy.approve_pending(row, "alice-sub")
         row = task_store.get_app(row["id"])
-        last = releases.app_data_dir(row) / "last.json"
+        assert app_supervisor.get(row["id"]).state == "up"
 
         # A good handler: the claim, the basis, the delivery id, the body.
         d = await app_handlers.enqueue(row, "ping", "trigger:t", {"n": 1})
         await app_handlers._drains[row["id"]]
         got = deliveries.get(d["id"])
         assert got["status"] == "done", got
-        seen = json.loads(last.read_text())
+        seen = on_the_machine.seen
         assert seen["path"] == "/_handler/ping" and seen["basis"] == "platform"
         assert seen["delivery"] == d["id"]
         claims = app_tokens.verify(seen["claim"], row["id"], app_tokens.PURPOSE_CALLER)
@@ -529,7 +588,7 @@ def test_the_fire_carries_the_claim_and_reads_the_verdict(agent_tree, monkeypatc
             conn.commit()
         await app_handlers.drain(row["id"])
         assert deliveries.get(d2["id"])["status"] == "done"
-        assert json.loads(json.loads(last.read_text())["body"])["attempt"] == 2
+        assert json.loads(on_the_machine.seen["body"])["attempt"] == 2
         d3 = await app_handlers.enqueue(row, "bad", "trigger:t", {})
         await app_handlers._drains[row["id"]]
         dead = deliveries.get(d3["id"])
@@ -781,3 +840,41 @@ def test_a_delta_with_no_running_loop_builds_no_coroutine(monkeypatch):
         app_handlers.on_feed_delta(["u"], AGENT, "tasks", {"last_run": "x"}, None)
         gc.collect()
     assert not [w for w in caught if "never awaited" in str(w.message)]
+
+
+def test_a_schedule_skips_its_ticks_while_the_release_that_brings_its_server_waits(
+        agent_tree, placed, healthy, monkeypatch):
+    """A tick while the release that brings the server waits makes no run
+    row and no delivery, as an unapproved app's tick; the next tick after
+    the approval is delivered."""
+    manifest = {"title": "Flow", "handlers": {"on_schedule": {"digest": {"cron": "0 7 * * *"}}}}
+    row = _deploy_approved(agent_tree, "flow", manifest)
+    (tid,) = [r["id"] for r in task_store.list_app_handler_tasks(row["id"])]
+    monkeypatch.setattr(app_handlers, "schedule_drain", lambda app_id: None)
+    _folder(agent_tree, "flow", manifest, HANDLER_SERVER)
+    assert _hook("deploy", {"slug": "flow", "visibility": "agent"}).json()["status"] == "pending approval"
+    task_def = scheduler._row_to_task(task_store.get_dynamic_task(tid))
+    assert asyncio.run(app_handlers.fire_scheduled(task_def)) == ""
+    assert deliveries.recent(row["id"]) == [] and task_store.list_runs(task_id=tid) == []
+    assert client.post(f"/v1/apps/{row['id']}/deploy/approve").status_code == 200
+    run_id = asyncio.run(app_handlers.fire_scheduled(task_def))
+    assert run_id and [d["handler"] for d in deliveries.recent(row["id"])] == ["digest"]
+
+
+def test_a_wake_of_an_app_with_no_server_dies_when_its_waiting_release_brings_none(
+        agent_tree, placed, monkeypatch):
+    """The hold is for a server that waits, not for any waiting release: the
+    approval setting on and client files only, a wake still finds no server."""
+    row = _deploy_approved(agent_tree, "flow", {"title": "Flow", "handlers": {"on_trigger": ["ping"]}})
+    task_store.set_deploy_state(row["id"], requires_approval=True)
+    (agent_tree / "workspace" / "apps" / "flow" / "client" / "index.html").write_text("<p>v2</p>")
+    assert _hook("deploy", {"slug": "flow", "visibility": "agent"}).json()["status"] == "pending approval"
+    monkeypatch.setattr(app_handlers, "schedule_drain", lambda app_id: None)
+
+    async def run() -> dict:
+        d = await app_handlers.enqueue(task_store.get_app(row["id"]), "ping", "trigger:t", {})
+        await app_handlers._fire(deliveries.get(d["id"]))
+        return deliveries.get(d["id"])
+
+    got = asyncio.run(run())
+    assert got["status"] == deliveries.DEAD and got["last_error"] == "the app has no server", got

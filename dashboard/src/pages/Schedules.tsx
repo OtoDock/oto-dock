@@ -10,7 +10,8 @@ import { errorText } from '../lib/http/apiJson'
 import { useDialogs } from '../components/ui/dialogs'
 import { Select } from '../components/ui/Field'
 import Button from '../components/ui/Button'
-import { BADGE_BASE, BADGE_TONE, BUTTON_DANGER_QUIET, CARD, PAGE_TITLE } from '../components/ui/classes'
+import { BUTTON_DANGER_QUIET, CARD, PAGE_TITLE } from '../components/ui/classes'
+import { TaskStateBadge } from '../components/common/TaskStateBadge'
 
 
 export default function Schedules() {
@@ -146,7 +147,7 @@ export default function Schedules() {
                   </td>
                   <td className="px-4 py-3 text-secondary text-xs">{formatNextRun(task.next_run_time)}</td>
                   <td className="px-4 py-3">
-                    <span className={`${BADGE_BASE} ${BADGE_TONE[task.enabled ? 'success' : 'neutral']}`}>{task.enabled ? 'Active' : 'Paused'}</span>
+                    <TaskStateBadge task={task} />
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-1.5 flex-wrap">
@@ -215,7 +216,7 @@ export default function Schedules() {
                 </div>
               </div>
               <div className="flex gap-1 shrink-0">
-                <span className={`${BADGE_BASE} ${BADGE_TONE[task.enabled ? 'success' : 'neutral']}`}>{task.enabled ? 'Active' : 'Paused'}</span>
+                <TaskStateBadge task={task} />
               </div>
             </div>
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-secondary">

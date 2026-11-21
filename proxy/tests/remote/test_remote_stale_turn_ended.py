@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from core.events import turn_ending
-from core.events.common_events import DONE, ERROR
+from core.events.common_events import DONE, ERROR, METADATA
 from core.layers.cli import remote as cli_remote
 from core.layers.cli.remote import ClaudeRemoteState
 from core.layers.cli.settle import SettleController
@@ -169,6 +169,74 @@ async def test_drain_until_turn_ended_hands_a_sub_agents_ask_to_the_engine_promp
 
 
 @pytest.mark.asyncio
+async def test_drain_until_turn_ended_keeps_a_turn_that_opens_after_the_result(monkeypatch):
+    """The CLI's own next turn can open in the window after the stop (the
+    review of a command that ended during the turn opens at once): from its
+    init on its lines are kept whole for the readers between turns, never
+    read and lost there. A line before it is background work, as before."""
+    from core.session import engine_prompts
+    seen: list[dict] = []
+    monkeypatch.setattr(engine_prompts, "note_frame", lambda sid, d, **kw: seen.append(d))
+    info = _make_info()
+    before = {"type": "system", "subtype": "task_progress", "task_id": "t-1"}
+    wake = [{"type": "system", "subtype": "init", "session_id": "sess-1"},
+            {"type": "stream_event", "event": {"type": "message_start"}},
+            {"type": "result", "subtype": "success", "result": "REVIEWED"}]
+    for frame in [before, *wake, {"type": "_turn_ended", "command_id": "current"}]:
+        info.event_queue.put_nowait(frame)
+    await cli_remote.drain_until_turn_ended(info, timeout=1.0, expected_command_id="current")
+    assert seen == [before]
+    assert info.carried == wake
+    assert info.event_queue.empty()
+    # A CLI that sends no init opens its turn with its first message.
+    info.carried.clear()
+    seen.clear()
+    for frame in [*wake[1:], {"type": "_turn_ended", "command_id": "current"}]:
+        info.event_queue.put_nowait(frame)
+    await cli_remote.drain_until_turn_ended(info, timeout=1.0, expected_command_id="current")
+    assert seen == [] and info.carried == wake[1:]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_whose_command_ended_inside_it_keeps_the_machine_sending():
+    """The stop asks the machine to keep sending after the turn when work
+    still runs, and when a background command ended during the turn: the
+    CLI's review of that end may follow the result."""
+    from core.events.bg_command_state import (
+        get_bg_command_registry,
+        reset_bg_command_registry,
+    )
+    sid = "sess-ended-inside"
+    info = _make_info(session_id=sid)
+    cm = MagicMock()
+    cm.send_fire_and_forget = AsyncMock()
+    cm.satellite_streams_between_turns = lambda machine_id: False  # an older satellite
+    reset_bg_command_registry(sid)
+    try:
+        await cli_remote.send_stop_turn(cm, info)
+        assert cm.send_fire_and_forget.await_args.args[1]["drain_bg"] is False
+        reg = get_bg_command_registry(sid)
+        reg.register_spawn("b-1", "toolu_1")
+        await cli_remote.send_stop_turn(cm, info)
+        assert cm.send_fire_and_forget.await_args.args[1]["drain_bg"] is True
+        reg.mark_done("b-1")
+        await cli_remote.send_stop_turn(cm, info)
+        assert cm.send_fire_and_forget.await_args.args[1]["drain_bg"] is True
+        reg.reset()  # the next turn begins: nothing ended during it
+        await cli_remote.send_stop_turn(cm, info)
+        frame = cm.send_fire_and_forget.await_args.args[1]
+        assert frame["drain_bg"] is False and "stream_between_turns" not in frame
+        # A satellite that streams between turns is asked to, whatever the
+        # registries know.
+        cm.satellite_streams_between_turns = lambda machine_id: True
+        await cli_remote.send_stop_turn(cm, info)
+        frame = cm.send_fire_and_forget.await_args.args[1]
+        assert frame["drain_bg"] is True and frame["stream_between_turns"] is True
+    finally:
+        reset_bg_command_registry(sid)
+
+
+@pytest.mark.asyncio
 async def test_drain_until_turn_ended_times_out_on_only_stale():
     """If only a stale marker is in the queue, drain should time out (not
     short-circuit on the stale one).
@@ -265,6 +333,26 @@ class TestForeignResultGate:
                  and e.data.get("content") == "THE REAL ANSWER"]
         assert texts, f"real answer lost: {events}"
         assert [e.type for e in events].count(DONE) == 1
+        assert events[-1].type == DONE
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_results_time_and_cost_never_reach_the_reply(self):
+        """The CLI answers the start's own message with an empty result of its
+        own: skipped, and its metadata with it, so the reply's footer reads
+        the turn's time and cost and appears only at the turn's end."""
+        layer = _mk_layer()
+        info = _make_info()
+        info.current_send_command_id = "new-cmd"
+        own = {**_result_event(""), "duration_ms": 77, "total_cost_usd": 0.0}
+        real = {**_result_event("THE REAL ANSWER"), "duration_ms": 4242, "total_cost_usd": 0.5}
+        info.event_queue.put_nowait(own)
+        info.event_queue.put_nowait(_text_event("THE REAL ANSWER"))
+        info.event_queue.put_nowait(real)
+        info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "new-cmd"})
+
+        events = [e async for e in _stream(layer, info)]
+        meta = [e for e in events if e.type == METADATA]
+        assert [m.data.get("duration_ms") for m in meta] == [4242]
         assert events[-1].type == DONE
 
     @pytest.mark.asyncio
@@ -471,6 +559,17 @@ class TestAdoptSession:
             def tunnel_port(self, machine_id):
                 return 41000
 
+            def satellite_streams_between_turns(self, machine_id):
+                return False
+
+            def is_compute(self, machine_id):
+                return False
+
+
+            def shares_folders(self, machine_id):
+
+                return False
+
             async def send_fire_and_forget(self, machine_id, msg):
                 sent.append(msg)
                 # Emulate the satellite's replay onto the queue.
@@ -498,7 +597,10 @@ class TestAdoptSession:
         assert events[-1].type == DONE
 
     @pytest.mark.asyncio
-    async def test_adopt_truncated_injects_marker(self):
+    async def test_a_truncated_replays_begin_carries_the_mark(self):
+        """The adoption writes no text of its own: whoever writes the replay
+        decides, from the rows the turn saved before the cut, whether rows
+        are missing (``core/events/replay_overlap.py``)."""
         class _CM:
             def create_session_queue(self, machine_id, sid, path, *, maxsize=1000):
                 self.q = asyncio.Queue(maxsize=maxsize)
@@ -506,6 +608,17 @@ class TestAdoptSession:
 
             def tunnel_port(self, machine_id):
                 return 41000
+
+            def satellite_streams_between_turns(self, machine_id):
+                return False
+
+            def is_compute(self, machine_id):
+                return False
+
+
+            def shares_folders(self, machine_id):
+
+                return False
 
             async def send_fire_and_forget(self, machine_id, msg):
                 self.q.put_nowait({"type": "_resume_replay_begin",
@@ -520,8 +633,12 @@ class TestAdoptSession:
         events = [e async for e in layer.adopt_session(
             machine_id="m-1", session_id="s-1", agent_name="pa",
             execution_path="claude-code-cli", command_id="cmd-1")]
-        assert any("truncated" in (e.data.get("content") or "")
-                   for e in events if e.type not in (DONE,))
+        from core.remote.remote_resume import REPLAY_BEGIN, TRUNCATED_LINE
+        begin = events[0]
+        assert begin.type == REPLAY_BEGIN
+        assert begin.data == {"truncated": True, "marker": TRUNCATED_LINE}
+        assert not any("truncated" in (e.data.get("content") or "")
+                       for e in events[1:] if e.type not in (DONE,))
 
 
 @pytest.mark.asyncio

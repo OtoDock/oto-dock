@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 const h = vi.hoisted(() => ({
@@ -69,15 +69,47 @@ describe('AgentUpdateModal', () => {
     expect(screen.getByText(/Will be replaced/)).toBeTruthy()
     expect(screen.getByText('the persona (config/agent.md)')).toBeTruthy()
     expect(screen.getByText(/Kept as you have them/)).toBeTruthy()
-    expect(screen.getByTestId('consent-app-home')).toBeTruthy()
+    expect(screen.getByTestId('apps-count').textContent).toBe('1 app: Home')
+    expect(screen.getByTestId('consent-app-home').textContent).toBe('New in this version. Every member of this agent gets their own Home.')
     expect(screen.queryByTestId('consent-app-old')).toBeNull()
+    expect(screen.getByTestId('checks-count').textContent).toBe('1 check')
+    expect(screen.getByText('Approve for every member.')).toBeTruthy()
+    fireEvent.click(within(screen.getByTestId('template-apps')).getByTestId('details-toggle'))
     expect(screen.getByTestId('consent-check-style')).toBeTruthy()
+    expect(screen.getByTestId('consent-app-details-home')).toHaveTextContent('What Home may do')
+    expect(screen.getByText('2 pieces are already current.')).toBeTruthy()
     fireEvent.click(screen.getByTestId('update-submit'))
     await waitFor(() => expect(h.applyMock).toHaveBeenCalled())
     const body = h.applyMock.mock.calls[0][0]
     expect(body.from_version).toBe('2.0.0')
     expect(body.approve_apps).toEqual({ home: 'sig-home' })
     expect(body.approve_checks).toEqual({ style: 'sig-style' })
+  })
+
+  it('says in view which app the new version gives its own program', () => {
+    h.plan.data = {
+      ...PLAN,
+      apps: [{ ...PLAN.apps[0], adds_server: true, row: { ...row, has_server: true } },
+             { ...PLAN.apps[1], slug: 'board', title: 'Board', change: 'changed', row: { ...row, slug: 'board', has_server: true } }],
+    }
+    renderModal()
+    expect(screen.getByTestId('consent-app-home').textContent)
+      .toBe('New in this version. Every member of this agent gets their own Home, with its own program on your OtoDock.')
+    expect(screen.getByTestId('consent-app-board')).toHaveTextContent('Changed in this version.')
+    expect(screen.getByTestId('consent-app-board')).not.toHaveTextContent('program')
+  })
+
+  it('names the apps whose server it showed in the consent, and none unticked', async () => {
+    h.plan.data = {
+      ...PLAN,
+      apps: [{ ...PLAN.apps[0], adds_server: true, row: { ...row, has_server: true } },
+             { ...PLAN.apps[1], slug: 'board', title: 'Board', change: 'changed', row: { ...row, slug: 'board', has_server: true } }],
+    }
+    h.applyMock.mockResolvedValue({ job_id: 'j', to_version: '3.0.0' })
+    renderModal()
+    fireEvent.click(screen.getByTestId('update-submit'))
+    await waitFor(() => expect(h.applyMock).toHaveBeenCalled())
+    expect(h.applyMock.mock.calls[0][0].approve_servers).toEqual(['home'])
   })
 
   it('sends no consent when the checkbox is unticked', async () => {
@@ -131,17 +163,17 @@ describe('AgentUpdateModal', () => {
     h.plan.data = { ...PLAN, task_pins_dropped: [note] }
     h.applyMock.mockResolvedValue({ job_id: 'j1', to_version: '3.0.0' })
     renderModal()
-    expect(screen.getByText('Model choices left out')).toBeTruthy()
+    expect(screen.getByText('Task choices left out')).toBeTruthy()
     expect(screen.getByText("The task 'digest' runs on the agent's usual model and engine. The model gpt-x is not turned on for OpenAI Codex.")).toBeTruthy()
     h.status.data = { running: false, status: 'done', report: { ...PLAN, task_pins_dropped: [note] } }
     fireEvent.click(screen.getByTestId('update-submit'))
     await waitFor(() => expect(screen.getByTestId('update-report')).toBeTruthy())
-    expect(screen.getByTestId('update-report').textContent).toContain('Model choices left out')
+    expect(screen.getByTestId('update-report').textContent).toContain('Task choices left out')
   })
 
   it('says nothing of model choices when the proxy sends none', () => {
     renderModal()
-    expect(screen.queryByText('Model choices left out')).toBeNull()
+    expect(screen.queryByText('Task choices left out')).toBeNull()
   })
 
   it("lists a refused new version's problems apart", () => {

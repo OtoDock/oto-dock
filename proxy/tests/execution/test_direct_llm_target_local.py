@@ -30,6 +30,7 @@ from core import placement
 from services.remote import remote_status
 from storage import database as task_store, remote_store
 from storage.agents import agent_store
+from tests._compute import COMPUTE, serve
 
 _ADMIN = {"username": "ada", "display_name": "Ada", "email": "a@x", "role": "admin"}
 _DIRECT = {"execution_target": "machine-admin", "execution_path": "direct-llm"}
@@ -76,12 +77,16 @@ def test_resolver_keeps_the_machine_for_a_cli_agent(temp_db):
 def _stub_builder(monkeypatch, tmp_path) -> dict:
     """Stub the heavy collaborators of build_agent_config; the resolver names
     a MACHINE so the builder's own placement decision is what is under test.
-    Captures the placement handed to the MCP config builder."""
+    Captures the placement handed to the MCP config builder. A compute
+    machine serves the platform's place: a session placed ``local`` is built
+    on it (a Direct LLM one keeps its loop in the proxy, its tool processes
+    run there), never on the paired machine the resolver named."""
     from core.config import config_builder as cb
     captured: dict = {}
 
     def _capture_mcp(*a, **k):
         captured["is_remote"] = k["placement"].is_remote
+        captured["placement"] = k["placement"]
         return (None, {}, {}, {}, set())
 
     monkeypatch.setattr(cb.mcp_registry, "build_session_mcp_config", _capture_mcp)
@@ -94,11 +99,14 @@ def _stub_builder(monkeypatch, tmp_path) -> dict:
                         lambda *a, **k: ("sub-test", {}))
     monkeypatch.setattr(cb.remote_status, "resolve_execution_target",
                         lambda *a, **k: ("machine-1", None))
-    monkeypatch.setattr(
-        cb.remote_store, "placement_of",
-        lambda target, *a, **k: (placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, label="My Desktop", machine_id="machine-1")
-                                 if target == "machine-1" else placement.LOCAL_PLACEMENT),
-    )
+    serve(monkeypatch)
+
+    def _placement_of(target, *a, compute=None, **k):
+        if compute:
+            return placement.from_machine(placement.KIND_COMPUTE, compute)
+        return (placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, label="My Desktop", machine_id="machine-1")
+                if target == "machine-1" else placement.LOCAL_PLACEMENT)
+    monkeypatch.setattr(cb.remote_store, "placement_of", _placement_of)
     monkeypatch.setattr(cb.remote_store, "get_remote_machine",
                         lambda *a, **k: {"id": "machine-1", "capabilities": "{}",
                                          "pairing_scope": "admin"})
@@ -111,6 +119,14 @@ def _stub_builder(monkeypatch, tmp_path) -> dict:
     import adapters.dashboard as dash
     monkeypatch.setattr(dash.DashboardAdapter, "build_client_context", lambda self, mc: "")
     return captured
+
+
+def _on_the_platforms_place(where: placement.PlacementCapabilities) -> bool:
+    """The compute machine that serves the platform's place, and nothing of
+    the paired machine the resolver named: no device tools, sandbox paths."""
+    return (where.kind == placement.KIND_COMPUTE and where.machine_id == COMPUTE["id"]
+            and not where.offers_device_tools and not where.needs_path_translation
+            and not where.admin_paired and not where.user_paired)
 
 
 def _build(agent: str, **kw):
@@ -128,8 +144,8 @@ class TestBuilderPlacesDirectLlmLocal:
         captured = _stub_builder(monkeypatch, tmp_path)
         cfg = _build("dl")
         assert cfg.execution_target == "local"
-        assert cfg.security_context.placement.is_local
-        assert captured["is_remote"] is False
+        assert _on_the_platforms_place(cfg.security_context.placement)
+        assert captured["placement"] == cfg.security_context.placement
 
     def test_a_pin_stored_before_the_fix_is_placed_local(self, temp_db, monkeypatch, tmp_path):
         agent_store.create_agent("dl", "DL", execution_path="direct-llm")
@@ -138,8 +154,8 @@ class TestBuilderPlacesDirectLlmLocal:
         with patch("services.remote.remote_status.is_reachable", return_value=True):
             cfg = _build("dl", pinned_target="machine-1")
         assert cfg.execution_target == "local"
-        assert cfg.security_context.placement.is_local
-        assert captured["is_remote"] is False
+        assert _on_the_platforms_place(cfg.security_context.placement)
+        assert captured["placement"] == cfg.security_context.placement
 
     def test_a_chat_level_override_to_direct_llm_is_local_too(self, temp_db, monkeypatch, tmp_path):
         # The agent defaults to the CLI layer (the resolver names its machine);
@@ -149,7 +165,8 @@ class TestBuilderPlacesDirectLlmLocal:
         captured = _stub_builder(monkeypatch, tmp_path)
         cfg = _build("cx", execution_path="direct-llm")
         assert cfg.execution_target == "local"
-        assert captured["is_remote"] is False
+        assert _on_the_platforms_place(cfg.security_context.placement)
+        assert captured["placement"] == cfg.security_context.placement
 
     def test_a_cli_chat_keeps_its_machine(self, temp_db, monkeypatch, tmp_path):
         # Regression guard for every other layer.

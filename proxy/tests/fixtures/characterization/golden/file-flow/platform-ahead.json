@@ -1,0 +1,173 @@
+[
+ {
+  "marks": {},
+  "stale_hold": false,
+  "step": "nothing marked"
+ },
+ {
+  "marks": {
+   "sat-one-0|flow-agent|workspace/m.txt": {
+    "in_flight_until": 0.0,
+    "machine": null,
+    "mtime_ns": 100,
+    "retry_at": 0.0,
+    "size": 10,
+    "stale": false
+   }
+  },
+  "stale_hold": false,
+  "step": "a failed push, no record"
+ },
+ {
+  "marks": {
+   "sat-one-0|flow-agent|workspace/m.txt": {
+    "in_flight_until": 60.0,
+    "machine": null,
+    "mtime_ns": 100,
+    "retry_at": 0.0,
+    "size": 10,
+    "stale": false
+   }
+  },
+  "stale_hold": false,
+  "step": "the same copy in flight keeps its baseline"
+ },
+ {
+  "marks": {
+   "sat-one-0|flow-agent|workspace/m.txt": {
+    "in_flight_until": 60.0,
+    "machine": null,
+    "mtime_ns": 100,
+    "retry_at": 0.0,
+    "size": 10,
+    "stale": false
+   }
+  },
+  "stale_hold": false,
+  "step": "another copy's window end changes nothing"
+ },
+ {
+  "marks": {
+   "sat-one-0|flow-agent|workspace/m.txt": {
+    "in_flight_until": 0.0,
+    "machine": null,
+    "mtime_ns": 100,
+    "retry_at": 0.0,
+    "size": 10,
+    "stale": false
+   }
+  },
+  "stale_hold": false,
+  "step": "its own window ends"
+ },
+ {
+  "marks": {
+   "sat-one-0|flow-agent|workspace/m.txt": {
+    "in_flight_until": 0.0,
+    "machine": {
+     "exists": true,
+     "mtime_ns": 2,
+     "size": 1
+    },
+    "mtime_ns": 100,
+    "retry_at": 0.0,
+    "size": 10,
+    "stale": false
+   }
+  },
+  "stale_hold": false,
+  "step": "a probed baseline replaces"
+ },
+ {
+  "marks": {
+   "sat-one-0|flow-agent|workspace/m.txt": {
+    "in_flight_until": 0.0,
+    "machine": {
+     "exists": true,
+     "mtime_ns": 2,
+     "size": 1
+    },
+    "mtime_ns": 100,
+    "retry_at": 0.0,
+    "size": 10,
+    "stale": true
+   }
+  },
+  "stale_hold": true,
+  "step": "a stale refusal holds"
+ },
+ {
+  "marks": {
+   "sat-one-0|flow-agent|workspace/m.txt": {
+    "in_flight_until": 0.0,
+    "machine": {
+     "exists": true,
+     "mtime_ns": 2,
+     "size": 1
+    },
+    "mtime_ns": 100,
+    "retry_at": 0.0,
+    "size": 10,
+    "stale": true
+   }
+  },
+  "stale_hold": true,
+  "step": "a mark of another copy, no platform file: the mark stands"
+ },
+ {
+  "marks": {
+   "sat-one-0|flow-agent|workspace/m.txt": {
+    "in_flight_until": 0.0,
+    "machine": null,
+    "mtime_ns": 100,
+    "retry_at": 0.0,
+    "size": 10,
+    "stale": true
+   }
+  },
+  "stale_hold": true,
+  "step": "an ack of another copy loses the baseline, the mark stands"
+ },
+ {
+  "marks": {
+   "sat-one-0|flow-agent|workspace/m.txt": {
+    "in_flight_until": 0.0,
+    "machine": null,
+    "mtime_ns": 200,
+    "retry_at": 0.0,
+    "size": 20,
+    "stale": false
+   }
+  },
+  "stale_hold": false,
+  "step": "the platform copy is the new one: replaced"
+ },
+ {
+  "marks": {},
+  "stale_hold": false,
+  "step": "an ack of the copy clears"
+ },
+ {
+  "marks": {
+   "sat-one-0|flow-agent|workspace/m.txt": {
+    "in_flight_until": 0.0,
+    "machine": {
+     "exists": true,
+     "mtime_ns": 70,
+     "size": 7
+    },
+    "mtime_ns": 200,
+    "retry_at": 0.0,
+    "size": 20,
+    "stale": false
+   }
+  },
+  "stale_hold": false,
+  "step": "the baseline is the machine's record"
+ },
+ {
+  "marks": {},
+  "stale_hold": false,
+  "step": "a merge's push clears whatever stands"
+ }
+]

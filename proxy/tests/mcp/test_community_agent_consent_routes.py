@@ -5,11 +5,13 @@ Load-bearing: the preview carries each template app in the approval card's
 row shape with its signature and each check with its words; the install
 route takes a person at the dashboard only (a bearer is refused, whatever
 its role) and passes the caller's own consent through; a template without
-apps or checks previews as before.
+apps or checks previews as before; each tool row names the tool and says
+whether every agent has it.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -87,6 +89,69 @@ def test_the_preview_carries_the_apps_and_checks_in_the_cards_shape(temp_db):
     assert body["apps"] == [] and body["checks"] == []
 
 
+def test_the_preview_says_which_app_brings_a_server(temp_db):
+    """The registry's ``has_server`` reaches the row (the card's media line
+    reads it) and the app's own ``adds_server`` (the dialog's line); an entry
+    the registry wrote before it named a server says nothing."""
+    _as(_admin())
+    with_server = {**ENTRY, "apps": [{**ENTRY["apps"][0], "has_server": True}]}
+    for entry, expected in ((with_server, True), (ENTRY, False)):
+        with patch("services.community.community_agents_catalog.fetch_registry",
+                   new=AsyncMock(return_value={"agents": [entry]})), \
+                patch("services.community.community_catalog.fetch_registry",
+                      new=AsyncMock(return_value={"mcps": []})):
+            (home,) = client.get("/v1/community/agents/pa/preview").json()["apps"]
+        assert home["adds_server"] is expected and home["row"]["has_server"] is expected, home
+
+
+def test_the_preview_names_each_tool_and_says_which_every_agent_has(temp_db):
+    """Each tool row carries its display name (the installed one's, else the
+    community list's, else its name) and whether every agent has it. A tool
+    from the community list waits for a request only when the installer is
+    not an admin: an admin's install adds it at once."""
+    manifests = {"schedules-mcp": SimpleNamespace(label="Schedules", assignment_mode="auto"),
+                 "phone-mcp": SimpleNamespace(label="Phone Calls", assignment_mode="explicit")}
+    entry = {**ENTRY, "required_mcps": [{"name": n} for n in ("schedules-mcp", "notion-mcp", "navis-mcp", "phone-mcp")]}
+
+    def rows(user: UserContext) -> dict[str, dict]:
+        _as(user)
+        with patch("services.community.community_agents_catalog.fetch_registry",
+                   new=AsyncMock(return_value={"agents": [entry]})), \
+                patch("services.community.community_catalog.fetch_registry",
+                      new=AsyncMock(return_value={"mcps": [{"name": "notion-mcp", "label": "Notion"}]})), \
+                patch("services.mcp.mcp_registry.get_manifest", side_effect=manifests.get), \
+                patch("services.mcp.mcp_registry.core_mcp_names", return_value=["schedules-mcp"]), \
+                patch("storage.mcp.mcp_store.get_mcp_instances", return_value=[]):
+            body = client.get("/v1/community/agents/pa/preview").json()
+        return {m["name"]: m for m in body["required_mcps"]}
+
+    admin = rows(_admin())
+    assert {n: (m["label"], m["core"]) for n, m in admin.items()} == {
+        "schedules-mcp": ("Schedules", True), "notion-mcp": ("Notion", False),
+        "navis-mcp": ("navis-mcp", False), "phone-mcp": ("Phone Calls", False)}
+    assert admin["notion-mcp"]["request_type"] == "install" and admin["notion-mcp"]["needs_request"] is False
+    assert admin["navis-mcp"]["blocked"] is True and admin["phone-mcp"]["blocked"] is True
+    assert admin["schedules-mcp"]["needs_request"] is False and admin["schedules-mcp"]["blocked"] is False
+    creator = rows(UserContext(sub="c", email="c@test.com", name="C", role="creator", agents=[], agent_roles={}))
+    assert creator["notion-mcp"]["needs_request"] is True and creator["notion-mcp"]["label"] == "Notion"
+
+
+def test_the_store_lists_each_tool_by_the_name_a_person_reads(temp_db):
+    """The browse list names each tool as the install preview does: the
+    installed one's label, else the community catalog's, else its id."""
+    _as(_admin())
+    entry = {**ENTRY, "required_mcps": [{"name": "schedules-mcp"}, {"name": "notion-mcp"}, {"name": "navis-mcp"}]}
+    with patch("services.community.community_agents_catalog.fetch_registry",
+               new=AsyncMock(return_value={"agents": [entry]})), \
+            patch("services.community.community_catalog.fetch_registry",
+                  new=AsyncMock(return_value={"mcps": [{"name": "notion-mcp", "label": "Notion"}]})), \
+            patch("services.mcp.mcp_registry.get_manifest",
+                  side_effect={"schedules-mcp": SimpleNamespace(label="Schedules")}.get):
+        (card,) = client.get("/v1/community/agents").json()["agents"]
+    assert [(m["name"], m["label"]) for m in card["required_mcps"]] == [
+        ("schedules-mcp", "Schedules"), ("notion-mcp", "Notion"), ("navis-mcp", "navis-mcp")]
+
+
 def test_the_install_route_takes_a_person_and_passes_their_consent(temp_db):
     calls: list[dict] = []
 
@@ -111,11 +176,34 @@ def test_the_install_route_takes_a_person_and_passes_their_consent(temp_db):
     # The consent is the caller's own, whoever the install is for.
     assert kw["consent_by"] == "admin-sub"
     assert kw["app_consent"] == {"home": "sig-home"} and kw["check_consent"] == {"lint": "sig-lint"}
+    assert kw["server_consent"] is None
     # Without the fields nothing is consented.
     calls.clear()
     with patch("services.community.community_agent_installer.install_from_catalog", new=fake_install):
         client.post("/v1/agents/install-from-community", json={"template_slug": "pa"})
     assert calls[0]["consent_by"] == "" and calls[0]["app_consent"] is None
+
+
+def test_the_dialogs_pass_the_apps_whose_server_they_showed(temp_db):
+    calls: list[dict] = []
+
+    async def fake_install(**kw):
+        calls.append(kw)
+        return {"agent_slug": kw["target_slug"], "agent": {}}
+
+    async def fake_apply(agent_slug, by_sub, by_role, **kw):
+        calls.append(kw)
+        return {"job_id": "j", "to_version": "3.0.0"}
+
+    _as(_admin())
+    with patch("services.community.community_agent_installer.install_from_catalog", new=fake_install):
+        r = client.post("/v1/agents/install-from-community", json={
+            "template_slug": "pa", "approve_apps": {"home": "sig-home"}, "approve_servers": ["home"]})
+    assert r.status_code == 200 and calls[-1]["server_consent"] == ["home"], r.text
+    with patch("services.community.community_agent_updater.apply", new=fake_apply):
+        r = client.post("/v1/agents/pa/update-template", json={
+            "from_version": "2.0.0", "approve_apps": {"home": "sig-home"}, "approve_servers": ["home"]})
+    assert r.status_code == 202 and calls[-1]["server_consent"] == ["home"], r.text
 
 
 def test_any_manager_of_the_agent_may_see_and_run_its_update(temp_db):

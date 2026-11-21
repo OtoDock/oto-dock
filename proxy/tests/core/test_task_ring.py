@@ -23,14 +23,14 @@ def ring(monkeypatch):
     concurrency._task_ring_order.clear()
     room = {"mb": 0}
 
-    def _has_room(est, *, is_task):
+    def _has_room(est, *, is_task, box=""):
         return room["mb"] >= est
 
     real_add = concurrency._add
 
-    def _add(session_id, kind, est, owner=""):
+    def _add(session_id, kind, est, owner="", box=""):
         room["mb"] -= est
-        real_add(session_id, kind, est, owner)
+        real_add(session_id, kind, est, owner, box)
 
     monkeypatch.setattr(concurrency, "_has_room", _has_room)
     monkeypatch.setattr(concurrency, "_add", _add)
@@ -88,7 +88,7 @@ async def test_a_cancelled_waiter_leaves_the_ring_and_the_next_head_is_woken(rin
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
-    assert concurrency._task_ring["carol"][0] == ("c2", 100)
+    assert concurrency._task_ring["carol"][0] == ("c2", 100, "")
     assert concurrency._parked_tasks == 2
     await _open(ring, 200)
     assert second.done() and other.done()

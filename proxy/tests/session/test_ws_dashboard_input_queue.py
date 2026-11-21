@@ -754,22 +754,27 @@ def test_a_shared_session_serves_only_the_person_it_was_warmed_for(monkeypatch):
     from types import SimpleNamespace
 
     from core.session import session_state
-    from services.engines import subscription_pool
     from ws.dashboard_chat_send import ChatSendMixin
     conn = SimpleNamespace(user_sub="user-b", user={"username": "bob"})
     serves = ChatSendMixin._session_serves_sender.__get__(conn)
-    monkeypatch.setattr(subscription_pool, "get_session_payer_sub", lambda sid: "")
     monkeypatch.setattr(session_state, "get_session_security",
                         lambda sid: SimpleNamespace(username="alice"))
-    assert serves("s1") is False   # warmed as another person: recycled
+    assert serves("s1", None, {"id": "c1"}) is False   # warmed as another person: recycled
     monkeypatch.setattr(session_state, "get_session_security",
                         lambda sid: SimpleNamespace(username="bob"))
-    assert serves("s1") is True
-    monkeypatch.setattr(subscription_pool, "get_session_payer_sub", lambda sid: "user-a")
-    assert serves("s1") is False   # paid by another person
+    assert serves("s1", None, {"id": "c1"}) is True    # the pool never bound it
+    assert serves("s1", "user-b", {"id": "c1"}) is True
+    assert serves("s1", "user-a", {"id": "c1"}) is False   # paid by another person
+    assert serves("s1", "", {"id": "c1"}) is False         # paid by the shared subscriptions
+    # Built the unattended way, even as this very person: it serves nobody.
+    monkeypatch.setitem(session_state._session_modes, "s1", "auto")
+    assert serves("s1", None, {"id": "c1"}) is False
+    # A delegated lane's chat (a plain id, an agent-scope lane on the shared
+    # owner) in the run's word: its person's message rides it, never recycled.
+    assert serves("s1", "user-b", {"id": "9f2c4c1e-uuid", "origin": "delegated"}) is True
+    monkeypatch.delitem(session_state._session_modes, "s1")
     monkeypatch.setattr(session_state, "get_session_security", lambda sid: None)
-    monkeypatch.setattr(subscription_pool, "get_session_payer_sub", lambda sid: "")
-    assert serves("s1") is False   # unproven: fails closed
+    assert serves("s1", None, {"id": "c1"}) is False   # unproven: fails closed
 
 
 @pytest.mark.asyncio
@@ -2051,10 +2056,10 @@ def test_a_queued_turn_on_a_machine_that_does_not_answer_goes_out_when_it_does(
     the watcher arms the queue again with no reconnect, and the message
     goes out on the resumed session."""
     from core.session import resume_probe
-    from ws import dashboard_warmup, resume_wait
+    from ws import dashboard_warmup_spawn, resume_wait
     layer, gate, slug = _setup(monkeypatch)
     gate.set()
-    monkeypatch.setattr(dashboard_warmup, "RESUME_PROBE_BUDGET_INLINE_S", 0.2)
+    monkeypatch.setattr(dashboard_warmup_spawn, "RESUME_PROBE_BUDGET_INLINE_S", 0.2)
     monkeypatch.setattr(resume_probe, "_PROBE_PAUSE_S", 0.05)
     monkeypatch.setattr(input_queue, "VIEWER_GRACE_S", 0.05)
     resume_wait._watching.clear()
@@ -2149,3 +2154,106 @@ def test_the_meeting_note_is_a_prelude_every_matcher_strips():
     # A person quoting the note's tail mid-message is never touched.
     quoted = 'say "you have only this note.]" back to me'
     assert title_from_prompt(quoted).startswith("say")
+
+
+# ---------------------------------------------------------------------------
+# The platform holds new work for an update (core.drain)
+# ---------------------------------------------------------------------------
+
+def _updating(monkeypatch, on: bool = True) -> None:
+    from core import drain
+    monkeypatch.setattr(drain, "_state", drain.DRAINING if on else drain.RUNNING)
+
+
+def test_a_send_while_the_platform_is_updating_waits_and_goes_out_at_the_resume(
+        temp_db, monkeypatch):
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+    monkeypatch.setattr(input_queue, "VIEWER_GRACE_S", 0.05)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await warm_new_chat(ws, layer, slug)
+            _updating(monkeypatch)
+            ws.client_send({"type": "chat", "text": "during the update", "chat_id": chat_id})
+            # The chip first: at ``done`` the page forgets which bubble it
+            # drew for this send, and the chip takes that bubble's place.
+            queued = await _until(ws, "queued")
+            assert queued["waiting"] == input_queue.WAITING_UPDATING
+            assert queued["text"] == "during the update"
+            await _until(ws, "done")
+            await asyncio.sleep(0.2)          # the armed delivery holds too
+            assert layer.messages == []
+            assert [r["text"] for r in task_store.list_chat_input_queue(chat_id)] == [
+                "during the update"]
+            assert not any(r == "user" for r, _ in _rows(chat_id))
+            # The stop was called off: the chip stops saying why, the message goes out.
+            _updating(monkeypatch, on=False)
+            input_queue.clear_updating()
+            snap = await _until(ws, "queue_snapshot")
+            assert "waiting" not in snap["messages"][0]
+            input_queue.arm(chat_id)
+            await _wait_for(lambda: len(layer.messages) == 1)
+            assert layer.messages[0][:2] == (sid, "during the update")
+    run_ws_scenario(scenario)
+
+
+def test_a_send_behind_a_running_turn_while_updating_never_cuts_it(temp_db, monkeypatch):
+    """Stop-and-send would interrupt the running turn for a message that then
+    waits for the platform anyway: the turn runs to its end, the message
+    stays queued with its reason."""
+    layer, gate, slug = _setup(monkeypatch)
+    layer.interrupt_for_queued_accepts = True
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await _start(ws, layer, slug)
+            _updating(monkeypatch)
+            ws.client_send({"type": "chat", "text": "behind it", "chat_id": chat_id,
+                            "queue_id": "q-behind"})
+            queued = await _until(ws, "queued")
+            assert queued["waiting"] == input_queue.WAITING_UPDATING
+            assert layer.queued_interrupts == []
+            gate.set()
+            await _until(ws, "done")
+            await asyncio.sleep(0.2)
+            assert [m[1] for m in layer.messages] == ["start"]
+            assert [r["text"] for r in task_store.list_chat_input_queue(chat_id)] == ["behind it"]
+    run_ws_scenario(scenario)
+
+
+def test_a_new_chats_first_message_is_refused_while_updating(temp_db, monkeypatch):
+    layer, gate, slug = _setup(monkeypatch)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            before = len(task_store.list_chats("user-admin"))
+            _updating(monkeypatch)
+            ws.client_send({"type": "warmup", "agent": slug, "text": "a new chat",
+                            "queue_id": "q-new"})
+            refused = await _until(ws, "error")
+            assert refused["message"] == wire.PLATFORM_UPDATING and refused["queue_id"] == "q-new"
+            assert layer.started == []
+            assert len(task_store.list_chats("user-admin")) == before
+    run_ws_scenario(scenario)
+
+
+def test_a_plans_implement_is_refused_before_the_close_while_updating(temp_db, monkeypatch):
+    """It closes the bound session and starts one: under a hold the close would
+    leave a chat that nothing starts again."""
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            await warm_new_chat(ws, layer, slug)
+            _updating(monkeypatch)
+            ws.client_send({"type": "implement_plan", "plan_path": "plans/p.md", "mode": "dontAsk"})
+            refused = await _until(ws, "error")
+            assert refused["message"] == wire.PLATFORM_UPDATING
+            assert layer.closed_sessions == []
+    run_ws_scenario(scenario)

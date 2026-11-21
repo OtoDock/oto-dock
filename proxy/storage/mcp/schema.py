@@ -29,6 +29,9 @@ def init_mcp(conn) -> None:
             tool_filter_regex TEXT NOT NULL DEFAULT ''
         )
     """)
+    # An admin's "Keep running" on a Docker tool: its container never sleeps
+    # (services/containers/idle.py).
+    conn.execute("ALTER TABLE mcp_state ADD COLUMN IF NOT EXISTS keep_running BOOLEAN NOT NULL DEFAULT FALSE")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS agent_mcps (
             agent_name TEXT NOT NULL,
@@ -53,6 +56,20 @@ def init_mcp(conn) -> None:
             config_key TEXT NOT NULL,
             config_value TEXT NOT NULL,
             PRIMARY KEY (mcp_name, config_key)
+        )
+    """)
+
+    # The MCP standard's annotations a server last sent for each of its
+    # functions (readOnlyHint, destructiveHint, idempotentHint, openWorldHint
+    # as a JSON object), keyed by the mcpServers key: the permission tiers
+    # and the Outside people picks read them (services/mcp/mcp_permissions.py).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mcp_tool_labels (
+            server_name TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            labels TEXT NOT NULL DEFAULT '{}',
+            listed_at TEXT NOT NULL,
+            PRIMARY KEY (server_name, tool_name)
         )
     """)
 
@@ -143,6 +160,30 @@ def init_community_requests(conn) -> None:
         CREATE INDEX IF NOT EXISTS idx_mcp_requests_batch
         ON mcp_assignment_requests (batch_id)
         WHERE batch_id IS NOT NULL
+    """)
+
+
+def init_mcp_tool_listings(conn) -> None:
+    """What a tool's program answered when a session started it (its
+    handshake, its tool, prompt and resource lists), kept so the next session
+    of the same agent and person answers from it and starts the program only
+    at its first call (``services/mcp/tool_listing.py``). One row per tool and
+    fingerprint (the environment and version the answers depend on); ``person``
+    is the session's username, ``outside:<channel>:<caller id>`` for one outside person, empty for
+    the agent's own runs. Rows go with their agent, and with their person
+    through the person's removal; unused ones after 30 days (the daily
+    retention pass)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mcp_tool_listings (
+            agent_name TEXT NOT NULL REFERENCES agents(slug) ON DELETE CASCADE,
+            person TEXT NOT NULL DEFAULT '',
+            server_name TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            listing TEXT NOT NULL,
+            listed_at TEXT NOT NULL,
+            used_at TEXT NOT NULL,
+            PRIMARY KEY (agent_name, person, server_name, fingerprint)
+        )
     """)
 
 

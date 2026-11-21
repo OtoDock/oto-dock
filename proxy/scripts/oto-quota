@@ -21,7 +21,9 @@ Subcommands
 
   assign   <dir> <project_id>
         Stamp <dir> with <project_id> + the inherit flag, recursively (so files
-        created later inherit the ID). xfs_quota ``project -s -p``.
+        created later inherit the ID). xfs_quota ``project -s -p``. <dir> is an
+        absolute path of plain parts, none of them a link; a folder that
+        already carries the ID and the flag is left as it is (no walk).
 
   setlimit <mountpoint> <project_id> <hard_bytes> <hard_inodes>
         Set the project's hard block + inode limits. ``0`` = unlimited.
@@ -30,12 +32,18 @@ Subcommands
         Print ``<used_bytes> <used_inodes>`` for the project (O(1), no walk).
 
 Security: this is a sudo entry point, so every argument is re-validated here —
-project IDs must be integers in the reserved range, paths are realpath'd, and
-quota mutation requires the target to be an XFS mount with project quota active.
+project IDs must be integers in the reserved range, a mountpoint is realpath'd,
+an ``assign`` folder is opened part by part with no link followed (sessions and
+tools write inside the scope folders, so a link there is never the
+platform's), and quota mutation requires the target to be an XFS mount with
+project quota active.
 """
 
+import fcntl
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -44,6 +52,12 @@ import sys
 # project IDs.
 PROJECT_ID_BASE = 0x40000000
 PROJECT_ID_MAX = 0xFFFFFFFF - 1
+# One part of an ``assign`` path: the only text that reaches xfs_quota's
+# command line besides the project number. Twin of storage_quota._PLAIN_PART.
+PLAIN_PART = re.compile(r"[A-Za-z0-9._@+-]+")
+# ioctl(FS_IOC_FSGETXATTR): struct fsxattr is five u32 and 8 bytes of padding.
+FS_IOC_FSGETXATTR = 0x801C581F
+FS_XFLAG_PROJINHERIT = 0x00000200
 
 
 def die(msg: str, code: int = 1):
@@ -84,6 +98,35 @@ def real_dir(raw: str) -> str:
     if not os.path.isdir(p):
         die(f"path {raw!r} is not an existing directory")
     return p
+
+
+def plain_dir(raw: str) -> tuple[str, int]:
+    """``(path, fd)`` of an absolute folder path whose every part is a plain
+    name, opened part by part from ``/`` with no link followed. The caller
+    closes ``fd``."""
+    parts = raw.split("/")[1:] if raw.startswith("/") else []
+    if not parts or not all(PLAIN_PART.fullmatch(p) and p.strip(".") for p in parts):
+        die(f"path {raw!r} is not an absolute path of plain folder names")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            step = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = step
+    except OSError as e:
+        os.close(fd)
+        die(f"path {raw!r} is not a folder reached without a link ({e.strerror})")
+    return raw, fd
+
+
+def stamped(fd: int, pid: int) -> bool:
+    """Whether the folder ``fd`` already carries ``pid`` and the inherit flag."""
+    try:
+        attrs = fcntl.ioctl(fd, FS_IOC_FSGETXATTR, bytes(28))
+    except OSError:
+        return False
+    xflags, _extsize, _nextents, projid = struct.unpack_from("=IIII", attrs)
+    return projid == pid and bool(xflags & FS_XFLAG_PROJINHERIT)
 
 
 def mount_info(path: str) -> tuple[str, str, str] | None:
@@ -138,13 +181,17 @@ def cmd_assign(args: list[str]):
     if len(args) != 2:
         die("usage: oto-quota assign <dir> <project_id>")
     need_tool("xfs_quota")
-    target = real_dir(args[0])
-    pid = valid_pid(args[1])
-    mp = require_xfs_prjquota(target)
-    # -s sets up the project: stamps the inherit flag on dirs + recursively
-    # assigns the id to existing files. -p <path> <id> defines it inline so we
-    # never touch /etc/projects / /etc/projid.
-    run(["xfs_quota", "-x", "-c", f"project -s -p {target} {pid}", mp])
+    target, fd = plain_dir(args[0])
+    try:
+        pid = valid_pid(args[1])
+        mp = require_xfs_prjquota(target)
+        if not stamped(fd, pid):
+            # -s sets up the project: stamps the inherit flag on dirs + recursively
+            # assigns the id to existing files. -p <path> <id> defines it inline so we
+            # never touch /etc/projects / /etc/projid.
+            run(["xfs_quota", "-x", "-c", f"project -s -p {target} {pid}", mp])
+    finally:
+        os.close(fd)
     print("ok")
 
 
@@ -201,7 +248,27 @@ _COMMANDS = {
 }
 
 
+#: The compute unit runs sessions as the same account as the server: a call
+#: from it is refused. sudo's child stays in its caller's cgroup. The check
+#: does not see a caller that left the compute unit's cgroup first: through a
+#: sudo whose PAM stack opens a systemd session (pam_systemd), or through the
+#: account's own user manager where one runs.
+COMPUTE_UNIT = "otodock-compute.service"
+CGROUP_FILE = "/proc/self/cgroup"
+
+
+def refuse_compute_caller() -> None:
+    try:
+        with open(CGROUP_FILE) as f:
+            paths = [line.rstrip("\n").split(":", 2)[-1] for line in f]
+    except OSError:
+        die("cannot read the caller's cgroup")
+    if any(COMPUTE_UNIT in path.split("/") for path in paths):
+        die("refused: the compute unit may not drive storage quotas")
+
+
 def main():
+    refuse_compute_caller()
     if len(sys.argv) < 2 or sys.argv[1] not in _COMMANDS:
         die(f"usage: oto-quota {{{'|'.join(_COMMANDS)}}} <args...>", code=2)
     _COMMANDS[sys.argv[1]](sys.argv[2:])

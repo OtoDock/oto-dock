@@ -1820,9 +1820,10 @@ function runExtensionSupervisor(cli, cfg, opts) {
     if (profile.error) return profile.error;
     if (opts.unattended && !opts.hasToken)
       return (
-        "This unattended session (task, call or meeting) cannot click Allow in the " +
-        "user's browser. Save the Playwright Extension token in the machine's settings " +
-        "(Remote machines → Use my own browser) so sessions connect without asking."
+        "Nobody is at this computer's screen for this session: it is a task, a trigger, a call, " +
+        "a meeting or a message sent with an API key. So it cannot click Allow in the browser. " +
+        "It can use this browser once a token is saved and the computer's owner ticks " +
+        "\"Also let unattended runs use this browser\" in the machine's settings, under Remote Machines."
       );
     return null;
   }

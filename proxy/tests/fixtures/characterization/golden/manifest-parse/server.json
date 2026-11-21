@@ -1,0 +1,136 @@
+{
+ "compose inside": {
+  "parsed": {
+   "args": [
+    "server.py"
+   ],
+   "command": "python3",
+   "docker_compose": "deploy/compose.yml",
+   "runtime": "python",
+   "transport": "stdio"
+  }
+ },
+ "compose outside": {
+  "parsed": {
+   "args": [
+    "server.py"
+   ],
+   "command": "python3",
+   "runtime": "python",
+   "transport": "stdio"
+  },
+  "warnings": [
+   "char-mcp: server.docker_compose '../compose.yml' is not a plain relative path, dropped"
+  ]
+ },
+ "defaults": {
+  "parsed": {
+   "runtime": "python",
+   "transport": "stdio"
+  }
+ },
+ "good range": {
+  "parsed": {
+   "args": [
+    "server.py"
+   ],
+   "command": "python3",
+   "runtime": "python",
+   "transport": "stdio",
+   "version_constraint": ">=2,<3"
+  }
+ },
+ "npm range": {
+  "parsed": {
+   "args": [
+    "server.py"
+   ],
+   "command": "python3",
+   "runtime": "python",
+   "transport": "stdio"
+  },
+  "warnings": [
+   "char-mcp: invalid server.version_constraint '^2' (expected a PEP 440 specifier like '>=2,<3') — treating as unbounded"
+  ]
+ },
+ "source build entries": {
+  "parsed": {
+   "args": [
+    "server.py"
+   ],
+   "command": "python3",
+   "runtime": "python",
+   "source_build": [
+    "ok-pkg"
+   ],
+   "transport": "stdio"
+  },
+  "warnings": [
+   "char-mcp: server.source_build entry 'bad name' is not a package name; dropped",
+   "char-mcp: server.source_build entry 3 is not a package name; dropped"
+  ]
+ },
+ "timeout bool": {
+  "parsed": {
+   "args": [
+    "server.py"
+   ],
+   "command": "python3",
+   "runtime": "python",
+   "transport": "stdio"
+  },
+  "warnings": [
+   "char-mcp: server.tool_timeout_sec True is not a whole number of seconds from 1 to 3600; Codex keeps its default"
+  ]
+ },
+ "timeout good": {
+  "parsed": {
+   "args": [
+    "server.py"
+   ],
+   "command": "python3",
+   "runtime": "python",
+   "tool_timeout_sec": 3600,
+   "transport": "stdio"
+  }
+ },
+ "timeout high": {
+  "parsed": {
+   "args": [
+    "server.py"
+   ],
+   "command": "python3",
+   "runtime": "python",
+   "transport": "stdio"
+  },
+  "warnings": [
+   "char-mcp: server.tool_timeout_sec 3601 is not a whole number of seconds from 1 to 3600; Codex keeps its default"
+  ]
+ },
+ "timeout text": {
+  "parsed": {
+   "args": [
+    "server.py"
+   ],
+   "command": "python3",
+   "runtime": "python",
+   "transport": "stdio"
+  },
+  "warnings": [
+   "char-mcp: server.tool_timeout_sec '5' is not a whole number of seconds from 1 to 3600; Codex keeps its default"
+  ]
+ },
+ "timeout zero": {
+  "parsed": {
+   "args": [
+    "server.py"
+   ],
+   "command": "python3",
+   "runtime": "python",
+   "transport": "stdio"
+  },
+  "warnings": [
+   "char-mcp: server.tool_timeout_sec 0 is not a whole number of seconds from 1 to 3600; Codex keeps its default"
+  ]
+ }
+}

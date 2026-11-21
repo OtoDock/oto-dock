@@ -13,11 +13,16 @@ export interface ModelRef {
 }
 
 
+// A chat's own continuation runs on the chat's model whatever a pin says
+// (the server's source word).
+const CHATS_OWN_MODEL = "the chat's"
+
 // The tooltip's lead for an unpinned task, by the source the server tags:
 // a person's own task runs on the engine their chats take ('your engine').
 const UNPINNED_SOURCE_WORDS: Record<string, string> = {
   'layer default': 'Engine default',
   'your engine': 'Your engine',
+  [CHATS_OWN_MODEL]: "The chat's own model",
 }
 
 /**
@@ -37,7 +42,7 @@ const UNPINNED_SOURCE_WORDS: Record<string, string> = {
  */
 export function TaskModelChip({ task }: { task: ModelRef }) {
   if (!task.effective_model) return null
-  const pinned = !!task.override_model
+  const pinned = !!task.override_model && task.effective_model_source !== CHATS_OWN_MODEL
   const layer = task.override_execution_path || ''
   const source = task.effective_model_source
     || (pinned ? 'pinned' : 'agent default')

@@ -3,7 +3,9 @@ in their own GitHub connection, narrows the agent to and whether it may
 write, and the one rule the places that hand GitHub out share. The MCP's tool calls (``core/credentials/mcp_gateway``),
 git and gh (``/v1/hooks/cli-credential``) and an app step judge with these
 functions; an installation binding of an admin's own app is narrowed at
-GitHub as well (``read_only_permissions``).
+GitHub as well (``read_only_permissions``). Each request that will carry
+git's and gh's token through the credential exit is judged too
+(``judge_request``, asked by the exit through the same route).
 
 A reach names repositories as ``owner/name``, compared without case (GitHub
 names are case-insensitive). An empty set is every repository the bound
@@ -19,10 +21,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import string
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from auth import gh_flags
 from auth.request_path import has_traversal
@@ -50,6 +54,13 @@ _IDENTITY_TOOLS = frozenset({"get_me", "get_teams", "get_team_members"})
 # any reach, and a sub-issue is named by a global id that can be any
 # repository's issue.
 _REFUSED_TOOLS = frozenset({"create_repository", "fork_repository", "sub_issue_write"})
+# The same for a review thread: the tool resolves one by its global id and
+# reads no repository for it, whatever the call names beside it.
+_THREAD_TOOL = "pull_request_review_write"
+_THREAD_METHODS = frozenset({"resolve_thread", "unresolve_thread"})
+_THREAD_ID = "threadid"
+# What an engine writes into a field it does not use.
+_NOT_SET = (None, "")
 # The searches: their ``query`` is held to its ``repo:`` qualifiers, or
 # given the reach's. A ``query`` on any other tool earns it nothing.
 _SEARCH_TOOLS = frozenset({
@@ -265,6 +276,13 @@ _WIDENING_SENTENCE = (
     "OR, or NOT before repo:, and gh may not use --owner, --org or --user."
 )
 UNREADABLE = "This request to GitHub could not be read, so it was refused."
+#: What a search at the exit is told to change (``_judge_search``), after
+#: the sentence that names the list.
+SEARCH_ADDRESS = "A search's address holds q, and may hold sort, order, per_page and page, each once and with a value."
+SEARCH_CONTROL = "Take the control characters out of the search."
+SEARCH_OWN_WORD = "Write each repo:owner/name as a word of its own, with a plain space before it."
+SEARCH_FIRST = "Write repo:owner/name as a word of its own before any quotation mark, with a plain space after it."
+LINKS_REFUSED = "A change of an issue's sub-issues, dependencies or related issues is not allowed for it."
 METHOD_REFUSED = "This agent's GitHub reach does not allow this request."
 PATH_REFUSED = "A path in this request could lead outside the repository, so it was refused."
 
@@ -387,6 +405,15 @@ class Verdict:
     body: bytes | None = None
 
 
+def _names_a_thread(args: dict) -> bool:
+    """Whether a review call acts on a thread: by its method, or by a
+    thread's id among its arguments under any spelling of the key."""
+    method = args.get("method")
+    if isinstance(method, str) and method.strip().lower() in _THREAD_METHODS:
+        return True
+    return any(str(k).replace("_", "").lower() == _THREAD_ID and v not in _NOT_SET for k, v in args.items())
+
+
 def _judge_call(
     reach: Reach, name: str, args: dict, writes: Callable[[str], bool | None],
 ) -> tuple[str, dict | None]:
@@ -396,6 +423,8 @@ def _judge_call(
         return "", None
     if name in _REFUSED_TOOLS:
         return f"{_only(reach)} The tool {name} is not allowed for it.", None
+    if name == _THREAD_TOOL and _names_a_thread(args):
+        return f"{_only(reach)} The tool {name} may not resolve a review thread for it.", None
     if steps_out(args):
         return PATH_REFUSED, None
     named = named_in_arguments(args)
@@ -601,9 +630,21 @@ _GH_REPO_TARGET = frozenset({"view", "clone", "edit", "delete", "archive", "unar
 _GH_REPO_NOT_ALLOWED = frozenset({"create", "fork", "list"})
 _GH_REPO_SOURCE = "--source"
 # ``gh pr list`` and ``gh issue list`` take a search, held to its ``repo:``
-# qualifiers as a search is.
+# qualifiers as a search is. gh adds the repository it works in to that
+# search, so the qualifiers' repositories are judged beside it.
 _GH_QUERY_FLAGS = frozenset({"--search", "-S"})
 _GH_QUERY_GROUPS = frozenset({"pr", "issue"})
+# The groups that take an issue or a pull request by its address and then
+# work in the address's repository. In every other group an address among
+# the words is a name, a tag or a file, and gh works where it would without.
+_GH_BY_ADDRESS = frozenset({"pr", "issue"})
+# A repository a command names beside the one it works in: by the place of
+# its argument after the verb (where an issue moves to, where labels are
+# copied from) or by a flag (where a linked branch is made). An issue a flag
+# takes by its address names its repository beside the one worked in too.
+_GH_SECOND_ARGUMENT = {("issue", "transfer"): 1, ("label", "clone"): 0}
+_GH_SECOND_FLAGS = {"issue": frozenset({"--branch-repo"})}
+_GH_ISSUE_FLAGS = {"issue": frozenset({"--duplicate-of"})}
 # Flags that reach past a repository: an owner's search, an organization's
 # or a user's secrets, variables and rulesets.
 _GH_WIDENING_FLAGS: dict[str, frozenset[str]] = {
@@ -711,11 +752,52 @@ def _gh_repo_flag(value: str) -> str:
     return normalize("/".join(parts)) or text.lower()
 
 
+def _gh_owner_missing(reach: Reach, word: str) -> str:
+    """The refusal for a repository named without its owner, ``""`` for
+    ``owner/name`` or an address (which holds a slash too)."""
+    if "/" not in word:
+        return f"{_only(reach)} {word} names no owner. Write it as owner/name."
+    return ""
+
+
 def _gh_query_refusal(reach: Reach, query: str, named: list[str]) -> str:
     if widens(query):
         return _WIDENING_SENTENCE.format(only=_only(reach))
     named += named_in_query(query)
     return ""
+
+
+def _gh_named(
+    reach: Reach, cmd: _GhCommand, group: str, verb: str, gh_repo: str,
+) -> tuple[str, list[str], list[str]]:
+    """The repositories a gh command's flags, words and ``GH_REPO`` name:
+    the ones gh works in, in place of the working directory's, and the ones
+    it reaches beside it. A second repository without its owner is refused."""
+    works_in = [_gh_repo_flag(r) for r in cmd.values(_GH_REPO_FLAGS)]
+    if gh_repo.strip():
+        works_in.append(_gh_repo_flag(gh_repo))
+    beside: list[str] = []
+    second = _GH_SECOND_ARGUMENT.get((group, verb))
+    for place, word in enumerate(cmd.words[1:], start=0 if group in _GH_NO_VERB else -1):
+        name = name_of_url(word)
+        if place == second:
+            refusal = _gh_owner_missing(reach, word)
+            if refusal:
+                return refusal, [], []
+            beside.append(_gh_repo_flag(word))
+        elif name and group in _GH_BY_ADDRESS:
+            works_in.append(name)
+        elif name and (group in _GH_IN_A_REPOSITORY or group == _GH_SEARCH):
+            beside.append(name)
+        elif name:
+            works_in.append(name)
+    for value in cmd.values(_GH_SECOND_FLAGS.get(group, frozenset())):
+        refusal = _gh_owner_missing(reach, value)
+        if refusal:
+            return refusal, [], []
+        beside.append(_gh_repo_flag(value))
+    beside += [n for n in map(name_of_url, cmd.values(_GH_ISSUE_FLAGS.get(group, frozenset()))) if n]
+    return "", works_in, beside
 
 
 def judge_gh(
@@ -724,7 +806,9 @@ def judge_gh(
     """A ``gh`` command (its arguments after ``gh``) under ``reach``: the
     refusal, ``""`` to run it. ``remotes`` are the working directory's git
     remote addresses and ``gh_repo``/``gh_host`` the command's ``GH_REPO``
-    and ``GH_HOST``, which gh falls back on."""
+    and ``GH_HOST``, which gh falls back on. Judged: the repository gh works
+    in (what the command names in its place, else every GitHub remote) and
+    every repository the command names beside it."""
     if not reach.narrows:
         return ""
     cmd = _gh_parse(list(argv or []))
@@ -742,58 +826,385 @@ def judge_gh(
         reading = "*" in reads or verb in reads
         if not reading or (group == _GH_API and _gh_method(cmd) != _GH_GET):
             return read_only_sentence(reach, "This gh command", "it did not run")
-    identity = (group == _GH_AUTH and verb == "status") or (group == _GH_API and path == _GH_USER_ENDPOINT)
+    identity = group == _GH_AUTH and verb == "status"
     if not reach.repositories or identity:
         return ""
+    if group == _GH_API and path == _GH_USER_ENDPOINT:
+        # Who the account is: the address is judged as the exit judges the
+        # request it becomes.
+        return _gh_api_refusal(reach, cmd, path)
     for host in [gh_host, *cmd.values(_GH_HOST_FLAGS)]:
         if host.strip() and host.strip().lower() not in _GITHUB_HOSTS:
             return f"{_only(reach)} This gh command is set to another host, {host.strip()}."
     if cmd.has(_GH_WIDENING_FLAGS.get(group, frozenset())):
         return _WIDENING_SENTENCE.format(only=_only(reach))
-    named = [_gh_repo_flag(r) for r in cmd.values(_GH_REPO_FLAGS)]
-    if gh_repo.strip():
-        named.append(_gh_repo_flag(gh_repo))
-    for word in cmd.words[1:]:
-        name = name_of_url(word)
-        if name:
-            named.append(name)
+    refusal, works_in, beside = _gh_named(reach, cmd, group, verb, gh_repo)
+    if refusal:
+        return refusal
     if group in _GH_QUERY_GROUPS:
         for query in cmd.values(_GH_QUERY_FLAGS):
-            refusal = _gh_query_refusal(reach, query, named)
+            refusal = _gh_query_refusal(reach, query, beside)
             if refusal:
                 return refusal
     if group == _GH_REPO:
         if verb in _GH_REPO_NOT_ALLOWED:
             return f"{_only(reach)} The command gh repo {verb} is not allowed for it."
         if verb in _GH_REPO_TARGET and args:
-            target = args[0]
-            if "/" not in target and not urlsplit(target).netloc:
-                return f"{_only(reach)} {target} names no owner. Write it as owner/name."
-            named.append(_gh_repo_flag(target))
-        named += [_gh_repo_flag(v) for v in cmd.values(frozenset({_GH_REPO_SOURCE}))]
+            refusal = _gh_owner_missing(reach, args[0])
+            if refusal:
+                return refusal
+            works_in.append(_gh_repo_flag(args[0]))
+        works_in += [_gh_repo_flag(v) for v in cmd.values(frozenset({_GH_REPO_SOURCE}))]
     if group == _GH_SEARCH:
-        refusal = _gh_query_refusal(reach, " ".join(args), named)
+        refusal = _gh_query_refusal(reach, " ".join(args), works_in)
         if refusal:
             return refusal
     in_a_repository = group in _GH_IN_A_REPOSITORY
+    tail: str | None = None
     if group == _GH_API:
+        # What the command check refuses on its own, stricter than the
+        # request's rule: any percent sign, and every address that is not
+        # ``repos/<owner>/<name>/…`` (the root, a search, a whole address).
         if has_traversal(path) or "%" in path:
             return PATH_REFUSED
         segments = path.split("/")
-        if len(segments) < 3 or segments[0] != "repos":
+        if len(segments) < 3 or segments[0] != _REPOS:
             return f"{_only(reach)} This gh api call names none of them."
         if tuple(segments[1:3]) == _GH_PLACEHOLDERS:
             in_a_repository = True              # gh fills them from GH_REPO or the remote
+            tail = "/".join(segments[3:])
         else:
-            named.append(normalize(f"{segments[1]}/{segments[2]}") or f"{segments[1]}/{segments[2]}".lower())
-    if not named and in_a_repository:
-        named = [n for n in (name_of_remote(r) for r in remotes or []) if n]
-    if not named:
-        return f"{_only(reach)} This gh command names none of them."
-    for n in named:
+            # The address names its repository: the request's rule owns
+            # whether it may go.
+            refusal = _gh_api_refusal(reach, cmd, path)
+            if refusal:
+                return refusal
+            works_in.append(name_of_url(f"https://{_API_HOST}/{path}") or f"{segments[1]}/{segments[2]}".lower())
+    if not works_in and in_a_repository:
+        works_in = [n for n in (name_of_remote(r) for r in remotes or []) if n]
+    for n in works_in + beside:
         if n not in reach.repositories:
             return outside_sentence(reach, n)
+    if not works_in:
+        return f"{_only(reach)} This gh command names none of them."
+    if tail is not None:
+        # gh writes the repository into the address: each one it may take is
+        # judged as the address it becomes.
+        for n in works_in:
+            refusal = _gh_api_refusal(reach, cmd, f"{_REPOS}/{n}/{tail}".rstrip("/"))
+            if refusal:
+                return refusal
     return ""
+
+
+def _gh_api_refusal(reach: Reach, cmd: _GhCommand, path: str) -> str:
+    """A ``gh api`` address under a repository list, judged by the rule that
+    judges the request it becomes (``judge_request``): one rule for a REST
+    address, at the command and at the exit. Read only is the command
+    check's own above: under it only a GET reaches here."""
+    return judge_request(reach, _gh_method(cmd), _API_HOST, f"/{path}").refusal
+
+
+# ---------------------------------------------------------------------------
+# A request at the credential exit
+# ---------------------------------------------------------------------------
+
+#: The most of a request's body the rule reads (a GraphQL document, an LFS
+#: batch): a larger one is refused. A machine's exit sends the body to the
+#: platform inside its ask, which must fit the request body the middleware
+#: lets a command-line token send (64 KB), base64 and all.
+REQUEST_BODY_MAX = 32 * 1024
+#: How a refusal reaches its caller: plain text git prints as ``remote:``
+#: lines, a JSON message gh prints, the same under git-lfs's own type.
+KIND_GIT, KIND_API, KIND_LFS = "git", "api", "lfs"
+_UPLOADS_HOST = "uploads.github.com"
+_REQUEST_READS = frozenset({"GET", "HEAD"})
+_POST = "POST"
+_RECEIVE_PACK = "git-receive-pack"
+_UPLOAD_PACK = "git-upload-pack"
+_INFO_REFS = ["info", "refs"]
+_LFS = ["info", "lfs"]
+_LFS_BATCH = ["info", "lfs", "objects", "batch"]
+_LFS_DOWNLOAD = "download"
+_LFS_UPLOAD = "upload"
+_JSON_TYPE = "application/json"
+_CHARSET = "charset"
+_UTF_8 = "utf-8"
+_LFS_TYPE = "application/vnd.git-lfs+json"
+_GRAPHQL = ["graphql"]
+_GRAPHQL_KEYS = frozenset({"query", "variables", "operationName"})
+# A document that holds either word may change something: GraphQL's
+# keywords have case, and only an operation of these kinds writes.
+_GRAPHQL_WRITES = ("mutation", "subscription")
+# The addresses under a repository that make a new one: a fork, a
+# repository from a template, an advisory's temporary private fork.
+_NEW_REPOSITORY = frozenset({"forks", "generate"})
+_ADVISORIES = "security-advisories"
+_FORKS = "forks"
+# The addresses under an issue that change its links to other issues (its
+# sub-issues, the issues that block it, its related issues): the request
+# names the other issue by an id alone, in its body or as its last segment,
+# and that id can be any repository's.
+_ISSUES = "issues"
+_LINKED_BY_ID = frozenset({"sub_issues", "sub_issue", "dependencies", "relates_to"})
+# What a URL parser ends an address at (a number sign) or drops from it (a
+# tab, a carriage return, a line feed): with one of them the text judged
+# here is not the address that is read or sent.
+_RESHAPED = frozenset("#\t\r\n")
+_REPOS = "repos"
+_SEARCH = "search"
+_SEARCH_QUERY = "q"
+_SEARCH_KEYS = frozenset({_SEARCH_QUERY, "sort", "order", "per_page", "page"})
+# A word that scopes a search, wherever it stands in the text.
+_SCOPE_WORD = re.compile(r"(?i)(repo|org|user|owner|enterprise):")
+_REPO_KEY = "repo"
+# After one of these a scope word is the inside of another word in every
+# reading (``monorepo:build``): no search grammar splits a word there.
+_INSIDE_A_WORD = frozenset(string.ascii_letters + string.digits + "_")
+_QUOTE = '"'
+_ESCAPE = "\\"
+_CONTROL = "Cc"
+# The control characters pasted text holds. They are blanks, never words.
+_PASTED_BLANKS = frozenset("\t\r\n")
+# What stands before a phrase's opening quotation mark, and after a word.
+_PHRASE_START = ("", " ", ":")
+_WORD_END = ("", " ")
+_IDENTITY_PATHS: tuple[list[str], ...] = ([], [_GH_USER_ENDPOINT])
+# GitHub names a repository's next page by its number: the answer's ``Link``
+# header is rewritten to the name, so the next request is judged as any.
+_LINK_BY_NUMBER = r"https://api\.github\.com/repositories/\d+/"
+REQUEST = "This request to GitHub"
+
+
+@dataclass(frozen=True)
+class RequestVerdict:
+    """A judged request: the refusal its caller reads (``kind`` says in
+    which form), else ``wants_body`` (the body must be read, up to that
+    many bytes, and the request judged again with it), else it goes: with
+    ``body`` in the place of the one read, and with the answer's ``Link``
+    header rewritten (``link``: a pattern and what replaces each match)."""
+
+    refusal: str = ""
+    kind: str = KIND_API
+    wants_body: int = 0
+    body: bytes | None = None
+    link: tuple[str, str] | None = None
+
+
+def _names_none(reach: Reach) -> str:
+    return f"{_only(reach)} {REQUEST} names none of them."
+
+
+def _strict_json(body: bytes) -> Any:
+    """A JSON text read as the judge reads every one (``_strict_object``);
+    raises ``ValueError``."""
+    return json.loads(body.decode("utf-8"), object_pairs_hook=_strict_object, parse_constant=_no_constant)
+
+
+def _media_type(content_type: str) -> str:
+    """The media type of a body the rule reads as UTF-8, ``""`` for a
+    header it cannot take so: more than one type (the exit joins a repeated
+    header with a comma) or a ``charset`` that is not UTF-8."""
+    text = content_type or ""
+    if "," in text:
+        return ""
+    media, *parameters = (part.strip() for part in text.split(";"))
+    for parameter in parameters:
+        key, _, value = parameter.partition("=")
+        if key.strip().lower() == _CHARSET and value.strip().strip('"').lower() != _UTF_8:
+            return ""
+    return media.lower()
+
+
+def _request_object(body: bytes, content_type: str, content_encoding: str, types: tuple[str, ...]) -> dict | None:
+    """A request's body as one JSON object, None when it cannot be read as
+    the server will read it: another content type or two, a charset that is
+    not UTF-8, any content encoding, a text that is not strict JSON, a list."""
+    if _media_type(content_type) not in types or (content_encoding or "").strip().lower() not in ("", "identity"):
+        return None
+    try:
+        doc = _strict_json(body)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _judge_git_request(reach: Reach, verb: str, path: str, segments: list[str], query: str,
+                       content_type: str, content_encoding: str, body: bytes | None) -> RequestVerdict:
+    """A request to a git host: the first two segments name the repository,
+    the service and the method say whether it writes."""
+    kind = KIND_LFS if segments[2:4] == _LFS else KIND_GIT
+    if reach.repositories and len(segments) < 2:
+        return RequestVerdict(refusal=_names_none(reach), kind=kind)
+    refusal = judge_git(reach, path.lstrip("/"))
+    if refusal:
+        return RequestVerdict(refusal=refusal, kind=kind)
+    if not reach.read_only:
+        return RequestVerdict()
+    last = segments[-1] if segments else ""
+    if last == _RECEIVE_PACK or (segments[-2:] == _INFO_REFS and _RECEIVE_PACK in unquote(query).lower()):
+        return RequestVerdict(refusal=push_refused(reach), kind=kind)
+    if verb in _REQUEST_READS or (verb == _POST and last == _UPLOAD_PACK):
+        return RequestVerdict()
+    if verb == _POST and segments[-4:] == _LFS_BATCH:
+        if body is None:
+            return RequestVerdict(wants_body=REQUEST_BODY_MAX, kind=kind)
+        doc = _request_object(body, content_type, content_encoding, (_LFS_TYPE, _JSON_TYPE))
+        operation = doc.get("operation") if doc is not None else None
+        if operation == _LFS_DOWNLOAD and doc is not None:
+            # What goes on is what was judged, never the caller's own bytes.
+            return RequestVerdict(body=json.dumps(doc).encode())
+        if operation == _LFS_UPLOAD:
+            return RequestVerdict(refusal=read_only_sentence(reach, "This upload to GitHub"), kind=kind)
+        return RequestVerdict(refusal=UNREADABLE, kind=kind)
+    return RequestVerdict(refusal=read_only_sentence(reach, REQUEST), kind=kind)
+
+
+def _judge_graphql(reach: Reach, verb: str, query: str, content_type: str, content_encoding: str,
+                   body: bytes | None) -> RequestVerdict:
+    """GitHub's GraphQL address. A repository list is not applied: the
+    document names its repositories inside itself and walks from one to
+    another. Read only is: a document that may change something is refused."""
+    if verb != _POST or query:
+        return RequestVerdict(refusal=METHOD_REFUSED)
+    if not reach.read_only:
+        return RequestVerdict()
+    if body is None:
+        return RequestVerdict(wants_body=REQUEST_BODY_MAX)
+    doc = _request_object(body, content_type, content_encoding, (_JSON_TYPE,))
+    document = doc.get("query") if doc is not None else None
+    if doc is None or set(doc) - _GRAPHQL_KEYS or not isinstance(document, str) or not document:
+        return RequestVerdict(refusal=UNREADABLE)
+    if any(word in document for word in _GRAPHQL_WRITES):
+        return RequestVerdict(refusal=read_only_sentence(reach, "This GraphQL request"))
+    return RequestVerdict(body=json.dumps(doc).encode())
+
+
+def _firm(asked: str, m: re.Match[str]) -> bool:
+    """Whether a counted ``repo:`` is a qualifier in every reading of the
+    text: a word of its own (the text's start or a plain space before it, a
+    plain space or the text's end after its value), and outside every
+    quoted phrase however the quotation marks are paired. So either no
+    quotation mark stands before it, or those before it are whole phrases:
+    each opens at a word's start and closes at a word's end, none behind a
+    backslash."""
+    start = m.start()
+    if asked[start - 1:start] not in _WORD_END or asked[m.end():m.end() + 1] not in _WORD_END:
+        return False
+    quotes = [i for i, c in enumerate(asked[:start]) if c == _QUOTE]
+    if len(quotes) % 2:
+        return False
+    for n, i in enumerate(quotes):
+        before, after = asked[i - 1:i], asked[i + 1:i + 2]
+        if n % 2 == 0 and before not in _PHRASE_START:
+            return False
+        if n % 2 and (after not in _WORD_END or before == _ESCAPE):
+            return False
+    return True
+
+
+def _search_fault(reach: Reach, asked: str) -> str:
+    """Why a search's words cannot be judged, as what to change ("" when
+    they can). ``named_in_query`` counts a ``repo:`` with a value at the
+    text's start, after a blank or after a parenthesis. A scope word
+    anywhere else that is not the inside of another word could be a
+    qualifier in GitHub's reading that the count missed (after a comma, a
+    quotation mark, a hyphen, with its value after a space), so it is
+    refused: for ``repo:`` with what to write, for the others as widening."""
+    if any(unicodedata.category(c) == _CONTROL and c not in _PASTED_BLANKS for c in asked):
+        return f"{_only(reach)} {SEARCH_CONTROL}"
+    counted = {m.start() + len(m.group(1)) for m in _REPO_QUALIFIER.finditer(asked)}
+    for m in _SCOPE_WORD.finditer(asked):
+        if asked[m.start() - 1:m.start()] in _INSIDE_A_WORD:
+            continue
+        if m.group(1).lower() != _REPO_KEY:
+            return _WIDENING_SENTENCE.format(only=_only(reach))
+        if m.start() not in counted:
+            return f"{_only(reach)} {SEARCH_OWN_WORD}"
+    return ""
+
+
+def _judge_search(reach: Reach, query: str) -> RequestVerdict:
+    """A REST search under a list: held to its ``repo:`` qualifiers as every
+    search is, and its query to the keys the rule knows. The address cannot
+    be rewritten, so the search goes only when it is held to the list in
+    every reading of its words: every ``repo:`` any reading could take as a
+    qualifier names a listed repository, and one of them is a qualifier in
+    every reading (``_firm``). Each refusal says what to change."""
+    try:
+        pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return RequestVerdict(refusal=f"{_only(reach)} {SEARCH_ADDRESS}")
+    keys = [k for k, _v in pairs]
+    asked = dict(pairs).get(_SEARCH_QUERY)
+    # Only the keys the rule knows, each once, and no second separator: a
+    # key it does not read could name a repository another way, and a server
+    # that splits on a semicolon too would read other keys from the same text.
+    if ";" in query or len(set(keys)) != len(keys) or set(keys) - _SEARCH_KEYS or asked is None:
+        return RequestVerdict(refusal=f"{_only(reach)} {SEARCH_ADDRESS}")
+    if widens(asked):
+        return RequestVerdict(refusal=_WIDENING_SENTENCE.format(only=_only(reach)))
+    fault = _search_fault(reach, asked)
+    if fault:
+        return RequestVerdict(refusal=fault)
+    named = named_in_query(asked)
+    if not named:
+        return RequestVerdict(refusal=f"{_only(reach)} Add repo:owner/name to the search.")
+    for n in named:
+        if n not in reach.repositories:
+            return RequestVerdict(refusal=outside_sentence(reach, n))
+    if not any(_firm(asked, m) for m in _REPO_QUALIFIER.finditer(asked) if not m.group(1)):
+        return RequestVerdict(refusal=f"{_only(reach)} {SEARCH_FIRST}")
+    return RequestVerdict()
+
+
+def judge_request(reach: Reach, method: str, host: str, target: str, *, content_type: str = "",
+                  content_encoding: str = "", body: bytes | None = None) -> RequestVerdict:
+    """One HTTPS request that will carry git's and gh's token, as the
+    credential exit is about to send it: ``host`` the connection's, ``target``
+    the request's path and query. ``body`` is None at the first ask; the
+    rule asks for it (``wants_body``) only where the address does not say
+    enough. git's addresses and GitHub's REST addresses name their
+    repository and are held to the list and to read only; GraphQL is held
+    to read only alone."""
+    if not reach.narrows:
+        return RequestVerdict()
+    verb = (method or "").upper()
+    name = (host or "").lower().rstrip(".")
+    path, _, query = (target or "").partition("?")
+    on_git = name in _GITHUB_HOSTS
+    if not path.startswith("/") or has_traversal(path) or "//" in path or _RESHAPED & set(target or ""):
+        return RequestVerdict(refusal=PATH_REFUSED, kind=KIND_GIT if on_git else KIND_API)
+    segments = [s for s in path.split("/") if s]
+    if on_git:
+        return _judge_git_request(reach, verb, path, segments, query, content_type, content_encoding, body)
+    if name == _API_HOST and segments == _GRAPHQL:
+        return _judge_graphql(reach, verb, query, content_type, content_encoding, body)
+    reading = verb in _REQUEST_READS
+    if reach.read_only and not reading:
+        return RequestVerdict(refusal=read_only_sentence(reach, REQUEST))
+    if not reach.repositories:
+        return RequestVerdict()
+    if name in (_API_HOST, _UPLOADS_HOST) and len(segments) >= 3 and segments[0] == _REPOS:
+        repository = name_of_url(f"https://{_API_HOST}{path}") or f"{segments[1]}/{segments[2]}".lower()
+        if repository not in reach.repositories:
+            return RequestVerdict(refusal=outside_sentence(reach, repository))
+        # The words after the name as a server that decodes an escape and
+        # folds case would read them.
+        rest = [unquote(s).lower() for s in segments[3:]]
+        if not reading and ((len(rest) == 1 and rest[0] in _NEW_REPOSITORY)
+                            or (len(rest) == 3 and rest[0] == _ADVISORIES and rest[2] == _FORKS)):
+            return RequestVerdict(refusal=f"{_only(reach)} A new repository is outside them.")
+        if not reading and len(rest) >= 3 and rest[0] == _ISSUES and rest[2] in _LINKED_BY_ID:
+            return RequestVerdict(refusal=f"{_only(reach)} {LINKS_REFUSED}")
+        link = (_LINK_BY_NUMBER, f"https://{_API_HOST}/{_REPOS}/{repository}/") if name == _API_HOST else None
+        return RequestVerdict(link=link)
+    if name == _API_HOST and reading:
+        if segments in _IDENTITY_PATHS:
+            return RequestVerdict()
+        if len(segments) == 2 and segments[0] == _SEARCH:
+            return _judge_search(reach, query)
+    return RequestVerdict(refusal=_names_none(reach))
 
 
 # ---------------------------------------------------------------------------

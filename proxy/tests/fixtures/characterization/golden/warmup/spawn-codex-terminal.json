@@ -1,0 +1,97 @@
+{
+ "chats": [
+  {
+   "agent": "warm-codex-term",
+   "execution_mode": "interactive",
+   "execution_path": "codex-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "autoReview",
+   "rows": [
+    [
+     "user",
+     "open it"
+    ]
+   ],
+   "session_id": "<id2>",
+   "title": "open it",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  {
+   "agent": "warm-codex-term",
+   "chat_id": "<id1>",
+   "execution_path": "codex-cli",
+   "execution_target": "",
+   "new_chat": true,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id1>",
+   "execution_path": "codex-cli",
+   "execution_target": "local",
+   "fallback_reason": null,
+   "interactive": true,
+   "mode": "autoReview",
+   "model": "test-model",
+   "offline_machine_name": "",
+   "session_id": "<id2>",
+   "type": "warmup_ready"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  }
+ ],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [],
+  "started": [
+   {
+    "agent": "warm-codex-term",
+    "chat_id": "<id1>",
+    "client_type": "dashboard",
+    "execution_path": "codex-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": true,
+    "interactive_first_prompt": "[Current time: <now>]\n\nopen it",
+    "interactive_theme": "dark",
+    "mode": "autoReview",
+    "model": "test-model",
+    "resume": false,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id2>",
+    "user_sub": "user-admin",
+    "username": ""
+   }
+  ]
+ },
+ "slots": {
+  "acquired": [
+   [
+    "<id2>",
+    {
+     "execution_path": "codex-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": []
+ },
+ "submitted": [
+  []
+ ]
+}

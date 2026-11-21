@@ -1,9 +1,10 @@
 import type { DelegateCardMark, DisplayMessage, MessageBlock } from '../components/chat/types'
 import type { PendingFile, PendingImage } from '../store/types'
 import { cleanUserMessageText } from './transcriptCleanup'
-import { PERSISTED, RESEND_REASONS, SYSTEM_SUBTYPE, WIRE, type DbMessageRow, type LiveBlock, type PersistedEvent } from '../api/wireEvents'
+import { EVENT_ROW, PERSISTED, RESEND_REASONS, SYSTEM_SUBTYPE, WIRE, type DbMessageRow, type LiveBlock, type PersistedEvent } from '../api/wireEvents'
 import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from './status/run'
 import { BG_COMMAND_BLOCK } from './kinds/block'
+import { delegateTallies } from './chat/delegateRows'
 
 // Pure mappers from wire/DB event shapes to renderable MessageBlocks.
 // Single source of truth shared by AgentChat (live chat + task chats)
@@ -20,10 +21,10 @@ export function costBilledOf(evt: { cost_billed?: unknown }): boolean | undefine
 }
 
 /**
- * Whether the chat-level cost gauge shows: the NEWEST persisted turn's flag.
- * The session binding is deleted when a session closes, so the persisted
- * metadata row is the only place the credential kind survives a reload.
- * `true` when no loaded turn carries the flag (fresh chat, pre-flag history).
+ * Whether the chat-level cost gauge shows, from the loaded rows alone: the
+ * NEWEST loaded turn's flag, `true` when none carries it. The fallback for an
+ * older server only: a 2.0 proxy says it over the whole chat (`restore.cost`),
+ * since a page of a long turn's own steps holds no metadata row.
  */
 export function latestCostBilled(dbMessages: DbMessageRow[]): boolean {
   for (let i = dbMessages.length - 1; i >= 0; i--) {
@@ -39,10 +40,10 @@ export function latestCostBilled(dbMessages: DbMessageRow[]): boolean {
 }
 
 /**
- * The tool fees among the loaded rows: an `mcp_cost` row is money whatever
- * the model runs on. Turns from before the fee had a row of its own carry
- * none, so an older chat's reload shows less than its live view did (Usage
- * keeps it all).
+ * The tool fees among the loaded rows, the older server's fallback beside
+ * `latestCostBilled`: an `mcp_cost` row is money whatever the model runs on.
+ * Turns from before the fee had a row of its own carry none, so an older
+ * chat's reload shows less than its live view did (Usage keeps it all).
  */
 export function toolFeesOf(dbMessages: DbMessageRow[]): number {
   let sum = 0
@@ -148,9 +149,10 @@ export function delegatePromptCard(badge: string | undefined, key: string): Dele
 }
 
 /** The platform's own prompt into the chat (a scheduled wake, the resume
- * after the agent's move): one card message from the live frame and from the
- * stored row, keyed by the task and the prompt, so the two are one card. The
- * answer the prompt starts opens its own bubble under it. */
+ * after the agent's move, its reload or the platform's restart): one card
+ * message from the live frame and from the stored row, keyed by the task and
+ * the prompt, so the two are one card. The answer the prompt starts opens its
+ * own bubble under it. */
 export function wakeMessage(
   evt: { prompt?: string; task_id?: string; source?: string }, id: string, createdAt: string,
 ): DisplayMessage {
@@ -220,7 +222,7 @@ export function delegatePreviewText(kind: DelegateCardMark['kind'], blocks: Mess
     .trim()
 }
 
-type SystemBlock = Extract<MessageBlock, { type: 'system' }>
+export type SystemBlock = Extract<MessageBlock, { type: 'system' }>
 
 /** The block a review's bubble starts with: how many of the agent's
  *  background agents or commands finished (the nudge row's `count`, the
@@ -311,7 +313,7 @@ export function liveBlockToMessageBlock(ib: LiveBlock): MessageBlock | null {
     case WIRE.PLAN_MODE:
       return { type: 'plan', action: ib.action || 'enter', toolInput: ib.tool_input }
     case WIRE.SYSTEM:
-      return { type: 'system', subtype: ib.subtype || '', message: ib.message, reason: ib.reason, agentName: ib.agent_display_name || ib.agent, agentColor: ib.agent_color }
+      return { type: 'system', subtype: ib.subtype || '', message: ib.message, reason: ib.reason, resetsAt: ib.resets_at, agentName: ib.agent_display_name || ib.agent, agentColor: ib.agent_color }
     case WIRE.CHECK_VERDICT:
       // The pump keeps the verdict card event in the live state as-is.
       return eventToBlock(ib)
@@ -412,6 +414,15 @@ export function eventToBlock(evt: PersistedEvent, dbMessageId?: number): Message
         round: evt.round || 1, rounds: evt.rounds || 0, ranOn: evt.ran_on || '',
         costUsd: typeof evt.cost_usd === 'number' ? evt.cost_usd : 0, verdictId: evt.verdict_id || undefined,
       }
+    case EVENT_ROW.WRAPUP:
+      // The wrap-up after a call: the card under the conversation.
+      return {
+        type: 'wrapup', state: evt.state || '', outcome: evt.outcome || '',
+        followUps: Array.isArray(evt.follow_ups) ? evt.follow_ups.filter((f) => typeof f === 'string' && f.trim() !== '') : [],
+        wrote: Array.isArray(evt.wrote)
+          ? evt.wrote.filter((w) => w && typeof w.name === 'string' && w.name !== '').map((w) => ({ kind: String(w.kind || ''), name: w.name }))
+          : [],
+      }
     case WIRE.THINKING:
       return { type: 'thinking', content: evt.content || '', collapsed: true, done: true }
     case WIRE.PERMISSION_PROMPT:
@@ -446,7 +457,7 @@ export function eventToBlock(evt: PersistedEvent, dbMessageId?: number): Message
         ...(evt.action ? {} : { unanswered: true }),  // its plan row may say more (withPlanRows)
       }
     case WIRE.SYSTEM:
-      return { type: 'system', subtype: evt.subtype || '', message: evt.message, reason: evt.reason, agentName: evt.agent_display_name || evt.agent, agentColor: evt.agent_color }
+      return { type: 'system', subtype: evt.subtype || '', message: evt.message, reason: evt.reason, resetsAt: evt.resets_at, agentName: evt.agent_display_name || evt.agent, agentColor: evt.agent_color }
     case WIRE.METADATA:
       return { type: 'metadata', costUsd: evt.cost_usd ?? 0, durationMs: evt.duration_ms ?? evt.duration_api_ms ?? 0, costBilled: costBilledOf(evt) }
     case PERSISTED.BG_NUDGE:
@@ -556,13 +567,15 @@ export function dbMessagesToDisplay(
       const blocks: MessageBlock[] = []
       let agentMeta: { agent_slug?: string; agent_display_name?: string; agent_color?: string; badge?: string } = {}
       let fromCard = false
-      // Check for image attachments, agent identity and a card's mark in event_data
+      let sentWithKey = ''
+      // Check for image attachments, agent identity and a card's or a key's mark in event_data
       if (m.event_data) {
         try {
           const ed = JSON.parse(m.event_data)
           blocks.push(...attachmentBlocks(ed.images, ed.files))
           if (ed.agent_slug) agentMeta = ed
           fromCard = Boolean(ed.card && typeof ed.card === 'object')
+          if (ed.api_key && typeof ed.api_key === 'object') sentWithKey = String(ed.api_key.name || '')
         } catch { /* ignore */ }
       }
       // Render-side cleanup (data untouched): injected time preludes and the
@@ -587,6 +600,7 @@ export function dbMessagesToDisplay(
         } : {}),
         ...(promptCard ? { delegateCard: promptCard } : {}),
         ...(fromCard ? { fromCard: true } : {}),
+        ...(sentWithKey ? { sentWithKey } : {}),
       })
       newTurnNext = false
       continueNext = false
@@ -674,8 +688,8 @@ export function dbMessagesToDisplay(
         const evt = JSON.parse(m.event_data)
         // Skip dismissed events
         if (evt.dismissed) continue
-        // A nudge's row data carries no type (its column names it).
-        if (!evt.type && nudge) evt.type = m.event_type
+        // A nudge's and a wrap-up's row data carry no type (the column names it).
+        if (!evt.type && (nudge || m.event_type === EVENT_ROW.WRAPUP)) evt.type = m.event_type
         const block = eventToBlock(evt, m.id)
         // Find or create the host assistant message — only when the event
         // actually renders an inline block (or opens a meeting identity
@@ -790,26 +804,8 @@ export function dbMessagesToDisplay(
   // matching delegate_spawn block. Fallback for any event/block missing a
   // task_id: count spawns vs results per task_name. The status-bar badge
   // derives from these blocks (no parallel array).
-  const completedTaskIds = new Set<string>()
-  const statusByTaskId: Record<string, string> = {}
-  const spawnCounts: Record<string, number> = {}
-  const resultCounts: Record<string, number> = {}
-  for (const m of dbMessages) {
-    if (m.role !== 'event' || !m.event_data) continue
-    try {
-      const ed = JSON.parse(m.event_data)
-      const name = ed.task_name || ''
-      if (m.event_type === WIRE.DELEGATE_SPAWN) {
-        spawnCounts[name] = (spawnCounts[name] || 0) + 1
-      } else if (m.event_type === WIRE.DELEGATE_RESULT) {
-        resultCounts[name] = (resultCounts[name] || 0) + 1
-        if (ed.task_id) {
-          completedTaskIds.add(ed.task_id)
-          statusByTaskId[ed.task_id] = ed.status || DELEGATE_RESULT.COMPLETED
-        }
-      }
-    } catch { /* skip */ }
-  }
+  const { statusByTaskId, spawnCounts, resultCounts } = delegateTallies(dbMessages)
+  const completedTaskIds = new Set(Object.keys(statusByTaskId))
   // Walk blocks in REVERSE — last N (spawns-results) per name are running
   const runningLeft: Record<string, number> = {}
   for (const name of Object.keys(spawnCounts)) {
@@ -1023,6 +1019,23 @@ const WORKLESS_BLOCKS: ReadonlySet<string> = new Set([WIRE.SYSTEM, WIRE.METADATA
 /** The turn-ended card of a bubble, if it has one. */
 export function turnEndedCard(m: DisplayMessage): SystemBlock | undefined {
   return m.blocks.find((b): b is SystemBlock => b.type === WIRE.SYSTEM && b.subtype === SYSTEM_SUBTYPE.TURN_ENDED)
+}
+
+/** The usage-limit card a terminal shows under its terminal: the chat's last
+ *  block when it is a limit's turn-ended card, until its reset has passed. */
+export function terminalLimitCard(messages: DisplayMessage[], now = Date.now()): SystemBlock | undefined {
+  const blocks = messages[messages.length - 1]?.blocks ?? []
+  const card = blocks[blocks.length - 1]
+  if (!card || card.type !== WIRE.SYSTEM || card.subtype !== SYSTEM_SUBTYPE.TURN_ENDED || card.reason !== 'limit') return undefined
+  return card.resetsAt && Date.parse(card.resetsAt) <= now ? undefined : card
+}
+
+/** Which limit a terminal's card is, for hiding it (lib/chatNoticeDismissals,
+ *  kind `limitcard`): its reset, else its line. A later limit has another
+ *  reset, so it shows again; the engine refusing again inside the same
+ *  window gives the same reset, the same limit. */
+export function limitCardKey(card: Pick<SystemBlock, 'resetsAt' | 'message'>): string {
+  return card.resetsAt || card.message || ''
 }
 
 /** Whether the turn a card ended had started: an assistant block that is

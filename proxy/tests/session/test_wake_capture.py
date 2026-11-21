@@ -294,3 +294,120 @@ async def test_wake_grace_instant_when_already_captured():
     layer = _FakeClaudeLayer(sid, captures_on_drain=False)
     assert await _wake_grace_covers(layer, sid) is True
     assert layer.drains == 0  # no drain needed — capture already noted
+
+
+# ── A review the engine may start right after a turn ────────────────────────
+
+class _Engine:
+    """A layer that says whether its sessions wake by themselves."""
+
+    def __init__(self, wakes: bool) -> None:
+        self.wakes = wakes
+
+    async def session_self_wakes(self, session_id: str) -> bool:
+        return self.wakes
+
+
+@pytest.mark.parametrize("wakes", [True, False], ids=["claude", "codex"])
+def test_work_that_ended_during_the_turn_arms_no_monitor(monkeypatch, wakes):
+    """Nothing still runs, though a command ended inside the turn: no monitor
+    starts. The engine's own review of that end is read by the session's one
+    reader between turns (``remote_bg_commands.wake_reader``)."""
+    from core.events import pump_bg_monitors
+    from core.events.bg_command_state import reset_bg_command_registry
+    spawned: list[str] = []
+
+    def _spawn(coro, *, name, owner):
+        spawned.append(name)
+        coro.close()
+    monkeypatch.setattr(pump_bg_monitors, "spawn", _spawn)
+    sid = f"s-ended-{wakes}"
+    reset_bg_command_registry(sid)
+    reg = get_bg_command_registry(sid)
+    reg.register_spawn("b-1", "toolu_1")
+    reg.mark_done("b-1")
+    try:
+        pump_bg_monitors.arm_bg_monitors(_Engine(wakes), sid, "chat-ended")
+        assert spawned == []
+        reg.register_spawn("b-2", "toolu_2")  # still running: its monitor
+        pump_bg_monitors.arm_bg_monitors(_Engine(wakes), sid, "chat-ended")
+        assert spawned == ["bg_command_monitor"]
+    finally:
+        reset_bg_command_registry(sid)
+
+
+def test_a_background_agent_that_ended_during_the_turn_counts_a_foreground_one_not():
+    from core.session.background_frames import ended_during_turn, read_after_turn
+    sid = "s-ended-agent"
+    reg = get_subagent_registry(sid)
+    reg.register_spawn("a-fg", "toolu_fg", label="fg", background=False)
+    reg.mark_done("a-fg")
+    assert not ended_during_turn(sid) and not read_after_turn(sid)
+    reg.register_spawn("a-bg", "toolu_bg", label="bg", background=True)
+    assert read_after_turn(sid) and not ended_during_turn(sid)
+    reg.mark_done("a-bg")
+    assert ended_during_turn(sid) and read_after_turn(sid)
+    reg.reset()
+    assert not ended_during_turn(sid) and not read_after_turn(sid)
+
+
+@pytest.mark.asyncio
+async def test_a_review_that_starts_more_work_keeps_the_monitor_reading(temp_db, caplog):
+    """The monitor armed for a command that ended inside the turn reads the
+    engine's review in its grace; that review starts another command, so the
+    monitor waits for it and reads its review too, instead of leaving it for
+    the next message."""
+    import logging
+
+    from core.events import pump_bg_monitors
+    from core.events.bg_command_state import reset_bg_command_registry
+    sid = "s-chain"
+    reset_bg_command_registry(sid)
+    wake_capture.forget_session(sid)
+    reg = get_bg_command_registry(sid)
+    reg.register_spawn("b-1", "toolu_1")
+    reg.mark_done("b-1")
+
+    class _Chain:
+        drains = 0
+
+        async def session_self_wakes(self, session_id: str) -> bool:
+            return True
+
+        async def is_session_alive(self, session_id: str) -> bool:
+            return True
+
+        async def drain_bg_commands(self, session_id: str, *, budget: float = 2.0) -> bool:
+            self.drains += 1
+            if self.drains == 1:      # the review of b-1, which starts b-2
+                reg.register_spawn("b-2", "toolu_2")
+                wake_capture.note_captured(session_id)
+                return True
+            if self.drains == 2:      # b-2 ends, and its review is read
+                reg.mark_done("b-2")
+                wake_capture.note_captured(session_id)
+                return True
+            return False
+
+    layer = _Chain()
+    try:
+        with caplog.at_level(logging.INFO, logger="otodock"):
+            review = await pump_bg_monitors._bg_command_monitor_impl(layer, sid, "chat-chain", 0)
+        assert review is None and layer.drains == 2
+        assert "the self-wake turn started 1 command(s)" in caplog.text
+    finally:
+        reset_bg_command_registry(sid)
+        wake_capture.forget_session(sid)
+
+
+@pytest.mark.asyncio
+async def test_a_review_being_recorded_covers_the_work(monkeypatch):
+    """The reader between turns records the engine's own review while a
+    monitor waits in its grace: that review covers the work, so the monitor
+    stands down instead of sending the platform's own review after it."""
+    sid = "s-wake-grace-live"
+    wake_capture.forget_session(sid)
+    layer = _FakeClaudeLayer(sid, captures_on_drain=False)
+    monkeypatch.setitem(wake_capture._capturing, sid, object())
+    assert await _wake_grace_covers(layer, sid) is True
+    assert layer.drains == 0

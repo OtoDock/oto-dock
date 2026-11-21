@@ -1,0 +1,1632 @@
+[
+ {
+  "slot_acquired": [
+   [
+    "sid-tails",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "a batch with no signal",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "streaming",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_title_timer",
+     "_run_midturn_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "the user line opens the turn",
+  "timers": [
+   [
+    "_fire_title_timer",
+    30.0
+   ],
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_title_timer",
+     "_run_midturn_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "rows while open: the mid-turn tail, armed again",
+  "timers": [
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Response ready",
+    "chat_id": "chat-tails",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test finished",
+    "user_sub": "user-admin"
+   }
+  ],
+  "library_reconcile": [
+   "term-tails"
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the turn ends: title, notice, waiter",
+  "title": [
+   [
+    "chat-tails",
+    "the answer"
+   ]
+  ],
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the waiter fired once",
+  "waited": [
+   "the answer"
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "library_reconcile": [
+   "term-tails"
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a tail with nothing new",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "streaming",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_run_midturn_tail"
+    ],
+    "title_armed": false,
+    "turn_open": true
+   }
+  },
+  "step": "the sweep's backstop opens the next turn",
+  "timers": [
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Response ready",
+    "chat_id": "chat-tails",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test finished",
+    "user_sub": "user-admin"
+   }
+  ],
+  "library_reconcile": [
+   "term-tails"
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the sweep's backstop reports its end",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "library_reconcile": [
+   "term-tails"
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a task's completion fires once",
+  "task_complete": [
+   "task done"
+  ],
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "library_reconcile": [
+   "term-tails"
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "and no second time",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "streaming",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Response ready",
+    "chat_id": "chat-tails",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test finished",
+    "user_sub": "user-admin"
+   }
+  ],
+  "library_reconcile": [
+   "term-tails"
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_run_midturn_tail"
+    ],
+    "title_armed": false,
+    "turn_open": true
+   }
+  },
+  "step": "a batch that reopens keeps the waiter",
+  "timers": [
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a background subagent holds the end",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Response ready",
+    "chat_id": "chat-tails",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test finished",
+    "user_sub": "user-admin"
+   }
+  ],
+  "library_reconcile": [
+   "term-tails"
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the final turn's end",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the waiter's message",
+  "waited": [
+   "the answer",
+   "final"
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Waiting for your answer",
+    "chat_id": "chat-tails",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test needs your input",
+    "user_sub": "user-admin"
+   }
+  ],
+  "library_reconcile": [
+   "term-tails"
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": true,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a question folds as parked",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "queued": true,
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": true,
+    "queue": [
+     "while parked"
+    ],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a prompt waits behind the dialog",
+  "timers": [
+   [
+    "_fire_inject_backstop",
+    5.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "streaming",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop",
+     "_run_midturn_tail"
+    ],
+    "title_armed": false,
+    "turn_open": true
+   }
+  },
+  "step": "the answer unparks",
+  "timers": [
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Waiting for your answer",
+    "chat_id": "chat-tails",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test needs your input",
+    "user_sub": "user-admin"
+   }
+  ],
+  "library_reconcile": [
+   "term-tails"
+  ],
+  "parked_at": 1000.0,
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": true,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a hook parks on the native dialog",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": true,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a line journaled before the park cannot reopen"
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": true,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the fold of the dialog the hook pinged is silent",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "streaming",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop",
+     "_run_midturn_tail"
+    ],
+    "title_armed": false,
+    "turn_open": true
+   }
+  },
+  "step": "a line after the park reopens",
+  "timers": [
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Context compacted. The session is ready.",
+    "chat_id": "chat-tails",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test compacted the conversation",
+    "user_sub": "user-admin"
+   }
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a manual compact closes the open turn",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Context compacted. The session is ready.",
+    "chat_id": "chat-tails",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test compacted the conversation",
+    "user_sub": "user-admin"
+   }
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a compact while the session is idle is the turn's end",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Context compacted. The session is ready.",
+    "chat_id": "chat-tails",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test compacted the conversation",
+    "user_sub": "user-admin"
+   }
+  ],
+  "library_reconcile": [
+   "term-tails"
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the engine's compact turn: one ping, compacted",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-tails",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "streaming",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop",
+     "_run_midturn_tail"
+    ],
+    "title_armed": false,
+    "turn_open": true
+   }
+  },
+  "step": "an auto compact mid-turn is no end",
+  "timers": [
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-tails",
+    "ready",
+    {
+     "agent": "term-tails"
+    }
+   ]
+  ],
+  "listened": [
+   [
+    "chat-tails",
+    0,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    true
+   ],
+   [
+    "chat-tails",
+    3,
+    true
+   ],
+   [
+    "chat-tails",
+    2,
+    false
+   ],
+   [
+    "chat-tails",
+    0,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    true
+   ],
+   [
+    "chat-tails",
+    1,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    true
+   ],
+   [
+    "chat-tails",
+    1,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    true
+   ],
+   [
+    "chat-tails",
+    1,
+    true
+   ],
+   [
+    "chat-tails",
+    1,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    false
+   ],
+   [
+    "chat-tails",
+    1,
+    true
+   ]
+  ],
+  "state": {
+   "sid-tails": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "question_parked",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the listener's batches",
+  "turn_end": [
+   [
+    "sid-tails",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ }
+]

@@ -26,8 +26,17 @@ NATIVE_TO_CANONICAL: dict[str, str] = {
     "update_plan": "TodoWrite",           # rollout function call (the checklist snapshot)
     "request_user_input": "request_user_input",
     "request_user_input_async": "request_user_input_async",
+    "send_message_to_user_async": "send_message_to_user_async",
     "CodexEscalation": "CodexEscalation", # the approval bridge's synthetic tool
     "CodexTerminalInput": "CodexTerminalInput",  # the bridge's terminal-input approval (0.158+)
+    # Codex's own agents: the hook sends their dotted names with the dot
+    # dropped; the name the tool list shows is the platform's.
+    "collaborationspawn_agent": "collaboration.spawn_agent",
+    "collaborationsend_message": "collaboration.send_message",
+    "collaborationwait_agent": "collaboration.wait_agent",
+    "collaborationinterrupt_agent": "collaboration.interrupt_agent",
+    "collaborationfollowup_task": "collaboration.followup_task",
+    "collaborationlist_agents": "collaboration.list_agents",
 }
 
 #: The app-server item types that are tool calls (the translator emits

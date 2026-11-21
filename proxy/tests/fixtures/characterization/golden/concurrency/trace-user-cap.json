@@ -1,0 +1,490 @@
+[
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 1,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 1,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 4,
+    "fit_light": 20,
+    "reserved_mb": 1000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "first"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 2,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 3,
+    "fit_light": 15,
+    "reserved_mb": 2000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "second"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "user_cap",
+   "user_message": "You already have 2 sessions running on this platform. End one, or wait a few minutes for an idle one to end, then try again."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 2,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 3,
+    "fit_light": 15,
+    "reserved_mb": 2000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "third, nothing of theirs idle"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 0,
+    "task": 1
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 10,
+    "reserved_mb": 3000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 1
+   }
+  },
+  "step": "a task is not counted"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 1,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 10,
+    "reserved_mb": 3000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a phone call is not"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 10,
+    "reserved_mb": 3000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "someone else"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 5,
+    "reserved_mb": 4000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a re-attach is not"
+ },
+ {
+  "parked": 0,
+  "result": false,
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 10,
+    "reserved_mb": 3000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "may they pre-warm"
+ },
+ {
+  "parked": 0,
+  "result": true,
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 10,
+    "reserved_mb": 3000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "may another pre-warm"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "speculative",
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 10,
+    "reserved_mb": 3000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "their pre-warm is refused quietly"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "remote",
+    "session": "u1-a"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 10,
+    "reserved_mb": 3000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "third again: their most idle closes, not another's"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 5,
+    "reserved_mb": 4000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a chat of no known owner"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 5,
+    "reserved_mb": 4000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "the same id, now with an owner"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "remote",
+    "session": "u2-a"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 5,
+    "reserved_mb": 4000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "that owner is at the cap: their idle one closes"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "remote",
+    "session": "u1-b"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 5,
+    "reserved_mb": 4000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a close that fails still frees the seat"
+ }
+]

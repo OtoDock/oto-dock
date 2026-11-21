@@ -1,5 +1,6 @@
-"""The permission authority: the permission, codex-question, mcp-credentials and
-session-files hooks, ``decide_tool_permission`` and ``ask_user_question``.
+"""The permission authority: the permission and codex-question hooks and
+``decide_tool_permission``. The question path is ``questions.py``, the credential
+hooks ``credentials.py``.
 
 One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 (its docstring holds the path-form contract). Routes register on this module's
@@ -10,10 +11,8 @@ import asyncio
 import contextvars
 import dataclasses
 import functools
-import hmac
 import json
 import logging
-import posixpath
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -22,10 +21,21 @@ from typing import TYPE_CHECKING, cast
 import psycopg
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-import config
 from api.hooks import routing
+from api.hooks.credentials import (  # noqa: F401
+    HookCliCredentialRequest,
+    hook_cli_credential,
+    hook_mcp_credentials,
+)
+from api.hooks.limits import limit_refusal
+from api.hooks.questions import (
+    _card_chat_of,
+    ask_user_question,
+    question_shown_reason,
+    show_question_card,
+)
 from api.sessions.sessions import _session_payload, verify_session_match_async
 from auth import git_reads
 from auth.path_policy import (
@@ -45,7 +55,7 @@ from core.execution_layer import (
     PERMISSION_MODES,
     PLAN_MODE,
     UNATTENDED_MODE,
-    current_mode,
+    known_mode,
 )
 from core.session import engine_prompts, session_events, session_kind
 from core.session.session_state import (
@@ -55,12 +65,13 @@ from core.session.session_state import (
     get_session_mode,
     get_session_security,
     is_session_tool_allowed,
+    live_state,
     note_live_word,
+    note_terminal_ask,
     record_hook_activity,
     recorded_session_mode,
     remember_session_tool_allow,
     review_paused,
-    session_token_refusal,
     set_session_mode,
     took_no_answer,
     wait_for_permission,
@@ -69,21 +80,68 @@ from core.session.session_state import (
 from ws import wire_events as wire
 
 if TYPE_CHECKING:
-    from core.execution_layer import ExecutionLayer
+    from core.engine import Engine
 
 logger = logging.getLogger("otodock")
 router = APIRouter()
 
 #: The tool ROLES auto-approved in every mode (read-only / safe / internal):
 #: reads, globs, searches, the web tools, tool discovery, a subagent spawn,
-#: the task list's reads, the checklist. Everything else asks in Ask; a
+#: the task list's reads, the checklist, a message the engine shows the
+#: person during its turn. Everything else asks in Ask; a
 #: file edit by path runs in Auto, where a patch, a delete, a skill, a
 #: workflow, the task list's edits go to the engine's own reviewer.
 _AUTO_APPROVED_ROLES = frozenset({
     tool_roles.READ, tool_roles.GLOB, tool_roles.SEARCH, tool_roles.WEB_FETCH,
     tool_roles.WEB_SEARCH, tool_roles.DISCOVERY, tool_roles.SUBAGENT,
-    tool_roles.TASK_READ, tool_roles.CHECKLIST,
+    tool_roles.TASK_READ, tool_roles.CHECKLIST, tool_roles.MESSAGE,
 })
+
+#: The built-in roles an outside session never gets, whatever was picked.
+_OUTSIDE_NEVER = frozenset({tool_roles.SHELL, tool_roles.SUBAGENT, tool_roles.WORKFLOW,
+                            tool_roles.ESCALATION})
+_OUTSIDE_WEB = frozenset({tool_roles.WEB_FETCH, tool_roles.WEB_SEARCH})
+_OUTSIDE_WRITE = frozenset({tool_roles.WRITE, tool_roles.DELETE})
+
+
+def outside_floor(ctx, tool_name: str, role: str) -> str:
+    """The floor of an outside session (a caller who is not a platform
+    user), before the path gate and every mode branch: the refusal, or ""
+    when the call may go on to the gate. The shell, sub-agents, workflows
+    and an engine's escalations never; the web tools and the write tools
+    only when a manager picked them (the context's ``outside_web`` and
+    ``outside_files_write``, the path gate judging the path after); a
+    tool of an attached server only when its function was granted
+    (``outside_grants``, by function name). No role, mode or allow-memory
+    lifts it."""
+    from services.mcp import outside_picks
+    if role in _OUTSIDE_NEVER or tool_roles.outside_never(tool_name):
+        return f"{tool_name} is not available to outside people."
+    if role in _OUTSIDE_WEB and not getattr(ctx, "outside_web", False):
+        return "The web is not open to outside people on this line."
+    if role in _OUTSIDE_WRITE and not getattr(ctx, "outside_files_write", False):
+        return "Writing files is not open to outside people on this line."
+    if tool_name.startswith("mcp__"):
+        parts = tool_name.split("__", 2)
+        server, function = (parts[1] if len(parts) >= 2 else ""), (parts[2] if len(parts) >= 3 else "")
+        if not outside_picks.allows(getattr(ctx, "outside_grants", ()), server, function):
+            return "This tool is not open to outside people on this line."
+    return ""
+
+
+def unattended_floor(ctx, tool_name: str, role: str) -> str:
+    """The floor of a session with no person to ask and a narrower engine
+    (the context's ``no_shell`` / ``no_web``: the wrap-up after a
+    conversation, the agent's own phone line), before the path gate and
+    every mode branch: the refusal, or "" when the call may go on. The
+    shell, sub-agents, workflows, escalations and cross-session tools never
+    with ``no_shell``, the web tools never with ``no_web``."""
+    if getattr(ctx, "no_shell", False) and (
+            role in _OUTSIDE_NEVER or tool_roles.outside_never(tool_name)):
+        return f"{tool_name} is not available in this session."
+    if getattr(ctx, "no_web", False) and role in _OUTSIDE_WEB:
+        return "The web is not available in this session."
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -141,17 +199,6 @@ def _prompt_wait_s(authorization: str | None, session_id: str) -> float:
     if not isinstance(exp, (int, float)):
         return PROMPT_WAIT_S
     return max(1.0, min(PROMPT_WAIT_S, exp - time.time() - _TOKEN_MARGIN_S))
-
-
-async def _card_chat_of(session_id: str) -> str:
-    """The chat a hook card shows on; none when the chat row cannot be read
-    now, so the card goes onto the queue as before."""
-    try:
-        return await routing.resolve_hook_chat_id(session_id)
-    except Exception:
-        logger.exception("Hook permission: the card's chat was not read for session %s",
-                         session_id[:8])
-        return ""
 
 
 async def _wait_on_person(queue: asyncio.Queue, request_id: str, wait, *, chat_id: str = ""):
@@ -220,13 +267,13 @@ async def _answer_with_keepalive(decision, deny: dict):
 
 @router.post("/v1/hooks/permission")
 async def hook_permission(req: HookPermissionRequest, authorization: str | None = Header(None)):
-    """Permission gate for the Claude CLI PreToolUse hook, the satellite stdio
-    MCP transport gate, and the satellite Codex approval bridge.
+    """Permission gate for the engines' PreToolUse hook
+    (``hooks/permission_gate.py``, Claude Code and Codex) and for the Codex
+    approval bridge on a machine (``core/layers/codex/codex_approvals.py``).
 
     Thin transport wrapper: it only verifies the session, then delegates to
-    ``decide_tool_permission`` — the single decision authority, reused in-process
-    by the local Codex app-server approval handler. A decision that waits on a
-    person is streamed with keepalives (``_answer_with_keepalive``).
+    ``decide_tool_permission``, the single decision authority. A decision that
+    waits on a person is streamed with keepalives (``_answer_with_keepalive``).
     """
     await verify_session_match_async(authorization, req.session_id)
     _hook_sent_at.set(req.hook_sent_at)
@@ -265,184 +312,6 @@ async def hook_codex_question(
     names = layer.capabilities.behaviour.tools.get(tool_roles.QUESTION, ()) if layer else ()
     return {"answers": await ask_user_question(
         req.session_id, req.questions, tool_name=names[0] if names else "")}
-
-
-@router.post("/v1/hooks/mcp-credentials")
-async def hook_mcp_credentials(authorization: str | None = Header(None)):
-    """Credential broker: return an stdio MCP's secret env at spawn.
-
-    Auth is the per-(session, mcp) CAPABILITY TOKEN ONLY — NOT the session JWT
-    and NOT the master key. The agent's bash holds the session JWT + PROXY_URL +
-    curl, so accepting it would let the agent harvest every MCP's (and every
-    co-resident user's) secrets; the capability token is instead injected only
-    into the MCP child's env and stripped by the wrapper before exec. The ``mcp``
-    is derived from the token, so a token for one MCP can't fetch another's.
-    Reachable directly on the proxy as well as via the satellite tunnel — the
-    token binding is the boundary; the tunnel allowlist is defense-in-depth.
-    """
-    from core.credentials import mcp_broker
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing capability token")
-    parts = authorization.split(" ", 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
-    ident = mcp_broker.verify_token(parts[1])
-    if ident is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired capability token")
-    sid, mcp = ident
-    bundle = mcp_broker.get(sid, mcp)
-    if bundle is None:
-        # Session closed / purged / proxy restarted mid-session → fail fast so
-        # the spawn-time wrapper errors cleanly instead of hanging on its timeout.
-        raise HTTPException(status_code=404, detail="No credentials for this session")
-    return {"env": bundle.env}
-
-
-class HookCliCredentialRequest(BaseModel):
-    session_id: str
-    host: str
-    # What the command names, for a narrowed GitHub reach
-    # (``auth/github_reach``): git's repository path, or gh's arguments, the
-    # working directory's remote addresses and gh's GH_REPO and GH_HOST. An
-    # older helper sends none.
-    path: str = Field(default="", max_length=1024)
-    command: list[str] = Field(default_factory=list, max_length=256)
-    remotes: list[str] = Field(default_factory=list, max_length=32)
-    gh_repo: str = Field(default="", max_length=512)
-    gh_host: str = Field(default="", max_length=255)
-
-
-@router.post("/v1/hooks/cli-credential")
-async def hook_cli_credential(
-    req: HookCliCredentialRequest, authorization: str | None = Header(None),
-):
-    """The credential a session's command-line tools get for ``host`` right
-    now: the git credential helper and the ``gh`` wrapper
-    (``proxy/hooks/credential_helper.py``) ask here at each command, so the
-    token is in no environment and no file and the current token file is
-    read every time. Auth is the session's COMMAND-LINE token
-    (``OTO_CLI_TOKEN``, ``session_token.attach_cli_token``): the shell holds
-    it, no MCP child does, so an MCP holding the session token cannot read
-    the account's token here. The holder is judged as a session token's is,
-    its session against the body's. A session token is refused (403) unless
-    it was minted before 1.9: a session started before the upgrade has no
-    command-line token, and keeps its git and gh until its token expires.
-    The master key is refused outright (it names no session). Answers: the
-    username git presents, the token and the names the wrapper sets; 404
-    when the session holds no credential for the host (not connected, or
-    the store emptied by a restart and not re-provisioned); 409 when the
-    account needs a reconnect. Reachable directly and over the satellite
-    tunnel.
-    """
-    from core.credentials import mcp_broker, mcp_gateway
-    await _authorize_cli_bearer(authorization, req.session_id)
-    cred = mcp_broker.cli_credential(req.session_id, req.host)
-    if cred is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No {req.host.strip().lower()[:253]} account is connected for this session",
-        )
-    refusal = _reach_refusal(cred, req)
-    if refusal:
-        raise HTTPException(status_code=403, detail=refusal)
-    res = await asyncio.to_thread(mcp_gateway.resolve_cli_credential, cred)
-    if isinstance(res, mcp_gateway.Refusal):
-        raise HTTPException(status_code=409, detail=res.detail)
-    return {"username": res.username, "password": res.secret, "env": list(res.env_names)}
-
-
-def _reach_refusal(cred, req: HookCliCredentialRequest) -> str:
-    """A narrowed GitHub reach judges what the command names: gh by its
-    arguments, git by the repository path it asks for."""
-    from auth import github_reach
-    reach = github_reach.Reach.from_dict(cred.reach)
-    if reach is None or not reach.narrows:
-        return ""
-    if req.command:
-        return github_reach.judge_gh(reach, [str(a)[:1024] for a in req.command], list(req.remotes),
-                                     gh_repo=req.gh_repo, gh_host=req.gh_host)
-    return github_reach.judge_git(reach, req.path)
-
-
-# The sessions whose pre-1.9 session token was taken on the command-line
-# route, logged once each.
-_CLI_GRACE_LOGGED: set[str] = set()
-
-
-async def _authorize_cli_bearer(authorization: str | None, session_id: str) -> None:
-    """The command-line route's bearer: the session's command-line token,
-    or a session token minted before 1.9 (its session has none). 401 for no
-    or an unreadable bearer and for a dead session or holder, 403 for the
-    master key, a token of another session, and a session token minted by
-    this release."""
-    from auth import token_holder
-    from auth.external_endpoints import EXTERNAL_BLOCKED_DETAIL
-    from auth.session_token import validate_cli_token, validate_session_token
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
-    if config.is_master_key(token):
-        raise HTTPException(status_code=403, detail="A session token is required")
-    claims = validate_cli_token(token)
-    if claims is None:
-        if validate_session_token(token, legacy=False) is not None:
-            raise HTTPException(
-                status_code=403, detail="This session's command-line token is required")
-        if validate_session_token(token) is None:
-            raise HTTPException(status_code=401, detail="Invalid API key")
-        await verify_session_match_async(authorization, session_id)
-        if session_id not in _CLI_GRACE_LOGGED:
-            _CLI_GRACE_LOGGED.add(session_id)
-            logger.info("cli-credential: session %s started before 1.9 presents its "
-                        "session token (taken until it expires)", session_id[:8])
-        return
-    sid = claims.get("sid")
-    if not session_id:
-        raise HTTPException(status_code=400, detail="Missing session_id")
-    if not isinstance(sid, str) or not sid or not hmac.compare_digest(
-            sid.encode("utf-8", "surrogatepass"), session_id.encode("utf-8", "surrogatepass")):
-        raise HTTPException(status_code=403, detail="Session token does not match request session_id")
-    if session_token_refusal(claims) or not await token_holder.holder_ok(claims):
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    # An external caller (a phone caller who is no platform user) reaches
-    # only its tools' endpoints, as the middleware rules for its session
-    # token; this route is none of them.
-    if claims.get("ext") and not claims.get("user_sub"):
-        raise HTTPException(status_code=403, detail=EXTERNAL_BLOCKED_DETAIL)
-
-
-@router.post("/v1/hooks/session-files")
-async def hook_session_files(authorization: str | None = Header(None)):
-    """Session-file broker: return a remote session's secret FILES at start.
-
-    The satellite calls this ONCE over the tunnel, before spawning the CLI,
-    to materialize per-session secret files (SSH private keys) 0600 under its
-    session-secrets dir — wiped at session close. Auth is the session-files
-    CAPABILITY TOKEN ONLY (never the session JWT, never the master key); the
-    token rides the start payload and never enters the spawned agent env, so
-    the agent's bash cannot replay it. Only admin-paired machines ever receive
-    a token — the gate is at provisioning time in ``remote_session_start``.
-    """
-    from core.credentials import mcp_broker
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing capability token")
-    parts = authorization.split(" ", 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
-    sid = mcp_broker.verify_files_token(parts[1])
-    if sid is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired capability token")
-    files = mcp_broker.get_session_files(sid)
-    if files is None:
-        raise HTTPException(status_code=404, detail="No files for this session")
-    return {
-        "files": {
-            relpath: {"content_b64": f.content_b64, "mode": f.mode}
-            for relpath, f in files.items()
-        }
-    }
 
 
 def _is_interactive_session(session_id: str) -> bool:
@@ -525,6 +394,8 @@ async def decide_tool_permission(
         session_id, tool_name, tool_input, _pass1_out, live_permission_mode,
         wait_s=wait_s,
     )
+    if _pass1_out.get(_TERMINAL_ASK):
+        note_terminal_ask(session_id, tool_use_id)
     if result.get("decision") == "allow" and tool_use_id:
         kind = _pass1_out.get(_GATE_RECORD) or (
             engine_prompts.HOOK_RECORD if _pass1_out.get(_GATE_MODE) in _HOOK_ONLY_MODES else "")
@@ -541,11 +412,35 @@ async def decide_tool_permission(
 # shell holds its session's token and could post a mode word itself).
 _GATE_RECORD = "gate_record"
 _GATE_MODE = "gate_mode"
+# The call went to a person's terminal, whose engine may ask on screen
+# (``session_state.note_terminal_ask``, ended at the call's PostToolUse).
+_TERMINAL_ASK = "terminal_ask"
 #: The modes in which the hook is the only authority: every allow is recorded.
 _HOOK_ONLY_MODES = frozenset({DONT_ASK_MODE, UNATTENDED_MODE})
 #: ExitPlanMode's deny when the person pressed Cancel on the plan review.
 PLAN_CANCELLED_REASON = ("The person cancelled this plan. Stop here and wait for their "
                          "next message.")
+
+
+async def _plan_of_another_session(session_id: str, name: str) -> bool:
+    """Whether ``name`` is another session's plan: the plan file a running
+    turn of another session wrote (its pump's plan name: a plan being
+    written or under review), or a plan another chat offered for review
+    before (its saved row). With no chat of its own in hand, any saved row
+    of the name is another's, and so is a name the store cannot answer for:
+    the engine's question then stays the person's card."""
+    from core.events.stream_pump import _active_pumps
+    if any(p.session_id != session_id and p._plan_filename == name
+           for p in _active_pumps.values()):
+        return True
+    from storage import database as task_store
+    from storage.pg import run_db_fast
+    try:
+        chat_id = await routing.resolve_hook_chat_id(session_id)
+        return await run_db_fast(task_store.chat_plan_held_elsewhere, name, chat_id)
+    except psycopg.Error:
+        logger.warning("Hook permission: session=%s, whose plan %s is could not be read", session_id, name)
+        return True
 
 
 def _record_gate_allow(session_id: str, tool_use_id: str, tool_name: str,
@@ -578,7 +473,7 @@ async def _meeting_mode(route: routing.HookRoute) -> str:
     unattended ``auto`` (it did: a participant then wrote without asking)."""
     mode = recorded_session_mode(route.parent_session_id) if route.parent_session_id else ""
     if mode:
-        return current_mode(mode)
+        return known_mode(mode)
     stored = ""
     if route.chat_id:
         from storage import database as task_store
@@ -589,7 +484,7 @@ async def _meeting_mode(route: routing.HookRoute) -> str:
             logger.warning("Hook permission: the meeting's chat %s could not be read",
                            route.chat_id[:8])
             chat = None
-        stored = current_mode(str((chat or {}).get("permission_mode") or ""))
+        stored = str((chat or {}).get("permission_mode") or "")
     return stored if stored in _MEETING_STORED_MODES else ASK_MODE
 
 
@@ -648,16 +543,84 @@ def _take_allowed_call(session_id: str, key: str) -> bool:
     return expiry > time.monotonic()
 
 
+# The modes a person picks, by how much runs with nobody asked, least first.
+_MODE_RANK = {PLAN_MODE: 0, ASK_MODE: 1, AUTO_REVIEW_MODE: 2, DONT_ASK_MODE: 3}
+
+
+@dataclass
+class _Follow:
+    """What a terminal's follow keeps for one life of a session id."""
+    life: int          # the life's token floor (``session_state.live_state``)
+    ceiling: str       # the highest mode a reported word may move the chat to
+    wrote: str         # the mode the follow last left the session in
+    clamped: bool = False
+
+
+# Session -> its follow record. A dropped record is rebuilt from the
+# session's mode at the next call, which is never above the ceiling it had.
+_FOLLOWS: dict[str, _Follow] = {}
+_FOLLOWS_CAP = 512
+
+
+def _follow_record(session_id: str, mode: str) -> _Follow:
+    """The follow record of this life of the session, its ceiling current.
+
+    The hook's caller holds the session's own token, so the word it reports
+    is the session's say-so and must never move the chat past what a person
+    agreed to. The ceiling is that agreement: the mode the session holds
+    whenever the follow did not write it (the mode the terminal started in,
+    a pick on the dashboard, the plan's own exit, a re-adoption), never
+    below Ask, so a chat started in Plan can leave it. It comes down with
+    every lower mode the follow writes (``_follow_terminal``), so a word can
+    never undo a Shift+Tab down: only the pill raises a chat. Every writer
+    of a session's mode but the follow is a person's act or lowers the mode,
+    and no route lets a session reach one. A new life of the id (a terminal
+    closed and reopened) starts a new record."""
+    life = live_state(session_id)[1]
+    rec = _FOLLOWS.get(session_id)
+    if rec is None or rec.life != life or rec.wrote != mode:
+        if rec is None and len(_FOLLOWS) >= _FOLLOWS_CAP:
+            for sid in list(_FOLLOWS)[:_FOLLOWS_CAP // 2]:
+                del _FOLLOWS[sid]
+        ceiling = mode if _MODE_RANK[mode] >= _MODE_RANK[ASK_MODE] else ASK_MODE
+        rec = _FOLLOWS[session_id] = _Follow(life, ceiling, mode)
+    return rec
+
+
+def _feeds_allow_memory(chat_id: str) -> bool:
+    """Whether an Allow on this chat's card is remembered for the session
+    (``api/public/key_turns.feeds_allow_memory``)."""
+    from api.public import key_turns
+    return key_turns.feeds_allow_memory(chat_id)
+
+
 async def _follow_terminal(session_id: str, mode: str, live: str) -> str:
     """The chat's mode after a terminal's hook call: when the live word
     differs from the last one the terminal reported (the first compared with
     the word the terminal was spawned with), the chat moves to the mode that
     word maps to: the session, the row once, a frame to the chat's viewers.
     A Don't Ask terminal reports ``default`` from its spawn: not a change; a
-    pick made on another surface after the spawn is not a change either."""
+    pick made on another surface after the spawn is not a change either. A
+    word that maps above the chat's ceiling (``_follow_record``) moves it to
+    the ceiling and no further, and a lower mode the follow writes becomes
+    the ceiling (never below Ask): the pill raises a chat, a terminal's own
+    word never does."""
+    rec = _follow_record(session_id, mode)
     new = _CLI_LIVE_MODE_MAP.get(live)
-    if not note_live_word(session_id, live) or new is None or new == mode:
+    if not note_live_word(session_id, live) or new is None:
         return mode
+    if _MODE_RANK[new] > _MODE_RANK[rec.ceiling]:
+        if not rec.clamped:
+            rec.clamped = True
+            logger.info("Hook permission: session=%s reported %s, above the chat's ceiling %s: "
+                        "held there (the dashboard's mode pill raises a chat)",
+                        session_id, live, rec.ceiling)
+        new = rec.ceiling
+    elif _MODE_RANK[new] < _MODE_RANK[rec.ceiling]:
+        rec.ceiling = new if _MODE_RANK[new] >= _MODE_RANK[ASK_MODE] else ASK_MODE
+    if new == mode:
+        return mode
+    rec.wrote = new
     set_session_mode(session_id, new)
     try:
         chat_id = await routing.resolve_hook_chat_id(session_id)
@@ -708,7 +671,7 @@ class _ToolCall:
     tool_input: dict
     _pass1_out: dict
     wait_s: float
-    layer: "ExecutionLayer | None"
+    layer: "Engine | None"
     role: str
     auto_approved: bool
     file_edit: bool
@@ -728,6 +691,9 @@ class _ToolCall:
     mcp_server: str = field(init=False, repr=False)
     mcp_tool_only: str = field(init=False, repr=False)
     mcp_tier: str | None = field(init=False, repr=False)
+    # A key's turn drives the session (``key_rows.drives``): nobody sits at
+    # the screen of the computer it runs on. Read for a granted device tool.
+    key_driven: bool = field(init=False, default=False, repr=False)
 
     @classmethod
     async def resolve(cls, session_id: str, tool_name: str, tool_input: dict | None,
@@ -752,10 +718,10 @@ class _ToolCall:
         # the web tools, tool discovery, a subagent spawn (its tools are gated
         # on their own), the task list's reads, the checklist.
         auto_approved = role in _AUTO_APPROVED_ROLES
-        # A file edit by path (auto-approved in acceptEdits; a patch is not, and
+        # A file edit by path (auto-approved in Auto; a patch is not, and
         # a delete never is).
         file_edit = role == tool_roles.WRITE and payload == tool_roles.FILE_PATH
-        mode = current_mode(get_session_mode(session_id))
+        mode = known_mode(get_session_mode(session_id))
         client_type = get_session_client_type(session_id)
         attended = session_kind.attended(client_type)
 
@@ -887,7 +853,7 @@ class _ToolCall:
     def _question_is_nonblocking(self) -> bool:
         if self.layer is None:
             return False
-        names = self.layer.capabilities_for(self.session_id).behaviour.nonblocking_question_tools
+        names = self.layer.capabilities.behaviour.nonblocking_question_tools
         return any(self.layer.canonical_tool_name(self.session_id, n) == self.tool_name
                    for n in names)
 
@@ -989,24 +955,31 @@ class _ToolCall:
         # Runs BEFORE mode-based logic. If path check denies, tool is blocked
         # regardless of permission mode (even dontAsk).
         self.path_decision = None  # Available for Pass 2 shell tier logic
-        # External sessions (a phone caller who is not a platform user) never
-        # get a shell — the hook floor of that rule, by ROLE (the CLI argv and
-        # the settings deny list, the other two layers, carry the engine's own
-        # shell names). Before the path gate and before every mode branch: no
-        # role, mode or allow-memory can lift it. The web tools are not floored;
+        # External sessions (a phone caller who is not a platform user), and a
+        # session with no person to ask that says no_shell / no_web (the
+        # wrap-up, the agent's own line), never get a shell — the hook floor
+        # of that rule, by ROLE (the CLI argv and the settings deny list, the
+        # other two layers, carry the engine's own shell names). Before the
+        # path gate and before every mode branch: no role, mode or
+        # allow-memory can lift it. The web tools are not floored;
         # a URL fetch goes through the SSRF gate in check_tool_access below like
         # every other session.
-        if (getattr(self.security_ctx, "principal", None) == "external"
-                and self.role == tool_roles.SHELL):
+        from core.session.external_identity import is_external_ctx
+        if is_external_ctx(self.security_ctx):
+            refusal = outside_floor(self.security_ctx, self.tool_name, self.role)
+        else:
+            refusal = unattended_floor(self.security_ctx, self.tool_name, self.role)
+        # The agent's tool limits (api/hooks/limits.py): the same floor for
+        # every session kind, read from the context the build resolved.
+        kind = "floor" if refusal else "limit"
+        refusal = refusal or limit_refusal(self.security_ctx, self.tool_name)
+        if refusal:
             logger.warning(
-                "Hook denied (external session, no shell): session=%s, "
-                "tool=%s, agent=%s",
-                self.session_id, self.tool_name, cast("SecurityContext", self.security_ctx).agent
+                "Hook denied (%s): session=%s, tool=%s, agent=%s, reason=%s",
+                kind, self.session_id, self.tool_name,
+                cast("SecurityContext", self.security_ctx).agent, refusal,
             )
-            return {
-                "decision": "deny",
-                "reason": f"{self.tool_name} is not available on external routes.",
-            }
+            return {"decision": "deny", "reason": refusal}
         # Per-tool target revocation check. If an admin unpaired
         # the satellite while the session was running, tear down cleanly
         # via a clear tool-error instead of letting the session limp on
@@ -1059,8 +1032,27 @@ class _ToolCall:
             _parts = self.tool_name.split("__", 2)
             self.mcp_server = _parts[1] if len(_parts) >= 2 else ""
             self.mcp_tool_only = _parts[2] if len(_parts) >= 3 else ""
-            self.mcp_tier = mcp_permissions.resolve_tool_tier(self.mcp_server, self.mcp_tool_only)
+            # The labels load from the store on the first read of a process.
+            self.mcp_tier = await asyncio.to_thread(
+                mcp_permissions.resolve_tool_tier, self.mcp_server, self.mcp_tool_only)
+            from core.session import key_rows
+            if key_rows.any_driven() and self._device_grant():
+                self.key_driven = key_rows.drives(await self._card_chat(), self.session_id)
         return None
+
+    def _device_grant(self) -> bool:
+        """The tool is a device MCP's (browser, computer or app control) whose
+        capability the machine's owner granted on this session's place."""
+        from services.mcp import mcp_registry
+        cap = mcp_registry.device_capability_for_server(self.mcp_server)
+        granted = cast("SecurityContext", self.security_ctx).placement.device_grants or set()
+        return bool(cap and cap in granted)
+
+    def device_granted(self) -> bool:
+        """A granted device tool runs with no card: its owner consented at the
+        grant, for a person at that screen. Never in a key's turn, where nobody
+        is: the tool then follows the chat's mode like any other."""
+        return self._device_grant() and not self.key_driven
 
     def bash_tier_auto_approve(self) -> dict | None:
         """The shell tier against the current mode: ``{"decision": "allow"}``
@@ -1103,12 +1095,10 @@ class _ToolCall:
             return self.bash_tier_auto_approve() is not None
         if not self.tool_name.startswith("mcp__") or self.mcp_tier == "critical":
             return False
-        from services.mcp import mcp_permissions, mcp_registry
+        from services.mcp import mcp_permissions
         if mcp_permissions.tier_decision(cast("str", self.mcp_tier), AUTO_REVIEW_MODE) == "allow":
             return True
-        cap = mcp_registry.device_capability_for_server(self.mcp_server)
-        granted = cast("SecurityContext", self.security_ctx).placement.device_grants or set()
-        return bool(cap and cap in granted) or is_session_tool_allowed(self.session_id, self.tool_name)
+        return self.device_granted() or is_session_tool_allowed(self.session_id, self.tool_name)
 
     async def plan_mode(self) -> dict | None:
         """Plan mode: the read-only tools and the plan files."""
@@ -1135,17 +1125,24 @@ class _ToolCall:
                              tool_roles.payload_value(self.tool_name, self.tool_input))))):
                 return self._plan_allow()
 
-            # Allow writing/editing plan files in ~/.claude/plans/. Normalize
-            # separators: a Windows-satellite session sends the host-absolute
-            # path with backslashes (C:\Users\...\.claude\plans\x.md) — without
-            # this the plan write is denied as a generic plan-mode write. The
-            # path is normalized first, so one that climbs out of the plans
-            # folder with ``..`` is a plain write. Never recorded: the CLI
-            # admits its own plan files by itself.
+            # Allow writing/editing this session's plan files, in its scope's
+            # plans folder or its own home's (``plan_file_name``: a machine's
+            # host path and a Windows path alike; one that climbs out with
+            # ``..`` is a plain write). Recorded: a session that runs from its
+            # own home writes through the home's ``plans`` link, and the CLI
+            # asks for that file after the hook allowed it
+            # (``engine_prompts.PLAN_FILE_RECORD``).
             if self.file_edit:
-                file_path = posixpath.normpath(tool_roles.payload_value(
-                    self.tool_name, self.tool_input).replace("\\", "/"))
-                if "/.claude/plans/" in file_path:
+                from core.sandbox.session_config_dir import plan_file_name
+                name = plan_file_name(tool_roles.payload_value(self.tool_name, self.tool_input),
+                                      self.session_id)
+                if name:
+                    # The scope's plans folder is every session's of the scope, and
+                    # the CLI admits only its own plan by name: another session's
+                    # plan (a running turn's, or another chat's saved one) is not
+                    # recorded, so the CLI's ask for it stays the person's card.
+                    if not await _plan_of_another_session(self.session_id, name):
+                        self._pass1_out[_GATE_RECORD] = engine_prompts.PLAN_FILE_RECORD
                     return {"decision": "allow"}
 
             return {"decision": "deny", "reason": _PLAN_REFUSAL}
@@ -1198,7 +1195,7 @@ class _ToolCall:
             # satellite, a meeting participant, a change not landed yet). A
             # terminal's residual is the CLI's own engine, except a destructive
             # shell call no reviewer judges (a terminal Shift+Tabbed out of its
-            # auto mode, or spawned in acceptEdits by an older satellite): it
+            # auto mode into its edits-only mode): it
             # keeps the terminal's carve-out below.
             if self.mode == AUTO_REVIEW_MODE and self.mcp_tier != "critical":
                 if self.auto_allows():
@@ -1256,22 +1253,18 @@ class _ToolCall:
             # so revoking mid-session makes the next call prompt again. A device MCP
             # can only have loaded (and thus emit a tool call) if it passed the
             # config-build gate, so a matching grant here means it's legitimately in
-            # use. (Non-dashboard sessions never reach this branch — they allow at
-            # the fallthrough below; only dashboard sessions carry target grants.)
+            # use. Non-dashboard sessions never reach this branch. A key's turn is
+            # a dashboard session nobody watches: its device tools follow the mode.
             if self.tool_name.startswith("mcp__"):  # security_ctx is non-None past the Pass-1 gate
-                from services.mcp import mcp_permissions, mcp_registry
+                from services.mcp import mcp_permissions
                 # Critical-tier tools skip EVERY auto-approve below (device grant,
                 # session allow-memory, tier table): they exist to prompt per
                 # call, so they drop straight to the prompt path.
                 if self.mcp_tier != "critical":
-                    cap = mcp_registry.device_capability_for_server(self.mcp_server)
-                    granted = cast("SecurityContext", self.security_ctx).placement.device_grants or set()
-                    if cap and cap in granted:
+                    if self.device_granted():
                         logger.info(
-                            "Hook permission: auto-approving device tool %s "
-                            "(capability '%s' granted on machine "
-                            "%s)",
-                            self.tool_name, cap, cast("SecurityContext", self.security_ctx).placement.machine_id[:8] or '?'
+                            "Hook permission: auto-approving device tool %s (granted on machine %s)",
+                            self.tool_name, cast("SecurityContext", self.security_ctx).placement.machine_id[:8] or '?'
                         )
                         return {"decision": "allow"}
 
@@ -1321,6 +1314,7 @@ class _ToolCall:
                 if (self.mcp_tier == "critical"
                         or (not self.reviews
                             and bool(getattr(self.path_decision, "destructive", False)))):
+                    self._pass1_out[_TERMINAL_ASK] = True
                     return {
                         "decision": "ask",
                         "reason": "OtoDock: this action always needs your approval",
@@ -1331,6 +1325,9 @@ class _ToolCall:
                 # matches their trusted-dir native behavior anyway.
                 if self._pass1_out.get("updated_input") is not None:
                     return {"decision": "allow"}
+                # The engine's own rules decide; a call they do not allow is
+                # its question on screen (a woken terminal tells its person).
+                self._pass1_out[_TERMINAL_ASK] = True
                 return {"decision": "defer"}
             if _is_interactive_session(self.session_id):
                 # An interactive session with NO human (client_type "task")
@@ -1366,8 +1363,9 @@ class _ToolCall:
             if approved and self.tool_name.startswith("mcp__"):
                 # Feed the session allow-memory (checked above before prompting).
                 # Critical-tier tools re-prompt per call by design, never
-                # remembered.
-                if self.mcp_tier != "critical":
+                # remembered; nor is an Allow given inside the turn of an
+                # API key that asks, which covers that one call.
+                if self.mcp_tier != "critical" and _feeds_allow_memory(chat_id):
                     remember_session_tool_allow(self.session_id, self.tool_name)
             elif approved and self.live and self.role in (tool_roles.SHELL, tool_roles.WRITE):
                 key = _call_key(self.role, self.tool_name, self.tool_input)
@@ -1432,52 +1430,6 @@ _STAGES = (
 )
 
 
-def question_shown_reason(tool_name: str) -> str:
-    """What the engine is told when its question went to the chat as a card:
-    the hook's deny reason, and every answer of a Codex question the hook did
-    not see. The person's next message is the answer."""
-    return ("Questions have been displayed to the user in the chat interface. "
-            "The user will reply in their next message. "
-            f"Do NOT re-ask these questions or call {tool_name} again this turn.")
-
-
-async def show_question_card(route: routing.HookRoute, session_id: str, tool_name: str,
-                             tool_input: dict, *, journaled: bool = False) -> None:
-    """The question card, a block of the turn like Claude's (or shown
-    between turns when no pump runs): no answer is awaited, the person's
-    next message is it. A ``journaled`` one (a terminal's blocking question,
-    which its tailer writes as the question's row) goes onto the queue,
-    whose drainer forwards it to a viewer; a terminal's non-blocking one is
-    no question row there, so it is shown here like any other."""
-    queue = get_permission_queue(route.queue_session_id)
-    item = {"event_type": wire.ITEM_QUESTION, "tool_name": tool_name, "tool_input": tool_input}
-    if journaled:
-        queue.put_nowait(item)
-        return
-    engine_prompts.offer_hook_card(queue, item, session_id=session_id,
-                                   chat_id=await _card_chat_of(session_id))
-
-
-async def ask_user_question(session_id: str, questions: list, *, tool_name: str = "") -> dict:
-    """A Codex ``request_user_input`` question set the PreToolUse hook did not
-    see (a satellite whose gate skips the turn): the same card the hook draws,
-    and the server request answered at once, every question with
-    ``question_shown_reason``, so the turn ends as the hook's deny ends it.
-    Reused in-process by the local Codex layer and over the tunnel by
-    ``/v1/hooks/codex-question``. Returns the answers MAP
-    ``{<id>: {"answers": [...]}}``; ``{}`` for an unattended session (no card:
-    nobody answers, the model goes on). ``tool_name`` is the engine's question
-    tool as the card records it (the caller's descriptor says)."""
-    if not session_kind.attended(get_session_client_type(session_id)):
-        return {}
-    route = routing.resolve_hook_route(session_id)
-    await show_question_card(route, session_id, tool_name, {"questions": questions})
-    reason = question_shown_reason(tool_name)
-    logger.info("Codex question: shown as a card, answered at once (%s)", len(questions))
-    return {str(q["id"]): {"answers": [reason]}
-            for q in questions if isinstance(q, dict) and q.get("id")}
-
-
 async def _decide(*args, **kwargs) -> dict:
     return await decide_tool_permission(*args, **kwargs)
 
@@ -1490,4 +1442,3 @@ async def _ask(*args, **kwargs) -> dict:
 # hook surface); each looks its function up at call time, so a patch of
 # either on this module reaches every in-process caller.
 session_events.register_permission_authority(_decide, _ask)
-

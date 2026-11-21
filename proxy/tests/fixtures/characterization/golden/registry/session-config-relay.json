@@ -1,0 +1,139 @@
+{
+ "available": {
+  "bash_env_keys": [
+   "GIT_CONFIG_COUNT",
+   "GIT_CONFIG_KEY_0",
+   "GIT_CONFIG_KEY_1",
+   "GIT_CONFIG_VALUE_0",
+   "GIT_CONFIG_VALUE_1"
+  ],
+  "bundles": {
+   "char-hosted": {
+    "env": {
+     "OTODOCK_RELAY_TOKEN": "relay-token-of-user-admin"
+    }
+   }
+  },
+  "excluded": {
+   "char-browser": "Requires a remote machine (satellite)",
+   "char-satellite": "Requires a remote machine (satellite)"
+  },
+  "file": {
+   "mcpServers": {
+    "char-hosted": {
+     "args": [
+      "<tmp>/mcps/custom/char-hosted/server.py"
+     ],
+     "command": "<tmp>/mcps/custom/char-hosted/venv/bin/python",
+     "env": {
+      "OTODOCK_RELAY_BASE": "https://relay.example.test/relay/char",
+      "OTO_CLI_TOKEN": "",
+      "OTO_STRIP_KEYS": "GIT_CONFIG_COUNT,GIT_CONFIG_KEY_0,GIT_CONFIG_KEY_1,GIT_CONFIG_VALUE_0,GIT_CONFIG_VALUE_1,OTO_CLI_TOKEN",
+      "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":true,\"label\":\"Hosted Relay\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+     },
+     "type": "stdio"
+    }
+   }
+  },
+  "flat_env": {
+   "GIT_CONFIG_COUNT": "2",
+   "GIT_CONFIG_KEY_0": "credential.https://git.example.test.helper",
+   "GIT_CONFIG_KEY_1": "credential.https://git.example.test.helper",
+   "GIT_CONFIG_VALUE_0": "",
+   "GIT_CONFIG_VALUE_1": "!\"$OTO_HOOK_PY\" -I \"$OTO_HOOKS_DIR/credential_helper.py\" git"
+  },
+  "instance_files": {},
+  "path": "<tmp>/sessions/user-mcp-configs/char-reg-4031a61059f9.json",
+  "server_order": [
+   "char-hosted"
+  ]
+ },
+ "not_available": {
+  "bash_env_keys": [
+   "GIT_CONFIG_COUNT",
+   "GIT_CONFIG_KEY_0",
+   "GIT_CONFIG_KEY_1",
+   "GIT_CONFIG_VALUE_0",
+   "GIT_CONFIG_VALUE_1"
+  ],
+  "bundles": {
+   "char-hosted": {}
+  },
+  "excluded": {
+   "char-browser": "Requires a remote machine (satellite)",
+   "char-satellite": "Requires a remote machine (satellite)"
+  },
+  "file": {
+   "mcpServers": {
+    "char-hosted": {
+     "args": [
+      "<tmp>/mcps/custom/char-hosted/server.py"
+     ],
+     "command": "<tmp>/mcps/custom/char-hosted/venv/bin/python",
+     "env": {
+      "OTODOCK_RELAY_ERROR": "OtoDock hosted relay not available yet. An admin can set up billing in Setup, OtoDock.",
+      "OTO_CLI_TOKEN": "",
+      "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Hosted Relay\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+     },
+     "type": "stdio"
+    }
+   }
+  },
+  "flat_env": {
+   "GIT_CONFIG_COUNT": "2",
+   "GIT_CONFIG_KEY_0": "credential.https://git.example.test.helper",
+   "GIT_CONFIG_KEY_1": "credential.https://git.example.test.helper",
+   "GIT_CONFIG_VALUE_0": "",
+   "GIT_CONFIG_VALUE_1": "!\"$OTO_HOOK_PY\" -I \"$OTO_HOOKS_DIR/credential_helper.py\" git"
+  },
+  "instance_files": {},
+  "path": "<tmp>/sessions/user-mcp-configs/char-reg-4031a61059f9.json",
+  "server_order": [
+   "char-hosted"
+  ]
+ },
+ "refused": {
+  "bash_env_keys": [
+   "GIT_CONFIG_COUNT",
+   "GIT_CONFIG_KEY_0",
+   "GIT_CONFIG_KEY_1",
+   "GIT_CONFIG_VALUE_0",
+   "GIT_CONFIG_VALUE_1"
+  ],
+  "bundles": {
+   "char-hosted": {}
+  },
+  "excluded": {
+   "char-browser": "Requires a remote machine (satellite)",
+   "char-satellite": "Requires a remote machine (satellite)"
+  },
+  "file": {
+   "mcpServers": {
+    "char-hosted": {
+     "args": [
+      "<tmp>/mcps/custom/char-hosted/server.py"
+     ],
+     "command": "<tmp>/mcps/custom/char-hosted/venv/bin/python",
+     "env": {
+      "OTODOCK_RELAY_ERROR": "the relay said no",
+      "OTO_CLI_TOKEN": "",
+      "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Hosted Relay\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+     },
+     "type": "stdio"
+    }
+   }
+  },
+  "flat_env": {
+   "GIT_CONFIG_COUNT": "2",
+   "GIT_CONFIG_KEY_0": "credential.https://git.example.test.helper",
+   "GIT_CONFIG_KEY_1": "credential.https://git.example.test.helper",
+   "GIT_CONFIG_VALUE_0": "",
+   "GIT_CONFIG_VALUE_1": "!\"$OTO_HOOK_PY\" -I \"$OTO_HOOKS_DIR/credential_helper.py\" git"
+  },
+  "instance_files": {},
+  "path": "<tmp>/sessions/user-mcp-configs/char-reg-4031a61059f9.json",
+  "server_order": [
+   "char-hosted"
+  ]
+ }
+}

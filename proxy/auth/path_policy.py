@@ -23,11 +23,21 @@ from core.placement import PlacementCapabilities
 
 # str-typed readers: a duck-typed / mocked context must never look external
 # (a truthy stand-in attribute would otherwise become a host path).
-from core.session.external_identity import external_home_of, is_external_ctx
+from core.session.external_identity import (
+    caller_home_of,
+    external_home_of,
+    is_external_ctx,
+)
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
+
+
+# ``SecurityContext.press_reach``: an app button's press at a member's own
+# role in the agent scope, or with no folder of the agent at all.
+PRESS_MEMBER = "member"
+PRESS_NONE = "none"
 
 
 @dataclass(frozen=True)
@@ -125,6 +135,60 @@ class SecurityContext:
     external_ephemeral: bool = False
     external_verified: bool = False  # the daemon's PIN gate passed
     external_claim: str = ""
+    # What a manager picked for outside people, resolved when the session
+    # was built (services/mcp/outside_picks.py): whether the engine's write
+    # tools may write the person's own files, whether the web tools are on,
+    # the knowledge folders bound read-only, and per attached server key the
+    # functions the session may call (None: every function). The hook, the
+    # gateway, the route list and the sandbox read these; an external
+    # context with none of them set gets nothing.
+    outside_files_write: bool = False
+    outside_web: bool = False
+    outside_knowledge: tuple = ()
+    outside_grants: tuple = ()
+    # The apps opened to outside people when the session started (app row
+    # ids): the app's door asks it, then the picks as they stand now.
+    outside_apps: tuple = ()
+    # The agent's tool limits for this session's kind, resolved when it was
+    # built (services/mcp/tool_limits.py): per limited server key the
+    # functions the session may call. A server with no pair keeps every
+    # function. The hook, the gateway, an app button's run and the engines'
+    # tool lists read it; a chat's or a run's default is no limit.
+    tool_limits: tuple = ()
+    # A session with no person to ask and a narrower engine: ``no_shell``
+    # (no shell, nor the sub-agents, workflows, escalations and cross-session
+    # tools that could carry one) and ``no_web``. The wrap-up after a
+    # conversation sets both, the agent's own phone line ``no_shell``.
+    no_shell: bool = False
+    no_web: bool = False
+    # The wrap-up after a conversation (services/phone/wrapup.py): the
+    # conversation's chat id ("" for every other session), the person's tree
+    # it writes into ("" for none: it writes nothing) and their identity row
+    # (the ``subj`` claim of its token, which maps the memory API to that
+    # person's memory alone).
+    wrapup: str = ""
+    wrapup_home: str = ""
+    subject_id: str = ""
+    # The agent's own phone line (``mcp_session_filter.agent_line_rule``):
+    # anyone who dials acts as the agent, from a scratch engine home, with
+    # the agent's memory and every other session's engine state shut.
+    open_line: bool = False
+    # The agent's own accounts the session's tools were built on, as
+    # ``(tool, lender's sub, account label)`` triples: set when the session
+    # registers (``session_state.set_session_security``), read when an
+    # account leaves the agent's set, to close the sessions built on it.
+    agent_accounts: tuple = ()
+    # An app button's press that runs below the button's identity
+    # (``services/apps/headless_exec.press_reach``): ``PRESS_MEMBER`` is the
+    # agent scope at the presser's own role, ``PRESS_NONE`` reaches no
+    # folder of the agent. Either reaches only the routes a tool needs for
+    # its files (``external_endpoints.is_press_endpoint_allowed``). "" for
+    # every other session.
+    press_reach: str = ""
+    # Any app button's session, at every reach (``headless_exec``): it never
+    # reads an engine's state (``_agent_state_denial``), not even at the
+    # app's own manager identity, since a file a member wrote can name it.
+    app_press: bool = False
     # The SSH hosts the agent's ssh-hosts instances name, as ``(host, user)``
     # pairs (``path_shell_hosts.attached_host``): the opening the command gate
     # gives a manager or editor on the local sandbox. Filled by the permission
@@ -274,14 +338,16 @@ def _translate_sandbox_path(raw_path: str, ctx: SecurityContext) -> str:
     if ctx.placement.isolates_with_bwrap and (raw_path == "~" or raw_path.startswith("~/")):
         return "/tmp" + raw_path[1:]
 
-    # /caller/ — an external caller's private tree (SecurityContext.
-    # external_home). A session without one has no /caller at all: the raw
-    # path is returned untranslated and resolves outside every allowed root.
+    # /caller/ — a person's private tree: an external caller's own, or the
+    # tree a wrap-up writes up (``caller_home_of``). A session without one
+    # has no /caller at all: the raw path is returned untranslated and
+    # resolves outside every allowed root.
     if raw_path == "/caller" or raw_path.startswith("/caller/"):
-        if not external_home_of(ctx):
+        caller_home = caller_home_of(ctx)
+        if not caller_home:
             return raw_path
         rest = raw_path[len("/caller"):].lstrip("/")
-        return str(Path(ctx.external_home) / rest) if rest else ctx.external_home
+        return str(Path(caller_home) / rest) if rest else caller_home
 
     # /config/ — agent config dir (manager/admin RW; editor/viewer RO)
     if layout.under(raw_path, layout.V_CONFIG):
@@ -313,8 +379,8 @@ def _session_cwd_anchor(ctx: SecurityContext) -> Path:
     """Host equivalent of the sandbox session cwd — ``/users/{u}`` for user
     mounts, ``/workspace`` for agent-scope (sandbox.get_cwd pins these)."""
     agent_dir = _AGENTS_DIR / ctx.agent
-    if external_home_of(ctx):
-        return Path(ctx.external_home)
+    if caller_home_of(ctx):
+        return Path(caller_home_of(ctx))
     if ctx.mount_username:
         return layout.user_dir(agent_dir, ctx.mount_username)
     return agent_dir / layout.WORKSPACE
@@ -527,6 +593,40 @@ def _is_local_tmp_path(resolved: Path, ctx: SecurityContext) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# The opening word of a denial, by whether the path was asked for a write.
+_DENIED = ("Read denied", "Write denied")
+
+
+def _press_denial(resolved: Path, ctx: SecurityContext, writing: bool) -> PathDecision | None:
+    """An app button's press that reaches no folder of the agent
+    (``PRESS_NONE``): every path but the sandbox's own ``/tmp``. Precedes the
+    admin shortcut, so no role a context carries can widen it."""
+    if getattr(ctx, "press_reach", "") != PRESS_NONE or _is_local_tmp_path(resolved, ctx):
+        return None
+    return PathDecision(False, f"{_DENIED[writing]}: this button's call reaches none of the agent's files")
+
+
+def _agent_state_denial(resolved: Path, ctx: SecurityContext, writing: bool) -> PathDecision | None:
+    """An engine's state (a scope-root ``.claude`` or ``.codex`` and below)
+    for a context with no person below the editor tier, and for an app
+    button's session at any reach and role: the sandbox masks it for those
+    contexts (``SandboxBuilder._agent_state_masks``), and a tool that
+    resolves its paths here (a Docker tool, outside bwrap) meets the same
+    wall. An outside session keeps its own rules."""
+    from services import path_roles
+    if is_external_ctx(ctx):
+        return None
+    if not getattr(ctx, "app_press", False) and (ctx.username or roles.can_edit(ctx.role)):
+        return None
+    try:
+        rel = resolved.relative_to((_AGENTS_DIR / ctx.agent).resolve())
+    except ValueError:
+        return None
+    if not path_roles.in_session_state_dir(rel):
+        return None
+    return PathDecision(False, f"{_DENIED[writing]}: the agent's engine state is not open to this session")
+
+
 def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     """Validate a read operation against the security context."""
     # OAuth credential files are protected for EVERY role (including
@@ -554,7 +654,12 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
             "Read denied: agent CLI config files are protected.",
         )
 
-    # Admin on admin agent: unrestricted
+    denied = _press_denial(resolved, ctx, False) or (
+        _agent_state_denial(resolved, ctx, False) if getattr(ctx, "app_press", False) else None)
+    if denied is not None:
+        return denied
+
+    # Admin on admin agent: unrestricted, never for a button's session (above).
     if ctx.is_admin_agent and roles.is_admin(ctx.role):
         return _ALLOW
 
@@ -569,6 +674,13 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     # well), and under externals/ only their own tree is theirs.
     if is_external_ctx(ctx):
         denied = _external_read_denial(resolved, ctx)
+        if denied is not None:
+            return denied
+    denied = _own_engine_denial(resolved, ctx) or _agent_state_denial(resolved, ctx, False)
+    if denied is not None:
+        return denied
+    if getattr(ctx, "wrapup", ""):
+        denied = _wrapup_read_denial(resolved, ctx)
         if denied is not None:
             return denied
 
@@ -600,8 +712,8 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
                 return True
             if _path_under(resolved, (agent_dir / layout.KNOWLEDGE).resolve()):
                 return True
-            if external_home_of(ctx) and _path_under(
-                    resolved, Path(ctx.external_home).resolve()):
+            if caller_home_of(ctx) and _path_under(
+                    resolved, Path(caller_home_of(ctx)).resolve()):
                 return True
             return False
 
@@ -646,7 +758,7 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
 
 # Subdirs of a user's own ``users/{u}/`` dir that accept writes. The dir
 # ROOT is reserved — mirrors the RO-root + RW-subdir bwrap mount in
-# core/sandbox/sandbox.py::_workspace_mounts (keep the two sets in step).
+# core/sandbox/sandbox.py::_role_mount_table (keep the two sets in step).
 # ``.credentials`` is deliberately absent: its writes are already denied
 # above via ``is_protected_credentials_path`` (MCP processes write tokens
 # in place, but they bypass this hook entirely).
@@ -659,6 +771,8 @@ _USER_DIR_WRITABLE_SUBDIRS: tuple[str, ...] = (
 #: list and the session's config — never a tool-write target (the CLI's
 #: own process state writes there without going through a tool).
 _EXTERNAL_WRITABLE_SUBDIRS: tuple[str, ...] = layout.USER_SUBDIRS
+#: The engines' state folders in a person's tree.
+_ENGINE_STATE_DIRS: tuple[str, ...] = (".claude", ".codex")
 
 # Paths that are NEVER writable (even admin on admin agent).
 # Protects the permission system itself and sensitive infrastructure.
@@ -698,14 +812,29 @@ def _is_memory_file(resolved: Path) -> bool:
 
 
 def _external_read_denial(resolved: Path, ctx: SecurityContext) -> PathDecision | None:
-    """External-session read rules that precede every grant: no shared agent
-    memory, and no other caller's tree. ``None`` = nothing to deny here."""
+    """External-session read rules that precede every grant, the mounts'
+    twin for a tool that reads through the proxy (a Docker tool resolves
+    its paths here, outside bwrap): the shared agent memory never, the
+    shared workspace never, of the knowledge only the folders a manager
+    picked (``outside_knowledge``, each through ``outside_picks.
+    knowledge_parts``, so the memory and the credentials never), and under
+    externals/ only the person's
+    own tree. ``None`` = nothing to deny here."""
     agent_dir = (_AGENTS_DIR / ctx.agent).resolve()
     if _path_under(resolved, (agent_dir / layout.KNOWLEDGE / "memory").resolve()):
         return PathDecision(
             False,
             "Read denied: shared agent memory is not available on external routes",
         )
+    if _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve()):
+        return PathDecision(False, "Read denied: the shared workspace is not open to outside people")
+    knowledge = (agent_dir / layout.KNOWLEDGE).resolve()
+    if _path_under(resolved, knowledge):
+        from services.mcp.outside_picks import knowledge_parts
+        picked = [knowledge.joinpath(*parts) for parts in
+                  map(knowledge_parts, getattr(ctx, "outside_knowledge", ()) or ()) if parts]
+        if not any(_path_under(resolved, folder) for folder in picked):
+            return PathDecision(False, "Read denied: this knowledge folder is not open to outside people")
     if _path_under(resolved, (agent_dir / "externals").resolve()):
         home = Path(ctx.external_home).resolve() if external_home_of(ctx) else None
         if home is None or not _path_under(resolved, home):
@@ -720,6 +849,11 @@ def _external_write_verdict(resolved: Path, ctx: SecurityContext) -> PathDecisio
         denied = _external_read_denial(resolved, ctx)
         if denied is not None:
             return PathDecision(False, denied.reason.replace("Read denied", "Write denied"))
+        if not getattr(ctx, "outside_files_write", False):
+            # The files pick at Read only: nothing is written during the
+            # conversation (the engines' write tools are floored too; this
+            # is where a patch and a Direct builtin are judged).
+            return PathDecision(False, "Write denied: writing files is not open to outside people on this line")
         if external_home_of(ctx):
             home = Path(ctx.external_home).resolve()
             if _path_under(resolved, home):
@@ -733,7 +867,63 @@ def _external_write_verdict(resolved: Path, ctx: SecurityContext) -> PathDecisio
                     "only its workspace/ and context/ subfolders are writable "
                     "on this line.",
                 )
+        # Nothing of the agent is written from an outside session, whatever
+        # role word the context carries: no shared workspace, no knowledge.
+        return PathDecision(False, "Write denied: outside people write only their own folder on this line")
     return None
+
+
+def _own_engine_denial(resolved: Path, ctx: SecurityContext) -> PathDecision | None:
+    """What a session that runs from its own scratch engine home (the wrap-up
+    after a conversation, the agent's own phone line) never reaches, to read or
+    to write, through its own tools or a Docker tool's path: the engine state
+    every agent-scope session keeps (``workspace/.claude``, ``workspace/.codex``:
+    earlier calls', tasks' and workers' transcripts). The line never reaches the
+    agent's shared memory either. The mounts hide both; this is their twin.
+    ``None`` = nothing to deny here."""
+    line = ctx.open_line
+    if not (line or ctx.wrapup):
+        return None
+    agent_dir = (_AGENTS_DIR / ctx.agent).resolve()
+    if any(_path_under(resolved, agent_dir / layout.WORKSPACE / d) for d in _ENGINE_STATE_DIRS):
+        return PathDecision(False, "Access denied: the engine's state of the agent's other sessions")
+    if line and _path_under(resolved, agent_dir / layout.KNOWLEDGE / "memory"):
+        return PathDecision(False, "Access denied: the agent's memory is not open on its phone line")
+    return None
+
+
+def _wrapup_read_denial(resolved: Path, ctx: SecurityContext) -> PathDecision | None:
+    """The wrap-up after a conversation reads what an agent-scope run reads,
+    but under externals/ only the tree of the person it is for. ``None`` =
+    nothing to deny here."""
+    agent_dir = (_AGENTS_DIR / ctx.agent).resolve()
+    if _path_under(resolved, (agent_dir / "externals").resolve()):
+        home = Path(ctx.wrapup_home).resolve() if ctx.wrapup_home else None
+        if home is None or not _path_under(resolved, home):
+            return PathDecision(False, "Access denied: another caller's files")
+        # The engine state of the person's calls: the mounts hide it under
+        # the run's own scratch state, and the policy names it the same.
+        if any(_path_under(resolved, home / d) for d in _ENGINE_STATE_DIRS):
+            return PathDecision(False, "Access denied: the engine's state of this person's calls")
+    return None
+
+
+def _wrapup_write_verdict(resolved: Path, ctx: SecurityContext) -> PathDecision | None:
+    """The wrap-up after a conversation writes only the files of the person
+    it is for: their tree's ``workspace/`` and ``context/``, never its
+    ``context/memory/`` (the memory tool writes that through the platform)
+    and nothing of the agent's. ``None`` = not a wrap-up."""
+    if not getattr(ctx, "wrapup", ""):
+        return None
+    refused = PathDecision(False, "Write denied: after a conversation the agent writes only in this person's folder")
+    if not ctx.wrapup_home:
+        return refused
+    home = Path(ctx.wrapup_home).resolve()
+    if _path_under(resolved, home / layout.CONTEXT / "memory"):
+        return PathDecision(False, "Write denied: this person's memory is written with the memory tool")
+    if any(_path_under(resolved, home / sub) for sub in _EXTERNAL_WRITABLE_SUBDIRS):
+        return _ALLOW
+    return refused
 
 
 def _mirror_verdict(resolved: Path, ctx: SecurityContext, agent_dir: Path) -> bool | None:
@@ -855,6 +1045,11 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     if resolved.name == ".env":
         return PathDecision(False, "Write denied: .env files are protected")
 
+    denied = (_own_engine_denial(resolved, ctx) or _press_denial(resolved, ctx, True)
+              or _agent_state_denial(resolved, ctx, True))
+    if denied is not None:
+        return denied
+
     # Admin on admin agent: allow everything else
     if ctx.is_admin_agent and roles.is_admin(ctx.role):
         return _ALLOW
@@ -865,7 +1060,7 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
 
     # External sessions: only their own caller tree under externals/, and
     # only its known subdirs (the root is reserved, like a user dir's root).
-    decision = _external_write_verdict(resolved, ctx)
+    decision = _external_write_verdict(resolved, ctx) or _wrapup_write_verdict(resolved, ctx)
     if decision is not None:
         return decision
 
@@ -1064,6 +1259,12 @@ def _protected_tool_path_denial(
     return None
 
 
+#: What the card of a write with no path says.
+NO_PATH_WRITE_REASON = "Write denied: this change names no file, so it cannot be checked. Try it again."
+#: What a call whose input is no object meets (no engine sends one).
+NOT_AN_OBJECT_REASON = "Denied: this call's input is not a set of named values, so it cannot be checked."
+
+
 def check_tool_access(
     tool_name: str,
     tool_input: dict,
@@ -1079,6 +1280,11 @@ def check_tool_access(
     are always allowed (they're gated by per-agent mcp-config.json
     and mode-based logic respectively).
     """
+    # Every rule below reads the input's named values: one that is no object
+    # is refused here, for every tool, rather than raise in a caller.
+    if not isinstance(tool_input, dict):
+        return PathDecision(False, NOT_AN_OBJECT_REASON), None
+
     # MCP tools: separate processes, gated by per-agent mcp-config.json
     if tool_name.startswith("mcp__"):
         return _ALLOW, None
@@ -1133,12 +1339,21 @@ def check_tool_access(
     # once.
     extra_paths = (tool_input.get("_codex_paths")
                    if role == tool_roles.WRITE and payload == tool_roles.FILE_PATH else None)
-    if isinstance(extra_paths, list):
-        for extra in extra_paths[1:]:
-            if isinstance(extra, str) and extra:
-                decision, _ = check_tool_access(tool_name, {"file_path": extra}, ctx)
-                if not decision.allowed:
-                    return decision, None
+    if extra_paths is not None and not isinstance(extra_paths, list):
+        return PathDecision(False, NO_PATH_WRITE_REASON), None
+    for extra in (extra_paths or [])[1:]:
+        if not isinstance(extra, str) or not extra:
+            return PathDecision(False, NO_PATH_WRITE_REASON), None  # an entry that names no file would go unchecked
+        decision, _ = check_tool_access(tool_name, {"file_path": extra}, ctx)
+        if not decision.allowed:
+            return decision, None
+
+    # A write that names no file (a Codex change whose approval arrived with
+    # no path to it, a malformed call): the path is all the checks below
+    # read, the protected set included, so there is nothing to allow it on.
+    if tool_roles.writes(tool_name) and payload == tool_roles.FILE_PATH \
+            and not tool_roles.payload_value(tool_name, tool_input):
+        return PathDecision(False, NO_PATH_WRITE_REASON), None
 
     # Admin on admin agent: skip the role matrix — never the universal
     # protected set, which the read and write checks below enforce for
@@ -1237,7 +1452,7 @@ def check_tool_access(
     if payload == tool_roles.FILE_PATH:
         raw_path = tool_roles.payload_value(tool_name, tool_input)
         if not raw_path:
-            return _ALLOW, None  # no path = tool will error naturally
+            return _ALLOW, None  # a read with no path errors by itself (a write was refused above)
         # Translate sandbox-internal paths to host paths for validation
         translated = _translate_sandbox_path(raw_path, ctx)
         resolved = _resolve_path(translated)

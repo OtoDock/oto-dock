@@ -76,6 +76,8 @@ class HostOS:
     display_server: str         # DISPLAY_* or "" (probed at connect)
     xdg_user_dirs: bool         # ~/.config/user-dirs.dirs names the well-known folders
     videos_folder: str          # Videos | Movies
+    memory_guard: bool = False  # the memory guard runs: the reading is measured here (Linux)
+    oom_score: bool = False     # /proc/self/oom_score_adj orders the kernel's last-resort kill
 
     @property
     def script_suffix(self) -> str:
@@ -90,7 +92,7 @@ def _table() -> dict:
         peercred=True, case_insensitive=False, conpty=False,
         locks_running_files=False, service_manager=SERVICE_SYSTEMD,
         powershell=False, tray=False, display_server="", xdg_user_dirs=True,
-        videos_folder="Videos",
+        videos_folder="Videos", memory_guard=True, oom_score=True,
     )
     darwin = HostOS(
         name=DARWIN, dirname=".oto-dock", exe_suffix="", venv_bin="bin",

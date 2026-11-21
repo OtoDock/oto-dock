@@ -45,6 +45,11 @@ export interface Chat {
   // Sharing as a snapshot (SHARING.md): the owner of a per-user chat,
   // editor and above on a shared-only agent's chat, never a task run.
   can_share?: boolean
+  // A person's pinned chats: the row is a chat of this person's history
+  // they may open (`can_pin`), and among their own pins (`pinned`). Absent
+  // from a server without pins: no Pin item, no toggle.
+  can_pin?: boolean
+  pinned?: boolean
   // Search rows only: the newest message holding every word of the query
   // (the result opens the chat there) and its words around the match, the
   // matched ones between SNIPPET_MARK_START and SNIPPET_MARK_END.
@@ -73,17 +78,25 @@ export interface ChatList<T extends Chat = Chat> {
   has_more: boolean
 }
 
-type ListKind = 'chats' | 'tasks'
+/** The chat history's pinned view: the one spelling of the word, for the
+ * list, its cache key and the search. */
+export const PINNED_VIEW = 'pinned'
+
+type ListKind = 'chats' | 'tasks' | typeof PINNED_VIEW
 
 // Each list's cache key, and its `kind` on the route (none: the chat list).
-const LIST_CACHE: Record<ListKind, string> = { chats: 'chats', tasks: 'task-chats' }
-const LIST_ROUTE_KIND: Record<ListKind, string | null> = { chats: null, tasks: 'tasks' }
+// The pinned view is cached UNDER the chat list's key, so every update of
+// `['chats']` (a delete's drop, a rename's patch) reaches it by the prefix.
+const LIST_CACHE: Record<ListKind, string> = { chats: 'chats', tasks: 'task-chats', pinned: 'chats' }
+const LIST_ROUTE_KIND: Record<ListKind, string | null> = { chats: null, tasks: 'tasks', pinned: null }
 
-const listKey = (kind: ListKind, agent?: string) => [LIST_CACHE[kind], agent] as const
+const listKey = (kind: ListKind, agent?: string) =>
+  kind === PINNED_VIEW ? [LIST_CACHE[kind], agent, PINNED_VIEW] as const : [LIST_CACHE[kind], agent] as const
 
 const LIST_FAILED: Record<ListKind, string> = {
   chats: 'Failed to fetch chats',
   tasks: 'Failed to fetch task chats',
+  pinned: 'Failed to fetch pinned chats',
 }
 
 async function fetchListPage<T extends Chat>(
@@ -95,6 +108,7 @@ async function fetchListPage<T extends Chat>(
   if (agent) params.set('agent', agent)
   const routeKind = LIST_ROUTE_KIND[kind]
   if (routeKind) params.set('kind', routeKind)
+  if (kind === PINNED_VIEW) params.set('pinned', '1')
   if (after) {
     params.set('before_updated_at', after.updated_at)
     params.set('before_chat_id', after.id)
@@ -229,6 +243,12 @@ export function useChats(agent?: string, pollPaused = false) {
   return useChatList<Chat>('chats', agent, true, pollPaused)
 }
 
+/** The chat history's pinned view: this person's pinned chats of the agent,
+ * the history's own rows in its own order, paged like it. */
+export function usePinnedChatList(agent?: string, enabled = true, pollPaused = false) {
+  return useChatList<Chat>(PINNED_VIEW, agent, !!agent && enabled, pollPaused)
+}
+
 // One row of GET /v1/chats?kind=tasks — a task-run chat joined with its
 // latest run. `unread` is always false server-side (tasks carry no unread
 // state anywhere — notifications cover completion).
@@ -277,13 +297,15 @@ export async function fetchActiveChats(): Promise<ActiveChat[]> {
  * the same run permission rules as the task listing. The newest matches
  * come first (up to 50), every word of the query a prefix; the first rows
  * name their newest matching message (`match_message_id`, `match_snippet`). */
-export function useSearchChats(agent: string | undefined, query: string, kind: 'chats' | 'tasks' = 'chats') {
+export function useSearchChats(agent: string | undefined, query: string,
+                               kind: 'chats' | 'tasks' | typeof PINNED_VIEW = 'chats') {
   return useQuery({
     queryKey: ['chat-search', agent, query, kind],
     queryFn: async () => {
       if (!query.trim() || !agent) return null
       const params = new URLSearchParams({ q: query, agent })
-      if (kind !== 'chats') params.set('kind', kind)
+      if (kind === PINNED_VIEW) params.set('pinned', '1')
+      else if (kind !== 'chats') params.set('kind', kind)
       const data = await apiJson<{ chats: Chat[] }>(`/v1/chats/search?${params}`, {}, 'Search failed')
       return data.chats
     },
@@ -418,17 +440,37 @@ export function useRenameChat() {
   })
 }
 
-// --- Agent Conversations (Conversations tab) — external sessions (phone /
-// future webhook) for any agent the viewer can manage. Dashboard chats are
-// excluded server-side and live on the chat-history page. ---
+// --- Agent Conversations (Conversations tab): the phone conversations of
+// outside people and of the agent's own line, each with its record (the
+// line, the person, the outcome, the wrap-up). Open to the agent's editors
+// and managers; a person's own calls live in their chat history. ---
 
-export function useAgentConversations(agent: string, sourceType?: string, offset = 0, limit = 50) {
+/** The line a conversation came on (`conversation_store.LINES`). */
+export type ConversationLine = 'caller' | 'agent' | 'shared' | 'person'
+
+/** One row of the Conversations tab: the chat with its record. */
+export interface AgentConversation extends Chat {
+  line: ConversationLine
+  direction: 'inbound' | 'outbound'
+  /** The outside person's id, or '' (the agent's own line, a withheld number). */
+  person_id: string
+  outcome: string
+  follow_ups: string[]
+  /** The wrap-up's state, '' before the call ends (`lib/status/wrapup`). */
+  wrapup: string
+  wrote: { kind: string; name: string }[]
+  ended_at: string | null
+}
+
+export const agentConversationsKey = (agent: string) => ['agent-conversations', agent] as const
+
+export function useAgentConversations(agent: string, offset = 0, limit = 50, person = '') {
   return useQuery({
-    queryKey: ['agent-conversations', agent, sourceType, offset],
+    queryKey: [...agentConversationsKey(agent), person, offset, limit],
     queryFn: async () => {
       const params = new URLSearchParams({ offset: String(offset), limit: String(limit) })
-      if (sourceType) params.set('source_type', sourceType)
-      return apiJson<{ conversations: Chat[]; total: number }>(`/v1/agents/${agent}/conversations?${params}`)
+      if (person) params.set('person', person)
+      return apiJson<{ conversations: AgentConversation[]; total: number }>(`/v1/agents/${agent}/conversations?${params}`)
         .catch(withMessage('Failed to fetch conversations'))
     },
     enabled: !!agent,
@@ -451,4 +493,49 @@ export function useChatDetail(chatId: string | null) {
 
 export class ForbiddenError extends Error {
   constructor() { super('Forbidden') }
+}
+
+const inPinnedView = (key: readonly unknown[], at: number) => key[at] === PINNED_VIEW
+
+/** Pin or unpin a chat for this person (PUT or DELETE /v1/chats/{id}/pinned).
+ * Optimistic: the row's `pinned` flips in every chat list and search result,
+ * and an unpin drops the row from the pinned view. A pin never inserts a row
+ * into the pinned view: its loaded pages end at a cursor, so the row comes
+ * with the refetch. A failure puts the cached rows back. */
+export function useSetChatPinned() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ chatId, pinned }: { chatId: string; pinned: boolean }) => {
+      await apiJson<{ pinned: boolean }>(`/v1/chats/${chatId}/pinned`, { method: pinned ? 'PUT' : 'DELETE' })
+        .catch(withFallback(() => (pinned ? 'Could not pin the chat.' : 'Could not unpin the chat.')))
+    },
+    onMutate: async ({ chatId, pinned }) => {
+      await queryClient.cancelQueries({ queryKey: ['chats'] })
+      await queryClient.cancelQueries({ queryKey: ['chat-search'] })
+      const saved = [
+        ...queryClient.getQueriesData<ChatList>({ queryKey: ['chats'] }),
+        ...queryClient.getQueriesData<Chat[] | null>({ queryKey: ['chat-search'] }),
+      ]
+      const flip = (c: Chat) => (c.id === chatId ? { ...c, pinned } : c)
+      const keep = (c: Chat) => pinned || c.id !== chatId
+      queryClient.setQueriesData<ChatList>({ queryKey: ['chats'] }, (list) => list && {
+        ...list, chats: list.chats.map(flip),
+      })
+      queryClient.setQueriesData<ChatList>(
+        { queryKey: ['chats'], predicate: (q) => inPinnedView(q.queryKey, 2) },
+        (list) => list && { ...list, chats: list.chats.filter(keep) })
+      queryClient.setQueriesData<Chat[] | null>({ queryKey: ['chat-search'] }, (rows) => rows && rows.map(flip))
+      queryClient.setQueriesData<Chat[] | null>(
+        { queryKey: ['chat-search'], predicate: (q) => inPinnedView(q.queryKey, 3) },
+        (rows) => rows && rows.filter(keep))
+      return saved
+    },
+    onError: (_e, _vars, saved) => {
+      for (const [key, data] of saved ?? []) queryClient.setQueryData(key, data)
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['chats'] })
+      queryClient.invalidateQueries({ queryKey: ['chat-search'] })
+    },
+  })
 }

@@ -28,20 +28,6 @@ def _one_tick(monkeypatch, module):
 
 
 @pytest.mark.asyncio
-async def test_codex_reaper_reads_the_cached_timeout(monkeypatch):
-    from core.layers.codex import session as cs
-    from core.session import session_state
-    seen: list = []
-    monkeypatch.setattr(session_state, "cached_idle_timeout", AsyncMock(return_value=7))
-    _forbid_on_loop_read(monkeypatch, cs.app_config)
-    monkeypatch.setattr(cs, "_codex_reap_candidates", lambda now, t: seen.append(t) or [])
-    _one_tick(monkeypatch, cs)
-    with pytest.raises(asyncio.CancelledError):
-        await cs.reap_idle_codex_sessions()
-    assert seen == [7]
-
-
-@pytest.mark.asyncio
 async def test_remote_reaper_reads_the_cached_timeout(monkeypatch):
     from types import SimpleNamespace
 
@@ -57,6 +43,7 @@ async def test_remote_reaper_reads_the_cached_timeout(monkeypatch):
     _one_tick(monkeypatch, rr)
     with pytest.raises(asyncio.CancelledError):
         await rr.reap_idle_remote_sessions()
+    await rr.settle()
     session_state.cached_idle_timeout.assert_awaited_once()
 
 
@@ -114,13 +101,16 @@ async def test_the_remote_reaper_spares_a_session_waiting_on_a_person(monkeypatc
         closed.append(sid)
 
     layer = SimpleNamespace(
-        _sessions={"parked": SimpleNamespace(last_activity=old, machine_id="m", turn_active=True),
-                   "idle": SimpleNamespace(last_activity=old, machine_id="m", turn_active=False)},
-        _cm=_Cm(), close_session=close_session,
+        _sessions={"parked": SimpleNamespace(last_activity=old, machine_id="m", turn_active=True,
+                                             cli_dead=False),
+                   "idle": SimpleNamespace(last_activity=old, machine_id="m", turn_active=False,
+                                           cli_dead=False)},
+        _cm=_Cm(), close_session=close_session, is_spawning=lambda sid: False,
         probe_session_process_dead=AsyncMock(return_value=False))
     monkeypatch.setattr(session_manager, "_get_remote_layer", lambda: layer)
     monkeypatch.setattr(session_state, "has_pending_prompt", lambda sid: sid == "parked")
     _one_tick(monkeypatch, rr)
     with pytest.raises(asyncio.CancelledError):
         await rr.reap_idle_remote_sessions()
+    await rr.settle()         # the tick starts each machine's reaping and waits for none
     assert closed == ["idle"]

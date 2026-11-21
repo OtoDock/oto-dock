@@ -44,15 +44,13 @@ def _seed() -> tuple[list[str], list[str]]:
 
 
 def test_thirty_page_loads_at_once_hold_the_loop(tmp_path, monkeypatch):
-    import core.session.interactive_session as interactive
-    import core.session.session_state as session_state
     from auth.providers import create_session_jwt
+    from services.delegation import lane_status
     from tests.loadtest import _harness as h
 
     slugs, chats = _seed()
     streaming = chats[:STREAMING]
-    monkeypatch.setattr(session_state, "streaming_chat_ids", lambda: list(streaming))
-    monkeypatch.setattr(interactive, "streaming_chat_ids", set)
+    monkeypatch.setattr(lane_status, "working_chat_ids", lambda: list(streaming))
     cookie = create_session_jwt("user-admin", "admin@test.com", "Admin User", "admin")
 
     async def phase(host, port, sockets: bool):

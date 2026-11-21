@@ -19,6 +19,7 @@ import { useDialogs } from '../../components/ui/dialogs'
 import Button from '../../components/ui/Button'
 import { Select } from '../../components/ui/Field'
 import { BADGE_BASE, BADGE_TONE, CARD, BUTTON_DANGER_QUIET } from '../../components/ui/classes'
+import { copyOrSay } from '../../lib/copyText'
 
 type ScopeFilter = 'all' | 'user' | 'agent'
 type StatusFilter = 'all' | 'active' | 'paused'
@@ -154,9 +155,7 @@ function TriggerRow({ trigger }: { trigger: Trigger }) {
 
   const onCopyUrl = async () => {
     if (!webhookUrl) return
-    try {
-      await navigator.clipboard.writeText(webhookUrl)
-    } catch { /* ignore */ }
+    await copyOrSay(webhookUrl)
   }
 
   const onDelete = async () => {

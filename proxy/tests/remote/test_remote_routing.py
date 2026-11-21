@@ -4,20 +4,29 @@ from unittest.mock import patch
 
 import pytest
 
+from core import placement
+from tests._compute import placed
+
 
 class TestGetExecutionLayer:
     """Test that get_execution_layer correctly routes to remote layer."""
 
-    def test_local_agent_returns_cli_layer(self):
+    def test_local_agent_runs_on_the_compute_machine_or_is_refused(self):
+        """The platform starts no session of a process engine itself: an
+        agent of the platform's place gets the remote layer for the compute
+        placement its config was built with, and the refusal with none."""
         with patch("core.session.session_manager.agent_store") as mock_store, \
              patch("services.remote.remote_status.resolve_execution_target", return_value=("local", None)):
             mock_store.get_agent.return_value = {
                 "execution_path": "claude-code-cli",
                 "execution_target": "local",
             }
-            from core.session.session_manager import _cli_layer, get_execution_layer
-            layer = get_execution_layer("test-agent")
-            assert layer is _cli_layer
+            from core.session.session_manager import get_execution_layer
+            layer = get_execution_layer("test-agent", placement_built=placed())
+            assert type(layer).__name__ == "RemoteExecutionLayer"
+            with pytest.raises(placement.NoComputeMachine) as refused:
+                get_execution_layer("test-agent")
+            assert str(refused.value) == placement.NO_COMPUTE_SENTENCE
 
     def test_local_direct_llm_returns_direct_layer(self):
         with patch("core.session.session_manager.agent_store") as mock_store:
@@ -63,22 +72,41 @@ class TestGetExecutionLayer:
             assert type(layer).__name__ == "RemoteExecutionLayer"
 
     def test_execution_path_override_respected(self):
+        """The override decides the engine, never the agent's row: a Direct
+        LLM override on a Claude Code agent answers the Direct layer (its
+        loop stays in the proxy), an engine nothing registers is its own
+        error, and a Codex override of the platform's place with no compute
+        placement is refused as any process engine is."""
         with patch("core.session.session_manager.agent_store") as mock_store, \
              patch("services.remote.remote_status.resolve_execution_target", return_value=("local", None)):
             mock_store.get_agent.return_value = {
                 "execution_path": "claude-code-cli",
                 "execution_target": "local",
             }
-            from core.session.session_manager import _codex_layer, get_execution_layer
-            layer = get_execution_layer("test-agent", execution_path="codex-cli")
-            assert layer is _codex_layer
+            from core.session.session_manager import (
+                UnknownExecutionPath,
+                _direct_layer,
+                get_execution_layer,
+            )
+            assert get_execution_layer("test-agent", execution_path="direct-llm") is _direct_layer
+            with pytest.raises(UnknownExecutionPath):
+                get_execution_layer("test-agent", execution_path="no-such-engine")
+            with pytest.raises(placement.NoComputeMachine):
+                get_execution_layer("test-agent", execution_path="codex-cli")
+            layer = get_execution_layer("test-agent", execution_path="codex-cli", placement_built=placed())
+            assert type(layer).__name__ == "RemoteExecutionLayer"
 
-    def test_unknown_agent_defaults_to_cli(self):
+    def test_unknown_agent_defaults_to_the_platforms_engine(self):
+        """A row that is gone reads as the platform's default engine, a
+        process engine: the remote layer for a compute placement, the
+        refusal with none (never an unknown-engine error)."""
         with patch("core.session.session_manager.agent_store") as mock_store:
             mock_store.get_agent.return_value = None
-            from core.session.session_manager import _cli_layer, get_execution_layer
-            layer = get_execution_layer("nonexistent")
-            assert layer is _cli_layer
+            from core.session.session_manager import get_execution_layer
+            layer = get_execution_layer("nonexistent", placement_built=placed())
+            assert type(layer).__name__ == "RemoteExecutionLayer"
+            with pytest.raises(placement.NoComputeMachine):
+                get_execution_layer("nonexistent")
 
     def test_user_override_returns_remote_layer(self):
         """User has a personal machine, agent default is local."""
@@ -93,16 +121,20 @@ class TestGetExecutionLayer:
             assert type(layer).__name__ == "RemoteExecutionLayer"
 
     def test_no_user_sub_uses_agent_default(self):
-        """Without user_sub, resolve_execution_target uses agent default."""
+        """Without user_sub, the resolver is asked for the agent's default
+        place (nobody's override). Its answer here is the platform's place,
+        which has no layer without a compute placement."""
         with patch("core.session.session_manager.agent_store") as mock_store, \
-             patch("services.remote.remote_status.resolve_execution_target", return_value=("local", None)):
+             patch("services.remote.remote_status.resolve_execution_target",
+                   return_value=("local", None)) as resolve:
             mock_store.get_agent.return_value = {
                 "execution_path": "claude-code-cli",
                 "execution_target": "local",
             }
-            from core.session.session_manager import _cli_layer, get_execution_layer
-            layer = get_execution_layer("test-agent")
-            assert layer is _cli_layer
+            from core.session.session_manager import get_execution_layer
+            with pytest.raises(placement.NoComputeMachine):
+                get_execution_layer("test-agent")
+            resolve.assert_called_once_with("test-agent", None, "manager")
 
 
 class TestServiceAccountNeverOnUserMachine:

@@ -57,69 +57,84 @@ def _manages(user: dict | None, agent_roles: dict[str, str], agent: str) -> bool
 
 
 async def clear_binding(row: dict, owner_sub: str) -> None:
-    """Unregister the service-scope subscriptions the binding lent through
-    the lender's own token, then drop the binding row; the admin delete
-    route calls it while that token still exists."""
+    """Take the lender's row out of the agent's set through the one remover,
+    which unregisters its service-scope subscriptions through the lender's
+    own token first; the admin delete route calls it while that token still
+    exists. A chat that chose it is closed and told."""
     mcp_name, agent, label = row["mcp_name"], row["agent_name"], row["account_label"]
-    try:
-        cleaned = await subscription_manager.cleanup_account_subscriptions(
-            scope="service", owner=owner_sub, mcp_name=mcp_name, account_label=label,
-            agent=agent, token_owner_sub=owner_sub,
-        )
-    except Exception:
-        logger.exception("offboarding: the subscriptions of %s on %s were not cleaned",
-                         mcp_name, agent)
-        cleaned = 0
-    removed = await run_db(functools.partial(
-        credential_store.remove_service_agent_binding, mcp_name, agent,
-        owner_sub=owner_sub, account_label=label))
+    from services.remote import chat_reload
+    removed = await chat_reload.remove_service_account(
+        mcp_name, agent, owner_sub=owner_sub, account_label=label)
     if not removed:
         logger.info("offboarding: the %s binding on %s names another account now; kept",
                     mcp_name, agent)
         return
-    logger.info("offboarding: cleared the %s binding of %s on %s (%d subscription(s))",
-                mcp_name, owner_sub[:8], agent, cleaned)
+    logger.info("offboarding: cleared the %s binding of %s on %s", mcp_name, owner_sub[:8], agent)
+
+
+async def clear_personal_only(agent_name: str | None = None) -> int:
+    """Take every account out of the own sets of a Personal-only agent (of
+    every such agent with no ``agent_name``), through the one remover: its
+    subscriptions, token files and sessions follow. A Personal-only agent
+    has no accounts of its own (``account_context.holds_own_accounts``).
+    Idempotent. Returns how many sets were emptied."""
+    from services.mcp import account_context
+    from services.remote import chat_reload
+    from storage.identity import service_account_set
+    emptied = 0
+    for mcp_name, agent in await run_db(service_account_set.sets_of, agent_name):
+        if await run_db(account_context.holds_own_accounts, agent):
+            continue
+        try:
+            if await chat_reload.remove_service_account(mcp_name, agent):
+                emptied += 1
+                logger.warning("service accounts: %s is Personal only, its own %s accounts were "
+                               "taken out", agent, mcp_name)
+        except Exception:
+            logger.exception("service accounts: the %s accounts of Personal-only %s were not "
+                             "taken out", mcp_name, agent)
+    return emptied
+
+
+async def _clear_personal_only_after_boot() -> None:
+    try:
+        await asyncio.sleep(BOOT_PASS_AFTER_S)
+        await clear_personal_only()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("service accounts: the boot pass over Personal-only agents failed")
 
 
 async def _sweep_orphans() -> int:
-    """Every service-scope subscription whose binding no longer stands, or
-    now names another account, goes; an installation row the standing
-    binding no longer covers goes alone. The vendor delete is best-effort."""
+    """Every service-scope subscription whose own account of the agent's set
+    no longer stands, or no longer covers the installation it targets, goes,
+    through that account's lender's token while the row is still there. A
+    subscription on another account than the default stays: each account of
+    the set keeps its own. The vendor delete is best-effort."""
+    from storage.identity import service_account_set
     rows = await run_db(webhook_subscription_store.list_subscriptions, scope="service")
     gone = 0
     for row in rows:
-        agent = row.get("agent") or ""
-        binding = await run_db(credential_store.get_service_agent_binding,
-                               row["mcp_name"], agent)
-        if binding and binding.account_label == row["account_label"]:
-            if row.get("target_kind") != oauth_app_kinds.INSTALLATION_TARGET_KIND:
-                continue
-            if await _covers(binding, row):
-                continue
-            try:
-                deleted, _ = await subscription_manager.delete_subscription(subscription_id=row["id"])
-                gone += int(deleted)
-            except Exception:
-                logger.exception("offboarding: the orphaned subscription %s was not cleaned",
-                                 row.get("id"))
+        agent, mcp_name, label = row.get("agent") or "", row["mcp_name"], row["account_label"]
+        if row.get("target_kind") == oauth_app_kinds.INSTALLATION_TARGET_KIND:
+            stands = await run_db(subscription_manager.service_row_covers, mcp_name, agent, label,
+                                  str(row.get("vendor_target") or ""))
+        else:
+            stands = await run_db(subscription_manager.service_account, mcp_name, agent, label) is not None
+        if stands:
             continue
+        held = next((r for r in await run_db(functools.partial(
+            service_account_set.list_service_agent_set, mcp_name, agent, standing_only=False))
+            if r.account_label == label), None)
         try:
-            gone += await subscription_manager.cleanup_account_subscriptions(
-                scope="service", owner="", mcp_name=row["mcp_name"],
-                account_label=row["account_label"], agent=agent,
-            )
+            deleted, _ = await subscription_manager.delete_subscription(
+                subscription_id=row["id"], token_owner_sub=held.account_owner_sub if held else "")
+            gone += int(deleted)
         except Exception:
             logger.exception("offboarding: the orphaned subscription %s was not cleaned",
                              row.get("id"))
     return gone
-
-
-async def _covers(binding: credential_store.ServiceBinding, row: dict) -> bool:
-    """Whether ``binding`` still covers the installation ``row`` targets."""
-    meta = {} if binding.installation_id else await run_db(
-        credential_store.get_account_meta, binding.account_owner_sub, row["mcp_name"],
-        row["account_label"])
-    return oauth_app_kinds.binding_covers(binding.installation_id, meta, row.get("vendor_target") or "")
 
 
 async def clear_unmanaged_bindings(sub: str) -> int:
@@ -179,7 +194,17 @@ async def on_offboard(event: offboarding.OffboardEvent) -> None:
                     swept, event.sub[:8], event.reason)
 
 
+#: A short while after the start, so the remover's closes find the sessions
+#: re-adopted from machines.
+BOOT_PASS_AFTER_S = 30.0
+
+
 def register() -> None:
+    """Subscribe the clear and schedule the boot pass over Personal-only
+    agents. Called once from the lifespan (a running loop)."""
+    from core import background
     offboarding.subscribe(SUBSCRIBER, on_offboard, priority=30)
+    background.spawn(_clear_personal_only_after_boot(), name="personal-only-accounts",
+                     owner="offboarding")
     logger.info("offboarding: %s subscribed (a binding follows its lender's standing)",
                 SUBSCRIBER)

@@ -129,8 +129,9 @@ describe('AgentGuard vs stale user.agents (grant without reload)', () => {
     renderGuardAt('/chat/oto')
     await waitFor(() => expect(screen.getByTestId('agent-chat')).toBeInTheDocument())
     expect(h.fetchCurrentUser).toHaveBeenCalledTimes(1)
-    // Admin list is the all=true query.
-    expect(h.apiFetch).toHaveBeenCalledWith('/v1/agents?all=true')
+    // Admin list is the all=true query. The guard lets an admin in while the
+    // list still loads, so the request may leave after the chat shows.
+    await waitFor(() => expect(h.apiFetch).toHaveBeenCalledWith('/v1/agents?all=true'))
   })
 
   it('live query ERROR + slug missing from snapshot → instant bounce, no blank wait', async () => {

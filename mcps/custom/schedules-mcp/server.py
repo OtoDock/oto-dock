@@ -534,7 +534,9 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Schedule a future continuation of THIS session: at the given time, the "
                 "prompt is delivered into this very conversation as a new turn (with full "
-                "context — the session resumes if it has gone idle). Use it for watchdog "
+                "context: the session resumes if it has gone idle. In a person's own chat it "
+                "resumes in that chat's mode with its tools, and in Ask a step that needs approval "
+                "waits for the person, who is told once). Use it for watchdog "
                 "wake-ups ('in 1 hour, check whether the delegated lanes reported back') "
                 "and deferred rounds ('at 15:00, start phase 2 if phase 1 finished').\n\n"
                 "One-shot: provide exactly one of `at` / `in_seconds`. Recurring: provide "
@@ -542,8 +544,10 @@ async def list_tools() -> list[Tool]:
                 "ALWAYS bounded (max_runs, default 5, or an `until` time); a chat must "
                 "never wake itself forever. For indefinite monitoring, create a recurring "
                 "TASK instead (fresh context per run — no context accretion in this chat).\n\n"
-                "Wake-ups COALESCE: a new wake is skipped while a previous one is still "
-                "unprocessed in this chat. Pending continuations appear in list_tasks and "
+                "Recurring wake-ups COALESCE: a run is skipped while a previous wake is "
+                "still unprocessed in this chat, and list_tasks says how many times in a "
+                "row. A one-shot wake is never skipped: it is delivered behind the wake in "
+                "front of it. Pending continuations appear in list_tasks and "
                 "are cancelled with delete_task (cancel yours when its purpose is served — "
                 "e.g. a watchdog wake that arrives after the thing it watched for already "
                 "happened should be deleted, not answered)."
@@ -660,12 +664,17 @@ async def list_tools() -> list[Tool]:
             description=(
                 "List all tasks (static + agent-created) for this agent, including "
                 "pending session continuations. Shows each task's schedule, next run "
-                "time, status (active or paused), and what its runs execute on: "
-                "`runs on: <model> [pinned|your engine|agent default|layer default, "
+                "time, status (active, paused, or will not fire: a one-shot whose time "
+                "passed with nothing left to run it), how many times in a row a wake "
+                "was skipped because its chat had not taken the previous one, and what "
+                "its runs execute on: "
+                "`runs on: <model> [pinned|your engine|agent default|layer default|the chat's, "
                 "tier N <label>]`, plus `via <layer> [pinned layer]` when the "
                 "engine is pinned (`your engine` = an unpinned user-scope task, "
-                "on the engine its creator's own chats take, and `layer default` = "
-                "only the engine is pinned and its own first choice runs); an "
+                "on the engine its creator's own chats take, `layer default` = "
+                "only the engine is pinned and its own first choice runs, and "
+                "`the chat's` = a session continuation, which runs on its chat's "
+                "own model, none shown when the chat has none); an "
                 "`[app]` handler row runs no LLM turn and "
                 "shows no model; `, machine: <name>` when the task runs on its "
                 "own machine instead of the agent's default. This is the "
@@ -1182,6 +1191,27 @@ async def _tool_get_task_result(arguments: dict) -> list[TextContent]:
     return [TextContent(type="text", text="\n".join(lines))]
 
 
+def _status(t: dict) -> str:
+    """A row's state as the platform reads it: paused, will not fire (a
+    one-shot whose time passed with nothing left to run it), or active."""
+    if not t.get("enabled"):
+        return "paused"
+    return "will not fire" if t.get("will_not_fire") else "active"
+
+
+def _state_notes(t: dict) -> list[str]:
+    """The sentences that explain a row's state to the agent reading it."""
+    notes: list[str] = []
+    if t.get("will_not_fire"):
+        notes.append("Its time has passed and nothing will run it. Run it now, or delete it.")
+    skips = int(t.get("wake_skips") or 0)
+    if skips:
+        times = "1 time" if skips == 1 else f"{skips} times"
+        notes.append(f"Its wake was skipped {times} in a row. The chat has not taken the "
+                     "previous wake yet.")
+    return notes
+
+
 async def _tool_list_tasks(arguments: dict) -> list[TextContent]:
     result = await _get("/v1/tasks", params=_agent_param(arguments))
     tasks = result.get("tasks", [])
@@ -1190,7 +1220,7 @@ async def _tool_list_tasks(arguments: dict) -> list[TextContent]:
     lines = [f"Tasks ({len(tasks)} total):"]
     for t in tasks:
         next_run = t.get("next_run_time") or "—"
-        status = "active" if t.get("enabled") else "paused"
+        status = _status(t)
         task_type = t.get("task_type", "task")
         machine = _machine_label(t)
         lines.append(
@@ -1198,13 +1228,14 @@ async def _tool_list_tasks(arguments: dict) -> list[TextContent]:
             f"({t['agent']}, {_fires_info(t)}, {status}, next: {next_run}"
             f"{_runs_on(t)}{f', machine: {machine}' if machine else ''})"
         )
+        lines.extend(f"    {note}" for note in _state_notes(t))
     return [TextContent(type="text", text="\n".join(lines))]
 
 
 async def _tool_get_task(arguments: dict) -> list[TextContent]:
     task_id = arguments["task_id"]
     t = await _get(f"/v1/tasks/{task_id}")
-    status = "active" if t.get("enabled") else "paused"
+    status = _status(t)
     # The zone a cron, an interval anchor or a naive run_at is read
     # in: the row's own, else the platform's (which the row keeps
     # following). Meaningless for a trigger-type task.
@@ -1233,6 +1264,7 @@ async def _tool_get_task(arguments: dict) -> list[TextContent]:
         + (f"   Who is told: {t['notify_audience']} and above"
            if t.get("scope") == _SCOPE_AGENT and t.get("notify_audience") else ""),
     ]
+    lines.extend(_state_notes(t))
     runs_on = _runs_on(t)
     if runs_on:
         lines.append("Runs on: " + runs_on[len(", runs on: "):]

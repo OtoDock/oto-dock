@@ -14,10 +14,8 @@ export interface User {
   agents: string[]
   default_agent?: string
   agent_roles: Record<string, AgentRole>
-  platform_configured?: boolean
   // Whether this user has connected their OWN AI engine (personal Claude Code
-  // or Codex subscription). Drives the per-user "connect an AI engine" banner —
-  // distinct from platform_configured (which is true if they can merely borrow).
+  // or Codex subscription): the admin's "connect an AI engine" strip.
   has_own_engine?: boolean
   auth_provider?: string
   totp_enabled?: boolean

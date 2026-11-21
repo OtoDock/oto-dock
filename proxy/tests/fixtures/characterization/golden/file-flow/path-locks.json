@@ -1,0 +1,9 @@
+{
+ "another_path": false,
+ "fan_out_again": true,
+ "fan_out_is_its_own": false,
+ "idle": true,
+ "idle_after": true,
+ "idle_while_held": false,
+ "same_key_one_lock": true
+}

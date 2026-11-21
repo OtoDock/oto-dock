@@ -5,7 +5,7 @@
 // frame's messages through `host.ts`. Nothing here reads a dashboard
 // cookie; the only requests are the link's own routes, same-origin.
 
-import { attachmentsLine, batchUrl, classify, frameSrc, linkQuery, openAllowed, pickTheme, readConfig, resultMessage, sessionUrl, settingsPlaceholder, cardPlaceholder, listPlaceholder, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, stateUrl, unlockUrl, viewerTokenUrl, webUrl, type ActionCall, type ShareConfig, type SnapshotMessage } from './host'
+import { attachmentsLine, batchUrl, classify, frameSrc, linkQuery, openAllowed, pickTheme, readConfig, resultMessage, sendLinkBatch, sessionUrl, settingsPlaceholder, cardPlaceholder, listPlaceholder, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, stateUrl, unlockUrl, viewerTokenUrl, webUrl, type ActionCall, type ShareConfig, type SnapshotMessage } from './host'
 import { WIRE } from '../api/wireEvents'
 import { fitViewportToDevice } from '../lib/device/viewport'
 
@@ -143,23 +143,17 @@ function renderApp(c: ShareConfig): void {
 
   let lastBatchAt = 0
   const runCalls = async (calls: ActionCall[]) => {
-    const now = Date.now()
-    const wait = Math.max(0, 1000 - (now - lastBatchAt))
-    lastBatchAt = now + wait
-    if (wait) await new Promise((r) => setTimeout(r, wait))
-    let lines: string[]
-    try {
-      const res = await fetch(batchUrl(c), {
+    const settled = await sendLinkBatch(calls, async (part) => {
+      const now = Date.now()
+      const wait = Math.max(0, 1000 - (now - lastBatchAt))
+      lastBatchAt = now + wait
+      if (wait) await new Promise((r) => setTimeout(r, wait))
+      return fetch(batchUrl(c), {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ calls: calls.map((k) => ({ call_id: k.call_id, action_id: k.id, args: k.args })) }),
+        body: JSON.stringify({ calls: part.map((k) => ({ call_id: k.call_id, action_id: k.id, args: k.args })) }),
       })
-      lines = res.ok ? (await res.text()).split('\n') : []
-      if (!res.ok) lines = calls.map((k) => JSON.stringify({ call_id: k.call_id, status: 'denied', reason: res.status === 401 ? 'password required' : 'not available on shared links' }))
-    } catch {
-      lines = calls.map((k) => JSON.stringify({ call_id: k.call_id, status: 'denied', reason: 'network error' }))
-    }
-    const settled = settleBatch(calls, lines)
+    })
     for (const k of calls) {
       const r = settled[k.call_id]
       post(resultMessage(k, r))

@@ -1,6 +1,7 @@
 import React from 'react'
 import { pageBuildId } from '../lib/buildId'
-import { crashReport, copyText } from '../lib/crash/crashReport'
+import { copyText } from '../lib/copyText'
+import { crashReport } from '../lib/crash/crashReport'
 import Button from './ui/Button'
 import { FIELD, FIELD_REGULAR, FIELD_BORDER, CARD } from './ui/classes'
 

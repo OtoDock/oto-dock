@@ -18,6 +18,10 @@ def _paths() -> set[str]:
     return {getattr(r, "path", "") for r in router.routes}
 
 
+def test_the_session_reload_route_is_registered():
+    assert "/v1/agents/{name}/reload-session" in _paths()
+
+
 def test_knowledge_library_routes_registered():
     paths = _paths()
     for p in (

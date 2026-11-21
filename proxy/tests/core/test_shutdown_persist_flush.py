@@ -10,12 +10,13 @@ import asyncio
 import pytest
 
 import startup
+import startup_shutdown
 from storage import pg as pg_pool
 
 
 @pytest.fixture(autouse=True)
 def _no_failsafe(monkeypatch):
-    monkeypatch.setattr(startup, "_ARM_EXIT_FAILSAFE", False)
+    monkeypatch.setattr(startup_shutdown, "_ARM_EXIT_FAILSAFE", False)
     startup._bg_tasks.clear()
     yield
     startup._bg_tasks.clear()
@@ -36,7 +37,7 @@ def test_persists_drained_and_watchdog_stopped_before_pool_close(monkeypatch):
     from core.layers.direct import mcp as direct_mcp
     from core.remote import satellite_connection as sc
 
-    monkeypatch.setattr(startup, "_flush_active_pumps", _fake_flush)
+    monkeypatch.setattr(startup_shutdown, "_flush_active_pumps", _fake_flush)
     monkeypatch.setattr(startup.task_store, "list_orphaned_runs", lambda: [])
     monkeypatch.setattr(startup.task_store, "mark_orphaned_runs_failed",
                         lambda exclude_ids=None: 0)
@@ -69,7 +70,7 @@ def test_slow_drain_is_bounded_and_never_blocks_close(monkeypatch, caplog):
     async def _fake_flush(logger):
         pass
 
-    monkeypatch.setattr(startup, "_flush_active_pumps", _fake_flush)
+    monkeypatch.setattr(startup_shutdown, "_flush_active_pumps", _fake_flush)
     monkeypatch.setattr(startup.task_store, "list_orphaned_runs", lambda: [])
     monkeypatch.setattr(startup.task_store, "mark_orphaned_runs_failed",
                         lambda exclude_ids=None: 0)

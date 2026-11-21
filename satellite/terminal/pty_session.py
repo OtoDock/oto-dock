@@ -13,12 +13,23 @@ bypass-acceptance screen a no-viewer can't clear), the first-run seed, and locat
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
+import stat
+import sys
 from pathlib import Path
 
 from ..config import otodock_dir, session_tools_env, write_command_wrappers
-from ..sessions.cli_session import _write_cli_hooks, _write_hook_scripts
+from ..host import safe_fs
+from ..sessions import session_homes
+from ..sessions.cli_session import (
+    _write_cli_hooks,
+    _write_hook_scripts,
+    remove_prompt_file,
+    write_prompt_file,
+)
 from .pty_session_base import BasePtySession
 
 logger = logging.getLogger("satellite")
@@ -32,6 +43,32 @@ _CLAUDE_PERMISSION_MODES = {"default", "acceptEdits", "plan", "bypassPermissions
 # by themselves: Auto (the CLI's classifier) and Plan; every other mode starts
 # in "default", the hook deciding above it.
 _TERMINAL_OWN_MODES = {"auto", "plan"}
+# How many entries the ``projects`` folder may list before a search finds
+# nothing (the platform's ``transcript_tailer._PROJECTS_MAX_ENTRIES``).
+_PROJECTS_MAX_ENTRIES = 10_000
+
+
+# The Claude Code TUI reads a key in its environment as a custom key a person
+# must approve on screen, and says "Not logged in" until one does. A terminal
+# on an API key signs in through a key helper given on its own command line
+# instead: the helper prints the key from a variable of the terminal's
+# environment, so nothing of the key is written to a file. The platform's own
+# terminal does the same (``proxy/core/layers/cli/session.py``). The helper is
+# this satellite's Python, which runs under the shell Claude Code uses on
+# every system.
+KEY_HELPER_ENV = "OTO_CLAUDE_API_KEY"
+
+
+def key_helper_args(env: dict) -> list[str]:
+    """The flags that sign a terminal in on the API key ``env`` carries,
+    the key moved to ``KEY_HELPER_ENV`` in ``env`` (``[]``: no key)."""
+    key = env.pop("ANTHROPIC_API_KEY", "")
+    if not key:
+        return []
+    env[KEY_HELPER_ENV] = key
+    helper = (f'"{sys.executable}" -c "import os,sys;'
+              f"sys.stdout.write(os.environ.get('{KEY_HELPER_ENV}', ''))\"")
+    return ["--settings", json.dumps({"apiKeyHelper": helper})]
 
 
 def terminal_permission_mode(config: dict) -> str:
@@ -107,18 +144,47 @@ class PtySession(BasePtySession):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._claude_dir: Path | None = None
+        # The folder the TUI reads: its home in ``_claude_dir`` when the start
+        # asks for one (``sessions/session_homes.py``), else that dir.
+        self._engine_dir: Path | None = None
         # The session id whose JSONL holds this run's turns: the resume id on
         # --resume (Claude appends to the original <id>.jsonl), else our own id.
         self._transcript_target_id = self.session_id
 
+    async def _start_compute(self) -> None:
+        """A terminal on a compute machine: the platform wrote the session's
+        files into the shared folder and planned the TUI's argv; this machine
+        renders the sandbox and spawns the plan with the plan's environment
+        and no cwd of its own. The transcript tail reads the shared folder."""
+        from ..sessions import credential_exit, sandbox_host, ssh_agent
+        self._own_copy = await sandbox_host.ready_own_copy(self.config, self.sat_config,
+                                                           self.session_id, self.agent_dir)
+        self._claude_dir = self.agent_dir / self.config["claude_dir_relative"]
+        # The session's SSH agent socket before the render, which binds it;
+        # the credential exit's door before it too (the render binds the bundle).
+        agent_env = await asyncio.to_thread(ssh_agent.start, self.session_id, self.config)
+        await asyncio.to_thread(credential_exit.start, self.session_id, self.config)
+        cmd = await sandbox_host.spawn_command(self.config, self.sat_config, "claude", for_pty=True)
+        env = sandbox_host.spawn_env(self.config)
+        ssh_agent.merge_env(env, agent_env, self.config)
+        if self.config.get("resume") and self.config.get("session_id_for_resume"):
+            self._transcript_target_id = self.config["session_id_for_resume"]
+            self._transcript_skip_existing = True
+        await self._wire_and_spawn(cmd, env, None)
+
     async def start(self) -> None:
         """Write config files + spawn the interactive Claude TUI under a PTY."""
+        if self._compute:
+            await self._start_compute()
+            return
         # --- session files + env (mirrors CLISession.start setup) -------------
         # cwd may be an arbitrary absolute folder (otodock-CLI); the config
         # dir stays agent_dir-rooted via claude_dir_relative regardless.
         self._cwd = self._resolve_work_cwd()
         self._claude_dir = self.agent_dir / self.config["claude_dir_relative"]
         self._claude_dir.mkdir(parents=True, exist_ok=True)
+        self._engine_dir = session_homes.open_home(
+            self._claude_dir, self.session_id, self.config.get("session_home"))
 
         # Wipe Claude Code's built-in auto-memory (the otodock memory-mcp is the
         # single source of truth); leave session JSONLs for --resume.
@@ -132,8 +198,8 @@ class PtySession(BasePtySession):
         _write_hook_scripts(self._claude_dir, self.config.get("hook_scripts", {}))
         write_command_wrappers(self._claude_dir, self.config.get("command_wrappers", {}))
 
-        prompt_file = self._claude_dir / "system-prompt.md"
-        prompt_file.write_text(self.config.get("system_prompt", ""))
+        prompt_file = write_prompt_file(
+            self._claude_dir, self.session_id, self.config.get("system_prompt", ""))
 
         mcp_config = self.config.get("mcp_config")
         mcp_file = self._claude_dir / f"mcp-config-{self.session_id[:12]}.json"
@@ -151,24 +217,23 @@ class PtySession(BasePtySession):
             mcp_config = None
             mcp_file.write_text(json.dumps({"mcpServers": {}}, indent=2))
 
-        _write_cli_hooks(self._claude_dir, self.config.get("disallowed_tools"))
+        _write_cli_hooks(self._engine_dir, self.config.get("disallowed_tools"),
+                         int(self.config.get("start_context_parts") or 0), scripts_dir=self._claude_dir)
 
         # OAuth file delivery (mirrors CLISession): the TUI authenticates from
         # .credentials.json in CLAUDE_CONFIG_DIR; rewritten on rotation by
         # ``credentials_update`` pushes.
         creds = self.config.get("credentials_json")
         if creds:
-            creds_path = self._claude_dir / ".credentials.json"
-            creds_path.write_text(json.dumps(creds))
-            creds_path.chmod(0o600)
+            session_homes.write_sign_in(self._engine_dir, ".credentials.json", creds)
 
         # Build env (mirrors CLISession): curate ambient → overlay platform env →
-        # session-file broker (OTO_SSH_KEY_DIR + credentials_dir token files) →
+        # the SSH agent socket and the exit's door (OTO_SSH_KEY_DIR, SSH_AUTH_SOCK) →
         # CLAUDE_CONFIG_DIR + disable-auto-memory → translate sandbox-virtual paths.
         # The shared base already set OTO_SESSION_ID + UTF-8 + TERM.
         env = self._base_env()
-        env.update(await self._materialize_session_files())
-        env["CLAUDE_CONFIG_DIR"] = str(self._claude_dir)
+        env.update(await self._session_agent_env())
+        env["CLAUDE_CONFIG_DIR"] = str(self._engine_dir)
         # The interactive flag the local Claude TUI spawn sets (satellite
         # 0.5.121 — parity with cli/session.py): the PostToolUse forwarder and
         # the SubagentStop tracker stand down (the transcript the satellite
@@ -189,6 +254,9 @@ class PtySession(BasePtySession):
         # The advisor tool is a model call the platform can neither meter nor
         # show. Mirrors proxy env_builder.
         env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
+        # Tools that really start connect together, not three at a time.
+        # Mirrors proxy env_builder.
+        env["MCP_SERVER_CONNECTION_BATCH_SIZE"] = str(min(16, max(3, 2 * (os.cpu_count() or 1))))
         env.pop("CLAUDECODE", None)
         env = session_tools_env(self._translate_env(env), self._claude_dir)
 
@@ -196,7 +264,7 @@ class PtySession(BasePtySession):
         # the remote terminal hangs at the picker. cwd key = the satellite-
         # absolute cwd (what Claude sees). Theme defaults dark.
         _seed_interactive_cli_config(
-            self._claude_dir, str(self._cwd), self.config.get("interactive_theme", "dark"),
+            self._engine_dir, str(self._cwd), self.config.get("interactive_theme", "dark"),
         )
 
         # --- build the INTERACTIVE command -----------------------------------
@@ -230,6 +298,7 @@ class PtySession(BasePtySession):
         # flags exist on the previous pin 2.1.281 too.
         cmd += ["--append-system-prompt-file", str(prompt_file)]
         cmd += ["--system-prompt-snapshot", "off", "--setting-sources", "user"]
+        cmd += key_helper_args(env)
         # NO --output-format/--input-format/--verbose: that's the -p pump's wire.
         if _is_resume:
             cmd += ["--resume", self.config["session_id_for_resume"]]
@@ -243,23 +312,47 @@ class PtySession(BasePtySession):
             self._transcript_target_id = self.config["session_id_for_resume"]
             self._transcript_skip_existing = True
 
-        await self._wire_and_spawn(cmd, env, str(self._cwd))
+        from ..sessions import sandbox_host
+        await self._wire_and_spawn(sandbox_host.paired_command(cmd), env, str(self._cwd))
+
+    def _on_close(self) -> None:
+        if self._compute:
+            return  # the prompt file is the platform's (swept there as a local terminal's)
+        remove_prompt_file(self._claude_dir, self.session_id)
+        session_homes.close_home(self._claude_dir, self.session_id, self.config.get("session_home"))
 
     # --- transcript forwarding (Claude: <id>.jsonl by name) ------------------
-    def _locate_transcript_file(self) -> Path | None:
-        """Find ``<claude_dir>/projects/<hash>/<target_id>.jsonl``. The project
-        hash derives from the cwd, so search every project dir. Created by Claude
-        shortly after spawn (resume: already present)."""
-        if self._claude_dir is None:
+    def _locate_transcript_file(self) -> str | None:
+        """Find ``<claude_dir>/projects/<hash>/<target_id>.jsonl``, as a path
+        beneath the agent's folder. The project hash derives from the cwd, so
+        search every project dir. Created by Claude shortly after spawn
+        (resume: already present). The folder is listed and each candidate's
+        status read beneath the agent's folder (``host/safe_fs``): a real
+        project folder and a regular file only; a ``projects`` folder past
+        ``_PROJECTS_MAX_ENTRIES`` entries finds nothing."""
+        rel = self.config.get("claude_dir_relative")
+        if self._claude_dir is None or not rel or not isinstance(rel, str):
             return None
-        projects = self._claude_dir / "projects"
-        if not projects.is_dir():
-            return None
+        projects = f"{rel}/projects"
+        name = f"{self._transcript_target_id}.jsonl"
         try:
-            for proj in projects.iterdir():
-                cand = proj / f"{self._transcript_target_id}.jsonl"
-                if cand.is_file():
-                    return cand
+            with safe_fs.open_root(self.agent_dir) as root:
+                listing = safe_fs.list_beneath(root, projects, max_entries=_PROJECTS_MAX_ENTRIES)
+                for proj in listing.dirs:
+                    cand = f"{projects}/{proj}/{name}"
+                    try:
+                        st = safe_fs.lstat_beneath(root, cand)
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(st.st_mode):
+                        return cand
+                if listing.links:
+                    self._warn_once("link", "PTY %s: %s/%s is a link, which the terminal does not follow: "
+                                    "a transcript there does not reach the chat",
+                                    self.session_id[:8], projects, listing.links[0])
+        except safe_fs.SymlinkRefused:
+            self._warn_once("link", "PTY %s: %s is reached through a link, which the terminal does not "
+                            "follow: its transcripts do not reach the chat", self.session_id[:8], projects)
         except OSError:
-            return None
+            logger.debug("PTY %s: transcript search failed", self.session_id[:8], exc_info=True)
         return None

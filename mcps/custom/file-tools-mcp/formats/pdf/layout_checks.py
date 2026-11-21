@@ -163,7 +163,6 @@ def _excerpt(spans: list[Span]) -> str:
 
 
 def rendered_overflow(ctx: checks.CheckContext) -> list[checks.Finding]:
-    import fitz
 
     from formats.pptx import pptx_deck, pptx_geometry, pptx_measure
 
@@ -177,7 +176,7 @@ def rendered_overflow(ctx: checks.CheckContext) -> list[checks.Finding]:
     parts = [str(slide.part.partname).lstrip("/") for slide in prs.slides]
     slide_w, slide_h = (prs.slide_width or 0) / EMU_PER_PT, (prs.slide_height or 0) / EMU_PER_PT
     found: list[checks.Finding] = []
-    with fitz.open(ctx.rendered_pdf) as doc:
+    with ctx.open_rendering() as doc:
         if doc.page_count != len(slides) or not slide_w:
             return [checks.Finding(checks.Severity.INFO, "", message=(
                 f"the rendering has {doc.page_count} pages for {len(slides)} shown slides, so it could not be "

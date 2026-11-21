@@ -91,6 +91,10 @@ class TestGate:
         with patch.object(pool_caps, "evaluate",
                           return_value=pool_caps.CapStatus("platform", "", "claude-code-cli")):
             assert asyncio.run(runner._pool_cap_block(_task())) == ""
-        with patch.object(pool_caps, "evaluate") as ev:
+        # A user-scope row with no creator has no person to pay
+        # (``core/config/spender.py``): the shared subscriptions, so the
+        # platform's cap.
+        with patch.object(pool_caps, "evaluate",
+                          return_value=pool_caps.CapStatus("platform", "", "claude-code-cli")) as ev:
             assert asyncio.run(runner._pool_cap_block(_task(scope="user", created_by=None))) == ""
-        ev.assert_not_called()
+        assert ev.call_args.args[:2] == ("platform", "")

@@ -80,10 +80,16 @@ class Env:
         mp.setattr(credential_store, "list_agent_account_bindings",
                    lambda sub, mcp: list(self.agent_bindings.get((sub, mcp), [])))
         mp.setattr(credential_store, "remove_account_agent_binding",
-                   lambda sub, mcp, agent: self.removed_bindings.append(("agent", sub, mcp, agent)))
+                   lambda sub, mcp, agent, label=None: self.removed_bindings.append(("agent", sub, mcp, agent, label)))
         mp.setattr(credential_store, "list_service_agent_bindings", lambda mcp: list(self.service_bindings.get(mcp, [])))
         mp.setattr(credential_store, "remove_service_agent_binding",
                    lambda mcp, agent, **kw: self.removed_bindings.append(("service", mcp, agent, kw)))
+        # The remover reads the agent's set first, to unregister the leaving
+        # account's subscriptions through its lender.
+        from storage.identity import service_account_set
+        mp.setattr(service_account_set, "list_service_agent_set", lambda mcp, agent, **kw: [
+            credential_store.ServiceBinding(b["account_label"], b["account_owner_sub"])
+            for b in self.service_bindings.get(mcp, []) if b["agent_name"] == agent])
 
         from services.webhooks import subscription_manager
 
@@ -271,6 +277,7 @@ def test_the_file_the_pending_unbind_the_row_and_the_agent_choice(env):
         {"provider_id": "facebook", "scope_id": "app", "user_key": "M1"},
         {"provider_id": "slack", "scope_id": "T9", "user_key": "U9"}])
     env.agent_bindings[("sub-a", "fb-mcp")] = [{"agent_name": "pa", "account_label": "Ann"},
+                                                {"agent_name": "pa", "account_label": "Bob"},
                                                 {"agent_name": "other", "account_label": "Bob"}]
     env.service_bindings["ig-mcp"] = [{"agent_name": "sales", "account_owner_sub": "sub-a", "account_label": "Ann"}]
     raw = _body(provider="facebook", scope_id="app", user_key="M1", reason="deauthorized", removed_at=1_234)
@@ -281,8 +288,8 @@ def test_the_file_the_pending_unbind_the_row_and_the_agent_choice(env):
         assert env.meta[("sub-a", mcp, "Ann")] == {relay_notices.REMOVED_REASON: {"reason": "deauthorized", "at": 1234}}
         assert relay_notices.removed_reason("sub-a", mcp, "Ann") == relay_notices.REMOVED_REASON
     assert relay_notices.removed_reason("sub-a", "fb-mcp", "Bob") == ""
-    assert ("agent", "sub-a", "fb-mcp", "pa") in env.removed_bindings
-    assert not any(b[:4] == ("agent", "sub-a", "fb-mcp", "other") for b in env.removed_bindings)
+    # The one account leaves the agent's set; the set's other account stays.
+    assert [b for b in env.removed_bindings if b[0] == "agent"] == [("agent", "sub-a", "fb-mcp", "pa", "Ann")]
     assert ("service", "ig-mcp", "sales", {"owner_sub": "sub-a", "account_label": "Ann"}) in env.removed_bindings
     assert {(c["scope"], c["mcp_name"]) for c in env.cleanups} == {
         ("user", "fb-mcp"), ("user", "ig-mcp"), ("service", "ig-mcp")}

@@ -19,9 +19,13 @@ def _frame(agent="pa", path="users/u/workspace/x.txt", action="write", session_i
     return {"agent_slug": agent, "path": path, "action": action, "session_id": session_id}
 
 
-def _machine_held(machine_id):
-    layer = SimpleNamespace(_sessions={"s-1": SimpleNamespace(machine_id=machine_id)})
-    return patch("core.session.session_manager.find_layer_for_session", return_value=layer)
+def _machine_held(machine_id: str):
+    """The remote layer holds the session on ``machine_id``, read as every
+    answer reads it (``session_manager.live_session``)."""
+    layer = SimpleNamespace(owns_session=lambda _sid: True,
+                            machine_of_session=lambda _sid: machine_id,
+                            is_session_grace_held=lambda _sid: False)
+    return patch("core.session.session_manager._remote_layer", layer)
 
 
 def test_a_frame_from_the_machine_the_layer_holds_the_session_on_is_admitted():

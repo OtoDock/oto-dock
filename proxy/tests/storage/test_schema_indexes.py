@@ -288,3 +288,70 @@ def test_init_schema_twice_is_a_no_op():
         conn.commit()
         after = conn.execute("SELECT count(*) AS n FROM pg_indexes WHERE schemaname = current_schema()").fetchone()["n"]
     assert before == after
+
+
+def _chat_reads(query: str, params: tuple) -> list[tuple[str, int]]:
+    """For each node of the executed plan that reads ``chats`` (as sent, then
+    prepared under a generic plan): its type and the rows it read, the rows
+    it kept plus the rows its filter or recheck threw away."""
+    def walk(node: dict, out: list[tuple[str, int]]) -> None:
+        if node.get("Relation Name") == "chats":
+            read = (node.get("Actual Rows", 0) + node.get("Rows Removed by Filter", 0)
+                    + node.get("Rows Removed by Index Recheck", 0))
+            out.append((node["Node Type"], int(read)))
+        for child in node.get("Plans", []):
+            walk(child, out)
+
+    found: list[tuple[str, int]] = []
+    with psycopg.connect(config.DATABASE_URL, autocommit=True) as c:
+        c.execute("SET enable_seqscan = off")
+        custom = c.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + query, params).fetchone()[0]
+        walk(custom[0]["Plan"], found)
+        n = 0
+
+        def _dollar(m):
+            nonlocal n
+            if m.group(0) == "%%":
+                return "%"
+            n += 1
+            return f"${n}"
+
+        c.execute("SET plan_cache_mode = force_generic_plan")
+        c.execute(sql.SQL("PREPARE zz_pin AS {}").format(sql.SQL(re.sub(r"%%|%s", _dollar, query))))
+        args = sql.SQL(", ").join(sql.Literal(p) for p in params)
+        generic = c.execute(sql.SQL("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE zz_pin({})").format(args)).fetchone()[0]
+        c.execute("DEALLOCATE zz_pin")
+        walk(generic[0]["Plan"], found)
+    return found
+
+
+@pytest.mark.parametrize("analysed", [True, False], ids=["analysed", "never-analysed"])
+def test_the_pinned_view_reads_the_pins_first(seeded, monkeypatch, analysed):
+    """A long history and a handful of pins: the view's query reads the
+    chats rows of the pins alone, by their key, in the plan as sent and in
+    the generic one, never the history row by row. A pins table under
+    autovacuum's threshold is never analysed in production."""
+    now = "2026-09-26T09:00:00"
+    with pg.get_conn() as conn:
+        conn.execute("TRUNCATE pinned_chats")
+        conn.cursor().executemany(
+            "INSERT INTO chats (id, user_sub, agent, created_at, updated_at, source_type, origin) "
+            "VALUES (%s, 'u-many', 'agent-many', %s, %s, 'chat', 'dashboard')",
+            [(f"m{i}", now, now) for i in range(2000)])
+        conn.cursor().executemany(
+            "INSERT INTO pinned_chats (user_sub, chat_id, pinned_at) VALUES ('user-viewer', %s, %s)",
+            [(f"m{i}", now) for i in (5, 500, 1500)])
+        conn.execute("ANALYZE chats")
+        if analysed:
+            conn.execute("ANALYZE pinned_chats")
+        conn.commit()
+    rec = _Recorder()
+    monkeypatch.setattr(db_chats, "get_conn", rec.get_conn)
+    rows = db_chats.list_chats("u-many", agent="agent-many", pinned_by="user-viewer")
+    assert sorted(r["id"] for r in rows) == ["m1500", "m5", "m500"]
+    query, params = rec.queries[0]
+    for plan in _plans(query, params):
+        assert "chats_pkey" in plan, plan
+    reads = _chat_reads(query, params)
+    assert len(reads) == 2, reads
+    assert all(read <= 3 for _, read in reads), reads

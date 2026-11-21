@@ -10,6 +10,7 @@ import re
 import time
 
 import numpy as np
+from audio.log_policy import log_transcript
 from audio.providers.stt.relisten import TURN_RELISTEN_WAIT_S
 
 from background import spawn
@@ -21,6 +22,27 @@ logger = logging.getLogger("pipeline")
 #: How long a classification waits for the classifier still building in
 #: the background before the heuristic timing stands in for that turn.
 TURN_CLASSIFIER_WAIT_S = 3.0
+
+#: The orphan sweep (``TurnMixin._sweep_orphan_final``). A final that landed
+#: in the provider's queue gets this long for a speech end, a turn timer or a
+#: delayed retry to take it: they wake on the provider's ready event and
+#: drain within milliseconds.
+ORPHAN_SWEEP_S = 0.6
+#: While the VAD says speech or a live partial exists, the sweep looks again
+#: at this step. Once the STT has produced nothing new for the stuck bound
+#: the "speech" is line noise, or the partial's final was lost, and the
+#: sweep goes on. At the cap it gives up: somebody is really speaking.
+ORPHAN_POLL_S = 0.25
+ORPHAN_STUCK_S = 1.5
+ORPHAN_WAIT_MAX_S = 6.0
+#: A line returns the agent's own voice this long after a frame of it went
+#: out: the round trip of a call. Frames inside it are never the caller's
+#: loudness.
+OWN_VOICE_TAIL_S = 0.6
+#: What the sweep needs on a phone line: this much of the line at or above
+#: the VAD's energy floor, in this stretch before the final landed.
+ORPHAN_LOUD_S = 0.15
+ORPHAN_LOUD_LOOKBACK_S = 3.0
 
 
 def _norm_words(text: str) -> list[str]:
@@ -322,7 +344,7 @@ class TurnMixin:
         return bool(self.state._utterance_task
                     and not self.state._utterance_task.done())
 
-    def _is_interim_fallback_dup(self, text: str) -> bool:
+    def _is_interim_fallback_dup(self, text: str, *, at: float | None = None) -> bool:
         """True when ``text`` is the late-arriving REAL final of an
         utterance a dispatch already consumed via the INTERIM fallback
         (recorded at the flush sites). The fallback exists for LOST finals
@@ -330,11 +352,12 @@ class TurnMixin:
         and re-dispatched the same word as its own turn (Paros
         double-send, 2026-08-25). Normalized exact match inside a tight
         window; one-shot so a deliberately repeated word later still
-        dispatches."""
+        dispatches. ``at`` is when the final landed, for a consumer that
+        reads it later (the orphan sweep waits before it drains)."""
         recorded = self.state._interim_fallback_text
         if not recorded:
             return False
-        if time.monotonic() - self.state._interim_fallback_at > 2.0:
+        if (time.monotonic() if at is None else at) - self.state._interim_fallback_at > 2.0:
             return False
         if _norm_words(text) == _norm_words(recorded):
             self.state._interim_fallback_text = ""
@@ -426,10 +449,9 @@ class TurnMixin:
                     # of dispatching again (Paros double-send, 2026-08-25).
                     self.state._interim_fallback_text = final
                     self.state._interim_fallback_at = time.monotonic()
-                logger.info(
-                    "[%s] STT final flush (%s): %s",
-                    self.conn.peer_addr, source, final
-                )
+                log_transcript(
+                    logger, f"[{self.conn.peer_addr}] STT final flush ({source})",
+                    final, event=True)
 
         if self.state._turn_segments:
             # A call that follows the caller's language: the first turn's
@@ -440,16 +462,12 @@ class TurnMixin:
             self.state._turn_segments.clear()
             self.state._turn_timer = None
 
-            logger.info(
-                "[%s] Turn dispatching "
-                "(%s segments): %s", self.conn.peer_addr, count, joined
-            )
+            log_transcript(
+                logger, f"[{self.conn.peer_addr}] Turn dispatching ({count} segments)",
+                joined, event=True)
 
             if self._turn_busy():
-                logger.info(
-                    "[%s] Queuing turn (LLM busy): %s",
-                    self.conn.peer_addr, joined
-                )
+                log_transcript(logger, f"[{self.conn.peer_addr}] Queuing turn (LLM busy)", joined, event=True)
                 self.state._queued_speech.append(joined)
                 self._interrupt_for_queued_speech()
             else:
@@ -482,20 +500,17 @@ class TurnMixin:
         if self.state._turn_segments:
             last = self.state._turn_segments[-1]
             if transcript.startswith(last) and len(transcript) > len(last):
-                logger.info(
-                    "[%s] Replacing interim segment "
-                    "with final: \"%s\" → \"%s\"",
-                    self.conn.peer_addr, last, transcript
-                )
+                log_transcript(
+                    logger, f"[{self.conn.peer_addr}] Replacing interim segment ({len(last)} chars) with final",
+                    transcript, event=True)
                 self.state._turn_segments[-1] = transcript
                 return True
             if source == "interim":
                 new, old = _norm_words(transcript), _norm_words(last)
                 if new and new == old[:len(new)]:
-                    logger.info(
-                        "[%s] Interim segment repeats the "
-                        "last one — dropped: \"%s\"", self.conn.peer_addr, transcript
-                    )
+                    log_transcript(
+                        logger, f"[{self.conn.peer_addr}] Interim segment repeats the last one — dropped",
+                        transcript, event=True)
                     return False
         self.state._turn_segments.append(transcript)
         return True
@@ -572,6 +587,191 @@ class TurnMixin:
 
         spawn(_abort(), name="abort_turn", owner="call")
 
+    # -- finished words no speech end drained ---------------------------------
+    #
+    # The STT hears every frame the loop reads while the agent is silent,
+    # whatever the VAD says, and every drain of its finals sits behind a VAD
+    # speech end (the speech end itself, the timer it starts, the retries it
+    # spawns). A sentence the VAD never started on (soft speech under its
+    # bar: a caller's first words then waited for his next sentence) or a
+    # final that lands after the retries gave up has no reader. The provider calls
+    # ``on_partial_final`` for every final it queues; the sweep takes what
+    # nobody took.
+
+    #: A phone line can return the agent's own voice and carries the room
+    #: behind the caller: its finals go out only when the caller was loud
+    #: while they were said. Live voice says False: the browser cancels the
+    #: agent's voice before the microphone's audio leaves it.
+    _orphan_needs_loud_line = True
+
+    def _watch_stt_finals(self) -> None:
+        """Register the provider's callback for a final that landed in its
+        queue. Every constructor of a pipeline calls this once its STT is
+        built; the callback is the provider's attribute and survives a
+        reconnect."""
+        self.stt.on_partial_final = self._on_stt_partial_final
+
+    def _on_stt_partial_final(self, text: str) -> None:
+        """A final landed in the provider's queue. Nothing happens while the
+        line is closed or muted, or during the STT echo window (the agent
+        audibly speaking with no early unmute: the provider is fed silence,
+        so the final is echo or stale and the pipeline discards it). A
+        PAUSED playback feeds the live line and its finals are the barge-in
+        commit evidence, never echo."""
+        text = (text or "").strip()
+        if not text or self.conn.is_closed or getattr(self.conn, "is_muted", False):
+            return
+        if (self.state._tts_playing and not self.state._stt_early_unmuted
+                and not self.state._playback_paused):
+            return
+        self._on_final_landed(text)
+        spawn(self._sweep_orphan_final(time.monotonic()), name="sweep_orphan_final", owner="call")
+
+    def _on_final_landed(self, text: str) -> None:
+        """Hook: a final the pipeline will consume landed (the duplex
+        session sends its caption frame). Base: no-op."""
+
+    def _note_line_frame(self, payload: bytes) -> None:
+        """One inbound audio frame's loudness, kept where it can only be the
+        caller's. A frame that follows the agent's own voice within the
+        line's round trip is not kept and empties what was: the voice, a
+        filler and the breath all return on a line, and a reply's last word
+        still arrives after playback ended. The ambience bed never stamps
+        ``_last_voice_sent``."""
+        if not self._orphan_needs_loud_line or len(payload) < 2:
+            return
+        frames = self.state._line_frames
+        now = time.monotonic()
+        if now - self.state._last_voice_sent < OWN_VOICE_TAIL_S:
+            frames.clear()
+            return
+        samples = np.frombuffer(payload[: len(payload) // 2 * 2], dtype="<i2").astype(np.float64)
+        rms = float(np.sqrt(np.mean(samples * samples)))
+        frames.append((now, rms, len(samples) / self._rate_in))
+
+    def _caller_loudness(self, landed: float) -> tuple[float, float]:
+        """The seconds of the line at or above the VAD's energy floor in the
+        stretch before ``landed``, and that stretch's loudest frame."""
+        floor = self.cfg.vad_min_energy_rms
+        loud_s = peak = 0.0
+        for at, rms, seconds in self.state._line_frames:
+            if landed - ORPHAN_LOUD_LOOKBACK_S <= at <= landed:
+                peak = max(peak, rms)
+                if rms >= floor:
+                    loud_s += seconds
+        return loud_s, peak
+
+    def _detector_saw(self, landed: float) -> str:
+        """What the VAD scored over the stretch the sweep looks back over,
+        as the tail of the sweep's log line: numbers only, never a word. The
+        VAD owns its scores (``SileroVad.scored``). Empty for a VAD that
+        keeps none."""
+        scored = getattr(self.vad, "scored", None)
+        if scored is None:
+            return ""
+        seen = scored(landed - ORPHAN_LOUD_LOOKBACK_S, landed)
+        return (f". The detector scored {seen.windows} windows: {seen.over} at or over its bar, "
+                f"{seen.speech} of them loud enough, longest run {seen.longest_run} of the "
+                f"{seen.needed_run} a speech start needs, highest {seen.peak:.2f}, "
+                f"{seen.bargein} in barge-in mode")
+
+    def _orphan_pending(self) -> bool:
+        return (self.state._running and not self.conn.is_closed
+                and not getattr(self.conn, "is_muted", False)
+                and self.stt.has_drainable_finals)
+
+    async def _sweep_orphan_final(self, landed: float) -> None:
+        """Send the provider finals no VAD speech cycle drained (see the
+        block comment above). VAD-driven consumers are parked on the
+        transcript-ready event and take a final within milliseconds, so one
+        still queued after the delay is orphaned.
+
+        While somebody is still speaking (the VAD says so, or a live partial
+        exists) the sweep waits: a speech end will take the words, or the
+        partial's own final lands. It goes on once both are quiet, or once
+        the STT has produced nothing new for ``ORPHAN_STUCK_S`` (a VAD held
+        in "speech" by line noise, a partial whose final was lost: the turn
+        timer's phantom rule and interim fallback then finish the turn), and
+        gives up at ``ORPHAN_WAIT_MAX_S``. It never starts a turn timer under
+        a caller who is really speaking: the timer's own wait for silence is
+        bounded and would send half a long sentence.
+
+        No-ops whenever the normal machinery owns the text: a turn timer
+        pending, playback audibly running. A turn in flight gets the words
+        queued, with the interrupt queued speech carries. On a line that
+        ``_orphan_needs_loud_line`` the words stay where they are unless the
+        caller was loud while they were said. Every decision is one INFO
+        line of numbers, with what the VAD scored over the same stretch."""
+        await asyncio.sleep(ORPHAN_SWEEP_S)
+        while self._orphan_pending():
+            if self.state._user_silent.is_set() and not self.stt.latest_interim:
+                break
+            now = time.monotonic()
+            if now - max(landed, self.stt.last_result_monotonic) >= ORPHAN_STUCK_S:
+                break
+            if now - landed >= ORPHAN_WAIT_MAX_S:
+                return
+            await asyncio.sleep(ORPHAN_POLL_S)
+        else:
+            return
+        if self.state._turn_timer and not self.state._turn_timer.done():
+            return
+        if self.state._tts_playing and not self.state._playback_paused:
+            return  # audible playback owns the floor; a PAUSE is eligible:
+            # its orphaned final is exactly the commit evidence
+        waited = time.monotonic() - landed
+        # The VAD started no speech on the words, or holds a speech it never ended.
+        missing = "start" if self.state._user_silent.is_set() else "end"
+        detector = self._detector_saw(landed)
+        if self._orphan_needs_loud_line:
+            loud_s, peak = self._caller_loudness(landed)
+            if loud_s < ORPHAN_LOUD_S:
+                logger.info(
+                    "[%s] Words with no speech %s kept: the line was quiet "
+                    "(%.2f s at or above %.0f, loudest %.0f, %.1f s after they landed)%s",
+                    self.conn.peer_addr, missing, loud_s, self.cfg.vad_min_energy_rms, peak, waited,
+                    detector)
+                return
+            logger.info(
+                "[%s] Words with no speech %s: %.2f s of the line at or above "
+                "%.0f, loudest %.0f, %.1f s after they landed%s",
+                self.conn.peer_addr, missing, loud_s, self.cfg.vad_min_energy_rms, peak, waited,
+                detector)
+        else:
+            logger.info("[%s] Words with no speech %s, %.1f s after they landed%s",
+                        self.conn.peer_addr, missing, waited, detector)
+        text = self.stt.drain_transcript()
+        if not text:
+            return
+        if self._is_interim_fallback_dup(text, at=landed):
+            log_transcript(
+                logger, f"[{self.conn.peer_addr}] Orphan final duplicates the interim-dispatched tail — dropped",
+                text, event=True)
+            return
+        if self._turn_busy():
+            if text in self.state._queued_speech:
+                return
+            log_transcript(
+                logger, f"[{self.conn.peer_addr}] Orphan STT final while turn busy — queuing",
+                text, event=True)
+            self._note_turn_taken()
+            self.state._queued_speech.append(text)
+            self._interrupt_for_queued_speech()
+            return
+        log_transcript(
+            logger, f"[{self.conn.peer_addr}] Orphan STT final — dispatching through the turn machinery",
+            text, event=True)
+        if not self.state._turn_segments:
+            # The buffer holds the last turn's speech: the VAD started none
+            # for these words, so the audio classifier gets no audio.
+            self.state._speech_audio_buf.clear()
+        self._append_turn_segment(text)
+        joined = " ".join(self.state._turn_segments)
+        self._cancel_turn_timer()
+        self.state._turn_timer = asyncio.create_task(
+            self._turn_timeout_handler(joined)
+        )
+
     async def _delayed_drain_retry(self) -> None:
         """Wait for STT to deliver a finalized transcript.
 
@@ -598,18 +798,15 @@ class TurnMixin:
             elapsed_ms = (time.monotonic() - self.state._speech_end_time) * 1000
 
             if transcript and self._is_interim_fallback_dup(transcript):
-                logger.info(
-                    "[%s] Delayed drain: late final "
-                    "duplicates the interim-dispatched tail — dropped: "
-                    "%s", self.conn.peer_addr, transcript
-                )
+                log_transcript(
+                    logger, f"[{self.conn.peer_addr}] Delayed drain: late final duplicates the "
+                    "interim-dispatched tail — dropped", transcript, event=True)
                 return
             if transcript:
                 self._append_turn_segment(transcript, source=source)
-                logger.info(
-                    "[%s] Delayed drain got (%s, %.0fms): %s",
-                    self.conn.peer_addr, source, elapsed_ms, transcript
-                )
+                log_transcript(
+                    logger, f"[{self.conn.peer_addr}] Delayed drain got ({source}, {elapsed_ms:.0f}ms)",
+                    transcript, event=True)
                 joined = " ".join(self.state._turn_segments)
                 self._cancel_turn_timer()
                 self.state._turn_timer = asyncio.create_task(
@@ -665,17 +862,14 @@ class TurnMixin:
                 transcript, source = self.stt.latest_interim, "interim"
 
             if transcript and self._is_interim_fallback_dup(transcript):
-                logger.info(
-                    "[%s] Delayed queue: late final "
-                    "duplicates the interim-dispatched tail — dropped: "
-                    "%s", self.conn.peer_addr, transcript
-                )
+                log_transcript(
+                    logger, f"[{self.conn.peer_addr}] Delayed queue: late final duplicates the "
+                    "interim-dispatched tail — dropped", transcript, event=True)
                 return
             if transcript:
-                logger.info(
-                    "[%s] Delayed queue got (%s, %.0fms): %s",
-                    self.conn.peer_addr, source, elapsed_ms, transcript
-                )
+                log_transcript(
+                    logger, f"[{self.conn.peer_addr}] Delayed queue got ({source}, {elapsed_ms:.0f}ms)",
+                    transcript, event=True)
                 self._note_turn_taken()
                 self.state._queued_speech.append(transcript)
                 # Interim fallback (audit F2) keeps the DISPATCH; only a real

@@ -1,0 +1,220 @@
+{
+ "a host path": {
+  "answer": true,
+  "record": null,
+  "stale": {},
+  "ticks": [
+   [
+    1,
+    1
+   ]
+  ],
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "h",
+    "command_id": "<id>",
+    "hash": "sha256:aaa9402664f1a41f40ebbc52c9993eb66aeb366602958fdfaa283b71e64db123",
+    "path": "/sat/ann/x.txt",
+    "path_kind": "satellite_host",
+    "type": "file_push"
+   }
+  ]
+ },
+ "a refusal": {
+  "answer": false,
+  "record": null,
+  "stale": {},
+  "ticks": [],
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "x",
+    "command_id": "<id>",
+    "hash": "sha256:2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+    "path": "workspace/refused.txt",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   }
+  ]
+ },
+ "a source that is gone": {
+  "answer": false,
+  "record": {
+   "exists": true,
+   "mtime_ns": 7000000000,
+   "size": 614400
+  },
+  "stale": {},
+  "ticks": [],
+  "wire": []
+ },
+ "a stale answer, the machine's stat out": {
+  "answer": false,
+  "record": null,
+  "stale": {
+   "mtime_ns": 88,
+   "reason": "changed",
+   "size": 4
+  },
+  "ticks": [],
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "x",
+    "command_id": "<id>",
+    "hash": "sha256:2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+    "path": "workspace/held.txt",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   }
+  ]
+ },
+ "in chunks from a path": {
+  "answer": true,
+  "record": {
+   "exists": true,
+   "mtime_ns": 7000000000,
+   "size": 614400
+  },
+  "stale": {},
+  "ticks": [
+   [
+    524288,
+    614400
+   ],
+   [
+    614400,
+    614400
+   ]
+  ],
+  "wire": [
+   {
+    "action": "write_chunk",
+    "agent_slug": "flow-agent",
+    "body": "<524288 bytes>",
+    "chunk_index": 0,
+    "command_id": "<id>",
+    "expect": "live",
+    "hash": "",
+    "path": "workspace/out.bin",
+    "path_kind": "agent_tree",
+    "total_chunks": 2,
+    "type": "file_push"
+   },
+   {
+    "action": "write_chunk",
+    "agent_slug": "flow-agent",
+    "body": "<90112 bytes>",
+    "chunk_index": 1,
+    "command_id": "<id>",
+    "expect": "live",
+    "hash": "sha256:0706f3f914a61a05e0268b09e56d238c9d4e71c903977f43d5ba7f3907a05ec7",
+    "path": "workspace/out.bin",
+    "path_kind": "agent_tree",
+    "total_chunks": 2,
+    "type": "file_push"
+   }
+  ]
+ },
+ "inline bytes, the stat on the ack recorded": {
+  "answer": true,
+  "record": {
+   "exists": true,
+   "mtime_ns": 7000000000,
+   "size": 5
+  },
+  "stale": {},
+  "ticks": [
+   [
+    5,
+    5
+   ]
+  ],
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "small",
+    "command_id": "<id>",
+    "hash": "sha256:81db8ebbbbc69c6c6ad4a6aa92b76e0c08af547da236b9e2c9dbe1d8285a8130",
+    "path": "workspace/out.bin",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   }
+  ]
+ },
+ "inline, an expectation and a pinned hash": {
+  "answer": true,
+  "record": {
+   "exists": true,
+   "mtime_ns": 7000000000,
+   "size": 5
+  },
+  "stale": {},
+  "ticks": [
+   [
+    5,
+    5
+   ]
+  ],
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "small",
+    "command_id": "<id>",
+    "expect": {
+     "mtime_ns": 2,
+     "size": 1
+    },
+    "hash": "sha256:pinned",
+    "path": "workspace/out.bin",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   }
+  ]
+ },
+ "no_connection": false,
+ "no_slug": "push_file(agent_tree) requires agent_slug",
+ "stat": {
+  "a_file": {
+   "exists": true,
+   "mtime_ns": 88,
+   "size": 4
+  },
+  "absent": {
+   "exists": false,
+   "mtime_ns": 0,
+   "size": 0
+  },
+  "an_error": null,
+  "no_connection": null
+ },
+ "stat_wire": [
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "path": "workspace/held.txt",
+   "path_kind": "agent_tree",
+   "type": "file_stat"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "path": "workspace/none",
+   "path_kind": "agent_tree",
+   "type": "file_stat"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "path": "workspace/out.bin",
+   "path_kind": "agent_tree",
+   "type": "file_stat"
+  }
+ ]
+}

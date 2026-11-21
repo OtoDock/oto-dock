@@ -32,6 +32,11 @@ its CPU time stays the work's own::
 Work that crosses threads, waits on I/O or sleeps keeps ``bound()`` and the
 wall clock: its CPU time says nothing about how long it took.
 
+The reference run holds its thread for about 0.1 s. A test that measures how
+late an event loop ran reads its bounds outside the measured block: two or
+three on the loop's thread with no await between them are a 0.3 s gap the
+code under test never caused.
+
 ``cpu_share(call)`` runs a call and says how much of its wall time this
 process spent on the CPU, for a test whose premise is that the process ran
 all through the call (a loaded host may not grant that; the test skips).

@@ -83,9 +83,15 @@ def contact_sheet_core(pdf_path: str, pages_spec: Any, src_path: str, password: 
     import fitz
     from PIL import Image, ImageDraw
 
+    import safe_fs
+    import shared
     from formats.pdf.pages import PageSpecError, parse_pages
 
-    doc = fitz.open(pdf_path)
+    fd, _ = shared.safe_read_fd(pdf_path)
+    try:
+        doc = fitz.open(safe_fs.fd_path(fd), filetype="pdf")
+    finally:
+        os.close(fd)
     if doc.needs_pass and not (password not in (None, "") and doc.authenticate(str(password))):
         doc.close()
         if password in (None, ""):
@@ -139,11 +145,14 @@ def contact_sheet_core(pdf_path: str, pages_spec: Any, src_path: str, password: 
 
 def shown_slides(path: str) -> list[int] | None:
     """The slide_index of each slide a deck shows, in order (LibreOffice
-    exports only those, one page each); None when the deck cannot be read."""
+    exports only those, one page each); None when the deck cannot be read
+    (read with ``shared.safe_open_read``)."""
     from lxml import etree
 
+    import shared
+
     try:
-        with zipfile.ZipFile(path) as package:
+        with shared.safe_open_read(path) as fh, zipfile.ZipFile(fh) as package:
             names = set(package.namelist())
             pres = etree.fromstring(package.read("ppt/presentation.xml"), _parser())
             rels = etree.fromstring(package.read("ppt/_rels/presentation.xml.rels"), _parser())
@@ -172,7 +181,9 @@ def select_sheet(path: str, sheet: Any) -> tuple[int, list[str]]:
 
     from lxml import etree
 
-    with zipfile.ZipFile(path) as package:
+    import shared
+
+    with shared.safe_open_read(path) as fh, zipfile.ZipFile(fh) as package:
         info = package.getinfo("xl/workbook.xml")
         if info.file_size > WORKBOOK_XML_CAP:
             raise ValueError(f"the workbook's sheet list is over {WORKBOOK_XML_CAP // (1024 * 1024)} MB")

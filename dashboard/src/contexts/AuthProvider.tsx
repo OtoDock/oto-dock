@@ -3,12 +3,13 @@
 
 import { useEffect, useState, useCallback, type ReactNode } from 'react'
 import { type User, type AuthConfig, fetchCurrentUser, fetchAuthConfig, startLogin, logout as doLogout } from '../api/auth'
-import { useChatStore } from '../store/chatStore'
+import { bindChatDrafts, clearChatDrafts } from '../store/chatDrafts'
 import { useAgentPrefsStore, migrateAgentPrefsToUser } from '../store/agentPrefsStore'
 import { migrateAudioPrefsToUser } from '../store/audioPrefsStore'
 import { useDocumentPaneStore } from '../store/documentPaneStore'
 import { setWakeDiag } from '../audio/wakeDiag'
 import { clearShareConfirm } from '../lib/shareConfirm'
+import { clearReadMarks } from '../lib/chat/readMarks'
 import { logError } from '../lib/debug/log'
 import { AuthContext } from './AuthContext'
 
@@ -30,13 +31,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // Per-user isolation for persisted localStorage stores: wipe drafts
         // + sticky prefs when the booting user differs from what was last
         // persisted on this machine (shared/family device case). agentPrefs
-        // self-checks via its __user_sub field; chatStore's draft layer
-        // has no user binding — we wipe on mismatch using the same signal.
+        // self-checks via its __user_sub field. The chat drafts are stored
+        // under their person and load before any chat page renders; the one
+        // record of an earlier version names nobody, so the same signal
+        // decides whose it is.
         if (u?.sub) {
           const prevAgentSub = useAgentPrefsStore.getState().__user_sub
-          if (prevAgentSub && prevAgentSub !== u.sub) {
-            useChatStore.persist.clearStorage()
-          }
+          if (prevAgentSub && prevAgentSub !== u.sub) clearChatDrafts()
+          bindChatDrafts(u.sub)
           migrateAgentPrefsToUser(u.sub)
           migrateAudioPrefsToUser(u.sub)
         }
@@ -70,7 +72,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(() => {
     // Clear persisted drafts + sticky prefs so the next user on a shared
     // machine doesn't inherit them. Theme stays (display preference).
-    try { useChatStore.persist.clearStorage() } catch { /* ignore */ }
+    try { clearChatDrafts() } catch { /* ignore */ }
     try { useAgentPrefsStore.persist.clearStorage() } catch { /* ignore */ }
     // The document pane's per-chat ids name the previous person's files.
     try { useDocumentPaneStore.persist.clearStorage() } catch { /* ignore */ }
@@ -80,6 +82,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // A share waiting on an identity-provider confirm belongs to this
     // account alone.
     clearShareConfirm()
+    // A read mark held for the next socket is this person's.
+    clearReadMarks()
     doLogout()
   }, [])
 

@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from services.engines import subscription_pool as pool
+from services.engines import pool_writer, subscription_pool as pool
 from storage.billing import subscription_store
 
 
@@ -108,10 +108,10 @@ async def test_the_shutdown_drain_is_bounded_and_off_the_loop_while_a_write_is_w
         return real(sub_id)
 
     monkeypatch.setattr(subscription_store, "decrement_active_sessions", stalled)
-    monkeypatch.setattr(pool, "_BINDING_DRAIN_TIMEOUT_S", 0.3, raising=False)
+    monkeypatch.setattr(pool_writer, "_BINDING_DRAIN_TIMEOUT_S", 0.3)
     pool.release_unbound_seat(sub)          # the wedged write
     pool.release_unbound_seat(sub)          # queued behind it
-    writer = pool._binding_writer
+    writer = pool_writer._binding_writer
     ticks = 0
 
     async def ticker():
@@ -132,7 +132,7 @@ async def test_the_shutdown_drain_is_bounded_and_off_the_loop_while_a_write_is_w
     assert drained is False
     assert elapsed < 2
     assert ticks >= 5                                      # the loop was never held
-    assert pool._binding_writes_closed
+    assert pool_writer._binding_writes_closed
     # The wedged decrement landed once released; the one queued behind it was dropped.
     assert subscription_store.get_subscription(sub)["active_sessions"] == 2
 

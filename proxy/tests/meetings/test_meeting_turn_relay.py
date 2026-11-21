@@ -26,7 +26,7 @@ from core.events.common_events import (
     TOOL_USE,
     CommonEvent,
 )
-from services.meetings import meeting_orchestrator as MO
+from services.meetings import meeting_orchestrator as MO, meeting_sessions
 from services.meetings.meeting_context import build_turn_prompt
 
 # ---------------------------------------------------------------------------
@@ -482,6 +482,158 @@ async def test_the_turn_start_reads_the_agent_row_off_the_loop():
     assert sorted(starts) == ["P1", "P1", "P2"]
 
 
+@pytest.mark.asyncio
+async def test_a_parallel_batch_forwards_each_agents_text_and_tools_live_and_once():
+    """A person watching sees a batch as it happens: each agent's text and tool
+    rows reach the pump while that agent runs, tagged with the agent, once."""
+    meeting = {
+        "id": "m1", "topic": "t", "moderator": "mod",
+        "parent_chat_id": "chat-relay-6",
+        "participants": json.dumps(["mod", "p1", "p2"]),
+    }
+    gate = asyncio.Event()
+
+    class _Held(_ScriptedLayer):
+        async def send_message(self, sid, prompt):
+            for ev in self._events:
+                yield ev
+            await gate.wait()
+
+    layers = {f"sid-{a}": _Held([_text(f"{a} says hello."), _tool_use(f"{a}_tool")]) for a in ("p1", "p2")}
+    queue: asyncio.Queue = asyncio.Queue()
+    with patch.object(MO.agent_store, "get_agent", new=_agent_row_off_the_loop), \
+         patch.object(MO, "build_turn_prompt", new=lambda *a, **k: "prompt"), \
+         patch.dict(MO._meeting_session_layers, layers):
+        batch = asyncio.ensure_future(MO._run_parallel_batch(
+            ["p1", "p2"], {"p1": "sid-p1", "p2": "sid-p2"}, meeting, [], {}, queue, "m1"))
+        seen = []
+
+        async def next_text():
+            while True:
+                ev = await queue.get()
+                seen.append(ev)
+                if ev.type == TEXT:
+                    return ev
+
+        first = await asyncio.wait_for(next_text(), 5)         # with both agents still running
+        assert not batch.done() and first.data["_meeting_agent"] in ("p1", "p2")
+        gate.set()
+        await asyncio.wait_for(batch, 5)
+    while not queue.empty():
+        seen.append(queue.get_nowait())
+    texts = [(e.data["_meeting_agent"], e.data["content"]) for e in seen if e.type == TEXT]
+    assert sorted(texts) == [("p1", "p1 says hello."), ("p2", "p2 says hello.")]
+    tools = [(e.data["_meeting_agent"], e.data["name"]) for e in seen if e.type == TOOL_USE]
+    assert sorted(tools) == [("p1", "p1_tool"), ("p2", "p2_tool")]
+
+
+class _Scripted(_ScriptedLayer):
+    """A participant's turn step by step: an event, a gate to wait at, a failure."""
+
+    async def send_message(self, sid, prompt):
+        for step in self._events:
+            if isinstance(step, Exception):
+                raise step
+            if isinstance(step, asyncio.Event):
+                await step.wait()
+                continue
+            yield step
+
+
+async def _batch(layers, *, while_running=None):
+    meeting = {"id": "m1", "topic": "t", "moderator": "mod", "parent_chat_id": "chat-relay-7",
+               "participants": json.dumps(["mod", "p1", "p2"])}
+    queue: asyncio.Queue = asyncio.Queue()
+    with patch.object(MO.agent_store, "get_agent", new=_agent_row_off_the_loop), \
+         patch.object(MO, "build_turn_prompt", new=lambda *a, **k: "prompt"), \
+         patch.object(MO, "_start_participant_bg_monitors", new=lambda *a, **k: None), \
+         patch.dict(MO._meeting_session_layers, layers):
+        batch = asyncio.ensure_future(MO._run_parallel_batch(
+            ["p1", "p2"], {"p1": "sid-p1", "p2": "sid-p2"}, meeting, [], {}, queue, "m1"))
+        seen = await while_running(queue) if while_running is not None else []
+        results = await asyncio.wait_for(batch, 5)
+    while not queue.empty():
+        seen.append(queue.get_nowait())
+    return {r.agent: r for r in results}, seen
+
+
+def _lines(seen):
+    return [(e.data.get("subtype"), e.data.get("agent")) for e in seen if e.type == MO.SYSTEM]
+
+
+@pytest.mark.asyncio
+async def test_a_participant_that_fails_after_its_first_event_gets_its_failed_line():
+    """The coordinator takes it at its first event, with no result yet. What it did
+    stands, and the person reads why it stopped, as on a live turn."""
+    gate = asyncio.Event()
+
+    async def until_first_text(queue):
+        seen = []
+        while True:
+            ev = await asyncio.wait_for(queue.get(), 5)
+            seen.append(ev)
+            if ev.type == TEXT:
+                gate.set()
+                return seen
+
+    results, seen = await _batch(
+        {"sid-p1": _Scripted([_text("p1 starts"), gate, RuntimeError("the machine went")]),
+         "sid-p2": _Scripted([gate, _text("p2 answers")])}, while_running=until_first_text)
+    lines = _lines(seen)
+    assert "_failed" in results["p1"].tools_called
+    assert ("meeting_agent_failed", "p1") in lines and ("meeting_turn_end", "p1") not in lines
+    assert ("meeting_turn_end", "p2") in lines and ("meeting_agent_failed", "p2") not in lines
+    failed = next(e for e in seen if e.data.get("subtype") == "meeting_agent_failed")
+    assert failed.data["error"] == "the machine went"
+    texts = [(e.data["_meeting_agent"], e.data["content"]) for e in seen if e.type == TEXT]
+    assert sorted(texts) == [("p1", "p1 starts"), ("p2", "p2 answers")]
+
+
+@pytest.mark.asyncio
+async def test_a_participant_that_failed_before_its_turn_came_keeps_what_it_did():
+    """It ran and failed while the coordinator forwarded the other: its text is
+    shown with the line, and not dropped."""
+    p1_chosen, p2_failed = asyncio.Event(), asyncio.Event()
+
+    class _Marks(_Scripted):
+        async def send_message(self, sid, prompt):
+            try:
+                async for event in super().send_message(sid, prompt):
+                    yield event
+            finally:
+                p2_failed.set()
+
+    async def until_p1_is_chosen(queue):
+        seen = []
+        while True:
+            ev = await asyncio.wait_for(queue.get(), 5)
+            seen.append(ev)
+            if ev.type == TEXT:
+                p1_chosen.set()
+                return seen
+
+    results, seen = await _batch(
+        {"sid-p1": _Scripted([_text("p1 starts"), p2_failed, _text("p1 ends")]),
+         "sid-p2": _Marks([p1_chosen, _text("p2 starts"), RuntimeError("it went")])},
+        while_running=until_p1_is_chosen)
+    lines = _lines(seen)
+    assert "_failed" in results["p2"].tools_called
+    assert ("meeting_turn_end", "p1") in lines
+    assert ("meeting_turn_start", "p2") in lines and ("meeting_agent_failed", "p2") in lines
+    assert ("p2", "p2 starts") in [(e.data["_meeting_agent"], e.data["content"]) for e in seen if e.type == TEXT]
+
+
+@pytest.mark.asyncio
+async def test_a_participant_that_failed_with_nothing_to_show_gets_the_line_alone():
+    results, seen = await _batch({"sid-p1": _Scripted([RuntimeError("it never started")]),
+                                  "sid-p2": _Scripted([_text("p2 answers")])})
+    lines = _lines(seen)
+    assert "_failed" in results["p1"].tools_called
+    assert ("meeting_agent_failed", "p1") in lines and ("meeting_turn_start", "p1") not in lines
+    failed = next(e for e in seen if e.data.get("subtype") == "meeting_agent_failed")
+    assert failed.data["error"] == "it never started"
+
+
 class _TurnBudget:
     """A ``max_turns`` that counts the round loop's condition checks: the
     loop re-tests ``total_turns < max_turns`` on every pass, a pass that runs
@@ -607,3 +759,232 @@ async def test_a_round_reads_the_chats_queue_for_the_moderator():
     turns = [e for e in every if e.type == QUEUE_TURN]
     assert [qi.queue_id for t in turns for qi in t.data["inputs"]] == ["q-1"]
     assert q.items == []
+
+
+class _ReconnectingLayer(_ScriptedLayer):
+    """A compute machine's layer whose link dropped: the session is held in
+    the reconnect grace and a turn sent meanwhile is refused at once, as the
+    real link refuses it. The wait brings the machine back."""
+
+    def __init__(self, events):
+        super().__init__(events)
+        self.linked = False
+        self.waits = 0
+
+    def is_session_grace_held(self, sid):
+        return not self.linked
+
+    async def wait_session_reconnect(self, sid, *, timeout=10.0):
+        self.waits += 1
+        self.linked = True
+        return True
+
+    async def send_message(self, sid, prompt):
+        if not self.linked:
+            raise RuntimeError("Satellite compute-1 not connected")
+        async for ev in super().send_message(sid, prompt):
+            yield ev
+
+
+@pytest.mark.asyncio
+async def test_a_participants_turn_waits_while_its_compute_machine_reconnects():
+    """One rule for every turn start: a participant whose compute machine is
+    reconnecting waits for it, alone or in a parallel batch, and speaks once
+    it is back. No failure line reaches the meeting."""
+    from core.session.session_manager import LiveSession
+    meeting = {
+        "id": "m1", "topic": "t", "moderator": "mod",
+        "parent_chat_id": "chat-relay-7",
+        "participants": json.dumps(["mod", "p1", "p2"]),
+    }
+    layers = {f"sid-{a}": _ReconnectingLayer([_text(f"{a} is back.")]) for a in ("p1", "p2")}
+    queue: asyncio.Queue = asyncio.Queue()
+    with patch.object(MO.agent_store, "get_agent", new=lambda slug: {"display_name": slug}), \
+         patch.object(MO, "build_turn_prompt", new=lambda *a, **k: "prompt"), \
+         patch.object(meeting_sessions, "live_session", new=lambda sid: LiveSession(
+             layers[sid], "compute-1", linked=layers[sid].linked, grace=not layers[sid].linked)), \
+         patch.dict(MO._meeting_session_layers, layers):
+        sessions = {"p1": "sid-p1", "p2": "sid-p2"}
+        alone = await MO._run_live_turn("p1", sessions, meeting, [], {}, queue, "m1")
+        layers["sid-p1"].linked = False
+        batch = await MO._run_parallel_batch(["p1", "p2"], sessions, meeting, [], {}, queue, "m1")
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert [layer.waits for layer in layers.values()] == [2, 1]
+    assert not [e for e in events if e.data.get("subtype") == "meeting_agent_failed"]
+    assert "_failed" not in alone.tools_called and all("_failed" not in r.tools_called for r in batch)
+    assert sorted(e.data["content"] for e in events if e.type == TEXT) == ["p1 is back.", "p1 is back.", "p2 is back."]
+
+
+@pytest.mark.asyncio
+async def test_a_participant_whose_session_was_lost_mid_turn_fails_and_the_meeting_goes_on():
+    """A machine came back without the participant's session while its turn
+    ran: the turn ends with the ``lost`` ending, and a meeting has no heal,
+    so the turn fails through the runner's failure path, alone or in a batch,
+    with the failure line the person reads."""
+    from core.events import turn_ending
+    from core.events.common_events import DONE, ERROR
+    lost = turn_ending.TurnEnding(reason=turn_ending.LOST, detail="the machine came back without this session")
+    gone = [_text("Half a sen"), CommonEvent(type=ERROR, data={"message": lost.line(), "ending": lost.as_dict()}),
+            CommonEvent(type=DONE)]
+    meeting = {
+        "id": "m1", "topic": "t", "moderator": "mod",
+        "parent_chat_id": "chat-relay-8",
+        "participants": json.dumps(["mod", "p1", "p2"]),
+    }
+    layers = {"sid-p1": _ScriptedLayer(gone), "sid-p2": _ScriptedLayer([_text("p2 is fine.")])}
+    queue: asyncio.Queue = asyncio.Queue()
+    with patch.object(MO.agent_store, "get_agent", new=lambda slug: {"display_name": slug}), \
+         patch.object(MO, "build_turn_prompt", new=lambda *a, **k: "prompt"), \
+         patch.dict(MO._meeting_session_layers, layers):
+        sessions = {"p1": "sid-p1", "p2": "sid-p2"}
+        alone = await MO._run_live_turn("p1", sessions, meeting, [], {}, queue, "m1")
+        batch = await MO._run_parallel_batch(["p1", "p2"], sessions, meeting, [], {}, queue, "m1")
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    failed = [e.data for e in events if e.data.get("subtype") == "meeting_agent_failed"]
+    assert [f["agent"] for f in failed] == ["p1", "p1"]
+    assert all(lost.line()[:40] in f["error"] for f in failed)
+    assert "_failed" in alone.tools_called
+    assert {r.agent: "_failed" in r.tools_called for r in batch} == {"p1": True, "p2": False}
+
+
+@pytest.mark.asyncio
+async def test_a_participant_the_memory_guard_stopped_gets_the_meetings_own_line_and_stays():
+    """The machine's memory guard ended a participant's engine mid-turn:
+    the chat's card for that ending never reaches the meeting, the meeting
+    says so about that agent by name, and the agent is not taken out: its
+    next turn starts its engine again."""
+    from core.events import turn_ending
+    from core.events.common_events import DONE, ERROR
+    stopped = turn_ending.TurnEnding(reason=turn_ending.EXITED, detail=turn_ending.MEMORY)
+    events = [_text("Half a sen"), CommonEvent(type=ERROR, data={"message": stopped.line(),
+                                                                 "ending": stopped.as_dict()}),
+              CommonEvent(type=DONE)]
+    meeting = {
+        "id": "m1", "topic": "t", "moderator": "mod",
+        "parent_chat_id": "chat-relay-9",
+        "participants": json.dumps(["mod", "p1", "p2"]),
+    }
+    layers = {"sid-p1": _ScriptedLayer(events), "sid-p2": _ScriptedLayer([_text("p2 is fine.")])}
+    queue: asyncio.Queue = asyncio.Queue()
+    with patch.object(MO.agent_store, "get_agent", new=lambda slug: {"display_name": slug.upper()}), \
+         patch.object(MO, "build_turn_prompt", new=lambda *a, **k: "prompt"), \
+         patch.dict(MO._meeting_session_layers, layers):
+        sessions = {"p1": "sid-p1", "p2": "sid-p2"}
+        alone = await MO._run_live_turn("p1", sessions, meeting, [], {}, queue, "m1")
+        batch = await MO._run_parallel_batch(["p1", "p2"], sessions, meeting, [], {}, queue, "m1")
+    seen = []
+    while not queue.empty():
+        seen.append(queue.get_nowait())
+    said = [e.data for e in seen if e.data.get("subtype") == "meeting_agent_stopped"]
+    assert [s["agent"] for s in said] == ["p1", "p1"]
+    assert said[0]["message"] == ("P1 used too much memory, so its engine was stopped. "
+                                  "It answers again at its next turn.")
+    # Never the chat's card, never a departure.
+    assert not [e for e in seen if e.type == ERROR]
+    assert not [e for e in seen if e.data.get("subtype") == "meeting_agent_failed"]
+    assert "_failed" not in alone.tools_called
+    assert all("_failed" not in r.tools_called for r in batch)
+
+
+class _GoneLayer(_ScriptedLayer):
+    """The layer that held a participant's session and no longer does (its
+    machine came back without it between two turns)."""
+
+    def __init__(self):
+        super().__init__([])
+        self.prepared: list[str] = []
+
+    async def is_session_alive(self, sid):
+        return False
+
+    async def is_session_process_dead(self, sid):
+        return True
+
+    async def can_resume_session(self, sid, **kw):
+        from core.execution_layer import ResumeVerdict
+        return ResumeVerdict.RESUMABLE
+
+    async def prepare_resume(self, sid):
+        self.prepared.append(sid)
+
+    async def send_message(self, sid, prompt):
+        raise RuntimeError("Remote session not found")
+        yield  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_a_participant_whose_session_is_gone_is_started_again_before_its_turn(monkeypatch):
+    """A participant idle when its compute machine restarted: the platform
+    closed its session. Its next turn starts it again under the same id,
+    with its config rebuilt as at the meeting's start and its conversation
+    resumed, on the layer the rebuilt config names, its slot taken where it
+    lands. The turn then runs: the agent is not lost to the meeting."""
+    from types import SimpleNamespace as NS
+
+    from core import concurrency, placement
+    from core.config import config_builder
+    from core.session.session_manager import LiveSession
+    where = placement.from_machine(placement.KIND_COMPUTE, {"id": "compute-2", "pairing_scope": "compute"})
+    cfg = NS(execution_path="claude-code-cli", execution_target="local", user_sub="", mcp_config_path="",
+             resume=False, security_context=NS(placement=where, role="editor", mount_username="alice"))
+    gone = _GoneLayer()
+    back = _ScriptedLayer([_text("I am back.")])
+    back.started = []
+
+    async def _start(sid, config):
+        back.started.append((sid, config.resume))
+    back.start_session = _start
+
+    async def _alive(sid):
+        return True
+    back.is_session_alive = _alive
+    built: list = []
+
+    async def _build(slug, meeting, sid):
+        built.append((slug, sid))
+        return cfg
+    asks: list = []
+    monkeypatch.setattr(meeting_sessions, "build_meeting_agent_config", _build)
+    monkeypatch.setattr(meeting_sessions, "get_execution_layer", lambda slug, **kw: asks.append(kw) or back)
+    monkeypatch.setattr(meeting_sessions, "live_session",
+                        lambda sid: LiveSession(gone) if sid == "sid-1" else None)
+    monkeypatch.setattr(meeting_sessions, "_save_sessions", lambda: None)
+    moved: list = []
+
+    async def _rehome(sid, **kw):
+        moved.append((sid, kw["kind"], kw["target"]))
+        return True
+    monkeypatch.setattr(concurrency, "rehome_slot", _rehome)
+    freed: list = []
+    monkeypatch.setattr(config_builder, "release_config_seat", lambda sid, c: freed.append(sid))
+    meeting = {"id": "m1", "topic": "t", "moderator": "mod", "parent_chat_id": "chat-relay-10",
+               "participants": json.dumps(["mod", "p1"])}
+    queue: asyncio.Queue = asyncio.Queue()
+    with patch.object(MO.agent_store, "get_agent", new=lambda slug: {"display_name": slug}), \
+         patch.object(MO, "build_turn_prompt", new=lambda *a, **k: "prompt"), \
+         patch.dict(MO._meeting_session_layers, {"sid-1": gone}):
+        result = await MO._run_live_turn("p1", {"p1": "sid-1"}, meeting, [], {}, queue, "m1")
+        assert MO._meeting_session_layers["sid-1"] is back
+    assert built == [("p1", "sid-1")] and gone.prepared == ["sid-1"]
+    assert back.started == [("sid-1", True)] and cfg.resume is True
+    assert asks[0]["placement_built"] is where and asks[0]["execution_target"] == "local"
+    assert moved == [("sid-1", "meeting", "compute-2")] and freed == []
+    assert result.content == "I am back." and "_failed" not in result.tools_called
+    MO._sessions.pop("sid-1", None)
+
+    # A restart that cannot start (no compute machine left) gives the seat
+    # back and fails the turn: the meeting goes on without the participant.
+    async def _refused(sid, config):
+        raise placement.NoComputeMachine()
+    back.start_session = _refused
+    with patch.object(MO.agent_store, "get_agent", new=lambda slug: {"display_name": slug}), \
+         patch.object(MO, "build_turn_prompt", new=lambda *a, **k: "prompt"), \
+         patch.dict(MO._meeting_session_layers, {"sid-1": gone}):
+        result = await MO._run_live_turn("p1", {"p1": "sid-1"}, meeting, [], {}, queue, "m1")
+    assert "_failed" in result.tools_called and freed == ["sid-1"]
+    failed = [e.data for e in list(queue._queue) if e.data.get("subtype") == "meeting_agent_failed"]
+    assert failed and failed[-1]["error"] == placement.NO_COMPUTE_SENTENCE

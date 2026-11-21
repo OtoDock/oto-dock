@@ -1,0 +1,104 @@
+{
+ "another_agent": null,
+ "entries": [
+  {
+   "path": "workspace/a.txt",
+   "size": 2
+  },
+  {
+   "path": "workspace/sub/b.txt",
+   "size": 1
+  }
+ ],
+ "entries_skipped": [
+  {
+   "dir": true,
+   "path": "workspace",
+   "size": 0,
+   "skipped": "denied"
+  },
+  {
+   "path": "workspace/sub/b.txt",
+   "size": 1
+  }
+ ],
+ "entries_wire": [
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "page_size": 4096,
+   "type": "request_manifest"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "page_size": 4096,
+   "report_skipped": true,
+   "type": "request_manifest"
+  }
+ ],
+ "files": {
+  "": [
+   "knowledge/k.md",
+   "workspace/a.txt",
+   "workspace/sub/b.txt"
+  ],
+  "none": [],
+  "workspace": [
+   "workspace/a.txt",
+   "workspace/sub/b.txt"
+  ],
+  "workspace/sub/": [
+   "workspace/sub/b.txt"
+  ]
+ },
+ "files_wire": [
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "page_size": 4096,
+   "type": "request_manifest"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "page_size": 4096,
+   "type": "request_manifest"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "page_size": 4096,
+   "type": "request_manifest"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "page_size": 4096,
+   "type": "request_manifest"
+  }
+ ],
+ "local": null,
+ "pull_into": {
+  "another_agent": false,
+  "bytes": "aa",
+  "local": false,
+  "not_canonical": false,
+  "ok": true,
+  "over_the_cap": false
+ },
+ "stat_probe": {
+  "absent": {
+   "exists": false,
+   "mtime_ns": 0,
+   "size": 0
+  },
+  "file": {
+   "exists": true,
+   "mtime_ns": 1700000000000000000,
+   "size": 2
+  },
+  "local": null,
+  "not_canonical": null
+ }
+}

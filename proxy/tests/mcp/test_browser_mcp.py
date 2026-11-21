@@ -10,7 +10,7 @@ what we assert here.
 import pytest
 
 from core import placement
-from services.mcp import mcp_registry as reg
+from services.mcp import mcp_manifest_store, mcp_registry as reg, mcp_server_resolve
 from tests._paths import REPO_ROOT as _ROOT
 
 _MANIFEST = _ROOT / "mcps" / "custom" / "browser-mcp" / "manifest.json"
@@ -57,7 +57,7 @@ def test_manifest_node_stdio_source(manifest):
 # ---------------------------------------------------------------------------
 
 def _reason(m, *, r=False, d=None, g=None):
-    return reg._device_placement_reason(m, placement=placement.PlacementCapabilities(
+    return mcp_manifest_store._device_placement_reason(m, placement=placement.PlacementCapabilities(
         kind=placement.KIND_ADMIN_REMOTE if r else placement.KIND_LOCAL,
         machine_id="m" if r else "", has_display=d, device_grants=g or set(),
     ))
@@ -82,11 +82,11 @@ def test_gate_excluded_when_known_headless(manifest):
 
 
 def test_device_capability_for_server(manifest):
-    reg._manifests[manifest.name] = manifest
+    mcp_manifest_store._manifests[manifest.name] = manifest
     try:
         assert reg.device_capability_for_server("local") == "browser"
     finally:
-        reg._manifests.pop(manifest.name, None)
+        mcp_manifest_store._manifests.pop(manifest.name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +111,7 @@ def test_resolve_server_config_node_stdio(manifest, monkeypatch):
 
 def test_apply_allowed_origins_sets_semicolon_joined_env():
     entry = {"type": "stdio", "command": "node", "env": {"OTO_BROWSER_CHANNEL": "chrome"}}
-    reg._apply_browser_allowed_origins(entry, ["https://a.com", "https://b.com:8443"])
+    mcp_server_resolve._apply_browser_allowed_origins(entry, ["https://a.com", "https://b.com:8443"])
     assert entry["env"]["PLAYWRIGHT_MCP_ALLOWED_ORIGINS"] == "https://a.com;https://b.com:8443"
     # existing env preserved
     assert entry["env"]["OTO_BROWSER_CHANNEL"] == "chrome"
@@ -119,13 +119,13 @@ def test_apply_allowed_origins_sets_semicolon_joined_env():
 
 def test_apply_allowed_origins_empty_is_noop():
     entry = {"type": "stdio"}
-    reg._apply_browser_allowed_origins(entry, [])
+    mcp_server_resolve._apply_browser_allowed_origins(entry, [])
     assert "env" not in entry  # empty list = permissive default (blocklist only)
 
 
 def test_apply_allowed_origins_creates_env_when_absent():
     entry = {"type": "stdio"}
-    reg._apply_browser_allowed_origins(entry, ["https://only.com"])
+    mcp_server_resolve._apply_browser_allowed_origins(entry, ["https://only.com"])
     assert entry["env"] == {"PLAYWRIGHT_MCP_ALLOWED_ORIGINS": "https://only.com"}
 
 
@@ -155,7 +155,7 @@ def test_apply_browser_mode_dedicated_leaves_nothing_but_strips_poison():
     bundles = {}
     for target in (None, BrowserTargetSettings()):
         entry = {"type": "stdio", "command": "node", "env": dict(poisoned)}
-        reg._apply_browser_mode(entry, bundles, target, unattended=False)
+        mcp_server_resolve._apply_browser_mode(entry, bundles, target, unattended=False)
         assert entry["env"] == {"OTO_BROWSER_CHANNEL": "chrome"}
         assert bundles == {}
 
@@ -164,7 +164,7 @@ def test_apply_browser_mode_own_with_token_uses_the_bundle():
     # An ATTENDED session uses the saved token.
     entry = {"type": "stdio", "command": "node", "env": {"OTO_BROWSER_CHANNEL": "auto"}}
     bundles = {}
-    reg._apply_browser_mode(entry, bundles, _own("T" * 43), unattended=False)
+    mcp_server_resolve._apply_browser_mode(entry, bundles, _own("T" * 43), unattended=False)
     assert entry["env"] == {
         "OTO_BROWSER_CHANNEL": "auto", "OTO_BROWSER_MODE": "own",
         "OTO_BROWSER_TOKEN_EXPECTED": "1",
@@ -179,12 +179,12 @@ def test_apply_browser_mode_unattended_needs_the_machine_optin_for_the_token():
     # own-browser token left for a person unless the machine row opts in.
     entry = {"type": "stdio", "command": "node"}
     bundles = {}
-    reg._apply_browser_mode(entry, bundles, _own("T" * 43, unattended=False), unattended=True)
+    mcp_server_resolve._apply_browser_mode(entry, bundles, _own("T" * 43, unattended=False), unattended=True)
     assert entry["env"] == {"OTO_BROWSER_MODE": "own", "OTO_BROWSER_UNATTENDED": "1"}
     assert bundles == {}
     # With the opt-in, the unattended session uses it.
     entry, bundles = {"type": "stdio", "command": "node"}, {}
-    reg._apply_browser_mode(entry, bundles, _own("T" * 43, unattended=True), unattended=True)
+    mcp_server_resolve._apply_browser_mode(entry, bundles, _own("T" * 43, unattended=True), unattended=True)
     assert entry["env"] == {"OTO_BROWSER_MODE": "own", "OTO_BROWSER_TOKEN_EXPECTED": "1"}
     assert bundles["local"].env == {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "T" * 43}
 
@@ -192,9 +192,9 @@ def test_apply_browser_mode_unattended_needs_the_machine_optin_for_the_token():
 def test_apply_browser_mode_own_without_token_flags_unattended():
     entry = {"type": "stdio", "command": "node"}
     bundles = {}
-    reg._apply_browser_mode(entry, bundles, _own(), unattended=False)
+    mcp_server_resolve._apply_browser_mode(entry, bundles, _own(), unattended=False)
     assert entry["env"] == {"OTO_BROWSER_MODE": "own"}
-    reg._apply_browser_mode(entry, bundles, _own(), unattended=True)
+    mcp_server_resolve._apply_browser_mode(entry, bundles, _own(), unattended=True)
     assert entry["env"] == {"OTO_BROWSER_MODE": "own", "OTO_BROWSER_UNATTENDED": "1"}
     assert bundles == {}
 
@@ -205,10 +205,10 @@ def test_apply_browser_mode_carries_the_machines_profile_in_own_mode_only():
     from storage.remote_store import BrowserTargetSettings
     entry = {"type": "stdio", "command": "node"}
     own = BrowserTargetSettings(mode="own", extension_token="T" * 43, profile="Work")
-    reg._apply_browser_mode(entry, {}, own, unattended=False)
+    mcp_server_resolve._apply_browser_mode(entry, {}, own, unattended=False)
     assert entry["env"]["OTO_BROWSER_PROFILE"] == "Work"
     entry = {"type": "stdio", "command": "node"}
-    reg._apply_browser_mode(entry, {}, BrowserTargetSettings(profile="Work"), unattended=False)
+    mcp_server_resolve._apply_browser_mode(entry, {}, BrowserTargetSettings(profile="Work"), unattended=False)
     assert "env" not in entry
 
 
@@ -218,7 +218,7 @@ def test_apply_browser_mode_withheld_gives_no_token_and_says_so():
     attended or not."""
     for unattended in (False, True):
         entry, bundles = {"type": "stdio", "command": "node"}, {}
-        reg._apply_browser_mode(entry, bundles, _own("T" * 43, unattended=True),
+        mcp_server_resolve._apply_browser_mode(entry, bundles, _own("T" * 43, unattended=True),
                                 unattended=unattended, withheld=True)
         assert entry["env"] == {"OTO_BROWSER_MODE": "own", "OTO_BROWSER_TOKEN_WITHHELD": "1"}
         assert bundles == {}
@@ -228,7 +228,7 @@ def test_apply_browser_mode_extends_an_existing_bundle():
     from core.credentials.mcp_broker import SecretBundle
     bundles = {"local": SecretBundle(env={"OTHER": "1"})}
     entry = {"type": "stdio", "command": "node"}
-    reg._apply_browser_mode(entry, bundles, _own("U" * 43), unattended=False)
+    mcp_server_resolve._apply_browser_mode(entry, bundles, _own("U" * 43), unattended=False)
     assert bundles["local"].env == {"OTHER": "1", "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "U" * 43}
 
 
@@ -246,10 +246,13 @@ def test_build_session_config_threads_target_browser(monkeypatch, tmp_path):
         }},
     )
     path, _env, _excl, bundles, _bash = reg.build_session_mcp_config(
-        "agent", None, placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
+        "agent", "u-1", placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
         task_mode=True, target_browser=_own("V" * 43, unattended=True),
     )
     local = json.loads(path.read_text())["mcpServers"]["local"]
+    # The browser's program waits for its first call; its start needs the
+    # token's fetch to answer (the marker is settled after the token joined).
+    assert json.loads(local["env"].pop("OTO_TOOL_STANDIN"))["fetch"] is True
     assert local["env"] == {
         "PLAYWRIGHT_MCP_BLOCKED_ORIGINS": "http://localhost:*",
         "OTO_BROWSER_MODE": "own", "OTO_BROWSER_TOKEN_EXPECTED": "1",
@@ -260,12 +263,14 @@ def test_build_session_config_threads_target_browser(monkeypatch, tmp_path):
     # No target_browser (local builders never pass one): the entry keeps only
     # what the framework allows, and no bundle is created.
     path, _env, _excl, bundles, _bash = reg.build_session_mcp_config(
-        "agent", None, placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
+        "agent", "u-1", placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
     )
     local = json.loads(path.read_text())["mcpServers"]["local"]
+    assert json.loads(local["env"].pop("OTO_TOOL_STANDIN"))["fetch"] is False
     assert local["env"] == {"PLAYWRIGHT_MCP_BLOCKED_ORIGINS": "http://localhost:*",
-                            "OTO_CLI_TOKEN": ""}
-    assert "local" not in bundles
+                            "OTO_STRIP_KEYS": "OTO_CLI_TOKEN", "OTO_CLI_TOKEN": ""}
+    # Its bundle is the stand-in's empty one: nothing to fetch.
+    assert not bundles["local"].env and bundles["local"].token is None
 
 
 _LOOPBACK_BLOCKLIST = (
@@ -279,7 +284,7 @@ def test_allow_listed_loopback_host_unblocks_it():
     allowlist mode keeps everything outside the allow-list unreachable."""
     entry = {"type": "stdio",
              "env": {"PLAYWRIGHT_MCP_BLOCKED_ORIGINS": _LOOPBACK_BLOCKLIST}}
-    reg._apply_browser_allowed_origins(entry, ["http://localhost:8400"])
+    mcp_server_resolve._apply_browser_allowed_origins(entry, ["http://localhost:8400"])
     assert entry["env"]["PLAYWRIGHT_MCP_ALLOWED_ORIGINS"] == "http://localhost:8400"
     # localhost patterns dropped (both schemes — host-keyed), 127.0.0.1 kept.
     assert entry["env"]["PLAYWRIGHT_MCP_BLOCKED_ORIGINS"] == (
@@ -290,21 +295,62 @@ def test_allow_listed_loopback_host_unblocks_it():
 def test_non_loopback_allow_list_keeps_blocklist_intact():
     entry = {"type": "stdio",
              "env": {"PLAYWRIGHT_MCP_BLOCKED_ORIGINS": _LOOPBACK_BLOCKLIST}}
-    reg._apply_browser_allowed_origins(entry, ["https://example.com"])
+    mcp_server_resolve._apply_browser_allowed_origins(entry, ["https://example.com"])
     assert entry["env"]["PLAYWRIGHT_MCP_BLOCKED_ORIGINS"] == _LOOPBACK_BLOCKLIST
 
 
 def test_empty_allow_list_never_touches_blocklist():
     entry = {"type": "stdio",
              "env": {"PLAYWRIGHT_MCP_BLOCKED_ORIGINS": _LOOPBACK_BLOCKLIST}}
-    reg._apply_browser_allowed_origins(entry, [])
+    mcp_server_resolve._apply_browser_allowed_origins(entry, [])
     assert entry["env"]["PLAYWRIGHT_MCP_BLOCKED_ORIGINS"] == _LOOPBACK_BLOCKLIST
     assert "PLAYWRIGHT_MCP_ALLOWED_ORIGINS" not in entry["env"]
 
 
 def test_origin_host_parsing():
-    assert reg._origin_host("http://localhost:*") == "localhost"
-    assert reg._origin_host("https://127.0.0.1:8443/path") == "127.0.0.1"
-    assert reg._origin_host("HTTP://LocalHost:8400") == "localhost"
-    assert reg._origin_host("http://[::1]:8400") == "[::1]"
-    assert reg._origin_host("example.com:443") == "example.com"
+    assert mcp_server_resolve._origin_host("http://localhost:*") == "localhost"
+    assert mcp_server_resolve._origin_host("https://127.0.0.1:8443/path") == "127.0.0.1"
+    assert mcp_server_resolve._origin_host("HTTP://LocalHost:8400") == "localhost"
+    assert mcp_server_resolve._origin_host("http://[::1]:8400") == "[::1]"
+    assert mcp_server_resolve._origin_host("example.com:443") == "example.com"
+
+
+@pytest.mark.parametrize("tick", [False, True])
+def test_a_session_a_keys_turn_builds_takes_the_rule_for_unattended_runs(monkeypatch, tmp_path, tick):
+    """A key's turn is an unattended run for the paired computer's own
+    browser: the owner's token reaches it only with "Also let unattended runs
+    use this browser" ticked, as for a task's run."""
+    from core.session import key_rows
+    from tests.mcp.test_mcp_broker_activation import _FakeManifest, _stub_assembly
+    _stub_assembly(
+        monkeypatch, [_FakeManifest("browser-control", server_name="local")],
+        env_by_mcp={}, tmp_path=tmp_path,
+        server_entries={"browser-control": {"type": "stdio", "command": "node", "args": ["index.js"]}},
+    )
+    where = placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m")
+    key_rows.hold("chat-key", "req-1")
+    try:
+        _p, _e, _x, bundles, _b = reg.build_session_mcp_config(
+            "agent", "u-1", placement=where, chat_id="chat-key", target_browser=_own("V" * 43, unattended=tick))
+    finally:
+        key_rows.release("chat-key", "req-1")
+    assert bool(bundles["local"].env.get("PLAYWRIGHT_MCP_EXTENSION_TOKEN")) is tick
+    # The person's own chat, no key holding it: the token, tick or not.
+    _p, _e, _x, bundles, _b = reg.build_session_mcp_config(
+        "agent", "u-1", placement=where, chat_id="chat-key", target_browser=_own("V" * 43, unattended=False))
+    assert bundles["local"].env.get("PLAYWRIGHT_MCP_EXTENSION_TOKEN") == "V" * 43
+
+
+def test_token_reaches_and_a_sessions_held_token():
+    from core.credentials import mcp_broker
+    assert mcp_server_resolve.token_reaches(_own("T" * 43), unattended=False)
+    assert not mcp_server_resolve.token_reaches(_own("T" * 43), unattended=True)
+    assert mcp_server_resolve.token_reaches(_own("T" * 43, unattended=True), unattended=True)
+    assert not mcp_server_resolve.token_reaches(_own(None), unattended=False)
+    assert not mcp_server_resolve.token_reaches(None, unattended=False)
+    mcp_broker.provision("sess-tok", {"local": mcp_broker.SecretBundle(env={"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "T"})})
+    try:
+        assert mcp_server_resolve.session_holds_browser_token("sess-tok")
+        assert not mcp_server_resolve.session_holds_browser_token("sess-none")
+    finally:
+        mcp_broker.purge_session("sess-tok")

@@ -8,7 +8,8 @@ list_tasks / get_task_result ONLY when its work depends on it). Injected:
 - per turn at the three layer prepend sites (ahead of the [Current time]
   line), and on a task run's first prompt (the runner: headless through
   those sites, interactive after the time line),
-- at session start via the delegation-mcp dynamic-context block,
+- at a start, as a section of the start's riding part
+  (``core/session/start_context.py``),
 - piggybacked on server-delivered prompts (the PTY rung writes raw bytes and
   never passes the layer sites).
 
@@ -98,7 +99,7 @@ def _chat_row_sync(chat_id: str) -> dict | None:
     return row
 
 
-def _chat_id_for_session_sync(session_id: str) -> str:
+def chat_id_for_session_sync(session_id: str) -> str:
     cached = _session_chats.get(session_id)
     if cached and time.monotonic() - cached[0] < _ROW_TTL:
         return cached[1]
@@ -156,8 +157,11 @@ _NAME_MAX = 80     # per listed title or task name
 def _one_line(text: str) -> str:
     """A title or task name folded onto one line and bounded: the matchers
     that strip the line from titles and bubbles read it as one line of at
-    most 2000 characters (ten names and the frame stay well under)."""
-    name = " ".join(str(text).split())
+    most 2000 characters (ten names and the frame stay well under). A
+    person names a chat and another agent a task, so the start's tag is
+    fenced (``start_context.fence_turn``)."""
+    from core.session.start_context import fence_turn
+    name = fence_turn(" ".join(str(text).split()))
     return name if len(name) <= _NAME_MAX else name[:_NAME_MAX - 1].rstrip() + "…"
 
 
@@ -189,6 +193,9 @@ def _line_for_chat_sync(chat_id: str) -> str:
         return ""
     siblings, tasks = _gather_sync(
         own.get("agent") or "", own.get("user_sub") or "", chat_id)
+    # Sorted: the set comes from a dict of live chats, and an unchanged set
+    # must hash the same (``start_section_sync`` primes the same hash).
+    siblings, tasks = sorted(siblings), sorted(tasks)
     if not siblings and not tasks:
         _last_hash.pop(chat_id, None)
         return ""
@@ -207,7 +214,7 @@ async def prelude_line(session_id: str) -> str:
     if not session_id:
         return ""
     try:
-        chat_id = await asyncio.to_thread(_chat_id_for_session_sync, session_id)
+        chat_id = await asyncio.to_thread(chat_id_for_session_sync, session_id)
         if not chat_id:
             return ""
         return await asyncio.to_thread(_line_for_chat_sync, chat_id)
@@ -228,26 +235,29 @@ async def prepend_if_changed(chat_id: str, text: str) -> str:
     return f"{line}\n\n{text}" if line else text
 
 
-def context_block(agent_name: str, user_sub: str) -> str | None:
-    """Session-start markdown block for the dynamic-context provider — covers
-    layers with no per-turn injection (PTY, remote) on their first turn."""
-    try:
-        from core.session.visibility import chat_history_owner, shared_chat_owner
-        owner = (chat_history_owner(agent_name, user_sub)
-                 if user_sub else shared_chat_owner(agent_name))
-        siblings, tasks = _gather_sync(agent_name, owner, own_chat_id="")
-    except Exception:
-        logger.exception("sibling context block failed for agent %s", agent_name)
-        return None
+def start_section_sync(chat_id: str) -> str:
+    """The parallel sessions for a start's riding part
+    (``core/session/start_context.py``), sorted so an unchanged set is the
+    same bytes. Whatever the per-turn line said before, the chat now holds
+    this view, so the line repeats nothing in the same turn."""
+    own = _chat_row_sync(chat_id) if chat_id else None
+    if not own:
+        return "_None._"
+    siblings, tasks = _gather_sync(own.get("agent") or "", own.get("user_sub") or "", chat_id)
+    siblings, tasks = sorted(siblings), sorted(tasks)
     if not siblings and not tasks:
-        return None
-    lines = ["## Active parallel sessions",
-             "For awareness only — no action needed:"]
+        _last_hash.pop(chat_id, None)
+        return "_None._"
+    _bound(_last_hash, None)
+    _last_hash[chat_id] = hash(_render_line(siblings, tasks))
+    lines = ["For awareness only, no action needed:"]
     for title, status in siblings[:_MAX_LISTED]:
-        lines.append(f"- '{title}' — {_STATUS_LABEL.get(status, status)}")
+        lines.append(f"- '{_one_line(title)}': {_STATUS_LABEL.get(status, status)}")
     for name, task_id in tasks[:_MAX_LISTED]:
-        lines.append(f"- background task '{name}' ({task_id}) — running")
-    lines.append(
-        "Check one only if your work depends on it: peek_session / "
-        "list_tasks / get_task_result.")
+        lines.append(f"- background task '{_one_line(name)}' ({task_id}): running")
+    more = max(0, len(siblings) - _MAX_LISTED) + max(0, len(tasks) - _MAX_LISTED)
+    if more:
+        lines.append(f"- +{more} more")
+    lines.append("Check one only if your work depends on it: peek_session / list_tasks / "
+                 "get_task_result.")
     return "\n".join(lines)

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import WebSocketDisconnect
 
+from core import placement
 from core.background import spawn
 from core.events import artifact_events, chat_writer, input_queue
 from core.events.common_events import (
@@ -69,8 +70,8 @@ _PUMP_POLL_S = 2.0
 
 # The notify-queue frames a streaming turn lets through at once: each starts
 # no turn and moves no turn state of the viewed chat (the page shows a toast,
-# a badge, a refetch, a machine's or an install's progress, or pings for
-# another chat).
+# a badge, a refetch, a machine's or an install's progress, a machine that
+# came or went, or pings for another chat).
 _TURN_FREE_FRAMES = frozenset({
     wire.NOTIFICATION, wire.NOTIFICATION_SILENT, wire.NOTIFICATION_COUNT,
     wire.SHARE_INBOX, wire.TURN_COMPLETE, wire.FILE_UPDATED,
@@ -79,7 +80,7 @@ _TURN_FREE_FRAMES = frozenset({
     wire.TRANSFER_STARTED, wire.TRANSFER_MACHINE_STATE, wire.TRANSFER_PROGRESS,
     wire.TRANSFER_DONE, wire.TRANSFER_STATE,
     wire.SATELLITE_UPDATING, wire.SATELLITE_UPDATED, wire.SATELLITE_UPDATE_FAILED,
-    wire.SATELLITE_UPDATE_SYNC,
+    wire.SATELLITE_UPDATE_SYNC, wire.MACHINE_LINK,
 })
 
 
@@ -144,6 +145,12 @@ class ChatStreamMixin(_Host):
             return res.session_id, res.layer
         except TurnDeferred:
             raise
+        except placement.NoComputeMachine as e:
+            logger.info("WS dashboard: session %s not resumed for chat=%s: no compute machine",
+                        sid[:8], target_chat_id)
+            if is_viewed:
+                await self._send_error(str(e))
+            return None
         except Exception as e:
             logger.exception("WS dashboard: auto-resume failed: %s", e)
             if is_viewed:
@@ -269,13 +276,14 @@ class ChatStreamMixin(_Host):
             # repairs it, and blocking the turn would help nothing.
             from services.engines.subscription_pool import (
                 TURN_MIN_TOKEN_RUNWAY_MS,
+                bound_attribution,
                 ensure_fresh_and_fan_out,
                 get_session_subscription,
                 session_token_expiry_ms,
             )
             _exp_ms = session_token_expiry_ms(sid)
             if _exp_ms and time.time() * 1000 > _exp_ms - TURN_MIN_TOKEN_RUNWAY_MS:
-                _sub_id = get_session_subscription(sid)
+                _sub_id = bound_attribution(sid)[0] or await run_db(get_session_subscription, sid)
                 if _sub_id:
                     logger.info(
                         "WS dashboard: session %s token runway low — "
@@ -398,7 +406,10 @@ class ChatStreamMixin(_Host):
         drain_as = (self.user_sub or "") if _vis.is_shared_only(scope_agent) else None
 
         def _queued_waiting() -> bool:
-            return any(drain_as is None or qi.author_sub == drain_as for qi in input_q.items)
+            # Nothing queued starts a turn while new work is held (a stop,
+            # an update): it stays in the queue for the resume or the boot.
+            return not input_queue.frozen() and any(
+                drain_as is None or qi.author_sub == drain_as for qi in input_q.items)
 
         async def _send_turn(text: str, **kwargs) -> bool:
             """One engine turn onto the pump; True when it yielded an ERROR."""
@@ -671,7 +682,7 @@ class ChatStreamMixin(_Host):
         runs now: a frame that starts no turn and carries no turn state for
         this view (a notification, the badge count, the share inbox, another
         chat's end-of-turn alert, a file's change, the install, transfer and
-        satellite lifecycles), or a status, read receipt or warmup heartbeat
+        satellite lifecycles, a machine that came or went), or a status, read receipt or warmup heartbeat
         of a chat other than the viewed one and the pump's (the sidebar dots
         and badges of the other chats; the viewed chat's own ``ready`` would
         turn Stop back into Send). Everything else (a server turn, the
@@ -1051,6 +1062,8 @@ class ChatStreamMixin(_Host):
                     # route through the normal dispatcher (it backgrounds
                     # pre_warmup and runs warmup's full path).
                     await self._dispatch_client_message(rm)
+                    if not self.chat_id:
+                        break  # leave_chat: the socket shows no chat to attach to
                 continue
 
             # For task chats and meetings: after a turn finishes, re-send
@@ -1154,8 +1167,10 @@ class ChatStreamMixin(_Host):
         if not (cid and self.agent_name):
             return False
         # A chat getting ready starts nothing here: its first turn takes what
-        # waits. A chat being deleted starts nothing ever again.
-        if input_queue.deleting(cid) or input_queue.getting_ready(cid):
+        # waits. A chat being deleted starts nothing ever again. While new
+        # work is held (a stop, an update) what waits stays in the queue.
+        if (input_queue.deleting(cid) or input_queue.getting_ready(cid)
+                or input_queue.frozen()):
             return False
         # The connection's own throttled re-check, as before a client
         # message: a turn this socket starts runs as its person.
@@ -1439,9 +1454,7 @@ class ChatStreamMixin(_Host):
         detached mid-turn. Awaiting the pump task (not the turn's last event)
         matters: it completes only after the producer's finally ran, which is
         where Codex registers bg sub-agents that outlive the turn — checking
-        has_pending any earlier can miss them. ``asyncio.wait``, not the task
-        itself: cancelling this watcher at shutdown must never cancel the
-        pump it watches."""
-        if pump._task:
-            await asyncio.wait({pump._task})
-        self._ensure_bg_monitor(session=sid, chat=cid, layer_=lyr)
+        has_pending any earlier can miss them (``arm_bg_monitors_after``)."""
+        from core.events.pump_bg_monitors import arm_bg_monitors_after
+        await arm_bg_monitors_after(pump, lyr or self.layer, sid or self.session_id,
+                                    cid or self.chat_id)

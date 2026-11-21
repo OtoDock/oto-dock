@@ -2,11 +2,12 @@
 
 Provider-agnostic **STT / TTS / VAD / turn-classifier / language-identifier** package for OtoDock.
 
-It is imported by the **proxy** for the chat audio surface (`/v1/audio/tts`,
-`/ws/audio/stt`, `/v1/audio/transcribe`), and by the **phone service** for
-its telephony call pipeline. The package is deliberately consumer-agnostic:
+The **proxy** imports it for the chat audio surface (`/v1/audio/tts`,
+`/ws/audio/stt`, `/v1/audio/transcribe`). The **phone service** imports it
+for its telephony call pipeline. The package is deliberately
+consumer-agnostic:
 
-The package contains **no telephony glue and no HTTP surface** — only reusable
+The package contains **no telephony glue and no HTTP surface**, only reusable
 provider implementations behind small ABCs.
 
 ## Design rules
@@ -17,15 +18,15 @@ provider implementations behind small ABCs.
    instantiates. This keeps the package testable with trivial mocks and free
    of process-specific bootstrap.
 2. **One provider per file**, one category per folder (`stt/`, `tts/`, `vad/`,
-   `turn/`), each with a `base.py` ABC that is the contributor contract. `lid/`
+   `turn/`). Each folder has a `base.py` ABC that is the contributor contract. `lid/`
    holds the language identifier's ABC beside the rule and the tracker that
    drive it.
 3. **No `import config`.** Audio-format constants live in
-   [`constants.py`](constants.py); the transcript-logging gate lives in
+   [`constants.py`](constants.py). The transcript-logging gate lives in
    [`log_policy.py`](log_policy.py).
-4. **Discovery is centralized** in [`providers/registry.py`](providers/registry.py)
-   (`KNOWN_*` maps name → `"module:Class"`, lazily imported so a provider's
-   import-time model load never fires on proxy startup).
+4. **Discovery is centralized** in [`providers/registry.py`](providers/registry.py).
+   `KNOWN_*` maps a name to `"module:Class"`. The class is imported lazily, so
+   a provider's import-time model load never fires on proxy startup.
 
 ## Layout
 
@@ -62,8 +63,8 @@ Re-run after dependency changes. (Docker deployments instead bake it in:
 each consumer's Dockerfile.)
 
 **Editing caveat:** `pip install -e` mounts the source, but Python caches
-imported modules — editing `audio/*.py` requires restarting the consuming
+imported modules. Editing `audio/*.py` requires restarting the consuming
 process. Inside a long-lived chat session the provider subprocess is also
-cached; close and reopen the chat to pick up new code.
+cached. Close and reopen the chat to pick up new code.
 
 See [`CONTRIBUTING_PROVIDERS.md`](CONTRIBUTING_PROVIDERS.md) to add a provider.

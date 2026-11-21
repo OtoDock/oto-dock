@@ -11,7 +11,7 @@ import json
 import pytest
 
 from services.community import community_installer
-from services.mcp import mcp_manifest_parse, mcp_registry
+from services.mcp import mcp_manifest_parse, mcp_manifest_store, mcp_registry
 from tests._paths import REPO_ROOT
 
 
@@ -52,10 +52,10 @@ def _write(tmp_path, data):
 @pytest.fixture
 def registry(monkeypatch):
     """A registry of exactly the manifests a test installs."""
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     from auth import oauth_providers
     oauth_providers.clear_manifest_cache()
-    yield mcp_registry._manifests
+    yield mcp_manifest_store._manifests
     oauth_providers.clear_manifest_cache()
 
 

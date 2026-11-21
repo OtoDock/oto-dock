@@ -45,7 +45,7 @@ import psycopg
 from cryptography.fernet import InvalidToken
 
 from core.background import spawn
-from core.execution_layer import Scoped, Window, Windows, WindowSpec
+from core.execution_layer import InBandSpec, Scoped, Window, Windows, WindowSpec
 
 logger = logging.getLogger("otodock.subscription-windows")
 
@@ -56,8 +56,9 @@ _SETTING_CACHE_S = 60
 # is 100, the margin keeps a live session's next few turns from hitting the
 # wall. Platform ROUTING policy, keyed by the window's role — an engine
 # declares its windows, never the margin the pool routes by. A per-model
-# window is a quota window.
-SPILL_PCT: dict[str, float] = {"session": 90.0, "quota": 95.0}
+# window is a quota window. A session window fills in minutes, so its margin
+# is wide; a week's is used to its last 2 %, which a reset would only lose.
+SPILL_PCT: dict[str, float] = {"session": 90.0, "quota": 98.0}
 
 # The two window keys the sample table has columns for (``five_hour_pct`` …);
 # a storage fact, frozen with the schema. Any other declared key is stored
@@ -68,14 +69,32 @@ _COLUMN_KEYS: tuple[str, ...] = ("five_hour", "seven_day")
 def window_specs(layer: str) -> dict[str, WindowSpec]:
     """The windows ``layer``'s vendor reports, keyed by window key — the
     engine's declaration, read through the registry per call (registry-pull;
-    the session manager is never imported at module level here). An engine
-    that is not registered declares nothing: its readings have no windows
-    and never exhaust."""
+    the session manager is never imported at module level here), the window
+    per model included (``WindowSpec.scope``). An engine that is not
+    registered declares nothing: its readings have no windows and never
+    exhaust."""
     from core.session.session_manager import get_layer_capabilities
     caps = get_layer_capabilities(layer)
     if caps is None:
         return {}
     return {spec.key: spec for spec in caps.usage.windows}
+
+
+def account_specs(specs: dict[str, WindowSpec]) -> dict[str, WindowSpec]:
+    """The whole-account windows of a declaration: each is a master limit
+    (every model stops at it), and each reading carries it under its key."""
+    return {key: spec for key, spec in specs.items() if spec.scope == "account"}
+
+
+def in_band_spec(layer: str, source: str) -> InBandSpec | None:
+    """The engine's declaration of the in-band source ``source``
+    (``UsageProfile.in_band``), or None when ``layer`` declares no such
+    source."""
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(layer)
+    if caps is None:
+        return None
+    return next((b for b in caps.usage.in_band if b.source == source), None)
 
 
 def spill_pct(spec: WindowSpec) -> float:
@@ -86,19 +105,21 @@ def spill_pct(spec: WindowSpec) -> float:
 
 
 def quota_spec(specs: dict[str, WindowSpec]) -> WindowSpec | None:
-    """The declared quota window — the one the drain-first sort, the day cap
+    """The first declared whole-account quota window — the one the day cap
     and the alerts key off — or None for an engine that declares none."""
-    for spec in specs.values():
+    for spec in account_specs(specs).values():
         if spec.role == "quota":
             return spec
     return None
 
 
 def spec_for_length(specs: dict[str, WindowSpec], seconds: float | None) -> WindowSpec | None:
-    """The declared window a vendor-reported length belongs to: the shortest
-    whose length covers the report with a fifth of slack (5 h covers a report
-    of up to 6 h — the boundary the Codex parser always used), else the
-    longest. None when nothing is declared or no length was reported."""
+    """The declared whole-account window a vendor-reported length belongs
+    to: the shortest whose length covers the report with a fifth of slack
+    (5 h covers a report of up to 6 h — the boundary the Codex parser always
+    used), else the longest. None when nothing is declared or no length was
+    reported."""
+    specs = account_specs(specs)
     if seconds is None or not specs:
         return None
     by_length = sorted(specs.values(), key=lambda s: s.length_s)
@@ -197,7 +218,7 @@ def from_row(row: dict, specs: dict[str, WindowSpec]) -> Windows:
         reached=str(data.get("reached") or ""),
         plan=str(data.get("plan") or ""),
     )
-    for key in specs:
+    for key in account_specs(specs):
         win = sample_window(row, key)
         if win is not None:
             w.windows[key] = win
@@ -218,7 +239,8 @@ def effective(w: Windows, now: datetime | None = None) -> Windows:
     passed is empty (and no longer ``reached``); a window with usage but no
     reset instant is unknown; a sample older than the window's own declared
     length is unknown for that window. The per-model windows settle by the
-    quota window's length (they are per-model quota windows)."""
+    declared window per model (``WindowSpec.scope``), else by the quota
+    window's length."""
     now = now or datetime.now(timezone.utc)
     age = (now - w.observed_at).total_seconds()
     out = Windows(specs=w.specs, observed_at=w.observed_at, source=w.source,
@@ -233,15 +255,15 @@ def effective(w: Windows, now: datetime | None = None) -> Windows:
             return None
         return win
 
-    for key, spec in w.specs.items():
+    for key, spec in account_specs(w.specs).items():
         src = w.windows.get(key)
         dst = settle(src, spec.length_s)
         if dst is not None:
             out.windows[key] = dst
         if out.reached == key and (dst is None or (src and src.resets_at and src.resets_at <= now)):
             out.reached = ""
-    quota = quota_spec(w.specs)
-    scoped_len = quota.length_s if quota else max(
+    model = w.model_spec or quota_spec(w.specs)
+    scoped_len = model.length_s if model else max(
         (s.length_s for s in w.specs.values()), default=0)
     for s in w.scoped:
         settled = settle(Window(s.pct, s.resets_at), scoped_len)
@@ -265,7 +287,7 @@ def to_public(w: Windows) -> dict:
     reading does not carry it."""
     def win(x: Window | None):
         return None if x is None else {"pct": round(x.pct, 1), "resets_at": _dt_iso(x.resets_at)}
-    out: dict = {key: win(w.windows.get(key)) for key in w.specs}
+    out: dict = {key: win(w.windows.get(key)) for key in account_specs(w.specs)}
     out.update({
         "scoped": [
             {"key": s.key, "label": s.label, "pct": round(s.pct, 1),
@@ -284,8 +306,10 @@ def to_public(w: Windows) -> dict:
 # The questions the pool asks
 # ---------------------------------------------------------------------------
 
-def _scoped_spill() -> float:
-    return SPILL_PCT["quota"]
+def _scoped_spill(w: Windows) -> float:
+    """The mark of a model's window: its declared role's, else the quota mark."""
+    model = w.model_spec
+    return spill_pct(model) if model is not None else SPILL_PCT["quota"]
 
 
 def exhausted(w: Windows, scope_key: str = "") -> bool:
@@ -304,7 +328,7 @@ def exhausted(w: Windows, scope_key: str = "") -> bool:
     s = w.scoped_for(scope_key)
     if s is None:
         return False
-    return s.pct >= _scoped_spill() or w.reached == f"scoped:{scope_key}"
+    return s.pct >= _scoped_spill(w) or w.reached == f"scoped:{scope_key}"
 
 
 def exhausted_overall(w: Windows) -> bool:
@@ -325,7 +349,7 @@ def has_headroom(w: Windows, key: str) -> bool:
     reading does not carry the window."""
     if key.startswith("scoped:"):
         s = w.scoped_for(key[len("scoped:"):])
-        return s is not None and s.pct < _scoped_spill() and w.reached != key
+        return s is not None and s.pct < _scoped_spill(w) and w.reached != key
     win = w.windows.get(key)
     spec = w.specs.get(key)
     if win is None or spec is None:
@@ -344,16 +368,28 @@ def frees_at(w: Windows, scope_key: str = "") -> datetime | None:
         if (win.pct >= spill_pct(spec) or w.reached == key) and win.resets_at:
             instants.append(win.resets_at)
     s = w.scoped_for(scope_key) if scope_key else None
-    if s is not None and (s.pct >= _scoped_spill() or w.reached == f"scoped:{scope_key}") and s.resets_at:
+    if s is not None and (s.pct >= _scoped_spill(w) or w.reached == f"scoped:{scope_key}") and s.resets_at:
         instants.append(s.resets_at)
     return min(instants) if instants else None
 
 
 def quota_reset(w: Windows) -> datetime | None:
-    """When the account's quota window resets (the drain-first sort key);
-    None without a quota window or a reading of it."""
-    win = w.windows.get(w.quota_key)
-    return win.resets_at if win is not None else None
+    """When the account's quota frees first (the drain-first sort key): the
+    soonest reset among its whole-account quota windows that still have room
+    (a weekly and a monthly quota: the one that resets first while both
+    serve), else the soonest among all of them. None without a quota window
+    or a reading of one."""
+    full: list[datetime] = []
+    room: list[datetime] = []
+    for key, spec in account_specs(w.specs).items():
+        win = w.windows.get(key)
+        if spec.role != "quota" or win is None or win.resets_at is None:
+            continue
+        full.append(win.resets_at)
+        if win.pct < spill_pct(spec) and w.reached != key:
+            room.append(win.resets_at)
+    pick = room or full
+    return min(pick) if pick else None
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +448,8 @@ def latest_readings(store, subs: list[dict], now: datetime | None = None) -> dic
     (``storage.billing.subscription_store`` or a caller's own import of it —
     the pool patches its module in tests). ``subs`` are subscription ROWS
     (``id`` + ``layer``): the layer names the windows the sample is read
-    against."""
+    against. A session's own reports (hints) are not read: the store leaves
+    them out."""
     by_id = {str(s.get("id")): s for s in subs if s.get("id")}
     rows = store.latest_window_samples(list(by_id))
     need = [sid for sid, row in rows.items() if row.get("source") != "poll"]
@@ -431,13 +468,39 @@ def latest(subs: list[dict], now: datetime | None = None) -> dict[str, Windows]:
     return latest_readings(subscription_store, subs, now)
 
 
+def shown(subs: list[dict], now: datetime | None = None) -> dict[str, Windows]:
+    """What the AI Engines cards show: ``latest``, with each whole-account
+    window raised by a newer report of one of the account's sessions (a hint
+    can raise a bar, never lower one, and moves nothing). An account with
+    only hints shows the newest."""
+    from storage.billing import subscription_store
+    now = now or datetime.now(timezone.utc)
+    readings = latest_readings(subscription_store, subs, now)
+    by_id = {str(s.get("id")): s for s in subs if s.get("id")}
+    hints = subscription_store.latest_window_samples(list(by_id), hints=True)
+    for sid, row in hints.items():
+        claim = effective(from_row(row, window_specs(by_id[sid].get("layer") or "")), now)
+        base = readings.get(sid)
+        if base is None:
+            readings[sid] = claim
+            continue
+        if claim.observed_at <= base.observed_at:
+            continue
+        for key, win in claim.windows.items():
+            held = base.windows.get(key)
+            if held is None or win.pct > held.pct:
+                base.windows[key] = win
+                base.source = claim.source
+    return readings
+
+
 def exhausted_any(w: Windows) -> bool:
     """Exhausted for SOME model: the overall windows, or any per-model
     quota window past its spill mark or reached. What makes a new sample
     worth a rebalance pass (the pass then judges each scope by its model)."""
     if exhausted_overall(w):
         return True
-    return any(s.pct >= _scoped_spill() or w.reached == f"scoped:{s.key}" for s in w.scoped)
+    return any(s.pct >= _scoped_spill(w) or w.reached == f"scoped:{s.key}" for s in w.scoped)
 
 
 def record(sub_id: str, w: Windows) -> bool:
@@ -468,19 +531,69 @@ def record(sub_id: str, w: Windows) -> bool:
     return written
 
 
+#: A report that arrives this soon after its session changed account may
+#: still describe the old one: it is dropped, never filed under the new.
+_MOVED_DROP_S = 30.0
+#: The confirming poll a session's report may ask for, at most one per
+#: account in this long: a hint cannot make the platform ask the vendor
+#: faster than the tick does.
+_HINT_POLL_FLOOR_S = 300.0
+#: The poll right after a limit error, at most one per account in this long
+#: (any poll counts): limit errors that keep coming on an account in use, or
+#: a terminal's error line the agent wrote, never ask the vendor faster than
+#: the tick does.
+_LIMIT_POLL_FLOOR_S = 300.0
+#: The tick leaves out an account asked this recently, so a requested poll
+#: and the tick never ask for one account twice.
+_TICK_SKIP_S = 60.0
+
+
 def record_for_session(session_id: str, w: Windows) -> bool:
-    """Attribute a reading to the account the session is bound to."""
+    """Attribute an in-band report to the account the session is bound to:
+    always the binding the platform holds, never an account the report
+    names. The account's engine must declare the report's source
+    (``UsageProfile.in_band``): a trusted source is a reading (``record``), a
+    session's claim is a hint (``record_hint``). A report within
+    ``_MOVED_DROP_S`` of the session's move is dropped."""
     if not session_id or not is_enabled():
         return False
     from services.engines import subscription_pool
+    from storage.billing import subscription_store
     sub_id = subscription_pool.get_session_subscription(session_id)
     if not sub_id or sub_id == "default":
         return False
+    if subscription_pool.moved_within(session_id, _MOVED_DROP_S):
+        logger.debug("windows: report of %s dropped, the session just moved", session_id[:8])
+        return False
     try:
-        return record(sub_id, w)
+        row = subscription_store.get_subscription(sub_id) or {}
+        spec = in_band_spec(str(row.get("layer") or ""), w.source)
+        if spec is None:
+            logger.info("windows: %s is not a source the engine of %s declares", w.source, sub_id[:8])
+            return False
+        return record(sub_id, w) if spec.trusted else record_hint(sub_id, w)
     except psycopg.Error:
         logger.warning("windows: recording for session %s failed", session_id[:8], exc_info=True)
         return False
+
+
+def record_hint(sub_id: str, w: Windows) -> bool:
+    """Store a session's claim about its account's windows, for the cards
+    (``shown``). When it disagrees with the account's newest reading about a
+    mark (one is past it and the other is not), it asks for one confirming
+    poll (``request_poll``, ``_HINT_POLL_FLOOR_S``): the vendor's answer is a
+    reading, and only a reading moves sessions, rests an account or ends a
+    rest. Returns whether a row was written."""
+    if not is_enabled():
+        return False
+    from storage.billing import subscription_store
+    written = subscription_store.insert_window_sample(sub_id, hint=True, **to_row(w))
+    before = subscription_store.latest_window_samples([sub_id]).get(sub_id)
+    claim = exhausted_any(effective(w, w.observed_at))
+    held = bool(before) and exhausted_any(effective(from_row(cast("dict", before), w.specs), w.observed_at))
+    if claim != held:
+        request_poll(sub_id, floor_s=_HINT_POLL_FLOOR_S, reason="a session's report")
+    return written
 
 
 def record_for_session_async(session_id: str, w: Windows) -> None:
@@ -505,11 +618,16 @@ def record_for_session_async(session_id: str, w: Windows) -> None:
 # Polling — idle accounts and interactive sessions have no in-band signal
 # ---------------------------------------------------------------------------
 
-# An account with a younger sample is not asked. Below the freshness tick
-# (300 s) so every tick polls every account without an in-band sample: an
-# interactive terminal has no stream events, and a reading that lags a tick
-# behind the CLI is what the AI Engines cards then show.
+# An account with a younger reading is not asked. Below the freshness tick
+# (300 s) so every tick polls every account without an in-band reading: a
+# terminal's reports are hints, which do not count, and a reading that lags
+# a tick behind the CLI is what the AI Engines cards then show.
 _POLL_INTERVAL_S = 240
+# An account a live session uses is also asked when its newest POLL is older:
+# the in-band readings carry the whole-account windows only, and the windows
+# per model decide where a new session of that model goes. Four readings an
+# hour, against the sixty Anthropic refused.
+_IN_USE_POLL_S = 900
 _POLL_TIMEOUT_S = 10.0
 _BACKOFF_MIN_S = 60.0
 _BACKOFF_MAX_S = 1800.0
@@ -518,6 +636,7 @@ _SHAPE_WARN_INTERVAL_S = 3600.0
 _poll_lock = threading.Lock()
 _backoff: dict[str, tuple[float, float]] = {}     # sub_id → (retry_at, current_wait)
 _shape_warned: dict[str, float] = {}
+_last_asked: dict[str, float] = {}                # sub_id → monotonic time of the last poll asked
 
 
 def _user_agent() -> str:
@@ -559,6 +678,7 @@ def reset_poll_state() -> None:
     with _poll_lock:
         _backoff.clear()
         _shape_warned.clear()
+        _last_asked.clear()
 
 
 def poll_request(sub: dict, cred: dict) -> tuple[str, dict] | None:
@@ -594,6 +714,8 @@ async def poll_one(sub: dict, client, *, now: float | None = None) -> bool:
     now = time.monotonic() if now is None else now
     if not sub_id or _backed_off(sub_id, now):
         return False
+    with _poll_lock:
+        _last_asked[sub_id] = now
     from storage.billing import subscription_store
     try:
         cred = await asyncio.to_thread(subscription_store.get_credential_data, sub_id)
@@ -670,12 +792,28 @@ async def poll_due(*, client=None, now: datetime | None = None) -> int:
     except Exception:
         logger.exception("windows: latest-sample read failed")
         return 0
-    due = []
-    for r in candidates:
-        row = latest_rows.get(r["id"])
+    from services.engines import subscription_pool
+    in_use = subscription_pool.bound_oauth_subscription_ids() & {r["id"] for r in candidates}
+    try:
+        polls = await asyncio.to_thread(
+            subscription_store.latest_window_samples, sorted(in_use), source="poll") if in_use else {}
+    except Exception:
+        logger.exception("windows: latest-poll read failed")
+        polls = {}
+
+    def _older(row: dict | None, seconds: float) -> bool:
         observed = _iso_dt(row.get("observed_at")) if row else None
-        if observed is None or (now - observed).total_seconds() >= _POLL_INTERVAL_S:
-            due.append(r)
+        return observed is None or (now - observed).total_seconds() >= seconds
+
+    asked_now = time.monotonic()
+    with _poll_lock:
+        just_asked = {sid for sid, at in _last_asked.items() if asked_now - at < _TICK_SKIP_S}
+    due = [
+        r for r in candidates
+        if r["id"] not in just_asked
+        and (_older(latest_rows.get(r["id"]), _POLL_INTERVAL_S)
+             or (r["id"] in in_use and _older(polls.get(r["id"]), _IN_USE_POLL_S)))
+    ]
     if not due:
         return 0
     own_client = client is None
@@ -696,6 +834,22 @@ async def poll_due(*, client=None, now: datetime | None = None) -> int:
     return len(due)
 
 
+async def _poll_now(sub_id: str, what: str) -> None:
+    """One poll of one account, spawned: never raises."""
+    from storage.billing import subscription_store
+    try:
+        sub = await asyncio.to_thread(subscription_store.get_subscription, sub_id)
+        if not sub or sub.get("auth_type") != "oauth":
+            return
+        client = _new_client()
+        try:
+            await poll_one(sub, client)
+        finally:
+            await client.aclose()
+    except Exception:  # noqa: BLE001  # a spawned poll: its error would vanish with the task
+        logger.debug("windows: %s poll failed", what, exc_info=True)
+
+
 def schedule_poll(sub_id: str) -> None:
     """One immediate poll for a freshly connected account, from the event
     loop, so its bars show right after the connect. Fire-and-forget."""
@@ -705,19 +859,35 @@ def schedule_poll(sub_id: str) -> None:
         asyncio.get_running_loop()
     except RuntimeError:
         return
+    spawn(_poll_now(sub_id, "connect-time"), name="connect_time_poll", owner="subscription_windows")
 
-    async def _run() -> None:
-        from storage.billing import subscription_store
-        try:
-            sub = await asyncio.to_thread(subscription_store.get_subscription, sub_id)
-            if not sub or sub.get("auth_type") != "oauth":
-                return
-            client = _new_client()
-            try:
-                await poll_one(sub, client)
-            finally:
-                await client.aclose()
-        except Exception:  # noqa: BLE001  # a spawned connect-time poll: its error would vanish with the task
-            logger.debug("windows: connect-time poll failed", exc_info=True)
 
-    spawn(_run(), name="connect_time_poll", owner="subscription_windows")
+def request_poll(sub_id: str, *, floor_s: float, reason: str) -> bool:
+    """One poll of the account soon, from any thread: after a limit error
+    (``_LIMIT_POLL_FLOOR_S``) or to confirm a session's report
+    (``_HINT_POLL_FLOOR_S``). Skipped when the account was asked within
+    ``floor_s`` (any poll counts, the tick's too) or is backed off after a
+    refusal. Returns whether one was scheduled."""
+    if not sub_id or not is_enabled() or _air_gapped():
+        return False
+    now = time.monotonic()
+    with _poll_lock:
+        last = _last_asked.get(sub_id)
+        if last is not None and now - last < floor_s:
+            return False
+        entry = _backoff.get(sub_id)
+        if entry is not None and now < entry[0]:
+            return False
+        _last_asked[sub_id] = now
+    from services.engines import token_fanout
+
+    def _go() -> None:
+        spawn(_poll_now(sub_id, reason), name="requested_poll", owner="subscription_windows")
+
+    if not token_fanout.on_loop(_go):
+        with _poll_lock:
+            if _last_asked.get(sub_id) == now:
+                _last_asked.pop(sub_id, None)
+        return False
+    logger.info("windows: one poll of %s asked (%s)", sub_id[:8], reason)
+    return True

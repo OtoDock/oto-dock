@@ -12,18 +12,21 @@ config repo, the satellite fan-out and the index row, in that order.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 import config
-from core import layout
+from core import agent_folder, layout
 from services.checks import patterns
+from services.infra import safe_fs
 from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
 from storage.checks import db_checks
 
@@ -44,6 +47,7 @@ SEVERITIES = ("error", "warning", "note")
 MAX_ROUNDS = 3
 DEFAULT_ROUNDS = 3
 MAX_DOC_BYTES = 64 * 1024
+_DOC_READ_MAX_BYTES = 4 * MAX_DOC_BYTES
 MAX_SCRIPT_BYTES = 256 * 1024
 MAX_RUBRIC_CHARS = 16 * 1024
 MAX_INPUTS = 16
@@ -370,7 +374,7 @@ def _agent_dir(agent: str) -> Path:
     """The agent's directory, contained: a normalized child of ``AGENTS_DIR``
     and nothing else — the routes check the agent exists, this keeps a name
     with a separator or a dot-dot out of every path built here."""
-    root = os.path.normpath(str(Path(config.AGENTS_DIR).resolve()))
+    root = os.path.normpath(str(config.AGENTS_DIR))
     candidate = os.path.normpath(os.path.join(root, str(agent or "")))
     if not candidate.startswith(root + os.sep) or os.path.dirname(candidate) != root:
         raise CheckError("not an agent")
@@ -393,30 +397,36 @@ def check_folder(agent: str, owner: str, name: str) -> Path:
     return checks_root(agent, owner) / name
 
 
-def _linked(agent: str, folder: Path) -> bool:
-    """True when a symlink stands between the agent's directory and
-    ``folder`` (a session that writes /config can plant one): such a folder
-    is never a check, and nothing is written through it."""
-    root = _agent_dir(agent)
-    try:
-        rel = folder.relative_to(root)
-    except ValueError:
-        return True
-    return os.path.realpath(folder) != os.path.join(os.path.realpath(root), *rel.parts)
+def _beneath(agent: str, path: Path) -> tuple[Path, str]:
+    """``path`` (joined from the agent's own folder, never resolved) as the
+    agent's real folder and the rel below it (``core/agent_folder.py``: the
+    agent's folder may be the operator's link). Every read, write and
+    removal of a check opens that rel strictly (``safe_fs``): a session that
+    writes /config, or a person's tree, can plant a link at any part of it,
+    and no link below the agent's folder is followed."""
+    return agent_folder.beneath_agent(path, agent)
+
+
+_LINKED = "the check's folder is reached through a link"
 
 
 def _read_folder(agent: str, owner: str, folder: Path) -> CheckDoc | None:
     """One folder → a CheckDoc (with ``problems`` when the file is broken),
-    or None when there is no document."""
-    if _linked(agent, folder):
-        return None
-    doc_path = folder / DOC_FILE
+    or None when there is no document (missing, a link, not a plain file)."""
+    base, rel = _beneath(agent, folder)
     try:
-        if not doc_path.is_file() or doc_path.is_symlink():
-            return None
-        raw = doc_path.read_bytes()
-    except OSError:
+        # The file is written indented: the read is bounded far above the
+        # document's own rule, which the validation keeps.
+        raw = safe_fs.read_bytes_beneath(base, f"{rel}/{DOC_FILE}", max_size=_DOC_READ_MAX_BYTES)
+    except safe_fs.FileTooLarge:
+        return CheckDoc(agent=agent, owner=owner, name=folder.name, doc={"name": folder.name}, folder=folder,
+                        doc_sha256="", problems=[f"the document is larger than {MAX_DOC_BYTES // 1024} KB"])
+    except _NO_SUCH_FILE:
         return None
+    except OSError as e:
+        # Could not look is not "no check": the row stays (``_sync_index``).
+        return CheckDoc(agent=agent, owner=owner, name=folder.name, doc={"name": folder.name}, folder=folder,
+                        doc_sha256="", problems=[f"the document cannot be read: {type(e).__name__}"])
     problems: list[str] = []
     doc: dict = {}
     try:
@@ -430,20 +440,38 @@ def _read_folder(agent: str, owner: str, folder: Path) -> CheckDoc | None:
     script_sha = ""
     script = doc.get("script") or {}
     if isinstance(script, dict) and script.get("run"):
-        sp = folder / script["run"]
         try:
-            if sp.is_symlink() or not sp.is_file():
-                problems.append(f"the script {script['run']} is missing")
-            else:
-                data = sp.read_bytes()
-                if len(data) > MAX_SCRIPT_BYTES:
-                    problems.append("the script is larger than 256 KB")
-                else:
-                    script_sha = sha256_text(data)
+            script_sha = sha256_text(_read_script_bytes(agent, folder, script["run"]))
+        except FileNotFoundError:
+            problems.append(f"the script {script['run']} is missing")
+        except safe_fs.FileTooLarge:
+            problems.append("the script is larger than 256 KB")
+        except (safe_fs.SymlinkRefused, safe_fs.NotRegularFile):
+            problems.append(f"the script {script['run']} is missing")
         except OSError as e:
-            problems.append(f"the script cannot be read: {e}")
+            problems.append(f"the script cannot be read: {type(e).__name__}")
     return CheckDoc(agent=agent, owner=owner, name=folder.name, doc=doc, folder=folder,
                     doc_sha256=sha256_text(raw), script_sha256=script_sha, problems=problems)
+
+
+# What is no file at a check's name: missing, a link, a folder or a special
+# file in its place. Any other error means the file could not be read.
+_NO_SUCH_FILE = (FileNotFoundError, NotADirectoryError, safe_fs.SymlinkRefused, safe_fs.NotRegularFile)
+
+
+def _read_script_bytes(agent: str, folder: Path, run: str) -> bytes:
+    base, rel = _beneath(agent, folder)
+    return safe_fs.read_bytes_beneath(base, f"{rel}/{run}", max_size=MAX_SCRIPT_BYTES)
+
+
+def read_script(check: CheckDoc) -> bytes:
+    """The check's script as its folder holds it now, read with no link
+    followed and under the 256 KB cap (``safe_fs`` errors are ``OSError``)."""
+    script = check.doc.get("script") or {}
+    run = script.get("run") if isinstance(script, dict) else None
+    if not run:
+        raise FileNotFoundError("the check has no script")
+    return _read_script_bytes(check.agent, check.folder, str(run))
 
 
 # (agent, owner) → the names whose folder was missing on the last load.
@@ -455,14 +483,17 @@ def _held(row: dict | None, owner: str) -> dict:
 
 
 def _sync_index(items: list[CheckDoc], agent: str, owner: str, *,
-                whole: bool = True) -> list[CheckDoc]:
+                whole: bool = True, unseen: bool = False) -> list[CheckDoc]:
     """The index follows the files: changed hashes are rewritten (as
     "file"), rows of vanished folders are dropped, the row's provenance is
     read back onto the item. A MANDATORY agent check whose folder is gone
     keeps its row (the manager removes it on the Checks page) and comes
     back as a held item with its problem. ``whole`` False (one check,
     loaded by name) touches that check's row only: the others were not
-    looked at, so none of them is missing."""
+    looked at, so none of them is missing. ``unseen``: the tree could not
+    be looked at (the agent's folder away, the checks folder unreadable),
+    so no row is dropped or counted as missing, and every mandatory one is
+    held at once."""
     rows = {r["name"]: r for r in db_checks.list_index(agent, owner)}
     for it in items:
         row = rows.get(it.name)
@@ -484,20 +515,24 @@ def _sync_index(items: list[CheckDoc], agent: str, owner: str, *,
         return []
     present = {it.name for it in items}
     gone = set(rows) - present
-    # A folder missing on ONE load may be a rename window (a sync writing
-    # the document as temp-and-rename, a commit in flight): the row is
-    # dropped only when the folder is missing on two loads in a row, so a
-    # blink never turns a manager's provenance into "file".
-    key = (agent, owner)
-    twice = gone & _missing_once.get(key, set())
-    _missing_once[key] = gone
-    held = sorted(n for n in twice if _held(rows[n], owner))
-    if twice - set(held):
-        db_checks.delete_index_missing(agent, owner, present | (gone - twice) | set(held))
+    if unseen:
+        held = sorted(n for n in gone if _held(rows[n], owner))
+        problem = "the agent's checks cannot be read now (it was mandatory)"
+    else:
+        # A folder missing on ONE load may be a rename window (a sync
+        # writing the document as temp-and-rename, a commit in flight): the
+        # row is dropped only when the folder is missing on two loads in a
+        # row, so a blink never turns a manager's provenance into "file".
+        key = (agent, owner)
+        twice = gone & _missing_once.get(key, set())
+        _missing_once[key] = gone
+        held = sorted(n for n in twice if _held(rows[n], owner))
+        if twice - set(held):
+            db_checks.delete_index_missing(agent, owner, present | (gone - twice) | set(held))
+        problem = "the check's folder is missing (it was mandatory)"
     return [CheckDoc(agent=agent, owner=owner, name=n, doc={"name": n}, folder=checks_root(agent, owner) / n,
                      doc_sha256="", updated_by=rows[n]["updated_by"], updated_at=rows[n]["updated_at"],
-                     problems=["the check's folder is missing (it was mandatory)"],
-                     held=_held(rows[n], owner))
+                     problems=[problem], held=_held(rows[n], owner))
             for n in held]
 
 
@@ -507,18 +542,31 @@ def load_checks(agent: str, owner: str = "", *, sync_index: bool = True) -> list
     mandatory check whose folder is gone). Synchronous."""
     root = checks_root(agent, owner)
     items: list[CheckDoc] = []
-    try:
-        folders = sorted(p for p in root.iterdir() if p.is_dir() and not p.is_symlink()
-                         and CHECK_NAME_RE.match(p.name)) if root.is_dir() else []
-    except OSError:
-        return []
+    folders: list[Path] = []
+    # The agent's own folder not there, or a tree that could not be looked
+    # at, answers nothing about its checks: the rows stay (``unseen``).
+    unseen = True
+    with contextlib.suppress(OSError):
+        base, rel = _beneath(agent, root)
+        if safe_fs.kind_beneath(base, "").kind == "dir":
+            unseen = False
+            try:
+                step = next(safe_fs.walk_beneath(base, rel))
+                folders = sorted(root / n for n in step.dirs if CHECK_NAME_RE.match(n))
+            except (*_NO_SUCH_FILE, StopIteration):
+                # The checks folder gone, a file or a link is no check at
+                # all: the index still answers a held item for each
+                # mandatory one.
+                pass
+            except OSError:
+                unseen = True
     for folder in folders[:MAX_CHECKS_PER_TREE]:
         it = _read_folder(agent, owner, folder)
         if it is not None:
             items.append(it)
     if sync_index:
         try:
-            items.extend(_sync_index(items, agent, owner))
+            items.extend(_sync_index(items, agent, owner, unseen=unseen))
         except Exception:  # noqa: BLE001  # the index is a cache: the checks still load from their files
             logger.warning("checks: index sync failed for %s/%s", agent, owner or "config",
                            exc_info=True)
@@ -593,8 +641,7 @@ def write_check(agent: str, owner: str, doc, script: str | None, *, updated_by: 
         raise CheckError(problem)
     name = clean["name"]
     folder = check_folder(agent, owner, name)
-    if _linked(agent, folder):
-        raise CheckError("the check's folder is reached through a link")
+    base, rel = _beneath(agent, folder)
     run = (clean.get("script") or {}).get("run")
     if script is not None:
         if not isinstance(script, str):
@@ -603,18 +650,26 @@ def write_check(agent: str, owner: str, doc, script: str | None, *, updated_by: 
             raise CheckError("the script is larger than 256 KB")
         if not run:
             raise CheckError("a script text needs a script section naming its file")
-    folder.mkdir(parents=True, exist_ok=True)
-    existing_script = folder / run if run else None
-    if run and script is None and not (existing_script and existing_script.is_file()):
-        raise CheckError(f"the script {run} is not in the check's folder — send its text")
+    try:
+        if run and script is None and not _plain_file(base, f"{rel}/{run}"):
+            raise CheckError(f"the script {run} is not in the check's folder — send its text")
+        # A link at either name is replaced, never written through; a link
+        # on the way to the folder refuses the write.
+        safe_fs.atomic_write_beneath(base, f"{rel}/{DOC_FILE}",
+                                     canonical_json(clean).encode("utf-8"), mkdirs=True)
+        if script is not None and run:
+            safe_fs.atomic_write_beneath(base, f"{rel}/{run}",
+                                         script_as_written(script).encode("utf-8"), mkdirs=True)
+    except safe_fs.SymlinkRefused as e:
+        raise CheckError(_LINKED) from e
+    except OSError as e:
+        raise CheckError("the check's files could not be written") from e
     doc_path = folder / DOC_FILE
-    doc_path.write_text(canonical_json(clean), encoding="utf-8")
-    if script is not None and run:
-        (folder / run).write_text(script_as_written(script), encoding="utf-8")
     _commit(agent, owner, [doc_path] + ([folder / run] if (script is not None and run) else []),
             f"checks: {name} by {updated_by or 'platform'}")
     it = _read_folder(agent, owner, folder)
-    assert it is not None
+    if it is None:
+        raise CheckError("the check's files could not be written")
     if it.problems:
         raise CheckError("; ".join(it.problems))
     saved = db_checks.upsert_index(agent, owner, name, it.doc, doc_sha256=it.doc_sha256,
@@ -623,17 +678,35 @@ def write_check(agent: str, owner: str, doc, script: str | None, *, updated_by: 
     return it
 
 
+def _plain_file(base: Path, rel: str) -> bool:
+    return safe_fs.kind_beneath(base, rel).is_file
+
+
 def delete_check(agent: str, owner: str, name: str) -> bool:
     """The folder and the index row; True when either existed (a held
-    mandatory check has only its row left)."""
-    import shutil
+    mandatory check has only its row left). A link at the check's name is
+    removed and its target kept; a link on the way to it removes nothing
+    on disk (the row still goes) and refuses with ``CheckError``."""
     folder = check_folder(agent, owner, name)
-    existed = folder.is_dir()
-    if existed:
-        shutil.rmtree(folder, ignore_errors=True)
+    base, rel = _beneath(agent, folder)
+    try:
+        st = safe_fs.lstat_beneath(base, rel)
+    except FileNotFoundError:
+        st = None
+    except OSError as e:
+        db_checks.delete_index(agent, owner, name)
+        raise CheckError(_LINKED) from e
+    if st is not None:
+        try:
+            if stat.S_ISDIR(st.st_mode):
+                safe_fs.rmtree_beneath(base, rel, missing_ok=True)
+            else:
+                safe_fs.unlink_beneath(base, rel, missing_ok=True)
+        except OSError:
+            logger.warning("checks: the folder of %s/%s was not removed", agent, name, exc_info=True)
         _commit(agent, owner, [folder], f"checks: remove {name}")
     had_row = db_checks.delete_index(agent, owner, name)
-    return existed or had_row
+    return st is not None or had_row
 
 
 def _commit(agent: str, owner: str, paths: list[Path], message: str) -> None:
@@ -654,13 +727,12 @@ async def fan_out(agent: str, owner: str, name: str) -> None:
     """A written check reaches the satellites that may see the tree, as any
     platform write does (file_bookkeeping)."""
     folder = check_folder(agent, owner, name)
-    agent_dir = _agent_dir(agent).resolve()
+    base, rel = _beneath(agent, folder)
     try:
         from services.infra import file_bookkeeping
-        for p in sorted(folder.iterdir()):
-            if p.is_file():
-                rel = p.resolve().relative_to(agent_dir).as_posix()
-                await file_bookkeeping.push_file_write(agent, rel, p, writer=None)
+        step = next(safe_fs.walk_beneath(base, rel))
+        for n in sorted(step.files):
+            await file_bookkeeping.push_file_write(agent, f"{rel}/{n}", folder / n, writer=None)
     except Exception:  # noqa: BLE001  # the fan-out to machines is best effort, the files are written
         logger.debug("checks: fan-out skipped for %s", folder, exc_info=True)
 

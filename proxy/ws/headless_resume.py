@@ -197,7 +197,9 @@ async def resume_dead_session_headless(
     # Waits its turn in the admission queue like a new chat; a Direct-LLM
     # session reserves for its stdio MCPs.
     from core.concurrency import acquire_chat_slot
-    adm = await acquire_chat_slot(sid, target=agent_cfg.execution_target,
+    _ctx = getattr(agent_cfg, "security_context", None)
+    _built = placement.compute_of(getattr(_ctx, "placement", None) if _ctx is not None else None)
+    adm = await acquire_chat_slot(sid, target=placement.admission_target(agent_cfg.execution_target, _built),
                                   execution_path=agent_cfg.execution_path,
                                   user_sub=user_sub,
                                   queue_wait_s=config.ADMISSION_QUEUE_WAIT_S,
@@ -210,6 +212,7 @@ async def resume_dead_session_headless(
         agent, execution_path=agent_cfg.execution_path or exec_path,
         user_sub=user_sub, role=effective_role,
         execution_target=agent_cfg.execution_target,
+        **({"placement_built": _built} if _built else {}),
     )
     try:
         await resolved_layer.start_session(sid, agent_cfg)

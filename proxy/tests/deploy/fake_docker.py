@@ -25,17 +25,45 @@ The fake reads its world from the environment:
   stands in for it in a one-off ``docker run -v name:path``.
 * ``FAKE_API_VERSION`` and ``FAKE_COMPOSE_VERSION``: what ``docker version``
   and ``docker compose version --short`` answer (1.51 and 2.35.1).
+  ``docker compose ps -q <service>`` lists the running containers of that
+  service; ``inspect`` of a health format answers a container's ``health``
+  (healthy).
 
 ``exec`` and ``run`` run the command the script asked for, with every path
 under a mount rewritten to the host path standing in for it, so the tree
 programs the scripts stream in run for real against test directories;
-``exec -e K=V`` sets the variable for that command. ``inspect -f`` answers
-a label with ``index .Config.Labels "<key>"``.
+``exec -e K=V`` sets the variable for that command; the admin command line
+(``admin_cli.py <verb>``) prints ``FAKE_ADMIN_<VERB>`` and exits
+``FAKE_ADMIN_<VERB>_RC`` when ``FAKE_ADMIN_<VERB>`` is set (else it runs);
+``FAKE_ADMIN_<VERB>_SIGNAL`` (a signal name) first sends that signal to the
+script that called docker, as a Ctrl+C or a ``timeout`` in that verb would. ``stop`` and ``start`` exit ``FAKE_STOP_RC`` and
+``FAKE_START_RC``. ``inspect -f`` answers a label with
+``index .Config.Labels "<key>"``.
+
+``write_host_fakes`` writes a refusing fake of every host command
+(``HOST_COMMANDS``) and ``host_commands_named`` reads which of them a script
+names: a suite that runs scripts with the host's PATH behind its fakes holds
+the two to each other in a guard test of its own.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+# The commands that act on the host itself (its services, its sessions, its
+# root account). A script a test runs may name one only where the test's PATH
+# holds a fake of it: the real one does not read HOME or a scratch folder.
+HOST_COMMANDS = ("systemctl", "loginctl", "sudo")
+# A host command no test here means to reach: the call is logged beside the
+# fake and nothing runs. A read of a unit's state (systemctl is-active) acts
+# on nothing: it answers "inactive" and is not logged.
+HOST_CALLS_LOG = "host-calls.log"
+FAKE_HOST_COMMAND = f'''#!/bin/sh
+[ "${{0##*/}}" = systemctl ] && [ "$1" = is-active ] && exit 3
+echo "${{0##*/}} $*" >> "${{0%/*}}/{HOST_CALLS_LOG}"
+exit 97
+'''
 
 FAKE_DOCKER = r'''#!/usr/bin/env python3
 import json, os, re, shutil, subprocess, sys
@@ -111,6 +139,15 @@ def run_cmd(cmd, mounts):
     if cmd[0] == "du" and os.environ.get("FAKE_DU_K"):
         print(os.environ["FAKE_DU_K"] + "\t/x")
         return 0
+    at = [i for i, a in enumerate(cmd) if str(a).endswith("/admin_cli.py")]
+    verb = str(cmd[at[0] + 1]) if at and at[0] + 1 < len(cmd) else ""
+    if verb and f"FAKE_ADMIN_{verb.upper()}" in os.environ:
+        sig = os.environ.get(f"FAKE_ADMIN_{verb.upper()}_SIGNAL")
+        if sig:
+            import signal
+            os.kill(os.getppid(), getattr(signal, f"SIG{sig}"))
+        print(os.environ[f"FAKE_ADMIN_{verb.upper()}"])
+        return int(os.environ.get(f"FAKE_ADMIN_{verb.upper()}_RC", "0"))
     real = [mapped(a, mounts) for a in cmd]
     if real[0] == "python3":
         real[0] = shutil.which("python3") or sys.executable
@@ -125,6 +162,11 @@ if args[:2] == ["compose", "version"] and "--short" in args:
     sys.exit(0)
 if args[:1] == ["ps"]:
     ps(args[1:])
+    sys.exit(0)
+if args[:3] == ["compose", "ps", "-q"]:
+    for c in cs:
+        if c.get("running", True) and c["labels"].get("com.docker.compose.service") == args[3]:
+            print(c["id"])
     sys.exit(0)
 if args[:1] == ["exec"]:
     rest, env = [], {}
@@ -148,6 +190,8 @@ if args[:1] == ["inspect"]:
     status = c.get("status") or ("running" if c.get("running", True) else "exited")
     if ".Id" in fmt and ".State.Status" in fmt:
         print(f"{c['id']} {status}")
+    elif "Health" in fmt:
+        print(c.get("health", "healthy"))
     elif ".State.Status" in fmt:
         print(status)
     elif ".Config.Labels" in fmt:
@@ -160,6 +204,8 @@ if args[:1] == ["inspect"]:
         mount = c.get("mounts", {}).get(m.group(1) if m else "", {})
         print(mount.get("name", "") if ".Name" in fmt else mount.get("source", ""))
     sys.exit(0)
+if args[:1] in (["stop"], ["start"]):
+    sys.exit(int(os.environ.get(f"FAKE_{args[0].upper()}_RC", "0")))
 if args[:1] == ["run"]:
     rest, mounts, entry, i = args[1:], {}, None, 0
     while i < len(rest):
@@ -189,3 +235,28 @@ def write_fake(bindir: Path) -> Path:
     path.write_text(FAKE_DOCKER)
     path.chmod(0o755)
     return path
+
+
+def write_host_fakes(bindir: Path) -> None:
+    """A refusing fake of every host command in ``bindir`` (first on the
+    PATH a script runs with), where a test's own fake is not already."""
+    bindir.mkdir(parents=True, exist_ok=True)
+    for name in HOST_COMMANDS:
+        path = bindir / name
+        if not path.exists():
+            path.write_text(FAKE_HOST_COMMAND)
+            path.chmod(0o755)
+
+
+def host_commands_named(script: Path) -> set[str]:
+    """The host commands a script names outside its comments, as a command
+    or in a message: either way the suite that runs it holds a fake."""
+    code = "\n".join(line for line in script.read_text(encoding="utf-8").splitlines()
+                     if not line.lstrip().startswith("#"))
+    return {name for name in HOST_COMMANDS if re.search(rf"(?<![\w-]){name}(?![\w-])", code)}
+
+
+def host_calls(bindir: Path) -> list[str]:
+    """Every call a refusing fake of ``bindir`` logged."""
+    log = bindir / HOST_CALLS_LOG
+    return log.read_text().splitlines() if log.exists() else []

@@ -160,3 +160,75 @@ describe('useInteractiveChat on a task chat (no terminal toggle there)', () => {
     expect(ws.sendPtyInput).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('useInteractiveChat: a mode pick that starts a live terminal again', () => {
+  function live() {
+    const ws = makeWs()
+    const hook = renderHook(() => useInteractiveChat(ws, 'interactive'))
+    act(() => { hook.result.current.onWarmupReady({ interactive: true, chat_id: 'c1' }) })
+    return hook
+  }
+
+  it('locks the controls until the new terminal is up, and comes back to the terminal', () => {
+    const { result } = live()
+    act(() => { result.current.restartInMode('c1', 'ask') })
+    expect(result.current.switching).toBe(true)
+    expect(result.current.restarting('c1')).toBe(true)
+    expect(result.current.restarting('c2')).toBe(false)
+    act(() => { result.current.onWarmupReady({ interactive: true, chat_id: 'c1' }) })
+    expect(result.current.switching).toBe(false)
+    expect(result.current.restarting('c1')).toBe(false)
+    expect(result.current.showRichView).toBe(false)
+  })
+
+  it('a pick made from the history view comes back to the history view', () => {
+    const { result } = live()
+    act(() => { result.current.setShowRichView(true) })
+    act(() => { result.current.restartInMode('c1', 'ask') })
+    // The switch's history frame drops the live flag while it starts.
+    act(() => { result.current.restoreFromMeta('interactive') })
+    act(() => { result.current.onWarmupReady({ interactive: true, chat_id: 'c1' }) })
+    expect(result.current.sessionInteractive).toBe(true)
+    expect(result.current.showRichView).toBe(true)
+  })
+
+  it('the server\'s answer with the chat\'s mode ends it; once the start began it does not', () => {
+    const { result } = live()
+    act(() => { result.current.restartInMode('c1', 'ask') })
+    act(() => { result.current.modeAnswered() })
+    expect(result.current.switching).toBe(false)
+    act(() => { result.current.restartInMode('c1', 'ask') })
+    act(() => { result.current.switchStarted('c1') })
+    act(() => { result.current.modeAnswered() })
+    expect(result.current.switching).toBe(true)
+  })
+
+  it('once the restart\'s history arrives an error puts no mode back: the row holds the pick', () => {
+    const { result } = live()
+    act(() => { result.current.restartInMode('c1', 'autoReview') })
+    // Another chat's history moves nothing.
+    act(() => { result.current.restoreFromMeta('interactive', 'c2') })
+    let back: string | null = 'unset'
+    act(() => { back = result.current.switchErrored('Access denied') })
+    expect(back).toBe('autoReview')
+    act(() => { result.current.restartInMode('c1', 'autoReview') })
+    act(() => { result.current.restoreFromMeta('interactive', 'c1') })
+    act(() => { back = result.current.switchErrored('Access denied for agent') })
+    expect(back).toBeNull()
+    expect(result.current.switching).toBe(true)
+  })
+
+  it('any error before its start refuses it and gives the mode before the pick back', () => {
+    const { result } = live()
+    act(() => { result.current.restartInMode('c1', 'autoReview') })
+    let back: string | null = null
+    act(() => { back = result.current.switchErrored('This chat runs on Ana\'s computer.') })
+    expect(back).toBe('autoReview')
+    expect(result.current.switching).toBe(false)
+    // A toggle's switch keeps its own rule: only the chat gate's refusal.
+    act(() => { result.current.performSwitch(false, 'c1', false) })
+    act(() => { back = result.current.switchErrored('Something else') })
+    expect(back).toBeNull()
+    expect(result.current.switching).toBe(true)
+  })
+})

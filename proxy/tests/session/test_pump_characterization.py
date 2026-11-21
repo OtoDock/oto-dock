@@ -51,8 +51,8 @@ from core.events.stream_pump import (
 )
 from core.layers.cli.layer import cli_chunk_to_events
 from core.layers.cli.translator import ClaudeCLIEventTranslator
+from core.layers.codex.events import CodexEvent
 from core.layers.codex.layer import CodexEventTranslator
-from core.layers.codex.session import CodexEvent
 from core.session import engine_prompts, session_kind, session_state
 from core.session.session_state import get_session_mode, get_subagent_registry
 from core.session.transcript_tool_events import result_summary
@@ -101,7 +101,7 @@ def seams(monkeypatch):
     it; the delta and workflow coalescing windows at zero so every frame
     goes out at once (the windows depend on the clock)."""
     from services import title_generator
-    from services.engines import subscription_pool
+    from services.engines import pool_limits, subscription_pool
     from services.knowledge import library_projector
     from services.scheduler import run_recovery
 
@@ -121,7 +121,7 @@ def seams(monkeypatch):
 
     def _rest(session_id, typed, msg):
         s.rests.append([session_id, typed.as_dict() if typed is not None else None, msg])
-    monkeypatch.setattr(subscription_pool, "rest_after_limit", _rest)
+    monkeypatch.setattr(pool_limits, "rest_after_limit", _rest)
     monkeypatch.setattr(subscription_pool, "session_cost_billed", lambda sid: True)
     monkeypatch.setattr(library_projector, "schedule_reconcile_for_agent", s.reconciles.append)
 
@@ -139,7 +139,7 @@ def seams(monkeypatch):
     monkeypatch.setattr(mcp_registry, "get_all_manifests", lambda: dict(s.manifests))
     monkeypatch.setattr(mcp_cost_engine, "find_costs_block_for_tool", s.costs.get)
     monkeypatch.setattr(mcp_cost_engine, "evaluate",
-                        lambda mcp, tool, tool_input, block: block)
+                        lambda mcp, tool, tool_input, block, tool_result=None: block)
     monkeypatch.setattr(mcp_output_relocation, "record_tool_start",
                         lambda sid, mcp: s.tool_starts.append([sid, mcp]))
 
@@ -437,6 +437,15 @@ async def _trace(name: str, chat_id: str, sid: str, steps: list[tuple], seams: _
     trace = []
     events = []
     opened: list[str] = []
+    # A turn end's save lands on the chat writer's thread and trims the live
+    # blocks when it does: the goldens read every step with the saves not
+    # landed yet, so the writer is held until the last read (a machine under
+    # load let a save land first). The clock trace drains it at every step.
+    import threading
+
+    from core.events import chat_writer
+    held = threading.Event()
+    gate = None if settle_s else chat_writer.submit(chat_id, lambda: held.wait(30), label="held")
     try:
         for kind, payload in steps:
             if kind == "event":
@@ -460,7 +469,6 @@ async def _trace(name: str, chat_id: str, sid: str, steps: list[tuple], seams: _
                 await asyncio.sleep(settle_s)   # the clock trace's flush timers
                 # A timer's flush saves on the writer's thread and trims the
                 # live blocks when the save lands: read them after it.
-                from core.events import chat_writer
                 await chat_writer.drain(chat_id, timeout=5.0)
                 await _settle(pump)
             trace.append({
@@ -471,13 +479,16 @@ async def _trace(name: str, chat_id: str, sid: str, steps: list[tuple], seams: _
                 "state": _pump_state(pump),
             })
         # The turn's saves landed: the rows as a reload shows them.
-        from core.events import chat_writer
+        held.set()
+        if gate is not None:
+            await gate
         await chat_writer.drain(chat_id, timeout=5.0)
         check_golden(f"pump-trace-{name}", {
             "events": events, "trace": trace, "rows": _rows(chat_id),
             "chat": _chat_row(chat_id), "seams": seams.snapshot(),
         })
     finally:
+        held.set()
         _cleanup(pump, opened)
 
 

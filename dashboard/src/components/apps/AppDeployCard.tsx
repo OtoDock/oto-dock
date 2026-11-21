@@ -4,13 +4,16 @@ import {
   AppCardShell, DetailsToggle, ExactManifest, ExactManifestToggle, ManifestBlocks, ManifestSummary, SecretsGroup,
   type SummaryLine,
 } from './AppApprovalCard'
+import { addsServerLine } from './appRow'
 import AppSettingsPanel from './AppSettingsPanel'
 import Button from '../ui/Button'
 
 /**
  * A folder app's release waiting for a person (APPS.md "Deploy pipeline"):
  * the agent deployed, but app.json changed (or the app's deploys always
- * wait, or a required secret has no value yet), so the copy sits next to
+ * wait, a required secret has no value yet, or the release brings a server
+ * the live one has not: the plain list then shows what the app may do,
+ * as for a changed manifest), so the copy sits next to
  * the live release until the owner or an editor approves it here — one
  * click that also approves the manifest it carries — or rejects it, which
  * removes the copy and keeps the live release and its manifest. Rendered in
@@ -62,6 +65,7 @@ export default function AppDeployCard({ app, agent }: Props) {
   const changes = status?.changes
   const waiting = status?.waiting ?? ''
   const lowersApproval = status?.lowers_approval === true
+  const addsServer = status?.adds_server === true
   // A release an update from the source cut is held whatever the app's
   // setting says (services/apps/app_follow.py), so the card says where it came from.
   const heldFrom = pending && app.follows?.held_release === pending
@@ -69,14 +73,23 @@ export default function AppDeployCard({ app, agent }: Props) {
     : ''
   const requiresApproval = status ? status.deploy_requires_approval : true
   const manifestChanged = status ? !status.manifest_approved : !app.actions_approved
-  const showsManifest = manifestChanged && !(app.manifest_empty ?? app.actions.length === 0)
+  const showsManifest = (manifestChanged || addsServer) && !(app.manifest_empty ?? app.actions.length === 0)
   const busy = approve.isPending || reject.isPending
   const error = (approve.error || reject.error) as Error | null
   // The card's row carries the declared names; the status carries the set
   // flags a moment fresher, so the lines read them from there when it has them.
-  const cardApp = status?.secrets ? { ...app, secrets: status.secrets } : app
+  // The server the release brings follows the status too, so the media line
+  // and this card's own line agree.
+  const cardApp = {
+    ...app,
+    ...(status?.secrets ? { secrets: status.secrets } : {}),
+    ...(addsServer ? { pending_has_server: true } : {}),
+  }
   const onSetSecret = app.can_manage ? () => setSettings(true) : undefined
-  const before = changes ? [changesLine(changes)].filter((l): l is SummaryLine => l !== null) : []
+  const before = [
+    changes ? changesLine(changes) : null,
+    addsServer ? addsServerLine('deploy-adds-server') : null,
+  ].filter((l): l is SummaryLine => l !== null)
 
   return (
     <AppCardShell
@@ -98,7 +111,9 @@ export default function AppDeployCard({ app, agent }: Props) {
                     ? `This release came from ${heldFrom}’s app, so it waits for a person here.`
                     : requiresApproval
                       ? 'Deploys of this app always wait for a person.'
-                      : 'This release waits for a person before it goes live.'}
+                      : addsServer
+                        ? 'This release runs its own program on your OtoDock, so it needs approval.'
+                        : 'This release waits for a person before it goes live.'}
           </p>
           {lowersApproval && (
             <p className="mt-0.5 text-status-warning-fg" data-testid="deploy-lowers-approval">
@@ -149,7 +164,7 @@ export default function AppDeployCard({ app, agent }: Props) {
               <Button
                 variant="primary"
                 size="xs"
-                onClick={() => approve.mutate({ appId: app.id, release: pending, sig: app.actions_sig })}
+                onClick={() => approve.mutate({ appId: app.id, release: pending, sig: app.actions_sig, sha: status?.pending_sha })}
                 disabled={busy || !!waiting}
                 title={waiting ? `${waiting}. Set it first.` : undefined}
               >

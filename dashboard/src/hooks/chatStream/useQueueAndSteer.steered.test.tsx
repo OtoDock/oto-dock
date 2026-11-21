@@ -25,6 +25,7 @@ const wsMock = vi.hoisted(() => ({
   sendPlanReviewResponse: vi.fn(),
   sendQuestionResponse: vi.fn(),
   resumeChat: vi.fn(),
+  leaveChat: vi.fn(),
   implementPlan: vi.fn(),
   sendLocationResponse: vi.fn(),
   subscribe: vi.fn(() => () => {}),  // generic frame registry (ui artifacts)

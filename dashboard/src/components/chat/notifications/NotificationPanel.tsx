@@ -1,6 +1,6 @@
 import { useRef, useEffect, useId, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
-import type { NotificationDelivery } from '../../../api/notifications'
+import { deliveryOpens, type NotificationDelivery } from '../../../api/notifications'
 import type { AgentSummary } from '../../../api/agents'
 import type { ShareInboxItem } from '../../../api/shares'
 import NotificationBody from './NotificationBody'
@@ -231,7 +231,7 @@ export default function NotificationPanel({
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                         </svg>
                       </button>
-                      {onNavigate && (d.href || (d.agent_slug && (d.chat_id || d.source === 'file_conflict'))) && (
+                      {onNavigate && deliveryOpens(d) && (
                         <button
                           onClick={(e) => { e.stopPropagation(); if (!d.read) onMarkRead(d.id); onNavigate(d.agent_slug || '', d.chat_id || '', d.href || undefined) }}
                           className="w-5 h-5 flex items-center justify-center text-tertiary hover:text-link transition-colors"

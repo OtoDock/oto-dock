@@ -17,18 +17,20 @@ function setup(initial: Props) {
   const performSwitch = vi.fn()
   const interactive = {
     toggle, performSwitch, setSessionInteractive: vi.fn(), showRichView: false, setShowRichView: vi.fn(),
+    sessionInteractive: true, restartInMode: vi.fn(), restarting: vi.fn(() => false),
   } as unknown as Parameters<typeof useInteractiveHandlers>[0]['interactive']
+  const resumeChat = vi.fn()
   const wrapper = ({ children }: { children: ReactNode }) => <>{children}<DialogsHost /></>
   const hook = renderHook(
     (p: Props) => useInteractiveHandlers({
       agentName: 'dev', sessionId: p.sessionId, chatId: p.chatId, interactive,
       viewedStreaming: p.streaming,
-      ws: { streaming: p.streaming, resumeChat: vi.fn(), cancelQueued: vi.fn() } as unknown as Parameters<typeof useInteractiveHandlers>[0]['ws'],
+      ws: { streaming: p.streaming, resumeChat, cancelQueued: vi.fn() } as unknown as Parameters<typeof useInteractiveHandlers>[0]['ws'],
       seedDbHistory: vi.fn(), draftKey: 'k', queuedMessages: [], setEditText: vi.fn(),
     }),
     { initialProps: initial, wrapper },
   )
-  return { hook, toggle, performSwitch }
+  return { hook, toggle, performSwitch, interactive, resumeChat }
 }
 
 describe('the interactive switch after its confirm', () => {
@@ -64,5 +66,35 @@ describe('the interactive switch after its confirm', () => {
     await act(async () => { await done })
     await waitFor(() => expect(performSwitch).not.toHaveBeenCalled())
     expect(toggle).not.toHaveBeenCalled()
+  })
+})
+
+describe('a mode pick on a live terminal', () => {
+  it('a pick of another mode starts the terminal again; the mode it shows starts nothing', () => {
+    const { hook, interactive } = setup({ sessionId: 's1', chatId: 'c1', streaming: false })
+    const restart = (interactive as unknown as { restartInMode: ReturnType<typeof vi.fn> }).restartInMode
+    expect(hook.result.current.handleLiveModePick('ask', 'ask')).toBe('same')
+    expect(restart).not.toHaveBeenCalled()
+    expect(hook.result.current.handleLiveModePick('dontAsk', 'ask')).toBe('restart')
+    expect(restart).toHaveBeenCalledWith('c1', 'ask')
+  })
+
+  it('a chat with no live terminal goes the headless way', () => {
+    const { hook, interactive } = setup({ sessionId: 's1', chatId: 'c1', streaming: false })
+    ;(interactive as unknown as { sessionInteractive: boolean }).sessionInteractive = false
+    hook.rerender({ sessionId: 's1', chatId: 'c1', streaming: false })
+    expect(hook.result.current.handleLiveModePick('dontAsk', 'ask')).toBeNull()
+  })
+
+  it('the old terminal\'s exit during a restart starts no second resume', () => {
+    const { hook, interactive, resumeChat } = setup({ sessionId: 's1', chatId: 'c1', streaming: false })
+    const flags = interactive as unknown as { restarting: ReturnType<typeof vi.fn>; setSessionInteractive: ReturnType<typeof vi.fn> }
+    flags.restarting.mockReturnValue(true)
+    hook.result.current.handleTerminalExit()
+    expect(resumeChat).not.toHaveBeenCalled()
+    flags.restarting.mockReturnValue(false)
+    hook.result.current.handleTerminalExit()
+    expect(resumeChat).toHaveBeenCalledWith('c1')
+    expect(flags.setSessionInteractive).toHaveBeenCalledWith(false)
   })
 })

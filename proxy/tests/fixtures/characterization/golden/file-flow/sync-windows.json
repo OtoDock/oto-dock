@@ -1,0 +1,38 @@
+{
+ "restored_mtime": 1700000000.0,
+ "windows": {
+  "platform": {
+   "workspace/held.txt": "the machine's copy",
+   "workspace/only-here.txt": "the platform's",
+   "workspace/unreadable.txt": "the platform's"
+  },
+  "tombstones": [],
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "flow-agent",
+    "body": "the platform's",
+    "command_id": "<id>",
+    "expect": "live",
+    "hash": "sha256:167c8c26d0105675a76d72c46857d3d99ba3b049fc8767c98a9545b368025871",
+    "path": "workspace/only-here.txt",
+    "path_kind": "agent_tree",
+    "type": "file_push"
+   },
+   {
+    "agent_slug": "flow-agent",
+    "command_id": "<id>",
+    "page_size": 4096,
+    "report_skipped": true,
+    "type": "request_manifest"
+   },
+   {
+    "agent_slug": "flow-agent",
+    "path": "workspace/held.txt",
+    "path_kind": "agent_tree",
+    "request_id": "<id>",
+    "type": "file_pull"
+   }
+  ]
+ }
+}

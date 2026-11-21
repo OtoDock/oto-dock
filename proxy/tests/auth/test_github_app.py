@@ -391,8 +391,9 @@ _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 def _patched(handler):
     return patch(
-        "auth.oauth_providers.generic.httpx.AsyncClient",
-        side_effect=lambda **kw: _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler), **kw),
+        "auth.oauth_providers.generic._client",
+        side_effect=lambda timeout: _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler),
+                                                       timeout=timeout),
     )
 
 

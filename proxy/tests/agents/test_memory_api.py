@@ -145,8 +145,11 @@ def test_create_agent_topic_lands_in_knowledge(client):
     d = _agent_mem_dir("acme")
     assert (d / "infrastructure.md").exists()
     assert (d / "MEMORY.md").exists()
-    # knowledge/ became a git repo lazily.
-    assert (d.parent / ".git").exists()
+    # knowledge/ got its history at the first write, kept in the proxy's
+    # own data: nothing of git lands in the folder.
+    from services.infra import git_writer
+    assert git_writer.store_path("acme/knowledge").is_dir()
+    assert not (d.parent / ".git").exists()
 
 
 def test_view_root_lists_available_scopes(client):
@@ -408,9 +411,11 @@ def test_the_promote_route_refusals(client):
     r = client.post("/v1/internal/memory/promote", json={"agent": "other", "path": "/memories/user/a.md"},
                     headers=_headers("s-31", "acme", "user-editor"))
     assert r.status_code == 403
+    # A session's token never reaches the route (the memory tool shares a
+    # topic through its own route, a person through this one).
     r = client.post("/v1/internal/memory/promote", json={"agent": "acme", "path": "/memories/user/a.md"},
                     headers=_headers("s-32", "acme"))
-    assert (r.status_code, r.json()["detail"]) == (400, "Only a person signed in can share a memory topic.")
+    assert (r.status_code, r.json()["detail"]) == (403, "A session's token does not reach this route")
     r = client.post("/v1/internal/memory/promote", json={"agent": "acme", "path": "/memories/agent/a.md"}, headers=editor)
     assert r.json() == {"output": "Only a topic under /memories/user/ can be shared.", "is_error": True, "warnings": []}
     r = client.post("/v1/internal/memory/promote",
@@ -928,3 +933,55 @@ def test_promote_refuses_a_missing_person(temp_db):
     _seed_agent("acme")
     with pytest.raises(MemoryOpError, match="person's own memory scope"):
         asyncio.run(memory_promote.promote("acme", "", "x.md", role="editor"))
+
+
+def test_a_write_to_a_linked_memory_folder_answers_a_sentence(client):
+    # A person's own session can put a link at their memory folder: the
+    # memory tool answers one sentence, never a server error, and nothing
+    # is written where the link points.
+    _seed_agent("acme")
+    _assign_role("user-manager", "acme", "manager")
+    d = _user_mem_dir("acme", "manager")
+    elsewhere = d.parent.parent / "workspace" / "elsewhere"
+    elsewhere.mkdir(parents=True)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    d.symlink_to(elsewhere)
+    r = _op(client, _headers("s-1", "acme", "user-manager"), command="create",
+            path="/memories/user/new.md", file_text="# New\n")
+    assert r.status_code == 200, r.text
+    assert r.json()["is_error"] is True
+    assert r.json()["output"] == "Error: this memory folder is reached through a link, so nothing was written."
+    assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.parametrize("route", ["rename", "promote"])
+def test_a_promotion_from_a_linked_memory_folder_answers_a_sentence(client, route):
+    _seed_agent("acme")
+    _assign_role("user-manager", "acme", "manager")
+    d = _user_mem_dir("acme", "manager")
+    elsewhere = d.parent.parent / "workspace" / "elsewhere"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "x.md").write_text("# X\n")
+    d.parent.mkdir(parents=True, exist_ok=True)
+    d.symlink_to(elsewhere)
+    h = _headers("s-1", "acme", "user-manager")
+    if route == "rename":
+        r = _op(client, h, command="rename", old_path="/memories/user/x.md", new_path="/memories/agent/x.md")
+    else:
+        r = client.post("/v1/internal/memory/promote", headers=_cookie("user-manager"),
+                        json={"agent": "acme", "path": "/memories/user/x.md"})
+    assert r.status_code == 200, r.text
+    assert r.json()["output"] == "Error: this memory folder is reached through a link, so nothing was moved."
+    assert (elsewhere / "x.md").exists()
+
+
+def test_a_write_while_the_agents_folder_is_not_there_answers_a_sentence(client, tmp_path):
+    import config
+    _seed_agent("acme")
+    _assign_role("user-manager", "acme", "manager")
+    config.get_agent_dir("acme").rename(tmp_path / "acme-away")
+    r = _op(client, _headers("s-1", "acme", "user-manager"), command="create",
+            path="/memories/user/a.md", file_text="# A\n")
+    assert r.status_code == 200, r.text
+    assert r.json()["output"] == "Error: the memory folder could not be opened, so nothing was written."
+    assert not config.get_agent_dir("acme").exists()

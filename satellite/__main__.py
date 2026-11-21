@@ -18,6 +18,7 @@ import asyncio
 import atexit
 import contextlib
 import faulthandler
+import hashlib
 import logging
 import os
 import signal
@@ -31,9 +32,19 @@ from .config import (
     SATELLITE_VERSION,
     SHARED_APP_SERVER_CLIENT_HASH,
     SHARED_CODEX_APPROVALS_HASH,
+    SHARED_EXIT_AUTHORITY_HASH,
+    SHARED_EXIT_RELAY_HASH,
+    SHARED_HOST_RESOURCES_HASH,
     SHARED_LAYOUT_HASH,
     SHARED_LOOP_WATCHDOG_HASH,
     SHARED_MCP_INSTALLER_HASH,
+    SHARED_MCP_PIN_HASH,
+    SHARED_MCP_SYSTEM_DEPS_HASH,
+    SHARED_OUTBOUND_URL_HASH,
+    SHARED_SANDBOX_NET_HASH,
+    SHARED_SANDBOX_RENDER_HASH,
+    SHARED_SESSION_HOME_HASH,
+    SHARED_SESSION_TEXT_HASH,
     SHARED_STDIO_INTERCEPTOR_HASH,
     SHARED_TERMINAL_QUERIES_HASH,
     atomic_replace,
@@ -68,10 +79,14 @@ def _verify_installer_drift() -> None:
         ("mcp_installer", SHARED_MCP_INSTALLER_HASH),
         ("app_server_client", SHARED_APP_SERVER_CLIENT_HASH),
         ("codex_approvals", SHARED_CODEX_APPROVALS_HASH),
+        ("session_text", SHARED_SESSION_TEXT_HASH),
         ("stdio_path_interceptor", SHARED_STDIO_INTERCEPTOR_HASH),
         ("terminal_queries", SHARED_TERMINAL_QUERIES_HASH),
         ("layout", SHARED_LAYOUT_HASH),
         ("loop_watchdog", SHARED_LOOP_WATCHDOG_HASH),
+        ("sandbox_render", SHARED_SANDBOX_RENDER_HASH),
+        ("host_resources", SHARED_HOST_RESOURCES_HASH),
+        ("session_home", SHARED_SESSION_HOME_HASH),
     ):
         try:
             mod = __import__(f"satellite._vendored.{mod_name}", fromlist=[mod_name])
@@ -86,6 +101,78 @@ def _verify_installer_drift() -> None:
                 mod_name, baked[:16], actual[:16],
             )
             sys.exit(2)
+    # The credential exit's modules import packages a venv may lack (then
+    # the machine runs no exit): hashed as files, so a drift is never
+    # skipped for want of an import.
+    vendored = Path(__file__).resolve().parent / "_vendored"
+    for file_name, baked in (
+        ("exit_relay.py", SHARED_EXIT_RELAY_HASH),
+        ("exit_authority.py", SHARED_EXIT_AUTHORITY_HASH),
+        ("outbound_url.py", SHARED_OUTBOUND_URL_HASH),
+        ("mcp_system_deps.py", SHARED_MCP_SYSTEM_DEPS_HASH),
+        ("mcp_pin.py", SHARED_MCP_PIN_HASH),
+    ):
+        try:
+            actual = hashlib.sha256((vendored / file_name).read_bytes()).hexdigest()
+        except OSError:
+            continue  # not vendored yet (older setup)
+        if baked and actual != baked:
+            logging.getLogger("satellite").error(
+                "%s drift detected: expected=%s actual=%s — run "
+                "scripts/sync-satellite-code.sh on the proxy and reinstall the satellite",
+                file_name, baked[:16], actual[:16],
+            )
+            sys.exit(2)
+    # The launcher is a script, not a module: hashed as a file.
+    launcher = vendored / "oto-sandbox-net"
+    try:
+        actual = hashlib.sha256(launcher.read_bytes()).hexdigest()
+    except OSError:
+        return  # not vendored yet (older setup)
+    if SHARED_SANDBOX_NET_HASH and actual != SHARED_SANDBOX_NET_HASH:
+        logging.getLogger("satellite").error(
+            "oto-sandbox-net drift detected: expected=%s actual=%s — run "
+            "scripts/sync-satellite-code.sh on the proxy and reinstall the satellite",
+            SHARED_SANDBOX_NET_HASH[:16], actual[:16],
+        )
+        sys.exit(2)
+
+
+def _refuse_second_satellite(config_path: Path | None) -> None:
+    """One satellite per home folder: a satellite installs the engines' CLIs
+    into its HOME's own prefix, so a second one under the same HOME, signed
+    in to an install with other pins, would change the CLI a running chat
+    uses. A start on a config file other than the HOME's own while that
+    file exists is such a second one. Nothing is kept to tell (no lock, no
+    pid file): the file itself says the HOME is taken, so a restart after
+    an update or a crash starts as before."""
+    own = satconfig._DEFAULT_CONFIG_PATH
+    if config_path is None or not own.exists():
+        return
+    if config_path.expanduser().resolve() == own.resolve():
+        return
+    logging.getLogger("satellite").error(
+        "Another satellite already uses this home folder with %s, so start this one with "
+        "a home folder of its own. If no satellite uses that file any more, remove it.", own,
+    )
+    sys.exit(2)
+
+
+def _refuse_platform_folder(config) -> None:
+    """A satellite that does not share the platform's folders (a paired
+    machine, a compute machine on another host) never starts on the
+    platform's own agents folder (the proxy marks it): its start-time
+    sweeps and its sync would purge and rewrite the platform's files."""
+    if config.compute and not config.own_copy:
+        return
+    from ._vendored.sandbox_render import PLATFORM_MARKER
+    if (config.agents_dir / PLATFORM_MARKER).exists():
+        logging.getLogger("satellite").error(
+            "agents_dir %s is the platform's own folder: a paired satellite never runs "
+            "on it. Point agents_dir elsewhere, or set [satellite] kind = compute.",
+            config.agents_dir,
+        )
+        sys.exit(2)
 
 
 def _check_post_update_state() -> None:
@@ -566,6 +653,112 @@ def _broadcast_env_change() -> None:
         pass
 
 
+async def _start_time_sweeps(sm) -> None:
+    """What a start sweeps from this machine's own folders: orphan process
+    trees, dead session secrets, a stale session move's staging, tool
+    runtimes behind this host's interpreter. A compute machine's folders
+    beside the platform are the platform's, so it runs none of this (its own
+    community tools folder has ``_tool_sweeps``); one on another host keeps
+    its own copy and runs it all."""
+    # Kill orphan processes from previous run
+    sm.cleanup_orphans()
+
+    # Wipe leftover per-session secret files (SSH keys, OAuth token files) —
+    # every session died with the previous satellite process, so anything
+    # under session-secrets/ (and any .credentials/ token dir in the agent
+    # tree) is dead material a crash prevented from being wiped at close.
+    # The .credentials purge also clears the persistent copies accumulated
+    # before token files became per-session transients.
+    try:
+        from .sessions import session_files
+        session_files.wipe_all()
+        session_files.purge_agent_tree_credentials(sm.config.agents_dir)
+        session_files.purge_agent_tree_mcp_configs(sm.config.agents_dir)
+        # The sessions' own engine folders the last run left (each holds
+        # a session's sign-in file).
+        from .sessions import session_homes
+        session_homes.sweep_all(sm.config.agents_dir)
+    except Exception:
+        logger.exception("session-secrets sweep failed (non-fatal)")
+
+    # A build's scratch a killed satellite left (a compute machine's builds).
+    try:
+        from .sessions import sandbox_host
+        swept = await asyncio.to_thread(sandbox_host.sweep_build_scratch)
+        if swept:
+            logger.info("builds: %d scratch folder(s) a stopped build left swept", swept)
+    except Exception:
+        logger.exception("build scratch sweep failed (non-fatal)")
+
+    # A session move's staging a day old is from a move that never ended (a
+    # daemon stopped between its push and its commit).
+    try:
+        from .sessions import session_move
+        swept = await asyncio.to_thread(session_move.sweep_all_staging, sm.config.agents_dir)
+        if swept:
+            logger.info("session move: %d day-old staging folder(s) swept", swept)
+    except Exception:  # noqa: BLE001  # a start-time sweep never stops the start
+        logger.warning("session move staging sweep failed (non-fatal)", exc_info=True)
+
+    # Reconcile MCP runtimes that lag this host's interpreter/node (e.g. after a
+    # Python 3.10→3.13 or Node 22→24 bump from a satellite update). Best-effort —
+    # never blocks startup; the common case (nothing stale) returns immediately.
+    try:
+        from .sessions.mcp_install_support import (
+            _uv_bin_if_present,
+            reconcile_mcp_runtimes,
+        )
+        # A compute machine builds in its sandbox; a paired computer has none.
+        reconciled = await reconcile_mcp_runtimes(
+            sm.config.mcps_dir, _uv_bin_if_present(),
+            compute=sm.config if getattr(sm.config, "compute", False) else None)
+        if reconciled:
+            logger.info("MCP runtime reconcile: %s", reconciled)
+    except Exception:
+        logger.exception("MCP runtime reconcile failed (non-fatal)")
+
+
+
+async def _tool_sweeps(sm) -> None:
+    """What the install's own compute machine sweeps at its start: its
+    community tools folder alone (``[satellite] tools = own``). The staged
+    folders a stopped install or a stopped copy left, a frame's trust files
+    a killed machine left, a stopped build's scratch, the interpreters no
+    tool uses. It builds no tool: one whose interpreter is
+    gone waits for the platform's run. The agents folder and the other
+    tools folders are the platform's: nothing of them is swept here, and no
+    process."""
+    from .sessions import mcp_install_support, sandbox_host
+    community = sm.config.mcps_dir / mcp_install_support.COMMUNITY
+    try:
+        await asyncio.to_thread(mcp_install_support.sweep_staged, community)
+        # A frame's trust files a killed machine left: no frame runs yet.
+        await asyncio.to_thread(sandbox_host.clear_egress)
+        swept = await asyncio.to_thread(sandbox_host.sweep_build_scratch)
+        if swept:
+            logger.info("builds: %d scratch folder(s) a stopped build left swept", swept)
+    except Exception:
+        logger.exception("tool sweep failed (non-fatal)")
+    try:
+        reconciled = await mcp_install_support.reconcile_mcp_runtimes(
+            sm.config.mcps_dir, mcp_install_support._uv_bin_if_present(), compute=sm.config,
+            categories=mcp_install_support.kept_categories(sm.config))
+        if reconciled:
+            logger.info("MCP runtime reconcile: %s", reconciled)
+    except Exception:
+        logger.exception("MCP runtime reconcile failed (non-fatal)")
+
+
+def _start_sweeps(config):
+    """The sweeps a start runs, by whose folders this machine works on: its
+    own (a paired computer, a compute machine on another host) all of them,
+    the platform's with a community tools folder of its own
+    (``own_tools``) the tool sweeps alone, the platform's alone none."""
+    if not config.compute or config.own_copy:
+        return _start_time_sweeps
+    return _tool_sweeps if config.own_tools else None
+
+
 async def _main(config_path: Path | None = None) -> None:
     # Heavy subpackage imports are deferred to here (NOT module top) so the boot
     # guard in main() can roll back a broken update before these would crash on a
@@ -577,6 +770,23 @@ async def _main(config_path: Path | None = None) -> None:
 
     _verify_installer_drift()
     config = load_config(config_path)
+    _refuse_second_satellite(config_path)
+    _refuse_platform_folder(config)
+    if config.own_copy:
+        # A compute machine on another host: its own copy of the folders, and
+        # its process out of reach of that server's other processes of its uid.
+        config.agents_dir.mkdir(parents=True, exist_ok=True)
+        config.mcps_dir.mkdir(parents=True, exist_ok=True)
+        from .transport import compute_link
+        compute_link.not_dumpable()
+    if config.compute:
+        from .sessions import sandbox_host
+        why = await asyncio.to_thread(sandbox_host.preflight, config)
+        if why:
+            logger.error("compute mode: this machine cannot run the platform's sandbox: %s", why)
+            sys.exit(2)
+        logger.info("compute mode: the platform's sandbox runs here (agents %s, tools %s)",
+                    config.agents_dir, config.mcps_dir)
 
     # An install written before the unit carried OOMPolicy=continue gets it
     # as a drop-in (its own unit only; the reload applies it to the running
@@ -600,9 +810,11 @@ async def _main(config_path: Path | None = None) -> None:
     ensure_darwin_tool_dirs_on_path()
     ensure_user_npm_bin_on_path()
 
-    # Ensure directories exist
-    config.agents_dir.mkdir(parents=True, exist_ok=True)
-    config.mcps_dir.mkdir(parents=True, exist_ok=True)
+    # Ensure directories exist (a compute machine's are the platform's,
+    # checked above, never made here)
+    if not config.compute:
+        config.agents_dir.mkdir(parents=True, exist_ok=True)
+        config.mcps_dir.mkdir(parents=True, exist_ok=True)
 
     sm = SessionManager(config)
     ws = SatelliteWSClient(config, sm)
@@ -616,6 +828,11 @@ async def _main(config_path: Path | None = None) -> None:
     tunnel_port = await tunnel.start()
     ws.tunnel = tunnel
     sm.local_tunnel_port = tunnel_port
+    # The sessions' credential exit beside the tunnel: the platform's relay on
+    # this machine's loopback, its port in the capabilities; the values it
+    # swaps are the tunnel's gateway table's (sessions/credential_exit.py).
+    from .sessions import credential_exit
+    await credential_exit.start_listener(tunnel.gateway.table, compute=config.compute, on_ready=ws.heartbeat_now)
     # A heal that could not keep the port moves it here too (app steps read it).
     tunnel.on_port = lambda port: setattr(sm, "local_tunnel_port", port)
 
@@ -628,7 +845,8 @@ async def _main(config_path: Path | None = None) -> None:
     # handler would log as a multi-line stack trace that reflects no problem.
     from .transport.http_tunnel import make_loop_exception_handler
     asyncio.get_running_loop().set_exception_handler(
-        make_loop_exception_handler(tunnel, quiet_close_resets=not satconfig.HOST.posix))
+        make_loop_exception_handler(tunnel, quiet_close_resets=not satconfig.HOST.posix,
+                                    exit_listener=credential_exit))
 
     # The local control socket — lets `otodock claude|codex` on
     # THIS machine open an interactive session as the agent. Brokers via the
@@ -639,46 +857,9 @@ async def _main(config_path: Path | None = None) -> None:
     # Self-heal the `otodock` PATH symlink (fresh install + every auto-update).
     _ensure_otodock_on_path()
 
-    # Kill orphan processes from previous run
-    sm.cleanup_orphans()
-
-    # Wipe leftover per-session secret files (SSH keys, OAuth token files) —
-    # every session died with the previous satellite process, so anything
-    # under session-secrets/ (and any .credentials/ token dir in the agent
-    # tree) is dead material a crash prevented from being wiped at close.
-    # The .credentials purge also clears the persistent copies accumulated
-    # before token files became per-session transients.
-    try:
-        from .sessions import session_files
-        session_files.wipe_all()
-        session_files.purge_agent_tree_credentials(sm.config.agents_dir)
-        session_files.purge_agent_tree_mcp_configs(sm.config.agents_dir)
-    except Exception:
-        logger.exception("session-secrets sweep failed (non-fatal)")
-
-    # A session move's staging a day old is from a move that never ended (a
-    # daemon stopped between its push and its commit).
-    try:
-        from .sessions import session_move
-        swept = await asyncio.to_thread(session_move.sweep_all_staging, sm.config.agents_dir)
-        if swept:
-            logger.info("session move: %d day-old staging folder(s) swept", swept)
-    except Exception:  # noqa: BLE001  # a start-time sweep never stops the start
-        logger.warning("session move staging sweep failed (non-fatal)", exc_info=True)
-
-    # Reconcile MCP runtimes that lag this host's interpreter/node (e.g. after a
-    # Python 3.10→3.13 or Node 22→24 bump from a satellite update). Best-effort —
-    # never blocks startup; the common case (nothing stale) returns immediately.
-    try:
-        from .sessions.mcp_install_support import (
-            _uv_bin_if_present,
-            reconcile_mcp_runtimes,
-        )
-        reconciled = await reconcile_mcp_runtimes(sm.config.mcps_dir, _uv_bin_if_present())
-        if reconciled:
-            logger.info("MCP runtime reconcile: %s", reconciled)
-    except Exception:
-        logger.exception("MCP runtime reconcile failed (non-fatal)")
+    sweeps = _start_sweeps(config)
+    if sweeps is not None:
+        await sweeps(sm)
 
     # Converge install-time Windows artifacts old installers left stale —
     # the visible-console task action, missing/stale start-tray.vbs and the
@@ -712,6 +893,13 @@ async def _main(config_path: Path | None = None) -> None:
         _WATCHDOG_THRESHOLD_S, _WATCHDOG_REPORT_S,
         tick_s=_WATCHDOG_TICK_S, watch_s=_WATCHDOG_WATCH_S,
     )
+    # The memory guard (Linux): its own thread stops a runaway command before
+    # this machine's reserve is eaten; its frames go out through the loop.
+    from . import background
+    from .sessions import memory_guard
+    if memory_guard.start(sm.memory_units, compute=sm.compute, mark_ended=sm.mark_ended_for_memory):
+        memory_guard.set_sender(lambda frame: loop.call_soon_threadsafe(
+            lambda: background.spawn(ws.enqueue_send(frame), name="memory_stop", owner="link")))
 
     # Windows system-tray icon (headless-safe: None off-Windows / no pystray).
     # asyncio keeps THIS main thread; the tray runs on its own daemon thread.
@@ -773,7 +961,53 @@ async def _main(config_path: Path | None = None) -> None:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await consumer_task
 
-    # Shutdown: close all sessions
+    sm.app_servers.kill_all()
+    pending = await _close_sessions(sm, pending, compute=config.compute)
+
+    # Shut down the tunnel server before cancelling tasks so subprocesses
+    # holding HTTP connections see a clean close.
+    try:
+        await tunnel.stop()
+    except Exception:
+        logger.exception("Tunnel shutdown failed (continuing)")
+
+    # Stop the otodock local control socket (PTY sessions already closed
+    # above → their _on_exit fed EXIT to any attached local terminals).
+    try:
+        await local_ctl.stop()
+    except Exception:
+        logger.exception("Local control socket shutdown failed (continuing)")
+
+    # Cancel remaining tasks
+    await _cancel(pending)
+
+    # The watchdog's thread is flagged before its tick task goes, so the
+    # shutdown never reads as a stall.
+    loop_watchdog.stop()
+    memory_guard.stop()
+
+    logger.info("Satellite shutdown complete")
+    if ws.exit_code:
+        sys.exit(ws.exit_code)
+
+
+async def _cancel(tasks) -> None:
+    for task in tasks:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _close_sessions(sm, pending, *, compute: bool):
+    """End every session at the stop; returns the tasks still to cancel. A
+    compute machine drops its link first: the platform then reads a machine
+    it lost (its grace, then the alive report at its return lacks the
+    sessions) and continues their turns, where a session closed over a live
+    link ends its turn as an exit and nothing continues it."""
+    if compute:
+        await _cancel(pending)
+        pending = set()
+    sm.tool_relay.close_all("the satellite stopped")
     logger.info("Closing %s active session(s)...", len(sm.sessions))
     for sid, session in list(sm.sessions.items()):
         try:
@@ -792,32 +1026,7 @@ async def _main(config_path: Path | None = None) -> None:
             except Exception:
                 logger.exception("Error closing PTY session %s", sid)
         sm.pty_sessions.clear()
-
-    # Shut down the tunnel server before cancelling tasks so subprocesses
-    # holding HTTP connections see a clean close.
-    try:
-        await tunnel.stop()
-    except Exception:
-        logger.exception("Tunnel shutdown failed (continuing)")
-
-    # Stop the otodock local control socket (PTY sessions already closed
-    # above → their _on_exit fed EXIT to any attached local terminals).
-    try:
-        await local_ctl.stop()
-    except Exception:
-        logger.exception("Local control socket shutdown failed (continuing)")
-
-    # Cancel remaining tasks
-    for task in pending:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-    # The watchdog's thread is flagged before its tick task goes, so the
-    # shutdown never reads as a stall.
-    loop_watchdog.stop()
-
-    logger.info("Satellite shutdown complete")
+    return pending
 
 
 def main() -> None:

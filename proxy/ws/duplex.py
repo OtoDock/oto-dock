@@ -191,6 +191,13 @@ async def ws_duplex_handler(websocket: WebSocket):
     sub = str(claims.get("sub") or "")
     chat_id = str(claims.get("chat_id") or "")
 
+    from core import drain
+    if drain.holding():
+        # No spoken conversation starts while the platform holds new work.
+        await _send_json(websocket, {"type": wire.ERROR, "reason": "updating"})
+        await _close_ws(websocket, 4503)
+        return
+
     # Availability + access re-check at attach time (a token may outlive an
     # admin flip or a role change by up to its TTL).
     cap = await asyncio.to_thread(audio_service.duplex_capability)

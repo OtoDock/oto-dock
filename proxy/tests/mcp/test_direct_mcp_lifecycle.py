@@ -51,7 +51,7 @@ async def test_contexts_enter_and_exit_in_same_task(monkeypatch):
     streams_cm = _RecordingCM((object(), object(), object()))  # (read, write, get_id)
     session_cm = _RecordingCM(_FakeSession())
 
-    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None: streams_cm)
+    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None, **_factory: streams_cm)
     monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: session_cm)
 
     conn = mcpmod.MCPServerConnection(
@@ -80,7 +80,7 @@ async def test_contexts_enter_and_exit_in_same_task(monkeypatch):
 async def test_close_is_idempotent_and_terminates_owner(monkeypatch):
     streams_cm = _RecordingCM((object(), object(), object()))
     session_cm = _RecordingCM(_FakeSession())
-    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None: streams_cm)
+    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None, **_factory: streams_cm)
     monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: session_cm)
 
     conn = mcpmod.MCPServerConnection(
@@ -105,7 +105,7 @@ async def test_failed_start_tears_down_in_owner_task(monkeypatch):
             raise RuntimeError("boom")
 
     session_cm = _RecordingCM(_BoomSession())
-    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None: streams_cm)
+    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None, **_factory: streams_cm)
     monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: session_cm)
 
     conn = mcpmod.MCPServerConnection(
@@ -125,7 +125,7 @@ async def test_http_type_alias_uses_streamable_transport(monkeypatch):
     # the connection must treat it as the same transport, not an unknown type.
     streams_cm = _RecordingCM((object(), object(), object()))
     session_cm = _RecordingCM(_FakeSession())
-    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None: streams_cm)
+    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None, **_factory: streams_cm)
     monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: session_cm)
 
     conn = mcpmod.MCPServerConnection(
@@ -135,42 +135,6 @@ async def test_http_type_alias_uses_streamable_transport(monkeypatch):
     await conn.start()
     assert conn.session is not None
     await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_http_servers_gated_to_opted_in_managers(tmp_path, monkeypatch):
-    # Sidecar HTTP MCPs are app-exec-only: a default manager (Direct-LLM chat)
-    # skips them; a manager that opted in (headless_exec) starts them.
-    import json as _json
-
-    cfg = tmp_path / "mcp.json"
-    cfg.write_text(_json.dumps({"mcpServers": {
-        "sidecar": {"type": "http", "url": "http://example.invalid/mcp"},
-        "local": {"command": "true"},
-    }}))
-
-    class _FakeConn:
-        def __init__(self, name, config, **kw):
-            self.name = name
-            self.config = config
-            self.tools = []
-            self.dead = False
-
-        async def start(self):
-            pass
-
-    monkeypatch.setattr(mcpmod, "MCPServerConnection", _FakeConn)
-
-    mgr = mcpmod.AgentMCPManager(
-        "agent-x", session_id="s-gate", prebuilt_config=(cfg, {}))
-    await mgr._start_impl()
-    assert set(mgr.servers) == {"local"}
-
-    mgr2 = mcpmod.AgentMCPManager(
-        "agent-x", session_id="s-gate2", prebuilt_config=(cfg, {}),
-        enable_http_transport=True)
-    await mgr2._start_impl()
-    assert set(mgr2.servers) == {"sidecar", "local"}
 
 
 @pytest.mark.asyncio
@@ -257,118 +221,40 @@ async def test_a_results_pictures_and_blobs_ride_beside_its_text():
 
 
 @pytest.mark.asyncio
-async def test_stdio_servers_start_below_the_proxys_priority(monkeypatch):
-    """A Direct-LLM session's stdio MCPs run at the session priority,
-    like every session process, so a busy MCP never starves the proxy."""
-    from core.credentials import mcp_broker
-    from core.sandbox import env_builder, pty_relay
-    captured = {}
-    streams_cm = _RecordingCM((object(), object()))
-    session_cm = _RecordingCM(_FakeSession())
-
-    def _stdio(params):
-        captured["params"] = params
-        return streams_cm
-    monkeypatch.setattr(mcpmod, "stdio_client", _stdio)
-    monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: session_cm)
-    monkeypatch.setattr(env_builder, "build_session_env", lambda *a, **k: {"PATH": "/bin"})
-    monkeypatch.setattr(mcp_broker, "get", lambda sid, name: None)
-    monkeypatch.setattr(pty_relay, "nice_prefix", lambda: ["nice", "-n", "10"])
-
-    conn = mcpmod.MCPServerConnection(
-        "srv", {"type": "stdio", "command": "srv-bin", "args": ["--x"]},
-        session_id="s1", agent_name="a",
-    )
-    await conn.start()
-    params = captured["params"]
-    assert params.command == "nice"
-    assert params.args == ["-n", "10", "srv-bin", "--x"]
-    await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_the_direct_builder_delivers_the_agent_scope_token_files(monkeypatch, tmp_path):
-    """A Direct-LLM session provisions its bundles itself: the OAuth stdio
-    MCPs' token files ride the bundle like on the Claude and Codex layers
-    for the agent scope the Direct build runs as."""
-    from core.credentials import credential_files as cf, mcp_broker
-    seen: list = []
-    monkeypatch.setattr(cf, "token_file_env",
-                        lambda agent, **kw: seen.append((agent, kw)) or
-                        {"gws": {cf.CREDENTIAL_FILES_ENV: "{}"}})
-    provisioned: list = []
-    monkeypatch.setattr(mcp_broker, "provision",
-                        lambda sid, bundles: provisioned.append((sid, dict(bundles))))
-    monkeypatch.setattr("services.mcp.mcp_registry.build_session_mcp_config",
-                        lambda *a, **kw: (tmp_path / "absent.json", None, None, {}, None))
-    mgr = mcpmod.AgentMCPManager("dev-agent")
-    mgr.session_id = "s-direct"
-    await mgr._start_impl()
-    assert seen == [("dev-agent", {"user_sub": "", "session_scope": "agent"})]
-    [(sid, bundles)] = provisioned
-    assert sid == "s-direct" and set(bundles) == {"gws"}
-
-
-@pytest.mark.asyncio
-async def test_prebuilt_bundles_keep_the_builder_identity_files(monkeypatch, tmp_path):
-    """An app button builds its bundles for the app's identity (a personal
-    owner's files); the manager must not re-deliver the agent scope over
-    them."""
-    from core.credentials import credential_files as cf, mcp_broker
-    from core.credentials.mcp_broker import SecretBundle
-    monkeypatch.setattr(cf, "token_file_env",
-                        lambda agent, **kw: {"gws": {cf.CREDENTIAL_FILES_ENV: "AGENT-SCOPE"}})
-    provisioned: list = []
-    monkeypatch.setattr(mcp_broker, "provision",
-                        lambda sid, bundles: provisioned.append(dict(bundles)))
-    owner = SecretBundle()
-    owner.env[cf.CREDENTIAL_FILES_ENV] = "OWNER-SCOPE"
-    mgr = mcpmod.AgentMCPManager("dev-agent")
-    mgr.session_id = "s-button"
-    mgr.prebuilt_config = (tmp_path / "absent.json", {"gws": owner})
-    await mgr._start_impl()
-    [bundles] = provisioned
-    assert bundles["gws"].env[cf.CREDENTIAL_FILES_ENV] == "OWNER-SCOPE"
-
-
-@pytest.mark.asyncio
-async def test_the_config_is_built_off_the_loop_one_build_at_a_time_per_identity(monkeypatch, tmp_path):
-    """The build, the token delivery and the read-back run in a worker
-    thread (no loop runs there, so an installation token can be minted),
-    one build at a time per build identity (two builds of one session id
-    serialize, another session's build runs beside them), and the lock map
-    is empty once every build is done."""
+async def test_the_builders_config_is_read_off_the_loop(monkeypatch, tmp_path):
+    """The read-back runs in a worker thread: a session start holds neither
+    loop."""
     import threading
-    import time
 
-    from core.credentials import credential_files as cf, mcp_broker
-    monkeypatch.setattr(cf, "token_file_env", lambda agent, **kw: {})
+    from core.credentials import mcp_broker
     monkeypatch.setattr(mcp_broker, "provision", lambda sid, bundles: None)
-    builds: list[tuple[str, int, bool, float, float]] = []
+    seen: list[tuple[int, bool]] = []
+    real = mcpmod.AgentMCPManager._read_config
 
-    def _build(agent, user_sub, **kw):
+    def _read(self):
         try:
             asyncio.get_running_loop()
             on_loop = True
         except RuntimeError:
             on_loop = False
-        t0 = time.monotonic()
-        time.sleep(0.3)
-        builds.append((kw["session_id"], threading.get_ident(), on_loop, t0, time.monotonic()))
-        return tmp_path / "absent.json", None, None, {}, None
+        seen.append((threading.get_ident(), on_loop))
+        return real(self)
 
-    monkeypatch.setattr("services.mcp.mcp_registry.build_session_mcp_config", _build)
-    first = mcpmod.AgentMCPManager("ag", session_id="s-a")
-    again = mcpmod.AgentMCPManager("ag", session_id="s-a")
-    other = mcpmod.AgentMCPManager("ag", session_id="s-b")
-    await asyncio.gather(first._start_impl(), again._start_impl(), other._start_impl())
-    assert len(builds) == 3
-    assert all(not on_loop and tid != threading.get_ident() for _, tid, on_loop, _, _ in builds)
-    same = sorted((t0, t1) for sid, _, _, t0, t1 in builds if sid == "s-a")
-    assert same[1][0] >= same[0][1]
-    [(other_start, _)] = [(t0, t1) for sid, _, _, t0, t1 in builds if sid == "s-b"]
-    assert other_start < same[0][1]
-    assert mcpmod._build_locks == {}
+    monkeypatch.setattr(mcpmod.AgentMCPManager, "_read_config", _read)
+    mgr = mcpmod.AgentMCPManager("ag", session_id="s-a", prebuilt_config=(tmp_path / "absent.json", {}))
+    await mgr._start_impl()
+    [(thread, on_loop)] = seen
+    assert not on_loop and thread != threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_a_manager_with_no_config_starts_nothing(monkeypatch):
+    from core.credentials import mcp_broker
+    provisioned: list = []
+    monkeypatch.setattr(mcp_broker, "provision", lambda sid, bundles: provisioned.append(dict(bundles)))
+    mgr = mcpmod.AgentMCPManager("ag", session_id="s-none")
+    await mgr._start_impl()
+    assert provisioned == [{}] and mgr.servers == {}
 
 
 @pytest.mark.asyncio
@@ -428,47 +314,6 @@ async def test_a_second_caller_during_a_start_shares_its_outcome(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_build_judges_the_audience_with_the_persons_role_and_scope(monkeypatch, tmp_path):
-    """A manifest's ``audience`` gates the Direct engine as it gates the
-    CLI engines: a viewer's user-scope session never starts an
-    editor-audience MCP, an editor's does, an agent-scope session is the
-    agent acting as itself, and a build that names no person filters
-    nothing (the builder's own rule, ``mcp_registry.audience_refusal``)."""
-    from core.credentials import credential_files as cf, mcp_broker
-    from tests.mcp.test_mcp_broker_activation import _FakeManifest, _stub_assembly
-
-    plain, gated = _FakeManifest("notes"), _FakeManifest("hosts")
-    gated.audience = "editor"
-    _stub_assembly(monkeypatch, [plain, gated], env_by_mcp={}, tmp_path=tmp_path)
-    monkeypatch.setattr(cf, "token_file_env", lambda agent, **kw: {})
-    monkeypatch.setattr(mcp_broker, "provision", lambda sid, bundles: None)
-
-    class _FakeConn:
-        def __init__(self, name, config, **kw):
-            self.name = name
-            self.config = config
-            self.tools = []
-            self.dead = False
-
-        async def start(self):
-            pass
-
-    monkeypatch.setattr(mcpmod, "MCPServerConnection", _FakeConn)
-
-    async def servers_for(role: str, scope: str, sid: str) -> set[str]:
-        mgr = mcpmod.AgentMCPManager("ag", session_id=sid, user_role=role, scope=scope)
-        await mgr._start_impl()
-        return set(mgr.servers)
-
-    assert await servers_for("viewer", "user", "s-viewer") == {"notes"}
-    assert await servers_for("contributor", "user", "s-contrib") == {"notes"}
-    assert await servers_for("editor", "user", "s-editor") == {"notes", "hosts"}
-    assert await servers_for("admin", "user", "s-admin") == {"notes", "hosts"}
-    assert await servers_for("viewer", "agent", "s-shared") == {"notes", "hosts"}
-    assert await servers_for("", "user", "s-nobody") == {"notes", "hosts"}
-
-
-@pytest.mark.asyncio
 async def test_a_server_that_never_answers_initialize_is_left_out(monkeypatch):
     """An HTTP MCP whose handshake never returns (an address that does not
     resolve) does not hold the session start: the bound fires, the
@@ -480,7 +325,7 @@ async def test_a_server_that_never_answers_initialize_is_left_out(monkeypatch):
             await asyncio.Event().wait()
 
     session_cm = _RecordingCM(_SilentSession())
-    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None: streams_cm)
+    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None, **_factory: streams_cm)
     monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: session_cm)
     monkeypatch.setattr(mcpmod, "MCP_START_TIMEOUT_S", 0.1)
 
@@ -505,7 +350,7 @@ async def test_a_transport_stuck_in_its_own_task_group_is_left_out(monkeypatch):
     import anyio
 
     @contextlib.asynccontextmanager
-    async def _stuck(url, headers=None):
+    async def _stuck(url, headers=None, **_factory):
         async with anyio.create_task_group() as tg:
             async def _never(*, task_status=anyio.TASK_STATUS_IGNORED):
                 await anyio.sleep_forever()
@@ -521,3 +366,176 @@ async def test_a_transport_stuck_in_its_own_task_group_is_left_out(monkeypatch):
     await asyncio.wait_for(conn.start(), timeout=5)
     assert conn.tools == [] and conn.session is None
     await asyncio.wait_for(conn.close(), timeout=5)
+
+
+# -- a stdio server on a compute machine --------------------------------------
+
+
+class _Builder:
+    """What the connection reads of a sandbox builder."""
+
+    cfg = type("_Cfg", (), {"username": "alice", "role": "editor"})()
+
+    def get_env_overrides(self):
+        return {"HOME": "/home/agent", "PATH": "/sandbox/bin"}
+
+    def describe(self):
+        return type("_Desc", (), {"to_dict": lambda _self: {"agent": "pa"}})()
+
+
+def _relayed_conn(monkeypatch, *, builder=None, machine="compute-1", main_loop="set"):
+    """A stdio connection with the relay replaced by a recording context."""
+    from core.remote import tool_relay
+    streams_cm = _RecordingCM((object(), object()))
+    session_cm = _RecordingCM(_FakeSession())
+    calls: list[dict] = []
+
+    def _relay(machine_id, session_id, server, **kw):
+        calls.append({"machine_id": machine_id, "session_id": session_id, "server": server, **kw})
+        return streams_cm
+
+    monkeypatch.setattr(tool_relay, "relay_client", _relay)
+    monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: session_cm)
+    conn = mcpmod.MCPServerConnection(
+        "memory-mcp", {"type": "stdio", "command": "/venv/bin/python", "args": ["server.py"],
+                       "env": {"FROM_MANIFEST": "yes"}},
+        session_id="s-relay", agent_name="pa",
+        sandbox_builder=_Builder() if builder is None else builder,
+        machine_id=machine, main_loop=asyncio.get_running_loop() if main_loop == "set" else main_loop,
+    )
+    return conn, calls, streams_cm, session_cm
+
+
+@pytest.mark.asyncio
+async def test_a_relayed_server_goes_through_the_relay_with_this_sessions_env(monkeypatch):
+    """The environment is the local spawn's, sandbox overrides included;
+    the description, not a wrapped command, travels."""
+    monkeypatch.setattr("core.sandbox.env_builder.build_session_env",
+                        lambda *_a, **_k: {"OTO_SESSION_ID": "s-relay", "PROXY_URL": "http://127.0.0.1:8400"})
+    conn, calls, streams_cm, session_cm = _relayed_conn(monkeypatch)
+    await conn.start()
+    [call] = calls
+    assert (call["machine_id"], call["session_id"], call["server"]) == ("compute-1", "s-relay", "memory-mcp")
+    assert call["argv"] == ["/venv/bin/python", "server.py"]
+    assert call["description"] == {"agent": "pa"}
+    env = call["env"]
+    assert env["OTO_SESSION_ID"] == "s-relay" and env["FROM_MANIFEST"] == "yes"
+    assert env["HOME"] == "/home/agent" and env["PATH"] == "/sandbox/bin"   # the sandbox's own
+    await conn.close()
+    # One owner task, as for every other connection.
+    assert streams_cm.exit_task is streams_cm.enter_task
+    assert session_cm.exit_task is session_cm.enter_task
+
+
+@pytest.mark.asyncio
+async def test_a_server_with_no_sandbox_never_starts_on_a_machine(monkeypatch):
+    monkeypatch.setattr("core.sandbox.env_builder.build_session_env", lambda *_a, **_k: {})
+    conn, calls, _s, _c = _relayed_conn(monkeypatch)
+    conn.sandbox_builder = None
+    await conn.start()      # logged and left out, as any failed start
+    assert calls == [] and conn.tools == [] and conn.session is None
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_a_stdio_server_with_no_machine_is_refused_and_starts_nothing(monkeypatch):
+    """The platform starts no tool itself: with no compute machine the
+    server is left out, and its call answers the compute sentence."""
+    from core import placement
+    from core.remote import tool_relay
+
+    def _no_relay(*_a, **_k):
+        raise AssertionError("a server with no machine never reaches the relay")
+
+    def _no_process(*_a, **_k):
+        raise AssertionError("the platform starts no tool")
+
+    monkeypatch.setattr(tool_relay, "relay_client", _no_relay)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _no_process)
+    monkeypatch.setattr("anyio.open_process", _no_process)
+    monkeypatch.setattr("core.sandbox.env_builder.build_session_env", lambda *_a, **_k: {"X": "1"})
+    monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: _RecordingCM(_FakeSession()))
+    conn = mcpmod.MCPServerConnection("local-mcp", {"type": "stdio", "command": "/bin/true"}, session_id="s-local")
+    await conn.start()      # logged and left out, as any failed start
+    assert conn.session is None and conn.tools == []
+    assert conn.refused == placement.NO_COMPUTE_SENTENCE
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_the_relays_end_marks_the_server_dead(monkeypatch):
+    monkeypatch.setattr("core.sandbox.env_builder.build_session_env", lambda *_a, **_k: {})
+    conn, calls, _s, _c = _relayed_conn(monkeypatch)
+    await conn.start()
+    assert conn.dead is False
+    calls[0]["on_end"](True)
+    assert conn.dead is True
+    await conn.close()
+
+
+class _RefusedOpen:
+    def __init__(self, error):
+        self.error = error
+
+    async def __aenter__(self):
+        raise self.error
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_an_open_that_lost_its_link_reads_lost_and_a_refused_one_does_not(monkeypatch):
+    """A failed open drops its child, so the relay no longer knows it: the
+    connection remembers a lost link. A tool that could not start on a
+    machine that answered is left out, and must not rebuild the session at
+    every message."""
+    from core.remote import tool_relay
+    monkeypatch.setattr("core.sandbox.env_builder.build_session_env", lambda *_a, **_k: {})
+    monkeypatch.setattr(tool_relay, "session_lost", lambda _m, _s: False)
+    for error, lost in ((tool_relay.LinkLost("gone"), True), (RuntimeError("the render refused it"), False)):
+        conn, _calls, _s, _c = _relayed_conn(monkeypatch)
+        monkeypatch.setattr(tool_relay, "relay_client", lambda *_a, _error=error, **_k: _RefusedOpen(_error))
+        await conn.start()
+        mgr = mcpmod.AgentMCPManager("ag", session_id="s-relay", machine_id="compute-1")
+        mgr.servers["memory-mcp"] = conn
+        assert conn.link_lost is lost and mgr.tools_lost() is lost
+        await conn.close()
+
+
+def test_a_manager_on_this_host_is_never_lost():
+    assert mcpmod.AgentMCPManager("ag", session_id="s").tools_lost() is False
+
+
+def test_a_managers_lost_tools_are_the_relays_answer(monkeypatch):
+    from core.remote import tool_relay
+    asked: list = []
+    monkeypatch.setattr(tool_relay, "session_lost", lambda m, s: asked.append((m, s)) or True)
+    assert mcpmod.AgentMCPManager("ag", session_id="s-1", machine_id="compute-1").tools_lost() is True
+    assert asked == [("compute-1", "s-1")]
+
+
+@pytest.mark.asyncio
+async def test_a_lost_manager_is_closed_and_a_new_one_started_under_its_id(monkeypatch):
+    pool = mcpmod.MCPPool()
+    closed: list = []
+
+    class _Mgr(mcpmod.AgentMCPManager):
+        lost = False
+
+        def tools_lost(self):
+            return self.lost
+
+        async def start(self):
+            pass
+
+        async def close(self):
+            closed.append(self)
+
+    monkeypatch.setattr(mcpmod, "AgentMCPManager", _Mgr)
+    first = await pool.get_or_create("s-1", "ag", machine_id="compute-1")
+    assert await pool.get_or_create("s-1", "ag", machine_id="compute-1") is first and closed == []
+    first.lost = True
+    second = await pool.get_or_create("s-1", "ag", machine_id="compute-1")
+    assert second is not first and closed == [first]
+    assert second.machine_id == "compute-1"

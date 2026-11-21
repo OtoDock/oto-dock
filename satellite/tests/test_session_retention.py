@@ -153,3 +153,29 @@ def test_an_empty_or_missing_agents_folder_is_nothing(tmp_path):
         "files": 0, "bytes": 0, "deleted": 0, "deleted_bytes": 0, "candidates": []}
     (tmp_path / "agents" / "a1").mkdir(parents=True)
     assert sr.apply(tmp_path / "agents", set(), set(), 3600, False)["files"] == 0
+
+
+def test_a_sibling_folder_goes_beneath_the_agents_folder_only(tmp_path, monkeypatch):
+    """A project folder that becomes a link once the walk has passed: the
+    sibling folder's removal is refused on the way and the stand-in folder
+    it would reach keeps its files."""
+    import shutil
+    agents = tmp_path / "agents"
+    sid = _uuid()
+    f = _claude(agents / "a1" / "users" / "alice", sid, sibling=True, project="-p")
+    _age(f, 10 * 86400)
+    project = f.parent
+    stand_in = tmp_path / "outside" / "-p"
+    (stand_in / sid / "tool-results").mkdir(parents=True)
+    (stand_in / sid / "tool-results" / "r.txt").write_bytes(b"keep")
+    real = sr.safe_fs.unlink_beneath
+
+    def _then_swap(root, rel, **kw):
+        real(root, rel, **kw)
+        shutil.rmtree(project)
+        project.symlink_to(stand_in, target_is_directory=True)
+
+    monkeypatch.setattr(sr.safe_fs, "unlink_beneath", _then_swap)
+    stats = sr.apply(agents, set(), set(), 7 * 86400, False)
+    assert stats["deleted"] == 1
+    assert (stand_in / sid / "tool-results" / "r.txt").read_bytes() == b"keep"

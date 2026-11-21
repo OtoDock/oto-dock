@@ -328,7 +328,7 @@ if __name__ == "__main__":
 def test_interrupt_diagnostic_text_is_dropped():
     # CLI-synthesized "[ede_diagnostic] …" assistant text (emitted on a
     # graceful interrupt) must never surface as chat content.
-    from core.layers.cli.session import ClaudeStreamChunk
+    from core.layers.cli.helpers import ClaudeStreamChunk
     noise = ClaudeStreamChunk(
         event_type="text",
         text="[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
@@ -345,7 +345,7 @@ def test_interrupt_diagnostic_error_is_dropped():
     # barge-in during a web search rendered "Error: [ede_diagnostic] …"
     # in the chat (live-hit 2026-08-11). Drop it on the error path too;
     # real errors still surface.
-    from core.layers.cli.session import ClaudeStreamChunk
+    from core.layers.cli.helpers import ClaudeStreamChunk
     noise = ClaudeStreamChunk(
         text="[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
         is_error=True,
@@ -475,13 +475,13 @@ def test_label_helpers():
 
 # ---------------------------------------------------------------------------
 # A completion read mid-turn reaches the chat: the pump binds the chat at the
-# turn start, then the CLI session's send resets the registries for the turn.
+# turn start, then the session's send resets the registries for the turn.
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def bound_turn(monkeypatch):
     """A session whose pump bound ``chat-bound``, then whose turn started
-    (both registries reset, as ``PersistentSession.send_message`` does);
+    (both registries reset, as ``ClaudeRemoteAdapter.begin_turn`` does);
     the pump's pushes are captured."""
     from core.events import bg_command_state
     from core.session import session_state

@@ -11,9 +11,14 @@
     "delegation_targets": [
      "char-shared"
     ],
+    "limits": null,
     "mcp_config_format": "json",
     "only_mcps": null,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "session_id": "s-task",
     "shared_chat": false,
     "target_browser": {},

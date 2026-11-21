@@ -113,7 +113,9 @@ def test_long_form_bind_mount_converted():
 def test_environment_and_healthcheck_preserved():
     svc = _transform(CAMOUFOX_COMPOSE)["services"]["camoufox"]
     assert svc["environment"] == ["OTO_MCP_SUPPRESS_SERVER_REQUESTS=1"]
-    assert svc["restart"] == "always"
+    # The tool's own service: a sleeping container stays stopped across a
+    # restart of Docker (``compose_rewrite.TOOL_RESTART``).
+    assert svc["restart"] == "unless-stopped"
     assert svc["shm_size"] == "2gb"
     assert "healthcheck" in svc
 
@@ -527,7 +529,8 @@ def test_reject_named_volume_declaration_without_external():
 
 
 @pytest.mark.parametrize(
-    "src", ["otodock-pgdata", "OtoDock-PgSock", "otodock-ssh-keys", "otodock-mcps", "otodock-recover-bin"],
+    "src", ["otodock-pgdata", "OtoDock-PgSock", "otodock-ssh-keys", "otodock-mcps", "otodock-recover-bin",
+            "otodock-compute-tools"],
 )
 def test_reject_platform_volume_source_short_form(src):
     data = {"services": {"camoufox": {"build": ".", "volumes": [f"{src}:/mnt"]}}}
@@ -686,6 +689,18 @@ def test_pull_form_gets_the_default_bounds(tmp_path, t2, monkeypatch):
     compose_rewrite.ensure_pull_compose(m)
     svc = yaml.safe_load((tmp_path / "docker-compose.yml").read_text())["services"]["camoufox"]
     assert svc["mem_limit"] == "2g" and svc["logging"]["driver"] == "json-file"
+
+
+def test_pull_form_keeps_a_sleeping_tool_stopped_and_leaves_its_sidecars(tmp_path, t2):
+    compose = {"services": {
+        "camoufox": {"image": "x", "restart": "always"},
+        "helper": {"image": "y", "restart": "always"},
+    }}
+    m = _pull_manifest(tmp_path, compose)
+    compose_rewrite.ensure_pull_compose(m)
+    written = yaml.safe_load((tmp_path / "docker-compose.yml").read_text())["services"]
+    assert written["camoufox"]["restart"] == "unless-stopped"
+    assert written["helper"]["restart"] == "always"
 
 
 # --------------------------------------------------------------------------- #
@@ -981,3 +996,25 @@ def test_extension_anchor_merged_into_a_service_is_resolved_and_dropped(tmp_path
     assert "x-common" not in written
     assert written["services"]["camoufox"]["mem_limit"] == "${OTODOCK_X_MEM_LIMIT:-3g}"
     assert compose_rewrite.ensure_pull_compose(m) is False
+
+
+@pytest.mark.parametrize("declared,expected", [
+    ({}, 500),
+    ({"oom_score_adj": 100}, 500),
+    ({"oom_score_adj": -1000}, 500),
+    ({"oom_score_adj": 500}, 500),
+    ({"oom_score_adj": 800}, 800),
+])
+def test_a_docker_tool_gets_its_oom_score_and_can_only_raise_it(declared, expected):
+    """The kernel takes a tool before the control plane: a compose may ask
+    for a higher score, never a lower or negative one."""
+    data = {"services": {"m": {"build": ".", **declared}}}
+    out = _transform(data, service_name="m", mcp_name="m")
+    assert out["services"]["m"]["oom_score_adj"] == expected
+    # The fixed point: hardening its own output changes nothing.
+    assert _transform(out, service_name="m", mcp_name="m")["services"]["m"]["oom_score_adj"] == expected
+
+
+def test_a_non_numeric_oom_score_is_replaced():
+    data = {"services": {"m": {"build": ".", "oom_score_adj": "low"}}}
+    assert _transform(data, service_name="m", mcp_name="m")["services"]["m"]["oom_score_adj"] == 500

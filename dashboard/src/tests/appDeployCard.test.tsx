@@ -195,6 +195,91 @@ describe('AppDeployCard', () => {
     expect(screen.getByTestId('app-card-body').contains(screen.getByTestId('manifest-blocks'))).toBe(true)
     expect(screen.getByText(/1 changed/).parentElement?.textContent).toContain('app.json')
   })
+
+  // A release that brings a server the live one has not waits for a person
+  // (releases.adds_server), and the card says why and what the app may do.
+  const media = { id: 'm', label: 'Show', type: 'platform' as const, method: 'files.media' }
+  const mediaFiles = { read: ['workspace/media'], write: [] as string[] }
+  const serverStatus = (over: Partial<DeployStatus> = {}): DeployStatus => ({
+    deploy_state: 'pending', release: 1, pending_release: 2, manifest_approved: true,
+    deploy_requires_approval: false, deploying: false, server: 'static', error: '', retry_after: 0,
+    changes: { added: ['server/index.ts'], changed: [], removed: [] }, adds_server: true, ...over,
+  })
+
+  it('says a release that adds a server waits, and keeps the media sentence under Details', async () => {
+    statusStub.current = serverStatus()
+    renderIn(<AppDeployCard app={mkApp({
+      actions_approved: true, actions: [media], files: mediaFiles, has_server: false, pending_has_server: false,
+    })} agent="dev" />)
+    await waitFor(() => expect(screen.getByTestId('deploy-adds-server').textContent)
+      .toBe('Runs its own program on your OtoDock'))
+    expect(screen.getByText('This release runs its own program on your OtoDock, so it needs approval.')).toBeTruthy()
+    // The short list names the reach alone. The row said no server yet: the
+    // Details sentence on the media follows the status's flag.
+    expect(screen.queryByTestId('summary-data')).toBeNull()
+    expect(screen.getByTestId('manifest-summary').textContent).not.toContain('pictures')
+    fireEvent.click(screen.getByTestId('details-toggle'))
+    expect(screen.getByTestId('media-server-line').textContent)
+      .toBe('While the app is open, its program can get the videos, audio and pictures it shows you.')
+    expect(screen.getByTestId('exact-manifest-toggle')).toBeTruthy()
+  })
+
+  it('names no server for a release that brings none, as before', async () => {
+    statusStub.current = serverStatus({ adds_server: false, changes: { added: [], changed: ['client/index.html'], removed: [] } })
+    const { container } = renderIn(<AppDeployCard app={mkApp({
+      actions_approved: true, actions: [media], files: mediaFiles, has_server: false, pending_has_server: false,
+    })} agent="dev" />)
+    await waitFor(() => expect(container.textContent).toContain('This release waits for a person before it goes live.'))
+    expect(container.querySelector('[data-testid="deploy-adds-server"]')).toBeNull()
+    expect(container.textContent).not.toContain('pictures')
+    expect(container.querySelector('[data-testid="summary-data"]')).toBeNull()
+  })
+
+  it('keeps the reason a changed manifest or a source gives, and adds the server line beside it', async () => {
+    statusStub.current = serverStatus({ manifest_approved: false })
+    const changed = renderIn(<AppDeployCard app={mkApp({ actions: [media], files: mediaFiles })} agent="dev" />)
+    await waitFor(() => expect(changed.container.querySelector('[data-testid="deploy-adds-server"]')).not.toBeNull())
+    expect(changed.container.textContent).toContain('What the app may do changed with this release')
+    expect(changed.container.textContent).not.toContain('This release runs its own program on your OtoDock')
+    statusStub.current = serverStatus()
+    const follows = {
+      agent: 'head', agent_name: 'Head Office', slug: 'board', release: 1, exists: true,
+      held_release: 2, can_take: true, update: null,
+    }
+    const held = renderIn(<AppDeployCard app={mkApp({ actions_approved: true, follows })} agent="dev" />)
+    await waitFor(() => expect(held.container.querySelector('[data-testid="deploy-adds-server"]')).not.toBeNull())
+    expect(held.container.textContent).toContain('This release came from Head Office’s app, so it waits for a person here.')
+  })
+
+  it('says the approval setting before the server, and keeps the server line', async () => {
+    statusStub.current = serverStatus({ deploy_requires_approval: true })
+    renderIn(<AppDeployCard app={mkApp({ actions_approved: true, actions: [media], files: mediaFiles })} agent="dev" />)
+    // The status first: before it loads the card assumes the setting is on.
+    await waitFor(() => expect(screen.getByTestId('deploy-adds-server').textContent)
+      .toBe('Runs its own program on your OtoDock'))
+    expect(screen.getByText('Deploys of this app always wait for a person.')).toBeTruthy()
+    expect(screen.queryByText('This release runs its own program on your OtoDock, so it needs approval.')).toBeNull()
+  })
+
+  it('names the waiting copy by its tree when it approves', async () => {
+    calls.length = 0
+    statusStub.current = serverStatus({ pending_sha: 'tree-2' })
+    renderIn(<AppDeployCard app={mkApp({ actions_approved: true })} agent="dev" />)
+    await waitFor(() => expect(screen.getByTestId('deploy-adds-server')).toBeTruthy())
+    fireEvent.click(screen.getByText('Approve and go live'))
+    await waitFor(() => expect(calls.some((c) => c.path === '/v1/apps/app-1/deploy/approve')).toBe(true))
+    const sent = calls.find((c) => c.path === '/v1/apps/app-1/deploy/approve')
+    expect(JSON.parse(sent?.body || '{}')).toEqual({ release: 2, sig: 'sig', sha: 'tree-2' })
+  })
+
+  it('says only the server for an app with nothing to approve', async () => {
+    statusStub.current = serverStatus()
+    renderIn(<AppDeployCard app={mkApp({ actions_approved: true, actions: [], manifest_empty: true })} agent="dev" />)
+    await waitFor(() => expect(screen.getByTestId('deploy-adds-server')).toBeTruthy())
+    const items = Array.from(screen.getByTestId('manifest-summary').querySelectorAll('li')).map((n) => n.textContent)
+    expect(items).toEqual(['Adds 1 file', 'Runs its own program on your OtoDock'])
+    expect(screen.queryByTestId('exact-manifest-toggle')).toBeNull()
+  })
 })
 
 describe('AppMenu — folder entries', () => {

@@ -1,0 +1,352 @@
+{
+ "a machine target runs no budget": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": "",
+  "configs": 1,
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ],
+   [
+    "send_message",
+    "<sid>",
+    "WAKE"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "and no slot of its own to give back": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": null,
+  "configs": 0,
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "given way to a person": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": null,
+  "configs": 0,
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "no conversation, not this chat's session": {
+  "admission": [],
+  "answer": null,
+  "configs": 0,
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "s-other",
+    "char-agent",
+    "vic"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "no credentials at all": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": null,
+  "configs": 0,
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [
+   "<sid>"
+  ],
+  "seats": []
+ },
+ "no subscription for the person": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": null,
+  "configs": 0,
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [
+   "<sid>"
+  ],
+  "seats": []
+ },
+ "the machine did not answer the probe": {
+  "admission": [],
+  "answer": null,
+  "configs": 0,
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "the machine it is pinned to is away": {
+  "admission": [],
+  "answer": null,
+  "configs": 0,
+  "frames": [],
+  "layer": [],
+  "layers_asked": [],
+  "released": [],
+  "seats": []
+ },
+ "the person left while it waited": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": null,
+  "configs": 0,
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    ""
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer2"
+   }
+  ],
+  "released": [
+   "<sid>"
+  ],
+  "seats": []
+ },
+ "waited out its turn": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": null,
+  "configs": 0,
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ }
+}

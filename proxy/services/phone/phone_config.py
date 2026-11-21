@@ -449,7 +449,8 @@ def assemble_phone_config(*, classifier: bool = True) -> dict:
         # Route identity / role / remember-callers are proxy-side session
         # policy (the warmup resolves them from the route id); the daemon has
         # no use for them and the tied user's sub must not travel.
-        for proxy_only in ("identity_mode", "identity_user_sub", "role", "remember_callers"):
+        for proxy_only in ("identity_mode", "identity_user_sub", "role", "remember_callers",
+                           "line_tools"):
             r.pop(proxy_only, None)
 
     # Default-for-calls providers set the per-call default STT/TTS ids (below) +

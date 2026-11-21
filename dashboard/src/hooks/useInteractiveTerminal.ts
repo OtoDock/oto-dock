@@ -12,6 +12,7 @@ import { attachImeEditRewriter } from '../lib/terminalImeInput'
 import { noteFold } from '../lib/nativeBridge'
 import { debugLog } from '../lib/debug/log'
 import { WIRE, type WireType, type WireFrame } from '../api/wireEvents'
+import { copyOrSay, terminalClipboard } from '../lib/copyText'
 
 /**
  * Drives the dashboard side of an interactive CLI (PTY) session:
@@ -229,8 +230,9 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     // selection by emitting OSC 52, which xterm ignores without this addon — so
     // Ctrl-C "selected N via osc 52" silently failed unless you held Shift (which
     // forces xterm's native selection). The addon writes OSC 52 payloads to the
-    // system clipboard (navigator.clipboard), so Ctrl-C copies without Shift.
-    try { term.loadAddon(new ClipboardAddon()) } catch { /* optional */ }
+    // system clipboard, so Ctrl-C copies without Shift. Through the one door
+    // (lib/copyText): the addon's own provider copies nothing on plain HTTP.
+    try { term.loadAddon(new ClipboardAddon(terminalClipboard)) } catch { /* optional */ }
 
     term.open(el)
     // One line per terminal event for the Android app's fold log (and the
@@ -375,7 +377,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       if (k === 'c') {
         const sel = term.getSelection()
         if (sel) {
-          navigator.clipboard?.writeText(sel).catch(() => { /* insecure ctx / denied */ })
+          void copyOrSay(sel)
           term.clearSelection()
           return false // copied — suppress SIGINT
         }

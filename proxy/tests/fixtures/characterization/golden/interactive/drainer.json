@@ -1,0 +1,243 @@
+[
+ {
+  "rows": [],
+  "slot_acquired": [
+   [
+    "sid-drain",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-drain": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [
+     "_mark_ready"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "no viewer yet: the item is dropped",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-drain",
+    {
+     "agent": "term-drain"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-drain",
+    {
+     "agent": "term-drain"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-drain",
+    {
+     "agent": "term-drain"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-drain",
+    {
+     "agent": "term-drain"
+    }
+   ]
+  ],
+  "rows": [
+   [
+    "event",
+    "settings_card",
+    "{\"type\": \"settings_card\", \"setting\": \"s.key\", \"label\": \"A setting\", \"catalog_version\": 3}"
+   ],
+   [
+    "event",
+    "action_card",
+    "{\"type\": \"action_card\", \"card_id\": \"c-1\", \"title\": \"T\", \"text\": \"body\", \"note\": \"n\", \"buttons\": [{\"label\": \"OK\"}], \"options\": []}"
+   ],
+   [
+    "event",
+    "list_card",
+    "{\"type\": \"list_card\", \"kind\": \"tasks\", \"filters\": {\"a\": 1}, \"title\": \"L\", \"person\": \"user-admin\"}"
+   ],
+   [
+    "event",
+    "url",
+    "{\"type\": \"url\", \"url\": \"https://example.invalid/report\", \"title\": \"Report\", \"description\": \"\"}"
+   ]
+  ],
+  "state": {
+   "sid-drain": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [
+     "_mark_ready"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the viewer gets them, the cards persisted first",
+  "viewer_perm": [
+   {
+    "event_type": "permission_prompt",
+    "request_id": "r-1",
+    "tool_name": "Bash"
+   },
+   {
+    "catalog_version": 3,
+    "db_message_id": "<row>",
+    "event_type": "settings_card",
+    "label": "A setting",
+    "setting": "s.key"
+   },
+   {
+    "buttons": [
+     {
+      "label": "OK"
+     }
+    ],
+    "card_id": "c-1",
+    "db_message_id": "<row>",
+    "event_type": "action_card",
+    "note": "n",
+    "options": [],
+    "text": "body",
+    "title": "T"
+   },
+   {
+    "db_message_id": "<row>",
+    "event_type": "list_card",
+    "filters": {
+     "a": 1
+    },
+    "kind": "tasks",
+    "person": "user-admin",
+    "title": "L"
+   },
+   {
+    "db_message_id": "<row>",
+    "event_type": "url",
+    "title": "Report",
+    "url": "https://example.invalid/report"
+   },
+   {
+    "event_type": "image_generating",
+    "model": "m",
+    "prompt_preview": "a cat"
+   }
+  ]
+ },
+ {
+  "action": {
+   "buttons": [],
+   "card_id": "c",
+   "note": "",
+   "options": [],
+   "text": "",
+   "title": "t",
+   "type": "action_card"
+  },
+  "card_items": [
+   "action_card",
+   "list_card",
+   "settings_card"
+  ],
+  "list": {
+   "filters": {},
+   "kind": "k",
+   "person": "",
+   "title": "",
+   "type": "list_card"
+  },
+  "no_chat": null,
+  "not_replayable": null,
+  "settings": {
+   "catalog_version": 0,
+   "label": "l",
+   "setting": "k",
+   "type": "settings_card"
+  },
+  "state": {
+   "sid-drain": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [
+     "_mark_ready"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the card helpers"
+ }
+]

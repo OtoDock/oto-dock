@@ -7,6 +7,10 @@ source install's venv).
     admin_cli.py support-info
     admin_cli.py jobs list
     admin_cli.py jobs run <job>
+    admin_cli.py drain [--bound SECONDS] [--away SECONDS] [--quiet] [--probe]
+    admin_cli.py resume
+    admin_cli.py status
+    admin_cli.py compute [--wait SECONDS]
 
 It reads the configuration and the database the server reads, through the
 same store functions the dashboard's routes call; it never migrates the
@@ -14,18 +18,26 @@ database. A command that changes something first names the config file
 and the database it is about to change, and writes a log line to stderr
 and the platform's log file: the dashboard's line for a password reset,
 the same words with the command line as the actor for 2FA and passkeys.
-Exit status: 0 done, 1 refused, 2 usage.
+``drain``, ``resume`` and ``status`` ask the running server instead, on
+its own address with the master key, and open no database.
+Exit status: 0 done, 1 refused, 2 usage; for the server's commands also 3 when
+no server runs and 4 when it is older than 2.0.
 """
 
 from __future__ import annotations
 
 import argparse
 import getpass
+import http.client
+import json
 import logging
 import os
 import re
 import socket
 import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -36,6 +48,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger("otodock")
 
 DONE, REFUSED, USAGE = 0, 1, 2
+# The server's commands only (``drain``, ``resume``, ``status``): nothing
+# answers on its address, and a server older than 2.0 (the route is unknown).
+NOT_RUNNING, OLDER = 3, 4
 
 # A config value is printed only when its key names none of these.
 _SECRET_WORDS = ("SECRET", "KEY", "TOKEN", "PASSWORD", "PASS", "PIN", "CREDENTIAL",
@@ -51,6 +66,15 @@ _SHORT_NUMBER = re.compile(r"^-?\d{1,8}(\.\d+)?$")
 
 class Refused(Exception):
     """A command that cannot do what was asked: the message says why."""
+
+
+class Unanswered(Refused):
+    """The running server could not be asked: ``code`` is the exit status
+    that says why (``REFUSED``, ``NOT_RUNNING``, ``OLDER``)."""
+
+    def __init__(self, message: str, code: int = REFUSED):
+        super().__init__(message)
+        self.code = code
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +326,10 @@ def support_info(out=sys.stdout) -> int:
 def _media_cache() -> int:
     from services.media import media_pipeline
     from storage import database as task_store
-    return media_pipeline.sweep_host_media_cache() + task_store.sweep_expired_media_tokens()
+    removed = media_pipeline.sweep_host_media_cache()
+    expired = task_store.sweep_expired_media_tokens()
+    media_pipeline.remove_cache_copies(expired)
+    return removed + len(expired)
 
 
 def _recover_bin_reap() -> int:
@@ -322,7 +349,7 @@ def _tombstone_reap() -> int:
     return file_tombstones_store.delete_expired()
 
 
-# The platform's minute sweep (startup.py ``sweep_items``), item by item:
+# The platform's minute sweep (startup_sweeps.py ``sweep_items``), item by item:
 # (slug, the sweep's name, what it does, how to run it from here or None
 # when it reads the running server's own state).
 JOBS: list[tuple[str, str, str, Callable[[], int] | None]] = [
@@ -349,6 +376,7 @@ JOBS: list[tuple[str, str, str, Callable[[], int] | None]] = [
     ("mcp-auto-update", "mcp auto-update sweep", "applies MCP updates once a week", None),
     ("agent-template-updates", "agent template update sweep",
      "tells managers a newer agent template exists", None),
+    ("tools-idle", "docker tools idle sweep", "stops Docker tools nobody used for their quiet spell", None),
 ]
 
 
@@ -374,8 +402,314 @@ def jobs_run(slug: str, out=sys.stdout) -> int:
 
 
 # ---------------------------------------------------------------------------
+# drain, resume, status: the running server's open work
+# ---------------------------------------------------------------------------
+
+WORK_PATH = "/v1/internal/work"
+DRAIN_PATH = "/v1/internal/drain"
+# Seconds: how long one request waits for the server's answer, the pause
+# between two reads of the work, how long past its bound a drain that never
+# reaches "held" is still read, and how long a silent server is asked again
+# (a server held by a busy disk right after an image build answers late).
+ANSWER_S = 10.0
+POLL_S = 2.0
+PAST_BOUND_S = 60.0
+ASK_FOR_S = 60.0
+# How long the paired machines are told the platform may be away.
+AWAY_S = 900
+# The kinds of open work the server counts, in the order a line names them:
+# (the key in the answer's "open" block, one of it, several).
+WORK_KINDS = (
+    ("turns", "turn", "turns"),
+    ("runs", "task run", "task runs"),
+    ("calls", "call", "calls"),
+    ("duplex", "voice conversation", "voice conversations"),
+    ("meetings", "meeting", "meetings"),
+    ("terminals", "terminal", "terminals"),
+    ("moves", "chat move", "chat moves"),
+    ("background", "background job", "background jobs"),
+)
+NO_ANSWER = "The server did not answer{}. It is not running, or it is older than 2.0."
+NOT_RUNNING_LINE = "Nothing answers on the server's address: it is not running."
+OLDER_LINE = "The server has no such route: it is older than 2.0."
+FORBIDDEN_LINE = ("The server refused the request: this is not its master key, "
+                  "or the command does not run on the server's own machine.")
+UNREADABLE_LINE = "The server answered something this command cannot read."
+# Why one request got no report (``_ask_once``).
+_SILENT, _NOBODY, _NO_ROUTE, _FORBIDDEN, _UNREADABLE = "silent", "nobody", "no_route", "forbidden", "unreadable"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The master key goes to the server's own address and nowhere a
+    redirect points."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def server_url() -> str:
+    """Where the running server listens for this machine: loopback and its
+    port, or the one address ``PROXY_HOST`` binds it to."""
+    import config
+    host = (config.HOST or "").strip()
+    if host in ("", "0.0.0.0", "::"):
+        host = "127.0.0.1"
+    return f"http://{f'[{host}]' if ':' in host else host}:{config.PORT}"
+
+
+def _ask_once(method: str, path: str, body: dict | None = None) -> tuple[dict | None, str]:
+    """One request to the running server with the master key: its report of
+    the open work, or None and why (silent: no answer in time, a reset or a
+    5xx; nobody listens; no such route, a release older than 2.0; the key or
+    the address refused; an answer that is no report)."""
+    import config
+    request = urllib.request.Request(
+        server_url() + path, method=method,
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {config.API_KEY}", "Content-Type": "application/json"})
+    # No proxy of the environment: the call never leaves this machine.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    try:
+        with opener.open(request, timeout=ANSWER_S) as resp:
+            answer = json.load(resp)
+    except urllib.error.HTTPError as e:
+        # A 401: the key is not the server's (a shell's own PROXY_API_KEY
+        # wins over the config file), said as the refused key it is.
+        why = {404: _NO_ROUTE, 403: _FORBIDDEN, 401: _FORBIDDEN}.get(
+            e.code, _SILENT if e.code >= 500 else _UNREADABLE)
+        return None, why
+    except urllib.error.URLError as e:
+        return None, _NOBODY if isinstance(e.reason, ConnectionRefusedError) else _SILENT
+    except ConnectionRefusedError:
+        return None, _NOBODY
+    except ValueError:
+        return None, _UNREADABLE
+    except (OSError, http.client.HTTPException):
+        return None, _SILENT
+    if isinstance(answer, dict) and isinstance(answer.get("state"), str):
+        return answer, ""
+    return None, _UNREADABLE
+
+
+def ask_server(method: str, path: str, body: dict | None = None) -> dict | None:
+    """One request to the running server: its report, or None (``_ask_once``)."""
+    return _ask_once(method, path, body)[0]
+
+
+def ask_until_answered(method: str, path: str, body: dict | None = None, *, what: str = "") -> dict:
+    """The server's report for ``drain``, ``resume`` and ``status``: a silent
+    server is asked again for ``ASK_FOR_S``; a server that is not running,
+    is older than 2.0 or refuses the key is said at once, each with its own
+    exit status (``Unanswered``)."""
+    start = time.monotonic()
+    while True:
+        answer, why = _ask_once(method, path, body)
+        if answer is not None:
+            return answer
+        if why == _NOBODY:
+            raise Unanswered(NOT_RUNNING_LINE, NOT_RUNNING)
+        if why == _NO_ROUTE:
+            raise Unanswered(OLDER_LINE, OLDER)
+        if why == _FORBIDDEN:
+            raise Unanswered(FORBIDDEN_LINE)
+        if why == _UNREADABLE:
+            raise Unanswered(UNREADABLE_LINE)
+        waited = time.monotonic() - start
+        if waited >= ASK_FOR_S:
+            raise Unanswered(f"The server did not answer{what} in {max(1, round(waited))} seconds.")
+        time.sleep(POLL_S)
+
+
+def _count(value: object) -> int:
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _counted(n: int, one: str, several: str) -> str:
+    return f"{n} {one if n == 1 else several}"
+
+
+def _span(seconds: int) -> str:
+    if seconds >= 60 and seconds % 60 == 0:
+        return _counted(seconds // 60, "minute", "minutes")
+    return _counted(seconds, "second", "seconds")
+
+
+def open_work(work: dict) -> tuple[int, str]:
+    """How many things are working, and their kinds in words ("2 turns, 1
+    task run"), empty when nothing is."""
+    counts = work.get("open")
+    counts = counts if isinstance(counts, dict) else {}
+    named = [(_count(counts.get(key)), one, several) for key, one, several in WORK_KINDS]
+    return (sum(n for n, _, _ in named),
+            ", ".join(_counted(n, one, several) for n, one, several in named if n))
+
+
+def _held_line(work: dict, bound_s: int) -> str:
+    """What a drain says once the server holds new work."""
+    total, kinds = open_work(work)
+    if work.get("drained", not total):
+        said = ["Nothing is working. New work is held until the platform is back."]
+    else:
+        left = f"{kinds} still working" if kinds else "work still open"
+        said = [f"{'The wait ran out' if bound_s else 'New work is held'} with {left}.",
+                "They are cut by the restart and continue after it." if total > 1
+                else "It is cut by the restart and continues after it."]
+    waiting = _count(work.get("waiting_on_people"))
+    if waiting:
+        said += [f"{_counted(waiting, 'turn waits', 'turns wait')} for a person.",
+                 "It is asked again after the restart." if waiting == 1
+                 else "They are asked again after the restart."]
+    return " ".join(said)
+
+
+def drain(*, bound: int | None = None, away: int = AWAY_S, quiet: bool = False,
+          probe: bool = False, out=sys.stdout) -> int:
+    """Ask the server to wait for its open work and hold what is new, and
+    follow it until it holds: a line when the work or the state changes,
+    one line in all with ``quiet``. ``probe`` only asks whether the server
+    knows the route."""
+    import config
+    from core.drain import HELD, RUNNING
+    if probe:
+        return DONE if ask_server("GET", WORK_PATH) is not None else REFUSED
+    bound_s = config.DRAIN_BOUND_S if bound is None else bound
+    work: dict | None = ask_until_answered(
+        "POST", DRAIN_PATH, {"action": "drain", "bound_s": bound_s, "away_s": away}, what=" the drain")
+    give_up = time.monotonic() + bound_s + PAST_BOUND_S
+    seen: tuple | None = None
+    while True:
+        if work is None:
+            # A read the server missed is read again until the drain's own end.
+            if time.monotonic() >= give_up:
+                raise Refused(NO_ANSWER.format(" the drain"))
+            time.sleep(POLL_S)
+            work = ask_server("GET", WORK_PATH)
+            continue
+        state = work["state"]
+        if state == HELD:
+            break
+        # Read back as running: a resume from another shell ended the drain.
+        if state == RUNNING and seen is not None:
+            raise Refused("The drain was called off. The platform takes new work again.")
+        _total, kinds = open_work(work)
+        if (state, kinds) != seen:
+            if not kinds:
+                line = "Nothing is working."
+            elif seen is None and bound_s:
+                line = f"Waiting for open work: {kinds}. Up to {_span(bound_s)}."
+            else:
+                line = f"Still working: {kinds}."
+            if not quiet:
+                print(line, file=out, flush=True)
+            seen = (state, kinds)
+        if time.monotonic() >= give_up:
+            raise Refused("The server did not finish the drain in time. Open work is cut by the "
+                          "restart and continues after it.")
+        time.sleep(POLL_S)
+        work = ask_server("GET", WORK_PATH)
+    print(_held_line(work, bound_s), file=out, flush=True)
+    return DONE
+
+
+def resume(out=sys.stdout) -> int:
+    """Call a drain off: the server takes new work again."""
+    ask_until_answered("POST", DRAIN_PATH, {"action": "resume"}, what=" the resume")
+    print("The platform takes new work again.", file=out)
+    return DONE
+
+
+def status(out=sys.stdout) -> int:
+    """Busy or idle, in one line, with no change of state."""
+    from core.drain import RUNNING
+    work = ask_until_answered("GET", WORK_PATH)
+    total, kinds = open_work(work)
+    busy = work.get("busy")
+    starting = work.get("starting") is True
+    if not (busy if isinstance(busy, bool) else total > 0):
+        # While the tools are prepared a restart starts their build again.
+        said = ["Idle."] if starting else ["Idle. A good moment to update."]
+    else:
+        said = [f"Busy: {kinds}." if kinds else "Busy."]
+    waiting = _count(work.get("waiting_on_people"))
+    if waiting:
+        said.append(f"{_counted(waiting, 'turn waits', 'turns wait')} for a person.")
+    queued = _count(work.get("queued"))
+    if queued:
+        said.append(f"{_counted(queued, 'message waits', 'messages wait')} to be sent.")
+    if starting:
+        said.append("The platform is starting. New work waits until its compute machine has signed in "
+                    "and its tools are ready.")
+    if work["state"] != RUNNING:
+        said.append("The platform is holding new work for an update.")
+    line = compute_line(work)
+    if line:
+        said.append(line)
+    print(" ".join(said), file=out)
+    return DONE
+
+
+def compute_line(work: dict) -> str:
+    """The compute machine in one sentence, "" when the server is older
+    than 2.0 (it names none)."""
+    block = work.get("compute")
+    if not isinstance(block, dict):
+        return ""
+    if signed_in(block):
+        return "The compute machine is signed in."
+    if block.get("own") is False:
+        return ("No compute machine is signed in, and this install runs none of its own. "
+                "Chats, tasks and calls cannot run until one is set up.")
+    return "The compute machine is not signed in. Chats, tasks and calls cannot run until it is."
+
+
+def signed_in(block: dict) -> bool:
+    """Whether the compute machine this install waits for is signed in. An
+    install that runs one of its own waits for that one, the machine that
+    shares the platform's folders, as readiness does: one on another server
+    never stopped for a backup or an update. An install with none of its
+    own, and a server that names no shared machine yet, count any."""
+    if block.get("own") is True:
+        return block.get("shared", block.get("connected")) is True
+    return block.get("connected") is True
+
+
+def compute(*, wait: int = 0, out=sys.stdout) -> int:
+    """Whether the compute machine is signed in, waiting up to ``wait``
+    seconds for it: 0 signed in, 1 not (chats, tasks and calls wait for it). Signed
+    in counts once the start no longer holds new work: the hold ends a few
+    seconds after the sign-in (the machine's sessions adopted), and a chat
+    sent before is refused."""
+    deadline = time.monotonic() + wait
+    while True:
+        work = ask_server("GET", WORK_PATH)
+        block = work.get("compute") if work else None
+        block = block if isinstance(block, dict) else {}
+        taking = signed_in(block) and work is not None and work.get("starting") is not True
+        if work is not None and (taking or not compute_line(work)):
+            print(compute_line(work) or "This server is older than 2.0: it runs no compute machine.", file=out)
+            return DONE
+        if time.monotonic() >= deadline:
+            if work is None:
+                raise Refused(NO_ANSWER.format(""))
+            if signed_in(block):
+                # Signed in, the platform still busy with its start: nothing for the compute service to answer.
+                print("The compute machine is signed in. The platform is still starting.", file=out)
+                return DONE
+            print(compute_line(work), file=out)
+            return REFUSED
+        time.sleep(POLL_S)
+
+
+# ---------------------------------------------------------------------------
 # The command line
 # ---------------------------------------------------------------------------
+
+def _seconds(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("a number of seconds, 0 or more")
+    return value
+
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="otodock-admin", description="OtoDock's admin command line.")
@@ -400,6 +734,24 @@ def _parser() -> argparse.ArgumentParser:
     run = jobs.add_parser("run")
     run.add_argument("job")
     run.set_defaults(run=lambda a: jobs_run(a.job), changes=True)
+    wait = sub.add_parser("drain", help="wait for open work and hold what is new, before a stop")
+    wait.add_argument("--bound", type=_seconds, metavar="SECONDS",
+                      help="how long to wait for open work (OTODOCK_DRAIN_BOUND_S, 600)")
+    wait.add_argument("--away", type=_seconds, default=AWAY_S, metavar="SECONDS",
+                      help="how long the paired machines are told the platform may be away (900)")
+    wait.add_argument("--quiet", action="store_true", help="print the last line only")
+    wait.add_argument("--probe", action="store_true",
+                      help="only ask whether the running server can drain (exit 0 or 1)")
+    wait.set_defaults(run=lambda a: drain(bound=a.bound, away=a.away, quiet=a.quiet,
+                                          probe=a.probe), server=True)
+    sub.add_parser("resume", help="call a drain off: take new work again").set_defaults(
+        run=lambda a: resume(), server=True)
+    sub.add_parser("status", help="busy or idle: whether this is a good moment to update"
+                   ).set_defaults(run=lambda a: status(), server=True)
+    machine = sub.add_parser("compute", help="whether the compute machine is signed in (exit 0 or 1)")
+    machine.add_argument("--wait", type=_seconds, default=0, metavar="SECONDS",
+                         help="how long to wait for it to sign in (0)")
+    machine.set_defaults(run=lambda a: compute(wait=a.wait), server=True)
     return p
 
 
@@ -454,11 +806,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if getattr(args, "changes", False):
             print(target_line(), file=sys.stderr)
-        _warn_on_another_release()
+        # A command that asks the running server opens no database.
+        if not getattr(args, "server", False):
+            _warn_on_another_release()
         return args.run(args)
     except Refused as exc:
         print(f"admin_cli: {exc}", file=sys.stderr)
-        return REFUSED
+        return exc.code if isinstance(exc, Unanswered) else REFUSED
     finally:
         pg.close_pool(timeout=2.0)
         logger.removeHandler(handler)

@@ -7,6 +7,7 @@ delegate_spawn badge fallback row.
 """
 
 import uuid
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -58,6 +59,10 @@ def client(temp_db, monkeypatch):
         return "run-test1234"
 
     monkeypatch.setattr(scheduler, "trigger_task_now", _fake_trigger)
+    # The delegating person can run the lane's engine (``TestWhoPays`` takes
+    # it away): a chat lane spends their own accounts.
+    from services.engines import subscription_pool
+    monkeypatch.setattr(subscription_pool, "user_can_run", lambda layer, sub, **kw: True)
 
     app = FastAPI()
     app.include_router(delegation_api.router)
@@ -386,6 +391,110 @@ class TestChatSurface:
     def test_continue_unknown_chat_404(self, client):
         r = _spawn(client, surface="chat", continue_id=str(uuid.uuid4()))
         assert r.status_code == 404
+
+
+def _no_person_session(sid: str):
+    return UserContext(
+        sub=f"session:{sid}", email="session@internal", name="Session Token", role="member",
+        is_api_key=True, session_id=sid, agent=AGENT, agents=[AGENT],
+    )
+
+
+class TestContinueTakesTheContinueGate:
+    """A follow-up drives the worker's session. A worker a manager started
+    writes the agent's knowledge, so it is a manager's to continue, through
+    this door as through the dashboard's: an editor and a session with no
+    person that lacks the write are refused before anything is written."""
+
+    MANAGER = "sub-max"
+    WORKER_SESSION = "44444444-4444-4444-4444-444444444444"
+
+    def _managers_worker(self, chat_id: str, *, status: str = "completed") -> None:
+        """An agent-scope worker run a manager delegated, with its chat in
+        the agent's pool: a task-surface chat by its ``task-`` id, a
+        chat-surface one by a plain id."""
+        from core.session.visibility import shared_chat_owner
+        task_store.upsert_user(self.MANAGER, "max@test.com", "Max", "member")
+        task_store.add_user_agent(self.MANAGER, AGENT, "manager", "admin")
+        run_id = f"run-{uuid.uuid4().hex[:8]}"
+        task_store.create_run(run_id, "dyn-mgr", AGENT, "manual", None, "write the handbook",
+                              task_type="delegate", scope="agent", created_by=self.MANAGER)
+        task_store.update_run(run_id, status=status, session_id=self.WORKER_SESSION,
+                              chat_id=chat_id)
+        task_store.create_chat(chat_id, shared_chat_owner(AGENT), AGENT, "auto",
+                               origin="delegated", title="handbook")
+        task_store.update_chat(chat_id, session_id=self.WORKER_SESSION)
+
+    def _refused(self, client, chat_id: str) -> None:
+        from core.session.visibility import KNOWLEDGE_RUN_REFUSED
+        before = len(client.fired)
+        r = _spawn(client, scope="agent", continue_id=chat_id)
+        assert r.status_code == 403
+        assert r.json()["detail"] == KNOWLEDGE_RUN_REFUSED
+        assert len(client.fired) == before
+
+    @pytest.mark.parametrize("chat_id", ["task-run-mgr7", "7c9d1f3e-0000-4000-8000-000000000007"])
+    def test_a_session_with_no_person_is_refused_a_managers_worker(self, client, chat_id):
+        self._managers_worker(chat_id)
+        client.app_ref.state.user = _no_person_session(PARENT_SESSION)
+        self._refused(client, chat_id)
+
+    def test_a_running_worker_is_refused_before_the_steer(self, client, monkeypatch):
+        from services.scheduler import lane_steer
+        self._managers_worker("task-run-mgr8", status="running")
+        steers: list[str] = []
+
+        async def _steer(chat, prompt, **_kw):
+            steers.append(prompt)
+            return {"run_id": "run-x", "task_id": "dyn-x", "chat_id": chat["id"]}
+
+        monkeypatch.setattr(lane_steer, "try_steer_continue", _steer)
+        client.app_ref.state.user = _no_person_session(PARENT_SESSION)
+        self._refused(client, "task-run-mgr8")
+        assert steers == []
+
+    def test_a_session_that_holds_the_write_continues_it(self, client):
+        """A manager's own scheduled run holds the write itself, so its
+        follow-up drives nothing it lacks."""
+        from auth.path_policy import SecurityContext
+        from core.session import session_state
+        self._managers_worker("task-run-mgr9")
+        client.app_ref.state.user = _no_person_session(PARENT_SESSION)
+        ctx = SecurityContext(role="manager", username="", agent=AGENT, is_admin_agent=False,
+                              knowledge_rw=True)
+        session_state.set_session_security(PARENT_SESSION, ctx)
+        try:
+            r = _spawn(client, scope="agent", continue_id="task-run-mgr9")
+        finally:
+            session_state.cleanup_session_permission_state(PARENT_SESSION)
+        assert r.status_code == 200
+        assert task_store.get_dynamic_task(r.json()["task_id"])["continue_session"] == \
+            self.WORKER_SESSION
+
+    def test_an_editor_is_refused_and_a_manager_continues(self, client):
+        """A person answers with their role on the worker's agent: the
+        worker sits in a pool both reach on a Shared-only agent."""
+        agent_store.update_agent(AGENT, collaborative=False, default_scope="agent")
+        self._managers_worker("task-run-mgr10")
+        self._refused(client, "task-run-mgr10")           # user-alice is an editor
+        client.app_ref.state.user = UserContext(
+            sub=self.MANAGER, email="max@test.com", name="Max", role="member",
+            is_api_key=True, session_id=PARENT_SESSION, agent=AGENT,
+            agents=[AGENT], agent_roles={AGENT: "manager"},
+        )
+        assert _spawn(client, scope="agent", continue_id="task-run-mgr10").status_code == 200
+
+    def test_a_worker_with_no_such_write_is_any_callers_to_continue(self, client):
+        """The agent's own worker (its creator is the agent, never a
+        person) takes no write, so the gate lets every caller through."""
+        from core.session.visibility import shared_chat_owner
+        task_store.create_run("run-own1", "dyn-own", AGENT, "manual", None, "sum up",
+                              task_type="delegate", scope="agent", created_by=AGENT)
+        task_store.update_run("run-own1", status="completed", chat_id="task-run-own1")
+        task_store.create_chat("task-run-own1", shared_chat_owner(AGENT), AGENT, "auto",
+                               origin="delegated", title="own")
+        client.app_ref.state.user = _no_person_session(PARENT_SESSION)
+        assert _spawn(client, scope="agent", continue_id="task-run-own1").status_code == 200
 
     def test_delegate_spawn_event_row_fallback(self, client):
         # No live pump in tests → the badge lands as a persisted event row
@@ -996,6 +1105,10 @@ class TestSpawnMachine:
             agent_store.create_agent("shared-only", "SO", collaborative=False, default_scope="agent")
         agent_store.set_delegation_targets(AGENT, ["shared-only"])
         task_store.upsert_user(sub, f"{sub}@test.com", sub.split("-")[-1].title(), "member")
+        # Stored too: a worker's round reads its delegator's tier from the
+        # store (``task_config_builder.worker_machine_owner``).
+        from storage.identity import db_users
+        db_users.add_user_agent(sub, "shared-only", "editor", "user-admin")
         caller = _session_user(sub=sub)
         caller.agents.append("shared-only")
         caller.agent_roles["shared-only"] = "editor"
@@ -1019,11 +1132,11 @@ class TestSpawnMachine:
         r = _spawn(client, agent="shared-only", surface="task", machine="alice-laptop")
         assert r.status_code == 400
 
-    def test_a_lane_on_the_delegators_own_computer_takes_their_engine(self, client, machines, monkeypatch):
-        """An agent-scope lane on its delegator's own computer spends the
-        delegator's accounts (the task builder's rule), so its row carries
-        the delegator's engine; the same lane on the platform keeps the
-        agent's default and asks nobody."""
+    def test_a_chat_lane_takes_its_delegators_engine_wherever_it_runs(self, client, machines, monkeypatch):
+        """A chat lane on a Shared-only agent spends its delegator's accounts
+        (``core/config/spender.py``), on their own computer and on the
+        platform alike, so its row carries the delegator's engine, as their
+        own chat there would."""
         from services.engines import engine_resolution as er
         from storage.billing import subscription_store
         monkeypatch.setattr(subscription_store, "list_models",
@@ -1043,8 +1156,8 @@ class TestSpawnMachine:
         assert asked == ["user-alice"]
         r = _spawn(client, agent="shared-only", surface="chat")
         chat = task_store.get_chat(r.json()["chat_id"])
-        assert (chat["execution_path"], chat["model"]) == ("claude-code-cli", "claude-opus-5-5")
-        assert asked == ["user-alice"]
+        assert (chat["execution_path"], chat["model"]) == ("direct-llm", "hosted-mini")
+        assert asked == ["user-alice", "user-alice"]
 
     def test_an_agent_scope_chat_worker_on_a_shared_agent_too(self, client, machines):
         task_store.upsert_user("user-alice", "alice@test.com", "Alice", "member")
@@ -1066,11 +1179,49 @@ class TestSpawnMachine:
         r = _spawn(client, agent="shared-only", continue_id=wid, prompt="more")
         assert r.status_code == 200, r.text
         assert client.fired[-1]["task"].target_machine == "m-alice"
-        # A teammate continuing the same pooled worker runs on the default.
+        # A teammate's continue of the same pooled worker would start fresh
+        # elsewhere, its memory left on Alice's computer: it is told instead.
         self._shared_only_teammate(client)
         r = _spawn(client, agent="shared-only", continue_id=wid, prompt="more")
+        assert r.status_code == 409
+        assert r.json()["detail"] == ("This chat runs on alice-laptop, which this work can't use. "
+                                      "Move the chat, then continue it.")
+
+    def test_a_continue_follows_its_worker_to_an_admin_machine(self, client, machines):
+        """A lane delegated to an admin machine continues there, not on the
+        agent's default (where its conversation is not)."""
+        from storage import remote_store
+        remote_store.create_remote_machine("m-srv", "mac-mini", "user-admin", pairing_scope="admin")
+        wid = str(uuid.uuid4())
+        task_store.create_chat(wid, "user-alice", AGENT, "auto", origin="delegated",
+                               parent_chat_id=client.parent_chat_id, delegate_role="worker")
+        task_store.update_chat(wid, session_id=str(uuid.uuid4()), execution_target="m-srv")
+        r = _spawn(client, continue_id=wid, prompt="more", scope="agent")
         assert r.status_code == 200, r.text
-        assert client.fired[-1]["task"].target_machine == ""
+        assert client.fired[-1]["task"].target_machine == "m-srv"
+
+    def test_a_continue_of_a_lane_moved_to_the_platform_stays_there(self, client, machines):
+        """``local`` is also the column's default: the platform is the
+        place only while it holds the session's file."""
+        import config
+        from core import layout
+        from storage import remote_store
+        remote_store.create_remote_machine("m-srv", "mac-mini", "user-admin", pairing_scope="admin")
+        remote_store.set_agent_remote_target(AGENT, "m-srv", "user-admin")
+        sid = str(uuid.uuid4())
+        wid = str(uuid.uuid4())
+        task_store.create_chat(wid, "user-alice", AGENT, "auto", origin="delegated",
+                               parent_chat_id=client.parent_chat_id, delegate_role="worker")
+        task_store.update_chat(wid, session_id=sid, execution_target="local")
+        r = _spawn(client, continue_id=wid, prompt="more", scope="agent")
+        assert r.status_code == 200, r.text
+        assert client.fired[-1]["task"].target_machine == ""        # never ran here
+        home = Path(config.AGENTS_DIR) / AGENT / layout.scope_root("")
+        (home / ".claude" / "projects" / "k").mkdir(parents=True, exist_ok=True)
+        (home / ".claude" / "projects" / "k" / f"{sid}.jsonl").write_text("{}\n")
+        r = _spawn(client, continue_id=wid, prompt="more", scope="agent")
+        assert r.status_code == 200, r.text
+        assert client.fired[-1]["task"].target_machine == "local"
 
     def _shared_only_teammate(self, client):
         task_store.upsert_user("user-bob", "bob@test.com", "Bob", "member")
@@ -1126,6 +1277,24 @@ class TestSpawnMachine:
             f"This chat is running on {chat_targets.owner_name('user-alice')}'s computer.")
         assert _asyncio.run(dashboard_chat_move.drive_refusal(alice, wid)) == ""
         dashboard_chat_move._lock_cache.clear()
+
+    def test_a_continue_waits_out_a_move_of_its_chat(self, client, machines, monkeypatch):
+        """A continue sent while its chat moves would resume the session where
+        it was: the caller is told to continue once the move ended."""
+        from services.remote import chat_move
+        wid = str(uuid.uuid4())
+        task_store.create_chat(wid, "user-alice", AGENT, "auto", origin="delegated",
+                               parent_chat_id=client.parent_chat_id, delegate_role="worker")
+        task_store.update_chat(wid, session_id=str(uuid.uuid4()), execution_target="m-alice")
+        monkeypatch.setitem(chat_move._running, wid,
+                            chat_move._Job("mv-1", wid, "Bob laptop", "m-bob"))
+        r = _spawn(client, continue_id=wid, prompt="more")
+        assert r.status_code == 409
+        assert r.json()["detail"] == ("This chat is moving to Bob laptop. Continue it when the "
+                                      "move ends.")
+        assert client.fired == []
+        chat_move._running.pop(wid)
+        assert _spawn(client, continue_id=wid, prompt="more").status_code == 200
 
     def test_a_continue_ignores_the_machine(self, client, machines):
         prior_sid = str(uuid.uuid4())
@@ -1315,3 +1484,107 @@ class TestFollowUpsAtTheCap:
         assert task_store.live_delegate_run_ids_for_chat("task-run-tied1") == [
             "run-next1", "run-task-run-tied1"]
         assert task_store.live_delegate_run_ids_for_chat("task-run-nothing") == []
+
+    def test_the_delegations_reporting_to_a_chat(self, client):
+        # The callers' side: a delegate task anchored on the chat with a live
+        # run, one entry however many runs, oldest first; an ended run, an
+        # anchor elsewhere and another kind of task are never named.
+        def task(tid, name, anchor, kind="delegate"):
+            task_store.create_dynamic_task(
+                tid, AGENT, name, "p", "cli", kind, None, None, None, 3600, "user-alice",
+                on_complete_chat_id=anchor)
+
+        def run(rid, tid, status=None):
+            task_store.create_run(rid, tid, AGENT, "manual", None, "p",
+                                  task_type="delegate", scope="user", created_by="user-alice")
+            if status:
+                task_store.update_run(rid, status=status)
+
+        task("dyn-old1", "first lane", "chat-caller1")
+        run("run-old1", "dyn-old1", "running")
+        run("run-old1b", "dyn-old1")
+        task("dyn-new1", "second lane", "chat-caller1")
+        run("run-new1", "dyn-new1")
+        task("dyn-done1", "ended lane", "chat-caller1")
+        run("run-done1b", "dyn-done1", "completed")
+        task("dyn-else1", "other caller", "chat-caller2")
+        run("run-else1", "dyn-else1")
+        task("dyn-once1", "one-time task", "chat-caller1", kind="one_time")
+        run("run-once1", "dyn-once1")
+        assert task_store.live_delegations_reporting_to(["chat-caller1", ""]) == [
+            {"id": "dyn-old1", "description": "first lane", "agent": AGENT},
+            {"id": "dyn-new1", "description": "second lane", "agent": AGENT},
+        ]
+        assert [d["id"] for d in task_store.live_delegations_reporting_to(
+            ["chat-caller1", "chat-caller2"])] == ["dyn-old1", "dyn-new1", "dyn-else1"]
+        assert task_store.live_delegations_reporting_to(["chat-nobody"]) == []
+        assert task_store.live_delegations_reporting_to([]) == []
+
+
+class TestWhoPays:
+    """The spawn records whose AI accounts the round spends
+    (``core/config/spender.py``): a chat lane its person, never an agent's
+    slug; a person with no account for the lane's engine is told before any
+    row is written."""
+
+    def test_a_chat_lane_records_its_person(self, client):
+        r = _spawn(client, surface="chat")
+        assert r.status_code == 200
+        assert task_store.get_dynamic_task(r.json()["task_id"])["spender_sub"] == "user-alice"
+
+    def test_a_task_lane_records_nothing_its_creator_answers(self, client):
+        r = _spawn(client)
+        assert task_store.get_dynamic_task(r.json()["task_id"])["spender_sub"] is None
+
+    def test_a_person_with_no_account_for_the_engine_gets_the_sentence_and_no_row(self, client, monkeypatch):
+        from services.engines import subscription_pool
+        monkeypatch.setattr(subscription_pool, "user_can_run", lambda layer, sub, **kw: False)
+        monkeypatch.setattr(subscription_pool, "user_scope_block_reason", lambda layer, sub, **kw: "none")
+        r = _spawn(client, surface="chat")
+        assert r.status_code == 409
+        assert "as their own chat on pa would" in r.json()["detail"]
+        assert "Settings, AI Engines" in r.json()["detail"]
+        assert client.fired == []
+        assert task_store.list_dynamic_tasks(AGENT) == []
+        assert task_store.list_chats_by_parent(client.parent_chat_id) == []
+
+    def test_a_lanes_own_chat_lane_passes_its_person_on(self, client):
+        from core.session.visibility import shared_chat_owner
+        lane_session = "55555555-5555-4555-8555-555555555555"
+        task_store.create_chat("c-lane-root", shared_chat_owner(AGENT), AGENT, "auto", origin="delegated")
+        task_store.update_chat("c-lane-root", session_id=lane_session)
+        task_store.create_run("run-root", "dyn-root", AGENT, "manual", None, "go", task_type="delegate",
+                              scope="agent", created_by="user-alice", spender_sub="user-alice")
+        task_store.update_run("run-root", chat_id="c-lane-root", started_at="2026-11-13T06:00:00")
+        task_store.upsert_user("user-alice", "alice@test.com", "Alice", "member")
+        task_store.add_user_agent("user-alice", AGENT, "editor", "admin")
+        client.app_ref.state.user = _no_person_session(lane_session)
+        r = _spawn(client, surface="chat", scope="agent")
+        assert r.status_code == 200, r.text
+        row = task_store.get_dynamic_task(r.json()["task_id"])
+        assert row["created_by"] == AGENT and row["spender_sub"] == "user-alice"
+
+    def test_a_continue_takes_its_kind_from_the_chat_never_from_the_request(self, client):
+        first = _spawn(client, surface="chat").json()
+        task_store.update_chat(first["chat_id"], session_id=str(uuid.uuid4()))
+        second = _spawn(client, surface="task", continue_id=first["chat_id"])
+        assert second.status_code == 200, second.text
+        assert task_store.get_dynamic_task(second.json()["task_id"])["spender_sub"] == "user-alice"
+
+    def test_a_passed_on_person_without_the_target_agent_is_refused(self, client):
+        from core.session.visibility import shared_chat_owner
+        lane_session = "66666666-6666-4666-8666-666666666666"
+        agent_store.create_agent("pb", "PB", collaborative=False, default_scope="agent")
+        agent_store.set_delegation_targets(AGENT, ["pb"])
+        task_store.create_chat("c-lane-2", shared_chat_owner(AGENT), AGENT, "auto", origin="delegated")
+        task_store.update_chat("c-lane-2", session_id=lane_session)
+        task_store.create_run("run-2", "dyn-2", AGENT, "manual", None, "go", task_type="delegate",
+                              scope="agent", created_by="user-alice", spender_sub="user-alice")
+        task_store.update_run("run-2", chat_id="c-lane-2", started_at="2026-11-13T06:00:00")
+        task_store.upsert_user("user-alice", "alice@test.com", "Alice", "member")
+        task_store.add_user_agent("user-alice", AGENT, "editor", "admin")
+        client.app_ref.state.user = _no_person_session(lane_session)
+        r = _spawn(client, surface="chat", scope="agent", agent="pb")
+        assert r.status_code == 409, r.text
+        assert "cannot run work on pb now" in r.json()["detail"]
+        assert client.fired == []

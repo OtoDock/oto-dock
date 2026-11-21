@@ -1,0 +1,1080 @@
+{
+ "AgentConfig": {
+  "fields": [
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "agent_name",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "user_sub",
+    "type": "str"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "placement_sub",
+    "type": "str | None"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "system_prompt",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "mcp_config_path",
+    "type": "str"
+   },
+   {
+    "default": "{}",
+    "factory": true,
+    "kw_only": false,
+    "name": "credential_env",
+    "type": "dict"
+   },
+   {
+    "default": "{}",
+    "factory": true,
+    "kw_only": false,
+    "name": "mcp_secret_bundles",
+    "type": "dict"
+   },
+   {
+    "default": "frozenset()",
+    "kw_only": false,
+    "name": "excluded_mcps",
+    "type": "frozenset[str]"
+   },
+   {
+    "default": "'ask'",
+    "kw_only": false,
+    "name": "permission_mode",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "client_type",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "model",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "effort",
+    "type": "str"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "resume",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "use_native_permissions",
+    "type": "bool"
+   },
+   {
+    "default": "{}",
+    "factory": true,
+    "kw_only": false,
+    "name": "extra_env",
+    "type": "dict"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "security_context",
+    "type": "object"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "subscription_id",
+    "type": "str"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "subscription_user_sub",
+    "type": "str | None"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "sandbox_host_claude_dir",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "session_home",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "resume_handle",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "chat_id",
+    "type": "str"
+   },
+   {
+    "default": "{}",
+    "factory": true,
+    "kw_only": false,
+    "name": "multi_value_envs",
+    "type": "dict"
+   },
+   {
+    "default": "'local'",
+    "kw_only": false,
+    "name": "execution_target",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "execution_path",
+    "type": "str"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "fallback_reason",
+    "type": "str | None"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "interactive",
+    "type": "bool"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "interactive_theme",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "default_execution_mode",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "interactive_first_prompt",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "work_cwd",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "term",
+    "type": "str"
+   },
+   {
+    "default": "0",
+    "kw_only": false,
+    "name": "token_minted_at",
+    "type": "int"
+   },
+   {
+    "default": "{}",
+    "factory": true,
+    "kw_only": false,
+    "name": "account_choices",
+    "type": "dict[str, str]"
+   }
+  ],
+  "frozen": false
+ },
+ "AuthProfile": {
+  "fields": [
+   {
+    "default": "()",
+    "kw_only": false,
+    "name": "auth_types",
+    "type": "tuple[str, ...]"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "credential_file",
+    "type": "CredentialFileSpec | None"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "oauth_flow",
+    "type": "str"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "sign_in_in_place",
+    "type": "bool"
+   },
+   {
+    "default": "()",
+    "kw_only": false,
+    "name": "resume_refusal_codes",
+    "type": "tuple[str, ...]"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "session_home",
+    "type": "SessionHomeSpec | None"
+   }
+  ],
+  "frozen": false
+ },
+ "BehaviourProfile": {
+  "fields": [
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "rebuilds_history_from_db",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "attach_images_inline",
+    "type": "bool"
+   },
+   {
+    "default": "'materialized_dir'",
+    "kw_only": false,
+    "name": "skills_delivery",
+    "type": "str"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_bash",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_plans_dir",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "builtin_file_tools",
+    "type": "bool"
+   },
+   {
+    "default": "True",
+    "kw_only": false,
+    "name": "has_shell_on_external_route",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "provider_pinned_per_session",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_steer",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_compact",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_interrupt_for_queued",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_background_commands",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_step_descriptions",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "hides_denied_tools",
+    "type": "bool"
+   },
+   {
+    "default": "{}",
+    "factory": true,
+    "kw_only": false,
+    "name": "tools",
+    "type": "dict[str, tuple[str, ...]]"
+   },
+   {
+    "default": "()",
+    "kw_only": false,
+    "name": "nonblocking_question_tools",
+    "type": "tuple[str, ...]"
+   },
+   {
+    "default": "()",
+    "kw_only": false,
+    "name": "repository_instruction_files",
+    "type": "tuple[str, ...]"
+   },
+   {
+    "default": "'turn'",
+    "kw_only": false,
+    "name": "start_context_door",
+    "type": "str"
+   },
+   {
+    "default": "0",
+    "kw_only": false,
+    "name": "prompt_cache_s",
+    "type": "int"
+   }
+  ],
+  "frozen": false
+ },
+ "CredentialFileSpec": {
+  "fields": [
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "wire_kind",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "dirname",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "filename",
+    "type": "str"
+   }
+  ],
+  "frozen": true
+ },
+ "EngineIdentity": {
+  "fields": [
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "short_name",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "vendor_id",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "vendor_label",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "account_label",
+    "type": "str"
+   },
+   {
+    "default": "'supporting'",
+    "kw_only": false,
+    "name": "role",
+    "type": "str"
+   },
+   {
+    "default": "100",
+    "kw_only": false,
+    "name": "sort_order",
+    "type": "int"
+   }
+  ],
+  "frozen": false
+ },
+ "LayerCapabilities": {
+  "fields": [
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "name",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "display_name",
+    "type": "str"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_resume",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_permissions",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_plan_mode",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_todos",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_subagents",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_context_compression",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_control_commands",
+    "type": "bool"
+   },
+   {
+    "default": "True",
+    "kw_only": false,
+    "name": "supports_mcps",
+    "type": "bool"
+   },
+   {
+    "default": "[]",
+    "factory": true,
+    "kw_only": false,
+    "name": "permission_modes",
+    "type": "list[str]"
+   },
+   {
+    "default": "[]",
+    "factory": true,
+    "kw_only": false,
+    "name": "control_commands",
+    "type": "list[str]"
+   },
+   {
+    "default": "[]",
+    "factory": true,
+    "kw_only": false,
+    "name": "models",
+    "type": "list[dict]"
+   },
+   {
+    "default": "[]",
+    "factory": true,
+    "kw_only": false,
+    "name": "effort_levels",
+    "type": "list[str]"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "effort_changeable_mid_session",
+    "type": "bool"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "compression_threshold_pct",
+    "type": "int | None"
+   },
+   {
+    "default": "'external_config'",
+    "kw_only": false,
+    "name": "mcp_delivery",
+    "type": "str"
+   },
+   {
+    "default": "'json'",
+    "kw_only": false,
+    "name": "mcp_config_format",
+    "type": "str | None"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "providers",
+    "type": "list[dict] | None"
+   },
+   {
+    "default": "EngineIdentity(short_name='', vendor_id='', vendor_label='', account_label='', role='supporting', sort_order=100)",
+    "factory": true,
+    "kw_only": false,
+    "name": "identity",
+    "type": "EngineIdentity"
+   },
+   {
+    "default": "RuntimeProfile(has_os_process=False, hard_abort_kills_process=False, supports_remote_execution=False, supports_interactive_pty=False, interactive_first_prompt_via_argv=False, supports_reattach_after_restart=False, readopts_idle_session=False, binary='', pin_key='', config_dir_name='', self_wakes=False, event_queue_depth=0, interactive_submit_backstop=False, installed_name='', interactive_reports_model=False)",
+    "factory": true,
+    "kw_only": false,
+    "name": "runtime",
+    "type": "RuntimeProfile"
+   },
+   {
+    "default": "BehaviourProfile(rebuilds_history_from_db=False, attach_images_inline=False, skills_delivery='materialized_dir', supports_bash=False, supports_plans_dir=False, builtin_file_tools=False, has_shell_on_external_route=True, provider_pinned_per_session=False, supports_steer=False, supports_compact=False, supports_interrupt_for_queued=False, supports_background_commands=False, supports_step_descriptions=False, hides_denied_tools=False, tools={}, nonblocking_question_tools=(), repository_instruction_files=(), start_context_door='turn', prompt_cache_s=0)",
+    "factory": true,
+    "kw_only": false,
+    "name": "behaviour",
+    "type": "BehaviourProfile"
+   },
+   {
+    "default": "ModelPolicy(default_model='', model_filter_policy='none', pricing_editable=False)",
+    "factory": true,
+    "kw_only": false,
+    "name": "model_policy",
+    "type": "ModelPolicy"
+   },
+   {
+    "default": "AuthProfile(auth_types=(), credential_file=None, oauth_flow='', sign_in_in_place=False, resume_refusal_codes=(), session_home=None)",
+    "factory": true,
+    "kw_only": false,
+    "name": "auth",
+    "type": "AuthProfile"
+   },
+   {
+    "default": "UsageProfile(windows=(), in_band=())",
+    "factory": true,
+    "kw_only": false,
+    "name": "usage",
+    "type": "UsageProfile"
+   }
+  ],
+  "frozen": false
+ },
+ "ModelPolicy": {
+  "fields": [
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "default_model",
+    "type": "str"
+   },
+   {
+    "default": "'none'",
+    "kw_only": false,
+    "name": "model_filter_policy",
+    "type": "str"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "pricing_editable",
+    "type": "bool"
+   }
+  ],
+  "frozen": false
+ },
+ "OAuthRefresh": {
+  "fields": [
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "oauth_token",
+    "type": "dict | None"
+   },
+   {
+    "default": "{}",
+    "factory": true,
+    "kw_only": false,
+    "name": "extra",
+    "type": "dict"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "refresh_token_expires_in",
+    "type": "int | None"
+   },
+   {
+    "default": "0",
+    "kw_only": false,
+    "name": "status",
+    "type": "int"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "body",
+    "type": "dict | None"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "error",
+    "type": "str"
+   }
+  ],
+  "frozen": true
+ },
+ "RemoteStartContext": {
+  "fields": [
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "session_id",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "machine_id",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "sat_port",
+    "type": "int"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "target_os",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "config",
+    "type": "AgentConfig"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "scope_root",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "env",
+    "type": "dict"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "proxy_api_key",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "secret_bundle_keys",
+    "type": "set"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "gateway",
+    "type": "dict"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "cm",
+    "type": "object"
+   },
+   {
+    "default": "None",
+    "kw_only": false,
+    "name": "spawn",
+    "type": "SpawnPlan | None"
+   }
+  ],
+  "frozen": false
+ },
+ "RemoteStartPlan": {
+  "fields": [
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "payload",
+    "type": "dict"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "credential_file_delivered",
+    "type": "bool"
+   },
+   {
+    "default": "60.0",
+    "kw_only": false,
+    "name": "start_timeout_s",
+    "type": "float"
+   }
+  ],
+  "frozen": false
+ },
+ "RuntimeProfile": {
+  "fields": [
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "has_os_process",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "hard_abort_kills_process",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_remote_execution",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_interactive_pty",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "interactive_first_prompt_via_argv",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "supports_reattach_after_restart",
+    "type": "bool"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "readopts_idle_session",
+    "type": "bool"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "binary",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "pin_key",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "config_dir_name",
+    "type": "str"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "self_wakes",
+    "type": "bool"
+   },
+   {
+    "default": "0",
+    "kw_only": false,
+    "name": "event_queue_depth",
+    "type": "int"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "interactive_submit_backstop",
+    "type": "bool"
+   },
+   {
+    "default": "''",
+    "kw_only": false,
+    "name": "installed_name",
+    "type": "str"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "interactive_reports_model",
+    "type": "bool"
+   }
+  ],
+  "frozen": false
+ },
+ "Scoped": {
+  "fields": [
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "key",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "label",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "pct",
+    "type": "float"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "resets_at",
+    "type": "datetime.datetime | None"
+   },
+   {
+    "default": "False",
+    "kw_only": false,
+    "name": "active",
+    "type": "bool"
+   }
+  ],
+  "frozen": false
+ },
+ "SubscriptionHandle": {
+  "fields": [
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "subscription_id",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "layer",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "provider",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "auth_type",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "api_key",
+    "type": "str | None"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "oauth_access_token",
+    "type": "str | None"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "endpoint_url",
+    "type": "str | None"
+   },
+   {
+    "default": "0",
+    "kw_only": false,
+    "name": "oauth_expires_at_ms",
+    "type": "int"
+   },
+   {
+    "default": "{}",
+    "factory": true,
+    "kw_only": false,
+    "name": "credential",
+    "type": "dict"
+   }
+  ],
+  "frozen": false
+ },
+ "UsageProfile": {
+  "fields": [
+   {
+    "default": "()",
+    "kw_only": false,
+    "name": "windows",
+    "type": "tuple[WindowSpec, ...]"
+   },
+   {
+    "default": "()",
+    "kw_only": false,
+    "name": "in_band",
+    "type": "tuple[InBandSpec, ...]"
+   }
+  ],
+  "frozen": false
+ },
+ "Window": {
+  "fields": [
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "pct",
+    "type": "float"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "resets_at",
+    "type": "datetime.datetime | None"
+   }
+  ],
+  "frozen": false
+ },
+ "WindowSpec": {
+  "fields": [
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "key",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "length_s",
+    "type": "int"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "role",
+    "type": "str"
+   },
+   {
+    "default": "<required>",
+    "kw_only": false,
+    "name": "label",
+    "type": "str"
+   },
+   {
+    "default": "'account'",
+    "kw_only": false,
+    "name": "scope",
+    "type": "str"
+   }
+  ],
+  "frozen": true
+ },
+ "Windows": {
+  "fields": [
+   {
+    "default": "<required>",
+    "kw_only": true,
+    "name": "specs",
+    "type": "dict[str, WindowSpec]"
+   },
+   {
+    "default": "{}",
+    "factory": true,
+    "kw_only": true,
+    "name": "windows",
+    "type": "dict[str, Window]"
+   },
+   {
+    "default": "[]",
+    "factory": true,
+    "kw_only": true,
+    "name": "scoped",
+    "type": "list[Scoped]"
+   },
+   {
+    "default": "''",
+    "kw_only": true,
+    "name": "reached",
+    "type": "str"
+   },
+   {
+    "default": "''",
+    "kw_only": true,
+    "name": "plan",
+    "type": "str"
+   },
+   {
+    "default": "<now, tz=UTC>",
+    "factory": true,
+    "kw_only": true,
+    "name": "observed_at",
+    "type": "datetime"
+   },
+   {
+    "default": "''",
+    "kw_only": true,
+    "name": "source",
+    "type": "str"
+   }
+  ],
+  "frozen": false
+ }
+}

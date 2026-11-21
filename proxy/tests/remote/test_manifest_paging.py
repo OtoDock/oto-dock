@@ -1,7 +1,7 @@
-"""A satellite's manifest reply can be paged. The proxy asks a 0.5.130
-satellite for pages, joins the frames of one command in order, binds them
-to the sending machine, bounds the total and clears the pages when the wait
-ends whatever way; an older satellite's single frame resolves at once.
+"""A satellite's manifest reply can be paged. The proxy asks the satellite
+for pages, joins the frames of one command in order, binds them to the
+sending machine, bounds the total and clears the pages when the wait ends
+whatever way, and a single frame resolves at once.
 """
 
 import asyncio
@@ -142,17 +142,15 @@ async def test_the_pages_are_cleared_when_the_wait_ends_without_a_last_frame():
     assert cm._manifest_pages == {}
 
 
-def test_the_request_asks_for_pages_only_from_a_satellite_that_pages():
-    assert rws.manifest_request(_cm_with("0.5.129"), "m1", "a") == {
-        "type": "request_manifest", "agent_slug": "a"}
-    req = rws.manifest_request(_cm_with("0.5.130"), "m1", "a")
-    assert req["page_size"] == rws._MANIFEST_PAGE_SIZE and 256 <= req["page_size"] <= 8192
-    assert _cm_with("0.5.130").satellite_supports_paged_manifest("m1")
-    assert not _cm_with("0.5.129").satellite_supports_paged_manifest("m1")
+def test_the_request_asks_for_pages():
+    req = rws.manifest_request("a")
+    assert req == {"type": "request_manifest", "agent_slug": "a",
+                   "page_size": rws._MANIFEST_PAGE_SIZE}
+    assert 256 <= req["page_size"] <= 8192
 
 
 @pytest.mark.asyncio
-async def test_the_file_listing_asks_a_paging_satellite_for_pages(monkeypatch):
+async def test_the_file_listing_asks_for_pages(monkeypatch):
     """The file listing sends the same paged request as the merge, through
     the manager's own command path (the joined pages resolve that wait)."""
     from types import SimpleNamespace
@@ -175,7 +173,7 @@ async def test_the_file_listing_asks_a_paging_satellite_for_pages(monkeypatch):
     monkeypatch.setattr("core.session.session_state._session_security", {})
 
     assert await rff.list_remote_files("s1", "workspace/notes") == ["workspace/notes/a.txt"]
-    assert [m for _mid, m in sent] == [rws.manifest_request(cm, "m1", "a")]
+    assert [m for _mid, m in sent] == [rws.manifest_request("a")]
     assert all(mid == "m1" for mid, _m in sent)
     assert cm._pending_acks == {}
 
@@ -204,7 +202,7 @@ async def test_the_listing_with_sizes_and_the_private_pull(monkeypatch, tmp_path
 
     async def pull_file_to_path(machine_id, ref, dest_path, *, agent_slug="",
                                 stall_s=None, max_bytes=None, request_fields=None,
-                                progress_cb=None):
+                                progress_cb=None, hash_out=None):
         pulls.append((machine_id, ref.kind, ref.value, dest_path, agent_slug, max_bytes))
         return True
 
@@ -231,34 +229,24 @@ async def test_the_listing_with_sizes_and_the_private_pull(monkeypatch, tmp_path
     assert len(pulls) == 1
 
 
-def test_skips_are_asked_of_a_0_5_145_satellite_and_old_windows_absence_is_unknown():
-    def cm(version, os_name):
-        c = _cm_with(version)
+def test_skips_are_asked_on_request_and_a_windows_satellite_restores_holds():
+    def cm(os_name):
+        c = _cm_with("0.5.145")
         c._connections["m1"].capabilities = {"os": os_name}
         return c
 
-    assert cm("0.5.145", "linux").satellite_supports_skipped_manifest("m1")
-    assert not cm("0.5.144", "linux").satellite_supports_skipped_manifest("m1")
-    assert rws.manifest_request(cm("0.5.145", "linux"), "m1", "a",
-                                report_skipped=True)["report_skipped"] is True
-    assert "report_skipped" not in rws.manifest_request(cm("0.5.145", "linux"), "m1", "a")
-    blind = {v: cm(v, "windows").satellite_absence_unreliable("m1")
-             for v in ("0.5.129", "0.5.130", "0.5.138", "0.5.143", "0.5.144", "0.5.145")}
-    assert blind == {"0.5.129": False, "0.5.130": True, "0.5.138": True,
-                     "0.5.143": True, "0.5.144": False, "0.5.145": False}
-    assert not cm("0.5.138", "linux").satellite_absence_unreliable("m1")
-    assert cm("0.5.145", "windows").satellite_restores_holds("m1")
-    assert not cm("0.5.144", "windows").satellite_restores_holds("m1")
-    assert not cm("0.5.145", "linux").satellite_restores_holds("m1")
-    assert not _cm_with("0.5.145").satellite_absence_unreliable("m-offline")
+    assert rws.manifest_request("a", report_skipped=True)["report_skipped"] is True
+    assert "report_skipped" not in rws.manifest_request("a")
+    assert cm("windows").satellite_restores_holds("m1")
+    assert not cm("linux").satellite_restores_holds("m1")
+    assert not cm("windows").satellite_restores_holds("m-offline")
 
 
 @pytest.mark.asyncio
-async def test_the_listing_asks_a_satellite_that_lists_what_it_skipped(monkeypatch):
-    """``report_skipped`` reaches only a satellite that lists what it could
-    not read (0.5.145); its skipped entries come back flagged, a folder's
-    with ``dir``, inside the prefix or covering it, and an older satellite
-    is asked for nothing and lists nothing of the kind."""
+async def test_the_listing_asks_for_what_the_satellite_skipped(monkeypatch):
+    """``report_skipped`` asks the satellite to list what it could not
+    read. Its skipped entries come back flagged, a folder's with ``dir``,
+    inside the prefix or covering it."""
     from types import SimpleNamespace
 
     from core.remote import remote_file_flow as rff
@@ -273,21 +261,17 @@ async def test_the_listing_asks_a_satellite_that_lists_what_it_skipped(monkeypat
         {"path": "", "skipped": "unreadable_dir", "dir": True},
     ]}
 
-    def _with(version: str):
-        cm = _cm_with(version)
+    cm = _cm_with("0.5.145")
 
-        async def send_command(machine_id, msg, *, timeout=30.0, command_id=None):
-            sent.append(dict(msg))
-            return answer
-        monkeypatch.setattr(cm, "send_command", send_command)
-        monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
-        return cm
-
+    async def send_command(machine_id, msg, *, timeout=30.0, command_id=None):
+        sent.append(dict(msg))
+        return answer
+    monkeypatch.setattr(cm, "send_command", send_command)
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
     monkeypatch.setattr(rff, "_get_remote_session_info",
                         lambda sid: SimpleNamespace(machine_id="m1", agent_name="a"))
     monkeypatch.setattr("core.session.session_state._session_security", {})
 
-    _with("0.5.145")
     out = await rff.list_remote_entries("s1", "workspace/t", report_skipped=True)
     assert sent[-1].get("report_skipped") is True
     assert out == [
@@ -297,27 +281,6 @@ async def test_the_listing_asks_a_satellite_that_lists_what_it_skipped(monkeypat
         {"path": "workspace/t/locked.md", "size": 0, "skipped": "unreadable"},
         {"path": "workspace/t/sub", "size": 0, "skipped": "unreadable_dir", "dir": True},
     ]
-    # Not asked: the plain listing, whatever the satellite.
+    # Not asked: the plain listing, and nothing skipped in it.
     assert await rff.list_remote_files("s1", "workspace/t") == ["workspace/t/a.md"]
     assert "report_skipped" not in sent[-1]
-
-    _with("0.5.144")
-    out = await rff.list_remote_entries("s1", "workspace/t", report_skipped=True)
-    assert "report_skipped" not in sent[-1]
-    assert out == [{"path": "workspace/t/a.md", "size": 12}]
-
-
-def test_absence_is_reliable_follows_the_satellite(monkeypatch):
-    from types import SimpleNamespace
-
-    from core.remote import remote_file_flow as rff
-
-    cm = _cm_with("0.5.145")
-    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
-    monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: None)
-    assert not rff.absence_is_reliable("s1")
-    monkeypatch.setattr(rff, "_get_remote_session_info",
-                        lambda sid: SimpleNamespace(machine_id="m1", agent_name="a"))
-    assert rff.absence_is_reliable("s1")
-    monkeypatch.setattr(cm, "satellite_absence_unreliable", lambda mid: True)
-    assert not rff.absence_is_reliable("s1")

@@ -5,7 +5,7 @@ background Bash command or background subagent completes while the session
 is idle: the CLI runs a full, unprompted model turn — bracketed by its own
 ``system/init`` … ``result`` frames — that reviews the completion ("the
 2.1.243 background-wake"). Empirical captures live in
-``tests/session/fixtures`` (probe rig 2026-08-27; see
+``tests/fixtures/cli_wake`` (probe rig 2026-08-27; see
 the 1.5 self-wake design round).
 
 Before 1.5 the between-turns readers (``drain_bg_commands``, the
@@ -31,28 +31,43 @@ resolved, but nothing is recorded.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
 
+import config
 from core.events.common_events import PRODUCER_DONE, SYSTEM, CommonEvent
 from core.session import session_kind
 from ws import wire_events as wire
 
+if TYPE_CHECKING:
+    from core.layers.cli.translator import ClaudeCLIEventTranslator
+
 logger = logging.getLogger("otodock")
 
 # Hard ceiling for one wake bracket — a wake turn can run tools, so this is
-# a runaway guard, not a latency budget (mirrors the bg monitors' 600s).
+# a runaway guard, not a latency budget (mirrors the bg monitors' 600s). A
+# caller that passes its session's liveness gets the turn ceiling instead
+# (``config.CLAUDE_TIMEOUT``): a wake turn is a turn.
 WAKE_BRACKET_CEILING_S = 600.0
 
 # Frame-gap timeout inside a bracket: the CLI streams continuously while a
 # turn runs; a long silent gap means the bracket will not close (process
-# died, satellite drain window closed) — flush partial and stop.
+# died, satellite drain window closed) — flush partial and stop. A caller
+# that passes its session's liveness is asked first: a tool of the wake turn
+# is silent for as long as it runs, so a gap ends a live session's bracket
+# only at the ceiling.
 WAKE_FRAME_GAP_S = 30.0
 
 # session_id → monotonic time of the last completed wake capture. Consulted
 # by the bg monitors' grace window (a captured wake IS the review turn).
 _last_wake_capture: dict[str, float] = {}
+
+# session_id → the translator of the bracket being captured: an interrupt the
+# session is asked for meanwhile ends that turn (``note_interrupt``).
+_capturing: dict[str, "ClaudeCLIEventTranslator"] = {}
 
 
 def is_wake_init(data: dict) -> bool:
@@ -64,8 +79,24 @@ def is_wake_init(data: dict) -> bool:
             and data.get("subtype") == "init")
 
 
+def opens_turn(data: dict) -> bool:
+    """A line read between turns that opens a turn of the main agent: its
+    ``system/init``, or its first message where the CLI sends no ``init``
+    (the 2.1.312 recording ``probe-bash-moved.jsonl``). Nothing of the main
+    agent's runs between turns but a turn the engine started by itself (or a
+    steer it took late), so its first such line opens one. A sub-agent's
+    lines carry ``parent_tool_use_id``."""
+    if not isinstance(data, dict) or data.get("parent_tool_use_id"):
+        return False
+    kind = data.get("type")
+    return is_wake_init(data) or kind in ("stream_event", "assistant")
+
+
 def recently_captured(session_id: str, within_s: float = 60.0) -> bool:
-    """Whether a wake turn finished capturing within the last ``within_s``."""
+    """Whether a wake turn finished capturing within the last ``within_s``,
+    or one is being recorded now (the review is under way)."""
+    if session_id in _capturing:
+        return True
     ts = _last_wake_capture.get(session_id)
     return ts is not None and (time.monotonic() - ts) <= within_s
 
@@ -73,6 +104,15 @@ def recently_captured(session_id: str, within_s: float = 60.0) -> bool:
 def captured_at(session_id: str) -> float | None:
     """The monotonic time the session's last wake turn finished capturing."""
     return _last_wake_capture.get(session_id)
+
+
+def note_interrupt(session_id: str) -> None:
+    """The session was asked to stop the turn it runs: when that turn is one
+    being captured, its closing result is the interruption, not an error of
+    the engine (the translator's own rule for a turn it was told to stop)."""
+    translator = _capturing.get(session_id)
+    if translator is not None:
+        translator.interrupted = True
 
 
 def note_captured(session_id: str) -> None:
@@ -90,18 +130,33 @@ async def capture_wake_turn(
     read_frame: Callable[[float], Awaitable[dict | None]],
     *,
     source: str = "idle",
+    alive: Callable[[], bool] | None = None,
+    turn_guard: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
+    steered: Callable[[], bool] | None = None,
 ) -> bool:
     """Record one wake bracket, ``first_frame`` (the init) included.
 
     ``read_frame(timeout)`` returns the next PARSED stream-json frame or
     None on timeout/EOF — the caller keeps holding the session lock and
-    reading from its own transport. Returns True when a bracket was
-    recorded to a chat (False: no chat row, or the bracket never closed —
-    partial content is still flushed in that case).
+    reading from its own transport. ``alive`` says whether the session can
+    still write a frame (its process runs, its stream is open): with it a
+    silent gap ends the bracket only once it answers False, and the bracket
+    has the turn ceiling. It must answer False at the stream's end, where
+    ``read_frame`` returns at once. ``turn_guard`` marks the session's turn
+    as running on its layer while this bracket is the chat's live turn, so
+    a Stop and a queued message's interrupt meet it as they meet any turn.
+    ``steered`` says a message was steered into this turn since its last
+    result: the CLI may take it after that result as a turn of its own, which
+    opens at once, so a turn that opens within the steer grace is read
+    through as part of this one (``_peek_after_result``'s twin).
+    Returns True when a bracket was recorded to a chat (False: no chat
+    row, or the bracket never closed — partial content is still flushed in
+    that case).
     """
     from core.events.stream_pump import ChatStreamPump, _active_pumps
 
     # Lazy: core.layers.cli.layer imports the session module, which calls us.
+    from core.layers.cli.helpers import _STEER_INIT_GRACE_S
     from core.layers.cli.layer import cli_chunk_to_events
     from core.layers.cli.translator import ClaudeCLIEventTranslator
     from core.session.session_state import get_session_client_type
@@ -115,17 +170,52 @@ async def capture_wake_turn(
                          session_id[:8])
 
     translator = ClaudeCLIEventTranslator(session_id)
+    _capturing[session_id] = translator
     pump: ChatStreamPump | None = None
     pump_task: asyncio.Task | None = None
     registered = False
     queue: asyncio.Queue | None = None
 
+    from core.session import engine_prompts
+
+    def _feed(data: dict) -> None:
+        engine_prompts.note_frame(session_id, data, in_turn=True)
+        for chunk in translator.feed(data):
+            for ev in cli_chunk_to_events(chunk):
+                if queue is not None:
+                    queue.put_nowait(ev)
+
+    ceiling = WAKE_BRACKET_CEILING_S if alive is None else float(config.CLAUDE_TIMEOUT)
+
+    async def _read_bracket() -> bool:
+        """The bracket's frames, read to its result: the pump's producer, so
+        a viewer's attach finds a running turn and a Stop cancels this."""
+        deadline = time.monotonic() + ceiling
+        _feed(first_frame)
+        while time.monotonic() < deadline:
+            data = await read_frame(WAKE_FRAME_GAP_S)
+            if data is None:
+                if alive is not None and alive():
+                    continue  # a silent tool of a live session
+                break  # gap/EOF — bracket will not close here
+            _feed(data)
+            if data.get("type") == "result":
+                if steered is None or not steered():
+                    return True
+                # The steered message's own turn, if the CLI took it after
+                # this result: read through; anything else ends the turn.
+                nxt = await read_frame(_STEER_INIT_GRACE_S)
+                if nxt is None:
+                    return True
+                _feed(nxt)
+                if not opens_turn(nxt):
+                    return True
+        return False
+
     if chat is not None:
         chat_id = chat["id"]
         queue = asyncio.Queue()
-        # The producer handle only anchors pump cancellation semantics — the
-        # frames are pushed by THIS coroutine, so a no-op task suffices.
-        producer = asyncio.create_task(asyncio.sleep(0))
+        producer = asyncio.create_task(_read_bracket())
         pump = ChatStreamPump(
             chat_id=chat_id,
             session_id=session_id,
@@ -140,6 +230,7 @@ async def capture_wake_turn(
             source_type=session_kind.driver_source_type(
                 get_session_client_type(session_id), chat),
         )
+        pump.records_engine_turn = True
         # Register for live streaming ONLY when the chat has no active pump.
         # A stale-drain capture runs with the NEXT user turn's pump already
         # registered — never displace it; the wake blocks still persist and
@@ -147,6 +238,9 @@ async def capture_wake_turn(
         if chat_id not in _active_pumps:
             _active_pumps[chat_id] = pump
             registered = True
+            # A message sent during this turn interrupts it, as during any
+            # turn: the pump's end hands the chat's queue on at once.
+            pump.stop_and_send = {"fired": False, "note": False}
         pump_task = pump.start()
         # Provenance marker row — history reload must explain the
         # unprompted assistant turn that follows.
@@ -156,33 +250,28 @@ async def capture_wake_turn(
             "source": source,
         }))
 
-    from core.session import engine_prompts
-
-    def _feed(data: dict) -> None:
-        engine_prompts.note_frame(session_id, data, in_turn=True)
-        for chunk in translator.feed(data):
-            for ev in cli_chunk_to_events(chunk):
-                if queue is not None:
-                    queue.put_nowait(ev)
-
     closed = False
-    deadline = time.monotonic() + WAKE_BRACKET_CEILING_S
-    _feed(first_frame)
+    guard = turn_guard() if (registered and turn_guard is not None) else contextlib.nullcontext()
     try:
-        while time.monotonic() < deadline:
-            data = await read_frame(WAKE_FRAME_GAP_S)
-            if data is None:
-                break  # gap/EOF — bracket will not close here
-            _feed(data)
-            if data.get("type") == "result":
-                closed = True
-                break
+        with guard:
+            if pump is None:
+                closed = await _read_bracket()
+            else:
+                await asyncio.wait({producer})
+                if not producer.cancelled():
+                    if producer.exception() is not None:
+                        logger.error("wake capture: reading the bracket of %s failed",
+                                     session_id[:8], exc_info=producer.exception())
+                    else:
+                        closed = producer.result()
         if not closed:
             logger.warning(
                 "wake capture: bracket for %s did not close (source=%s) — "
                 "flushing partial", session_id[:8], source,
             )
     finally:
+        if _capturing.get(session_id) is translator:
+            del _capturing[session_id]
         if pump is not None and queue is not None:
             queue.put_nowait(CommonEvent(type=PRODUCER_DONE, data={}))
             try:

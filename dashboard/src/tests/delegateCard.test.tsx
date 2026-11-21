@@ -114,6 +114,28 @@ describe("every card sits on the person's side", () => {
     expect(within(card).getByTestId('delegate-card-preview')).toHaveTextContent('You now run on drill-sat. Continue the work.')
   })
 
+  it("the resume after the agent's reload reads Continued after the reload", () => {
+    renderList(dbMessagesToDisplay([row('event', '', 'schedule_wake', {
+      prompt: 'Your session was rebuilt. Continue the work.', source: 'reload',
+    })], AGENTS))
+    const card = screen.getByTestId('delegate-card')
+    expect(within(card).getByTestId('wake-card-label')).toHaveTextContent('Continued after the reload')
+    expect(within(card).queryByText('Continued after the move')).toBeNull()
+    expect(within(card).queryByText('Scheduled wake')).toBeNull()
+  })
+
+  it("the platform's own resume after its restart reads Continued after a restart", () => {
+    renderList(dbMessagesToDisplay([row('event', '', 'schedule_wake', {
+      prompt: 'OtoDock restarted in the middle of your turn. Continue the work.', source: 'continue',
+    })], AGENTS))
+    const card = screen.getByTestId('delegate-card')
+    expect(within(card).getByTestId('wake-card-label').textContent).toBe('Continued after a restart')
+    expect(within(card).queryByText('Continued after the reload')).toBeNull()
+    expect(within(card).queryByText('Scheduled wake')).toBeNull()
+    expect(within(card).getByTestId('delegate-card-preview'))
+      .toHaveTextContent('OtoDock restarted in the middle of your turn. Continue the work.')
+  })
+
   it("a task run's own prompt is a card with its badge", () => {
     const msgs = dbMessagesToDisplay([row('user', 'count the files', '', {
       agent_slug: 'worker', agent_display_name: 'Worker Agent', agent_color: '', badge: 'task prompt',

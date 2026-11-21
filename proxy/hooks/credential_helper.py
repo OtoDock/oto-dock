@@ -64,8 +64,9 @@ _REFUSE_UPDATE = (
 )
 _REFUSE_UNREACHABLE = "the platform cannot be reached to fetch the credential"
 _REFUSE_MCP = "the command-line credential is not available to MCP servers"
-# A satellite below 0.5.139 refuses the route on its tunnel with exactly
-# this body; a 403 with any other body is a refusal of the platform's.
+# The body a satellite's tunnel answers for a route it does not admit. A
+# satellite below 0.5.139 refused this route so, and none that old signs in
+# now. A 403 with any other body is a refusal of the platform's.
 _OLD_TUNNEL_REFUSAL = {"error": "path-not-allowlisted"}
 # The wrapper directories a command has already passed through, so a
 # helper never hands the command back to a wrapper (``_real_command``).
@@ -262,6 +263,11 @@ def _run(host: str, command: str, args: list[str]) -> int:
         for name in answer.get("env") or []:
             if isinstance(name, str) and name:
                 env[name] = answer["password"]
+        # On a paired computer the credential exit's variables, so the real
+        # command reaches the host through the exit with its placeholder.
+        for key, value in (answer.get("process_env") or {}).items():
+            if isinstance(key, str) and key and isinstance(value, str):
+                env[key] = value
     argv = [real, *args]
     # The command and its arguments are the person's own command line, handed
     # to the real binary found past this wrapper; the environment is this

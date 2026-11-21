@@ -1,0 +1,185 @@
+{
+ "char-context": {
+  "json": {
+   "type": "none"
+  },
+  "none": {
+   "type": "none"
+  },
+  "toml": {
+   "type": "none"
+  }
+ },
+ "char-http": {
+  "json": {
+   "type": "http",
+   "url": "http://localhost:8932/mcp/"
+  },
+  "none": {
+   "type": "http",
+   "url": "http://localhost:8932/mcp/"
+  },
+  "toml": {
+   "type": "streamable-http",
+   "url": "http://localhost:8932/mcp/"
+  }
+ },
+ "char-keyed": {
+  "json": {
+   "type": "http",
+   "url": "https://api.example.test/mcp"
+  },
+  "none": {
+   "type": "http",
+   "url": "https://api.example.test/mcp"
+  },
+  "toml": {
+   "type": "streamable-http",
+   "url": "https://api.example.test/mcp"
+  }
+ },
+ "char-sse": {
+  "json": {
+   "type": "sse",
+   "url": "https://sse.example.test/sse"
+  },
+  "none": {
+   "type": "sse",
+   "url": "https://sse.example.test/sse"
+  },
+  "toml": {
+   "type": "sse",
+   "url": "https://sse.example.test/sse"
+  }
+ },
+ "char-tools": {
+  "json": {
+   "args": [
+    "<tmp>/mcps/custom/char-tools/server.py",
+    "--mode",
+    "fast",
+    "char-reg",
+    "quote\"and\\back",
+    "line\nbreak"
+   ],
+   "command": "<tmp>/mcps/custom/char-tools/venv/bin/python",
+   "env": {
+    "CHAR_AGENT": "char-reg",
+    "CHAR_ASK": "",
+    "CHAR_CHAT": "",
+    "CHAR_DIR": "<tmp>/mcps/custom/char-tools/data",
+    "CHAR_LIMIT": "9",
+    "CHAR_MASTER": "${proxy_api_key}",
+    "CHAR_MODE": "fast",
+    "CHAR_OFF": "false",
+    "CHAR_ON": "true",
+    "CHAR_OWNER": "",
+    "CHAR_PROXY": "http://localhost:<port>",
+    "CHAR_REF": "http://192.168.77.10:9100/metrics",
+    "CHAR_ROOT": "<platform-root>/x",
+    "CHAR_SAVED": "saved",
+    "CHAR_SCOPE": "",
+    "CHAR_STATIC": "1",
+    "CHAR_USER": ""
+   },
+   "tool_timeout_sec": 120,
+   "type": "stdio"
+  },
+  "none": {
+   "args": [
+    "<tmp>/mcps/custom/char-tools/server.py",
+    "--mode",
+    "fast",
+    "char-reg",
+    "quote\"and\\back",
+    "line\nbreak"
+   ],
+   "command": "<tmp>/mcps/custom/char-tools/venv/bin/python",
+   "env": {
+    "CHAR_AGENT": "char-reg",
+    "CHAR_ASK": "",
+    "CHAR_CHAT": "",
+    "CHAR_DIR": "<tmp>/mcps/custom/char-tools/data",
+    "CHAR_LIMIT": "9",
+    "CHAR_MASTER": "${proxy_api_key}",
+    "CHAR_MODE": "fast",
+    "CHAR_OFF": "false",
+    "CHAR_ON": "true",
+    "CHAR_OWNER": "",
+    "CHAR_PROXY": "http://localhost:<port>",
+    "CHAR_REF": "http://192.168.77.10:9100/metrics",
+    "CHAR_ROOT": "<platform-root>/x",
+    "CHAR_SAVED": "saved",
+    "CHAR_SCOPE": "",
+    "CHAR_STATIC": "1",
+    "CHAR_USER": ""
+   },
+   "tool_timeout_sec": 120,
+   "type": "stdio"
+  },
+  "toml": {
+   "args": [
+    "<tmp>/mcps/custom/char-tools/server.py",
+    "--mode",
+    "fast",
+    "char-reg",
+    "quote\"and\\back",
+    "line\nbreak"
+   ],
+   "command": "<tmp>/mcps/custom/char-tools/venv/bin/python",
+   "env": {
+    "CHAR_AGENT": "char-reg",
+    "CHAR_ASK": "",
+    "CHAR_CHAT": "",
+    "CHAR_DIR": "<tmp>/mcps/custom/char-tools/data",
+    "CHAR_LIMIT": "9",
+    "CHAR_MASTER": "${proxy_api_key}",
+    "CHAR_MODE": "fast",
+    "CHAR_OFF": "false",
+    "CHAR_ON": "true",
+    "CHAR_OWNER": "",
+    "CHAR_PROXY": "http://localhost:<port>",
+    "CHAR_REF": "http://192.168.77.10:9100/metrics",
+    "CHAR_ROOT": "<platform-root>/x",
+    "CHAR_SAVED": "saved",
+    "CHAR_SCOPE": "",
+    "CHAR_STATIC": "1",
+    "CHAR_USER": ""
+   },
+   "tool_timeout_sec": 120,
+   "type": "stdio"
+  }
+ },
+ "session_ctx": {
+  "args": [
+   "<tmp>/mcps/custom/char-tools/server.py",
+   "--mode",
+   "fast",
+   "char-reg",
+   "quote\"and\\back",
+   "line\nbreak"
+  ],
+  "command": "<tmp>/mcps/custom/char-tools/venv/bin/python",
+  "env": {
+   "CHAR_AGENT": "char-reg",
+   "CHAR_ASK": "1",
+   "CHAR_CHAT": "chat-1",
+   "CHAR_DIR": "<tmp>/mcps/custom/char-tools/data",
+   "CHAR_LIMIT": "9",
+   "CHAR_MASTER": "${proxy_api_key}",
+   "CHAR_MODE": "fast",
+   "CHAR_OFF": "false",
+   "CHAR_ON": "true",
+   "CHAR_OWNER": "owner",
+   "CHAR_PROXY": "http://localhost:<port>",
+   "CHAR_REF": "http://192.168.77.10:9100/metrics",
+   "CHAR_ROOT": "<platform-root>/x",
+   "CHAR_SAVED": "saved",
+   "CHAR_SCOPE": "user",
+   "CHAR_STATIC": "1",
+   "CHAR_USER": "own"
+  },
+  "tool_timeout_sec": 120,
+  "type": "stdio"
+ }
+}

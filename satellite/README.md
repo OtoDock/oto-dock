@@ -1,12 +1,13 @@
 # OtoDock Satellite
 
-The satellite is the daemon that runs on a remote Linux, macOS or Windows
-machine and hosts OtoDock agent sessions there. It keeps one **outbound**
+The satellite is the program that runs OtoDock agent sessions on a machine.
+It runs on a paired computer (a Linux, macOS or Windows machine an admin or a
+person pairs) and on a compute machine (the platform's own, which every install
+comes with, or one an admin adds on another server). It keeps one **outbound**
 websocket to the platform (`wss://<public-host>/v1/satellite`), receives
-commands, runs Claude Code and Codex sessions as direct subprocesses of its
-own user, and streams their events back. Hook callbacks, MCP traffic and the
-file sync ride that same websocket: the machine opens no port and needs no
-VPN.
+commands, runs Claude Code and Codex sessions as processes of its own user,
+and streams their events back. Hook callbacks, MCP traffic and the file sync
+ride that same websocket: a paired computer opens no port and needs no VPN.
 
 ## How it works
 
@@ -26,14 +27,16 @@ Platform (proxy)                    Satellite (remote machine)
 
 - **A dumb pipe.** Engine output goes to the platform verbatim. Every
   decision about a turn is the platform's.
-- **No sandbox here.** Sessions run on the host filesystem as the
-  satellite's user. The platform's permission gate decides what they may
-  touch, and the satellite checks host paths again itself.
+- **No sandbox on a paired computer.** Sessions there run on the host
+  filesystem as the satellite's user. The platform's permission gate decides
+  what they may touch, and the satellite checks host paths again itself. On a
+  compute machine every session runs in the platform's sandbox.
 - **Hooks ship with each session**, so the machine always runs the
   platform's current hook scripts.
 - **Agent folders sync** both ways in real time, and build folders stay local.
 - **Versioned.** The platform updates a satellite older than its own copy
-  over the websocket. The update ends the sessions the machine runs.
+  over the websocket. An automatic update waits until the machine runs no
+  session ("Updates" below).
 
 The wire (every frame, the capability gates, the sessions, file sync, MCP
 installs, the version history) is in [`PROTOCOL.md`](PROTOCOL.md).
@@ -45,8 +48,8 @@ Run with `python -m satellite`. The subpackages each own one concern.
 | Path | Responsibility |
 |---|---|
 | `__main__.py`, `config.py`, `engines.py`, `background.py` | `__main__.py` is the entry point and boot guard. `config.py` holds the host OS table (`config.HOST`), `SATELLITE_VERSION` and the vendored hashes. `engines.py` holds the `ENGINES` table. `background.py` holds `spawn(coro, name=, owner=)`, the one way to start a task nobody keeps: held until it ends, a death handed to the loop's exception handler under `owner:name`. |
-| `transport/` | the wire: `ws_client`, `lifecycle_update` (auto-update), `http_tunnel`, `mcp_gateway`, `file_sync` |
-| `sessions/` | engine sessions: `session_manager`, `cli_session`, `codex_session`, `alive_report`, `session_files`, `session_move` (a chat's session files moved on and off this machine, the `session_move` frame), `step_runner` (app steps and script checks, the `step_run` frame), `mcp_install_support` (MCP venvs on the satellite's own Python, the boot's reconcile, a failed install's cause), `mcp_interceptor` |
+| `transport/` | the wire: `ws_client`, `lifecycle_update` (auto-update), `http_tunnel`, `mcp_gateway`, `file_sync`, `compute_link` (what a compute machine takes from the link) |
+| `sessions/` | engine sessions: `session_manager`, `cli_session`, `codex_session`, `codex_files`, `alive_report`, `resume_probe`, `close_hold`, `start_slots` (how many sessions start at once), `memory_guard` (keeps the machine's memory reserve free), `session_homes` (a session's own home, so two sessions of one scope run on two accounts), `session_files` (a session's own secrets folder, wiped at its close), `session_move` (a chat's session files moved on and off this machine, the `session_move` frame), `step_runner` (app steps and script checks, the `step_run` frame), `mcp_install_support` (MCP venvs on the satellite's own Python, the boot's reconcile, a failed install's cause), `mcp_interceptor`, `credential_exit` (the credential exit on this machine: a session holds a placeholder for a tool's key, and the exit adds the value on the way out), `ssh_agent` (a session's SSH agent endpoint. Each message goes to the platform, which signs it, so no private key reaches the machine. A unix socket, and on Windows a named pipe through `ssh_agent_pipe`), and on a compute machine `sandbox_host` (the platform's sandbox, rendered here), `tool_relay` (Direct LLM's tool programs) and `app_server` (app servers) |
 | `terminal/` | interactive PTYs and the local `otodock` command: `local_socket`, `otodock_cli`, `otodock_proto`, `pty_session_base`, `pty_session`, `codex_pty_session`, `pty_relay`, `winpty_relay` |
 | `host/` | the machine: `host_probe`, `satellite_policy`, `auth_paths`, `safe_fs` (file opens beneath the agents root with no link followed), `env_hygiene`, `path_translator`, `cli_versions` (the CLI pins, and the npm and Mac tool folders put on `PATH` at start), `session_retention` (the retention sweep's keep list applied to the transcripts here), `interpreters` (Git Bash, its `env.exe` and the install's Python on Windows, for a script's first line), `tray`, `service_unit`, `macos_app` (`OtoDock Satellite.app`, the Mac's login item, which `install.sh` builds by running it as a script) |
 | `_vendored/` | byte-for-byte copies of proxy modules. Never edit them (see "Development"). |
@@ -56,39 +59,67 @@ broken auto-update back before any subpackage import is attempted.
 
 ### Where sessions run
 
-An admin pairs a machine and assigns agents to it (Admin, Remote Machines):
-every user of those agents runs there. A user may also pair a machine of
+An admin pairs a machine and assigns agents to it (Admin, Remote Machines).
+The agents' managers and admins run there. Other roles run there only when
+the machine's admin turns on "Every role of its agents runs here". A user may also pair a machine of
 their own (User Settings, Remote Machines) and make it their active target,
 unless an admin turned personal pairing off. A user's target wins over the
-agent's, which wins over the platform itself. When a user's machine is
+agent's, which wins over the platform's compute machines. When a user's machine is
 offline the session falls back to the agent's target (the
 `remote_fallback_user_override` setting, on by default).
 
+A **compute machine** is different. Nobody owns it, and every session of the
+platform's own place runs on one, in the platform's own sandbox. Every install
+comes with one beside the platform. An admin may add more on other servers
+(Remote Machines, Compute machines), and the platform spreads its sessions
+across the ones that are online. The one beside the platform reads the
+platform's folders through shared mounts and builds and keeps the community
+tools itself. One on another server keeps its own copy of the folders, which
+the platform syncs as it does a paired computer's. The satellite raises its sessions'
+OOM score above its own (`sessions/sandbox_host.with_oom_raise`, raise only), so
+the kernel takes a session before the machine's link. Its satellite runs in compute
+mode (`kind = compute`). It takes no code and no uninstall from the platform,
+and no update is ever pushed to it ("Updates" below).
+
 ### Updates
 
-- The platform updates a satellite older than its own copy over the
-  websocket when it reconnects, without waiting for a running turn: the
-  update ends the sessions the machine runs, and they stop mid-turn.
+- With automatic updates on (the default), the platform updates a satellite
+  older than its own copy over the websocket, and the satellite restarts once
+  for it. A machine that still runs a session takes the update once it runs
+  none. Update now on the Remote Machines page pushes it at once, which ends
+  the sessions the machine runs. It runs once. A second press is refused while
+  the update runs. A machine that is away takes it at its next sign-in.
+- A compute machine is never pushed an update. Its version is its image's, and
+  the platform refuses one that runs another version. One on another server
+  follows the platform's image through its host service.
+- The platform's protocol floor (`MIN_SATELLITE_VERSION`) is 0.5.196. A
+  satellite below it, such as every 1.9.1 machine (0.5.168), cannot connect
+  until it updates:
+  - With automatic updates on, it takes the update at its first sign-in,
+    before it serves a session. The machine shows offline for about 30
+    seconds, then online again on the platform's own version.
+  - With automatic updates off or paused, it is refused with an upgrade error
+    and stays offline until an admin clicks Update now. Its card says "Update
+    needed".
+  - On a plaintext link it opted into, it is refused and stays offline until
+    you run the installer again on that machine.
 - The Claude Code and Codex CLIs follow the platform's pins at every
   reconnect. Node, uv and pnpm move only when the install command runs
   again, and an update never changes the machine's Python.
-- A Mac paired before 1.9.1 finds its CLIs again after the update alone:
-  from 0.5.160 the satellite puts Homebrew's and your own tool folders in
-  front of its `PATH` at start. Homebrew's `python@3.13`, the login item's
-  `PATH` and `OtoDock Satellite.app` reach it only when you pair it again.
+- The satellite puts Homebrew's and your own tool folders in front of its
+  `PATH` at start. On a Mac paired before 1.9.1, Homebrew's `python@3.13`, the
+  login item's `PATH` and `OtoDock Satellite.app` arrive only when you pair it
+  again.
 - On an opted-in plaintext link (`allow_insecure_transport`) the satellite
   refuses updates and uninstalls from the platform: run the installer again
   to update it.
-- A satellite below the platform's protocol floor (`MIN_SATELLITE_VERSION`)
-  with auto-update turned off is refused with an upgrade error.
-- A permission prompt raised by the engine itself is answered through a
-  person only for a satellite at 0.5.140 or later. The platform refuses it at
-  once for an older one.
-- git and `gh` on a machine fetch the connected GitHub account's token per
-  command from 0.5.139. On an older satellite git refuses with a message that
-  names the update and `gh` runs as the plain command. A credential the
-  platform revokes stops on the machine within seconds, and from 0.5.140 the
-  next call says why.
+- A permission prompt raised by the engine itself reaches a person as a card,
+  as it does on a compute machine.
+- git and `gh` on a machine ask the platform at each command. On a compute
+  machine and a Linux computer the agent never sees the token: OtoDock adds
+  the connected GitHub account's token to each request on the way out. On a
+  macOS or Windows computer each command gets the token for that command alone. A credential the platform revokes stops on the machine within
+  seconds, and the next call says why.
 
 ## Prerequisites
 
@@ -103,7 +134,7 @@ offline the session falls back to the agent's target (the
   Homebrew there and no Command Line Tools, the installer stops and asks
   you to run `xcode-select --install`. Without `python@3.13` it warns and
   builds on Homebrew's newest Python, where tools written in Python may not
-  install. From 0.5.160 the satellite builds every MCP's venv on its own
+  install. The satellite builds every MCP's venv on its own
   Python, since Homebrew's plain `python3` moves to a newer minor that no
   compiled package serves yet. Auto-update keeps the interpreter the
   venv was built on.
@@ -124,6 +155,14 @@ Remote Machines). The dialog shows an install command to run on the machine:
 bash <(curl -sL -H "X-Pairing-Token: <token>" "https://<public-host>/v1/satellite/bootstrap?os=linux")
 ```
 
+The command and the machine's socket use `https` and `wss`, except on an
+install served over plain `http://` at `localhost`, a loopback address or a
+private LAN address written as a number (10.x, 172.16 to 172.31, 192.168.x,
+169.254.x, fc00::/7, fe80::/10). There they use `http` and `ws`, and the
+pairing crosses that network unencrypted, as signing in does. An install
+reached by any other name over plain HTTP keeps `https`, and its command
+fails.
+
 `/v1/satellite/bootstrap` returns a self-extracting script (bash, or
 PowerShell for Windows). It installs the developer toolchain through
 `scripts/install-baseline-tools.sh` (git, gh, Python with uv, Node with npm
@@ -132,6 +171,14 @@ CLIs, exchanges the pairing token for the machine secret, writes the config
 and registers a **per-user** service (a systemd user unit with
 `loginctl enable-linger`, a launchd LaunchAgent, or a Windows logon
 Scheduled Task). Nothing runs as root or SYSTEM.
+
+A compute machine on another server pairs through the same door. An admin adds
+it on the Remote Machines page and runs the command shown there on that Linux
+server with `sudo bash`. The script (`scripts/remote-compute-install.sh`) checks
+the server and makes the machine's secret there. It sends only the secret's
+hash, then starts the platform's image under the systemd unit
+`otodock-remote-compute.service`. The compute machine that comes with the
+platform needs no pairing.
 
 On a Mac run the install command as yourself: it refuses root, as Homebrew
 does, and the toolchain comes from Homebrew. npm and the git credential
@@ -213,13 +260,34 @@ otodock claude <agent> --resume         # pick a chat to resume first
 otodock claude <agent> --mode ask       # start in Ask (ask|auto|dontAsk|plan, default auto)
 ```
 
+The same command uses your OtoDock with a personal API key, made in User
+Settings (`terminal/otodock_api.py`, one standard-library file, which also runs
+alone on a machine with no satellite: download it there as `otodock.py`):
+
+```bash
+otodock login                                      # asks for the address and the key
+otodock agents
+otodock chat send --agent <agent> --wait "..."     # a new chat, prints the answer
+otodock chat send --chat <id> --wait "..."         # exit 0 done, 1 refused, 3 still running
+otodock tasks run --agent <agent> --wait "..."     # create a task and run it
+otodock files get --agent <agent> workspace/a.txt
+otodock notify "Build finished"
+```
+
+The key is saved where only you can read it, under this machine's OtoDock
+folder, which the machine's sessions are refused. These verbs refuse to run
+inside an agent's session. On a paired machine that is a guard and not a
+boundary: do not keep a key on a machine whose sessions you do not trust.
+
 `--mode` picks the session's permission mode: `ask`, `auto`, `dontAsk` or
 `plan`, `auto` when it is left out. The older words `default` and
 `acceptEdits` are still taken, as Ask and Auto.
 
 ## Configuration
 
-`~/.oto-dock/satellite.conf` (INI):
+`~/.oto-dock/satellite.conf` (INI). One satellite runs per home folder: a second one started with `--config`
+naming another file does not start while this file exists. Give it a home folder of its own. If the file is a
+leftover of a satellite that is gone, remove it.
 
 | Section | Key | Description |
 |---------|-----|-------------|
@@ -229,6 +297,9 @@ otodock claude <agent> --mode ask       # start in Ask (ask|auto|dontAsk|plan, d
 | | `agents_dir` | the local agent folders (default `~/.oto-dock/agents`) |
 | | `mcps_dir` | the local MCP servers (default `~/.oto-dock/mcps`) |
 | | `allow_insecure_transport` | `true` lets a plain `ws://` URL reach a public host (a split-horizon self-host). Such a link refuses updates and uninstalls (`PROTOCOL.md`, "Versions"). |
+| | `kind` | `compute` makes this process a compute machine: the platform's own, running the platform's sessions in the platform's sandbox (`PROTOCOL.md`, "Compute mode"). Not for a paired computer. |
+| | `files` | `own`, with `kind = compute`: a compute machine on another server. It keeps its own copy of the agents and tools folders, which the platform syncs. Without it the machine reads the platform's folders on shared mounts. |
+| | `tools` | `own`, with `kind = compute`: the install's own compute machine builds and keeps the community tools in a folder of its own. |
 | `[cli]` | `claude_bin` | a Claude Code CLI hint (default `claude`). When the platform ships CLI pins, the binary that satisfies the pin is what spawns. With no pin the hint decides. |
 | `[codex]` | `codex_bin` | a Codex CLI hint (default `codex`), resolved the same way |
 
@@ -245,6 +316,8 @@ The hint keys are the `conf_section` / `conf_key` of each engine's row in
 ├── .satellite-app.sha256     # macOS: the app's stamp. A match keeps the app and its permissions
 ├── steps/                    # app steps' scratch: one 0700 folder per running step, never synced
 ├── run/                      # the local control socket of the otodock command
+├── credential-exit/          # the credential exit's authority and trust bundle
+├── session-secrets/          # a session's own files (its SSH public keys), wiped at its close
 ├── agents/                   # agent folders, synced with the platform
 │   └── {agent-slug}/
 │       ├── config/           # agent config (the platform's, pushed)

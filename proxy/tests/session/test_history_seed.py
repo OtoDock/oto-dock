@@ -367,6 +367,7 @@ def test_a_move_without_its_files_reseeds_one_chat_at_the_chosen_place(temp_db):
     db.update_chat("moving", execution_target="m-office", session_id="sess-1",
                    codex_thread_id="thread-1", last_turn_aborted=True,
                    context_used=120000)
+    remote_store.set_chat_compute_machine("moving", "rack-2")
     db.create_chat("staying", "user-1", "agent-x")
     db.update_chat("staying", execution_target="m-office", session_id="sess-2")
 
@@ -380,6 +381,7 @@ def test_a_move_without_its_files_reseeds_one_chat_at_the_chosen_place(temp_db):
     assert moved["session_id"] is None and moved["codex_thread_id"] is None
     assert moved["last_turn_aborted"] is False and moved["context_used"] == 0
     assert moved["pending_history_seed"] == "moved:mv-1"
+    assert moved["compute_machine"] == ""
     staying = db.get_chat("staying")
     assert staying["execution_target"] == "m-office" and staying["session_id"] == "sess-2"
 
@@ -389,12 +391,15 @@ def test_a_move_with_its_files_keeps_the_ids(temp_db):
     db.create_chat("m2", "user-1", "agent-x")
     db.update_chat("m2", execution_target="local", session_id="sess-9",
                    context_used=5000, pending_history_seed="resume_failed")
+    remote_store.set_chat_compute_machine("m2", "rack-2")
     assert remote_store.rebind_chat_with_files(
         "m2", "m-office", expect_target="local", expect_session_id="sess-9",
         expect_thread=None) is True
     row = db.get_chat("m2")
     assert row["execution_target"] == "m-office" and row["session_id"] == "sess-9"
     assert row["context_used"] == 5000 and not row["pending_history_seed"]
+    # Its record moved with it: no compute machine on another host holds it.
+    assert row["compute_machine"] == ""
 
 
 def test_a_rebind_of_an_unknown_chat_changes_nothing(temp_db):
@@ -532,8 +537,13 @@ def test_a_revive_on_a_new_thread_reseeds_the_chat_bound_to_the_session(temp_db)
     from storage import database as db
     db.create_chat("c-rv", "user-1", "agent-x")
     db.update_chat("c-rv", session_id="sid-rv")
+    from core.session import start_context
+    start_context._held["sid-rv"] = {"memory": "h"}
     asyncio.run(codex_remote._reseed_after_revive("sid-rv"))
     assert db.get_chat("c-rv")["pending_history_seed"] == "resume_failed"
+    # The new thread holds none of the start's data: its next start sends it all.
+    assert "sid-rv" not in start_context._held and "sid-rv" in start_context._pending
+    start_context.ended("sid-rv")
     asyncio.run(codex_remote._reseed_after_revive("sid-nobody"))   # no chat: nothing
 
 

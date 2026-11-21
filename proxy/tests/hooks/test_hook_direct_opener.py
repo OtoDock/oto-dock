@@ -33,6 +33,10 @@ _SCRIPTS = [
     PROXY_DIR / "hooks" / "tool_result_forwarder.py",
     PROXY_DIR / "core" / "stdio_path_interceptor.py",
 ]
+_USAGE_REPORT = PROXY_DIR / "hooks" / "usage_report.py"
+#: Ends before it imports the network on most starts (a Claude start runs ten
+#: of them), so it opens its one call through an opener of its own.
+_START_CONTEXT = PROXY_DIR / "hooks" / "start_context.py"
 
 
 @pytest.fixture
@@ -122,11 +126,44 @@ def test_the_credential_helper_goes_direct(platform):
     assert "password=pw-from-the-platform" in out.stdout
 
 
-@pytest.mark.parametrize("script", _SCRIPTS, ids=lambda p: p.name)
+def test_the_usage_report_goes_direct(platform, tmp_path):
+    url, seen = platform
+    report = {"rate_limits": {"five_hour": {"used_percentage": 12, "resets_at": 1}}}
+    out = _run(_USAGE_REPORT, json.dumps(report), _env(url, TMPDIR=str(tmp_path)))
+    assert seen == ["/v1/hooks/usage-report"], out.stderr
+
+
+def test_the_start_context_goes_direct(platform):
+    url, seen = platform
+    out = _run(_START_CONTEXT, json.dumps({"source": "startup"}),
+               _env(url, CODEX_HOME="/nonexistent"), "1", "1")
+    assert seen == ["/v1/hooks/start-context"], out.stderr
+
+
+def test_the_start_context_never_changes_the_process_opener():
+    """It opens its call through its own no-proxy opener, after its early
+    ends: never ``install_opener``, never an import of the network at the
+    top."""
+    tree = ast.parse(_START_CONTEXT.read_text())
+    source = ast.unparse(tree)
+    assert "ProxyHandler({})" in source and "install_opener" not in source
+    top = [ast.unparse(node) for node in tree.body if not isinstance(node, (ast.If, ast.FunctionDef))]
+    assert not any("urllib" in line for line in top)
+
+
+def test_every_hook_script_that_calls_the_platform_goes_direct():
+    """The one list of the scripts a session installs: a new one that uses
+    urllib carries the no-proxy opener, or this fails."""
+    from core.sandbox.session_config_dir import HOOK_SCRIPTS
+    calls = [n for n in HOOK_SCRIPTS if "urllib" in (PROXY_DIR / "hooks" / n).read_text()]
+    assert {"permission_gate.py", "start_context.py", "usage_report.py"} <= set(calls)
+    assert [n for n in calls if "ProxyHandler({})" not in (PROXY_DIR / "hooks" / n).read_text()] == []
+
+
+@pytest.mark.parametrize("script", [*_SCRIPTS[:-1], _USAGE_REPORT], ids=lambda p: p.name)
 def test_every_script_installs_the_no_proxy_opener_when_run(script):
     """In its ``__main__`` block, never at import: a test that loads the
-    script keeps the process's own opener. The interceptor is checked here
-    alone (it wraps a stdio MCP, its call needs a broker token)."""
+    script keeps the process's own opener."""
     tree = ast.parse(script.read_text())
     main_blocks = [node for node in tree.body if isinstance(node, ast.If)
                    and "__name__" in ast.unparse(node.test)]
@@ -135,3 +172,19 @@ def test_every_script_installs_the_no_proxy_opener_when_run(script):
     assert "urllib.request.install_opener(" in block and "ProxyHandler({})" in block
     top = [ast.unparse(node) for node in tree.body if not isinstance(node, (ast.If, ast.FunctionDef))]
     assert not any("install_opener" in line for line in top)
+
+
+def test_the_interceptor_installs_it_at_its_first_call_when_run(platform):
+    """The interceptor loads urllib only when it first calls (a stand-in
+    waits for its tool's first call without it): its ``__main__`` block
+    owes the opener, and the fetch at its tool's start goes direct."""
+    script = _SCRIPTS[-1]
+    tree = ast.parse(script.read_text())
+    main_blocks = [node for node in tree.body if isinstance(node, ast.If)
+                   and "__name__" in ast.unparse(node.test)]
+    assert len(main_blocks) == 1 and "opener_owed" in ast.unparse(main_blocks[0])
+    top = [ast.unparse(node) for node in tree.body if not isinstance(node, (ast.If, ast.FunctionDef))]
+    assert not any("install_opener" in line or "import urllib.request" in line for line in top)
+    url, seen = platform
+    _run(script, "", _env(url, OTO_MCP_FETCH_TOKEN="cap"), "--", sys.executable, "-c", "pass")
+    assert seen == ["/v1/hooks/mcp-credentials"]

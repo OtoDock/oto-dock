@@ -92,6 +92,11 @@ class ServerConfig:
     docker_compose: str = ""
     port: int = 0
     health_endpoint: str = ""
+    # A Docker tool's own answer to "are you working?" (``GET`` this path,
+    # ``{"busy": true|false}``): the idle sweep keeps a tool that says yes
+    # awake for a bounded time (``services/containers/idle.py``). "" = never
+    # asked, the tool sleeps by its use alone.
+    busy_endpoint: str = ""
     url_template: str = ""
     # Opt-in for Docker/HTTP MCPs that call back to the proxy hooks
     # (resolve-path, document-preview, file-written, images). When true, the
@@ -125,11 +130,16 @@ class ServerConfig:
     # build backend runs on the host; a catalog entry names an exception here
     # (a dependency with no wheel) and the curation review sees it.
     source_build: list[str] = field(default_factory=list)
-    # Seconds Codex gives one tool call of this server before it fails the
-    # call; 0 leaves Codex's own default (60 s, short of a media generation
-    # or a document conversion). Written as ``tool_timeout_sec`` into the
-    # Codex TOML only: Claude Code has its own limit and reads no such key.
+    # Seconds one tool call of this server may take; 0 leaves each engine its
+    # own (Codex's 60 s, Claude Code's 5 silent minutes over HTTP), short of a
+    # media generation or a document conversion. Written as each engine's own
+    # key (``mcp_session_config.call_limit_s``).
     tool_timeout_sec: int = 0
+    # When a session starts this server's program: at the agent's first call
+    # to one of its tools (the default; a stand-in answers its tool list
+    # until then, services/mcp/tool_listing.py), or with the chat, for a
+    # server whose list reads live data a saved answer could not repeat.
+    starts: str = "first_call"
 
 
 @dataclass
@@ -153,6 +163,13 @@ class CredentialConfig:
     # Security tab under the manifest's name. Validated at parse
     # (``mcp_manifest_parse._validate_api_key_header``).
     api_key_header: dict | None = None
+    # The secrets the tool sends in a header of its own toward declared
+    # hosts: ``[{key, header, prefix, hosts}]``, the dicts as declared. The
+    # credential exit may hand the tool a placeholder for ``key`` and write
+    # ``prefix`` + the value in ``header`` on the way out; the hosts join
+    # the MCP's allowlist rows under the manifest's name. Validated at parse
+    # (``mcp_manifest_blocks._validate_exit``).
+    exit: list[dict] | None = None
     ui_type: str = ""
     has_service_account: bool = False
     app_credential_fields: list[dict[str, str]] = field(default_factory=list)
@@ -211,9 +228,7 @@ class SystemRequirements:
 
     Each OS key is a list of package names understood by that distro's package
     manager. The installer uses these for pre-install dependency checks and
-    (when MCP_AUTO_INSTALL_SYSTEM_DEPS=true) invokes the local package manager
-    to install missing ones. Otherwise it logs a clear warning so admins can
-    install manually.
+    logs a clear warning for a missing one, so admins can install it.
 
     node_min is an interpreter version floor — the installer rejects an MCP
     early if the local node is too old, avoiding cryptic npm errors later. (A
@@ -273,7 +288,6 @@ class PathEnvDecl:
       - ``shared_workspace``: `/workspace` (manager+ user-scoped, agent-scoped) |
         empty (viewer)
       - ``config``: `/config` (manager+ user-scoped only) | empty
-      - ``credentials_dir``: `/users/{u}/{subpath}` | `/workspace/{subpath}`
 
     Exactly one of ``role`` or ``values`` must be set; the parser enforces
     this and skips invalid entries.
@@ -402,6 +416,9 @@ class CostRule:
     amount: float                            # base price (USD)
     match: dict[str, Any] = field(default_factory=dict)  # arg-equality conditions; {} = catch-all
     multiply_by: str = ""                    # optional integer arg name; missing/garbage → multiplier 1
+    # Words the tool's answer must contain: a default that hangs on a credential
+    # cannot show in the arguments, so the answer names the model that ran.
+    result_has: str = ""
 
 
 @dataclass
@@ -682,6 +699,10 @@ class McpManifest:
     # for the vast majority of MCPs.
     network_targets: list[NetworkTargetDecl] = field(default_factory=list)
     network_access_default: bool = True  # default state of the _network_access toggle
+    # A Docker MCP whose container closes its own local network when the
+    # platform asks (``OTODOCK_LOCAL_NETWORK=closed``: the platform browser).
+    # The same ``_network_access`` approval decides it, off on a hosted install.
+    network_exit: bool = False
     instances: InstanceConfig | None = None  # per-instance, per-agent config
     data_dirs: dict[str, str] = field(default_factory=dict)
     sandbox_mounts: list[SandboxMountDef] = field(default_factory=list)
@@ -714,6 +735,9 @@ class McpManifest:
     replaces: list[ReplacesDecl] = field(default_factory=list)
     patched: bool = False
     patch_note: str | None = None
+    # The manifest still names the token folder role an earlier release
+    # delivered through: its tool needs an update from the catalog.
+    legacy_token_dir: bool = False
     manifest_path: Path = field(default_factory=lambda: Path("."))
     mcp_dir: Path = field(default_factory=lambda: Path("."))
 

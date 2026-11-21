@@ -66,7 +66,14 @@ def init_agents(conn) -> None:
             -- ``execution_path`` and ``execution_paths`` together are the
             -- engines the agent MAY run on: each person's sessions take
             -- their own engine among them (services/engines/engine_resolution.py).
-            local_only_engines TEXT NOT NULL DEFAULT ''
+            local_only_engines TEXT NOT NULL DEFAULT '',
+            -- The team account (services/mcp/account_context.py): on a
+            -- collaborative agent, every session with a person behind it
+            -- runs the tools on the agent's own accounts, from the floor
+            -- role up; below it a person gets no account for those tools.
+            team_account BOOLEAN NOT NULL DEFAULT FALSE,
+            team_account_floor TEXT NOT NULL DEFAULT 'editor'
+                CHECK (team_account_floor IN ('viewer', 'contributor', 'editor', 'manager'))
         )
     """)
     conn.execute("""
@@ -116,6 +123,64 @@ def init_agents(conn) -> None:
         CREATE TABLE IF NOT EXISTS platform_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+
+def init_outside(conn) -> None:
+    """What an agent's managers picked for outside people (a caller on the
+    agent's phone line, a visitor who is not a member): the tools, each Read
+    only, Read and write or a custom list of function names; the person's
+    own files, the web, the knowledge folders and the apps. Nothing is
+    picked by default. ``services/mcp/outside_picks.py`` reads the tables. After a
+    conversation: whether the agent writes down what it learned
+    (``wrapup_enabled``, on), whether that keeps a note for the team
+    (``shared_notes``, off) and the model it runs on (``wrapup_model``, ''
+    = the agent's own)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_outside (
+            agent_name TEXT PRIMARY KEY,
+            files_access TEXT NOT NULL DEFAULT 'read_only'
+                CHECK (files_access IN ('read_only', 'read_write')),
+            web BOOLEAN NOT NULL DEFAULT FALSE,
+            knowledge TEXT NOT NULL DEFAULT '[]',
+            shared_notes BOOLEAN NOT NULL DEFAULT FALSE,
+            wrapup_model TEXT NOT NULL DEFAULT '',
+            wrapup_enabled BOOLEAN NOT NULL DEFAULT TRUE
+        )
+    """)
+    # ``granted`` keeps the read-only functions the labels gave when a Read
+    # only pick was made; a later listing that changes the set stamps
+    # ``changed_at`` and tells the managers (services/mcp/outside_picks.py).
+    # ``governs`` says which sessions a row is for: outside people (a pick,
+    # which opens a tool to them), the agent's own runs or people's chats (a
+    # limit, which narrows a tool the agent has: services/mcp/tool_limits.py).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_outside_tools (
+            agent_name TEXT NOT NULL,
+            mcp_name TEXT NOT NULL,
+            access TEXT NOT NULL
+                CHECK (access IN ('read_only', 'read_write', 'custom')),
+            functions TEXT NOT NULL DEFAULT '[]',
+            granted TEXT NOT NULL DEFAULT '[]',
+            changed_at TEXT NOT NULL DEFAULT '',
+            governs TEXT NOT NULL DEFAULT 'outside'
+                CHECK (governs IN ('outside', 'runs', 'chats')),
+            PRIMARY KEY (agent_name, mcp_name, governs)
+        )
+    """)
+    # The apps a manager opened to outside people, by the app row's id (a
+    # purged slug never moves a pick to a new app). ``methods`` keeps the
+    # methods the app opened to outside people when it was picked; a later
+    # release that changes them stamps ``changed_at`` and tells the
+    # managers (services/mcp/outside_picks.py). 2.0's own table.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_outside_apps (
+            agent_name TEXT NOT NULL,
+            app_id TEXT NOT NULL,
+            methods TEXT NOT NULL DEFAULT '[]',
+            changed_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (agent_name, app_id)
         )
     """)
 
@@ -176,6 +241,11 @@ def init_departments(conn) -> None:
             ended_at TEXT
         )
     """)
+    # The places in ``lines`` of the lines that say something was not done
+    # (the dialog never folds them). An install that made the table before
+    # gains it here, every earlier job with none.
+    conn.execute("ALTER TABLE set_installs ADD COLUMN IF NOT EXISTS "
+                 "not_done JSONB NOT NULL DEFAULT '[]'::jsonb")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_set_installs_set ON set_installs (set_slug, status)")
     # One running job per set: the insert is the claim, so two starts
     # close together never both run (the second answers 409).
@@ -198,6 +268,28 @@ def init_departments(conn) -> None:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_department_levels_dept
         ON department_levels(department_id)
+    """)
+    # The agent a set install placed for each member template of its set
+    # (``agent`` '' when it placed none): what a binding that names that
+    # template reaches from inside the department (services/apps/
+    # binding_target.py). Written by a set install's placement
+    # (db_departments.place_members) and by a hand placement into an empty
+    # place (db_departments.fill_place); an agent's delete empties its rows.
+    # Whole-table CREATE: a new table converges existing installs at startup,
+    # and a department made before it records nothing.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS department_set_members (
+            department_id TEXT NOT NULL REFERENCES departments(id)
+                ON DELETE CASCADE,
+            template TEXT NOT NULL,
+            agent TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (department_id, template)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_department_set_members_agent
+        ON department_set_members(agent)
     """)
 
 
@@ -262,6 +354,38 @@ def init_memory(conn) -> None:
 ENGINE_ALLOWLIST_WIDENED_FLAG = "engine_allowlist_widened"
 
 
+def _primary_key(conn, table: str) -> tuple[str, list[str]] | None:
+    """``(name, columns in key order)`` of ``table``'s primary key, None
+    when it has none."""
+    row = conn.execute(
+        "SELECT c.conname AS name, ("
+        "  SELECT array_agg(a.attname::text ORDER BY k.ord) FROM unnest(c.conkey) WITH ORDINALITY k(attnum, ord) "
+        "  JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum"
+        ") AS cols FROM pg_constraint c "
+        "JOIN pg_class t ON t.oid = c.conrelid "
+        "JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "WHERE t.relname = %s AND n.nspname = current_schema() AND c.contype = 'p'",
+        (table,),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["name"], list(row["cols"] or [])
+
+
+def _widen_outside_tools_key(conn) -> None:
+    """The primary key of ``agent_outside_tools`` takes ``governs``: the
+    two-column key of an install that made the table before the column is
+    dropped by its name and the three-column one added. Idempotent."""
+    key = _primary_key(conn, "agent_outside_tools")
+    if key is None or key[1] == ["agent_name", "mcp_name", "governs"]:
+        return
+    name = '"' + key[0].replace('"', '""') + '"'
+    conn.execute(f"ALTER TABLE agent_outside_tools DROP CONSTRAINT {name}")
+    conn.execute("ALTER TABLE agent_outside_tools ADD PRIMARY KEY (agent_name, mcp_name, governs)")
+    import logging
+    logging.getLogger(__name__).info("agent_outside_tools: the key now names which sessions a row governs")
+
+
 def migrate_agents(conn, *, engines=()) -> None:
     """The agents domain's forward migrations on an existing install
     (``run_migrations`` calls it once; every step is idempotent; the next
@@ -280,12 +404,42 @@ def migrate_agents(conn, *, engines=()) -> None:
     (the test fixture, the standalone scheduler) widens nothing and leaves
     the flag unset, so the next proxy boot widens.
     """
+    # 2.0: after a conversation, the note for the team, the wrap-up's model
+    # and whether it runs at all (the table is 2.0's own; an install that
+    # made it before these columns gains them here, every agent's wrap-up
+    # on as it was).
+    conn.execute("ALTER TABLE agent_outside ADD COLUMN IF NOT EXISTS "
+                 "shared_notes BOOLEAN NOT NULL DEFAULT FALSE")
+    conn.execute("ALTER TABLE agent_outside ADD COLUMN IF NOT EXISTS "
+                 "wrapup_model TEXT NOT NULL DEFAULT ''")
+    conn.execute("ALTER TABLE agent_outside ADD COLUMN IF NOT EXISTS "
+                 "wrapup_enabled BOOLEAN NOT NULL DEFAULT TRUE")
     for column in ("community_set", "community_set_version"):
         conn.execute(f"ALTER TABLE departments ADD COLUMN IF NOT EXISTS {column} TEXT NOT NULL DEFAULT ''")
     conn.execute(
         "ALTER TABLE agents "
         "ADD COLUMN IF NOT EXISTS local_only_engines TEXT NOT NULL DEFAULT ''"
     )
+    # Days an agent keeps its history (services/infra/history_retention.py), 0 is off.
+    conn.execute(
+        "ALTER TABLE agents "
+        "ADD COLUMN IF NOT EXISTS history_retention_days INTEGER NOT NULL DEFAULT 0"
+    )
+    # 2.0: the team account and its role floor (services/mcp/account_context.py).
+    conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS team_account BOOLEAN NOT NULL DEFAULT FALSE")
+    conn.execute(
+        "ALTER TABLE agents ADD COLUMN IF NOT EXISTS team_account_floor TEXT NOT NULL DEFAULT 'editor' "
+        "CHECK (team_account_floor IN ('viewer', 'contributor', 'editor', 'manager'))"
+    )
+    # 2.0: a tool pick row says which sessions it governs. An install that
+    # made the table before the column keeps every outside pick exactly as
+    # it was, under 'outside', and its key widens to the three columns. No
+    # savepoint: a half-widened key would refuse every later write.
+    conn.execute(
+        "ALTER TABLE agent_outside_tools ADD COLUMN IF NOT EXISTS governs TEXT NOT NULL DEFAULT 'outside' "
+        "CHECK (governs IN ('outside', 'runs', 'chats'))"
+    )
+    _widen_outside_tools_key(conn)
     engines = [e for e in engines if e]
     if not engines:
         return

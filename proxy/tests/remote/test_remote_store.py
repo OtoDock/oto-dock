@@ -72,6 +72,7 @@ class TestExchangePairingToken:
         mock_db.execute.return_value.fetchone.return_value = {
             "pairing_token_hash": token_hash,
             "pairing_token_created_at": now,
+            "pairing_scope": "admin",
         }
         # The exchange UPDATE is conditional on the hash still being present
         # and requires exactly one affected row (atomic one-time use).

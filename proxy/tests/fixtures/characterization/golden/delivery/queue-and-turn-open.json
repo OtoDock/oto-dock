@@ -1,0 +1,16 @@
+{
+ "armed": [
+  "c-queued"
+ ],
+ "sleeps": [
+  1.0,
+  1.0,
+  1.0
+ ],
+ "wait": {
+  "a dead terminal": false,
+  "never open": false,
+  "open at once": true,
+  "open on the second look": true
+ }
+}

@@ -14,6 +14,7 @@ vi.mock('@/api/chats', async (importOriginal) => {
     ...orig,
     useDeleteChat: () => ({ mutate: deleteMutateMock }),
     useRenameChat: () => ({ mutate: renameChatMutateMock }),
+    useSetChatPinned: () => ({ mutate: vi.fn() }),
     useSearchChats: (...args: unknown[]) => searchMock(...args as []),
   }
 })

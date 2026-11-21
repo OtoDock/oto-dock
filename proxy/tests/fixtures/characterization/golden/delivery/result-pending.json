@@ -1,0 +1,39 @@
+{
+ "saved": [
+  [
+   "s-pend",
+   "ECHO TEXT"
+  ]
+ ],
+ "seen": {
+  "admission": [],
+  "frames": [],
+  "layer": [
+   [
+    "is_session_alive",
+    "s-pend"
+   ],
+   [
+    "send_message",
+    "s-pend",
+    "RESULT"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "",
+    "execution_target": "",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "manager",
+    "user_sub": null
+   }
+  ],
+  "released": [],
+  "seats": []
+ }
+}

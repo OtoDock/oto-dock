@@ -15,7 +15,7 @@ restart that cut it) follows the last answer since the switch. Text a turn
 saves while it still runs (a steer's early save, a meeting's, a long turn's
 checkpoints) is no answer yet. A switch whose new engine never answers well
 keeps the files. Every row ends after ``WINDOW``, answered or not (a machine
-that never comes back, or never updates), and then the files stay. A
+that never comes back), and then the files stay. A
 session the chat names again, or that another chat or a task still names,
 stays too. A delete waits ``DELETE_WAIT_S`` at most: a machine that reads
 as reachable and does not answer is asked again later, never holding the
@@ -92,12 +92,11 @@ def _place_ready(place: str) -> bool | None:
     asked later, None when it is gone for good (a deleted machine)."""
     if placement.is_local(place):
         return True
-    from core.remote.satellite_connection import get_connection_manager
     from services.remote.remote_status import is_reachable
     from storage import remote_store
     if remote_store.get_remote_machine(place) is None:
         return None
-    return is_reachable(place) and get_connection_manager().satellite_supports_session_move(place)
+    return is_reachable(place)
 
 
 async def _drop(leftover_id: str) -> None:

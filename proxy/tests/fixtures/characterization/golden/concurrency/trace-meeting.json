@@ -1,0 +1,220 @@
+[
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 0,
+    "meeting": 2,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 2,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 3,
+    "fit_light": 15,
+    "reserved_mb": 2000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "two local and one on a machine"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 0,
+    "meeting": 2,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 2,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 3,
+    "fit_light": 15,
+    "reserved_mb": 2000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "the same people again"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 0,
+    "meeting": 4,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 12,
+    "reserved_mb": 2430,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "in-process participants"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "busy",
+   "user_message": "Too many active sessions. The platform is busy. Try again shortly, or close an idle chat."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 0,
+    "meeting": 4,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 12,
+    "reserved_mb": 2430,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "too many for the budget"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "host_memory",
+   "user_message": "This server is low on memory: 500 MB free, about 1400 MB needed to start. Free some memory on the server, then try again."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 0,
+    "meeting": 4,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 500,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 2430,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "too little memory"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "busy",
+   "user_message": "Too many active sessions. The platform is busy. Try again shortly, or close an idle chat."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 0,
+    "meeting": 4,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 12,
+    "reserved_mb": 2430,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "past the session cap"
+ },
+ {
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 0,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 0,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 5,
+    "fit_light": 25,
+    "reserved_mb": 0,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "released, the machine's id a no-op"
+ }
+]

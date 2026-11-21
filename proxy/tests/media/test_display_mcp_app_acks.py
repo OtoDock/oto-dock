@@ -608,3 +608,41 @@ async def test_a_waiting_secret_reads_as_a_sentence_in_the_list_and_the_status_t
                          "placed": []})
     text = _texts(await app_tools._handle_app_hook("list", {}))
     assert ". Waiting: STRIPE_SECRET_KEY is not set" in text and "— waiting" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_release_that_adds_a_server_says_why_it_waits(monkeypatch):
+    # The deploy answer names the server; with a changed manifest both
+    # reasons are said; a flag that is not a boolean is no flag.
+    _patch(monkeypatch, {"status": "pending approval", "release": 2, "app_id": "a1", "live_release": 1,
+                         "manifest_changed": False, "adds_server": True})
+    text = _texts(await app_tools._handle_deploy_hook("deploy", {"slug": "board"}))
+    assert "because it brings a server the live app does not run" in text, text
+    _patch(monkeypatch, {"status": "pending approval", "release": 2, "app_id": "a1", "live_release": 1,
+                         "manifest_changed": True, "adds_server": True})
+    text = _texts(await app_tools._handle_deploy_hook("deploy", {"slug": "board"}))
+    assert "because its app.json changed (or is new) and it brings a server the live app does not run" in text
+    _patch(monkeypatch, {"status": "pending approval", "release": 2, "app_id": "a1", "live_release": 1,
+                         "manifest_changed": False, "adds_server": "yes"})
+    text = _texts(await app_tools._handle_deploy_hook("deploy", {"slug": "board"}))
+    assert "brings a server" not in text and "this app's deploys need approval" in text
+    _patch(monkeypatch, {"status": "ok", "release": 1, "pending_release": 2, "deploy_state": "pending",
+                         "server": "static", "manifest_approved": True, "adds_server": True})
+    text = _texts(await app_tools._handle_deploy_hook("status", {"slug": "board"}))
+    assert ("The pending release brings a server the live app does not run, so a person approves it on "
+            "the card.") in text
+    _patch(monkeypatch, {"status": "ok", "release": 1, "pending_release": 2, "deploy_state": "pending",
+                         "server": "static", "manifest_approved": True, "adds_server": 1})
+    text = _texts(await app_tools._handle_deploy_hook("status", {"slug": "board"}))
+    assert "brings a server" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_first_release_that_waits_says_the_app_is_not_live_yet(monkeypatch):
+    # A new app's first release with a server waits even with nothing else
+    # to approve: the reply names the server and says nothing is live.
+    _patch(monkeypatch, {"status": "pending approval", "release": 1, "app_id": "a1", "live_release": 0,
+                         "manifest_changed": False, "adds_server": True})
+    text = _texts(await app_tools._handle_deploy_hook("deploy", {"slug": "board"}))
+    assert "because it brings a server the live app does not run" in text, text
+    assert "The app is not live until then." in text and "Viewers keep" not in text, text

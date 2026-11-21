@@ -1,0 +1,40 @@
+{
+ "chats": [
+  {
+   "agent": "warm-send-away",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "sid-undecided",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [
+   "sid-undecided"
+  ],
+  "messages": [],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [],
+  "started": []
+ },
+ "result": {
+  "raised": "TurnDeferred",
+  "session_id": "sid-undecided",
+  "unanswered": false
+ },
+ "slots": {
+  "acquired": [],
+  "released": []
+ }
+}

@@ -34,8 +34,6 @@ def layer(monkeypatch):
     fake = _Layer()
     from core.session import session_manager
     monkeypatch.setattr(session_manager, "find_layer_for_session", lambda sid: fake)
-    from core.remote import remote_file_flow
-    monkeypatch.setattr(remote_file_flow, "remote_machine_id", lambda sid: "")
     broadcasts: list[tuple[str, dict]] = []
     monkeypatch.setattr(session_state, "broadcast_chat_frame",
                         lambda cid, frame: broadcasts.append((cid, frame)))
@@ -110,31 +108,6 @@ async def test_a_phone_call_refuses_at_once(layer):
     engine_prompts.watch("s-ph", _request("r-ph"))
     await _settled("r-ph", timeout=1)
     assert layer.answers == [("s-ph", "r-ph", False, {"command": "rm -rf *"})]
-
-
-@pytest.mark.asyncio
-async def test_a_remote_request_waits_only_on_a_satellite_that_answers(layer, monkeypatch):
-    from core.remote import remote_file_flow
-    monkeypatch.setattr(remote_file_flow, "remote_machine_id", lambda sid: "m-1")
-    _kind("s-rem", "dashboard")
-    monkeypatch.setattr(engine_prompts, "ANSWER_SATELLITE_VERSION", "")
-    engine_prompts.watch("s-rem", _request("r-rem"))
-    await _settled("r-rem", timeout=1)
-    assert layer.answers[-1][2] is False
-    # A satellite at the answering version waits for the person.
-    monkeypatch.setattr(engine_prompts, "ANSWER_SATELLITE_VERSION", "0.5.140")
-    from core.remote import satellite_connection
-
-    class _Cm:
-        def satellite_version(self, machine_id):
-            return "0.5.141"
-    monkeypatch.setattr(satellite_connection, "get_connection_manager", _Cm)
-    engine_prompts.watch("s-rem", _request("r-rem2"))
-    await asyncio.sleep(0.05)
-    assert engine_prompts.owns("r-rem2")
-    session_state.resolve_permission("r-rem2", True)
-    await _settled("r-rem2")
-    assert layer.answers[-1][1:3] == ("r-rem2", True)
 
 
 @pytest.mark.asyncio
@@ -221,35 +194,26 @@ def test_the_request_names_the_session_that_raised_it():
 
 
 @pytest.mark.asyncio
-async def test_the_cli_session_writes_the_parsed_shape_to_stdin():
-    from core.layers.cli.session import PersistentSession
+async def test_the_answer_goes_to_the_sessions_machine_in_the_parsed_shape():
+    """The machine writes the frame's ``response`` into the CLI's stdin as
+    given (``satellite/tests/test_cli_session.py``, the permission answer)."""
+    from unittest.mock import AsyncMock, MagicMock
 
-    class _Stdin:
-        def __init__(self):
-            self.lines: list[bytes] = []
-
-        def write(self, b):
-            self.lines.append(b)
-
-        async def drain(self):
-            return None
-
-    class _Proc:
-        returncode = None
-
-        def __init__(self):
-            self.stdin = _Stdin()
-    session = PersistentSession.__new__(PersistentSession)
-    session.session_id = "s-cli"
-    session.proc = _Proc()
-    await session.send_control_response("r-cli", True, tool_input={"command": "ls"})
-    written = json.loads(session.proc.stdin.lines[0].decode())
-    assert written["response"]["response"] == {"behavior": "allow",
-                                               "updatedInput": {"command": "ls"}}
-    # A process gone: nothing written, nothing raised.
-    session.proc.returncode = 1
-    await session.send_control_response("r-cli", False)
-    assert len(session.proc.stdin.lines) == 1
+    from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
+    lay = RemoteExecutionLayer(MagicMock())
+    lay._cm.send_fire_and_forget = AsyncMock()
+    lay._sessions["s-cli"] = RemoteSessionInfo(
+        session_id="s-cli", machine_id="m1", agent_name="a",
+        execution_path="claude-code-cli", event_queue=asyncio.Queue())
+    await lay.answer_engine_prompt("s-cli", "r-cli", True, {"command": "ls"})
+    machine, frame = lay._cm.send_fire_and_forget.await_args.args
+    assert machine == "m1" and frame["type"] == "control_response"
+    assert (frame["session_id"], frame["request_id"], frame["approved"]) == ("s-cli", "r-cli", True)
+    assert frame["response"]["response"] == {"behavior": "allow",
+                                             "updatedInput": {"command": "ls"}}
+    # A session the layer does not hold: nothing sent, nothing raised.
+    await lay.answer_engine_prompt("s-gone", "r-cli", False, {})
+    assert lay._cm.send_fire_and_forget.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -347,59 +311,6 @@ async def test_a_decline_limit_outside_auto_is_refused_and_nothing_re_enters(lay
         assert changes == [] and not session_state.review_paused(sid)
     finally:
         session_state._session_modes.pop(sid, None)
-
-
-@pytest.mark.asyncio
-async def test_a_mode_picked_during_the_turn_survives_the_re_entry(layer, monkeypatch):
-    """The decline limit lands mid-turn; the person picks Ask before the
-    turn ends. The CLI layer re-enters only under the session's lock (after
-    the turn), reads the mode again there and leaves it: no control frame,
-    the session stays in Ask. With the mode still Auto it sends Ask then
-    Auto to the CLI, in the CLI's words, and writes no platform mode."""
-    from core.layers.cli import layer as cli_layer
-    sid = "sess-review-race"
-    sent: list = []
-
-    class _Session:
-        def __init__(self):
-            self.lock = asyncio.Lock()
-
-        async def send_control_request(self, subtype, **kw):
-            sent.append((subtype, kw))
-
-        async def send_control_response(self, request_id, approved, tool_input=None):
-            pass
-
-    session = _Session()
-
-    async def _get(session_id):
-        return session
-    monkeypatch.setattr(cli_layer, "get_persistent_session", _get)
-    cli = cli_layer.CLIExecutionLayer.__new__(cli_layer.CLIExecutionLayer)
-    from core.session import session_manager
-    monkeypatch.setattr(session_manager, "find_layer_for_session", lambda s: cli)
-    session_state.set_session_mode(sid, "autoReview")
-    try:
-        await session.lock.acquire()          # the turn holds the session
-        engine_prompts.note_frame(sid, _review_limit("rr0"), in_turn=True)
-        await asyncio.sleep(0.05)
-        session_state.set_session_mode(sid, "ask")   # the person's pick
-        session.lock.release()
-        await asyncio.sleep(0.05)
-        assert sent == []
-        assert session_state.get_session_mode(sid) == "ask"
-        # Still in Auto when the lock frees: the CLI leaves auto and comes back.
-        session_state.set_session_mode(sid, "autoReview")
-        assert await cli.reenter_review(sid) is True
-        assert sent == [("set_permission_mode", {"mode": "default"}),
-                        ("set_permission_mode", {"mode": "auto"})]
-        assert session_state.get_session_mode(sid) == "autoReview"
-    finally:
-        if session.lock.locked():
-            session.lock.release()
-        session_state.cleanup_session_permission_state(sid)
-        session_state._session_modes.pop(sid, None)
-        session_state._review_reentries.pop(sid, None)
 
 
 @pytest.mark.asyncio
@@ -538,25 +449,6 @@ async def test_a_record_is_used_once_and_expires(layer, plan_record):
     assert [rid for _s, rid, _ok, _i in layer.answers] == ["r-1"]
     engine_prompts.note_gate_allow("s-new", "toolu_new", "mcp__display__display_ui", digest)
     assert "s-old" not in engine_prompts._gate_allowed
-
-
-@pytest.mark.asyncio
-async def test_a_remote_record_waits_on_a_satellite_that_answers(layer, plan_record, monkeypatch):
-    """A satellite older than the answer's shape keeps today's path: the ask
-    is a card (refused at once there), never answered from the record."""
-    from core.remote import remote_file_flow, satellite_connection
-    monkeypatch.setattr(remote_file_flow, "remote_machine_id", lambda sid: "m-1")
-
-    class _CM:
-        def satellite_version(self, machine):
-            return "0.5.139"
-    monkeypatch.setattr(satellite_connection, "get_connection_manager", _CM)
-    engine_prompts.note_gate_allow("s-rem", "toolu_plan", "mcp__display__display_ui",
-                                   engine_prompts.input_digest({"html": "<p>x</p>"}))
-    engine_prompts.note_frame("s-rem", _plan_ask("r-rem"), in_turn=True)
-    await asyncio.sleep(0.05)
-    assert layer.answers == []
-    assert not engine_prompts.withdrawn_before_registered("r-rem")
 
 
 def _bypass_ask(rid: str, command: str = "cd out && rm -f *", tool_use_id: str = "toolu_rm",

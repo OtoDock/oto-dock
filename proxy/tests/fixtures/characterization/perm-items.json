@@ -92,7 +92,7 @@
   },
   "mode_restored": {
     "event_type": "mode_restored",
-    "mode": "default"
+    "mode": "ask"
   },
   "images": {
     "event_type": "images",

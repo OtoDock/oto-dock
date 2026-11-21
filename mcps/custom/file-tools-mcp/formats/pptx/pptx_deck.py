@@ -6,6 +6,7 @@ content type it loaded; templates, shows and their macro forms open here and
 are saved as the kind the target path names.
 """
 
+import os
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -55,16 +56,24 @@ def _register_main_types() -> None:
     _registered = True
 
 
-def open_presentation(path: str) -> Any:
-    """The presentation in ``path``, whichever PowerPoint kind it is."""
+def open_presentation(source: Any, name: str = "") -> Any:
+    """The presentation in ``source``, whichever PowerPoint kind it is: a
+    path (opened with ``shared.safe_open_read``: beneath the mount, no link
+    followed) or the binary file the caller holds, ``name`` its file name
+    for a message. The package is read whole at the open."""
     from pptx.package import Package
     from pptx.parts.presentation import PresentationPart
 
+    import shared
+
+    if isinstance(source, (str, os.PathLike)):
+        name = name or Path(source).name
     _register_main_types()
-    part = Package.open(path).main_document_part
+    with shared.reading(source) as fh:
+        part = Package.open(fh).main_document_part
     if not isinstance(part, PresentationPart) or part.content_type not in _MAIN_TYPE_BY_EXT.values():
         raise ValueError(
-            f"'{Path(path).name}' is not a PowerPoint presentation or template "
+            f"'{name or 'the file'}' is not a PowerPoint presentation or template "
             f"(its main part is {part.content_type})")
     return part.presentation
 

@@ -1,4 +1,45 @@
 {
+  "2.0.0": {
+    "everyone": [
+      {
+        "icon": "sparkle",
+        "title": "New models",
+        "text": "GPT-6.2 Sol, GPT-6.2 Astra and Claude Fable 5.2 are here."
+      },
+      {
+        "icon": "chat",
+        "title": "Pin a chat",
+        "text": "You can now pin a chat from your chat history."
+      },
+      {
+        "icon": "machine",
+        "title": "Computer control is faster",
+        "text": "The agent can do several actions in one go."
+      }
+    ],
+    "admins": [
+      {
+        "icon": "machine",
+        "title": "Compute machines",
+        "text": "Chats, tasks and tools now run on a compute machine. You can add more on other servers."
+      },
+      {
+        "icon": "backup",
+        "title": "Updates wait for open work",
+        "text": "From the next update on, OtoDock waits for open chats, tasks and calls."
+      },
+      {
+        "icon": "phone",
+        "title": "Outside people get what you pick",
+        "text": "Callers and link visitors get only what you pick on an agent's External identities card."
+      },
+      {
+        "icon": "sparkle",
+        "title": "AI engines updated",
+        "text": "OtoDock now runs Claude Code 2.1.325 and Codex 0.170.0."
+      }
+    ]
+  },
   "1.9.1": {
     "everyone": [
       {

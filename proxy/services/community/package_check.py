@@ -205,7 +205,8 @@ def _check_package_identity(pkg: _Package) -> None:
     """The name, the category and the server source."""
     data, errors, source, remote, name = pkg.data, pkg.errors, pkg.source, pkg.remote, pkg.name
     if isinstance(name, str) and name and not _is_safe_name(name):
-        errors.append(f"name {name!r} must be lowercase letters, digits, dashes and underscores")
+        errors.append(f"name {name!r} must be lowercase letters, digits, dashes and underscores, "
+                      "and not a number or localhost")
     if data.get("category") not in (None, "community"):
         errors.append("category must be \"community\" (core and custom ship with the platform)")
     if source and not remote and mcp_installer.parse_source(source) is None:
@@ -227,7 +228,8 @@ def _check_package_skill_files(pkg: _Package) -> None:
 
 
 def _check_package_container(pkg: _Package) -> None:
-    """A container runtime's compose file, image, address and version."""
+    """A container runtime's compose file, image, address and version, and
+    the ``with_platform`` start only the platform's own tools keep."""
     mcp_root, data, errors, warnings, server, rt = (
         pkg.mcp_root, pkg.data, pkg.errors, pkg.warnings, pkg.server, pkg.rt)
     compose_file = server.get("docker_compose") or ""
@@ -250,6 +252,9 @@ def _check_package_container(pkg: _Package) -> None:
             )
         if not str(data.get("version") or ""):
             errors.append("version must be set for a docker MCP (the image tag)")
+    if server.get("starts") == "with_platform":
+        warnings.append("server.starts: with_platform is for the platform's own tools, "
+                        "so this package's server starts at its first call")
 
 
 def _check_package_git_source(pkg: _Package) -> None:

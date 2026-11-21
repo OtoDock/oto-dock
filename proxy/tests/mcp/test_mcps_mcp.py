@@ -23,6 +23,10 @@ from tests._paths import CUSTOM_MCPS, load_mcp_server
 
 MCP_DIR = CUSTOM_MCPS / "mcps-mcp"
 
+_READ = {"list_enabled_mcps", "list_available_mcps", "list_community_mcps", "list_community_skills"}
+_REQUESTS = {"request_mcp_install", "request_mcp_access", "request_skill_install",
+             "disable_mcp_for_agent", "get_request_status", "cancel_my_request"}
+
 
 def _load_server(env: dict[str, str]):
     """Load ``mcps-mcp/server.py`` fresh with the supplied env vars.
@@ -59,6 +63,7 @@ class TestPermissionMatrix:
             "OTO_SCOPE": "user",
             "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "OTO_CAN_EDIT_AGENT": "true",
+            "OTO_USER_SUB": "sub-alice",
         })
         assert m.ENABLED_TOOLS == {
             "list_enabled_mcps",
@@ -81,6 +86,7 @@ class TestPermissionMatrix:
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
             "OTO_ROLE": "editor", "OTO_CAN_EDIT_AGENT": "true",
+            "OTO_USER_SUB": "sub-alice",
         })
         assert m.ENABLED_TOOLS == {"validate_mcp_package"}
 
@@ -102,49 +108,92 @@ class TestPermissionMatrix:
             "OTO_SCOPE": "user",
             "OTO_ROLE": "admin", "OTO_CAN_MANAGE_AGENT": "true",
             "OTO_CAN_EDIT_AGENT": "true",
+            "OTO_USER_SUB": "sub-alice",
         })
         manager = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
             "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "OTO_CAN_EDIT_AGENT": "true",
+            "OTO_USER_SUB": "sub-alice",
         })
         assert admin.ENABLED_TOOLS == manager.ENABLED_TOOLS
         # Explicit assertion the removed tools are gone.
         assert "install_mcp_admin" not in admin.ENABLED_TOOLS
         assert "enable_mcp_admin" not in admin.ENABLED_TOOLS
 
-    def test_agent_scope_cannot_disable(self):
-        """Foot-gun guard: scheduled tasks / phone / triggers must not be
-        able to unilaterally turn off MCPs the agent might need on the
-        next run. The change would be platform-wide, not session-local."""
+    def test_a_session_whose_token_names_nobody_cannot_disable(self):
+        """Foot-gun guard: a session with no person (the agent's own phone
+        line, a run) must not turn off an MCP the agent needs on its next
+        run, whatever role it carries. The change would be platform-wide,
+        not session-local."""
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "agent",
-            "OTO_ROLE": "",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true",
+            "OTO_USER_SUB": "",
         })
-        assert "disable_mcp_for_agent" not in m.ENABLED_TOOLS
+        assert m.ENABLED_TOOLS == _READ
 
-    def test_agent_scope_is_read_only(self):
-        """Tasks / phone / triggers / Shared-only agents — no user in the
-        session, so requests can't be created on anyone's behalf, and the
-        check route needs a signed-in person."""
+    def test_a_session_whose_token_names_nobody_reads_only(self):
+        """No person in the token: the check route refuses a caller with
+        none, so the list tools alone."""
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "agent",
             "OTO_ROLE": "", "OTO_CAN_EDIT_AGENT": "true",
         })
-        assert m.ENABLED_TOOLS == {
-            "list_enabled_mcps",
-            "list_available_mcps",
-            "list_community_mcps",
-            "list_community_skills",
+        assert m.ENABLED_TOOLS == _READ
+
+    def test_a_shared_only_chat_checks_a_package_and_requests_nothing(self):
+        """A Shared-only agent's chat mounts the agent's scope and its token
+        names the person whose turn built the session (OTO_USER_SUB). The
+        editor tier gets the check tool, as in a person's own scope. No
+        request tool: a request is one person's own act, made from that
+        person's own chat or from the dashboard."""
+        def tools(role: str) -> set[str]:
+            return _load_server({
+                "OTO_AGENT_NAME": "pa", "OTO_SCOPE": "agent", "OTO_ROLE": role,
+                "OTO_CAN_MANAGE_AGENT": "true" if role in ("manager", "admin") else "false",
+                "OTO_CAN_EDIT_AGENT": "true",
+                "OTO_USER_SUB": "sub-alice",
+            }).ENABLED_TOOLS
+        assert tools("editor") == tools("manager") == tools("admin") == _READ | {"validate_mcp_package"}
+
+    def test_the_matrix_at_both_scopes(self):
+        """Every scope, every role, a person or nobody. The tier flags come
+        from the proxy's own role rule (``core/sandbox/oto_env.py``), the
+        person from the token's subject: the check tool needs the editor
+        tier and a person at either scope, the request tools a manager in
+        their own scope."""
+        from auth import roles
+        check = {"validate_mcp_package"}
+        expected = {
+            ("user", "admin"): _READ | _REQUESTS | check,
+            ("user", "manager"): _READ | _REQUESTS | check,
+            ("user", "editor"): check,
+            ("user", "contributor"): set(),
+            ("user", "viewer"): set(),
+            ("agent", "admin"): _READ | check,
+            ("agent", "manager"): _READ | check,
+            ("agent", "editor"): _READ | check,
+            ("agent", "contributor"): _READ,
+            ("agent", "viewer"): _READ,
         }
+        for (scope, role), want in expected.items():
+            for sub in ("sub-alice", ""):
+                m = _load_server({
+                    "OTO_AGENT_NAME": "pa", "OTO_SCOPE": scope, "OTO_ROLE": role,
+                    "OTO_CAN_MANAGE_AGENT": "true" if roles.can_manage(role) else "false",
+                    "OTO_CAN_EDIT_AGENT": "true" if roles.can_edit(role) else "false",
+                    "OTO_USER_SUB": sub,
+                })
+                assert m.ENABLED_TOOLS == (want if sub else want - check), (scope, role, sub)
 
     def test_validate_package_renders_the_verdict(self, monkeypatch):
         m = _load_server({
             "OTO_AGENT_NAME": "pa", "OTO_SCOPE": "user",
-            "OTO_ROLE": "editor", "OTO_CAN_EDIT_AGENT": "true",
+            "OTO_ROLE": "editor", "OTO_CAN_EDIT_AGENT": "true", "OTO_USER_SUB": "sub-alice",
             "PROXY_URL": "http://test", "PROXY_API_KEY": "k",
         })
         seen = {}
@@ -186,6 +235,7 @@ class TestPermissionMatrix:
         m = _load_server({
             "OTO_AGENT_NAME": "pa", "OTO_SCOPE": "user",
             "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true",
+            "OTO_USER_SUB": "sub-alice",
             "PROXY_URL": "http://test", "PROXY_API_KEY": "k",
         })
         verdict = {"ok": True, "errors": [], "warnings": [], "summary": {"name": "weather-tools"}}

@@ -1,0 +1,114 @@
+{
+ "deferred": [
+  {
+   "base_hash": "s1",
+   "capture_reason": null,
+   "capture_side": null,
+   "clear_base": false,
+   "drop_tombstone": false,
+   "keep_mtime": null,
+   "notify_user": null,
+   "op": "pull",
+   "rel_path": "workspace/big.bin"
+  },
+  {
+   "base_hash": "s2",
+   "capture_reason": null,
+   "capture_side": null,
+   "clear_base": false,
+   "drop_tombstone": false,
+   "keep_mtime": null,
+   "notify_user": null,
+   "op": "pull",
+   "rel_path": "workspace/edge.bin"
+  }
+ ],
+ "foreground": [
+  {
+   "base_hash": "s3",
+   "capture_reason": null,
+   "capture_side": null,
+   "clear_base": false,
+   "drop_tombstone": false,
+   "keep_mtime": null,
+   "notify_user": null,
+   "op": "pull",
+   "rel_path": "workspace/under.bin"
+  },
+  {
+   "base_hash": "p",
+   "capture_reason": null,
+   "capture_side": null,
+   "clear_base": false,
+   "drop_tombstone": false,
+   "keep_mtime": null,
+   "notify_user": null,
+   "op": "push",
+   "rel_path": "workspace/big_push.bin"
+  },
+  {
+   "base_hash": "s4",
+   "capture_reason": null,
+   "capture_side": "platform",
+   "clear_base": false,
+   "drop_tombstone": false,
+   "keep_mtime": null,
+   "notify_user": null,
+   "op": "pull",
+   "rel_path": "workspace/conflict.bin"
+  },
+  {
+   "base_hash": null,
+   "capture_reason": null,
+   "capture_side": null,
+   "clear_base": true,
+   "drop_tombstone": false,
+   "keep_mtime": null,
+   "notify_user": null,
+   "op": "delete_satellite",
+   "rel_path": "workspace/gone.txt"
+  },
+  {
+   "base_hash": "s5",
+   "capture_reason": null,
+   "capture_side": null,
+   "clear_base": false,
+   "drop_tombstone": false,
+   "keep_mtime": null,
+   "notify_user": null,
+   "op": "noop",
+   "rel_path": "workspace/same.txt"
+  },
+  {
+   "base_hash": "s6",
+   "capture_reason": null,
+   "capture_side": null,
+   "clear_base": false,
+   "drop_tombstone": false,
+   "keep_mtime": null,
+   "notify_user": null,
+   "op": "pull",
+   "rel_path": "workspace/unlisted.bin"
+  }
+ ],
+ "manifest_request": {
+  "skipped=False": {
+   "agent_slug": "flow-agent",
+   "page_size": 4096,
+   "type": "request_manifest"
+  },
+  "skipped=True": {
+   "agent_slug": "flow-agent",
+   "page_size": 4096,
+   "report_skipped": true,
+   "type": "request_manifest"
+  }
+ },
+ "nothing_deferred": {
+  "a_copy": true,
+  "deferred": [],
+  "foreground": [
+   "workspace/under.bin"
+  ]
+ }
+}

@@ -12,14 +12,23 @@ returns None on a shape it does not recognise.
 
 from __future__ import annotations
 
+import logging
+import threading
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 from core.execution_layer import Scoped, Window, Windows, WindowSpec
 
+logger = logging.getLogger("otodock.subscription-windows")
+
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
+#: The source a terminal's status line report is stored under (its engine's
+#: ``usage.in_band`` declares it a hint).
+STATUSLINE_SOURCE = "claude_statusline"
+
 # The model families Claude scopes weekly windows by; the join between the
-# vendor's window label ("Fable") and a spawn's model id (claude-fable-5-1).
+# vendor's window label ("Fable") and a spawn's model id (claude-fable-5-2).
 FAMILIES = ("fable", "opus", "sonnet", "haiku")
 
 # The vendor's ``rateLimitType`` on a rejected stream event for an overall
@@ -32,7 +41,7 @@ _EVENT_TYPE_TO_KEY = {
 
 
 def model_family(model: str) -> str:
-    """``claude-fable-5-1`` → ``fable``; a name with no known family → ``""``."""
+    """``claude-fable-5-2`` → ``fable``; a name with no known family → ``""``."""
     m = (model or "").lower()
     for fam in FAMILIES:
         if fam in m:
@@ -219,12 +228,60 @@ def from_event(info: dict, specs: dict[str, WindowSpec]) -> Windows | None:
     return w
 
 
+def from_statusline(rate_limits, specs: dict[str, WindowSpec]) -> Windows | None:
+    """A terminal's status line input's ``rate_limits``: ``five_hour`` and
+    ``seven_day``, each a ``used_percentage`` and an epoch ``resets_at``.
+    Stored as a hint (``STATUSLINE_SOURCE``)."""
+    if not isinstance(rate_limits, dict):
+        return None
+    w = Windows(specs=specs, source=STATUSLINE_SOURCE)
+    for key in ("five_hour", "seven_day"):
+        d = rate_limits.get(key)
+        if key not in specs or not isinstance(d, dict):
+            continue
+        pct = _pct(d.get("used_percentage"))
+        if pct is None or not 0 <= pct <= 1000:
+            continue
+        w.windows[key] = Window(pct=pct, resets_at=_epoch_dt(d.get("resets_at")))
+    if not w.windows:
+        return None
+    for key, win in w.windows.items():
+        if win.pct >= 100:
+            w.reached = key
+            break
+    return w
+
+
+# The event's own fields (``rateLimitType``, ``status``), logged per session
+# when they change: which window the CLI says it watches while allowed. They
+# hold no secret. Until such an event is seen naming a model's window, the
+# readings take the whole-account windows from it alone.
+_EVENT_SEEN_MAX = 1024
+_event_seen: OrderedDict[str, tuple] = OrderedDict()
+_event_seen_lock = threading.Lock()
+
+
+def _note_event_fields(session_id: str, info: dict) -> None:
+    fields = (str(info.get("rateLimitType") or ""), str(info.get("status") or ""))
+    with _event_seen_lock:
+        if _event_seen.get(session_id) == fields:
+            return
+        _event_seen[session_id] = fields
+        _event_seen.move_to_end(session_id)
+        while len(_event_seen) > _EVENT_SEEN_MAX:
+            _event_seen.popitem(last=False)
+    logger.info("windows: rate_limit_event of %s: type=%s status=%s utilization=%s",
+                session_id[:8], fields[0] or "-", fields[1] or "-", info.get("utilization"))
+
+
 def record_event_async(session_id: str, info: dict) -> None:
     """A headless Claude session's ``rate_limit_event.rate_limit_info`` → a
     window sample on the session's account, off the event loop. The engine's
     own session and translator call this; shared code goes through
     ``ExecutionLayer.record_usage_event``."""
     from core.layers.cli.layer import _CLI_CAPABILITIES
+    if isinstance(info, dict):
+        _note_event_fields(session_id, info)
     w = from_event(info, {s.key: s for s in _CLI_CAPABILITIES.usage.windows})
     if w is not None:
         from services.engines import subscription_windows

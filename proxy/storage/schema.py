@@ -2,11 +2,11 @@
 
 ``init_schema`` (called once at startup, then by the test conftest) runs one
 ``init_*`` function per domain in foreign-key order. The functions live next
-to the stores of their tables: ``storage/<domain>/schema.py`` for the ten
-sub-packages, this module for the flat domains (remote machines, pinned
-apps, storage quotas). ``run_migrations`` carries the forward migrations for
-pre-existing installs and ``check_schema_drift`` is the boot guard for a
-column that never got one. Every CREATE TABLE / CREATE INDEX uses IF NOT
+to the stores of their tables: ``storage/<domain>/schema.py`` for the
+sub-packages, this module for the flat domains (remote machines, storage
+quotas). ``run_migrations`` runs the forward migrations for pre-existing
+installs, a domain's own ``migrate_*`` or inline, and ``check_schema_drift`` is
+the boot guard for a column that never got one. Every CREATE TABLE / CREATE INDEX uses IF NOT
 EXISTS so re-runs are safe (the startup path is idempotent).
 """
 
@@ -20,7 +20,16 @@ from storage.agents.schema import (
     init_agents,
     init_departments,
     init_memory,
+    init_outside,
     migrate_agents,
+)
+from storage.apps.schema import (
+    init_app_handler_deliveries,
+    init_app_secrets,
+    init_app_state,
+    init_pinned_app_user_hides,
+    init_pinned_apps,
+    migrate_apps,
 )
 from storage.automation.schema import (
     init_notifications,
@@ -32,7 +41,13 @@ from storage.automation.schema import (
 )
 from storage.billing.schema import init_execution_layers, init_usage
 from storage.cards.schema import init_cards
-from storage.chat.schema import init_chats, init_meetings, init_reply_reports
+from storage.chat.schema import (
+    backfill_conversation_records,
+    init_chats,
+    init_meetings,
+    init_reply_reports,
+    migrate_chat,
+)
 from storage.checks.schema import init_checks
 from storage.files.schema import (
     init_file_sync,
@@ -46,18 +61,18 @@ from storage.mcp.schema import (
     init_community_requests,
     init_mcp,
     init_mcp_autoupdate,
+    init_mcp_tool_listings,
     migrate_mcp,
 )
 from storage.move_schema import init_chat_moves, init_engine_switch_leftovers
 from storage.notebook.schema import init_notebook
 from storage.phone.schema import init_audio_telephony, init_phone_call_log
-from storage.schema_base import _drop_invalid_indexes, _index_exists
-from storage.sharing.schema import (
-    DECISION_CHECK,
-    GRANTEE_CHECK,
-    GRANTEE_KIND_CHECK,
-    init_shares,
+from storage.schema_base import (  # noqa: F401
+    _check_constraint_words,
+    _column_exists,
+    _index_exists,
 )
+from storage.sharing.schema import _SHARE_CHECKS, init_shares, migrate_sharing
 
 logger = logging.getLogger(__name__)
 
@@ -68,48 +83,12 @@ _ROLE_CHECKS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     ("user_agents", "user_agents_agent_role_check", "agent_role", roles.AGENT_ROLES),
     ("agents", "agents_default_for_new_users_role_check", "default_for_new_users_role",
      ("",) + tuple(reversed(roles.AGENT_ROLES))),
+    ("agents", "agents_team_account_floor_check", "team_account_floor", tuple(reversed(roles.AGENT_ROLES))),
     ("shares", "shares_role_cap_check", "role_cap", roles.AGENT_ROLES),
     ("dynamic_tasks", "dynamic_tasks_notify_audience_check", "notify_audience", roles.AGENT_ROLES),
     ("triggers", "triggers_notify_audience_check", "notify_audience", roles.AGENT_ROLES),
     ("notifications", "notifications_audience_check", "audience", roles.AGENT_ROLES),
 )
-
-# The named CHECKs of ``shares`` (SHARING.md) ``run_migrations`` keeps current
-# the same way: (name, definition, the quoted words the catalog renders). The
-# 1.7.0 table carried an auto-named scope CHECK over ``grantee_sub`` alone;
-# the grantee rewrite drops it, found by its definition.
-_SHARE_CHECKS: tuple[tuple[str, str, frozenset[str]], ...] = tuple(
-    (name, definition, frozenset(re.findall(r"'([^']*)'", definition)))
-    for name, definition in (
-        ("shares_grantee_check", GRANTEE_CHECK),
-        ("shares_grantee_kind_check", GRANTEE_KIND_CHECK),
-        ("shares_decision_check", DECISION_CHECK),
-    )
-)
-
-
-def _check_constraint_words(conn, table: str, name: str, schema: str | None = None) -> set[str] | None:
-    """The quoted words of a CHECK constraint as the catalog renders it
-    (``current_schema()`` unless ``schema`` names another); None when the
-    constraint does not exist."""
-    row = conn.execute(
-        "SELECT pg_get_constraintdef(c.oid) AS d FROM pg_constraint c "
-        "JOIN pg_class t ON t.oid = c.conrelid "
-        "JOIN pg_namespace n ON n.oid = t.relnamespace "
-        "WHERE c.conname = %s AND t.relname = %s "
-        "AND n.nspname = COALESCE(%s, current_schema())",
-        (name, table, schema),
-    ).fetchone()
-    return set(re.findall(r"'([^']*)'", row["d"])) if row else None
-
-
-def _column_exists(conn, table: str, column: str) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM information_schema.columns "
-        "WHERE table_schema = current_schema() AND table_name = %s "
-        "AND column_name = %s",
-        (table, column),
-    ).fetchone() is not None
 
 
 # ---------------------------------------------------------------------------
@@ -168,11 +147,16 @@ def init_remote_machines(conn) -> None:
             name TEXT NOT NULL UNIQUE,
             status TEXT NOT NULL DEFAULT 'offline',
             last_seen TEXT,
-            registered_by TEXT NOT NULL,
+            -- NULL only on a compute machine, which nobody owns
+            -- (remote_schema.OWNER_CHECK, added by its migration).
+            registered_by TEXT,
             -- 'admin' = paired via /v1/admin/remote-machines/pair (platform
             -- infrastructure, can be agent-scope default for any agent).
             -- 'user'  = paired via /v1/users/me/remote-machines/pair
             -- (personal, only for the owner's user-scope chats/tasks).
+            -- 'compute' = registered via /v1/admin/remote-machines/compute
+            -- (the platform's own machine, where the sessions of the
+            -- platform's place run).
             pairing_scope TEXT NOT NULL DEFAULT 'admin',
             pairing_token_hash TEXT,
             pairing_token_created_at TEXT,
@@ -267,217 +251,6 @@ def init_remote_machines(conn) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_remote_targets_machine ON user_remote_targets(machine_id)")
 
 
-def init_pinned_apps(conn) -> None:
-    """Pinned apps registry (standing agent-authored dashboards)."""
-    # One row per pinned app (``storage/db_apps.py``). The HTML content is a
-    # workspace file at ``rel_path`` (agent-dir-relative) — the row is the
-    # registry: identity, tab order, and the user-approved declared-actions
-    # manifest. ``owner_sub`` is NULL for shared rows — a deliberate deviation
-    # from the ``''`` convention (media_tokens): the users-FK CASCADE that
-    # cleans personal rows on user delete needs NULL, not ''. ``username`` is
-    # the filesystem slug ('' = shared) used for path anchoring and the
-    # per-scope UNIQUE. ``actions_approved_sig`` holds sha256(canonical
-    # manifest JSON) at approval time — any manifest change breaks it, so
-    # actions stay dead until re-approved. ``hidden`` is the dashboard-side
-    # SOFT unpin: the row (manifest + approval) survives so an agent re-pin
-    # of the same slug restores the app without re-approval; the agent-side
-    # unpin_app hook is the hard delete. ``scope_chat_id`` /
-    # ``scope_project_id`` (at most one set — the Dock feature): a scoped row
-    # is a per-chat / per-project pinned dashboard shown on the chat's Dock
-    # overlay instead of the standing apps strip; exactly one per scope
-    # (partial unique indexes — created in ``run_migrations`` because a
-    # pre-existing install runs this CREATE-IF-NOT-EXISTS before the columns
-    # exist). Inline constraints only (NEVER ``ALTER ADD CONSTRAINT`` —
-    # conftest pool deadlock), so pre-existing installs get the scope XOR
-    # from the store layer, not the CHECK.
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS pinned_apps (
-            id            TEXT PRIMARY KEY,
-            agent         TEXT NOT NULL,
-            owner_sub     TEXT REFERENCES users(sub) ON DELETE CASCADE,
-            username      TEXT NOT NULL DEFAULT '',
-            slug          TEXT NOT NULL,
-            title         TEXT NOT NULL DEFAULT '',
-            rel_path      TEXT NOT NULL,
-            actions       TEXT NOT NULL DEFAULT '[]',
-            actions_approved_sig TEXT NOT NULL DEFAULT '',
-            approved_by   TEXT NOT NULL DEFAULT '',
-            position      INTEGER NOT NULL DEFAULT 0,
-            hidden        BOOLEAN NOT NULL DEFAULT FALSE,
-            scope_chat_id    TEXT,
-            scope_project_id TEXT,
-            -- The release copy viewers are served (agent-dir-relative path
-            -- under app-releases/ and its sha256); empty = not deployed
-            -- yet, the working file serves (the upgrade path).
-            release_path  TEXT NOT NULL DEFAULT '',
-            release_sha256 TEXT NOT NULL DEFAULT '',
-            -- Folder apps (APPS.md): 'file' (one html) or 'folder' (a
-            -- release directory, a server); the deploy state is idle or
-            -- pending ("deploying" is the in-process lock, never stored);
-            -- the per-app approval switch and the release waiting for it;
-            -- the two manifest blocks the runtime signs with the actions.
-            kind          TEXT NOT NULL DEFAULT 'file',
-            deploy_state  TEXT NOT NULL DEFAULT 'idle',
-            deploy_requires_approval BOOLEAN NOT NULL DEFAULT FALSE,
-            pending_release INTEGER NOT NULL DEFAULT 0,
-            files         TEXT NOT NULL DEFAULT '',
-            egress        TEXT NOT NULL DEFAULT '',
-            -- APPS.md "Handlers" / "Bindings": three more signed blocks,
-            -- and `requires` (what the app needs to work), which grants
-            -- nothing and is therefore not part of the signature.
-            handlers      TEXT NOT NULL DEFAULT '',
-            exports       TEXT NOT NULL DEFAULT '',
-            bindings      TEXT NOT NULL DEFAULT '',
-            requires      TEXT NOT NULL DEFAULT '',
-            -- APPS.md "Steps": the scripts handlers run instead of the
-            -- server route, with their content hashes; signed.
-            steps         TEXT NOT NULL DEFAULT '',
-            -- APPS.md "Secrets": the declared secret names, whether each
-            -- is required and where the platform sends it; signed. The
-            -- values live in app_secrets, never here.
-            secrets       TEXT NOT NULL DEFAULT '',
-            -- APPS.md "Inbound hooks": the public routes a vendor may call,
-            -- the scheme and the secret each is verified with, the handler
-            -- each wakes; signed.
-            inbound       TEXT NOT NULL DEFAULT '',
-            -- APPS.md "External links": what a link may do — the hosts the
-            -- host page may open, the paths that need a challenge, the
-            -- session cookie's lifetime; signed.
-            external      TEXT NOT NULL DEFAULT '',
-            -- COMMUNITY-AGENTS-REGISTRY.md "Per-user template apps": the
-            -- template and app slug a seeded row came from ('' = the
-            -- member's own app, never touched by a seed or an update), and
-            -- why a seeded row is hidden ('opted_out' = the owner purged or
-            -- unpinned it, never re-seeded; 'removed' = a membership
-            -- removal, restored on re-attach).
-            template_ref  TEXT NOT NULL DEFAULT '',
-            template_state TEXT NOT NULL DEFAULT '',
-            from_template TEXT NOT NULL DEFAULT '',
-            from_version  TEXT NOT NULL DEFAULT '',
-            follows       TEXT NOT NULL DEFAULT '',
-            created_at    TEXT NOT NULL,
-            updated_at    TEXT NOT NULL,
-            UNIQUE (agent, username, slug),
-            CHECK (scope_chat_id IS NULL OR scope_project_id IS NULL)
-        )
-    """)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_pinned_apps_agent ON pinned_apps (agent)"
-    )
-
-
-def init_pinned_app_user_hides(conn) -> None:
-    """Per-user hides of SHARED pinned apps (S2 of the shared-dashboards
-    unit): a viewer removing a team dashboard from THEIR OWN strip must not
-    hide it for the team — ``pinned_apps.hidden`` is the global soft-unpin
-    (editor+ only), this table is the personal one (any role). One row =
-    "this user hid this shared app for themselves"; restore = delete the
-    row. Personal pins never get rows here (they already belong to one
-    user). Both FKs CASCADE so app hard-deletes and user deletes reap
-    hides for free. Whole-table CREATE in init (new-table pattern —
-    converges existing installs on startup, no migration needed)."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS pinned_app_user_hides (
-            app_id     TEXT NOT NULL REFERENCES pinned_apps(id) ON DELETE CASCADE,
-            user_sub   TEXT NOT NULL REFERENCES users(sub) ON DELETE CASCADE,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (app_id, user_sub)
-        )
-    """)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_app_user_hides_user "
-        "ON pinned_app_user_hides (user_sub)"
-    )
-
-
-def init_app_state(conn) -> None:
-    """The per-app state document (APPS.md "Live apps"): one JSON
-    object per pinned app that the agent writes and every viewer's page
-    reads, so an app's data changes without a re-pin of its HTML. ``doc``
-    is the canonical JSON text (TEXT like ``pinned_apps.actions``; nothing
-    queries inside it), ``rev`` grows by one per write so a page can drop
-    a stale delivery. The FK CASCADE ties it to the row: a hard unpin, an
-    agent delete or a user delete reaps it; a soft unpin keeps the row and
-    therefore the state. Whole-table CREATE in init (new-table pattern)."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS app_state (
-            app_id     TEXT PRIMARY KEY REFERENCES pinned_apps(id) ON DELETE CASCADE,
-            doc        TEXT NOT NULL DEFAULT '{}',
-            rev        INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL,
-            updated_by TEXT NOT NULL DEFAULT ''
-        )
-    """)
-
-
-def init_app_handler_deliveries(conn) -> None:
-    """A handler fire that must not be lost (APPS.md "Handlers"): one row
-    per wake of an app's server, written before anything wakes, claimed by
-    the drain with a lease (`inflight`, `next_at` = the lease end), retried
-    on 5xx and timeouts, `dead` on 4xx or after the last attempt. The FK
-    CASCADE ties it to the app row like `app_state`. `event_id` carries a
-    caller's idempotency key (`X-OtoDock-Event-Id`, or the emitter's
-    sequence for a cross-app event); the partial unique index makes a
-    replay a no-op. Whole-table CREATE in init (new-table pattern)."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS app_handler_deliveries (
-            id          TEXT PRIMARY KEY,
-            app_id      TEXT NOT NULL REFERENCES pinned_apps(id) ON DELETE CASCADE,
-            handler     TEXT NOT NULL,
-            event       TEXT NOT NULL,
-            payload     JSONB NOT NULL DEFAULT '{}',
-            event_id    TEXT NOT NULL DEFAULT '',
-            trigger_id  TEXT,
-            task_run_id TEXT,
-            attempts    INTEGER NOT NULL DEFAULT 0,
-            status      TEXT NOT NULL DEFAULT 'pending',
-            next_at     TEXT NOT NULL,
-            claimed_at  TEXT,
-            done_at     TEXT,
-            last_error  TEXT NOT NULL DEFAULT '',
-            created_at  TEXT NOT NULL,
-            -- APPS.md "Steps" (2026-09-17): a step's verdict — the exit
-            -- code, the first 32 KB of its output, where it ran (`local`
-            -- or a machine id) and when it started.
-            exit_code   INTEGER,
-            output      TEXT NOT NULL DEFAULT '',
-            ran_on      TEXT NOT NULL DEFAULT '',
-            started_at  TEXT
-        )
-    """)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_app_deliveries_due "
-        "ON app_handler_deliveries (status, next_at)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_app_deliveries_app "
-        "ON app_handler_deliveries (app_id, status)"
-    )
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_app_deliveries_event "
-        "ON app_handler_deliveries (app_id, handler, event_id) WHERE event_id <> ''"
-    )
-
-
-def init_app_secrets(conn) -> None:
-    """The values behind an app's declared secrets (APPS.md "Secrets"): one
-    row per (app, name), the value Fernet-encrypted with the credential
-    store's key, who set it and when — never the value in clear, never in a
-    manifest, a release or a synced tree. The FK CASCADE ties it to the app
-    row: a hard unpin or a purge drops the values with the row, a soft unpin
-    keeps them. Whole-table CREATE in init (new-table pattern)."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS app_secrets (
-            app_id      TEXT NOT NULL REFERENCES pinned_apps(id) ON DELETE CASCADE,
-            name        TEXT NOT NULL,
-            value_enc   TEXT NOT NULL,
-            set_by      TEXT NOT NULL DEFAULT '',
-            updated_at  TEXT NOT NULL,
-            PRIMARY KEY (app_id, name)
-        )
-    """)
-
-
 # ---------------------------------------------------------------------------
 # Schema entry points
 # ---------------------------------------------------------------------------
@@ -491,6 +264,7 @@ def init_schema(conn) -> None:
     init_usage(conn)
     init_mcp(conn)
     init_agents(conn)
+    init_outside(conn)
     init_departments(conn)
     init_storage_quotas(conn)
     init_community_requests(conn)
@@ -503,6 +277,7 @@ def init_schema(conn) -> None:
     init_execution_layers(conn)
     init_notifications(conn)
     init_mcp_autoupdate(conn)
+    init_mcp_tool_listings(conn)
     init_push(conn)
     init_webhooks(conn)
     init_triggers(conn)
@@ -794,6 +569,32 @@ def apscheduler_dow_to_standard(field: str) -> str:
     return ",".join(out)
 
 
+def _widen_identity_mode_check(conn) -> None:
+    """``phone_routes.identity_mode`` takes 'agent': the CHECK an older
+    install's CREATE made knows three words. Replaced in a SAVEPOINT so a
+    surprise leaves the old one and the next boot tries again; read from the
+    catalog, so a boot after the first does nothing."""
+    row = conn.execute(
+        "SELECT pg_get_constraintdef(c.oid) AS def FROM pg_constraint c "
+        "JOIN pg_class t ON t.oid = c.conrelid "
+        "JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "WHERE t.relname = 'phone_routes' AND n.nspname = current_schema() "
+        "AND c.conname = 'phone_routes_identity_mode_check'"
+    ).fetchone()
+    if row is not None and "'agent'" in (row["def"] or ""):
+        return
+    conn.execute("SAVEPOINT widen_identity_mode")
+    try:
+        conn.execute("ALTER TABLE phone_routes DROP CONSTRAINT IF EXISTS phone_routes_identity_mode_check")
+        conn.execute(
+            "ALTER TABLE phone_routes ADD CONSTRAINT phone_routes_identity_mode_check "
+            "CHECK (identity_mode IN ('caller', 'shared', 'user', 'agent'))")
+        conn.execute("RELEASE SAVEPOINT widen_identity_mode")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT widen_identity_mode")
+        logger.exception("phone_routes: the identity CHECK was not widened; the next boot retries")
+
+
 def run_migrations(conn, *, engines=()) -> None:
     """Post-launch schema migration hook.
 
@@ -816,76 +617,14 @@ def run_migrations(conn, *, engines=()) -> None:
     The pre-launch transitional migrations that once lived here were removed
     once every install converged (pre-launch DBs are hand-converged).
     """
-    # 2026-07-10: dashboard soft-unpin for pinned apps (ADD COLUMN
-    # IF NOT EXISTS is idempotent — no information_schema probe needed).
-    conn.execute(
-        "ALTER TABLE pinned_apps "
-        "ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT FALSE"
-    )
+    migrate_apps(conn)
+    migrate_chat(conn)
     # 2026-09-12: a notification row may carry its own dashboard path (a
     # shared app or chat); empty on every pre-existing row = the old deep link.
     conn.execute(
         "ALTER TABLE notification_deliveries "
         "ADD COLUMN IF NOT EXISTS href TEXT NOT NULL DEFAULT ''"
     )
-    # 2026-09-12: app releases. Empty on every pre-existing row = the
-    # working file keeps serving until the app is pinned again.
-    conn.execute(
-        "ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS release_path TEXT NOT NULL DEFAULT ''"
-    )
-    conn.execute(
-        "ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS release_sha256 TEXT NOT NULL DEFAULT ''"
-    )
-    # 2026-09-13: folder apps (APPS.md). Every pre-existing row is a
-    # single-file app with nothing pending and no extra manifest blocks.
-    for ddl in (
-        "kind TEXT NOT NULL DEFAULT 'file'",
-        "deploy_state TEXT NOT NULL DEFAULT 'idle'",
-        "deploy_requires_approval BOOLEAN NOT NULL DEFAULT FALSE",
-        "pending_release INTEGER NOT NULL DEFAULT 0",
-        "files TEXT NOT NULL DEFAULT ''",
-        "egress TEXT NOT NULL DEFAULT ''",
-    ):
-        conn.execute(f"ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS {ddl}")
-    # 2026-09-13: handlers, exports, bindings and requires (APPS.md
-    # "Handlers", "Bindings"). Empty on every pre-existing row, so no
-    # approval changes: the signature covers a block only once it holds
-    # something.
-    for ddl in (
-        "handlers TEXT NOT NULL DEFAULT ''",
-        "exports TEXT NOT NULL DEFAULT ''",
-        "bindings TEXT NOT NULL DEFAULT ''",
-        "requires TEXT NOT NULL DEFAULT ''",
-    ):
-        conn.execute(f"ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS {ddl}")
-    # 2026-09-17: app steps (APPS.md "Steps"), one more signed block; empty
-    # on every pre-existing row, so no approval changes. The delivery table
-    # gains the step's verdict columns the same day.
-    conn.execute("ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS steps TEXT NOT NULL DEFAULT ''")
-    for ddl in (
-        "exit_code INTEGER",
-        "output TEXT NOT NULL DEFAULT ''",
-        "ran_on TEXT NOT NULL DEFAULT ''",
-        "started_at TEXT",
-    ):
-        conn.execute(f"ALTER TABLE app_handler_deliveries ADD COLUMN IF NOT EXISTS {ddl}")
-    # 2026-09-18: app secrets (APPS.md "Secrets"), one more signed block;
-    # empty on every pre-existing row, so no approval changes. The values
-    # table is created by init_app_secrets.
-    conn.execute("ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS secrets TEXT NOT NULL DEFAULT ''")
-    # 2026-09-18: inbound hooks (APPS.md "Inbound hooks"), one more signed
-    # block; empty on every pre-existing row.
-    conn.execute("ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS inbound TEXT NOT NULL DEFAULT ''")
-    # 2026-09-18: what a link may do (APPS.md "External links"), one more
-    # signed block; empty on every pre-existing row.
-    conn.execute("ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS external TEXT NOT NULL DEFAULT ''")
-    # Template-seeded apps, a bundle's origin and (1.9.1) the source a copy follows; empty on old rows.
-    for column in ("template_ref", "template_state", "from_template", "from_version", "follows"):
-        conn.execute(f"ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS {column} TEXT NOT NULL DEFAULT ''")
-    # 2026-09-17: checks (CHECKS.md). The checks attached to a chat (a JSON
-    # list of refs, '' = none) and to a task; empty on every pre-existing
-    # row. The three checks tables are new tables (init_checks).
-    conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS checks TEXT NOT NULL DEFAULT ''")
     conn.execute("ALTER TABLE dynamic_tasks ADD COLUMN IF NOT EXISTS checks TEXT NOT NULL DEFAULT ''")
     # 2026-09-13: an app handler as a task row (`task_type='app'`) and as a
     # trigger's action. NULL on every pre-existing row. The partial unique
@@ -961,76 +700,6 @@ def run_migrations(conn, *, engines=()) -> None:
             "UPDATE remote_machines SET browser_unattended = TRUE "
             "WHERE browser_extension_token_enc IS NOT NULL"
         )
-    # 2026-07-11: chat/project-scoped pins (the Dock). The one-per-scope
-    # partial unique indexes live HERE, not in init_pinned_apps: on a
-    # pre-existing install the CREATE-IF-NOT-EXISTS no-ops before these
-    # columns exist, so an index in init would reference a missing column.
-    # The scope XOR CHECK stays in-CREATE only (never ALTER ADD CONSTRAINT).
-    conn.execute(
-        "ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS scope_chat_id TEXT"
-    )
-    conn.execute(
-        "ALTER TABLE pinned_apps ADD COLUMN IF NOT EXISTS scope_project_id TEXT"
-    )
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pinned_apps_scope_chat "
-        "ON pinned_apps (scope_chat_id) WHERE scope_chat_id IS NOT NULL"
-    )
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pinned_apps_scope_project "
-        "ON pinned_apps (scope_project_id) WHERE scope_project_id IS NOT NULL"
-    )
-    # 2026-07-18: durable delegate-wake replay — undeliverable delegate
-    # results are stored on the parent chat and injected at its next
-    # warmup/turn.
-    conn.execute(
-        "ALTER TABLE chats "
-        "ADD COLUMN IF NOT EXISTS pending_delegate_wake TEXT NOT NULL DEFAULT ''"
-    )
-    # The chats with a parked wake (startup and every satellite reconnect);
-    # here, not in init_chats: the column itself arrives by this migration.
-    _drop_invalid_indexes(conn, "idx_chats_pending_wake")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chats_pending_wake ON chats (id) "
-        "WHERE pending_delegate_wake <> ''"
-    )
-    # A stored wake names the person it runs as since 1.7.1 (a JSON array of
-    # {"prompt", "person", "role", "by"}); 1.7.0 stored plain strings. Each
-    # such value is rewritten with no person; a converted value starts with
-    # '[{', so the pass is idempotent and needs no flag. A value that is not
-    # JSON is cleared (the reader would drop it anyway).
-    conn.execute("SAVEPOINT pending_wake_records")
-    try:
-        from storage.chat.db_chats import wake_records
-        rows = conn.execute(
-            "SELECT id, pending_delegate_wake FROM chats "
-            "WHERE pending_delegate_wake <> '' AND pending_delegate_wake NOT LIKE '[{%%'"
-        ).fetchall()
-        for r in rows:
-            wakes = wake_records(r["pending_delegate_wake"])
-            if not wakes and r["pending_delegate_wake"].strip() != "[]":
-                logger.warning("pending wake migration: chat %s held no readable wake; cleared",
-                               r["id"])
-            conn.execute("UPDATE chats SET pending_delegate_wake = %s WHERE id = %s",
-                         (json.dumps(wakes) if wakes else "", r["id"]))
-        conn.execute("RELEASE SAVEPOINT pending_wake_records")
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT pending_wake_records")
-        logger.exception("pending wake migration failed; it retries at the next startup")
-    # The engine-reported running cost total at the last recorded turn and
-    # the engine session it belongs to. Claude Code ≥ 2.1.277 resumes
-    # a session from its saved total, and the pump's per-turn delta needs the
-    # baseline across a proxy restart: the in-memory map made durable, keyed
-    # by session id exactly like it (a fresh session on the chat starts at 0).
-    # 0 / '' on every pre-existing row.
-    conn.execute(
-        "ALTER TABLE chats "
-        "ADD COLUMN IF NOT EXISTS engine_cost_total DOUBLE PRECISION NOT NULL DEFAULT 0"
-    )
-    conn.execute(
-        "ALTER TABLE chats "
-        "ADD COLUMN IF NOT EXISTS engine_cost_session_id TEXT NOT NULL DEFAULT ''"
-    )
     # 2026-08-12: departments (agents map). Every pre-existing delegation edge
     # is a manual one; the CHECK stays in-CREATE only per convention.
     conn.execute(
@@ -1161,6 +830,13 @@ def run_migrations(conn, *, engines=()) -> None:
         "ALTER TABLE phone_routes "
         "ADD COLUMN IF NOT EXISTS remember_callers BOOLEAN NOT NULL DEFAULT TRUE"
     )
+    # 2.0: the agent's own line ('agent', the call runs as the agent itself)
+    # and the management tools its route ticks. The identity CHECK an
+    # install's CREATE made is widened to the new word, once.
+    conn.execute(
+        "ALTER TABLE phone_routes ADD COLUMN IF NOT EXISTS line_tools JSONB NOT NULL DEFAULT '[]'"
+    )
+    _widen_identity_mode_check(conn)
     # 2026-10-10: the call tools' transfer targets and the per-call language
     # identification. Existing routes keep today's behaviour (no targets,
     # detection off); the route form defaults detection on for new routes.
@@ -1190,6 +866,9 @@ def run_migrations(conn, *, engines=()) -> None:
         "ALTER TABLE phone_call_log "
         "ADD COLUMN IF NOT EXISTS tools_run JSONB NOT NULL DEFAULT '[]'"
     )
+    # 2.0: the record of every phone-owned conversation an install holds,
+    # its line read from the call log's labels above.
+    backfill_conversation_records(conn)
     # 2026-07-13: cron day-of-week convention fix. Stored 5-field schedules
     # used to reach APScheduler verbatim, whose numeric day-of-week is
     # 0=Monday; the platform now stores/accepts STANDARD cron (0=Sunday) and
@@ -1280,139 +959,7 @@ def run_migrations(conn, *, engines=()) -> None:
     conn.execute(
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_last_step BIGINT NOT NULL DEFAULT 0"
     )
-
-    # The single-column agent index on chats (1.7.1): idx_chats_agent_updated
-    # covers it by its prefix, and every chats UPDATE rewrote it for nothing.
-    # Guarded by the catalog so a database that never had it, or already
-    # lost it, does nothing here.
-    if _index_exists(conn, "idx_chats_agent"):
-        conn.execute("SAVEPOINT drop_idx_chats_agent")
-        try:
-            conn.execute("DROP INDEX IF EXISTS idx_chats_agent")
-            conn.execute("RELEASE SAVEPOINT drop_idx_chats_agent")
-        except Exception:
-            conn.execute("ROLLBACK TO SAVEPOINT drop_idx_chats_agent")
-            logger.exception("dropping idx_chats_agent failed; the next boot retries")
-
-    # 1.7.1: shares to an agent or a department, a role cap, a decision and a
-    # placement (SHARING.md). The 1.7.0 table knew one grantee kind, so the
-    # columns reach an existing install here; their defaults are what a
-    # 1.7.0 INSERT leaves after a downgrade (``person``, ``pending``,
-    # ``viewer``), which every CHECK below accepts. The role-cap CHECK rides
-    # the column add, so the role loop above finds it from the next boot.
-    conn.execute(
-        "ALTER TABLE shares ADD COLUMN IF NOT EXISTS grantee_kind TEXT NOT NULL DEFAULT 'person'"
-    )
-    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS grantee_agent TEXT")
-    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS grantee_department TEXT")
-    conn.execute(
-        "ALTER TABLE shares ADD COLUMN IF NOT EXISTS role_cap TEXT NOT NULL DEFAULT 'viewer' "
-        "CONSTRAINT shares_role_cap_check CHECK (role_cap IN ("
-        + ", ".join(f"'{w}'" for w in roles.AGENT_ROLES) + "))"
-    )
-    conn.execute(
-        "ALTER TABLE shares ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'pending'"
-    )
-    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS decided_by TEXT")
-    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS decided_at TEXT")
-    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS placed_agent TEXT")
-    # The backfill runs at every boot and never writes ``pending``, so a
-    # decision is never flipped back and a row 1.7.0 wrote with the defaults
-    # after a downgrade is repaired: a link has no kind and no decision; a
-    # chat share needs no decision.
-    conn.execute(
-        "UPDATE shares SET grantee_kind = '', decision = '' "
-        "WHERE scope = 'external' AND (grantee_kind <> '' OR decision <> '')"
-    )
-    conn.execute(
-        "UPDATE shares SET decision = 'accepted' "
-        "WHERE scope = 'internal' AND target_kind = 'chat' AND decision = 'pending'"
-    )
-    _rewrite_share_checks(conn)
-    # 1.8.0: a deleted person's waiting messages go with them; rows a 1.7.x
-    # deletion left behind could never be sent. One-shot.
-    _QUEUE_FLAG = "chat_input_queue_orphans_swept"
-    if not conn.execute("SELECT 1 FROM platform_settings WHERE key = %s",
-                        (_QUEUE_FLAG,)).fetchone():
-        gone = conn.execute(
-            "DELETE FROM chat_input_queue q WHERE q.author_sub <> '' AND NOT EXISTS "
-            "(SELECT 1 FROM users u WHERE u.sub = q.author_sub)").rowcount
-        if gone:
-            logger.info("chat_input_queue: %d waiting message(s) of deleted people removed", gone)
-        conn.execute("INSERT INTO platform_settings (key, value) VALUES (%s, 'done') "
-                     "ON CONFLICT (key) DO NOTHING", (_QUEUE_FLAG,))
-    # The 1.7.0 unique index keyed every unrevoked internal row and would
-    # refuse a re-share after a decline; the three per-kind indexes replace
-    # it. Here, never in init_shares: the CREATE no-ops on an existing table
-    # and an index on a column this block adds would fail the boot.
-    if _index_exists(conn, "idx_shares_internal_grant"):
-        conn.execute("SAVEPOINT drop_idx_shares_internal_grant")
-        try:
-            conn.execute("DROP INDEX IF EXISTS idx_shares_internal_grant")
-            conn.execute("RELEASE SAVEPOINT drop_idx_shares_internal_grant")
-        except Exception:
-            conn.execute("ROLLBACK TO SAVEPOINT drop_idx_shares_internal_grant")
-            logger.exception("dropping idx_shares_internal_grant failed; the next boot retries")
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_person_grant "
-        "ON shares (target_kind, COALESCE(app_id, chat_id), grantee_sub) "
-        "WHERE scope = 'internal' AND grantee_kind = 'person' AND revoked_at IS NULL "
-        "AND decision <> 'declined'"
-    )
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_agent_grant "
-        "ON shares (app_id, grantee_agent) "
-        "WHERE grantee_kind = 'agent' AND revoked_at IS NULL AND decision <> 'declined'"
-    )
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_department_grant "
-        "ON shares (app_id, grantee_department) "
-        "WHERE grantee_kind = 'department' AND revoked_at IS NULL AND decision <> 'declined'"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_shares_grantee_agent ON shares (grantee_agent)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_shares_grantee_department ON shares (grantee_department)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_shares_placed_agent ON shares (placed_agent)"
-    )
-
-
-def _rewrite_share_checks(conn) -> None:
-    """Keep the named ``shares`` CHECKs at the code's words on an existing
-    install: a constraint that is absent or lacks a word is dropped and added
-    again inside a SAVEPOINT (a no-op once the words are in, logged and
-    retried next boot on a failure). The grantee rewrite also drops the 1.7.0
-    scope CHECK, auto-named by Postgres, found by its definition: it reads
-    ``grantee_sub`` and not ``grantee_kind``."""
-    for name, definition, words in _SHARE_CHECKS:
-        present = _check_constraint_words(conn, "shares", name)
-        if present is not None and present >= words:
-            continue
-        conn.execute(f"SAVEPOINT {name}")
-        try:
-            if name == "shares_grantee_check":
-                old = conn.execute(
-                    "SELECT c.conname FROM pg_constraint c "
-                    "JOIN pg_class t ON t.oid = c.conrelid "
-                    "JOIN pg_namespace n ON n.oid = t.relnamespace "
-                    "WHERE t.relname = 'shares' AND n.nspname = current_schema() "
-                    "AND c.contype = 'c' "
-                    "AND pg_get_constraintdef(c.oid) LIKE '%%grantee_sub%%' "
-                    "AND pg_get_constraintdef(c.oid) NOT LIKE '%%grantee_kind%%'"
-                ).fetchall()
-                for row in old:
-                    quoted = '"' + row["conname"].replace('"', '""') + '"'
-                    conn.execute(f"ALTER TABLE shares DROP CONSTRAINT IF EXISTS {quoted}")
-            conn.execute(f"ALTER TABLE shares DROP CONSTRAINT IF EXISTS {name}")
-            conn.execute(f"ALTER TABLE shares ADD CONSTRAINT {name} CHECK ({definition})")
-            conn.execute(f"RELEASE SAVEPOINT {name}")
-            logger.info("shares CHECK %s rewritten", name)
-        except Exception:
-            conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
-            logger.exception("shares CHECK %s could not be rewritten; the next boot retries", name)
+    migrate_sharing(conn)
 
 
 # ---------------------------------------------------------------------------

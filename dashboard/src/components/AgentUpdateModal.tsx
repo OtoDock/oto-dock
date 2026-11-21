@@ -21,7 +21,7 @@ import {
   type TemplateUpdateReport,
 } from '../api/communityAgents'
 import { refusalProblems } from '../lib/http/apiJson'
-import { DetailsToggle, ManifestBlocks, ManifestSummary } from './apps/AppApprovalCard'
+import TemplateApps from './common/TemplateApps'
 import Dialog from './ui/Dialog'
 import Button from './ui/Button'
 import { DIALOG_PANEL } from './ui/classes'
@@ -32,13 +32,17 @@ interface Props {
   onClose: () => void
 }
 
+/** A count of pieces in words: "1 piece is", "2 pieces were". */
+function piecesWere(n: number, past: boolean): string {
+  return n === 1 ? `1 piece ${past ? 'was' : 'is'}` : `${n} pieces ${past ? 'were' : 'are'}`
+}
+
 export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
   const plan = useTemplateUpdatePlan(open ? agentSlug : null)
   const applyUpdate = useApplyTemplateUpdate()
   const takeNew = useTakeNewVersion()
   const qc = useQueryClient()
   const [approveAll, setApproveAll] = useState(true)
-  const [openDetails, setOpenDetails] = useState<Record<string, boolean>>({})
   const [started, setStarted] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [taken, setTaken] = useState<Record<string, string>>({})
@@ -87,6 +91,8 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
           ? {
               approve_apps: Object.fromEntries(consentApps.map(a => [a.slug, a.sig])),
               approve_checks: Object.fromEntries(consentChecks.map(c => [c.name, c.sig])),
+              // The apps whose server this dialog showed: the consent covers it for every copy.
+              approve_servers: consentApps.filter(a => a.adds_server).map(a => a.slug),
             }
           : {}),
       })
@@ -161,7 +167,7 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
         <div className="text-xs" data-testid="update-report">
           <p className="text-sm text-primary mb-3">
             Updated to <strong>{report.to_version}</strong>.
-            {report.unchanged ? ` ${report.unchanged} piece(s) were already current.` : ''}
+            {report.unchanged ? ` ${piecesWere(report.unchanged, true)} already current.` : ''}
           </p>
           {list('Replaced', report.replaced)}
           {list('Added', report.added)}
@@ -219,71 +225,23 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
         {list('Will be replaced, unchanged since the install', p.replaced)}
         {list('Will be added', p.added)}
         {keptList(p.kept, false)}
-        {p.unchanged > 0 && <p className="text-tertiary mb-3">{p.unchanged} piece(s) are already current.</p>}
+        {p.unchanged > 0 && <p className="text-tertiary mb-3">{piecesWere(p.unchanged, false)} already current.</p>}
         {p.mcps?.new?.length ? list('MCPs the new version needs', p.mcps.new) : null}
         {list(TASK_PINS_HEADING, taskPinNotes(p))}
 
         {hasConsentItems && (
           <div className="rounded-card border border-subtle p-3" data-testid="update-consent">
-            {consentApps.length > 0 && (
-              <div className="font-medium text-primary mb-2">
-                {consentApps.length === 1 ? 'An app the new version brings or changes' : `${consentApps.length} apps the new version brings or changes`}
-              </div>
-            )}
-            {consentApps.map(a => (
-              <div key={a.slug} className="mb-3" data-testid={`consent-app-${a.slug}`}>
-                <div className="flex flex-wrap items-baseline gap-x-1.5">
-                  <span className="font-medium text-primary">{a.title}</span>
-                  <span className="text-secondary">
-                    {a.change === 'new' ? 'new · ' : 'changed · '}
-                    {a.visibility === 'user' ? 'one copy for each member' : 'shared by the agent'}
-                    {a.owner_approval ? ' · each member approves their own copy' : ''}
-                  </span>
-                </div>
-                <ManifestSummary app={a.row} />
-                <div className="mt-1">
-                  <DetailsToggle
-                    open={!!openDetails[a.slug]}
-                    onToggle={() => setOpenDetails(d => ({ ...d, [a.slug]: !d[a.slug] }))}
-                  />
-                </div>
-                {openDetails[a.slug] && <ManifestBlocks app={a.row} />}
-              </div>
-            ))}
-            {consentChecks.length > 0 && (
-              <div className="mb-2">
-                <div className="font-medium text-primary mb-1">
-                  {consentChecks.length === 1 ? 'A check the new version brings or changes' : `${consentChecks.length} checks the new version brings or changes`}
-                </div>
-                <ul className="space-y-1 text-secondary">
-                  {consentChecks.map(c => (
-                    <li key={c.name} data-testid={`consent-check-${c.name}`}>
-                      <span className="font-mono text-2xs text-primary">{c.name}</span>
-                      {c.mandatory ? <span>, mandatory</span> : null}
-                      {c.description ? <span>: {c.description}</span> : null}
-                      {c.words ? <span> · {c.words}</span> : null}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            <label className="mt-2 flex items-start gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={approveAll}
-                onChange={e => setApproveAll(e.target.checked)}
-                className="mt-0.5 accent-action"
-                data-testid="update-consent-checkbox"
-              />
-              <span className="text-primary">
-                {p.consent_scope === 'everyone'
-                  ? 'Approve these apps and checks for everyone who gets a copy'
-                  : 'Approve these apps and checks: the shared ones and your own copy. Members approve theirs.'}
-              </span>
-            </label>
-            <p className="mt-1 text-tertiary">
-              Unticked, each new app release waits for approval on its card. Each check stays offered, not mandatory.
-            </p>
+            <TemplateApps
+              apps={consentApps}
+              checks={consentChecks}
+              approval={{
+                checked: approveAll,
+                onChange: setApproveAll,
+                scope: p.consent_scope === 'everyone' ? 'everyone' : 'own',
+                testId: 'update-consent-checkbox',
+                hint: 'Unticked, each new app release waits for approval on its card. Each check stays offered, not mandatory.',
+              }}
+            />
           </div>
         )}
       </div>

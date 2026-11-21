@@ -1,7 +1,7 @@
 """The SSH hosts an admin attached to an agent, as the command gate reads
 them (``auth/path_shell.py``).
 
-On the local sandbox the admin tier is a platform admin's, with one opening:
+In a compute machine's sandbox the admin tier is a platform admin's, with one opening:
 a manager or an editor runs ``ssh``, ``scp`` and ``rsync`` to a host the
 agent's ssh-hosts instances name, as that instance's user
 (``local_refusal``). The hosts reach the gate on the session's context
@@ -126,7 +126,7 @@ def takes_attached_hosts(ctx) -> bool:
 
 @dataclass
 class Reach:
-    """The gate's answer for one command on the local sandbox: a refusal
+    """The gate's answer for one command in a compute machine's sandbox: a refusal
     (None when the command may run) and the local files its options read
     (identities, judged by the folder that holds them) and write."""
     refusal: str | None = None
@@ -393,12 +393,12 @@ _READERS = {"ssh": _read_ssh, "scp": _read_scp, "sftp": _read_sftp, "rsync": _re
 
 
 def _admin_only(cmd_name: str, role: str) -> str:
-    return (f"'{cmd_name}' requires platform admin role on local sandbox sessions "
+    return (f"'{cmd_name}' requires platform admin role in a compute machine's sandbox "
             f"(current role: {role}). These commands touch host state outside the sandbox.")
 
 
 def local_refusal(cmd_name: str, segment: str, ctx) -> Reach:
-    """The admin tier's role gate on the local sandbox for a session that is
+    """The admin tier's role gate in a compute machine's sandbox for a session that is
     not a platform admin's: ``Reach.refusal`` is the sentence (without the
     ``Bash denied:`` prefix), None when the command may run."""
     if cmd_name not in SSH_COMMANDS:

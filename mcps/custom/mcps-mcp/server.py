@@ -10,8 +10,9 @@ catalog (``list_community_mcps``), and the community SKILLS catalog
   otherwise)
 - ``request_skill_install`` (the skills twin: Skills-PATCH direct enable
   when the package is installed; ``kind: "skill"`` admin request when not)
-- ``disable_mcp_for_agent`` (manager + admin user-scope only — agent-scope
-  is gated out to avoid scheduled tasks turning off MCPs they'll need)
+- ``disable_mcp_for_agent`` (manager + admin in their own scope only: the
+  agent's scope is gated out so no run or call turns off an MCP the agent
+  needs on its next run)
 - ``get_request_status`` / ``cancel_my_request`` (request lifecycle helpers)
 
 Admin-only power operations (platform-wide install without an agent
@@ -22,8 +23,9 @@ avoids the two-step admin chain that breaks down on ``explicit``-mode
 MCPs needing instance config the tool layer can't provide.
 
 Permission gating is resolved ONCE at module load using the auto-injected
-``OTO_*`` env var set (``OTO_CAN_MANAGE_AGENT``, ``OTO_SCOPE``). Disallowed sessions
-(viewers) end up with an empty tool list — the MCP starts cleanly but exposes
+``OTO_*`` env var set (``OTO_CAN_MANAGE_AGENT``, ``OTO_CAN_EDIT_AGENT``,
+``OTO_SCOPE``, ``OTO_USER_SUB``). Disallowed sessions (a viewer in their own
+scope) end up with an empty tool list — the MCP starts cleanly but exposes
 nothing, which is friendlier to the MCP launcher than ``sys.exit(0)`` would be
 (no spurious failure logs).
 
@@ -48,7 +50,11 @@ Env vars (auto-injected by ``core/oto_env.py`` + ``env_builder.py``):
                          tier on the agent (a manager or an admin; the
                          manifest excludes task, meeting and external
                          sessions, so no fire or caller loads this MCP)
-  OTO_SCOPE            — ``user`` or ``agent``
+  OTO_CAN_EDIT_AGENT   — ``true`` when that person holds the editor tier
+  OTO_SCOPE            — ``user`` or ``agent`` (the mount: a Shared-only
+                         agent's chat mounts the agent's scope)
+  OTO_USER_SUB         — the person the session's token names; empty when
+                         it names nobody
   OTO_SESSION_ID       — session id (currently unused; future correlation)
   PROXY_URL            — proxy base URL
   PROXY_API_KEY        — session-scoped JWT (not the master key)
@@ -80,6 +86,11 @@ CAN_MANAGE = os.environ.get("OTO_CAN_MANAGE_AGENT", "") == "true"
 # ``mcp-authoring`` skill it comes with is for the same tier).
 CAN_EDIT = os.environ.get("OTO_CAN_EDIT_AGENT", "") == "true"
 SCOPE = os.environ.get("OTO_SCOPE", "")
+# The person the session's token names (OTO_USER_SUB, the token's own
+# subject): the check route's caller, and empty when the token names nobody
+# (a run, the agent's own phone line, an outside caller). A Shared-only
+# agent's chat mounts the agent's scope and still names its person.
+PERSON = bool(os.environ.get("OTO_USER_SUB", ""))
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
 API_KEY = os.environ.get("PROXY_API_KEY", "")
@@ -88,26 +99,20 @@ API_KEY = os.environ.get("PROXY_API_KEY", "")
 def _resolve_tool_set() -> set[str]:
     """Return the set of tool names this session is allowed to call.
 
-    The matrix:
+    - The check tool: the editor tier with a person the token names
+      (``PERSON``), at either scope. Its route takes exactly that caller.
+    - ``scope=user`` (a person's own chat) × a manager or an admin → the
+      list and request tools too. A contributor or a viewer → nothing.
+    - ``scope=agent`` (a Shared-only agent's chat, or a session whose token
+      names nobody) → the list tools for every role. No request tool: a
+      request is one person's own act, made from that person's own chat
+      or from the dashboard.
 
-    - ``scope=user`` × below the editor tier (a viewer, a contributor) →
-      empty (only the owner tier manages MCPs; the others collaborate on
-      the workspace).
-    - ``scope=user`` × an editor → ``validate_mcp_package`` alone (the
-      authoring check tool; a package is handed to an admin to install).
-    - ``scope=user`` × a manager → read + request tools, plus the check tool.
-    - ``scope=user`` × an admin → the same set as a manager.
-    - ``scope=agent`` (a Shared-only agent's chat, or a user-tied phone
-      route on one) → read-only (no requests — agent-scope can't act on
-      behalf of a user; the check route needs a signed-in person). Task,
-      trigger, meeting and external-caller sessions never load this MCP
-      (the manifest's ``exclude_from``).
+    Tasks, triggers, meetings and outside people never load this MCP (the
+    manifest's ``exclude_from``).
     """
     read = {"list_enabled_mcps", "list_available_mcps", "list_community_mcps",
             "list_community_skills"}
-    if SCOPE == "agent":
-        return read
-
     # Admin sessions get the same tool set as managers — power operations
     # (platform-wide install without an agent target; cross-agent enable)
     # live in the dashboard's Browse Community drawer + agent MCPs tab.
@@ -121,11 +126,15 @@ def _resolve_tool_set() -> set[str]:
         "cancel_my_request",
     }
     tools: set[str] = set()
-    if SCOPE == "user":
+    if SCOPE == "agent":
+        tools |= read
+    elif SCOPE == "user":
         if CAN_MANAGE:
             tools |= manager
-        if CAN_EDIT:
-            tools.add("validate_mcp_package")
+    else:
+        return tools
+    if CAN_EDIT and PERSON:
+        tools.add("validate_mcp_package")
     return tools
 
 
@@ -772,7 +781,8 @@ async def _try_enable_skill_directly(skill_name: str) -> tuple[str, str | None]:
     return "enabled", (
         f"✅ Skill package `{skill_name}` enabled for **{AGENT_NAME}** "
         f"directly ({names}) — it was already installed on the platform "
-        f"(no admin approval needed). New sessions pick the skills up."
+        f"(no admin approval needed). New sessions pick the skills up. "
+        f"To use it in this chat, reload it (`reload_session`)."
     )
 
 
@@ -856,7 +866,8 @@ async def _try_enable_directly(mcp_name: str) -> tuple[str, str | None]:
         "enabled",
         f"✅ `{mcp_name}` enabled for **{AGENT_NAME}** directly "
         f"(no admin approval needed — the MCP was already installed and "
-        f"available to this agent).",
+        f"available to this agent). To use it in this chat, reload it "
+        f"(`reload_session`).",
     )
 
 

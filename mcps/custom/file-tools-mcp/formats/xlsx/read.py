@@ -167,39 +167,44 @@ _WINDOW_CELL_BUDGET = 100_000
 _DOM_PER_XML_BYTE = 20
 
 
-def _sheet_xml_sizes(path: str) -> tuple[dict[str, int], int] | None:
+def _sheet_xml_sizes(source) -> tuple[dict[str, int], int] | None:
     """(uncompressed bytes per sheet NAME, sharedStrings bytes) from the zip
     directory — no decompression. None when the file isn't a readable zip
-    (encrypted/odd container: let openpyxl raise its own error)."""
+    (encrypted/odd container: let openpyxl raise its own error).
+    ``source``: a path (``shared.safe_open_read``) or the file the caller
+    holds."""
     import zipfile
     from xml.etree import ElementTree
+
+    import shared
 
     NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
     PNS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
-    try:
-        with zipfile.ZipFile(path) as zf:
-            sizes = {i.filename: i.file_size for i in zf.infolist()}
-            rels = {}
-            for rel in ElementTree.fromstring(
-                zf.read("xl/_rels/workbook.xml.rels")
-            ).findall(f"{PNS}Relationship"):
-                target = rel.get("Target", "").lstrip("/")
-                if not target.startswith("xl/"):
-                    target = "xl/" + target
-                rels[rel.get("Id")] = target
-            by_name = {}
-            for sh in ElementTree.fromstring(zf.read("xl/workbook.xml")).findall(
-                f"{NS}sheets/{NS}sheet"
-            ):
-                member = rels.get(sh.get(f"{RNS}id"), "")
-                by_name[sh.get("name")] = sizes.get(member, 0)
-            return by_name, sizes.get("xl/sharedStrings.xml", 0)
-    except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError):
-        return None
+    with shared.reading(source) as fh:
+        try:
+            with zipfile.ZipFile(fh) as zf:
+                sizes = {i.filename: i.file_size for i in zf.infolist()}
+                rels = {}
+                for rel in ElementTree.fromstring(
+                    zf.read("xl/_rels/workbook.xml.rels")
+                ).findall(f"{PNS}Relationship"):
+                    target = rel.get("Target", "").lstrip("/")
+                    if not target.startswith("xl/"):
+                        target = "xl/" + target
+                    rels[rel.get("Id")] = target
+                by_name = {}
+                for sh in ElementTree.fromstring(zf.read("xl/workbook.xml")).findall(
+                    f"{NS}sheets/{NS}sheet"
+                ):
+                    member = rels.get(sh.get(f"{RNS}id"), "")
+                    by_name[sh.get("name")] = sizes.get(member, 0)
+                return by_name, sizes.get("xl/sharedStrings.xml", 0)
+        except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError):
+            return None
 
 
-def _preflight_density(path: str, purpose: str = "read as a grid",
+def _preflight_density(source, purpose: str = "read as a grid",
                        extra_bytes: int = 0) -> None:
     """Refuse workbooks whose full-DOM load alone would blow the parse
     budget — BEFORE loading, with the offending sheet named. Sparse
@@ -209,7 +214,7 @@ def _preflight_density(path: str, purpose: str = "read as a grid",
     archive is a compressed copy of the whole file)."""
     from isolation import worker_rss_budget_bytes
 
-    info = _sheet_xml_sizes(path)
+    info = _sheet_xml_sizes(source)
     if info is None:
         return
     by_name, shared = info
@@ -228,7 +233,7 @@ def _preflight_density(path: str, purpose: str = "read as a grid",
 
 
 def _stream_values_window(
-    path: str,
+    source,
     sheet_name: str,
     r1: int,
     c1: int,
@@ -242,35 +247,40 @@ def _stream_values_window(
     every .cell() call, and a second full-DOM load doubles peak memory — so
     the window is materialized in a single iter_rows sweep. Merged-cell
     anchors that sit OUTSIDE the window are fetched with targeted single-cell
-    sweeps, capped: past the cap those cells fall back to formula text."""
+    sweeps, capped: past the cap those cells fall back to formula text.
+    ``source``: a path (``shared.safe_open_read``) or the file the caller
+    holds, kept open until the read-only workbook is closed."""
     from openpyxl import load_workbook
 
+    import shared
+
     out: dict[tuple[int, int], object] = {}
-    wb = load_workbook(path, read_only=True, data_only=True)
-    try:
-        if sheet_name not in wb.sheetnames:
-            return out
-        ws = wb[sheet_name]
-        for r_idx, row in enumerate(
-            ws.iter_rows(min_row=r1, max_row=r2, min_col=c1, max_col=c2, values_only=True),
-            start=r1,
-        ):
-            for c_off, v in enumerate(row):
-                if v is not None:
-                    out[(r_idx, c_off + c1)] = v
-        outside = set()
-        for (r, c), (ar, ac) in anchors.items():
-            if r1 <= r <= r2 and c1 <= c <= c2 and not (r1 <= ar <= r2 and c1 <= ac <= c2):
-                outside.add((ar, ac))
-        for ar, ac in sorted(outside)[:50]:
-            for row in ws.iter_rows(
-                min_row=ar, max_row=ar, min_col=ac, max_col=ac, values_only=True
+    with shared.reading(source) as fh:
+        wb = load_workbook(fh, read_only=True, data_only=True)
+        try:
+            if sheet_name not in wb.sheetnames:
+                return out
+            ws = wb[sheet_name]
+            for r_idx, row in enumerate(
+                ws.iter_rows(min_row=r1, max_row=r2, min_col=c1, max_col=c2, values_only=True),
+                start=r1,
             ):
-                if row and row[0] is not None:
-                    out[(ar, ac)] = row[0]
-    finally:
-        wb.close()
-    return out
+                for c_off, v in enumerate(row):
+                    if v is not None:
+                        out[(r_idx, c_off + c1)] = v
+            outside = set()
+            for (r, c), (ar, ac) in anchors.items():
+                if r1 <= r <= r2 and c1 <= c <= c2 and not (r1 <= ar <= r2 and c1 <= ac <= c2):
+                    outside.add((ar, ac))
+            for ar, ac in sorted(outside)[:50]:
+                for row in ws.iter_rows(
+                    min_row=ar, max_row=ar, min_col=ac, max_col=ac, values_only=True
+                ):
+                    if row and row[0] is not None:
+                        out[(ar, ac)] = row[0]
+        finally:
+            wb.close()
+        return out
 
 
 _LIST_VALIDATION = "list"
@@ -286,19 +296,30 @@ def read_xlsx(
 ) -> str:
     """Read an XLSX file and return a coordinate-labeled grid.
 
-    Supports range-based reading, formula view, and metadata output.
+    Supports range-based reading, formula view, and metadata output. The
+    file is opened once (``shared.safe_open_read``: beneath the mount, no
+    link followed) and that one handle is read by every pass.
     """
+    import shared
+
+    with shared.safe_open_read(path) as fh:
+        return _read_xlsx(fh, path, sheet, max_rows, start_cell, end_cell, show_formulas)
+
+
+def _read_xlsx(fh, path: str, sheet: str | None, max_rows: int, start_cell: str | None,
+               end_cell: str | None, show_formulas: bool) -> str:
     from openpyxl import load_workbook
     from openpyxl.utils import get_column_letter
 
-    check_readable(path)
-    _preflight_density(path)
+    check_readable(fh)
+    _preflight_density(fh)
 
     # Formula text and structure (comments, merged ranges, validations) need
     # the full DOM. Cached values do NOT — they stream from a read_only pass
     # over just the rendered window (a second full-DOM load doubled peak
     # memory).
-    wb_form = load_workbook(path, read_only=False, data_only=False)
+    fh.seek(0)
+    wb_form = load_workbook(fh, read_only=False, data_only=False)
 
     sheets = wb_form.sheetnames
     result = [f"**XLSX**: {inventory.clean(Path(path).name)} — Sheets: "
@@ -348,7 +369,7 @@ def read_xlsx(
     vals_window: dict[tuple[int, int], object] = {}
     if not show_formulas and shown_rows > 0 and n_cols > 0:
         vals_window = _stream_values_window(
-            path, target, min_row, min_col,
+            fh, target, min_row, min_col,
             min_row + shown_rows - 1, max_col_bound, anchors,
         )
 

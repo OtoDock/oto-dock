@@ -1,13 +1,14 @@
 import '@xterm/xterm/css/xterm.css'
-import { useCallback } from 'react'
+import { useCallback, useState } from 'react'
 import { useInteractiveTerminal, type InteractiveWs } from '@/hooks/useInteractiveTerminal'
 import { ptyPasteB64, withInteractiveTime } from '@/hooks/useInteractiveChat'
 import { buildArtifactInteractionText } from '@/lib/artifactInteraction'
 import type { useArtifactWindows } from '@/hooks/useArtifactWindows'
 import PermissionDialog from '../PermissionDialog'
+import SystemEvent from '../SystemEvent'
+import { limitCardKey, type SystemBlock } from '@/lib/messageBlocks'
+import { loadDismissed, recordDismissed } from '@/lib/chatNoticeDismissals'
 import ArtifactWindows from '../artifacts/ArtifactWindows'
-import Tooltip from '../../ui/Tooltip'
-import { DONT_ASK_CHIP, runsWithoutAsking } from '../../../lib/engines/modes'
 
 /**
  * The live view of an interactive CLI (PTY) session: a
@@ -30,31 +31,27 @@ interface Props {
   /** Fired when the PTY process REALLY ends (not 'superseded') — the page leaves
    * the dead terminal for the DB rich view + primes a resume on the next send. */
   onExit?: () => void
-  /** The chat's permission mode. The TUI prints its own mode line for Ask,
-   * Auto and Plan, so the badge shows only Don't Ask: the CLI has no Don't
-   * Ask of its own (the spawn maps it to the CLI's default), so its footer
-   * reads "manual mode" while the platform runs every tool. The mode
-   * follows a Shift+Tab inside the terminal. */
-  permissionMode?: string
+  /** The chat's usage-limit card (`terminalLimitCard`): shown under the
+   *  terminal, never over its last rows, while no permission card is and
+   *  until a person hides that limit's card in this chat. */
+  notice?: SystemBlock
 }
 
-/** The badge: Don't Ask alone, the mode the terminal cannot show. */
-const DONT_ASK_BADGE = {
-  note: "Don't Ask: this chat runs every tool without asking. The terminal's own mode line does not show it.",
-  classes: `${DONT_ASK_CHIP.bg} ${DONT_ASK_CHIP.border} ${DONT_ASK_CHIP.text}`,
-  path: 'M13 10V3L4 14h7v7l9-11h-7z',
-}
-
-function badgeOf(mode: string | undefined) {
-  return runsWithoutAsking(mode) ? DONT_ASK_BADGE : undefined
-}
-
-export default function TerminalView({ ws, chatId, className, agent, artifacts, onExit, permissionMode }: Props) {
-  const badge = badgeOf(permissionMode)
+export default function TerminalView({ ws, chatId, className, agent, artifacts, onExit, notice }: Props) {
   const {
     containerRef, pendingPermission, respondPermission, exited, exitReason,
     reconnecting, focus, readOnly, controller, takeOver,
   } = useInteractiveTerminal(ws, chatId, onExit)
+  // The limit cards a person hid in this chat, kept by this browser.
+  const [hidden, setHidden] = useState(() => loadDismissed('limitcard', chatId))
+  // The chat switch reloads them, in render (as ChatTargetBanner does).
+  const [hiddenFor, setHiddenFor] = useState(chatId)
+  if (hiddenFor !== chatId) {
+    setHiddenFor(chatId)
+    setHidden(loadDismissed('limitcard', chatId))
+  }
+  const limitKey = notice ? limitCardKey(notice) : ''
+  const showNotice = !!notice && !pendingPermission && !hidden.has(limitKey)
 
   // Backchannel for PiP artifacts: interactive chats deliver by TYPING the
   // framed interaction into the terminal — the composer's own rail (bracketed
@@ -81,7 +78,8 @@ export default function TerminalView({ ws, chatId, className, agent, artifacts, 
       : pendingPermission?.toolName || ''
 
   return (
-    <div className={`relative flex-1 min-h-0 bg-surface-page overflow-hidden ${className || ''}`}>
+    <div className={`flex-1 min-h-0 flex flex-col bg-surface-page overflow-hidden ${className || ''}`}>
+      <div className="relative flex-1 min-h-0">
       <div ref={containerRef} className="absolute inset-0" onMouseDown={focus} />
       <ArtifactWindows
         chatId={chatId}
@@ -97,27 +95,6 @@ export default function TerminalView({ ws, chatId, className, agent, artifacts, 
           read-only one carries its Take over button). Absolute: the
           terminal's size never depends on them. */}
       <div className="absolute top-2 right-3 z-10 flex flex-col items-end gap-1.5">
-        {/* The status bar's mode chip, the glyph alone: its tint is
-            translucent, so it sits on the page colour, never on the
-            terminal's text. It takes focus, so a keyboard reaches the note. */}
-        {badge && (
-          <Tooltip text={badge.note}>
-            <span className="block rounded-control bg-surface-page shadow-elevation-1">
-              <span
-                role="img"
-                tabIndex={0}
-                aria-label={badge.note}
-                data-testid="terminal-mode"
-                className={`flex items-center justify-center w-7 h-7 rounded-control border ${badge.classes} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring/50`}
-              >
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={badge.path} />
-                </svg>
-              </span>
-            </span>
-          </Tooltip>
-        )}
-
         {exited && (
           <div className="text-xs font-medium text-status-info-fg bg-status-info-bg border border-status-info-border px-2 py-1 rounded-control shadow-elevation-1">
             {exitReason === 'superseded'
@@ -165,6 +142,27 @@ export default function TerminalView({ ws, chatId, className, agent, artifacts, 
               toolName={permLabel}
               toolInput={pendingPermission.toolInput}
               onRespond={respondPermission}
+            />
+          </div>
+        </div>
+      )}
+      </div>
+
+      {/* Its own strip: the terminal refits above it, so the engine's own
+          rows and input line stay in view. */}
+      {showNotice && notice && (
+        <div className="shrink-0 px-3 pt-2" data-testid="terminal-limit-card">
+          <div className="max-w-2xl mx-auto">
+            <SystemEvent
+              subtype={notice.subtype}
+              message={notice.message}
+              reason={notice.reason}
+              onDismiss={() => {
+                // Hidden for this view even when the browser refuses the
+                // write. The store decides the next mount.
+                recordDismissed('limitcard', chatId, limitKey)
+                setHidden((was) => new Set(was).add(limitKey))
+              }}
             />
           </div>
         </div>

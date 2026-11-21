@@ -9,6 +9,7 @@ Provides:
 """
 
 import contextlib
+import dataclasses
 import logging
 import math
 import secrets
@@ -61,12 +62,18 @@ class PrincipalKind(str, Enum):
                     trigger, scheduled agent-scope task, meeting service). A
                     low-privilege principal: it may act on the single agent it
                     was minted for, but is neither admin nor a manager.
+    API_KEY       — a person's ``otok_`` key on the public routes
+                    (``auth/api_keys.py``): acts as that person, never more,
+                    on the routes ``auth/api_key_endpoints.py`` lists. Never a
+                    signed-in session: every "person at the keyboard" gate
+                    refuses it, the copy its routes hand the handlers too.
     """
 
     COOKIE = "cookie"
     SERVICE = "service"
     USER_SESSION = "user_session"
     AGENT_SESSION = "agent_session"
+    API_KEY = "api_key"
 
 
 # --- UserContext ---
@@ -101,6 +108,10 @@ class UserContext:
     external_claim: str = ""
     external_channel: str = ""
     external_id: str = ""
+    # The wrap-up after a conversation: the outside person's identity row
+    # its session token names (the ``subj`` claim), which maps the memory
+    # API to that person's memory alone. Empty for every other principal.
+    subject_id: str = ""
     # The platform's own headless render (``auth/render_principal.py``): the
     # one app this principal may reach, and the live token's id. Empty for
     # every other principal.
@@ -110,6 +121,14 @@ class UserContext:
     # (``auth_gate``): ``must_change_password``, ``must_enroll_2fa`` or "".
     # Only the cookie branch sets it.
     auth_gate: str = ""
+    # A person's ``otok_`` key (``PrincipalKind.API_KEY``): its id, name,
+    # scopes, named agents (empty: every agent the person holds) and whether
+    # it was minted to run without asking. Empty for every other principal.
+    api_key_id: str = ""
+    api_key_name: str = ""
+    api_key_scopes: tuple[str, ...] = ()
+    api_key_agents: tuple[str, ...] = ()
+    api_key_runs_unasked: bool = False
 
     @property
     def is_admin(self) -> bool:
@@ -131,6 +150,8 @@ class UserContext:
         ``is_api_key`` records the low-level fact (token vs. cookie); ``kind``
         is the security-relevant classification built from it.
         """
+        if self.api_key_id:
+            return PrincipalKind.API_KEY
         if not self.is_api_key:
             return PrincipalKind.COOKIE
         if self.sub == "api-key":
@@ -209,10 +230,13 @@ class UserContext:
 
     def acting_role(self, agent: str) -> str:
         """The role this ADMITTED principal acts with on ``agent``:
-        ``effective_role`` or, holding no row, ``roles.VIEWER`` — a session
-        acting on the agent it was minted for, a share grantee. Every
-        caller sits behind an admission gate (``can_access_agent``, a
+        ``roles.EXTERNAL`` for an outside person's session (below every
+        floor), else ``effective_role`` or, holding no row, ``roles.VIEWER``
+        — a session acting on the agent it was minted for, a share grantee.
+        Every caller sits behind an admission gate (``can_access_agent``, a
         grant, a route check) that refused a stranger already."""
+        if self.is_external:
+            return roles.EXTERNAL
         return roles.acting_role(self.role, self.agent_roles, agent)
 
     def can_manage_agent(self, agent: str) -> bool:
@@ -714,6 +738,63 @@ def user_context_for_sub(sub: str) -> UserContext | None:
     )
 
 
+def capped_principal(u: UserContext, agent: str, cap: str) -> UserContext:
+    """``u`` acting at most at ``cap`` on ``agent``: that agent's row capped
+    (and the agent reached), a platform member whatever its platform role
+    was (an admin or a creator alike), and no setup owner. Rows on other
+    agents stay. The one shape of every principal that acts below its
+    person (a key on the file routes, a session whose role was capped)."""
+    role = roles.capped(u.acting_role(agent), cap)
+    agents = list(dict.fromkeys([*u.agents, agent]))
+    return dataclasses.replace(u, role=roles.MEMBER, agents=agents, is_owner=False,
+                               agent_roles={**u.agent_roles, agent: role})
+
+
+def session_principal(person: UserContext, token: dict) -> UserContext:
+    """``person`` as the session of ``token`` (a validated session token's
+    claims: ``sid``, ``agent``, ``role``) lets them act: at the role the
+    session was built with when that is lower than theirs
+    (``session_role_cap``, ``capped_principal``). The one reading of a
+    session's person for every route its request reaches."""
+    sid, agent = token.get("sid") or "", token.get("agent") or ""
+    cap = session_role_cap(sid, agent, person.effective_role(agent), token.get("role"))
+    return capped_principal(person, agent, cap) if cap else person
+
+
+def session_row_role(sub: str, token: dict) -> str:
+    """The row the person of a session (``token``: ``sid``, ``agent``,
+    ``role``) presents on its agent to an app or a placed app: their own row
+    there (``viewer`` with none), never a platform admin's standing, at most
+    the role the session was built with (``session_role_cap``). Synchronous:
+    the DB executor."""
+    agent = token.get("agent") or ""
+    own = roles.row_role(task_store.get_user_agent_roles(sub), agent) or roles.VIEWER
+    cap = session_role_cap(token.get("sid") or "", agent, own, token.get("role"))
+    return roles.capped(own, cap) if cap else own
+
+
+def session_role_cap(session_id: str, agent: str, stored_role: str,
+                     claimed: object = None) -> str:
+    """The role a session acts at on its own agent when it is lower than its
+    person's stored role there (``stored_role``): the role its session was
+    built with (a call on a line tied to a person is capped). The token's
+    own ``role`` claim (``claimed``) says it
+    wherever the token is accepted; a token that carries none is judged by
+    the session's registered context. "" when it is not lower, or neither
+    says."""
+    if not session_id or not agent:
+        return ""
+    role = claimed if isinstance(claimed, str) and claimed else ""
+    if not role:
+        from core.session.session_state import get_session_security
+        ctx = get_session_security(session_id)
+        built = getattr(ctx, "role", "") if ctx is not None else ""
+        role = built if isinstance(built, str) else ""
+    if not role or roles.is_external(role):
+        return ""
+    return role if roles.rank(role) < roles.rank(stored_role) else ""
+
+
 def effective_role_of(sub: str, agent: str, *, fallback_user: dict | None = None) -> str:
     """The store-backed resolver: the live users row (or ``fallback_user``,
     the dict a socket kept from connect time, when the row is gone), the
@@ -768,6 +849,12 @@ async def _resolve_principal(req: Request) -> UserContext | None:
         parts = auth_header.split(" ", 1)
         if len(parts) == 2 and parts[0].lower() == "bearer":
             token = parts[1]
+            # A person's key: the middleware verified it on a listed route
+            # and left the principal on the request (``get_current_user``'s
+            # memo), so reaching here means no such route: nobody, never the
+            # cookie beside it. A WebSocket scope has no middleware.
+            if token.strip().startswith("otok_"):
+                return None
             # Master API key (Docker MCPs, standalone scheduler, phone)
             if config.is_master_key(token):
                 return UserContext(
@@ -798,6 +885,17 @@ async def _resolve_principal(req: Request) -> UserContext | None:
                 agent_name = session_payload.get("agent") or ""
                 user_sub = session_payload.get("user_sub") or ""
                 ext = _parse_external_claim(session_payload.get("ext") or "")
+                if ext is None:
+                    # A damaged identity claim names nobody: refused, never
+                    # demoted to the broader no-user principal.
+                    return None
+                subject = session_payload.get("subj") or ""
+                if subject and (user_sub or ext
+                                or not await run_db_fast(_subject_holds, subject, agent_name)):
+                    # The wrap-up's grant names one outside person of its own
+                    # agent: on a token with a person or a caller, or for a
+                    # person forgotten since, it is refused, never ignored.
+                    return None
                 if user_sub:
                     user, agent_roles, _ = await run_db_fast(
                         _load_user, user_sub, with_default=False,
@@ -808,7 +906,7 @@ async def _resolve_principal(req: Request) -> UserContext | None:
                     # no-user agent principal below.
                     if not user or not session_token_is_current(user, session_payload):
                         return None
-                    return UserContext(
+                    person = UserContext(
                         sub=user["sub"],
                         email=user["email"],
                         name=user["name"],
@@ -822,6 +920,9 @@ async def _resolve_principal(req: Request) -> UserContext | None:
                         agent=agent_name,
                         **ext,
                     )
+                    # A session acts at the role it was built with when that
+                    # is lower than its person's: every route judges the cap.
+                    return session_principal(person, session_payload)
                 # No-user session (phone / trigger / scheduled agent-scope /
                 # meeting service): a low-privilege agent principal. NOT admin —
                 # it can act on its own agent (see can_access_agent) and create
@@ -837,6 +938,7 @@ async def _resolve_principal(req: Request) -> UserContext | None:
                     is_api_key=True,
                     session_id=sid,
                     agent=agent_name,
+                    subject_id=subject,
                     **ext,
                 )
 
@@ -886,16 +988,24 @@ async def _resolve_principal(req: Request) -> UserContext | None:
     return None
 
 
+def _subject_holds(subject: str, agent: str) -> bool:
+    """Whether a wrap-up token's ``subj`` names an outside person of its own
+    agent who is still on record."""
+    from storage.identity import external_identity_store
+    row = external_identity_store.get_by_id(subject)
+    return row is not None and row.get("agent") == agent
+
+
 class _ExternalClaim(TypedDict, total=False):
     external_claim: str
     external_channel: str
     external_id: str
 
 
-def _parse_external_claim(claim: str) -> _ExternalClaim:
-    """``UserContext`` kwargs for a session token's ``ext`` claim. A malformed
-    claim (the proxy signed it, so that is a bug) is logged and treated as
-    absent — the token then has no external standing at all."""
+def _parse_external_claim(claim: str) -> _ExternalClaim | None:
+    """``UserContext`` kwargs for a session token's ``ext`` claim, or None
+    for a malformed claim (the proxy signed it, so that is a bug): the
+    caller refuses the token, never demotes it."""
     if not claim:
         return {}
     try:
@@ -903,7 +1013,7 @@ def _parse_external_claim(claim: str) -> _ExternalClaim:
         channel, ident, _ephemeral = parse_claim(claim)
     except ValueError:
         logger.error("Session token carries a malformed external claim: %r", claim)
-        return {}
+        return None
     return {
         "external_claim": claim,
         "external_channel": channel,
@@ -945,7 +1055,7 @@ def require_admin(user: UserContext | None) -> UserContext:
     confinement middleware limits it to its endpoint allowlist.
     """
     u = require_auth(user)
-    if getattr(u, "is_api_key", False):
+    if getattr(u, "is_api_key", False) or getattr(u, "api_key_id", ""):
         raise HTTPException(
             status_code=403, detail="User authentication required (not API key)"
         )
@@ -966,7 +1076,7 @@ def require_human(user: UserContext | None) -> UserContext:
     prompt can make — those routes use this gate.
     """
     u = require_auth(user)
-    if getattr(u, "is_api_key", False):
+    if getattr(u, "is_api_key", False) or getattr(u, "api_key_id", ""):
         raise HTTPException(
             status_code=403, detail="User authentication required (not API key)"
         )
@@ -982,7 +1092,7 @@ def require_creator(user: UserContext | None) -> UserContext:
     S2S key must never inherit them.
     """
     u = require_auth(user)
-    if getattr(u, "is_api_key", False):
+    if getattr(u, "is_api_key", False) or getattr(u, "api_key_id", ""):
         raise HTTPException(
             status_code=403, detail="User authentication required (not API key)"
         )
@@ -1010,7 +1120,7 @@ def require_creator_interactive(user: UserContext | None) -> UserContext:
     that must stay dashboard-only.
     """
     u = require_auth(user)
-    if u.acting_sub is None:
+    if u.acting_sub is None or u.api_key_id:
         raise HTTPException(
             status_code=403,
             detail="User authentication required (not a service credential)",

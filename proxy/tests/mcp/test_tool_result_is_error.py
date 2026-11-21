@@ -78,3 +78,10 @@ class TestHookRequestCarriesFlag:
             session_id="s", tool_name="t", summary="error: boom", is_error=True,
         )
         assert flagged.is_error is True
+
+
+class TestFailureEvent:
+    def test_the_failure_event_is_an_error_whatever_its_summary(self):
+        assert forwarder._is_failure({"hook_event_name": "PostToolUseFailure"}) is True
+        assert forwarder._is_failure({"hook_event_name": "PostToolUse"}) is False
+        assert forwarder._is_failure({}) is False

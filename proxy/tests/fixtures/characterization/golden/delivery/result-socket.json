@@ -1,0 +1,23 @@
+{
+ "payload": {
+  "chat_id": "c-ws",
+  "delegate_agent": "char-peer",
+  "output_text": "the worker's answer",
+  "result_prompt": "[status=completed task=t-ws name=the-worker chat= agent=char-peer]\nthe worker's answer",
+  "session_id": "s-ws",
+  "status": "completed",
+  "task_id": "t-ws",
+  "task_name": "the-worker",
+  "type": "task_result_prompt"
+ },
+ "pending": [],
+ "rows": [],
+ "seen": {
+  "admission": [],
+  "frames": [],
+  "layer": [],
+  "layers_asked": [],
+  "released": [],
+  "seats": []
+ }
+}

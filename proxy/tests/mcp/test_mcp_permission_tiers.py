@@ -11,12 +11,13 @@ Covers the three pieces that make the tier system a security contract:
 
 DB-free by design: manifests are monkeypatched into the registry cache.
 """
+import json
 from pathlib import Path
 
 import pytest
 
 import config
-from services.mcp import mcp_permissions, mcp_registry as reg
+from services.mcp import mcp_manifest_store, mcp_permissions
 from services.mcp.mcp_manifest_types import PermissionRule, PermissionsBlock
 from services.mcp.mcp_registry import (
     CredentialConfig,
@@ -106,11 +107,12 @@ def _mk(name, *, permissions=None, server_name="", category="custom",
 @pytest.fixture
 def manifests(monkeypatch):
     cache: dict[str, McpManifest] = {}
-    monkeypatch.setattr(reg, "_manifests", cache)
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", cache)
     # No hints a server sent elsewhere in the run.
     monkeypatch.setattr(mcp_permissions, "_hints", {})
     monkeypatch.setattr(mcp_permissions, "_hints_loaded", True)
-    return cache
+    yield cache
+    mcp_permissions.reset_cache()
 
 
 class TestResolveToolTier:
@@ -253,30 +255,56 @@ class TestToolHints:
         assert mcp_permissions.resolve_tool_tier("bare", "read") == "open"
         assert mcp_permissions.resolve_tool_tier("bare", "other") == "sensitive"
 
-    def test_hints_are_kept_across_a_restart(self, manifests, monkeypatch, tmp_path, caplog):
+    def test_hints_are_kept_across_a_restart(self, manifests, monkeypatch, tmp_path, caplog, temp_db):
+        """The labels live in ``mcp_tool_labels``: a fresh process reads
+        them back; the other keys a server sent (a title) are not kept."""
         monkeypatch.setattr(config, "PLATFORM_DATA_DIR", str(tmp_path))
         mcp_permissions.record_tool_hints("srv", [("read", {**_RO, "title": "Read"}),
                                                   ("write", _DESTRUCTIVE), ("plain", None)])
-        on_disk = (tmp_path / "mcp-tool-hints.json").read_text()
-        assert '"title"' not in on_disk
-        monkeypatch.setattr(mcp_permissions, "_hints", {})
-        monkeypatch.setattr(mcp_permissions, "_hints_loaded", False)
+        from storage.mcp import mcp_store
+        stored = mcp_store.get_all_tool_labels()
+        assert stored == {"srv": {"read": _RO, "write": _DESTRUCTIVE, "plain": {}}}
+        assert not (tmp_path / "mcp-tool-hints.json").exists()
+        mcp_permissions.reset_cache()
         assert mcp_permissions.tool_hints("srv", "read") == _RO
         assert mcp_permissions.tool_hints("srv", "plain") == {}
         assert mcp_permissions.known_tools("srv") == ["plain", "read", "write"]
-        # A server that loosens its own word is logged.
+        # A server that loosens its own word is logged. A list that names
+        # fewer tools (a session's role-limited view of the server) updates
+        # what it names and keeps the rest; an empty list records nothing.
         with caplog.at_level("INFO", logger="services.mcp.mcp_permissions"):
             mcp_permissions.record_tool_hints("srv", [("write", _RO)])
         assert "srv/write now labels itself open (was sensitive)" in caplog.text
-        assert mcp_permissions.known_tools("srv") == ["write"]
+        assert mcp_permissions.known_tools("srv") == ["plain", "read", "write"]
+        assert mcp_store.get_all_tool_labels() == {"srv": {"read": _RO, "write": _RO, "plain": {}}}
+        mcp_permissions.record_tool_hints("srv", [])
+        assert mcp_permissions.known_tools("srv") == ["plain", "read", "write"]
 
-    def test_an_unreadable_hints_file_is_an_empty_cache(self, manifests, monkeypatch, tmp_path, caplog):
+    def test_the_1_9_file_is_imported_once_into_an_empty_table(self, manifests, monkeypatch, tmp_path, temp_db):
+        monkeypatch.setattr(config, "PLATFORM_DATA_DIR", str(tmp_path))
+        (tmp_path / "mcp-tool-hints.json").write_text(
+            json.dumps({"old": {"peek": _RO, "poke": _DESTRUCTIVE}, 7: {}, "junk": "x"}))
+        mcp_permissions.reset_cache()
+        assert mcp_permissions.tool_hints("old", "peek") == _RO
+        from storage.mcp import mcp_store
+        assert mcp_store.get_all_tool_labels() == {"old": {"peek": _RO, "poke": _DESTRUCTIVE}}
+        # The file is read into the table once: a later edit of it changes nothing.
+        (tmp_path / "mcp-tool-hints.json").write_text(json.dumps({"other": {"x": _RO}}))
+        mcp_permissions.reset_cache()
+        assert mcp_permissions.tool_hints("other", "x") is None
+        assert mcp_permissions.tool_hints("old", "peek") == _RO
+
+    def test_an_unreadable_hints_file_is_an_empty_cache(self, manifests, monkeypatch, tmp_path, caplog, temp_db):
         monkeypatch.setattr(config, "PLATFORM_DATA_DIR", str(tmp_path))
         (tmp_path / "mcp-tool-hints.json").write_text("{not json")
-        monkeypatch.setattr(mcp_permissions, "_hints_loaded", False)
+        mcp_permissions.reset_cache()
         with caplog.at_level("WARNING", logger="services.mcp.mcp_permissions"):
             assert mcp_permissions.tool_hints("srv", "read") is None
         assert "unreadable" in caplog.text
+
+    def test_reads_only_is_the_read_only_label_alone(self):
+        assert mcp_permissions.reads_only(_RO) and not mcp_permissions.reads_only(_DESTRUCTIVE)
+        assert not mcp_permissions.reads_only(None) and not mcp_permissions.reads_only({})
 
     def test_codex_prompts_a_globbed_sensitive_server_until_its_list_is_read(self, manifests):
         manifests["glob"] = _mk("glob", permissions=PermissionsBlock(
@@ -399,9 +427,11 @@ class TestTierDecision:
         ("critical", "plan", "deny"),
         ("critical", "dontAsk", "prompt"),
         ("critical", "auto", "deny"),
-        # a word from before 1.9 reads as its current one
+        # a word no release writes (one from before 1.9) is no more than Ask
         ("standard", "default", "prompt"),
-        ("standard", "acceptEdits", "allow"),
+        ("standard", "acceptEdits", "prompt"),
+        ("sensitive", "acceptEdits", "prompt"),
+        ("critical", "acceptEdits", "prompt"),
     ])
     def test_grid(self, tier, mode, expected):
         assert mcp_permissions.tier_decision(tier, mode) == expected
@@ -448,21 +478,26 @@ class TestCanonicalToolName:
         manifests["gh"] = _mk("gh", server_name="github-mcp")
         assert _canonical("mcp__github_mcp__list_issues") == "mcp__github-mcp__list_issues"
 
-    def test_a_known_session_restores_against_its_own_servers(self, manifests, monkeypatch):
-        """Two manifests whose names sanitise alike: a session that declared
-        one of them resolves to that one, never to whichever the registry
-        lists first."""
+    def test_names_that_sanitise_alike_restore_to_the_first_manifest(self, manifests, monkeypatch):
+        """The restore reads every manifest and no session: of two manifests
+        whose names sanitise alike the one the registry lists first answers,
+        also for a session on a machine whose own tool is the other one."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from core.remote.remote_execution import RemoteExecutionLayer
+        from core.remote.remote_session_info import RemoteSessionInfo
+        from core.session import session_manager
         manifests["a-b"] = _mk("a-b")
         manifests["a_b"] = _mk("a_b", server_name="a.b")
-        from core.layers.codex import session as codex_session
-        sess = codex_session.CodexAppServerSession(
-            session_id="11111111-2222-4333-8444-555555555555", agent_name="pa",
-            model="gpt-6", sandbox_mode="workspace-write", working_dir="",
-            config_dir="/tmp/x", mcp_server_names=["a.b"],
-        )
-        monkeypatch.setitem(codex_session._codex_sessions, sess.session_id, sess)
-        assert _canonical("mcp__a_b__go", sess.session_id) == "mcp__a.b__go"
+        sid = "11111111-2222-4333-8444-555555555555"
+        remote = RemoteExecutionLayer(MagicMock())
+        remote._sessions[sid] = RemoteSessionInfo(
+            session_id=sid, machine_id="m-1", agent_name="pa", execution_path="codex-cli",
+            event_queue=asyncio.Queue(), used_mcps={"a_b"})
+        monkeypatch.setattr(session_manager, "_remote_layer", remote)
         assert _canonical("mcp__a_b__go") == "mcp__a-b__go"
+        assert _canonical("mcp__a_b__go", sid) == "mcp__a-b__go"
 
     def test_native_names_map_to_the_platforms(self):
         assert _canonical("commandExecution") == "Bash"

@@ -1,5 +1,7 @@
 import { Link } from 'react-router-dom'
 import { CHAT_MOVED_REASON, RESEND_REASONS, SYSTEM_SUBTYPE, UNDELIVERED_REASON } from '../../api/wireEvents'
+import EngineNotice from '../common/EngineNotice'
+import { ENGINE_CONNECT_REASONS } from '../../lib/engines/notice'
 
 interface Props {
   subtype: string
@@ -16,12 +18,16 @@ interface Props {
    *  ending no re-send answers. */
   sendAgain?: 'resume' | 'again'
   onSendAgain?: () => void
+  /** The turn-ended card's Hide button, at the title row's right end. Only
+   *  the limit card under a terminal passes it: the history keeps its card. */
+  onDismiss?: () => void
 }
 
 // The proxy's line ends in an instruction for a reader without this card
 // (a task run's output, a delegator). The card says its own, so it drops it.
 const LINE_INSTRUCTIONS = [
   'Send the message again once the machine is back.',
+  'Send the message again in a few minutes.',
   'Send the message again, the conversation continues where it left off.',
   'Send the message again.',
   'Send a message to continue.',
@@ -58,7 +64,7 @@ const LABELS: Record<string, string> = {
   [SYSTEM_SUBTYPE.MEETING_AGENT_LEFT]: 'Agent left the meeting',
 }
 
-export default function SystemEvent({ subtype, message, reason, returned, sendAgain, onSendAgain }: Props) {
+export default function SystemEvent({ subtype, message, reason, returned, sendAgain, onSendAgain, onDismiss }: Props) {
   // Meeting turn start/end: no inline separators (indicator bar handles speaker identity)
   if (subtype === SYSTEM_SUBTYPE.MEETING_TURN_START) return null
   if (subtype === SYSTEM_SUBTYPE.MEETING_TURN_END) return null
@@ -75,7 +81,22 @@ export default function SystemEvent({ subtype, message, reason, returned, sendAg
     const line = sendAgain ? withoutInstruction(message) : message
     return (
       <div className={`${NOTICE_BOX} ${resend ? NOTICE.danger : NOTICE.warning}`} data-testid="turn-ended" data-reason={reason}>
-        <div className="font-medium">This turn ended early</div>
+        <div className="flex items-start justify-between gap-2">
+          <div className="font-medium">This turn ended early</div>
+          {onDismiss && (
+            <button
+              type="button"
+              onClick={onDismiss}
+              aria-label="Hide this notice"
+              title="Hide"
+              className="p-1.5 -mr-1 -mt-0.5 shrink-0 rounded-control hover:bg-surface-hover"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          )}
+        </div>
         {line && <div className="mt-1 whitespace-pre-wrap break-words">{line}</div>}
         {sendAgain && onSendAgain && (
           <>
@@ -123,6 +144,28 @@ export default function SystemEvent({ subtype, message, reason, returned, sendAg
     )
   }
 
+  // The agent asked the platform to rebuild the chat's session (persisted,
+  // and the same block live): the server's note, titled by how it ended.
+  // Neutral like the move's card: a choice the agent made. A terminal's
+  // live announcement of its new terminal never becomes a block.
+  if (subtype === SYSTEM_SUBTYPE.SESSION_RELOADED) {
+    const title = reason === CHAT_MOVED_REASON.FAILED
+      ? 'Session was not reloaded'
+      : reason === CHAT_MOVED_REASON.RESUME_STOPPED
+        ? 'Session reloads stopped'
+        : reason === CHAT_MOVED_REASON.ACCOUNT_CHANGED
+          ? 'Account changed'
+          : reason === CHAT_MOVED_REASON.ACCOUNT_CHANGE_WAITS
+            ? 'Account change waiting'
+            : 'Session reloaded'
+    return (
+      <div className={`${NOTICE_BOX} ${NOTICE.neutral}`} data-testid="session-reloaded" data-reason={reason || undefined}>
+        <div className="font-medium text-primary">{title}</div>
+        {message && <div className="mt-1">{message}</div>}
+      </div>
+    )
+  }
+
   // The chat's tools on its machine (persisted): still installing when the
   // session started, or how they ended. Neutral: nothing failed in the chat.
   if (subtype === SYSTEM_SUBTYPE.TOOLS_INSTALLING) {
@@ -134,15 +177,10 @@ export default function SystemEvent({ subtype, message, reason, returned, sendAg
     )
   }
 
-  // No usable subscription for this execution layer (user-scoped warmup blocked).
-  // A setup prompt, not a crash — amber, points the user at their settings.
+  // A send the warm-up refused for want of an AI engine (the refusal's own
+  // sentence, its reason deciding whether a connect button helps).
   if (subtype === SYSTEM_SUBTYPE.NO_SUBSCRIPTION) {
-    return (
-      <div className={`${NOTICE_BOX} ${NOTICE.warning}`}>
-        <div className="font-medium">Subscription required</div>
-        {message && <div className="mt-1">{message}</div>}
-      </div>
-    )
+    return message ? <EngineNotice message={message} reason={reason} className="my-2" /> : null
   }
 
   // The pool's subscription cap refused the spawn (the proxy's wording says
@@ -202,6 +240,11 @@ export default function SystemEvent({ subtype, message, reason, returned, sendAg
       <div className={`${NOTICE_BOX} ${NOTICE.danger}`}>
         <div className="font-medium">Meeting could not start</div>
         {message && <div className="mt-1">{message}</div>}
+        {reason && ENGINE_CONNECT_REASONS.has(reason) && (
+          <div className="mt-1 text-xs">
+            <Link to="/user-settings?tab=ai-engines" className="underline hover:no-underline">Connect an AI engine</Link>
+          </div>
+        )}
       </div>
     )
   }
@@ -269,6 +312,28 @@ export default function SystemEvent({ subtype, message, reason, returned, sendAg
     )
   }
 
+  // A turn cut by a restart whose machine has not reported: nothing is decided
+  // yet. A card follows if the chat does not continue.
+  if (subtype === SYSTEM_SUBTYPE.TURN_WAITING) {
+    return (
+      <div className={`${NOTICE_BOX} ${NOTICE.info}`} data-testid="turn-waiting">
+        <div className="font-medium">This turn is waiting for its machine</div>
+        {message && <div className="mt-1">{message}</div>}
+      </div>
+    )
+  }
+
+  // A terminal's turn the engine stopped on an Escape before it answered:
+  // the text is back in its input box. Nothing to resend: the person's own
+  // Escape, so the neutral tone and no button.
+  if (subtype === SYSTEM_SUBTYPE.TURN_DROPPED) {
+    return (
+      <div className={`${NOTICE_BOX} ${NOTICE.neutral}`} data-testid="turn-dropped">
+        The agent stopped before it answered. Your message is back in the terminal&apos;s input box.
+      </div>
+    )
+  }
+
   // A permission request the engine raised that nobody answered (or that
   // its surface cannot answer): refused, and the turn went on.
   if (subtype === SYSTEM_SUBTYPE.ENGINE_PROMPT_REFUSED) {
@@ -286,7 +351,17 @@ export default function SystemEvent({ subtype, message, reason, returned, sendAg
   if (subtype === SYSTEM_SUBTYPE.PHOTOS_NOT_ATTACHED) {
     return (
       <div className={`${NOTICE_BOX} ${NOTICE.warning}`} data-testid="photos-not-attached">
-        {message || 'The photos did not reach the agent. Attach them again to send them.'}
+        {message || 'The photos did not reach the agent. Attach them again as JPEG or PNG.'}
+      </div>
+    )
+  }
+
+  // A turn that started on its machine before the files meant for it arrived:
+  // persisted, so a reload shows it where the live frame did.
+  if (subtype === SYSTEM_SUBTYPE.FILES_LATE) {
+    return (
+      <div className={`${NOTICE_BOX} ${NOTICE.warning}`} data-testid="files-late">
+        {message}
       </div>
     )
   }
@@ -328,7 +403,11 @@ export default function SystemEvent({ subtype, message, reason, returned, sendAg
     )
   }
 
-  const label = LABELS[subtype]
+  // A participant whose engine was stopped and starts again: the meeting's
+  // own sentence about it names the agent.
+  const label = subtype === SYSTEM_SUBTYPE.MEETING_AGENT_STOPPED
+    ? (message || 'An agent used too much memory, so its engine was stopped. It answers again at its next turn.')
+    : LABELS[subtype]
   // Unknown subtypes (the CLI's raw pass-through such as "api_retry", a
   // subtype a newer proxy mints) are suppressed — rendering raw subtype
   // strings as separators is confusing. The proxy's translator filters the

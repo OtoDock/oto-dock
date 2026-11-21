@@ -188,6 +188,19 @@ async def test_a_connection_seeds_the_link_from_its_auth_capabilities():
         assert await cm.drain_persists()
 
 
+def test_a_sign_ins_exit_fields_are_read_as_a_heartbeats_are():
+    """The exit's reason and its upstream are kept from a sign-in only as a
+    heartbeat keeps them: a word outside ``EXIT_WHY`` or a value that is no
+    boolean is dropped, from the live report and the row's snapshot alike."""
+    cm, conn = _cm_with({"local_tunnel_port": 41000, "exit_port": 41111, "exit_ok": False,
+                         "exit_why": "anything at all", "exit_upstream": "yes"})
+    assert "exit_why" not in conn.capabilities and "exit_upstream" not in conn.capabilities
+    assert cm.exit_report("m-1") == {"why": "", "upstream": False}
+    cm, conn = _cm_with({"local_tunnel_port": 41000, "exit_port": 41111, "exit_ok": False,
+                         "exit_why": "socks", "exit_upstream": True})
+    assert cm.exit_report("m-1") == {"why": "socks", "upstream": True}
+
+
 def test_the_live_status_carries_the_link():
     from services.remote import remote_status
     cm, conn = _cm_with()
@@ -204,3 +217,40 @@ def test_the_live_status_carries_the_link():
          patch("storage.remote_store.get_remote_machine", return_value=None):
         gone = remote_status.get_live_machine_status("m-9")
     assert gone["link_ok"] is True and gone["link_down_s"] is None and gone["link_error"] == ""
+
+
+def test_the_exit_fields_are_read_and_the_connection_keeps_them(caplog):
+    """Satellite 0.5.175 reports its credential exit's listener: the port and
+    whether it answers ride the capabilities and the heartbeat, a flip is
+    logged once, and ``exit_state`` is what the machine rule reads."""
+    got = tunnel_state.read({"exit_port": 41111, "exit_ok": True})
+    assert got == {"exit_port": 41111, "exit_ok": True}
+    assert tunnel_state.read({"exit_port": True, "exit_ok": "yes"}) == {}
+    cm, conn = _cm_with({"local_tunnel_port": 41000, "exit_port": 41111, "exit_ok": True})
+    assert cm.exit_state("m-1") == (41111, True)
+    assert cm.exit_state("nobody") == (0, False)
+    with caplog.at_level(logging.INFO, logger="otodock.remote.tunnel"):
+        assert tunnel_state.apply(conn, {"exit_port": 41111, "exit_ok": False}) is True
+        assert tunnel_state.apply(conn, {"exit_port": 41111, "exit_ok": False}) is False
+    assert cm.exit_state("m-1") == (41111, False) and "stopped answering" in caplog.text
+    assert tunnel_state.apply(conn, {"exit_port": 41222, "exit_ok": True}) is True
+    assert cm.exit_state("m-1") == (41222, True)
+    # A machine that reports no exit answers none.
+    cm2, _conn2 = _cm_with({"local_tunnel_port": 41000})
+    assert cm2.exit_state("m-1") == (0, False)
+
+
+def test_why_an_exit_does_not_answer_and_its_upstream_are_read_and_kept():
+    """``exit_why`` takes the known reasons alone, ``exit_upstream`` a bool;
+    a heartbeat moves both, and ``exit_report`` reads them (the platform's
+    own mark of the egress names it sent counts as an upstream too)."""
+    assert tunnel_state.read({"exit_ok": False, "exit_why": "installing"}) == {"exit_ok": False, "exit_why": "installing"}
+    assert tunnel_state.read({"exit_why": "something else", "exit_upstream": "yes"}) == {}
+    assert tunnel_state.read({"exit_why": "", "exit_upstream": True}) == {"exit_why": "", "exit_upstream": True}
+    cm, conn = _cm_with({"local_tunnel_port": 41000, "exit_ok": False, "exit_why": "installing"})
+    assert cm.exit_report("m-1") == {"why": "installing", "upstream": False}
+    assert tunnel_state.apply(conn, {"exit_port": 41111, "exit_ok": True, "exit_why": ""}) is True
+    assert cm.exit_state("m-1") == (41111, True) and cm.exit_report("m-1") == {"why": "", "upstream": False}
+    conn.exit_upstream_sent = True
+    assert cm.exit_report("m-1")["upstream"] is True
+    assert cm.exit_report("nobody") == {}

@@ -21,11 +21,12 @@
  * returned — one instance each.
  */
 import { useRef, useEffect, useState, useCallback, useLayoutEffect, useEffectEvent } from 'react'
-import type { RefObject } from 'react'
+import type { Dispatch, RefObject, SetStateAction } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import type { NavigateFunction } from 'react-router-dom'
 import { useChatStream } from '../../../hooks/useChatStream'
 import { WARMUP_FAILED_REASON, WIRE } from '../../../api/wireEvents'
+import type { PreWarmRefusal } from '../../../lib/engines/notice'
 import { AUTO_REVIEW_MODE } from '../../../lib/engines/modes'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import type { useChatNotifications } from '../../../hooks/useChatNotifications'
@@ -43,6 +44,8 @@ import { isNativePlatform } from '../../../audio/types'
 import { chatTargetsKey } from '../../../api/remoteMachines'
 import { emitAppToast } from '../../../lib/appToasts'
 import { useStoreReviewTurns } from '../../../hooks/storeReview/useStoreReview'
+import { markTabForAnswer } from '../../../lib/ui/tabMark'
+import { isForShownChat } from '../../../lib/chat/shownChat'
 
 type Selection = ReturnType<typeof useModelEngineSelection>
 type FindBar = ReturnType<typeof useFindBar>
@@ -58,7 +61,7 @@ export function useAgentChatStream({
   agents, urlChatId, agentDefaultModel, agentExecutionPath, agentName, navigate, isFavoriteAgent, preWarmPath,
   warmingUp, setWarmingUp, chatNotif, sessionInteractiveRef, duplexActiveRef,
   setChatActiveLayer, setProcessAlive, setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError,
-  pendingFindQueryRef, setFindInput, setFindQuery, setFindBarOpen, setDriveRefusal,
+  pendingFindQueryRef, setFindInput, setFindQuery, setFindBarOpen, setDriveRefusal, setPreWarmRefusal,
 }: {
   agents: ReturnType<typeof useAgents>['data']
   urlChatId: string | undefined
@@ -85,6 +88,7 @@ export function useAgentChatStream({
   /** The drive gate's sentence for the chat that just loaded ("" when this
    *  person may drive it): the page locks its pickers with it. */
   setDriveRefusal: (refusal: { chatId: string; text: string } | null) => void
+  setPreWarmRefusal: Dispatch<SetStateAction<PreWarmRefusal | null>>
 }) {
   // Written by the page in a layout effect (see the header); never read
   // before the first commit, so the placeholder is never observed.
@@ -104,6 +108,10 @@ export function useAgentChatStream({
   // A phone call drives the viewed chat (chat_view_only): the banner shows
   // until the socket re-resumes the chat at the call's end.
   const [phoneCallActive, setPhoneCallActive] = useState(false)
+  // A call holds the chat: the agent's conversation for good, a person's own
+  // chat until the call ends. The server's sentence, by chat id, so moving to
+  // another chat never carries its lock along.
+  const [callLock, setCallLock] = useState<{ chat: string; sentence: string } | null>(null)
 
   // The refs the callbacks share with the page's handlers.
   const chatRowsTimerRef = useRef<number | null>(null)
@@ -183,6 +191,8 @@ export function useAgentChatStream({
     clearQueueOnAbort: false,
     onWarmupRefetch: () => latestRef.current.refetchChats(),
     onWarmupReadyExtra: (data) => {
+      // A session up on the refused engine: someone connected one since.
+      setPreWarmRefusal(r => (r && r.executionPath === (data.execution_path || agentExecutionPath) ? null : r))
       setChatActiveLayer(data.execution_path || agentExecutionPath)  // Lock to chat's actual layer
       setWarmingUp(false)
       // Interactive CLI: a live PTY-backed session →
@@ -240,7 +250,11 @@ export function useAgentChatStream({
         navigate(withWorkspaceParams(`/chat/${agentName}/${data.chat_id}`), { replace: true })
       }
     },
-    onPreWarmupReady: (data) => { preWarmedRef.current = data.session_id },
+    onPreWarmupReady: (data) => { preWarmedRef.current = data.session_id; setPreWarmRefusal(null) },
+    // The warm-up's refusal on a new chat (the notice over the composer).
+    onPreWarmupRefused: (data) => setPreWarmRefusal({
+      agent: data.agent, executionPath: data.execution_path, reason: data.reason, error: data.error,
+    }),
     isWarmingUp: warmingUp,
     onWarmupReset: () => {
       setWarmingUp(false)
@@ -248,7 +262,17 @@ export function useAgentChatStream({
     },
     // A live switch refused before its re-warm started gets no warmup_ready:
     // its refusal unlocks the terminal toggle.
-    onErrorExtra: (message) => latestRef.current.interactive.switchErrored(message),
+    // A mode pick's restart refused this way puts the pick back.
+    onErrorExtra: (message) => {
+      const back = latestRef.current.interactive.switchErrored(message)
+      if (back !== null) setMode(back)
+    },
+    // A pick on a live terminal answered with the chat's mode: no restart
+    // follows, and a refusal says why.
+    onModeAnswered: (refusal) => {
+      latestRef.current.interactive.modeAnswered()
+      if (refusal) emitAppToast({ severity: 'info', title: 'The mode did not change', body: refusal })
+    },
     onWarmupFailedReset: (data) => {
       // Clear warmup state so input re-enables and the user can retry
       // (e.g. once the admin brings the satellite back online).
@@ -271,6 +295,7 @@ export function useAgentChatStream({
       // history is read-only; the socket re-resumes the chat when the call
       // ends and clears this with null.
       setPhoneCallActive(data !== null)
+      setCallLock(data?.lock ? { chat: data.chat_id, sentence: data.lock } : null)
     },
     onChatMoved: (data: { chat_id: string; ok?: boolean; message?: string }) => {
       // A move of the open chat ended (every tab viewing it hears it, the
@@ -286,9 +311,22 @@ export function useAgentChatStream({
       if (data.ok === false && data.message) {
         emitAppToast({ severity: 'warning', title: 'The chat was not moved', body: data.message })
       }
-      setSessionId(null)
-      latestRef.current.interactive.resetSession()  // the old session (interactive included) was closed server-side
-      ws.resumeChat(cid)
+      reopenViewedChat(cid)
+    },
+    onTerminalReloaded: () => {
+      // The agent reloaded a terminal chat: its terminal closed (the pty_exit
+      // left the page on the history) and the new one is up now. A chat
+      // still in terminal mode attaches to it the way a reopen does: the
+      // resume answers warmup_ready{interactive} and the terminal view
+      // mounts and attaches. A chat switched to the transcript meanwhile
+      // stays there (its next send starts what it asks for).
+      // A page already on the new terminal, or whose own switch or pick is
+      // starting it again (its own warmup_ready attaches it), has nothing to
+      // attach.
+      const cid = chatIdRef.current
+      const { interactiveMode, sessionInteractive, restarting } = latestRef.current.interactive
+      if (!cid || !interactiveMode || sessionInteractive || restarting(cid)) return
+      reopenViewedChat(cid)
     },
     onEngineSwitched: (data) => {
       // switch_engine ack (direct + per-user broadcast — idempotent): the
@@ -324,14 +362,18 @@ export function useAgentChatStream({
     // voice mode has nothing to speak (the list itself is hidden, seeding is
     // pure state). Trailing debounce coalesces the per-batch nudges a busy
     // turn produces.
+    // The rows are the nudged chat's: the page may leave it before the
+    // timer fires or the page arrives, and then they are not the view's.
     onChatRows: (data) => {
-      if (!chatId || data.chat_id !== chatId) return
+      const cid = chatIdRef.current
+      if (!cid || !isForShownChat(data.chat_id, cid, true)) return
       if (chatRowsTimerRef.current) window.clearTimeout(chatRowsTimerRef.current)
       chatRowsTimerRef.current = window.setTimeout(async () => {
         chatRowsTimerRef.current = null
+        if (!isForShownChat(cid, chatIdRef.current, true)) return
         try {
-          const { messages: rows, has_more } = await fetchChatPage(chatId, 50)
-          seedDbHistory(rows, has_more)
+          const { messages: rows, has_more } = await fetchChatPage(cid, 50)
+          if (isForShownChat(cid, chatIdRef.current, true)) seedDbHistory(rows, has_more)
         } catch { /* transient — the next nudge retries */ }
       }, 800)
     },
@@ -365,7 +407,7 @@ export function useAgentChatStream({
       // Restore the per-chat interactive toggle from the stored execution_mode.
       // The live flag stays false until a warmup_ready{interactive} arrives — a
       // dead interactive chat shows its DB history with the toggle reflected on.
-      latestRef.current.interactive.restoreFromMeta(data.execution_mode)
+      latestRef.current.interactive.restoreFromMeta(data.execution_mode, data.chat_id)
       setDriveRefusal(data.drive_refusal && data.chat_id
         ? { chatId: data.chat_id, text: data.drive_refusal } : null)
     },
@@ -414,13 +456,16 @@ export function useAgentChatStream({
       // tail and only covered duplex).
       speechIdle(() => latestRef.current.refetchChats())
     },
-    onTurnComplete: (_data) => {
+    onTurnComplete: (data) => {
       // Origin-routed end-of-turn ping: a hidden tab or a background chat
       // (useChatStream already drops it for the visible viewed chat, which
       // onTurnDone pings). The native app alerts via FCM instead.
       try {
         if (isNativePlatform()) return
       } catch { /* not native */ }
+      // The shown chat answered while the tab is hidden: a dot on its icon,
+      // also when the ping is held for a voice session or a dictation.
+      markTabForAnswer(data.chat_id, chatIdRef.current)
       if (!duplexActiveRef.current && !isDictationActive()) chatNotif.playPing()
       speechIdle(() => latestRef.current.refetchChats())
     },
@@ -441,6 +486,15 @@ export function useAgentChatStream({
   } = stream
   // The turn's clock starts at the adoption, not at the spawn.
   const startTurnNow = useCallback(() => setTurnStartTime(Date.now()), [setTurnStartTime])
+  // Re-open the viewed chat in place after the server closed its session (a
+  // move, a terminal's reload): the same re-open path as clicking the chat
+  // row, no page reset (the chat_history reload is wholesale anyway). The
+  // next warmup_ready, a live terminal's included, lands as on a reopen.
+  const reopenViewedChat = (cid: string) => {
+    setSessionId(null)
+    latestRef.current.interactive.resetSession()  // the old session (interactive included) was closed server-side
+    ws.resumeChat(cid)
+  }
 
   // Sends typed during "Getting ready": kept in order; what is still held
   // when the warmup fails goes back to the composer, attachments included.
@@ -519,6 +573,7 @@ export function useAgentChatStream({
     chatRowsTimerRef, preWarmedRef, lastResumedChatIdRef,
     warmupSends, serverKickPendingRef, keepAppsOnChatEntryRef,
     phoneCallActive,
+    callLock: urlChatId && callLock?.chat === urlChatId ? callLock.sentence : '',
     newChatPlace, pickNewChatPlace,
   }
 }

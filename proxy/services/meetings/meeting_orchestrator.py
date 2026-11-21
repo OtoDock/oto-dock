@@ -18,9 +18,10 @@ from typing import TYPE_CHECKING, cast
 from auth import roles
 from core import placement
 from core.background import spawn
-from core.events import input_queue, tool_roles
+from core.events import input_queue, tool_roles, turn_ending
 from core.events.bg_command_state import get_bg_command_registry
 from core.events.common_events import (
+    ERROR,
     METADATA,
     PLAN_MODE,
     PRODUCER_DONE,
@@ -41,13 +42,15 @@ from core.events.pump_bg_monitors import (
 )
 from core.events.stream_pump import ChatStreamPump, _active_pumps
 from core.session import session_kind
-from core.session.session_manager import get_execution_layer
+from core.session.session_manager import (
+    get_execution_layer,
+)
 from core.session.session_state import (
     _save_sessions,
     _sessions,
     cleanup_meeting_session_info,
-    cleanup_session_permission_state,
     clear_meeting_turn_routed,
+    forget_session,
     get_permission_queue,
     get_subagent_registry,
     note_meeting_turn_text,
@@ -64,6 +67,12 @@ from services.meetings.meeting_context import (
     departure_entry,
     parent_note,
 )
+from services.meetings.meeting_sessions import (
+    _meeting_session_layers,
+    _ready_for_turn,
+    _session_layer,
+    _stopped_for_memory_event,
+)
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.agents.schema import DEFAULT_EXECUTION_PATH
@@ -72,7 +81,7 @@ from storage.pg import run_db
 from ws import wire_events as wire
 
 if TYPE_CHECKING:
-    from core.execution_layer import ExecutionLayer
+    pass
 
 logger = logging.getLogger("otodock")
 
@@ -181,9 +190,26 @@ class _TurnTracker:
         self.chars = 0
         self.meeting_tool_done = False
         self.salvage = False
+        self.lost = ""
+        self.stopped_for_memory = False
 
     def observe(self, event: CommonEvent) -> bool:
         """Account for one stream event; True when it should be forwarded."""
+        if event.type == ERROR:
+            ending = turn_ending.from_dict(event.data.get("ending"))
+            if ending is not None and ending.reason == turn_ending.LOST:
+                # The session is gone in the middle of the turn (its machine
+                # came back without it): the turn fails (``raise_if_lost``).
+                self.lost = ending.line()
+                return False
+            if (ending is not None and ending.reason == turn_ending.EXITED
+                    and ending.detail == turn_ending.MEMORY):
+                # The machine's memory guard stopped the engine: the meeting
+                # says so about this agent in its own line, the chat's card
+                # for the same ending is never forwarded, and the agent's
+                # next turn starts its engine again (``_ready_for_turn``).
+                self.stopped_for_memory = True
+                return False
         if event.type == METADATA:
             # Cost only — meeting costs are tracked separately via
             # meeting_turns, never forwarded to the pump.
@@ -235,6 +261,12 @@ class _TurnTracker:
                 self.tail_text = 0
         return True
 
+    def raise_if_lost(self) -> None:
+        """A turn whose session was lost fails through its runner's own
+        failure path: the failure line, and the meeting goes on without it."""
+        if self.lost:
+            raise RuntimeError(self.lost)
+
     def result(self) -> TurnResult:
         return TurnResult(
             agent=self.agent,
@@ -248,14 +280,6 @@ class _TurnTracker:
             tools_called=self.tools_called,
             tail_text=self.tail_text,
         )
-
-
-# Per-meeting-session execution layer, captured at session-create so every
-# turn and close reuses the SAME layer the session was started on. A bare
-# get_execution_layer at those sites would re-resolve WITHOUT the meeting
-# creator's user_sub/role and, for a user-override meeting, return the wrong
-# layer (sending/closing on local while the session lives on the user's box).
-_meeting_session_layers: "dict[str, ExecutionLayer]" = {}
 
 
 def _start_participant_bg_monitors(
@@ -276,7 +300,7 @@ def _start_participant_bg_monitors(
     bgreg = get_bg_command_registry(session_id)
     reg.chat_id = chat_id
     bgreg.chat_id = chat_id
-    layer = _meeting_session_layers.get(session_id) or get_execution_layer(agent_slug)
+    layer = _session_layer(session_id, agent_slug)
     if reg.has_pending and not bg_monitor_running(session_id):
         spawn(_bg_agent_monitor(layer, session_id, chat_id, reg.pending_count),
               name="bg_agent_monitor", owner="meeting_orchestrator")
@@ -347,7 +371,7 @@ async def _announce_departure(
     cleanup_meeting_session_info(sid)
     if sid:
         with contextlib.suppress(Exception):
-            layer = _meeting_session_layers.get(sid) or get_execution_layer(agent_slug)
+            layer = _session_layer(sid, agent_slug)
             await layer.close_session(sid)
 
 
@@ -375,8 +399,8 @@ async def _run_live_turn(
             propose_from = msg.get("from")
             break
 
-    prompt = build_turn_prompt(meeting, agent_slug, transcript,
-                               prompt_type=prompt_type, propose_from=propose_from)
+    prompt = await run_db(build_turn_prompt, meeting, agent_slug, transcript,
+                          prompt_type=prompt_type, propose_from=propose_from)
 
     # Emit turn_start
     ad = await run_db(agent_store.get_agent, agent_slug)
@@ -390,7 +414,7 @@ async def _run_live_turn(
 
     # Stream events live to pump — reuse the layer the session was started on.
     session_id = agent_sessions[agent_slug]
-    layer = _meeting_session_layers.get(session_id) or get_execution_layer(agent_slug)
+    layer = _session_layer(session_id, agent_slug)
     tracker = _TurnTracker(agent_slug, session_id,
                            agent_slug == meeting["moderator"])
 
@@ -400,12 +424,14 @@ async def _run_live_turn(
         # would deny the between-turn hooks of tolerated background work).
         clear_meeting_turn_routed(session_id)
         async with layer.session_lock(session_id):
+            layer = await _ready_for_turn(meeting, agent_slug, session_id)
             async for event in layer.send_message(session_id, prompt):
                 if not tracker.observe(event):
                     continue
                 # Tag with meeting agent and forward LIVE to pump
                 event.data["_meeting_agent"] = agent_slug
                 await event_queue.put(event)
+        tracker.raise_if_lost()
 
     except Exception as e:  # noqa: BLE001  # an agent's failed turn becomes a failure event, the meeting goes on
         logger.error("Meeting %s: agent %s failed: %s", meeting_id, agent_slug, e)
@@ -417,6 +443,9 @@ async def _run_live_turn(
         return TurnResult(agent=agent_slug, events=[], tools_called={"_failed"})
     finally:
         clear_meeting_turn_routed(session_id)
+
+    if tracker.stopped_for_memory:
+        await event_queue.put(await _stopped_for_memory_event(agent_slug))
 
     # Background work the agent left running keeps resolving after its turn.
     _start_participant_bg_monitors(agent_slug, session_id, meeting["parent_chat_id"])
@@ -436,6 +465,32 @@ async def _run_live_turn(
 # Parallel batch runner
 # ---------------------------------------------------------------------------
 
+def _batch_prompts(
+    ready_agents: list[str],
+    meeting: dict,
+    transcript: list[dict],
+    pending: dict[str, list],
+) -> dict[str, str]:
+    """Each agent's prompt for a parallel batch, in one job (agent reads)."""
+    prompts: dict[str, str] = {}
+    for agent_slug in ready_agents:
+        pending_msgs = pending.get(agent_slug, [])
+        prompt_type = "normal"
+        propose_from = None
+        for msg in pending_msgs:
+            if isinstance(msg, dict):
+                t = msg.get("type", "")
+                if t in ("start", "wrapup", "checkin", "conclude_proposal", "restate"):
+                    prompt_type = t
+                    propose_from = msg.get("from")
+                    break
+        prompts[agent_slug] = build_turn_prompt(
+            meeting, agent_slug, transcript,
+            prompt_type=prompt_type, propose_from=propose_from,
+        )
+    return prompts
+
+
 async def _run_parallel_batch(
     ready_agents: list[str],
     agent_sessions: dict[str, str],
@@ -453,54 +508,51 @@ async def _run_parallel_batch(
     events flush immediately (they were generating in parallel).
     """
 
-    # Build prompts
-    prompts: dict[str, str] = {}
-    for agent_slug in ready_agents:
-        pending_msgs = pending.get(agent_slug, [])
-        prompt_type = "normal"
-        propose_from = None
-        for msg in pending_msgs:
-            if isinstance(msg, dict):
-                t = msg.get("type", "")
-                if t in ("start", "wrapup", "checkin", "conclude_proposal", "restate"):
-                    prompt_type = t
-                    propose_from = msg.get("from")
-                    break
-        prompts[agent_slug] = build_turn_prompt(
-            meeting, agent_slug, transcript,
-            prompt_type=prompt_type, propose_from=propose_from,
-        )
+    prompts = await run_db(_batch_prompts, ready_agents, meeting, transcript, pending)
 
     # Per-agent event queues and result holders
     agent_queues: dict[str, asyncio.Queue] = {a: asyncio.Queue() for a in ready_agents}
     agent_results: dict[str, TurnResult] = {}
+    failures: dict[str, str] = {}
+
+    def _failed_line(agent_slug: str) -> CommonEvent:
+        return CommonEvent(type=SYSTEM, data={
+            "subtype": wire.SUBTYPE_MEETING_AGENT_FAILED,
+            "agent": agent_slug,
+            "error": failures.get(agent_slug) or "unknown error",
+        })
 
     async def _run_agent(agent_slug: str) -> None:
         """Run one agent, forwarding events to its queue."""
         q = agent_queues[agent_slug]
         sid = agent_sessions[agent_slug]
-        layer = _meeting_session_layers.get(sid) or get_execution_layer(agent_slug)
+        layer = _session_layer(sid, agent_slug)
         tracker = _TurnTracker(agent_slug, sid, agent_slug == meeting["moderator"])
 
         try:
             clear_meeting_turn_routed(sid)
             async with layer.session_lock(sid):
+                layer = await _ready_for_turn(meeting, agent_slug, sid)
                 async for event in layer.send_message(sid, prompts[agent_slug]):
                     if not tracker.observe(event):
                         continue
-                        await q.put(event)
+                    await q.put(event)
+            tracker.raise_if_lost()
         except Exception as e:  # noqa: BLE001  # an agent's failed turn is marked failed, the meeting goes on
             logger.error("Meeting %s: agent %s failed: %s", meeting_id, agent_slug, e)
             tracker.tools_called.add("_failed")
+            failures[agent_slug] = str(e)[:200]
         finally:
             clear_meeting_turn_routed(sid)
 
+        if tracker.stopped_for_memory:
+            await q.put(await _stopped_for_memory_event(agent_slug))
         if "_failed" not in tracker.tools_called:
             # Background work the agent left running keeps resolving after its turn.
             _start_participant_bg_monitors(agent_slug, sid, meeting["parent_chat_id"])
 
-        await q.put(None)  # done sentinel
         agent_results[agent_slug] = tracker.result()
+        await q.put(None)  # done sentinel
 
     # Start all agents simultaneously
     tasks = [asyncio.create_task(_run_agent(a)) for a in ready_agents]
@@ -522,20 +574,11 @@ async def _run_parallel_batch(
 
         remaining.discard(chosen)
 
-        result_ref = agent_results.get(chosen)
-        if result_ref and "_failed" in result_ref.tools_called:
-            # Agent already failed before producing events
-            await event_queue.put(CommonEvent(type=SYSTEM, data={
-                "subtype": wire.SUBTYPE_MEETING_AGENT_FAILED,
-                "agent": chosen,
-                "error": (result_ref.content or "unknown error")[:200],
-            }))
-            # Drain sentinel
-            while True:
-                ev = await agent_queues[chosen].get()
-                if ev is None:
-                    break
-            results_ordered.append(result_ref)
+        first = await agent_queues[chosen].get()
+        failed = agent_results.get(chosen)
+        if first is None and failed and "_failed" in failed.tools_called:
+            await event_queue.put(_failed_line(chosen))     # nothing of its turn to show
+            results_ordered.append(failed)
             continue
 
         # Emit turn_start
@@ -549,15 +592,19 @@ async def _run_parallel_batch(
         }))
 
         # Forward events live from this agent's queue
-        while True:
-            event = await agent_queues[chosen].get()
-            if event is None:
-                break  # agent done
+        event = first
+        while event is not None:
             event.data["_meeting_agent"] = chosen
             await event_queue.put(event)
+            event = await agent_queues[chosen].get()
 
         # Collect result and emit turn_end — cost is added by meeting_produce
         result = agent_results.get(chosen)
+        if result and "_failed" in result.tools_called:
+            # What it did stands, and the person reads why it stopped, as on a live turn.
+            await event_queue.put(_failed_line(chosen))
+            results_ordered.append(result)
+            continue
         await event_queue.put(CommonEvent(type=SYSTEM, data={
             "subtype": wire.SUBTYPE_MEETING_TURN_END,
             "agent": chosen,
@@ -831,7 +878,7 @@ class _MeetingRun:
                          result.agent, meeting_status.LEAVABLE)
             try:
                 _sid = self.agent_sessions[result.agent]
-                layer = _meeting_session_layers.get(_sid) or get_execution_layer(result.agent)
+                layer = _session_layer(_sid, result.agent)
                 await layer.close_session(_sid)
             except Exception:  # noqa: BLE001  # closing a meeting agent's session at the meeting's end
                 pass
@@ -1080,8 +1127,11 @@ async def fail_meeting(meeting_id: str, reason: str) -> None:
 
 
 async def _notify_meeting_failed(meeting_id: str, reason: str, *,
-                                 claim: object | None = None, wait: bool = True) -> None:
+                                 claim: object | None = None, wait: bool = True,
+                                 refusal: str = "") -> None:
     """Surface a pre-pump meeting failure into the requesting chat.
+    ``refusal`` is the ``NoSubscriptionError`` word when one refused it
+    (the card's connect button).
 
     Every early-exit path in start_meeting() (usage pre-check, config build,
     admission denial, participant spawn) used to fail the meeting with only a
@@ -1107,13 +1157,17 @@ async def _notify_meeting_failed(meeting_id: str, reason: str, *,
         if not meeting:
             return
         parent_chat_id = meeting["parent_chat_id"]
+        if not parent_chat_id:
+            # A meeting made through the API asked from no chat: the failed
+            # row and its summary are the whole record.
+            return
         if claim is None and wait:
             # The usage pre-check fires while the moderator's ack turn may
             # still be streaming.
             claim = await input_queue.claim_when_free(parent_chat_id,
                                                       timeout=_FAIL_CLAIM_WAIT_S)
         if claim is None:
-            _write_failed_line(parent_chat_id, meeting_id, reason)
+            _write_failed_line(parent_chat_id, meeting_id, reason, refusal=refusal)
             return
 
         pump_session_id = "meeting-" + meeting_id
@@ -1124,6 +1178,7 @@ async def _notify_meeting_failed(meeting_id: str, reason: str, *,
                 "subtype": wire.SUBTYPE_MEETING_FAILED,
                 "meeting_id": meeting_id,
                 "message": reason,
+                **({"reason": refusal} if refusal else {}),
             }))
             await asyncio.sleep(_FAIL_PUMP_LINGER_S)
             await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))
@@ -1144,7 +1199,7 @@ async def _notify_meeting_failed(meeting_id: str, reason: str, *,
             pump.start()
             await cast("asyncio.Task", pump._task)  # start() set it
         finally:
-            cleanup_session_permission_state(pump_session_id)
+            await forget_session(pump_session_id)
     except Exception:
         logger.exception("Meeting %s: failure surfacing failed", meeting_id)
     finally:
@@ -1152,14 +1207,14 @@ async def _notify_meeting_failed(meeting_id: str, reason: str, *,
             input_queue.get(parent_chat_id).release(claim)
 
 
-def _write_failed_line(chat_id: str, meeting_id: str, reason: str) -> None:
+def _write_failed_line(chat_id: str, meeting_id: str, reason: str, *, refusal: str = "") -> None:
     """The failure's line with no pump (the chat stayed busy): written on
     the chat's lane, in the row shape a reload renders, and sent to the
     chat's viewers."""
     from core.events import chat_writer
     from core.session.session_state import broadcast_chat_frame
     block = {"type": wire.SYSTEM, "subtype": wire.SUBTYPE_MEETING_FAILED,
-             "meeting_id": meeting_id, "message": reason}
+             "meeting_id": meeting_id, "message": reason, **({"reason": refusal} if refusal else {})}
     chat_writer.submit(chat_id, functools.partial(
         task_store.add_chat_message, chat_id, "event", "",
         event_type=wire.SYSTEM, event_data=json.dumps(block)), label="meeting_failed")
@@ -1186,23 +1241,24 @@ async def start_meeting(meeting_id: str) -> None:
     # budget. Block before spawning any session if already over. Best-effort —
     # the reason surfaces on the meeting (summary + failed status).
     try:
+        from core.config import spender
         from services.billing import pool_caps, usage_service
         from services.engines import subscription_pool
-        m_scope = meeting.get("scope", "user")
         blocked_reason = ""
         host_chat = await run_db(task_store.get_chat, meeting["parent_chat_id"]) or {}
         host_agent = host_chat.get("agent") or meeting.get("moderator", "")
-        if m_scope == "agent":
+        # The limit and the cap of whoever pays (``core/config/spender.py``):
+        # the creator of a person's meeting, else the host agent's.
+        payer = await run_db(spender.meeting_spender, meeting, host_agent)
+        if not payer.sub:
             if host_agent:
                 ls = await asyncio.to_thread(usage_service.check_agent_limit, host_agent)
                 if not ls["allowed"]:
                     blocked_reason = f"Agent '{host_agent}' usage limit exceeded"
-        elif meeting.get("created_by"):
-            creator = await run_db(task_store.get_user, meeting["created_by"])
+        else:
+            creator = await run_db(task_store.get_user, payer.sub)
             creator_role = (creator or {}).get("role", "member")
-            ls = await asyncio.to_thread(
-                usage_service.check_user_limit, meeting["created_by"], creator_role
-            )
+            ls = await asyncio.to_thread(usage_service.check_user_limit, payer.sub, creator_role)
             if not ls["allowed"]:
                 blocked_reason = "User usage limit exceeded"
         # The subscription pool cap, on the host agent's engine (a participant
@@ -1210,11 +1266,11 @@ async def start_meeting(meeting_id: str) -> None:
         if not blocked_reason and host_agent:
             host_layer = ((agent_store.get_agent(host_agent) or {}).get(
                 "execution_path") or DEFAULT_EXECUTION_PATH)
-            if m_scope == "agent":
+            if not payer.sub:
                 cap = await asyncio.to_thread(pool_caps.evaluate, "platform", "", host_layer)
                 cap_sub = None
             else:
-                cap_sub = meeting.get("created_by") or ""
+                cap_sub = payer.sub
                 cap = await asyncio.to_thread(pool_caps.evaluate, "user", cap_sub, host_layer)
             if not cap.allowed and (
                 cap.on_reached != "continue"
@@ -1301,8 +1357,11 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
         from core.sandbox.session_config_dir import AgentStateRefused
         from services.engines.subscription_pool import NoSubscriptionError
         refused = isinstance(_build_err, AgentStateRefused)
+        no_place = isinstance(_build_err, placement.PlacementRefused)
         if refused:
             logger.info("Meeting %s: a participant is below the editor tier: %s", meeting_id, _build_err)
+        elif no_place:
+            logger.info("Meeting %s: a participant has no place to run: %s", meeting_id, _build_err)
         else:
             logger.error("Meeting %s: failed to build participant configs: %s",
                          meeting_id, _build_err,
@@ -1322,7 +1381,12 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
             # user-scope block): the reason is the message, not a crash.
             await _notify_meeting_failed(
                 meeting_id, f"The meeting could not start: {_build_err}",
-                claim=claim)
+                claim=claim, refusal=_build_err.reason)
+        elif no_place:
+            # No compute machine is connected, or a participant's machine may
+            # not take it: the refusal's own sentence, written for a person.
+            await _notify_meeting_failed(
+                meeting_id, f"The meeting could not start: {_build_err}", claim=claim)
         else:
             await _notify_meeting_failed(
                 meeting_id,
@@ -1331,7 +1395,10 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
             )
         return
     agent_cfgs = dict(zip(participants, _built, strict=False))
-    sid_targets = {session_id_map[slug]: (cfg.execution_target or placement.LOCAL)
+    # A participant placed on a compute machine reserves on its box.
+    sid_targets = {session_id_map[slug]: placement.admission_target(
+                       cfg.execution_target or placement.LOCAL,
+                       placement.compute_of(getattr(cfg.security_context, "placement", None)))
                    for slug, cfg in agent_cfgs.items()}
     sid_paths = {session_id_map[slug]: (cfg.execution_path or "")
                  for slug, cfg in agent_cfgs.items()}
@@ -1339,8 +1406,8 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
     sid_mcps = {session_id_map[slug]: (cfg.mcp_config_path or "")
                 for slug, cfg in agent_cfgs.items()}
 
-    # Atomic-N reserve of the LOCAL participants only (remote ones are enforced
-    # by their satellites). All-or-nothing for the local subset.
+    # Atomic-N reserve of the participants the platform counts, each on its box
+    # (a machine of a person or an admin counts its own). All-or-nothing.
     adm = await acquire_meeting_slots(all_sids, targets=sid_targets, exec_paths=sid_paths,
                                       mcp_paths=sid_mcps)
     if not adm:
@@ -1368,12 +1435,16 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
         # before any meeting pump exists, leaving the dashboard with nothing to
         # attach to. Agent-scope meetings keep an empty user_sub (→ None), so
         # the guard still correctly refuses them on user-paired machines.
+        # The compute placement the config carries goes with it: the
+        # builder decided where, and the layer is that place's.
+        built = placement.compute_of(getattr(agent_cfg.security_context, "placement", None))
         layer = get_execution_layer(
             agent_slug,
             execution_path=agent_cfg.execution_path,
             user_sub=agent_cfg.user_sub or None,
             role=getattr(agent_cfg.security_context, "role", roles.MANAGER) or roles.MANAGER,
             execution_target=agent_cfg.execution_target,
+            **({"placement_built": built} if built else {}),
         )
         _meeting_session_layers[sid] = layer
         await layer.start_session(sid, agent_cfg)
@@ -1494,14 +1565,14 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
         for slug, sid in agent_sessions.items():
             cleanup_meeting_session_info(sid)
             try:
-                layer = _meeting_session_layers.get(sid) or get_execution_layer(slug)
+                layer = _session_layer(sid, slug)
                 await layer.close_session(sid)
             except Exception:  # noqa: BLE001  # closing the sessions of a meeting that failed to start
                 pass
             _meeting_session_layers.pop(sid, None)
         release_meeting_slots(list(agent_sessions.values()))
         # Clean up the meeting pump's permission queue
-        cleanup_session_permission_state(pump_session_id)
+        await forget_session(pump_session_id)
 
         # Extract moderator's final summary from the last moderator turn
         meeting = await run_db(task_store.get_meeting, meeting_id)

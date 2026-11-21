@@ -12,6 +12,7 @@ vi.mock('@/api/auth', () => ({
 }))
 
 import {
+  useListReading,
   useAddSubscription,
   useBulkAddModels,
   useDeleteSubscription,
@@ -19,7 +20,8 @@ import {
   useUpdateSubscription,
 } from '@/api/executionLayers'
 
-const READER_KEYS = ['execution-layers', 'user-execution-layers', 'admin-execution-layers']
+// The accounts lists' live numbers too: an older poll's answer never outlives a change (the numbers it shows).
+const READER_KEYS = ['execution-layers', 'user-execution-layers', 'admin-execution-layers', 'accounts-live']
 
 function harness() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -75,5 +77,14 @@ describe('engine mutations refresh every reader', () => {
       await result.current.mutateAsync({ layer: 'codex-cli', id: 7, enabled: false })
     })
     expect(invalidated()).toEqual(expect.arrayContaining(READER_KEYS))
+  })
+})
+
+describe("a list's own read", () => {
+  it('reads the live numbers again with the list', () => {
+    const { wrapper, invalidated } = harness()
+    const { result } = renderHook(() => useListReading('own'), { wrapper })
+    act(() => { result.current.reread() })
+    expect(invalidated()).toEqual(expect.arrayContaining(['user-execution-layers', 'accounts-live']))
   })
 })

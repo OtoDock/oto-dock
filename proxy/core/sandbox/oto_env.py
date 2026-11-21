@@ -44,8 +44,13 @@ def build_oto_env(
     external_channel: str = "",
     external_id: str = "",
     external_verified: bool = False,
+    wrapup: bool = False,
+    wrapup_person: bool = False,
 ) -> dict[str, str]:
     """Build the standard ``OTO_*`` env vars dict.
+
+    ``wrapup`` = the wrap-up after a conversation: no shared memory, and the
+    user scope is the outside person's (``wrapup_person``: it has one).
 
     ``external`` = an EXTERNAL session (a phone caller who is not a platform
     user — ``core/session/external_identity.py``): the shared memory is off,
@@ -102,6 +107,12 @@ def build_oto_env(
         memory_agent_enabled = False
         memory_user_enabled = bool(memory_user_enabled and ext_tree)
         default_scope = "user" if ext_tree else "agent"
+    if wrapup:
+        # The wrap-up after a conversation: one outside person's memory, as
+        # the user scope, and no other (the memory API maps its token so).
+        memory_agent_enabled = False
+        memory_user_enabled = bool(memory_user_enabled and wrapup_person)
+        default_scope = "user"
 
     # Resolve each role independently using the same path_roles logic that
     # drives manifest path_env injection. Lock-step by construction.
@@ -174,6 +185,8 @@ def build_oto_env(
         "OTO_EXTERNAL_CHANNEL": external_channel or "",
         "OTO_EXTERNAL_ID": external_id or "",
         "OTO_EXTERNAL_VERIFIED": "true" if external_verified else "false",
+        # The wrap-up's person: the memory tool's user scope is theirs.
+        "OTO_MEMORY_PERSON": "true" if wrapup and wrapup_person else "false",
     }
 
 

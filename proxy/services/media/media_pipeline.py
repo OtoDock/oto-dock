@@ -16,13 +16,16 @@ with a download fallback in the player.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import shutil
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 import config
 from services.infra import safe_fs
@@ -174,19 +177,64 @@ def ffmpeg_available() -> bool:
     return bool(FFMPEG and FFPROBE)
 
 
+# The only demuxers ffprobe and ffmpeg may pick for an input: the containers
+# the product plays and converts (MEDIA_MIME, the remux lists, the camcorder,
+# DVD and voice-note containers, GIF, Apple's CAF, raw AC-3 and WavPack),
+# each of which reads its one file. ffmpeg matches a demuxer's whole name
+# list, so "mov" admits "mov,mp4,m4a,3gp,3g2,mj2". A playlist, a
+# concatenation, an image sequence or any other demuxer would open further
+# files the input names.
+INPUT_FORMATS: tuple[str, ...] = (
+    "mov", "matroska", "ogg", "avi", "asf", "flv", "mpegts", "mpeg",
+    "mp3", "aac", "wav", "flac", "aiff", "amr", "gif", "caf", "ac3", "wv",
+)
+_INPUT_LIMITS = ("-protocol_whitelist", "file", "-format_whitelist", ",".join(INPUT_FORMATS))
+
+
+@contextlib.contextmanager
+def _media_input(path: Path) -> Iterator[tuple[int, os.stat_result]]:
+    """``(fd, stat)`` of the input, opened by the server itself: below one of
+    the serving roots, with no link at any part, a regular file. Raises
+    ``safe_fs.SafeFsError`` for anything else, ``FileNotFoundError`` for a
+    missing file. Closes the descriptor on exit."""
+    root, rel = safe_fs.split_under(os.path.abspath(os.fspath(path)), _serve_roots())
+    fd, st = safe_fs.open_regular_for_read(root, rel)
+    try:
+        yield fd, st
+    finally:
+        os.close(fd)
+
+
+def _run_media_tool(program: str, fd: int, head: list[str], tail: list[str], *,
+                    timeout: int) -> subprocess.CompletedProcess:
+    """The one start of ffprobe and ffmpeg. The input is the descriptor the
+    server opened, read through its ``/proc/self/fd`` path (a pipe could not
+    seek, and the faststart remux seeks), behind the input format list and
+    the file-only protocol list."""
+    argv = [program, *head, *_INPUT_LIMITS, "-i", safe_fs.fd_path(fd), *tail]
+    return subprocess.run(argv, capture_output=True, timeout=timeout,
+                          pass_fds=(fd,), stdin=subprocess.DEVNULL)
+
+
+def _refused(path: Path, exc: OSError) -> None:
+    logger.info("media file %s not handed to the media tools: %s", Path(path).name, type(exc).__name__)
+
+
 def _probe_sync(path: Path) -> dict | None:
     """Return ``{"video": codec, "audio": codec}`` (either may be ""), or None
-    if ffprobe is unavailable/fails."""
+    if ffprobe is unavailable/fails or the input is refused."""
     if not FFPROBE:
         return None
     try:
-        r = subprocess.run(
-            [FFPROBE, "-v", "quiet", "-print_format", "json", "-show_streams", str(path)],
-            capture_output=True, timeout=30,
-        )
+        with _media_input(path) as (fd, _st):
+            r = _run_media_tool(FFPROBE, fd, ["-v", "quiet", "-print_format", "json", "-show_streams"], [],
+                                timeout=30)
         if r.returncode != 0:
             return None
         data = json.loads(r.stdout or b"{}")
+    except safe_fs.SafeFsError as e:
+        _refused(path, e)
+        return None
     except (OSError, subprocess.SubprocessError, ValueError) as e:
         logger.warning("ffprobe failed for %s: %s", path, e)
         return None
@@ -236,116 +284,122 @@ def _transcode_sync(
     codecs are already web-safe; full transcode to H.264/AAC otherwise. Cached
     by (path, mtime, size) under ``dest_dir`` (default durable media-cache;
     satellite-host media passes the TTL'd host cache). Returns (output_path,
-    mime) or (None, mime) on failure so the caller can fall back to the
-    original."""
+    mime) or (None, mime) on failure or a refused input so the caller can
+    fall back to the original."""
     cache = dest_dir or _CACHE_DIR
     cache.mkdir(parents=True, exist_ok=True)
-    try:
-        st = path.stat()
-        key = hashlib.sha256(
-            f"{path}:{st.st_mtime_ns}:{st.st_size}".encode()
-        ).hexdigest()[:32]
-    except OSError:
-        return None, ""
-
     v = (codecs or {}).get("video", "")
     a = (codecs or {}).get("audio", "")
     is_video = bool(v)
-
-    if is_video:
-        out = cache / f"{key}.mp4"
-        mime = "video/mp4"
-        if v == "h264" and a in ("aac", "mp3", ""):
-            cmd = [FFMPEG, "-y", "-i", str(path), "-c", "copy",
-                   "-movflags", "+faststart", str(out)]
-        else:
-            audio_args = ["-c:a", "aac"] if a else ["-an"]
-            cmd = [FFMPEG, "-y", "-i", str(path),
-                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                   *audio_args, "-movflags", "+faststart", str(out)]
-    else:
-        out = cache / f"{key}.m4a"
-        mime = "audio/mp4"
-        cmd = [FFMPEG, "-y", "-i", str(path), "-c:a", "aac",
-               "-movflags", "+faststart", str(out)]
-
-    if out.is_file() and out.stat().st_size > 0:
-        return out, mime  # cache hit
-
+    mime = "video/mp4" if is_video else "audio/mp4"
+    out: Path | None = None
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=600)
+        with _media_input(path) as (fd, st):
+            key = hashlib.sha256(
+                f"{path}:{st.st_mtime_ns}:{st.st_size}".encode()
+            ).hexdigest()[:32]
+            if is_video:
+                out = cache / f"{key}.mp4"
+                if v == "h264" and a in ("aac", "mp3", ""):
+                    tail = ["-c", "copy", "-movflags", "+faststart", str(out)]
+                else:
+                    audio_args = ["-c:a", "aac"] if a else ["-an"]
+                    tail = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                            *audio_args, "-movflags", "+faststart", str(out)]
+            else:
+                out = cache / f"{key}.m4a"
+                tail = ["-c:a", "aac", "-movflags", "+faststart", str(out)]
+            if out.is_file() and out.stat().st_size > 0:
+                return out, mime  # cache hit
+            r = _run_media_tool(FFMPEG, fd, ["-y"], tail, timeout=600)
+            if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
+                tail_text = (r.stderr or b"")[-300:].decode(errors="replace")
+                logger.warning("ffmpeg transcode failed for %s: %s", path, tail_text)
+                out.unlink(missing_ok=True)
+                return None, mime
+            return out, mime
+    except safe_fs.SafeFsError as e:
+        _refused(path, e)
+        return None, mime
+    except FileNotFoundError:
+        return None, mime
     except (OSError, subprocess.SubprocessError) as e:
         logger.warning("ffmpeg transcode error for %s: %s", path, e)
-        out.unlink(missing_ok=True)
+        if out is not None:
+            out.unlink(missing_ok=True)
         return None, mime
-    if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
-        tail = (r.stderr or b"")[-300:].decode(errors="replace")
-        logger.warning("ffmpeg transcode failed for %s: %s", path, tail)
-        out.unlink(missing_ok=True)
-        return None, mime
-    return out, mime
 
 
-def _is_faststart(path: Path) -> bool:
+def _is_faststart(f: BinaryIO) -> bool:
     """True if an MP4's ``moov`` box precedes ``mdat`` (progressive/faststart),
     so the browser can start + seek immediately. Conservative: returns True
-    (skip the remux) when the file can't be parsed."""
+    (skip the remux) when the file can't be parsed. Reads ``f`` from its
+    start."""
     try:
-        with open(path, "rb") as f:
-            while True:
-                header = f.read(8)
-                if len(header) < 8:
+        f.seek(0)
+        while True:
+            header = f.read(8)
+            if len(header) < 8:
+                return True
+            size = int.from_bytes(header[:4], "big")
+            box = header[4:8]
+            if box == b"moov":
+                return True
+            if box == b"mdat":
+                return False
+            if size == 1:  # 64-bit extended size
+                ext = f.read(8)
+                if len(ext) < 8:
                     return True
-                size = int.from_bytes(header[:4], "big")
-                box = header[4:8]
-                if box == b"moov":
-                    return True
-                if box == b"mdat":
-                    return False
-                if size == 1:  # 64-bit extended size
-                    ext = f.read(8)
-                    if len(ext) < 8:
-                        return True
-                    size = int.from_bytes(ext, "big")
-                    skip = size - 16
-                elif size == 0:
-                    return True  # box runs to EOF
-                else:
-                    skip = size - 8
-                if skip < 0:
-                    return True
-                f.seek(skip, 1)
+                size = int.from_bytes(ext, "big")
+                skip = size - 16
+            elif size == 0:
+                return True  # box runs to EOF
+            else:
+                skip = size - 8
+            if skip < 0:
+                return True
+            f.seek(skip, 1)
     except OSError:
         return True
 
 
 def _faststart_remux_sync(path: Path, dest_dir: Path | None = None) -> Path | None:
-    """Stream-copy remux an MP4 with ``+faststart`` (moov → front). No re-encode,
-    fast. Cached by (path, mtime, size). Returns the output or None on failure."""
+    """Stream-copy remux an MP4 with ``+faststart`` (moov → front) when its
+    ``moov`` sits after ``mdat``. No re-encode, fast. Cached by (path, mtime,
+    size). Returns the output, or None when the file already starts fast,
+    is refused or the remux fails."""
     cache = dest_dir or _CACHE_DIR
     cache.mkdir(parents=True, exist_ok=True)
+    out: Path | None = None
     try:
-        st = path.stat()
-        key = hashlib.sha256(
-            f"faststart:{path}:{st.st_mtime_ns}:{st.st_size}".encode()
-        ).hexdigest()[:32]
-    except OSError:
+        with _media_input(path) as (fd, st):
+            # A duplicate: closing the reader leaves the tool's descriptor open.
+            with os.fdopen(os.dup(fd), "rb") as reader:
+                if _is_faststart(reader):
+                    return None
+            key = hashlib.sha256(
+                f"faststart:{path}:{st.st_mtime_ns}:{st.st_size}".encode()
+            ).hexdigest()[:32]
+            out = cache / f"{key}.mp4"
+            if out.is_file() and out.stat().st_size > 0:
+                return out
+            r = _run_media_tool(FFMPEG, fd, ["-y"], ["-c", "copy", "-movflags", "+faststart", str(out)],
+                                timeout=600)
+            if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
+                out.unlink(missing_ok=True)
+                return None
+            return out
+    except safe_fs.SafeFsError as e:
+        _refused(path, e)
         return None
-    out = cache / f"{key}.mp4"
-    if out.is_file() and out.stat().st_size > 0:
-        return out
-    cmd = [FFMPEG, "-y", "-i", str(path), "-c", "copy",
-           "-movflags", "+faststart", str(out)]
-    try:
-        r = subprocess.run(cmd, capture_output=True, timeout=600)
+    except FileNotFoundError:
+        return None
     except (OSError, subprocess.SubprocessError) as e:
         logger.warning("faststart remux error for %s: %s", path, e)
-        out.unlink(missing_ok=True)
+        if out is not None:
+            out.unlink(missing_ok=True)
         return None
-    if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
-        out.unlink(missing_ok=True)
-        return None
-    return out
 
 
 async def ensure_playable_async(
@@ -377,7 +431,6 @@ async def ensure_playable_async(
         ffmpeg_available()
         and (codecs or {}).get("video")
         and Path(path).suffix.lower() in (".mp4", ".m4v")
-        and not await asyncio.to_thread(_is_faststart, path)
     ):
         out = await asyncio.to_thread(_faststart_remux_sync, path, dest_dir)
         if out is not None:
@@ -385,19 +438,40 @@ async def ensure_playable_async(
     return path, guess_media_mime(path), False
 
 
+# The document pane's prepared downloads, one folder per link
+# (``api/media/document_downloads``): the expired-token sweep unlinks the file,
+# this sweep the folder left empty.
+CONVERTED_DIR = "converted"
+# A folder this young may be a conversion still writing into it.
+_CONVERTED_GRACE_S = 300
+
+
 def sweep_host_media_cache(ttl_seconds: int = 7200) -> int:
     """Remove satellite-host media files idle longer than ``ttl_seconds`` (by
-    mtime). Nothing here is load-bearing — it's re-pulled on demand — so this
-    just bounds disk. Returns the number of files removed."""
+    mtime), and the pane's prepared-download folders left empty or older
+    than that. Nothing here is load-bearing — it's re-pulled on demand — so
+    this just bounds disk. Returns the number of entries removed."""
     if not _HOST_CACHE_DIR.is_dir():
         return 0
+    import shutil as _shutil
     import time as _time
-    cutoff = _time.time() - ttl_seconds
+    now = _time.time()
+    cutoff = now - ttl_seconds
     removed = 0
     for p in _HOST_CACHE_DIR.iterdir():
         try:
             if p.is_file() and p.stat().st_mtime < cutoff:
                 p.unlink()
+                removed += 1
+        except OSError:
+            pass
+    converted = _HOST_CACHE_DIR / CONVERTED_DIR
+    for p in converted.iterdir() if converted.is_dir() else ():
+        try:
+            mtime = p.lstat().st_mtime
+            if p.is_dir() and not p.is_symlink() and (
+                    mtime < cutoff or (mtime < now - _CONVERTED_GRACE_S and not any(p.iterdir()))):
+                _shutil.rmtree(p)
                 removed += 1
         except OSError:
             pass
@@ -446,3 +520,34 @@ def locate_media_row(info: dict) -> tuple[str, str]:
             if not config.is_safe_agent_name(first) or (agent and first != agent):
                 raise MediaUnserveable("agent segment does not match the row")
     return root, rel
+
+
+def remove_cache_copies(rows: list[dict]) -> int:
+    """Remove the copy of each cache-owned media row (a chat's deleted with
+    it, an expired link's): placed by :func:`locate_media_row` beneath its
+    root, and under the agents root only a lazy-pull copy in the host cache,
+    never a file of an agent's own folder. Removed with no link followed (a
+    link at the name goes, its target stays). A copy already gone, with its
+    folder or without, is passed over in silence. A row it cannot place is
+    left and logged. Never raises; returns the copies removed. Blocking:
+    call it in a worker thread."""
+    agents = _serve_roots()[0]
+    removed = 0
+    for info in rows:
+        if not info.get("cache_owned"):
+            continue
+        try:
+            root, rel = locate_media_row(info)
+            if root == agents and rel.split("/", 1)[0] != HOST_CACHE_SEGMENT:
+                raise MediaUnserveable("a file of an agent's own folder is never a cache copy")
+            safe_fs.unlink_beneath(root, rel, missing_ok=True)
+        except FileNotFoundError:
+            # The copy's folder went before it (a closed session's cache, a
+            # download the next one replaced): nothing is left to remove.
+            continue
+        except (MediaUnserveable, OSError) as exc:
+            logger.warning("Media cache copy not removed (%s): %s", type(exc).__name__,
+                           info.get("abs_path") or "")
+            continue
+        removed += 1
+    return removed

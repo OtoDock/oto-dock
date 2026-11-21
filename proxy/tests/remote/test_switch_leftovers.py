@@ -24,14 +24,10 @@ CODEX = "codex-cli"
 
 @pytest.fixture
 def online(monkeypatch):
-    """Machines reachable and on a satellite that takes the file frames:
-    the set the test fills."""
-    from core.remote import satellite_connection as sc
+    """Machines reachable: the set the test fills."""
     from services.remote import remote_status
     up: set[str] = set()
     monkeypatch.setattr(remote_status, "is_reachable", lambda mid: mid in up)
-    monkeypatch.setattr(sc.get_connection_manager(), "satellite_supports_session_move",
-                        lambda mid: mid in up)
     return up
 
 

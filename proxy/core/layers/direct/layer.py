@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, cast
 
 import config as app_config
 from core import placement
+from core.engine_records import PROXY_MANAGED
 from core.events.common_events import (
     CONTEXT_COMPACT,
     DONE,
@@ -44,6 +45,7 @@ from core.execution_layer import (
     SubscriptionHandle,
     UsageProfile,
 )
+from core.layers.direct.mcp import ENGINE_ID
 from core.layers.direct.session import (
     DirectSession,
     close_direct_session,
@@ -51,17 +53,20 @@ from core.layers.direct.session import (
     get_direct_session,
     run_direct_stream,
 )
-from core.session import session_kind
+from core.session import session_closing, session_kind
 from core.session.session_state import (
     START_MARK_TTL_S,
     _record_session_use,
     cleanup_session_permission_state,
     clear_starting,
+    forget_session,
+    is_starting,
     mark_starting,
     register_session_state,
     session_is_held,
     set_session_mode,
 )
+from storage.pg import run_db
 
 if TYPE_CHECKING:
     from auth.path_policy import SecurityContext
@@ -135,7 +140,7 @@ def direct_event_to_common(event: dict) -> CommonEvent | None:
 # ---------------------------------------------------------------------------
 
 _DIRECT_CAPABILITIES = LayerCapabilities(
-    name="direct-llm",
+    name=ENGINE_ID,
     display_name="Direct LLM API",
     supports_resume=False,
     supports_permissions=True,
@@ -151,7 +156,7 @@ _DIRECT_CAPABILITIES = LayerCapabilities(
     effort_levels=["low", "medium", "high", "xhigh", "max"],
     effort_changeable_mid_session=False,
     compression_threshold_pct=None,
-    mcp_delivery="proxy_managed",
+    mcp_delivery=PROXY_MANAGED,
     mcp_config_format=None,
     providers=[
         # The ladders are what each provider's API takes (DIRECT-LLM.md
@@ -213,16 +218,21 @@ _DIRECT_CAPABILITIES = LayerCapabilities(
     behaviour=BehaviourProfile(
         rebuilds_history_from_db=True,        # every turn rebuilds from chat_messages
         attach_images_inline=True,            # native vision content blocks
-        phone_http_mcps=False,                # a call stays on stdio MCPs (60 s cap, no sidecars)
         skills_delivery="prompt_catalog",     # the prompt lists skills its Skill builtin loads
         supports_bash=False,
         supports_plans_dir=False,
         builtin_file_tools=True,              # the platform's own Read/Write/Edit/Delete
         has_shell_on_external_route=False,
+        hides_denied_tools=True,              # the functions a limit leaves out are not offered (tool_limits)
         provider_pinned_per_session=False,    # change_model re-acquires across providers
-        supports_steer=False,
+        supports_steer=True,                  # read at the turn's next tool boundary
         supports_compact=False,
         supports_interrupt_for_queued=False,
+        supports_background_commands=False,  # no shell
+        supports_step_descriptions=False,  # no shell
+        # Its Anthropic calls mark the cache ephemeral (five minutes), and
+        # OpenAI keeps an idle prefix five to ten minutes.
+        prompt_cache_s=300,
         # The platform's own builtins (builtins.py) — canonical names already;
         # the vendors' server tools (web search) are the provider's, not this
         # engine's, and arrive under the provider's name.
@@ -337,13 +347,19 @@ def _rebuild_history_from_db(session, session_id: str, chat_id: str = "", *,
             return
         chats = [chat]
 
+    from core.session import key_rows
+    from core.session.start_context import fence_turn
     messages_db: list[dict] = []
     rebuilt: list[dict] = []
     for chat in chats:
-        rows = task_store.get_chat_messages(chat["id"])
+        # A key's message being delivered is this turn's prompt already.
+        rows = [m for m in task_store.get_chat_messages(chat["id"])
+                if not key_rows.held_row(chat["id"], m)]
         messages_db.extend(rows)
+        # A row holds what was typed: fenced as the turn's own text was, so
+        # only the platform's block carries the start's tag.
         rebuilt.extend(_aborted_trimmed(chat, [
-            {"role": m["role"], "content": m["content"]} for m in rows
+            {"role": m["role"], "content": fence_turn(m["content"])} for m in rows
             if m.get("role", "") in ("user", "assistant") and m.get("content", "")
             and not (skip_row and m.get("id") == skip_row)]))
 
@@ -417,38 +433,9 @@ def _aborted_trimmed(chat: dict, rebuilt: list[dict]) -> list[dict]:
     return rebuilt
 
 
-def direct_mcp_policy(client_type: str) -> tuple[bool, int]:
-    """``(enable_http_transport, tool_timeout)`` for a direct session by
-    client type. Chats, tasks and meetings get the sidecar HTTP MCPs
-    (file-tools, video-tools, browser…) and the chat call cap; a phone call
-    stays stdio-only with the short cap — a document render behind a 300 s
-    timeout must never hang a caller."""
-    from core.layers.direct.mcp import TOOL_CALL_TIMEOUT, TOOL_CALL_TIMEOUT_CHAT
-    if client_type == session_kind.PHONE.name:
-        return False, TOOL_CALL_TIMEOUT
-    return True, TOOL_CALL_TIMEOUT_CHAT
-
-
-def audience_gate(ctx, external: bool) -> tuple[str, str]:
-    """``(user_role, scope)`` the Direct manager's MCP build judges the
-    manifests' audience with, from the session's security context, as the
-    session's builder judged its own build: the person's effective role on
-    the agent and the mount scope. An external caller's session is never
-    the agent acting as itself (the phone builder judges it in user scope),
-    and a session with no context names no person and filters nothing."""
-    if ctx is None:
-        return "", "user"
-    role = str(getattr(ctx, "role", "") or "")
-    scope = "user" if external else str(getattr(ctx, "session_scope", "") or "user")
-    return role, scope
-
-
 def excluded_server_keys(names) -> set[str]:
-    """The ``mcpServers`` keys of the MCPs a session's builder left out, from
-    their manifest names (``AgentConfig.excluded_mcps``): the manager's own
-    rebuild knows the phone and external facts alone, so a task's, a
-    meeting's and a ``shared_chat`` session's exclusions reach the pool by
-    key. A name with no manifest is its own key."""
+    """The ``mcpServers`` keys of the MCPs a session does not start, from
+    their manifest names. A name with no manifest is its own key."""
     from services.mcp import mcp_registry as mcp_reg
     keys: set[str] = set()
     for name in names:
@@ -477,6 +464,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         external claim from the live context. A failed start drops the
         registration again (see the CLI layer).
         """
+        await session_closing.wait_closed(session_id)
         held = session_is_held(session_id)
         mark_starting(session_id, START_MARK_TTL_S)
         try:
@@ -506,10 +494,9 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             )
         phone_mode = config.client_type == session_kind.PHONE.name
         # An EXTERNAL session (a phone caller who is not a platform user):
-        # the MCP set is filtered by the same rule the builder applied
-        # (mcp_registry.session_exclusion_reason), here for the per-MCP dir
-        # binds and again inside the manager's own config rebuild.
+        # its sandbox is a caller's. The tools it gets are the builder's.
         from core.session.external_identity import external_home_of, is_external_ctx
+        from services.mcp import tool_limits
         external = is_external_ctx(config.security_context)
         extra = config.extra_env or {}
         # Provider-aware: subscription_pool sets _API_KEY/_PROVIDER/_ENDPOINT_URL
@@ -523,40 +510,34 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         # Each stdio MCP gets wrapped individually in bwrap so it sees the
         # same restricted mount namespace as CLI MCPs.
         sandbox_builder = None
+        # The compute machine this session's stdio tools run on, the builder's
+        # one decision of where, carried in the session's own record (a
+        # relayed tool's callbacks come through that machine's link).
+        _on = placement.compute_of(getattr(config.security_context, "placement", None))
+        machine_id = str(_on.machine_id) if _on is not None else ""
         if config.sandbox_host_claude_dir:
             from core.sandbox.sandbox import (
                 SandboxBuilder,
                 mcp_sandbox_mounts,
+                own_engine_home,
                 resolve_sandbox_config,
             )
             from services.mcp import mcp_registry as mcp_reg
 
             ctx = cast("SecurityContext | None", config.security_context)
-            # Resolve MCP sandbox mounts from manifest declarations.
-            # is_remote=False (fail-closed default, explicit here): LOCAL bwrap
-            # mount path — satellite_only device MCPs never mount locally.
-            assigned_mcps = mcp_reg.get_agent_mcps(config.agent_name, placement=placement.LOCAL_PLACEMENT) or []
-            mcp_mounts = mcp_sandbox_mounts(assigned_mcps)
-
-            # Per-MCP dir binds: Direct-LLM has no MCP config FILE
-            # (proxy-managed delivery), so derive the stdio dirs from the
-            # assigned set directly. ``.uv-python`` rides along for venvs
-            # whose interpreter is uv-fetched.
-            stdio_dirs = [
-                str(manifest.mcp_dir)
-                for manifest in mcp_reg.filter_manifests_for_session(
-                    assigned_mcps,
-                    contexts={"phone"} if phone_mode else set(),
-                    external=external,
-                )
-                if manifest.server.transport == "stdio"
+            # The MCPs the session's build attached (the assigned set minus
+            # ``AgentConfig.excluded_mcps``): their manifest mounts and
+            # routes. LOCAL bwrap mount path: satellite_only device MCPs
+            # never mount here.
+            attached = [
+                m for m in (await run_db(mcp_reg.get_agent_mcps, config.agent_name,
+                                         placement=placement.LOCAL_PLACEMENT) or [])
+                if m.name not in (config.excluded_mcps or ())
             ]
-            if stdio_dirs:
-                _uv = app_config.MCPS_DIR.resolve() / ".uv-python"
-                if _uv.is_dir():
-                    stdio_dirs.append(str(_uv))
+            mcp_mounts = mcp_sandbox_mounts(attached)
 
-            sandbox_cfg = resolve_sandbox_config(
+            sandbox_cfg = await run_db(
+                resolve_sandbox_config,
                 role=ctx.role if ctx else "viewer",
                 username=ctx.mount_username if ctx else "",
                 agent_name=config.agent_name,
@@ -564,19 +545,47 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                 host_claude_dir=Path(config.sandbox_host_claude_dir),
                 user_sub=config.user_sub,
                 mcp_sandbox_mounts=mcp_mounts,
+                account_choices=config.account_choices or None,
                 config_visible=ctx.config_visible if ctx else None,
                 mount_shared=ctx.mount_shared if ctx else True,
                 knowledge_rw=bool(getattr(ctx, "knowledge_rw", False)) if ctx else False,
-                mcp_dir_binds=stdio_dirs,
+                # The tool folders follow the builder's config, as for the
+                # CLI engines: the MCPs it forces (the meeting tools) have theirs.
+                mcp_config_path=config.mcp_config_path,
                 external=external,
                 external_home=external_home_of(ctx),
                 read_only=bool(getattr(ctx, "read_only", False)),
+                attached_mcps=[m.name for m in attached],
+                outside_files_write=bool(getattr(ctx, "outside_files_write", False)),
+                outside_knowledge=tuple(getattr(ctx, "outside_knowledge", ()) or ()),
+                wrapup_home=getattr(ctx, "wrapup_home", "") if getattr(ctx, "wrapup", "") else None,
+                engine_home=own_engine_home(ctx, config.sandbox_host_claude_dir),
             )
             sandbox_builder = SandboxBuilder(sandbox_cfg)
+            # The credential exit: the tool children this layer spawns take
+            # its variables (``credential_exit.env_of``) and its port and
+            # bundle through the sandbox they are wrapped in on the compute
+            # machine (the relayed tool's open carries the session's door).
+            from core.credentials import credential_exit
+            await credential_exit.attach_sandbox(
+                session_id, sandbox_builder, {}, config.sandbox_host_claude_dir,
+                sandbox_config_dir=sandbox_builder.get_env_overrides().get(
+                    "CLAUDE_CONFIG_DIR", "/workspace/.claude"),
+                machine=_on)
 
-        enable_http, tool_timeout = direct_mcp_policy(config.client_type)
-        user_role, scope = audience_gate(config.security_context, external)
-        from services.phone.call_control import ASK_BACK_ENV, CALL_TOOLS_ENV
+        # The builder's tool config, the person's accounts and the chat's
+        # choice of account in it, as the CLI engines read it.
+        built_config = (Path(config.mcp_config_path) if config.mcp_config_path else None,
+                        config.mcp_secret_bundles)
+        from services.phone.call_control import (
+            ASK_BACK_ENV,
+            CALL_CONTROL_MCP,
+            CALL_TOOLS_ENV,
+        )
+        # This engine has the call tools as builtins (``end_call`` and
+        # ``transfer_call``, which set ``line_closing``): the builders force
+        # the call-control MCP for the CLI engines alone to read.
+        excluded = excluded_server_keys({*(config.excluded_mcps or ()), CALL_CONTROL_MCP})
         session = await create_direct_session(
             session_id=session_id,
             agent_name=config.agent_name,
@@ -587,14 +596,14 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             credential_env=config.credential_env or None,
             system_prompt=config.system_prompt,
             sandbox_builder=sandbox_builder,
-            enable_http_transport=enable_http,
-            tool_timeout=tool_timeout,
-            external=external,
             call_tools=bool(extra.get(CALL_TOOLS_ENV)),
             call_ask_back=bool(extra.get(ASK_BACK_ENV)),
-            user_role=user_role,
-            scope=scope,
-            excluded_mcps=excluded_server_keys(config.excluded_mcps) or None,
+            excluded_mcps=excluded or None,
+            model=config.model,
+            prebuilt_config=built_config,
+            machine_id=machine_id,
+            web_tools=self._web_tools(config.security_context, external=external),
+            tool_grants=tool_limits.engine_pairs(config.security_context),
         )
         # The builtin file tools resolve against this session's mount table
         # (the same decisions the MCP subprocesses get from bwrap).
@@ -605,9 +614,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         # from the resolved creds identity and never blanked for a user chat — else
         # change_model would widen scope. The resolver also normalises "" defensively.
         session.user_sub = extra.get("_USER_SUB", "")
-        # Override model and effort if specified
-        if config.model:
-            session.model = config.model
+        # Override effort if specified
         if config.effort:
             session.effort = config.effort
         # (permission mode + security context were registered before the start)
@@ -696,17 +703,42 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             task.cancel()
         return False
 
+    async def steer(self, session_id: str, text: str) -> bool:
+        """A message into the running turn: the tool loop reads it at its
+        next boundary (``session.steers``). Refused with no running turn,
+        while a permission card waits (the card is the question: a typed
+        message keeps its place in the queue), and once the turn can no longer
+        read one, so the caller queues it instead."""
+        session = await get_direct_session(session_id)
+        if session is None or not text or not session.steer_open or session_id not in self._active_streams:
+            return False
+        from core.session.session_state import has_pending_prompt
+        if has_pending_prompt(session_id):
+            return False
+        from core.session.start_context import fence_turn
+        session.steers.append(fence_turn(text))
+        return True
+
     async def close_session(self, session_id: str) -> None:
         """Close the direct session and its MCP servers."""
+        from .session import _direct_sessions
+        if session_id not in _direct_sessions and is_starting(session_id):
+            # What is kept under the id is the start's in flight.
+            return
+        with session_closing.closing(session_id):
+            await self._drop_session(session_id)
+            from core.concurrency import release_chat_slot
+            release_chat_slot(session_id)
+
+    async def _drop_session(self, session_id: str) -> None:
+        """The session, its MCP servers, its permission state and its seat."""
         await close_direct_session(session_id)
-        # A closed session must not keep a live permission context (see the
-        # CLI layer).
-        cleanup_session_permission_state(session_id)
-        # Release subscription + concurrency slot
+        # A closed session must not keep a live permission context: the hook
+        # fails closed without one, and a session token that outlives its
+        # session is dead only once this is gone.
+        await forget_session(session_id)
         from services.engines.subscription_pool import release_subscription
         release_subscription(session_id)
-        from core.concurrency import release_chat_slot
-        release_chat_slot(session_id)
 
     async def respond_permission(
         self, session_id: str, request_id: str, approved: bool,
@@ -797,6 +829,13 @@ class DirectLLMExecutionLayer(ExecutionLayer):
 
     # --- Capabilities ---
 
+    @staticmethod
+    def _web_tools(ctx, *, external: bool) -> bool:
+        """The provider's own web tools: never for a session with no web (the
+        wrap-up), for an outside person only when their managers picked it."""
+        return (not getattr(ctx, "no_web", False)
+                and (not external or bool(getattr(ctx, "outside_web", False))))
+
     @property
     def capabilities(self) -> LayerCapabilities:
         return _DIRECT_CAPABILITIES
@@ -814,6 +853,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
     def prepare_config_dir(
         self, agent_name: str, *, username: str = "", scope: str = "user",
         external_home=None, no_shell: bool = False, read_only: bool = False,
+        outside_picks=None, kind_rule=None,
     ) -> Path:
         """Direct LLM has no CLI config of its own (``config_dir_name`` is
         ""), but a session's plans dir and its in-process MCP config home
@@ -829,6 +869,8 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         extra: dict = {}
         if external_home:
             extra["external_home"] = external_home
+            extra["outside_picks"] = outside_picks
+            extra["kind_rule"] = kind_rule
         return _cd.ensure_persistent_claude_dir(
             agent_name, username=username, scope=scope, **extra)
 
@@ -858,9 +900,16 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         return await get_direct_session(session_id)
 
     async def is_session_alive(self, session_id: str) -> bool:
-        """Direct sessions are always alive if they exist."""
+        """A session that exists, until its relayed tools are lost."""
         session = await get_direct_session(session_id)
-        return session is not None
+        return session is not None and not self._tools_gone(session_id, session)
+
+    def _tools_gone(self, session_id: str, session: DirectSession) -> bool:
+        """Its relayed tools went with their machine, or can no longer reach
+        the platform. A running turn finishes first (it ends with the tools'
+        errors, as a CLI turn whose process died)."""
+        manager = session.mcp_manager
+        return manager is not None and session_id not in self._active_streams and manager.tools_lost()
 
     # --- Session lock + lifecycle ---
 
@@ -875,12 +924,19 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             yield
 
     async def is_session_process_dead(self, session_id: str) -> bool:
-        """Direct sessions have no process — never dead."""
-        return False
+        """A Direct session has no process of its own; its tools' processes
+        on a compute machine are the part that can die."""
+        session = await get_direct_session(session_id)
+        return session is not None and self._tools_gone(session_id, session)
 
     async def prepare_resume(self, session_id: str) -> None:
-        """No-op — direct sessions don't resume."""
-        pass
+        """A session whose tools were lost goes here, its pool and seat with
+        it, so the next start builds a new one where the platform serves now.
+        Its slot stays the caller's, as on the other engines: a call healed in
+        place keeps the one it holds."""
+        session = await get_direct_session(session_id)
+        if session is not None and self._tools_gone(session_id, session):
+            await self._drop_session(session_id)
 
     async def can_resume_session(
         self, session_id: str, *, agent_name: str = "", username: str = "",

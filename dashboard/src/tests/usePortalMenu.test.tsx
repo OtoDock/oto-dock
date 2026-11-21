@@ -4,7 +4,7 @@
 // workspace overlay's handler below it on the escape stack stays put).
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createPortal } from 'react-dom'
 
 import WorkspaceToolbar from '@/components/workspace/WorkspaceToolbar'
@@ -27,6 +27,23 @@ function Harness() {
         m.portalRoot,
       )}
     </>
+  )
+}
+
+function RadioHarness({ closeOnMove = false }: { closeOnMove?: boolean }) {
+  const m = usePortalMenu({ items: '[role="menuitemradio"]', focus: '[aria-checked="true"]', closeOnMove })
+  return (
+    <div style={{ overflow: 'auto' }} data-testid="scroller">
+      <button ref={m.buttonRef} onClick={m.toggle} aria-haspopup="menu" aria-expanded={m.open}>Open</button>
+      {m.open && createPortal(
+        <div ref={m.panelRef} role="menu" onKeyDown={m.onKeyDown} style={m.style} data-testid="panel">
+          <button role="menuitemradio" aria-checked="false">Live</button>
+          <button role="menuitemradio" aria-checked="true">Version 2</button>
+          <button role="menuitemradio" aria-checked="false" disabled>Version 1</button>
+        </div>,
+        m.portalRoot,
+      )}
+    </div>
   )
 }
 
@@ -88,6 +105,51 @@ describe('usePortalMenu', () => {
     expect(screen.getByRole('menu')).toBeInTheDocument()
     fireEvent.mouseDown(document.body)
     await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+  })
+})
+
+describe('usePortalMenu options', () => {
+  it('moves through the items it names and focuses the chosen one on open', async () => {
+    render(<RadioHarness />)
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+    await waitFor(() => expect(focused()).toBe('Version 2'))
+    const menu = screen.getByRole('menu')
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(focused()).toBe('Live') // the disabled radio is skipped, then it wraps
+    act(() => { (document.activeElement as HTMLElement).blur() })
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(focused()).toBe('Version 2') // nothing focused: ArrowUp is the last item
+  })
+
+  it('closeOnMove closes on the window losing the focus, a resize and a scroll that moves the button', async () => {
+    render(<RadioHarness closeOnMove />)
+    const button = screen.getByRole('button', { name: 'Open' })
+    for (const move of [
+      () => window.dispatchEvent(new Event('blur')),
+      () => window.dispatchEvent(new Event('resize')),
+      () => fireEvent.scroll(screen.getByTestId('scroller')),
+    ]) {
+      fireEvent.click(button)
+      await screen.findByRole('menu')
+      act(move)
+      await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    }
+    fireEvent.click(button)
+    await screen.findByRole('menu')
+    fireEvent.scroll(screen.getByTestId('panel'))
+    expect(screen.getByRole('menu')).toBeInTheDocument() // the menu's own scroll keeps it
+  })
+
+  it('without closeOnMove a blur, a resize or a scroll keeps the menu open (the toolbar and RunsOnChip)', async () => {
+    render(<RadioHarness />)
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+    await screen.findByRole('menu')
+    act(() => {
+      window.dispatchEvent(new Event('blur'))
+      window.dispatchEvent(new Event('resize'))
+      fireEvent.scroll(screen.getByTestId('scroller'))
+    })
+    expect(screen.getByRole('menu')).toBeInTheDocument()
   })
 })
 

@@ -11,8 +11,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 // automatic updates say so. A git+ offer is built by the weekly job at a
 // commit the catalog pins; one at a tag or a branch offers no Update.
 
+const auth = vi.hoisted(() => ({ cloud: false }))
 vi.mock('@/contexts/AuthContext', () => ({
-  useAuth: () => ({ authConfig: {}, user: { sub: 'u1', role: 'admin', agent_roles: {} } }),
+  useAuth: () => ({ authConfig: { cloud: auth.cloud }, user: { sub: 'u1', role: 'admin', agent_roles: {} } }),
 }))
 vi.mock('@/components/CommunityMcpsBrowser', () => ({ default: () => null }))
 vi.mock('@/components/admin/McpInstanceManager', () => ({ default: () => null }))
@@ -192,5 +193,75 @@ describe('a Docker action the server refuses', () => {
     fireEvent.click(await screen.findByText('Video Tools'))
     fireEvent.click(screen.getByRole('button', { name: 'Restart' }))
     expect(await screen.findByText(/run Update again/)).toBeInTheDocument()
+  })
+})
+
+describe('McpServersPage — a Docker tool that sleeps', () => {
+  afterEach(() => fetchSpy.mockReset())
+
+  it('reads Sleeping, starts at its next use, and keeps running from its switch', async () => {
+    mockApi([mcp({ docker_status: 'sleeping', docker_keep_running: false })])
+    renderPage()
+    expect(await screen.findByText('Sleeping')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Video Tools'))
+    expect(screen.getByText('It starts at its next use.')).toBeInTheDocument()
+    expect(screen.getByText('Uses memory all the time.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('switch', { name: 'Keep Video Tools running' }))
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledWith(
+      '/v1/admin/mcps/video-tools/docker/keep-running',
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ keep: true }) }),
+    ))
+  })
+
+  it('says a working tool stays awake, and for how long at most', async () => {
+    mockApi([mcp({ docker_status: 'running', docker_working_minutes: 42 })])
+    renderPage()
+    fireEvent.click(await screen.findByText('Video Tools'))
+    expect(screen.getByTestId('docker-working').textContent).toBe(
+      'It is working on a job, so it stays awake for up to 42 more minutes.')
+  })
+
+  it('never says a tool that is not running is working', async () => {
+    for (const status of ['stopped', 'did_not_start', 'starting', 'sleeping'] as const) {
+      mockApi([mcp({ docker_status: status, docker_working_minutes: 42 })])
+      const { unmount } = renderPage()
+      fireEvent.click(await screen.findByText('Video Tools'))
+      expect(screen.queryByTestId('docker-working')).toBeNull()
+      unmount()
+    }
+  })
+
+  it('reads Did not start with its one plain cause, Stop off', async () => {
+    mockApi([mcp({ docker_status: 'did_not_start',
+      docker_wake_error: 'Its image is not on this server: press Start to fetch it.' })])
+    renderPage()
+    expect(await screen.findByText('Did not start')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Video Tools'))
+    expect(screen.getByText(
+      'It did not start at its last use. Its image is not on this server: press Start to fetch it.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Start' })).toBeEnabled()
+  })
+
+  it('shows no Keep running on hosted OtoDock', async () => {
+    auth.cloud = true
+    try {
+      mockApi([mcp({ docker_status: 'sleeping', docker_keep_running: false })])
+      renderPage()
+      fireEvent.click(await screen.findByText('Video Tools'))
+      expect(screen.getByText('It starts at its next use.')).toBeInTheDocument()
+      expect(screen.queryByText('Keep running')).not.toBeInTheDocument()
+      expect(screen.queryByText('Uses memory all the time.')).not.toBeInTheDocument()
+    } finally {
+      auth.cloud = false
+    }
+  })
+
+  it('shows no switch for a tool that always runs', async () => {
+    mockApi([mcp({ docker_status: 'running', docker_always_on: true })])
+    renderPage()
+    fireEvent.click(await screen.findByText('Video Tools'))
+    expect(screen.queryByText('Keep running')).not.toBeInTheDocument()
   })
 })

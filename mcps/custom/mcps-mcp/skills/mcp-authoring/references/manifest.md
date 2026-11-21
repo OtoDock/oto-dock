@@ -26,7 +26,7 @@ floor the fields imply.
 | `config` | no | Admin-managed key/value settings shown on the MCP's page; `user_overridable: true` lets each person override one. A row's `default` applies until an admin saves another value (an empty default sets nothing), so a safe default belongs here, not only in the description. |
 | `env` | no | Static variables for every launch. |
 | `agent_env` | no | Per-session variables with `${session.*}` tokens. |
-| `path_env` | no | Path-bearing variables by role (`workspace`, `user_root`, `shared_workspace`, `config`, `knowledge_dir`, `credentials_dir`). The platform fills them with the right sandbox path per session. |
+| `path_env` | no | Path-bearing variables by role (`workspace`, `user_root`, `shared_workspace`, `config`, `knowledge_dir`). The platform fills them with the right sandbox path per session. |
 | `tool_arg_paths` | no | Which tool arguments are paths (`{"tool": {"arg.path": {"mode": "read"}}}`), so the platform translates and admits them before your server sees them. |
 | `skills` | no | Skills bundled with the MCP: `{id, file, description, loading, default_exclude_from, audience}`. `loading` is `on_demand` (default) or `always`; `audience` (`owner`, `editor`, `workspace`) limits a skill to a tier. |
 | `agent_context` | no | Prompt blocks with `${account.*}`, `${agent.*}`, `${trigger.*}` tokens. |
@@ -42,11 +42,12 @@ floor the fields imply.
 | `replaces` | no | Sources this entry supersedes, with credential key renames: `[{"source": "<previous source>", "credentials": {"OLD": "NEW"}}]`. Information for the admin's switch, never an authorization. |
 | `tool_filter` | no | For a container whose server takes a tool-filter regex: `{arg_name, env_var_name, regex_env_var_name}`. The platform writes the admin's regex bare to `regex_env_var_name` (default `ENABLED_TOOLS_REGEX`) and the flag `arg_name '<regex>'` to `env_var_name` (default `ENABLED_TOOLS_FLAG`); read the bare one (`env_file: .env`, then `"$$ENABLED_TOOLS_REGEX"` quoted in a `sh -c` entrypoint, or the server's own env). |
 | `patched`, `patch_note` | no | `true` plus one line when `patches/*.patch` are shipped and applied after `npm install`. |
-| `deprecated`, `platform_min_version` | no | Catalog metadata. `platform_min_version` is the oldest platform the entry works on: 1.7.1 when it uses `audience`, a skill's `audience`, `replaces`, `credentials.api_key_header` or `oauth.authorization_server`; 1.8.0 for `result_files`, `tool_filter.regex_env_var_name` or a PyPI source with extras. `validate_mcp_package` computes it from the fields and warns when the declared one is lower. |
+| `deprecated`, `platform_min_version` | no | Catalog metadata. `platform_min_version` is the oldest platform the entry works on: 1.7.1 when it uses `audience`, a skill's `audience`, `replaces`, `credentials.api_key_header` or `oauth.authorization_server`; 1.8.0 for `result_files`, `tool_filter.regex_env_var_name` or a PyPI source with extras, and 2.0.0 for `credentials.exit`. `validate_mcp_package` computes it from the fields and warns when the declared one is lower. |
 
 Fields a community package never sets: `requires_capability`, `hosted`,
-`server.proxy_callbacks`, `placement`, `device_capability`,
-`companion_app` (platform and device features).
+`server.proxy_callbacks` (platform features). An app connector sets
+`placement`, `requires_display`, `device_capability` and `companion_app`:
+see "App connectors" below.
 
 ## `server`
 
@@ -58,7 +59,7 @@ Fields a community package never sets: `requires_capability`, `hosted`,
 | `source` | yes | `npm:<package>`, `pypi:<package>` (with extras: `pypi:<package>[<extra>,<extra>]`, platform 1.8.0 and later), `git+<url>@<commit>#subdirectory=<dir>`, `docker:<label>` or `remote:<host>`. A catalog git source pins the full 40-character commit, never a tag or a branch (they can move upstream); from 1.8.0 the weekly update builds a new commit the catalog pins. An admin's own ZIP may pin a tag. |
 | `version_constraint` | no | A PEP 440 range (`">=2,<3"`) that bounds the automatic updates of an npm or PyPI package. |
 | `source_build` | no | For a PyPI package: the distributions the installer may build from source when the machine has no wheel for them (every package installs from wheels first; a listed one is built only when that resolve fails on it). |
-| `tool_timeout_sec` | no | Seconds Codex gives one tool call before it fails the call, 1 to 3600 (Codex's own default is 60). Set it on a server whose tools run for minutes: a media generation, a document conversion, an install. Claude Code keeps its own limit, and a platform that does not read the key ignores it, so it needs no `platform_min_version`. |
+| `tool_timeout_sec` | no | Seconds one tool call may take before the engine fails the call, 1 to 3600. Without it Codex allows 60 seconds and Claude Code 5 minutes of silence over HTTP. Set it on a server whose tools run for minutes: a media generation, a document conversion, an install. A platform that does not read the key ignores it, so it needs no `platform_min_version`. |
 | `port`, `url_template`, `health_endpoint`, `docker_compose`, `image`, `service_name` | docker | The port, `http://${docker_mcp_host}:${port}`, an optional health path, the compose file in the folder, the prebuilt image (required for the containerised deployment), an optional service-DNS name. |
 | `url_template` | remote | The endpoint URL (`https://mcp.vendor.com/mcp`); its host is the MCP's identity. |
 
@@ -72,8 +73,23 @@ Fields a community package never sets: `requires_capability`, `hosted`,
 - `type: "infra"` with `fields`: one set of values for the install, entered
   by an admin on the MCP's page.
 - `oauth`: `provider_id`, `flows`, the vendor's URLs, `app_credential` and
-  its fields, `services` with scopes; a stdio MCP that reads a token file
-  adds a `path_env` entry with `role: "credentials_dir"`; a remote MCP that
+  its fields, `services` with scopes; a stdio MCP that needs the account's
+  token names its variables in `mcp_env_injection`, and the access token
+  arrives in those variables in the MCP's own process when it starts. No
+  stdio MCP is handed a token file, a refresh token or a client secret. Beside
+  the token the platform sets `OTO_TOKEN_SCOPES` (what the sign-in granted,
+  separated by spaces), `OTO_TOKEN_ACCOUNT` (the account's label, its address
+  for Google) and, when the token has an expiry, `OTO_TOKEN_EXPIRES_AT`
+  (ISO 8601 UTC). A token with less than 24 hours left at the session's start
+  also brings `OTO_TOKEN_RENEWAL`. When `OTO_TOKEN_EXPIRES_AT` comes close,
+  send `POST` to `$PROXY_URL/v1/hooks/mcp-credentials` with
+  `Authorization: Bearer $OTO_TOKEN_RENEWAL`, with no HTTP proxy between (the
+  address is the platform's own loopback listener). The answer is
+  `{"env": {...}}` with your variables, the new expiry, the scopes and the
+  account, and no other secret. A 409 means the account needs a reconnect
+  (its `detail` is a sentence to show), a 503 means try again in a moment, a
+  404 means the session no longer holds the token and a 401 that the renewal
+  is no longer good. A remote MCP that
   needs the bearer header sets `bearer_required: true` and `proposed_hosts`,
   on a streamable-HTTP `server.transport` (`sse` is refused: the platform
   forwards to the one declared path). The platform never writes the bearer into a config file — it adds the
@@ -105,6 +121,49 @@ Fields a community package never sets: `requires_capability`, `hosted`,
   as it leaves and is never written into a config file. A catalog entry with
   the block declares `platform_min_version: "1.7.1"`: an older platform loads
   the MCP without adding the header.
+- `exit`: for a stdio MCP that sends a secret in a header of its own toward
+  fixed vendor hosts. The session then never holds the secret. The tool's
+  environment holds a placeholder (`oto-exit-` and 32 hex characters), and
+  the platform writes the value into that header on the way out of the
+  sandbox. `[{key, header, prefix, hosts, streams}]`, one entry per secret:
+  - `key` names the variable the secret arrives in: an env-delivered
+    `instances.fields` key marked `secret`, a `credentials.fields` key with
+    `input_type: "password"`, or a `credentials.oauth.mcp_env_injection`
+    name. No two entries share a key.
+  - `header` is the header the tool writes it in (`Authorization`,
+    `X-Api-Key`). Never one the platform owns: `cookie`, `host`,
+    `content-*`, `accept*`, `mcp-*`, `forwarded`, `x-forwarded-*`,
+    `x-real-ip`, `proxy-*` and the transport headers.
+  - `prefix` is what the tool writes before the key (`"Bearer "`), 32
+    printable characters at most.
+  - `hosts` are the hosts the secret may go to: literal names or
+    `*.domain` with two labels or more. Never an address, `localhost` or a
+    name with a trailing dot. Under an engine's domain only a literal API
+    host below it fits (`api.openai.com`), never the domain, a wildcard over
+    it, `chatgpt.com` or `claude.com`. From the community catalog a literal
+    host applies by itself. A wildcard, and every host of a ZIP, waits for
+    the admin's Allow.
+  - `streams: true` lets a request body above 16 MiB pass as it arrives.
+    Set it when the tool sends a picture or a file inline in a request that
+    carries the secret. Without it such a request is refused.
+
+  What fits: a client that reads `HTTPS_PROXY` and the trust variables
+  (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`) and speaks
+  HTTP/1.1. Python's httpx, requests and urllib do. Node needs axios 1.18 or
+  newer, or its own fetch with `NODE_USE_ENV_PROXY`, which the platform sets
+  (Node 22.21, 24 or newer). What does not fit: a key the tool sends in the
+  address or in the body, since the platform refuses a placeholder there. A
+  client that ignores the proxy or brings its own trust store, gRPC, and a
+  client that speaks HTTP/2 alone: these would send the placeholder to the
+  vendor. Leave such a key out of `exit`, and the tool gets the value itself.
+  A token named in `mcp_env_injection` fits only when every name of that
+  token is declared. The tool then holds it with no expiry and no renewal,
+  so `OTO_TOKEN_EXPIRES_AT` and `OTO_TOKEN_RENEWAL` are absent.
+
+  On a computer that cannot add the value on the way out, the platform
+  leaves the tool out of the session and says why. Never
+  beside `oauth.bearer_required`. A catalog entry with the block declares
+  `platform_min_version: "2.0.0"`.
 - `oauth.authorization_server`: for a vendor-hosted server that names its
   own authorization server the MCP way (Notion's and Linear's hosted servers
   do). The platform discovers that server from the endpoint URL, registers
@@ -144,3 +203,72 @@ Fields a community package never sets: `requires_capability`, `hosted`,
   catalog entry with the block declares `platform_min_version: "1.7.1"`.
   People whose dashboard is reached over plain http (not localhost) cannot
   connect such an MCP: the vendors accept https or loopback callbacks only.
+
+## App connectors
+
+An app connector drives a program on the person's own computer. The
+Blender and OBS Studio entries in the catalog are app connectors. The
+server runs on that computer and reaches the program on a local port. Four
+fields make a package one:
+
+| Field | Value | What it does |
+|---|---|---|
+| `device_capability` | `"app"` | The tool needs the computer's App connectors grant. This field alone keeps it off every machine but a paired computer. |
+| `placement` | `"satellite_only"` | The tool runs only on a paired computer. Set it beside `device_capability`, as the catalog's entries do. |
+| `requires_display` | `true` | The tool is left out on a computer known to have no screen. |
+| `companion_app` | an object | The program and how the server reaches it, below. The platform checks its shape and refuses a wrong one. It never starts the program. |
+
+`companion_app` holds `program`, the program's name. `connect` holds
+`host` (default `127.0.0.1`), `transport` (default `tcp_json`), `port`
+and `port_discovery`, empty or `plugin_announce`. `plugin` holds `asset`,
+`min_plugin_version` and `supported_host_versions`. Then `status_tool`,
+and `auth`: `none`, or `per_connection_token`, the default.
+
+```json
+"placement": "satellite_only",
+"requires_display": true,
+"device_capability": "app",
+"companion_app": {
+  "program": "blender",
+  "connect": {"host": "127.0.0.1", "transport": "tcp_json", "port": 9876},
+  "plugin": {"asset": "", "min_plugin_version": "1.0.3",
+             "supported_host_versions": ["blender>=5.1"]},
+  "status_tool": "",
+  "auth": "none"
+}
+```
+
+Where it loads. The tool loads only in a session on a computer a person or
+an admin paired. It never loads on the platform's own compute machines.
+
+It loads only where that computer's App connectors grant is on. The person
+who paired the computer turns it on in their own settings. It sits under
+Remote Machines, on that computer's card, under Device control. For a
+computer an admin paired, an admin turns it on under Admin, Remote Machines.
+
+Its calls. Where the grant is on, a chat in Ask or Auto runs the
+connector's tools without a prompt. The grant is the person's consent.
+
+A turn that an API key drives follows the chat's mode like any tool. Nobody
+sits at that screen then. A tool that runs code inside the program is no
+exception. So the package needs no `permissions` block.
+
+Set each tool's annotations truthfully, as for any MCP: they give its tier
+where the grant does not decide. Leave out `device_high_risk_tools`: it
+pins nothing.
+
+The program must be open. Some connectors connect to their program as they
+start. OBS Studio's does. Blender's connects at each call. For a connector
+that connects as it starts, the program must be open before the chat
+starts.
+
+Otherwise the first chat after the tool's install or update may get none of
+its tools. They come once the program is open and the chat is reloaded. In
+a later chat the tools are listed. A call while the program is closed says
+the tool did not start. The next call works once the program is open.
+
+So tell the agent what to do, in the entry's `system_requirements.notes`
+and in its own skill. It asks the person to open the program. Then it calls
+again, or reloads the chat with `reload_session`. A server you write
+yourself avoids all this. It lists its tools without the program and
+connects at each call, as Blender's does.

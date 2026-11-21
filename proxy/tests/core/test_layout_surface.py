@@ -46,7 +46,7 @@ from pathlib import Path
 from tests._paths import REPO_ROOT
 
 _SCAN_ROOTS = ("proxy", "satellite", "mcps/custom")
-_EXCLUDED_PARTS = {"tests", "docs", "venv", ".venv", "_vendored", "skills", "node_modules", "__pycache__"}
+_EXCLUDED_PARTS = {"tests", "__tests__", "docs", "venv", ".venv", "_vendored", "skills", "node_modules", "__pycache__"}
 _PREFIX_METHODS = ("startswith", "endswith")
 
 LAYOUT_HOMES = ("proxy/core/layout.py",)
@@ -69,14 +69,18 @@ KNOWN_LAYOUT_SITES: dict[str, tuple[str, dict[str, int]]] = {
 KNOWN_OS_SITES: dict[str, tuple[str, dict[str, int]]] = {
     "proxy/services/infra/safe_fs.py": ("vendored into file-tools with no proxy import: probes its own kernel for openat2", {"linux": 1, "sys.platform": 1}),
     "mcps/custom/file-tools-mcp/safe_fs.py": ("the byte copy of services/infra/safe_fs.py the file-tools image runs (the copy test pins it)", {"linux": 1, "sys.platform": 1}),
-    "proxy/services/mcp/mcp_installer.py": ("vendored byte-for-byte into the satellite and self-contained by its docstring: its sys.platform reads (the venv layout, `cmd /c`, the bounded run's process-group spawn and tree kill, and the interpreter prune that a Windows junction keeps POSIX-only) and the package families (a manifest vocabulary) stay", {"win32": 6, "windows": 3, "darwin": 1, "linux": 1, "sys.platform": 6, "platform.system": 1}),
-    "mcps/custom/computer-mcp/environment.py": ("an MCP process probing its own host (os_kind / display_backend, the macOS grants)", {"darwin": 6, "linux": 2, "windows": 1, "sys.platform": 1}),
-    "mcps/custom/computer-mcp/executor.py": ("an MCP process probing its own host", {"darwin": 2, "windows": 1}),
-    "mcps/custom/computer-mcp/screen.py": ("an MCP process probing its own host", {"windows": 1}),
-    "mcps/custom/computer-mcp/server.py": ("an MCP process probing its own host", {"darwin": 1, "windows": 1}),
+    "proxy/services/mcp/mcp_installer.py": ("vendored byte-for-byte into the satellite and self-contained by its docstring: its sys.platform reads (the venv layout, `cmd /c`, the bounded run's process-group spawn and tree kill, and the interpreter prune that a Windows junction keeps POSIX-only) stay", {"win32": 6, "sys.platform": 6}),
+    "proxy/services/mcp/mcp_system_deps.py": ("the installer's system-requirements check, vendored byte-for-byte into the satellite beside it: the package families (a manifest vocabulary) and the host's own OS probe stay", {"windows": 3, "darwin": 1, "linux": 1, "platform.system": 1}),
+    "mcps/custom/computer-mcp/environment.py": ("an MCP process probing its own host (os_kind / display_backend, the macOS grants, the window reads' module and the desktop's lock file per system)", {"darwin": 7, "linux": 2, "windows": 4, "sys.platform": 1}),
+    "mcps/custom/computer-mcp/executor.py": ("an MCP process probing its own host (the paste key and the super key)", {"darwin": 2}),
+    "mcps/custom/computer-mcp/screen.py": ("an MCP process probing its own host (DPI awareness, the macOS zoom grab)", {"darwin": 1, "windows": 1}),
+    "mcps/custom/computer-mcp/server.py": ("an MCP process probing its own host (check_permissions)", {"darwin": 1}),
     "mcps/custom/ssh-hosts/server.py": ("an MCP process reading its own host for the ControlMaster question", {"platform.system": 1}),
     "satellite/terminal/otodock_cli.py": ("the standalone otodock terminal client: its fallback import branch has no package, so it cannot read config.HOST", {"win32": 2, "sys.platform": 2}),
     "proxy/hooks/credential_helper.py": ("a hook-dir script that imports nothing of the proxy: it replaces itself with the real command on POSIX and runs it as a child elsewhere", {"os.name": 1}),
+    "proxy/core/credentials/exit_relay.py": ("vendored byte-for-byte into the satellite and self-contained: the listener's socket is shared for a rebind on Windows alone", {"win32": 1, "sys.platform": 1}),
+    "proxy/core/sandbox/session_home.py": ("vendored byte-for-byte into the satellite and standard library only: a home's links are junctions on Windows and its walk goes by checked paths there", {"os.name": 2, "nt": 2}),
+    "proxy/core/credentials/exit_authority.py": ("vendored byte-for-byte into the satellite and self-contained: the key file's mode is checked on POSIX alone, and the Windows store's roots join the bundle", {"os.name": 1, "win32": 1, "sys.platform": 1}),
 }
 
 

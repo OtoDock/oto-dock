@@ -2,7 +2,7 @@ import { useState } from 'react'
 
 import { useActOnCard, useCardState, type CardClick, type CardOutcome, type CardState } from '../../api/cards'
 import { ApiError } from '../../lib/http/apiJson'
-import { BUTTON_KIND, CARD_WORDS, CLICK_STATUS, OUTCOME, SET_MEMBER_WORDS, type SetMemberState } from '../../lib/kinds/card'
+import { BUTTON_KIND, CARD_WORDS, CLICK_STATUS, OUTCOME, setMemberWord } from '../../lib/kinds/card'
 import Button from '../ui/Button'
 import ChatCard from '../ui/ChatCard'
 
@@ -197,7 +197,7 @@ function Outcome({ outcome }: { outcome: CardOutcome }) {
           {outcome.members.map((m) => (
             <li key={m.template}>
               <span className="text-primary">{m.display_name}</span>{' '}
-              {SET_MEMBER_WORDS[m.status as SetMemberState] ?? m.status}
+              {setMemberWord(m)}
               {m.detail ? `: ${m.detail}` : ''}
             </li>
           ))}

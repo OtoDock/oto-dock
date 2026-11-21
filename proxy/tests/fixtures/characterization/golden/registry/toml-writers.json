@@ -1,0 +1,206 @@
+{
+ "bash_env_keys": [
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_KEY_0",
+  "GIT_CONFIG_KEY_1",
+  "GIT_CONFIG_VALUE_0",
+  "GIT_CONFIG_VALUE_1"
+ ],
+ "built": "[mcp_servers.char-bearer]\nstartup_timeout_sec = 10\nurl = \"http://127.0.0.1:<port>/v1/mcp-gateway/char-bearer/mcp\"\n[mcp_servers.char-bearer.http_headers]\n\"Authorization\" = \"Bearer OTO_SESSION_JWT\"\n\n[mcp_servers.char-gitish]\nstartup_timeout_sec = 10\ntool_timeout_sec = 120\ncommand = \"<tmp>/mcps/custom/char-gitish/venv/bin/python\"\nargs = [\"<tmp>/mcps/custom/char-gitish/server.py\"]\nenv = { \"OTO_STRIP_KEYS\" = \"GIT_CONFIG_COUNT,GIT_CONFIG_KEY_0,GIT_CONFIG_KEY_1,GIT_CONFIG_VALUE_0,GIT_CONFIG_VALUE_1,OTO_CLI_TOKEN\", \"OTO_TOOL_STANDIN\" = \"{\\\"account\\\":\\\"b91b695cc597cbac\\\",\\\"fetch\\\":true,\\\"label\\\":\\\"Gitish\\\",\\\"stamp\\\":\\\"1.0.0+0.0.0\\\",\\\"v\\\":1}\", \"OTO_CLI_TOKEN\" = \"\" }\n\n[mcp_servers.char-http]\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\nurl = \"http://127.0.0.1:<port>/v1/mcp-gateway/char-http/mcp/\"\n[mcp_servers.char-http.http_headers]\n\"Authorization\" = \"Bearer OTO_SESSION_JWT\"\n\n[mcp_servers.char-keyed]\nstartup_timeout_sec = 10\nurl = \"http://127.0.0.1:<port>/v1/mcp-gateway/char-keyed/mcp\"\n[mcp_servers.char-keyed.http_headers]\n\"Authorization\" = \"Bearer OTO_SESSION_JWT\"\n\n[mcp_servers.char-sse]\nstartup_timeout_sec = 10\nurl = \"https://sse.example.test/sse\"\n\n[mcp_servers.char-tools]\nstartup_timeout_sec = 10\ntool_timeout_sec = 180\ncommand = \"<tmp>/mcps/custom/char-tools/venv/bin/python\"\nargs = [\"<tmp>/mcps/custom/char-tools/server.py\", \"--mode\", \"fast\", \"char-reg\", \"quote\\\"and\\\\back\", \"line\\nbreak\"]\nenv = { \"CHAR_STATIC\" = \"1\", \"CHAR_DIR\" = \"<tmp>/mcps/custom/char-tools/data\", \"CHAR_ROOT\" = \"<platform-root>/x\", \"CHAR_AGENT\" = \"char-reg\", \"CHAR_CHAT\" = \"\", \"CHAR_OWNER\" = \"\", \"CHAR_USER\" = \"\", \"CHAR_SCOPE\" = \"\", \"CHAR_ASK\" = \"\", \"CHAR_PROXY\" = \"http://localhost:<port>\", \"CHAR_REF\" = \"http://192.168.77.10:9100/metrics\", \"CHAR_MASTER\" = \"${proxy_api_key}\", \"CHAR_MODE\" = \"fast\", \"CHAR_LIMIT\" = \"9\", \"CHAR_ON\" = \"true\", \"CHAR_OFF\" = \"false\", \"CHAR_SAVED\" = \"saved\", \"OTO_TOOL_STANDIN\" = \"{\\\"account\\\":\\\"\\\",\\\"fetch\\\":false,\\\"label\\\":\\\"Char Tools\\\",\\\"stamp\\\":\\\"1.0.0+0.0.0\\\",\\\"v\\\":1}\", \"OTO_CLI_TOKEN\" = \"\" }\n",
+ "bundles": {
+  "char-bearer": {
+   "account": "user-admin|main",
+   "gateway": {
+    "allowlist_key": "char-oauth",
+    "manifest": "char-bearer",
+    "path": "/mcp",
+    "token_ref": {
+     "account_label": "main",
+     "token_dir": "<tmp>/sessions/char-oauth-tokens/ada"
+    },
+    "upstream": "https://vendor.example.test"
+   }
+  },
+  "char-gitish": {
+   "account": "user-admin|main",
+   "cli": {
+    "env_names": [
+     "GH_TOKEN"
+    ],
+    "host": "git.example.test",
+    "manifest": "char-gitish",
+    "token_ref": {
+     "account_label": "main",
+     "token_dir": "<tmp>/sessions/char-git-tokens/ada"
+    }
+   },
+   "env": {
+    "CHAR_GIT_TOKEN": "token-of-ada",
+    "OTO_TOKEN_ACCOUNT": "main"
+   },
+   "exit": [
+    {
+     "allowlist_key": "char-gitish",
+     "cli": {
+      "env_names": [
+       "GH_TOKEN"
+      ],
+      "host": "git.example.test",
+      "manifest": "char-gitish",
+      "token_ref": {
+       "account_label": "main",
+       "token_dir": "<tmp>/sessions/char-git-tokens/ada"
+      }
+     },
+     "header": "Authorization",
+     "hosts": [
+      "git.example.test",
+      "*.git.example.test"
+     ],
+     "manifest": "char-gitish",
+     "placeholder": "oto-exit-00000000000000000000000000000001"
+    }
+   ],
+   "token": {
+    "env_names": [
+     "CHAR_GIT_TOKEN"
+    ],
+    "manifest": "char-gitish",
+    "token_ref": {
+     "account_label": "main",
+     "token_dir": "<tmp>/sessions/char-git-tokens/ada"
+    }
+   }
+  },
+  "char-http": {
+   "gateway": {
+    "allowlist_key": "",
+    "callbacks": true,
+    "header": "",
+    "kind": "container",
+    "manifest": "char-http",
+    "path": "/mcp/",
+    "prefix": "",
+    "proxy_local": true,
+    "upstream": "http://localhost:8932"
+   }
+  },
+  "char-keyed": {
+   "gateway": {
+    "allowlist_key": "char-keyed",
+    "header": "X-Char-Key",
+    "manifest": "char-keyed",
+    "path": "/mcp",
+    "prefix": "",
+    "upstream": "https://api.example.test",
+    "value": "char-keyed-secret",
+    "value_from": "CHAR_KEY"
+   }
+  },
+  "char-tools": {}
+ },
+ "excluded": {
+  "char-browser": "Requires a remote machine (satellite)",
+  "char-satellite": "Requires a remote machine (satellite)"
+ },
+ "flat_env": {
+  "GIT_CONFIG_COUNT": "2",
+  "GIT_CONFIG_KEY_0": "credential.https://git.example.test.helper",
+  "GIT_CONFIG_KEY_1": "credential.https://git.example.test.helper",
+  "GIT_CONFIG_VALUE_0": "",
+  "GIT_CONFIG_VALUE_1": "!\"$OTO_HOOK_PY\" -I \"$OTO_HOOKS_DIR/credential_helper.py\" git"
+ },
+ "injected": "[mcp_servers.char-bearer]\nstartup_timeout_sec = 10\nurl = \"http://127.0.0.1:<port>/v1/mcp-gateway/char-bearer/mcp\"\n[mcp_servers.char-bearer.http_headers]\n\"Authorization\" = \"Bearer OTO_SESSION_JWT\"\n\n[mcp_servers.char-gitish]\nstartup_timeout_sec = 10\ntool_timeout_sec = 120\ncommand = \"<tmp>/mcps/custom/char-gitish/venv/bin/python\"\nargs = [\"<tmp>/mcps/custom/char-gitish/server.py\"]\nenv = { \"OTO_STRIP_KEYS\" = \"GIT_CONFIG_COUNT,GIT_CONFIG_KEY_0,GIT_CONFIG_KEY_1,GIT_CONFIG_VALUE_0,GIT_CONFIG_VALUE_1,OTO_CLI_TOKEN\", \"OTO_TOOL_STANDIN\" = \"{\\\"account\\\":\\\"b91b695cc597cbac\\\",\\\"fetch\\\":true,\\\"label\\\":\\\"Gitish\\\",\\\"stamp\\\":\\\"1.0.0+0.0.0\\\",\\\"v\\\":1}\", \"OTO_CLI_TOKEN\" = \"\", \"CHAR_INJECTED\" = \"va\\\"lue\\\\with\\nall\" }\n\n[mcp_servers.char-http]\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\nurl = \"http://127.0.0.1:<port>/v1/mcp-gateway/char-http/mcp/\"\n[mcp_servers.char-http.http_headers]\n\"Authorization\" = \"Bearer OTO_SESSION_JWT\"\n\n[mcp_servers.char-keyed]\nstartup_timeout_sec = 10\nurl = \"http://127.0.0.1:<port>/v1/mcp-gateway/char-keyed/mcp\"\n[mcp_servers.char-keyed.http_headers]\n\"Authorization\" = \"Bearer OTO_SESSION_JWT\"\n\n[mcp_servers.char-sse]\nstartup_timeout_sec = 10\nurl = \"https://sse.example.test/sse\"\n\n[mcp_servers.char-tools]\nstartup_timeout_sec = 10\ntool_timeout_sec = 180\ncommand = \"<tmp>/mcps/custom/char-tools/venv/bin/python\"\nargs = [\"<tmp>/mcps/custom/char-tools/server.py\", \"--mode\", \"fast\", \"char-reg\", \"quote\\\"and\\\\back\", \"line\\nbreak\"]\nenv = { \"CHAR_STATIC\" = \"1\", \"CHAR_DIR\" = \"<tmp>/mcps/custom/char-tools/data\", \"CHAR_ROOT\" = \"<platform-root>/x\", \"CHAR_AGENT\" = \"char-reg\", \"CHAR_CHAT\" = \"\", \"CHAR_OWNER\" = \"\", \"CHAR_USER\" = \"\", \"CHAR_SCOPE\" = \"\", \"CHAR_ASK\" = \"\", \"CHAR_PROXY\" = \"http://localhost:<port>\", \"CHAR_REF\" = \"http://192.168.77.10:9100/metrics\", \"CHAR_MASTER\" = \"${proxy_api_key}\", \"CHAR_MODE\" = \"fast\", \"CHAR_LIMIT\" = \"9\", \"CHAR_ON\" = \"true\", \"CHAR_OFF\" = \"false\", \"CHAR_SAVED\" = \"saved\", \"OTO_TOOL_STANDIN\" = \"{\\\"account\\\":\\\"\\\",\\\"fetch\\\":false,\\\"label\\\":\\\"Char Tools\\\",\\\"stamp\\\":\\\"1.0.0+0.0.0\\\",\\\"v\\\":1}\", \"OTO_CLI_TOKEN\" = \"\", \"CHAR_INJECTED\" = \"va\\\"lue\\\\with\\nall\" }\n",
+ "path": "<tmp>/sessions/user-mcp-configs/sessions/11f7a438085e920c/char-reg-4031a61059f9-mcp.toml",
+ "returned_same_path": true,
+ "servers_saved": {
+  "char-bearer": {
+   "headers": {
+    "Authorization": "Bearer OTO_SESSION_JWT"
+   },
+   "type": "streamable-http",
+   "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-bearer/mcp"
+  },
+  "char-gitish": {
+   "args": [
+    "<tmp>/mcps/custom/char-gitish/server.py"
+   ],
+   "command": "<tmp>/mcps/custom/char-gitish/venv/bin/python",
+   "env": {
+    "OTO_CLI_TOKEN": "",
+    "OTO_STRIP_KEYS": "GIT_CONFIG_COUNT,GIT_CONFIG_KEY_0,GIT_CONFIG_KEY_1,GIT_CONFIG_VALUE_0,GIT_CONFIG_VALUE_1,OTO_CLI_TOKEN",
+    "OTO_TOOL_STANDIN": "{\"account\":\"b91b695cc597cbac\",\"fetch\":true,\"label\":\"Gitish\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+   },
+   "type": "stdio"
+  },
+  "char-http": {
+   "headers": {
+    "Authorization": "Bearer OTO_SESSION_JWT"
+   },
+   "type": "streamable-http",
+   "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-http/mcp/"
+  },
+  "char-keyed": {
+   "headers": {
+    "Authorization": "Bearer OTO_SESSION_JWT"
+   },
+   "type": "streamable-http",
+   "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-keyed/mcp"
+  },
+  "char-sse": {
+   "type": "sse",
+   "url": "https://sse.example.test/sse"
+  },
+  "char-tools": {
+   "args": [
+    "<tmp>/mcps/custom/char-tools/server.py",
+    "--mode",
+    "fast",
+    "char-reg",
+    "quote\"and\\back",
+    "line\nbreak"
+   ],
+   "command": "<tmp>/mcps/custom/char-tools/venv/bin/python",
+   "env": {
+    "CHAR_AGENT": "char-reg",
+    "CHAR_ASK": "",
+    "CHAR_CHAT": "",
+    "CHAR_DIR": "<tmp>/mcps/custom/char-tools/data",
+    "CHAR_LIMIT": "9",
+    "CHAR_MASTER": "${proxy_api_key}",
+    "CHAR_MODE": "fast",
+    "CHAR_OFF": "false",
+    "CHAR_ON": "true",
+    "CHAR_OWNER": "",
+    "CHAR_PROXY": "http://localhost:<port>",
+    "CHAR_REF": "http://192.168.77.10:9100/metrics",
+    "CHAR_ROOT": "<platform-root>/x",
+    "CHAR_SAVED": "saved",
+    "CHAR_SCOPE": "",
+    "CHAR_STATIC": "1",
+    "CHAR_USER": "",
+    "OTO_CLI_TOKEN": "",
+    "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Char Tools\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+   },
+   "tool_timeout_sec": 120,
+   "type": "stdio"
+  }
+ },
+ "sidecar_gone": true,
+ "untouched": {
+  "json_format": true,
+  "no_config": null,
+  "no_env": true,
+  "no_format": true,
+  "sidecar_kept": true,
+  "still_built": true
+ },
+ "with_a_bad_sidecar": [
+  true,
+  true
+ ],
+ "without_a_sidecar": [
+  true,
+  true
+ ]
+}

@@ -3,7 +3,8 @@
 Every HTTP request passes one ``PlatformHttpMiddleware``, which judges in
 this order, outermost first: the sliding session refresh and the security
 headers on the way out, the 500 guard with timing, the render,
-external-session and service-key confinements, then the request body cap
+external-session and service-key confinements, the origin check, the API
+key's gate (``auth/api_keys.py``), then the request body cap
 and the body deadline of a request without a valid credential. It is one
 pure-ASGI layer, never a stack of ``BaseHTTPMiddleware`` wrappers: each of
 those builds a task group and a memory stream per request and per streamed
@@ -60,6 +61,18 @@ def _mcp_gateway_cap() -> int:
     return MAX_BODY_BYTES
 
 
+# The one route a tool's fetch token proves a credential on: the stand-in's
+# report, which carries what the tool's program answered.
+_TOOL_REPORT_ROUTE = "/v1/hooks/tool-start"
+
+
+def _tool_report_cap() -> int:
+    # Four times what ``keep`` stores: the report also carries the program's
+    # labels and its raw handshake, and the stand-in's own bound is the same.
+    from services.mcp.tool_listing import MAX_LISTING_BYTES
+    return 4 * MAX_LISTING_BYTES
+
+
 def _file_save_cap() -> int:
     # The editor saves, as JSON, a file it opened inline, so the body is
     # bounded by INLINE_TEXT_MAX_BYTES; escaping a control character takes
@@ -98,6 +111,9 @@ _ROUTE_CAPS = (
     # an MCP client's request through the credential gateway, under the
     # gateway's own cap (``api/mcp/gateway.py``)
     ("POST", re.compile(r"^/v1/mcp-gateway/[^/]+/"), _mcp_gateway_cap),
+    # a tool stand-in's report with its program's answers (``api/hooks/
+    # tool_start.py``), proven by the tool's own fetch token
+    ("POST", re.compile(r"^/v1/hooks/tool-start$"), _tool_report_cap),
 )
 # Routes authenticated by their own app or link tokens: the unauthenticated
 # tier does not apply. These read the body themselves after their token
@@ -148,12 +164,27 @@ def credential_state(request: Request, cookies: dict, path: str) -> str:
     route verifies them) or the install accepts unsigned calls
     (``WOPI_ACCEPT_UNSIGNED``): a token copied from a log, sent alone, never
     reaches past the unauthenticated tier. The editor relay (``/collabora/``)
-    is the browser's: it carries no proof headers."""
-    from auth.external_endpoints import session_token_claims
+    is the browser's: it carries no proof headers. A tool's fetch token
+    whose session is live proves one on the stand-in's report alone
+    (``_TOOL_REPORT_ROUTE``), the exact path: its program's answers run past
+    the unauthenticated tier."""
+    from auth.external_endpoints import callback_token_claims, session_token_claims
     from auth.service_endpoints import extract_master_key
+    if request.scope.get("otodock.api_key"):
+        return "valid"  # verified by ``auth/api_keys.gate`` before the body
     presented = request.headers.get("authorization", "") != ""
-    if extract_master_key(request) is not None or session_token_claims(request) is not None:
+    if (extract_master_key(request) is not None or session_token_claims(request) is not None
+            or callback_token_claims(request) is not None):
         return "valid"
+    if path == _TOOL_REPORT_ROUTE:
+        scheme, _, bearer = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() == "bearer" and bearer:
+            # Its session still holds the tool's bundle (an in-memory read,
+            # no database), as the routes check it: a token copied out of a
+            # session that ended proves nothing.
+            from core.credentials.mcp_broker import live_token
+            if not isinstance(live_token(bearer.strip()), int):
+                return "valid"
     session = cookies.get("session")
     if session:
         presented = True
@@ -224,33 +255,153 @@ def _log_session_refusal(request: Request, sid: str, reason: str) -> None:
                 reason, request.method, request.url.path, sid[:8])
 
 
+# --- where a session's tokens are accepted ------------------------------------
+#
+# A session's processes reach the proxy on the internal listener: the
+# sandbox's forward lands there and so does a paired machine's tunnel
+# (``auth/lan_check``). The public listener is where browsers, reverse
+# proxies and every outside address arrive, and a container on the Docker
+# network arrives there too, from a local address, so neither the address nor
+# a forwarded header can tell a Docker tool from an outsider. A session's
+# token is therefore accepted on the internal listener only, and there on
+# the routes the platform's tools and hooks call (``SESSION_ROUTES``) and no
+# other (decision 4). A Docker tool calls back with a token of its own kind
+# (``TOOL_CALLBACK``), good for the five file callbacks on either listener.
+# The pattern below is matched whole (``fullmatch``): the router's own
+# pattern ends in ``$``, which also matches before a final newline, so a
+# path ending in ``%0A`` reaches the same handler and must be judged as that
+# route.
+#
+# The routes that hand a session its credentials on a token of another kind
+# (git's command-line token, a tool program's fetch token), and a tool's
+# saved answers and its start on its fetch token: their callers run inside
+# the session or behind a machine's tunnel.
+_SESSION_CREDENTIAL_ROUTES = re.compile(
+    r"/v1/hooks/(cli-credential|mcp-credentials|tool-listing|tool-start)\n?")
+SESSION_OUTSIDE_DETAIL = "A session's token works only from inside its session"
+_OUTSIDE = "outside"
+_OFF_LIST = "off-list"
+_LIMIT = "limit"
+# Said once per process when the rule is off (no internal listener).
+_listener_off_warned = False
+
+
+def off_session_listener(scope) -> bool:
+    """Whether a request or a socket arrived anywhere but the internal
+    listener, while one is bound. Read from the listener the connection came
+    in on, never from an address or a header. With no internal listener (a
+    test client, a bare ``uvicorn app:app``) sandboxes and tunnels use the
+    main port themselves, and nothing is off it: the rule is off, and the
+    log says so once. Every supported start binds one (``python app.py``:
+    the service unit and the image)."""
+    global _listener_off_warned
+    from auth import lan_check
+    if not config.INTERNAL_LISTENER_PORT:
+        if not _listener_off_warned:
+            _listener_off_warned = True
+            logger.warning(
+                "No internal listener is bound: a session's token is accepted on the main "
+                "port from any address. Start the proxy with `python app.py`, which binds one.")
+        return False
+    return not lan_check.resolve(scope).internal
+
+
 def _session_refusal(request: Request) -> Response | None:
     """A session token as the bearer is accepted only while its session is
     live, and never when it was minted for an earlier life of the same
     session id (``session_state.session_token_refusal``, decision 8):
-    401 before any database read, on both listeners. A token carrying an
-    ``ext`` claim and no real user (an external caller) then reaches only
-    ``auth/external_endpoints.py``'s allowlist."""
+    401 before any database read, on both listeners. On the public listener
+    it reaches nothing, and the three routes that hand a session its
+    credentials answer on the internal one alone (``off_session_listener``,
+    decision 4). A token carrying an ``ext`` claim and no real user (an
+    external caller) then reaches only ``auth/external_endpoints.py``'s
+    allowlist, the wrap-up after a conversation (its registered context says
+    so) only its own, and every session token the routes the platform's
+    tools and hooks call (``SESSION_ROUTES``): off that list, 403 with one
+    sentence. An app button's press confined below its identity
+    (``press_reach``) reaches only its tool's file routes
+    (``is_press_endpoint_allowed``). On a first-party tool's route the session's tool limits hold
+    as on the tool call (``ROUTE_TOOLS``, ``session_route_refusal``): 403
+    with the limit's sentence. A Docker tool's callback token is judged for
+    liveness the same way and reaches a POST to the five file callbacks on
+    either listener."""
     from auth.external_endpoints import (
+        CALLBACK_OUTSIDE_DETAIL,
         EXTERNAL_BLOCKED_DETAIL,
+        PRESS_BLOCKED_DETAIL,
         SESSION_DEAD_DETAIL,
+        SESSION_ROUTE_DETAIL,
+        WRAPUP_BLOCKED_DETAIL,
+        callback_token_claims,
+        is_callback_endpoint_allowed,
         is_external_endpoint_allowed,
+        is_press_endpoint_allowed,
+        is_session_endpoint_allowed,
+        is_wrapup_endpoint_allowed,
+        session_route_refusal,
         session_token_claims,
     )
+    from core.session.session_state import get_session_security, session_token_refusal
     claims = session_token_claims(request)
     if not claims:
+        callback = callback_token_claims(request)
+        if callback is not None:
+            sid = callback.get("sid") or ""
+            sid = sid if isinstance(sid, str) else ""
+            reason = session_token_refusal(callback)
+            if reason:
+                _log_session_refusal(request, sid, reason)
+                return JSONResponse({"detail": SESSION_DEAD_DETAIL}, status_code=401)
+            if not is_callback_endpoint_allowed(request.method, routed_path(request)):
+                _log_session_refusal(request, sid, _OFF_LIST)
+                return JSONResponse({"detail": CALLBACK_OUTSIDE_DETAIL}, status_code=401)
+            return None
+        if (_SESSION_CREDENTIAL_ROUTES.fullmatch(routed_path(request))
+                and off_session_listener(request.scope)):
+            _log_session_refusal(request, "", _OUTSIDE)
+            return JSONResponse({"detail": SESSION_OUTSIDE_DETAIL}, status_code=401)
         return None
-    from core.session.session_state import session_token_refusal
     sid = claims.get("sid") or ""
+    sid = sid if isinstance(sid, str) else ""
     reason = session_token_refusal(claims)
     if reason:
-        _log_session_refusal(request, sid if isinstance(sid, str) else "", reason)
+        _log_session_refusal(request, sid, reason)
         return JSONResponse({"detail": SESSION_DEAD_DETAIL}, status_code=401)
-    if claims.get("ext") and not claims.get("user_sub") and not is_external_endpoint_allowed(
+    if off_session_listener(request.scope):
+        _log_session_refusal(request, sid, _OUTSIDE)
+        return JSONResponse({"detail": SESSION_OUTSIDE_DETAIL}, status_code=401)
+    if claims.get("ext") and not claims.get("user_sub"):
+        ctx = get_session_security(sid) if sid else None
+        if not is_external_endpoint_allowed(request.method, routed_path(request), ctx):
+            logger.warning("External session blocked from endpoint: %s %s sid=%s",
+                           request.method, request.url.path, sid[:8])
+            return JSONResponse({"detail": EXTERNAL_BLOCKED_DETAIL}, status_code=403)
+    elif not claims.get("user_sub"):
+        # The wrap-up after a conversation, a person or not: confined by its
+        # registered context, never by a claim it may lack.
+        ctx = get_session_security(sid) if sid else None
+        if (getattr(ctx, "wrapup", "") or claims.get("subj")) and not is_wrapup_endpoint_allowed(
+                request.method, routed_path(request)):
+            logger.warning("Wrap-up session blocked from endpoint: %s %s sid=%s",
+                           request.method, request.url.path, sid[:8])
+            return JSONResponse({"detail": WRAPUP_BLOCKED_DETAIL}, status_code=403)
+    # An app button's press below its identity, a person or not: confined by
+    # its registered context to its tool's file routes.
+    press_ctx = get_session_security(sid) if sid else None
+    if getattr(press_ctx, "press_reach", "") and not is_press_endpoint_allowed(
             request.method, routed_path(request)):
-        logger.warning("External session blocked from endpoint: %s %s sid=%s",
-                       request.method, request.url.path, sid[:8])
-        return JSONResponse({"detail": EXTERNAL_BLOCKED_DETAIL}, status_code=403)
+        _log_session_refusal(request, sid, f"press:{request.method} {routed_path(request)}")
+        return JSONResponse({"detail": PRESS_BLOCKED_DETAIL}, status_code=403)
+    agent = claims.get("agent")
+    if not is_session_endpoint_allowed(request.method, routed_path(request),
+                                       agent if isinstance(agent, str) else ""):
+        _log_session_refusal(request, sid, f"{_OFF_LIST}:{request.method} {routed_path(request)}")
+        return JSONResponse({"detail": SESSION_ROUTE_DETAIL}, status_code=403)
+    sentence = session_route_refusal(request.method, routed_path(request),
+                                     get_session_security(sid) if sid else None)
+    if sentence:
+        _log_session_refusal(request, sid, f"{_LIMIT}:{request.method} {routed_path(request)}")
+        return JSONResponse({"detail": sentence}, status_code=403)
     return None
 
 
@@ -683,6 +834,14 @@ class PlatformHttpMiddleware:
                 x.answered = True
                 await refusal(scope, receive, lambda m: x.forward(m, own=True))
                 return
+        # A person's key and the public routes (``auth/api_keys.py``): judged
+        # and verified before the body is read.
+        from auth import api_keys
+        refusal = await api_keys.gate(request)
+        if refusal is not None:
+            x.answered = True
+            await refusal(scope, receive, lambda m: x.forward(m, own=True))
+            return
 
         routed = scope_routed_path(scope)
         full, narrowable = body_cap(scope.get("method", ""), routed)

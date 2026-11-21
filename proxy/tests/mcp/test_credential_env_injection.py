@@ -11,9 +11,8 @@ Two surfaces:
   must read the bound account's token file and populate each declared
   env var with the canonical ``access_token``. Works for both
   ``bearer_required: true`` MCPs (returns env-vars only) and stdio MCPs
-  with ``credentials_dir`` (env-vars merged on top of the file-copy
-  result). The DB / token-file pieces are stubbed via monkeypatch so
-  the test focuses on the resolver branch.
+  that read their token from the environment. The DB / token-file pieces
+  are stubbed via monkeypatch so the test focuses on the resolver branch.
 """
 
 from __future__ import annotations
@@ -402,9 +401,6 @@ class TestResolverMcpEnvInjection:
     def test_stdio_no_credentials_dir_token_via_env(self, patch_resolver, monkeypatch):
         """notion shape: stdio, no credentials_dir, no bearer — the
         mcp_env_injection vars ARE the credential delivery."""
-        monkeypatch.setattr(
-            "services.mcp.mcp_registry.get_credentials_dirs", lambda m: [],
-        )
         patch_resolver.set_manifest(_build_mcp_env_manifest(["NOTION_TOKEN"]))
         _write_token_file(patch_resolver.token_dir, "primary", "ntn_secret_1")
 
@@ -420,9 +416,6 @@ class TestResolverMcpEnvInjection:
         """Pre-existing behavior preserved: env_injection alone (no
         credentials_dir, no bearer, no mcp_env_injection) does NOT make an
         MCP 'connected'."""
-        monkeypatch.setattr(
-            "services.mcp.mcp_registry.get_credentials_dirs", lambda m: [],
-        )
         patch_resolver.set_manifest(
             _build_mcp_env_manifest(None, env_injection=["SOME_TOKEN"]),
         )
@@ -448,6 +441,49 @@ class TestResolverMcpEnvInjection:
         assert result == {"VENDOR_TOKEN": "tok_xyz"}
 
 
+class TestResolverTokenCredential:
+    """The token by reference beside its value: read fresh at every fetch."""
+
+    def _resolve(self, patch_resolver, expires_at):
+        patch_resolver.set_manifest(_build_mcp_env_manifest(["VENDOR_TOKEN"]))
+        path = _write_token_file(patch_resolver.token_dir, "primary", "tok_1")
+        raw = json.loads(path.read_text())
+        raw.update(expires_at=expires_at, refresh_token="the-refresh-token", scopes=["a", "b"])
+        path.write_text(json.dumps(raw))
+        creds: dict = {}
+        out = credential_resolver._resolve_oauth_mcp(
+            mcp_name="notion-mcp", cred_type_info={"oauth": {}},
+            user_sub="user-sub-1", task_scope="user", agent_name="dev-agent",
+            token_credentials=creds,
+        )
+        return out, creds["notion-mcp"]
+
+    def test_a_token_that_expires_within_a_session_renews(self, patch_resolver):
+        from datetime import datetime, timedelta, timezone
+        soon = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        out, cred = self._resolve(patch_resolver, soon)
+        assert cred.renews is True and cred.env_names == ("VENDOR_TOKEN",)
+        assert cred.token_ref.account_label == "primary"
+        assert out["VENDOR_TOKEN"] == "tok_1"
+        assert out["OTO_TOKEN_EXPIRES_AT"] == soon and out["OTO_TOKEN_SCOPES"] == "a b"
+        assert out["OTO_TOKEN_ACCOUNT"] == "primary"
+        assert "the-refresh-token" not in json.dumps(out)
+
+    def test_a_token_far_from_its_expiry_does_not_renew(self, patch_resolver):
+        assert self._resolve(patch_resolver, "2099-01-01T00:00:00Z")[1].renews is False
+
+    def test_a_manifest_still_naming_the_token_folder_says_to_install_its_new_package(self, patch_resolver):
+        manifest = _build_mcp_env_manifest(None)
+        manifest.legacy_token_dir = True
+        patch_resolver.set_manifest(manifest)
+        _write_token_file(patch_resolver.token_dir, "primary", "tok")
+        with pytest.raises(credential_resolver.CredentialUnavailable, match="new package"):
+            credential_resolver._resolve_oauth_mcp(
+                mcp_name="old-mcp", cred_type_info={"oauth": {}},
+                user_sub="user-sub-1", task_scope="user", agent_name="dev-agent",
+            )
+
+
 class TestCallerSecretClassification:
     def test_mcp_env_names_classified_as_pure_secrets(
         self, patch_resolver, monkeypatch,
@@ -460,9 +496,6 @@ class TestCallerSecretClassification:
         )
         patch_resolver.set_manifest(manifest)
         _write_token_file(patch_resolver.token_dir, "primary", "ntn_secret_2")
-        monkeypatch.setattr(
-            "services.mcp.mcp_registry.get_credentials_dirs", lambda m: [],
-        )
         monkeypatch.setattr(
             "services.mcp.mcp_registry.get_agent_mcps_all_placements",
             lambda agent: [manifest],

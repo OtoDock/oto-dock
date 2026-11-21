@@ -1,6 +1,6 @@
 """The sandbox carve never reaches a platform service in compose mode: the
-document-sidecar plane (``OTODOCK_INTERNAL_SUBNET``) is carved only for the
-platform's own file-tools, and the phone daemon's address is never carved
+document-sidecar plane (``OTODOCK_INTERNAL_SUBNET``) and a Docker tool are
+never carved, and the phone daemon's address is never carved
 (it holds the phone secret the proxy sends and an unauthenticated
 AudioSocket)."""
 
@@ -10,7 +10,7 @@ import pytest
 
 import config
 from core.config import deployment
-from services.mcp import mcp_registry
+from services.mcp import mcp_egress, mcp_registry
 from services.mcp.mcp_registry import McpManifest, NetworkTargetDecl, ServerConfig
 
 
@@ -45,25 +45,25 @@ def _docker(name: str, service: str, category: str) -> McpManifest:
 def compose(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "MCPS_DIR", tmp_path / "mcps")
     monkeypatch.setattr(deployment, "in_docker_compose", lambda: True)
-    monkeypatch.setattr(mcp_registry, "_platform_targets_cache", {})
+    monkeypatch.setattr(mcp_egress, "_platform_targets_cache", {})
     monkeypatch.setattr(config, "DATABASE_URL", "postgresql://u:p@otodock-postgres:5432/x")
     monkeypatch.setattr(config, "DOCKER_SOCKET_PROXY_HOST", "docker-socket-proxy")
     monkeypatch.setattr(config, "PHONE_SERVER_URL", "http://otodock-phone:9093")
-    monkeypatch.setattr(mcp_registry, "manifest_capability_available", lambda mm: True)
-    monkeypatch.setattr(mcp_registry, "network_access_enabled", lambda mm: True)
-    monkeypatch.setattr(mcp_registry, "_is_local_host_ip", lambda ip: False)
+    monkeypatch.setattr(mcp_egress, "manifest_capability_available", lambda mm: True)
+    monkeypatch.setattr(mcp_egress, "network_access_enabled", lambda mm: True)
+    monkeypatch.setattr(mcp_egress, "_is_local_host_ip", lambda ip: False)
     dns: dict[str, list[str]] = {
         "otodock-postgres": ["10.203.0.2"],
         "docker-socket-proxy": ["10.202.0.2"],
         "otodock-phone": ["10.200.0.7"],
     }
-    monkeypatch.setattr(mcp_registry, "_resolve_to_ips", lambda h: list(dns.get(h, [])))
+    monkeypatch.setattr(mcp_egress, "_resolve_to_ips", lambda h: list(dns.get(h, [])))
     return dns
 
 
 def _egress(monkeypatch, manifests, targets=()):
-    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: list(manifests))
-    monkeypatch.setattr(mcp_registry, "enumerate_mcp_network_targets",
+    monkeypatch.setattr(mcp_egress, "get_agent_mcps", lambda *a, **k: list(manifests))
+    monkeypatch.setattr(mcp_egress, "enumerate_mcp_network_targets",
                         lambda mm, a, **k: list(targets))
     return mcp_registry.resolve_sandbox_egress("pa")[1]
 
@@ -74,22 +74,17 @@ def test_a_homelab_target_on_the_sidecar_plane_is_not_carved(monkeypatch, compos
     assert allow == ["10.200.0.20"]
 
 
-def test_the_platform_file_tools_is_carved_on_the_sidecar_plane(monkeypatch, compose):
-    compose["file-tools"] = ["10.204.0.3"]
-    allow = _egress(monkeypatch, [_docker("file-tools", "file-tools", "custom")])
-    assert allow == ["10.204.0.3"]
-
-
-def test_a_community_docker_mcp_on_the_sidecar_plane_is_not_carved(monkeypatch, compose):
-    compose["lookalike"] = ["10.204.0.4"]
-    allow = _egress(monkeypatch, [_docker("lookalike", "lookalike", "community")])
-    assert allow == []
-
-
-def test_a_community_docker_mcp_on_the_shared_network_is_carved(monkeypatch, compose):
-    compose["camoufox"] = ["10.200.0.30"]
-    allow = _egress(monkeypatch, [_docker("camoufox", "camoufox", "community")])
-    assert allow == ["10.200.0.30"]
+@pytest.mark.parametrize("name, ips, category", [
+    ("file-tools", ["10.204.0.3"], "custom"),
+    ("lookalike", ["10.204.0.4"], "community"),
+    ("camoufox", ["10.200.0.30"], "community"),
+])
+def test_no_docker_mcp_is_carved(monkeypatch, compose, name, ips, category):
+    """A session reaches a Docker tool through the credential gateway on the
+    proxy port: neither the platform's own file-tools on the sidecar plane nor
+    a community tool on the shared network is carved."""
+    compose[name] = ips
+    assert _egress(monkeypatch, [_docker(name, name, category)]) == []
 
 
 def test_the_phone_daemon_address_is_not_carved(monkeypatch, compose):

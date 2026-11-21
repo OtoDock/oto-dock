@@ -45,6 +45,7 @@ from services.community.community_agent_template_store import (
 )
 from storage import database as task_store
 from storage.agents import agent_store
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock.community-agent-installer")
 
@@ -159,6 +160,13 @@ def _refusal_reason(res: dict) -> str:
                      if f.get("severity") == app_lint.FAIL) or "refused"
 
 
+def blueprint_task_slugs(blueprint: dict | None) -> dict[str, dict]:
+    """A blueprint's tasks by slug (the ``fire_task`` buttons' targets), a
+    malformed entry left out: one reading for the install dialog and the
+    folder check."""
+    return {str(t.get("slug")): t for t in (blueprint or {}).get("tasks") or [] if isinstance(t, dict)}
+
+
 def _blueprint_tasks(folder: Path) -> list[dict]:
     return list(_blueprint(folder).get("tasks") or [])
 
@@ -199,17 +207,19 @@ def resume_copy_triggers(app_id: str) -> int:
 # ── the dialog ──────────────────────────────────────────────────────────────
 
 
-def preview_shape(app_json: dict, visibility: str, blueprint: dict | None) -> dict:
+def preview_shape(app_json: dict, visibility: str, blueprint: dict | None, *,
+                  has_server: bool = False) -> dict:
     """A template app in the ``GET /v1/apps`` row shape BEFORE any row
     exists, for the install dialog's approval-card components: the raw
     manifest's blocks through the same parsers a stored row goes through,
-    a ``fire_task`` button's task named from the blueprint. Nothing is
+    a ``fire_task`` button's task named from the blueprint, and whether its
+    folder holds a server (the card's media line reads it). Nothing is
     approved, nothing is stored."""
     from services.apps import manifest as _mf
     from storage.db_apps import MANIFEST_BLOCKS
     pseudo = {name: (json.dumps(app_json.get(name)) if app_json.get(name) not in (None, "", [], {}) else "")
               for name in (*MANIFEST_BLOCKS, "requires")}
-    tasks = {str(t.get("slug")): t for t in (blueprint or {}).get("tasks") or [] if isinstance(t, dict)}
+    tasks = blueprint_task_slugs(blueprint)
     actions = []
     for a in app_json.get("actions") or []:
         if not isinstance(a, dict):
@@ -224,6 +234,7 @@ def preview_shape(app_json: dict, visibility: str, blueprint: dict | None) -> di
         "id": "", "slug": "", "title": str(app_json.get("title") or ""),
         "scope": "personal" if visibility == "user" else "shared", "pin_scope": "standing",
         "position": 0, "rel_path": "", "updated_at": "", "kind": task_store.APP_KIND_FOLDER,
+        "has_server": has_server,
         "actions": actions, "actions_sig": "", "actions_approved": False, "approval_stale": False,
         "can_approve": False, "can_manage": False, "viewer_role": "viewer", "hidden_for_me": False,
         "files": _mf.parse_files(pseudo), "egress": _mf.parse_egress(pseudo),
@@ -261,11 +272,14 @@ def check_words(entry: dict) -> str:
 
 def record_consent(data: dict, template: CommunityAgentTemplate,
                    app_consent: dict[str, str] | None, check_consent: dict[str, str] | None,
-                   consent_by: str) -> list[str]:
+                   consent_by: str, *, servers: list[str] | None = None) -> list[str]:
     """Write the installer's consent into the persisted record: an app or a
     check whose signature the caller rendered matches what the tarball
-    holds. Returns the names whose given signature did NOT match (they
-    land pending or offered, never approved)."""
+    holds. ``servers`` names the apps whose server the dialog showed: their
+    entry says ``server`` when the app's folder holds one (``consent_reach``).
+    Returns the names whose given signature did NOT match (they land
+    pending or offered, never approved)."""
+    from services.apps import app_sandbox
     now = datetime.now(timezone.utc).isoformat()
     ignored: list[str] = []
     apps: dict[str, dict] = {}
@@ -275,6 +289,8 @@ def record_consent(data: dict, template: CommunityAgentTemplate,
             continue
         if given == item.sig:
             apps[item.slug] = {"sig": item.sig, "by": consent_by, "at": now}
+            if item.slug in (servers or ()) and item.dir is not None and app_sandbox.server_entry(item.dir):
+                apps[item.slug]["server"] = True
         else:
             ignored.append(f"app:{item.slug}")
     checks: dict[str, dict] = {}
@@ -336,6 +352,23 @@ def copy_matches(item: AppItem, folder: Path) -> bool:
 COPY_CHANGED = "the template's stored copy of the app changed since the consent was given"
 
 
+def consent_reach(item: AppItem | None, entry: dict | None, row: dict | None) -> dict:
+    """What a recorded consent covers on one copy, handed to
+    ``import_folder``: the tree it names (``consent_tree``), on which alone
+    the consent lets a server go live with no card, and whether its dialog
+    showed the app's server (``consent_server``): only then does it cover a
+    server added to a copy that runs a release with none. An entry recorded
+    before the dialogs said it covers a first copy alone, as it did. A copy
+    its owner opted out of gets neither: its restore (the agent's
+    ``pin_app``, or "Take the new version") brings back an app the owner
+    removed, so a server it brings waits on the card. ``entry`` is the
+    consent the caller admitted (with none admitted, the deploy approves
+    nothing and covers nothing)."""
+    if item is None or (row or {}).get("template_state") == "opted_out":
+        return {"consent_tree": "", "consent_server": False}
+    return {"consent_tree": item.tree_sha, "consent_server": (entry or {}).get("server") is True}
+
+
 # ── seeding ─────────────────────────────────────────────────────────────────
 
 
@@ -350,11 +383,13 @@ async def seed_shared(agent: str, template: CommunityAgentTemplate, data: dict) 
     for item in template.apps:
         if item.visibility != "user":
             assert item.dir is not None
-            by, why = admits(item, consent_entry(data, "apps", item.slug), agent, "", None)
+            entry = consent_entry(data, "apps", item.slug)
+            by, why = await run_db(admits, item, entry, agent, "", None)
             try:
                 res = await app_blueprints.import_folder(
                     agent, "", None, item.slug, item.dir, template_slug=template.slug,
                     tasks=list(item.blueprint.get("tasks") or []), cold=True, approve_as=by,
+                    **consent_reach(item, entry, None),
                     template_ref=template_ref(template.slug, item.slug),
                     triggers=list(item.blueprint.get("triggers") or []),
                     origin=_origin(template))
@@ -492,13 +527,15 @@ async def seed_user_copy(agent: str, owner_sub: str, slug: str, *,
         source = seed_source_dir(agent, slug)
         if not source.is_dir():
             return "skipped", "the template's copy of the app is not on this install"
-        by, why = admits(item, consent_entry(data, "apps", slug), agent, username, owner_sub)
+        entry = consent_entry(data, "apps", slug)
+        by, why = await run_db(admits, item, entry, agent, username, owner_sub)
         if by and not await asyncio.to_thread(copy_matches, item, source):
             by, why = "", COPY_CHANGED
         try:
             res = await app_blueprints.import_folder(
                 agent, username, owner_sub, slug, source, template_slug=template.slug,
-                tasks=_blueprint_tasks(source), cold=True, approve_as=by, template_ref=ref,
+                tasks=_blueprint_tasks(source), cold=True, approve_as=by, **consent_reach(item, entry, None),
+                template_ref=ref,
                 triggers=_blueprint_triggers(source), origin=_origin(template))
         except Exception as e:
             reason = str(e)
@@ -532,7 +569,8 @@ async def restore(row: dict) -> dict:
         from fastapi import HTTPException
         raise HTTPException(status_code=400,
                             detail=f"the template's copy of '{slug}' is not on this install")
-    by, _why = admits(item, consent_entry(data, "apps", slug), agent, username, row.get("owner_sub"))
+    entry = consent_entry(data, "apps", slug)
+    by, _why = await run_db(admits, item, entry, agent, username, row.get("owner_sub"))
     if by and not await asyncio.to_thread(copy_matches, item, source):
         by = ""
     async with _lock(agent, username, slug):
@@ -541,7 +579,7 @@ async def restore(row: dict) -> dict:
         tpl = cast("CommunityAgentTemplate", template)
         res = await app_blueprints.import_folder(
             agent, username, row.get("owner_sub"), slug, source, template_slug=tpl.slug,
-            tasks=_blueprint_tasks(source), cold=True, approve_as=by,
+            tasks=_blueprint_tasks(source), cold=True, approve_as=by, **consent_reach(item, entry, row),
             template_ref=row.get("template_ref") or template_ref(tpl.slug, slug),
             triggers=_blueprint_triggers(source), origin=_origin(tpl))
     if res.get("app_id"):

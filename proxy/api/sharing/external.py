@@ -31,8 +31,14 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketDisconnect
 
 import config
-from api.apps.app_actions import _check_fire_rate, _run_action
-from api.apps.apps import APP_RUNTIME, _app_document
+from api.apps.app_actions import (
+    BATCH_MAX_CALLS,
+    _check_fire_rate,
+    _run_action,
+    paced_batch,
+    refusal_line,
+)
+from api.apps.apps import APP_RUNTIME, PressTooFast, _app_document
 from api.media.ui import (
     _placeholder,
     _ui_response,
@@ -77,8 +83,9 @@ def _today() -> str:
 def load_live_link(token: str) -> tuple[dict, dict] | None:
     """The share and its target row when the link may serve: the row is
     live, the target exists (an app not soft-unpinned; a chat still there),
-    and whoever made the link may still share it (a demoted or removed
-    creator kills their links). Sync."""
+    whoever made the link may still share it (a demoted or removed creator
+    kills their links), and an app with a server reads no folder outside
+    people may not see. Sync."""
     if not token or len(token) > 128:
         return None
     share = share_store.get_share_by_token_hash(token_hash(token))
@@ -101,6 +108,11 @@ def load_live_link(token: str) -> tuple[dict, dict] | None:
     if not row or row.get("hidden") or task_store.app_is_scoped(row):
         return None
     if not _mf.sub_can_approve_surface(share.get("created_by") or "", row):
+        return None
+    # A link's visitors are outside people: an app that reads a folder they
+    # may not see serves no link (the folder rule).
+    from services.mcp import outside_picks
+    if outside_picks.link_refusal(row):
         return None
     return share, row
 
@@ -171,7 +183,7 @@ def _external_claim(share: dict, row: dict, session: str) -> dict:
     share, and — when the link's cookie holds one — the app's own session
     token inside it, which the app reads from the verified header."""
     from services.apps import app_tokens
-    claims = {"principal": "external", "sub": "", "username": "", "role": "viewer",
+    claims = {"principal": "external", "sub": "", "username": "", "role": _mf.LINK_ROLE,
               "grant": share["id"], "agent": row.get("agent") or "",
               "visibility": db_apps.app_scope(row.get("username")), "external": True}
     if session:
@@ -287,7 +299,9 @@ def _host_page(share: dict, row: dict, unlocked: bool, site_key: str) -> str:
         "kind": "chat" if is_chat else "app",
         "title": title,
         "needs_password": needs_password(share) and not unlocked,
-        "actions": bool(share.get("allow_actions")) and not is_chat,
+        # The Buttons switch, and a button a visitor may press: a link's
+        # visitor is an outside person, judged at the external floor.
+        "actions": bool(share.get("allow_actions")) and not is_chat and bool(_mf.outside_buttons(row)),
         "turnstile_site_key": site_key,
         # A folder app's document is addressed by its release hash (APPS.md
         # "Client files"); the host builds the frame's src from it.
@@ -670,10 +684,9 @@ async def share_snapshot_ui(token: str, media_token: str, request: Request):
         return _ui_response(_placeholder("Enter the link's password first."), origin, 401)
     if not found or found[0].get("target_kind") != "chat":
         return _ui_response(_placeholder("This link is not available."), origin, 404)
-    path = await asyncio.to_thread(chat_snapshot.file_path, found[0], media_token)
-    if path is None:
+    content = await asyncio.to_thread(chat_snapshot.read_page, found[0], media_token)
+    if content is None:
         return _ui_response(_placeholder("This artifact no longer exists."), origin, 404)
-    content = await asyncio.to_thread(path.read_text, "utf-8", "replace")
     if is_full_document(content):
         return _ui_response(inject_runtime(content), origin)
     return _ui_response(wrap_fragment(content), origin)
@@ -683,22 +696,15 @@ async def share_snapshot_ui(token: str, media_token: str, request: Request):
 async def share_snapshot_media(token: str, media_token: str, request: Request):
     """An image, clip or file from a chat link's snapshot; inert types
     inline, the rest as a download."""
-    import mimetypes
-
-    from fastapi.responses import FileResponse
-
+    from api.sharing.shares import snapshot_file_response
     from services.sharing import chat_snapshot
     found = await asyncio.to_thread(_gate, request, token)
     if not found or found[0].get("target_kind") != "chat":
         raise HTTPException(status_code=404, detail="not available")
-    path = await asyncio.to_thread(chat_snapshot.file_path, found[0], media_token)
-    if path is None:
+    opened = await asyncio.to_thread(chat_snapshot.open_file, found[0], media_token)
+    if opened is None:
         raise HTTPException(status_code=404, detail="not available")
-    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    headers = {"X-Content-Type-Options": "nosniff"}
-    if chat_snapshot.inline_ok(mime):
-        return FileResponse(path, media_type=mime, headers=headers)
-    return FileResponse(path, media_type=mime, filename=path.name, headers=headers)
+    return snapshot_file_response(*opened)
 
 
 @router.get("/s/{token}/state")
@@ -758,29 +764,32 @@ async def share_actions_batch(token: str, req: LinkBatchRequest, request: Reques
         raise HTTPException(status_code=404, detail="not available")
     share, row = found
     calls = req.calls
-    if not 1 <= len(calls) <= 16:
-        raise HTTPException(status_code=400, detail="a batch carries 1 to 16 calls")
-    _check_fire_rate(row["id"], "\x00batch", f"share:{share['id']}", interval=1.0)
+    if not 1 <= len(calls) <= BATCH_MAX_CALLS:
+        raise HTTPException(status_code=400, detail=f"a batch carries 1 to {BATCH_MAX_CALLS} calls")
+    try:
+        _check_fire_rate(row["id"], "\x00batch", f"share:{share['id']}", interval=1.0)
+    except PressTooFast as e:
+        return paced_batch(e)
     ip = get_client_ip(request)
     fire_seen = False
-    entries: list[tuple[LinkBatchCall, bool]] = []
+    entries: list[tuple[LinkBatchCall, bool, bool]] = []
     for call in calls:
         action = _mf.find_action(row, call.action_id) or {}
         fires = action.get("type") == "fire_task"
-        entries.append((call, fires and fire_seen))
+        entries.append((call, fires, fires and fire_seen))
         fire_seen = fire_seen or fires
 
-    async def _one(call: LinkBatchCall, extra_fire: bool) -> dict:
+    async def _one(call: LinkBatchCall, fires: bool, extra_fire: bool) -> dict:
         out: dict = {"call_id": call.call_id, "action_id": call.action_id}
         try:
             if extra_fire:
                 raise HTTPException(status_code=429, detail="One task run per batch")
             out.update(await _run_link_action(share, row, call.action_id, call.args, ip))
         except HTTPException as e:
-            out.update({"status": "denied", "reason": e.detail, "code": e.status_code})
+            out.update(refusal_line(e, fires))
         return out
 
-    tasks = [asyncio.ensure_future(_one(c, extra)) for c, extra in entries]
+    tasks = [asyncio.ensure_future(_one(c, fires, extra)) for c, fires, extra in entries]
 
     async def _lines():
         for fut in asyncio.as_completed(tasks):
@@ -828,9 +837,7 @@ async def read_snapshot_ui(share_id: str, token: str, request: Request,
         return _ui_response(_placeholder("Sign in to OtoDock to view this artifact."), origin, 401)
 
     def _load() -> str | None:
-        share = _load_snapshot_share(user, share_id)
-        path = chat_snapshot.file_path(share, token)
-        return path.read_text("utf-8", "replace") if path else None
+        return chat_snapshot.read_page(_load_snapshot_share(user, share_id), token)
 
     try:
         content = await asyncio.to_thread(_load)

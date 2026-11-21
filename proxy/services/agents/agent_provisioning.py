@@ -28,18 +28,23 @@ def install() -> None:
     """Register the post-commit steps with the stores; idempotent."""
     agent_store.on_agent_created(provision_agent_tree)
     agent_store.on_agent_deleted(release_agent_quota)
+    agent_store.on_agent_deleted(forget_agent_histories)
     db_users.on_membership_change(_remove_user_scope_memory, _ensure_user_agent_dirs)
 
 
 def provision_agent_tree(slug: str) -> None:
-    """An agent's config audit repo and its shared quota scope, after
-    ``create_agent`` wrote the row and the folders."""
-    # Initialize git repo for the agent's config dir so agent.md /
-    # context files have an audit trail from day one.
+    """An agent's config and knowledge histories and its shared quota scope,
+    after ``create_agent`` wrote the row and the folders."""
+    # agent.md, the context files and the shared memory have an audit trail
+    # from day one. A new agent has no history: both create routes refuse a
+    # name whose folder exists, so one found under the name is an earlier
+    # agent's and is set aside, never shown as this one's.
     try:
         from services.infra import git_writer
         agent_dir = config.AGENTS_DIR / slug
-        git_writer.init_if_missing(agent_dir / "config")
+        git_writer.set_aside_agent(slug)
+        git_writer.init_if_missing(agent_dir / layout.CONFIG)
+        git_writer.init_if_missing(agent_dir / layout.KNOWLEDGE)
     except OSError:
         pass
     # Bind the shared bucket (workspace + knowledge + config) to its XFS project
@@ -63,6 +68,13 @@ def release_agent_quota(slug: str) -> None:
         storage_quota.reclaim_agent(slug)
     except psycopg.Error:
         pass
+
+
+def forget_agent_histories(slug: str) -> None:
+    """The agent's histories removed with it, after ``delete_agent`` removed
+    a row: a later agent of the same name starts with none."""
+    from services.infra import git_writer
+    git_writer.forget_agent(slug)
 
 
 def _remove_user_scope_memory(sub: str, username: str | None, agent: str) -> None:
@@ -107,8 +119,16 @@ def _ensure_user_agent_dirs(sub: str, agents: list[str]) -> None:
             if not agent_dir.exists():
                 continue
             user_dir = layout.user_dir(agent_dir, username)
-            (user_dir / layout.WORKSPACE).mkdir(parents=True, exist_ok=True)
-            (user_dir / "context").mkdir(parents=True, exist_ok=True)
+            # Made beneath the agent's real folder with no link followed.
+            from core import agent_folder
+            from services.infra import safe_fs
+            root = agent_folder.agent_root(agent_name)
+            try:
+                for folder in (layout.WORKSPACE, "context"):
+                    safe_fs.mkdirs_beneath(root, f"{layout.user_rel(username)}/{folder}")
+            except OSError as exc:
+                logger.warning("The folders of %s in %s were not made: %s", username, agent_name, exc)
+                continue
             try:
                 from services.infra import git_writer
                 git_writer.init_if_missing(user_dir / "context")
@@ -129,6 +149,11 @@ def _ensure_user_agent_dirs(sub: str, agents: list[str]) -> None:
 
 
 # Persona filename migration (prompt.md → agent.md, pre-1.4 installs).
+#: Two persona files are compared whole up to this size; a larger one is
+#: left as it is (the readers prefer agent.md anyway).
+_PERSONA_COMPARE_MAX_BYTES = 16 * 1024 * 1024
+
+
 def migrate_persona_filenames() -> int:
     """One-shot startup sweep: converge every agent on ``config/agent.md``.
 
@@ -147,7 +172,8 @@ def migrate_persona_filenames() -> int:
     """
     import time as _time
 
-    from services.infra import git_writer
+    from core import agent_folder
+    from services.infra import git_writer, safe_fs
     from storage.files import file_author_store, file_tombstones_store
 
     migrated = 0
@@ -155,21 +181,27 @@ def migrate_persona_filenames() -> int:
         config_dir = config.AGENTS_DIR / slug / "config"
         old = config_dir / "prompt.md"
         new = config_dir / "agent.md"
+        # Looked at, compared, removed and renamed beneath the agent's real
+        # folder with no link followed (a manager's session writes /config).
+        root = agent_folder.agent_root(slug)
+        old_rel, new_rel = "config/prompt.md", "config/agent.md"
         try:
-            if not old.is_file():
+            if not safe_fs.kind_beneath(root, old_rel).is_file:
                 continue
-            if new.is_file():
-                if new.read_bytes() != old.read_bytes():
+            if safe_fs.kind_beneath(root, new_rel).is_file:
+                cap = _PERSONA_COMPARE_MAX_BYTES
+                if (safe_fs.read_bytes_beneath(root, new_rel, max_size=cap)
+                        != safe_fs.read_bytes_beneath(root, old_rel, max_size=cap)):
                     logger.warning(
                         "Agent %s has both agent.md and prompt.md with "
                         "different content — keeping both; agent.md wins at "
                         "read time", slug,
                     )
                     continue
-                old.unlink()
+                safe_fs.unlink_beneath(root, old_rel)
                 action = "removed duplicate config/prompt.md"
             else:
-                old.rename(new)
+                safe_fs.rename_beneath(root, old_rel, new_rel)
                 action = "renamed config/prompt.md to agent.md"
             file_tombstones_store.record(
                 slug, "config/prompt.md", _time.time(),

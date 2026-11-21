@@ -65,13 +65,13 @@ describe('usePermissionModeInvariant', () => {
     expect(setMode).toHaveBeenCalledWith('ask')
   })
 
-  it('reads a word from before 1.9 as its current one', () => {
+  it('moves a word no engine declares to the first declared mode', () => {
     const setMode = vi.fn()
     renderHook(() => usePermissionModeInvariant('acceptEdits', declared, setMode))
-    expect(setMode).toHaveBeenCalledWith('autoReview')
-    const direct = vi.fn()
-    renderHook(() => usePermissionModeInvariant('acceptEdits', ['ask', 'dontAsk'], direct))
-    expect(direct).toHaveBeenCalledWith('ask')
+    expect(setMode).toHaveBeenCalledWith(declared[0])
+    const kept = vi.fn()
+    renderHook(() => usePermissionModeInvariant('autoReview', declared, kept))
+    expect(kept).not.toHaveBeenCalled()
   })
 
   it('waits for the catalog before correcting anything', () => {

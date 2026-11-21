@@ -1,7 +1,7 @@
 import { useParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { useAgentInfo } from '../api/agents'
-import { canManageAgent } from '../lib/permissions'
+import { canEditAgent, canManageAgent } from '../lib/permissions'
 import SettingsShell from './settings/SettingsShell'
 import { agentSections, agentSettingsBase } from './settings/sections'
 
@@ -12,13 +12,14 @@ export default function AgentLayout() {
   const { data: agentInfo } = useAgentInfo(name)
   const agentDisplayName = agentInfo?.display_name || name
   const canManage = canManageAgent(user, name)
+  const canEdit = canEditAgent(user, name)
 
   return (
     <SettingsShell
       base={agentSettingsBase(name)}
       title={agentDisplayName}
       subtitle="Agent Settings"
-      sections={agentSections(name, canManage)}
+      sections={agentSections(name, canManage, canEdit)}
       agent={name}
     />
   )

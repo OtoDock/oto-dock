@@ -24,6 +24,13 @@ import yaml
 
 import config
 from core.config import deployment
+from services.containers import state as _state
+from services.containers.compose_files import (  # noqa: F401  # moved, read here and by tests
+    _SUBPATH_MIN_API,
+    _compose_mounts_subpath,
+    _odd_backslash_run_before_quote,
+    dotenv_quote,
+)
 from services.mcp import compose_progress, mcp_manifest_types as _mt
 
 logger = logging.getLogger("otodock.docker-manager")
@@ -42,8 +49,12 @@ NOT_FOUND = "not_found"
 ERROR = "error"
 NOT_CHECKED = "not_checked"
 UNKNOWN = "unknown"
+# The admin list's words for an enabled tool the platform drives that does
+# not run: it sleeps until its next use, or its last wake failed.
+SLEEPING = "sleeping"
+DID_NOT_START = "did_not_start"
 STATUSES: frozenset[str] = frozenset({RUNNING, UNHEALTHY, STARTING, STOPPED, NOT_FOUND, ERROR,
-                                      NOT_CHECKED, UNKNOWN})
+                                      NOT_CHECKED, UNKNOWN, SLEEPING, DID_NOT_START})
 #: A container process exists (healthy or not): a recreate reaches it.
 PRESENT: frozenset[str] = frozenset({RUNNING, STARTING, UNHEALTHY})
 #: Running or coming up: no start is needed.
@@ -444,27 +455,6 @@ def _target_service(manifest) -> str | None:
         return None
 
 
-# A volume ``subpath`` mount (one file of a volume) needs Docker Engine 26,
-# API 1.45: an older engine mounts the whole volume, and the service misses
-# the file it expects (the file tools' Collabora runs without its WOPI key).
-_SUBPATH_MIN_API = (1, 45)
-
-
-def _compose_mounts_subpath(manifest) -> bool:
-    """Whether the MCP's compose mounts one file of a volume."""
-    try:
-        data = yaml.safe_load((manifest.mcp_dir / manifest.server.docker_compose).read_text()) or {}
-    except (OSError, ValueError, AttributeError, yaml.YAMLError):
-        return False
-    services = data.get("services") if isinstance(data, dict) else None
-    for svc in (services.values() if isinstance(services, dict) else ()):
-        for vol in ((svc.get("volumes") or []) if isinstance(svc, dict) else ()):
-            spec = vol.get("volume") if isinstance(vol, dict) else None
-            if isinstance(spec, dict) and spec.get("subpath"):
-                return True
-    return False
-
-
 def _engine_api_version() -> tuple[int, ...] | None:
     """The Docker Engine's API version, ``None`` when it cannot be read."""
     try:
@@ -496,34 +486,6 @@ def _check_engine_for_subpath(manifest, engine_api: list) -> None:
             "mounts the whole volume instead. Update Docker, then restart OtoDock.",
             manifest.name, ".".join(str(part) for part in api),
         )
-
-
-def _odd_backslash_run_before_quote(value: str) -> bool:
-    """Whether an odd run of backslashes ends ``value`` or precedes a ``'``
-    in it (one pass; a regex over a long run of backslashes backtracks)."""
-    run = 0
-    for ch in value:
-        if ch == "\\":
-            run += 1
-            continue
-        if ch == "'" and run % 2:
-            return True
-        run = 0
-    return bool(run % 2)
-
-
-def dotenv_quote(value: str) -> str | None:
-    """``value`` as a single-quoted ``.env`` value Compose's dotenv reader
-    hands the container literally: no ``$`` interpolation, backslashes kept,
-    each ``'`` written ``\\'``. ``None`` for a value that form cannot carry: a
-    control character (a newline ends the line), or an odd run of
-    backslashes right before a ``'`` or at the end (Compose reads the quote
-    after an odd run as escaped)."""
-    if any(ord(c) < 0x20 or c == "\x7f" for c in value):
-        return None
-    if _odd_backslash_run_before_quote(value):
-        return None
-    return "'" + value.replace("'", "\\'") + "'"
 
 
 def _inject_mcp_env(manifest) -> bool:
@@ -886,6 +848,7 @@ def _record_build(manifest, state: tuple[str, list[str]] | None) -> None:
         logger.warning("Could not record the build of %s: %s", manifest.name, e)
 
 
+@_state.locked
 def start_container(manifest, *, force_recreate: bool = False) -> bool:
     """Start Docker container via docker compose up -d.
 
@@ -907,25 +870,13 @@ def start_container(manifest, *, force_recreate: bool = False) -> bool:
     """
     try:
         _inject_mcp_env(manifest)
-        from services.mcp import compose_rewrite
         in_t2 = deployment.in_docker_compose()
-
-        if in_t2:
-            # T2: rewrite the catalog's build-from-context compose to pull the
-            # pre-built image (the socket-proxy blocks builds). Raises with an
-            # actionable message if the MCP has no `server.image` to pull — fail
-            # rather than let `compose up` attempt a build the socket-proxy 403s.
-            try:
-                compose_rewrite.ensure_pull_compose(manifest)
-            except ValueError as e:
-                logger.error("Cannot start Docker MCP %s: %s", manifest.name, e)
-                return False
-        else:
-            # T1: generate/refresh the override (subnet pin + namespaced
-            # container_name + image tag) BEFORE any compose op, so the bridge is
-            # pinned to our pool and can never auto-grab a 192.168.x LAN overlap.
-            # Best-effort: a parse failure just degrades to docker's auto-bridge.
-            compose_rewrite.ensure_t1_override(manifest)
+        try:
+            refresh_compose_form(manifest)
+        except ValueError as e:
+            logger.error("Cannot start Docker MCP %s: %s", manifest.name, e)
+            _state.failed_start(manifest.name, str(e))
+            return False
 
         args = ["up", "-d"]
         if force_recreate:
@@ -1072,7 +1023,10 @@ def _compose_up(manifest, args: list[str], *, timeout: int, t1_retry: bool = Fal
     (``_settle_interrupted_recreate``).
     """
     try:
-        return _compose_up_attempts(manifest, args, timeout=timeout, t1_retry=t1_retry)
+        started = _compose_up_attempts(manifest, args, timeout=timeout, t1_retry=t1_retry)
+        if started:
+            _state.started(manifest.name)
+        return started
     except ComposeEnded as e:
         if getattr(e, "recreating", False):
             logger.warning("Docker MCP %s: the proxy stopped while compose recreated its "
@@ -1097,6 +1051,7 @@ def _compose_up(manifest, args: list[str], *, timeout: int, t1_retry: bool = Fal
             "By hand: cd %s && %s",
             manifest.name, what, shlex.quote(str(manifest.mcp_dir)), by_hand,
         )
+        _state.failed_start(manifest.name, f"{what[:1].upper()}{what[1:]}.")
         return False
 
 
@@ -1170,6 +1125,7 @@ def _compose_up_attempts(manifest, args: list[str], *, timeout: int, t1_retry: b
     if _is_docker_perm_denied(stderr):
         _log_docker_perm_denied(f"compose up for {manifest.name} failed")
     logger.error("Failed to start Docker MCP %s: %s", manifest.name, stderr[:500])
+    _state.failed_start(manifest.name, stderr)
     return False
 
 
@@ -1212,6 +1168,7 @@ def _warn_foreign_mcp_leftovers() -> None:
         logger.debug("foreign-MCP-leftover scan skipped: %s", e)
 
 
+@_state.locked
 def stop_container(manifest) -> bool:
     """Stop Docker container via docker compose down."""
     try:
@@ -1223,6 +1180,7 @@ def stop_container(manifest) -> bool:
         )
         if result.returncode == 0:
             logger.info("Stopped Docker MCP: %s", manifest.name)
+            _state.removed(manifest.name)
             return True
         logger.error(
             "Failed to stop Docker MCP %s: %s", manifest.name, result.stderr[:500]
@@ -1260,6 +1218,7 @@ def remove_image(image: str) -> bool:
         return False
 
 
+@_state.locked
 def remove_container(manifest, *, prune_image: bool = True) -> bool:
     """Tear a Docker MCP down completely — used when an MCP is DELETED (not just
     stopped). ``compose down --volumes --remove-orphans`` stops and removes the
@@ -1267,8 +1226,7 @@ def remove_container(manifest, *, prune_image: bool = True) -> bool:
     in ``otodock-mcp-<name>-*`` volumes) and any orphaned siblings; then a
     best-effort ``docker rmi`` of ``server.image`` reclaims the image layer.
 
-    Self-host only (T1 bare-metal + T2 socket-proxy). On cloud (external-pool)
-    there is no per-install container, so ``delete_mcp`` never calls this.
+    T1 bare-metal and T2 socket-proxy alike.
 
     Returns True when the ``down`` succeeds. Image removal is best-effort and
     never fails the call — the image may be shared with another MCP or still in
@@ -1289,6 +1247,7 @@ def remove_container(manifest, *, prune_image: bool = True) -> bool:
         ok = result.returncode == 0
         if ok:
             logger.info("Removed Docker MCP container + volumes: %s", manifest.name)
+            _state.removed(manifest.name)
         else:
             logger.warning(
                 "compose down for %s exited %s: %s",
@@ -1304,6 +1263,7 @@ def remove_container(manifest, *, prune_image: bool = True) -> bool:
         return False
 
 
+@_state.locked
 def restart_container(manifest, *, start_exited: bool = False) -> bool:
     """Recreate a Docker MCP's container from the current ``.env`` and the
     image the manifest names.
@@ -1330,11 +1290,7 @@ def restart_container(manifest, *, start_exited: bool = False) -> bool:
                 "" if state.get("enabled") else ", disabled",
             )
             return False
-        from services.mcp import compose_rewrite
-        if deployment.in_docker_compose():
-            compose_rewrite.ensure_pull_compose(manifest)
-        else:
-            compose_rewrite.ensure_t1_override(manifest)
+        refresh_compose_form(manifest)
         return _compose_up(
             manifest,
             ["up", "-d", "--force-recreate", "--no-build", "--pull", "never"],
@@ -1379,9 +1335,7 @@ def startup_docker_mcps() -> None:
     # Only bare-metal T1 (managed-local) drives per-MCP container lifecycle from
     # here. T2 Docker-Compose: community Docker MCPs are pull-managed siblings
     # (started at install via the socket-proxy); starting them here would
-    # 403 on build and fight the operator. T3 cloud (external-pool): there is no
-    # local daemon — Docker MCPs are connections to the OtoDock-hosted central
-    # pool, never started locally. Both skip; only T1 proceeds.
+    # 403 on build and fight the operator, so it skips; only T1 proceeds.
     if deployment.current_mode() != deployment.MANAGED_LOCAL:
         logger.info(
             "%s: skipping per-MCP docker startup — Docker MCPs are not "
@@ -1414,8 +1368,10 @@ _BRINGUP_WORKERS = 4
 
 def _bring_up(name: str, manifest) -> None:
     """One enabled Docker MCP at boot: its ``.env`` refreshed, then started,
-    or recreated when its ``.env`` or its compose config changed. Nothing
-    once the proxy is stopping (the pool's queued projects)."""
+    or recreated when its ``.env`` or its compose config changed. A tool
+    that sleeps until its first use is left asleep, unless it stays warm or
+    has no record of its tools yet (its first session reads it). Nothing once the
+    proxy is stopping (the pool's queued projects)."""
     if _stopping.is_set():
         return
     env_changed = False
@@ -1426,24 +1382,55 @@ def _bring_up(name: str, manifest) -> None:
 
     status = get_container_status(manifest)
     if status != RUNNING:
+        from services.containers import lifecycle
+        if not lifecycle.starts_at_boot(manifest):
+            logger.info("Docker MCP %s: asleep until its first use", name)
+            return
         logger.info("Docker MCP %s: status=%s, starting...", name, status)
         start_container(manifest)
         return
-    # Compose-config drift check: the skip path historically ran
-    # NOTHING, so base-compose/override changes (a new mem_limit
-    # default, an image retag) never reached a running container
-    # until something else happened to recreate it. Hash the on-disk
-    # config BEFORE refreshing the override (the pre-refresh text is
-    # a faithful baseline for what the running container was created
-    # from — only start_container ever writes the override), refresh
-    # it, re-hash, and recreate on drift. Any failure degrades to
-    # the plain skip this branch always was.
+    compose_changed = _compose_drifted(manifest)
+    if env_changed:
+        logger.info(
+            "Docker MCP %s: .env changed, force-recreating to pick up new values",
+            name,
+        )
+        start_container(manifest, force_recreate=True)
+    elif compose_changed:
+        logger.info(
+            "Docker MCP %s: compose config changed, force-recreating to pick it up",
+            name,
+        )
+        start_container(manifest, force_recreate=True)
+    else:
+        logger.info("Docker MCP %s: already running", name)
+
+
+def refresh_compose_form(manifest) -> None:
+    """A tool's compose form as this install runs it, written before any
+    compose run: in the Docker install the pull form of the catalog's
+    build-from-context file (the socket-proxy blocks builds; it raises when
+    the MCP names no ``server.image``), on bare metal the override that pins
+    its bridge to our pool, names its container and tags its image."""
+    from services.mcp import compose_rewrite
+    if deployment.in_docker_compose():
+        compose_rewrite.ensure_pull_compose(manifest)
+    else:
+        compose_rewrite.ensure_t1_override(manifest)
+
+
+def _compose_drifted(manifest) -> bool:
+    """Whether the tool's compose config changed since its container was
+    made (a plain ``up -d`` of a running container never applies that: a
+    new mem_limit default, an image retag). The on-disk config is hashed
+    BEFORE the override is refreshed (the pre-refresh text is a faithful
+    baseline for what the running container was created from: only a start
+    writes the override), refreshed, hashed again. Any failure reads as no
+    change."""
     compose_changed = False
     try:
-        from services.mcp import compose_rewrite
-
         pre = _compose_config_hash(manifest)
-        compose_rewrite.ensure_t1_override(manifest)
+        refresh_compose_form(manifest)
         post = _compose_config_hash(manifest)
         recorded = _read_recorded_compose_hash(manifest)
         if post is not None:
@@ -1459,20 +1446,6 @@ def _bring_up(name: str, manifest) -> None:
                     _record_compose_hash(manifest)
     except (OSError, ValueError) as e:
         logger.warning(
-            "Compose drift check for %s failed (skipping): %s", name, e,
+            "Compose drift check for %s failed (skipping): %s", manifest.name, e,
         )
-
-    if env_changed:
-        logger.info(
-            "Docker MCP %s: .env changed, force-recreating to pick up new values",
-            name,
-        )
-        start_container(manifest, force_recreate=True)
-    elif compose_changed:
-        logger.info(
-            "Docker MCP %s: compose config changed, force-recreating to pick it up",
-            name,
-        )
-        start_container(manifest, force_recreate=True)
-    else:
-        logger.info("Docker MCP %s: already running", name)
+    return compose_changed

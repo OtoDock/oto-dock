@@ -96,6 +96,10 @@ async def gateway(mcp: str, rest: str, request: Request):
         logger.info("mcp-gateway: %s refused for session %s mcp %r", prepared.reason,
                     session_id[:8], mcp)
         return _refuse(method, body, prepared.detail)
+    if isinstance(prepared, mcp_gateway.Answered):
+        # A Docker tool's door answered (``services/containers/door.py``).
+        return StreamingResponse(prepared.aiter_raw(), status_code=prepared.status_code,
+                                 headers=prepared.headers, background=BackgroundTask(prepared.aclose))
     client = cast("httpx.AsyncClient", prepared.client)  # mcp_gateway.client() built it
     req = client.build_request(method, cast("httpx.URL", prepared.url), headers=prepared.headers,
                                content=body if prepared.content is None else prepared.content)

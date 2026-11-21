@@ -79,6 +79,20 @@ def test_viewer_cannot_create_agent_scope_meeting(temp_db):
     assert ei.value.status_code == 403
 
 
+def test_no_meeting_is_created_while_the_platform_is_updating(temp_db, monkeypatch):
+    from core import drain
+    agent_store.create_agent("a1", "A1", collaborative=True)
+    agent_store.create_agent("a2", "A2", collaborative=True)
+    u = _user({"a1": "editor", "a2": "editor"})
+    monkeypatch.setattr(drain, "_state", drain.HELD)
+    with pytest.raises(HTTPException) as ei:
+        _create(u, ["a1", "a2"], scope="user", x_agent_name="a1")
+    assert ei.value.status_code == 503 and "updating" in ei.value.detail
+    assert ei.value.headers == {"Retry-After": "60"}
+    monkeypatch.setattr(drain, "_state", drain.RUNNING)
+    assert _create(u, ["a1", "a2"], scope="user", x_agent_name="a1")["status"] == "pending"
+
+
 def _nouser(agent: str) -> UserContext:
     """No-user AGENT_SESSION JWT (agent-scope task / trigger / phone)."""
     return UserContext(

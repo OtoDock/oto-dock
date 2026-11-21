@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 
-from proxy.client import TOOL_USE_SIGNAL
+from proxy.client import TOOL_USE_SIGNAL, spoken_error
 
 logger = logging.getLogger("duplex")
 
@@ -126,7 +126,9 @@ class DuplexLlmClient:
                     "[%s] turn error: %s", self._conn.peer_addr, reason
                 )
                 self.turn_in_flight = False
-                yield "Sorry, I hit an error handling that."
+                # The platform's own line when it wrote one to be spoken
+                # (no compute machine is connected), else this apology.
+                yield spoken_error(msg.get("data"), "Sorry, I hit an error handling that.")
                 break
 
         self.turn_in_flight = False

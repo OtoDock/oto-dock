@@ -180,22 +180,25 @@ def list_verdicts(agent: str, *, user_sub: str | None = None, chat_id: str = "",
 _VERDICT_DELETE_BATCH = 5000
 
 
-def delete_verdicts_before(cutoff_iso: str, *, dry_run: bool = False) -> int:
+def delete_verdicts_before(cutoff_iso: str, *, agent: str = "", dry_run: bool = False) -> int:
     """The retention sweep (SESSIONS.md): verdicts older than the session
-    retention window go with the session files, in committed batches; the
-    count, or what would go on a dry run."""
+    retention window go with the session files, in committed batches, or
+    one agent's under its history window (``agent``); the count, or what
+    would go on a dry run."""
+    where = "created_at < %s AND agent = %s" if agent else "created_at < %s"
+    params: tuple = (cutoff_iso, agent) if agent else (cutoff_iso,)
     with get_conn() as conn:
         if dry_run:
-            row = conn.execute("SELECT COUNT(*) AS n FROM check_verdicts WHERE created_at < %s",
-                               (cutoff_iso,)).fetchone()
+            row = conn.execute(f"SELECT COUNT(*) AS n FROM check_verdicts WHERE {where}",
+                               params).fetchone()
             return int(row["n"] if row else 0)
         total = 0
         while True:
             cur = conn.execute(
-                """DELETE FROM check_verdicts
+                f"""DELETE FROM check_verdicts
                     WHERE id IN (SELECT id FROM check_verdicts
-                                  WHERE created_at < %s LIMIT %s)""",
-                (cutoff_iso, _VERDICT_DELETE_BATCH),
+                                  WHERE {where} LIMIT %s)""",
+                (*params, _VERDICT_DELETE_BATCH),
             )
             n = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
             conn.commit()

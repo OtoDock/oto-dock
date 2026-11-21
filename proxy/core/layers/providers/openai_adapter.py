@@ -79,6 +79,17 @@ def _summary_rejected(err) -> bool:
     return getattr(err, "status_code", 0) == 400 and "summary" in str(err).lower()
 
 
+
+def _checked_http(url: str | None) -> dict:
+    """An endpoint an admin or the relay named is dialled through the
+    platform's checked transport (``pinned_http.admin_host``: this machine
+    and the LAN pass, a hosted install reaches public addresses only);
+    the vendor's own host keeps the SDK's client."""
+    if not url:
+        return {}
+    from services.infra import pinned_http
+    return {"http_client": pinned_http.sdk_client(url)}
+
 class _ThinkTagSplitter:
     """Route ``<think>…</think>`` spans that some OpenAI-compatible servers
     stream INSIDE ``delta.content`` (reasoning parsing off) to the thinking
@@ -452,6 +463,7 @@ class OpenAIAdapter(ProviderAdapter):
         client_kwargs: dict = {"api_key": effective_key}
         if base_url:
             client_kwargs["base_url"] = base_url
+        client_kwargs.update(_checked_http(endpoint_url and base_url))
         client = AsyncOpenAI(**client_kwargs)
 
         try:
@@ -971,6 +983,7 @@ class OpenAIAdapter(ProviderAdapter):
         base_url = self._get_base_url(endpoint_url)
         if base_url:
             client_kwargs["base_url"] = base_url
+        client_kwargs.update(_checked_http(endpoint_url and base_url))
 
         client = AsyncOpenAI(**client_kwargs)
         try:

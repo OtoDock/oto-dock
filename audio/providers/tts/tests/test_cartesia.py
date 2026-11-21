@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from audio.providers.tts import cartesia as cartesia_mod
-from audio.providers.tts.base import UnsupportedProviderOperation
+from audio.providers.tts.base import UnsupportedProviderOperation, speakable
 from audio.providers.tts.cartesia import CartesiaTTS
 from cartesia import AsyncCartesia
 from cartesia.lib._tts import AsyncTTSResourceConnection
@@ -209,6 +209,142 @@ async def test_a_refusal_from_cartesia_is_logged(caplog):
     with caplog.at_level(logging.WARNING, logger="audio.providers.tts.cartesia"):
         assert [chunk async for chunk in tts.receive_audio()] == []
     assert "Invalid request" in caplog.text and "speed out of range" in caplog.text
+
+
+# ── A context with nothing to say ──────────────────────────────────
+
+
+@pytest.mark.parametrize("text, says", [
+    ("Hello", True), ("Γεια σου", True), ("42", True), ("$5", True), ("(ok)", True),
+    ("", False), ("  \n", False), ("...", False), ("**", False), ("```", False), ("?!", False), ("👍", False),
+])
+def test_text_is_speakable_when_it_holds_a_letter_or_a_digit(text, says):
+    assert speakable(text) is says
+
+
+async def _streamed(chunks, *, clear_queues=False, receiver_first=True):
+    """The frames the vendor gets for ``chunks`` (text, is_last) on the SDK's
+    real connection, and the task of a receiver on that context. The pipeline
+    starts its receiver before the first text."""
+    socket = _Socket()
+    tts = CartesiaTTS(api_key="x", voice_id="v-en")
+    tts._conn = AsyncTTSResourceConnection(socket)
+
+    async def receive():
+        return [chunk async for chunk in tts.receive_audio()]
+
+    tts.start_streaming_context(language="en")
+    receiver = None
+    if receiver_first:
+        receiver = asyncio.create_task(receive())
+        await asyncio.sleep(0)          # it waits on the context's queue
+    if clear_queues:
+        tts._conn._context_queues.clear()   # what a reconnect of the SDK's connection does
+    for text, is_last in chunks:
+        await tts.send_text_chunk(text, is_last=is_last)
+    if receiver is None:
+        receiver = asyncio.create_task(receive())
+    return socket.frames, receiver, tts
+
+
+async def _ended(receiver, tts):
+    """The receiver's audio, once it ended by itself. A receiver still
+    waiting on the vendor fails here."""
+    try:
+        return await asyncio.wait_for(receiver, 0.5)
+    finally:
+        await tts._conn.close()
+
+
+@pytest.mark.parametrize("chunks", [
+    pytest.param([("", True)], id="an end and nothing else"),
+    pytest.param([("**", False), ("", True)], id="markup alone, then the end"),
+    pytest.param([("...", True)], id="punctuation alone as the last chunk"),
+    pytest.param([("", True), ("", True)], id="a second end"),
+    pytest.param([("", True), ("Hello there.", False)], id="words after the end"),
+])
+@pytest.mark.parametrize("receiver_first", [True, False])
+async def test_a_context_nothing_was_said_in_reaches_no_vendor_and_its_receiver_ends(chunks, receiver_first, caplog):
+    """An end of input on a context that never held anything to say: no
+    frame goes to the vendor, which refuses a transcript with nothing in it,
+    and the receiver ends at once with no audio, whether it started before
+    the end or after it."""
+    with caplog.at_level(logging.WARNING, logger="audio.providers.tts.cartesia"):
+        frames, receiver, tts = await _streamed(chunks, receiver_first=receiver_first)
+        assert await _ended(receiver, tts) == []
+    assert frames == []
+    assert caplog.text == ""
+
+
+async def test_the_receiver_of_an_empty_context_ends_after_the_sdk_dropped_its_queues():
+    """A reconnect of the SDK's connection clears its table of queues. The
+    receiver already waits on the context's own queue: the end must reach
+    that queue, and no frame may go out for a context the new socket never
+    saw."""
+    frames, receiver, tts = await _streamed([("", True)], clear_queues=True)
+    assert await _ended(receiver, tts) == []
+    assert frames == []
+
+
+async def test_text_with_nothing_to_say_goes_in_front_of_the_first_words():
+    """Markup before any words is held and sent with them: the vendor reads
+    what it read before, and a context of markup alone is never opened."""
+    frames, receiver, tts = await _streamed([("**", False), ("Hello there.", False), ("", True)])
+    receiver.cancel()
+    await tts._conn.close()
+    assert [frame["transcript"] for frame in frames] == ["**Hello there.", ""]
+    assert [frame["continue"] for frame in frames] == [True, False]
+
+
+async def test_after_the_first_words_every_chunk_passes_and_the_end_is_sent_once():
+    """A closing full stop still reaches its sentence. Text after the end of
+    input opens nothing."""
+    frames, receiver, tts = await _streamed([("Hello", False), (".", False), ("", True), ("More.", False), ("", True)])
+    receiver.cancel()
+    await tts._conn.close()
+    assert [frame["transcript"] for frame in frames] == ["Hello", ".", ""]
+
+
+@pytest.mark.parametrize("first, second, frames", [
+    pytest.param([("", True)], [("Hello there.", False), ("", True)], ["Hello there.", ""],
+                 id="after a context that ended with nothing said"),
+    pytest.param([("**", False), ("", True)], [("Hello there.", False), ("", True)], ["Hello there.", ""],
+                 id="after a context that held markup and ended"),
+    pytest.param([("**", False), ("", True)], [("**", False), ("Hello there.", False), ("", True)],
+                 ["**Hello there.", ""], id="its own markup goes in front, never the last context's"),
+    pytest.param([("Hi.", True)], [("Hello there.", False), ("", True)], ["Hello there.", ""],
+                 id="after a context that spoke and ended"),
+])
+async def test_a_new_context_starts_clean_of_the_last_ones_end_and_held_text(first, second, frames):
+    """Every reply ends a context, and the next reply opens one on the same
+    provider and socket. The new context must take text again, and none of
+    the text the last one held: without that the agent speaks its greeting
+    and never again."""
+    socket = _Socket()
+    tts = CartesiaTTS(api_key="x", voice_id="v-en")
+    tts._conn = AsyncTTSResourceConnection(socket)
+    try:
+        tts.start_streaming_context(language="en")
+        for text, is_last in first:
+            await tts.send_text_chunk(text, is_last=is_last)
+        sent_before = len(socket.frames)
+        tts.start_streaming_context(language="en")
+        for text, is_last in second:
+            await tts.send_text_chunk(text, is_last=is_last)
+    finally:
+        await tts._conn.close()
+    assert [frame["transcript"] for frame in socket.frames[sent_before:]] == frames
+    assert len({frame["context_id"] for frame in socket.frames[sent_before:]}) == 1
+
+
+async def test_a_context_the_sdk_shapes_otherwise_gets_the_end_as_before():
+    """With no queue to take when the context starts, the provider sends
+    what it always sent: the worst case is the vendor's refusal."""
+    tts = CartesiaTTS(api_key="x", voice_id="v-en")
+    tts._ctx = _Ctx()
+    await tts.send_text_chunk("**")
+    await tts.send_text_chunk("", is_last=True)
+    assert tts._ctx.pushed == ["**"] and tts._ctx.ended == 1
 
 
 def test_validate_advanced_names_each_bad_field():

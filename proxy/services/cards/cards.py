@@ -23,6 +23,7 @@ from core.session import session_kind, session_state, visibility
 from services.cards import actions as catalog, lists, say, status as st
 from storage import database as task_store
 from storage.cards import db_cards
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock.cards")
 
@@ -135,7 +136,7 @@ async def draw(*, chat_id: str, session_id: str, agent: str, person_sub: str,
         title = title or words["title"]
         if words.get("text"):
             text_parts.append(words["text"])
-        for opt in action.options(params, u):
+        for opt in await run_db(action.options, params, u):
             options.setdefault(str(opt["id"]), {"id": str(opt["id"]), "label": str(opt["label"])[:db_cards.MAX_LABEL * 2],
                                                  "default": bool(opt.get("default"))})
         stored.append({"id": bid, "label": words["label"][:db_cards.MAX_LABEL], "kind": kind,

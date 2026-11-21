@@ -7,6 +7,8 @@ and its outcome reaches this socket as the ``chat_moved`` broadcast (no
 direct ack). The happy path here is a chat pinned to a machine that is
 not connected, moved to the server: its files cannot travel, so the chat
 is rebound the reseed way (``moved:<move id>``) and the move row says why.
+And ``target_check``: after a machine came or went the page asks again
+about the banner of the chat its socket is on.
 """
 
 import asyncio
@@ -423,3 +425,52 @@ class TestTheNewChatsPlace:
         assert place("home-pc")[3] == "You can't start this chat there."   # ids only
         assert place("local") == ("local", "OtoDock platform", "m-def", "")
         assert place("") == ("", "", "", "")
+
+
+# -- the banner asked again (target_check) ---------------------------------
+
+
+def test_a_target_check_reads_the_sockets_chat_again(temp_db, monkeypatch):
+    """A machine came back: the answer is the banner's fields of the moment,
+    none once the agent's new chats run where this chat runs. The request
+    names no chat, so another person's cannot be asked about."""
+    from services.remote import remote_status
+    from storage import database as task_store
+    layer = FakeExecutionLayer()
+    stub_dashboard_seams(monkeypatch, layer)
+    _stub_remote_layer(monkeypatch, layer)
+    slug = make_test_agent()
+    _insert_machine("m-office", "Office-PC")
+    cid = _make_chat(slug, messages=(("user", "hi"), ("assistant", "hello")))
+    task_store.update_chat(cid, execution_target="m-office")
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            ws.client_send({"type": "resume_chat", "chat_id": cid})
+            assert (await ws.next_frame())["type"] == "chat_history"
+            assert (await ws.next_frame())["resolved_target"] == "local"
+            await ws.next_frame()  # queue_snapshot
+            ws.client_send({"type": "target_check"})
+            await ws.expect({"type": "target_mismatch", "chat_id": cid,
+                             "pinned_target": "m-office", "pinned_label": "Office-PC",
+                             "resolved_target": "local",
+                             "resolved_label": "the OtoDock platform"})
+            monkeypatch.setattr(remote_status, "resolve_execution_target",
+                                lambda *a, **k: ("m-office", None))
+            ws.client_send({"type": "target_check", "chat_id": "someone-elses"})
+            await ws.expect({"type": "target_mismatch", "chat_id": cid})
+            assert layer.started == []
+    run_ws_scenario(scenario)
+
+
+def test_a_target_check_on_a_socket_with_no_chat_answers_nothing(temp_db, monkeypatch):
+    stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            ws.client_send({"type": "target_check"})
+            ws.client_send({"type": "ping"})
+            assert (await ws.next_frame())["type"] == "pong"
+    run_ws_scenario(scenario)

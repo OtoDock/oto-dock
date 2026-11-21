@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 import config
 from services.infra import retention
 from services.infra.retention import LiveSnapshot
@@ -69,6 +71,28 @@ def _sweep(*, days: int = 30, enabled: bool = True,
 
 def _uuid() -> str:
     return str(uuid.uuid4())
+
+
+def _machine_session(monkeypatch, sid: str, *, agent: str, username: str, thread: str = ""):
+    """A Codex session a compute machine runs for ``username`` on ``agent``:
+    the remote layer's record of it (its files are in the platform's folder)
+    and the security context its start registered, the only context there
+    is. Returns the layer."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from auth.path_policy import SecurityContext
+    from core.remote.remote_execution import RemoteExecutionLayer
+    from core.remote.remote_session_info import RemoteSessionInfo
+    from core.session import session_manager, session_state
+    layer = RemoteExecutionLayer(MagicMock())
+    layer._sessions[sid] = RemoteSessionInfo(
+        session_id=sid, machine_id="compute-1", agent_name=agent, execution_path="codex-cli",
+        event_queue=asyncio.Queue(), resume_handle=thread, compute=True, files_synced=False)
+    monkeypatch.setattr(session_manager, "_remote_layer", layer)
+    monkeypatch.setattr(session_state, "_session_security", {sid: SecurityContext(
+        role="manager", username=username, agent=agent, is_admin_agent=False)})
+    return layer
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +471,124 @@ def test_codex_junk_cleaned_state_kept(temp_db, monkeypatch):
     assert stats["codex_junk_files"] == 3
 
 
+def test_a_temporary_sign_in_file_codex_left_goes(temp_db, monkeypatch):
+    """Codex 0.169 saves its sign-in by a temporary ``.auth-XXXXXX`` and a
+    rename; one a killed save left holds the credentials. An hour old, it
+    goes from a store whatever runs there (a save takes a moment); the two
+    empty lock files stay (a live Codex may hold one)."""
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    codex = _home("a1", "alice") / ".codex"
+    codex.mkdir(parents=True, exist_ok=True)
+    left, fresh = codex / ".auth-Ab12Cd", codex / ".auth-Ef34Gh"
+    locks = [codex / "auth.lock", codex / "auth.json.lock"]
+    for f in (left, fresh, *locks):
+        f.write_text("z")
+    for f in (left, *locks):
+        _age_file(f, 1)
+    _sweep(days=30)
+    assert not left.exists() and fresh.exists()
+    assert all(f.exists() for f in locks)
+
+
+def test_codex_junk_prunes_no_folder_through_a_link(temp_db, monkeypatch):
+    """A ``.tmp`` that is a link lists and prunes nothing in its target; a
+    real ``.tmp`` keeps a folder that is not empty."""
+    import config
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    linked, real = _home("a1", "alice"), _home("a2", "alice")
+    target = Path(config.AGENTS_DIR) / "elsewhere"
+    (target / "empty").mkdir(parents=True)
+    (target / "kept.bin").write_text("z" * 10)
+    _age_file(target / "kept.bin", 1)
+    (linked / ".codex").mkdir(parents=True)
+    (linked / ".codex" / ".tmp").symlink_to(target)
+    (real / ".codex" / ".tmp" / "empty" / "deeper").mkdir(parents=True)
+    (real / ".codex" / ".tmp" / "full").mkdir()
+    (real / ".codex" / ".tmp" / "full" / "young.bin").write_text("z")
+
+    _sweep(days=30)
+
+    assert (target / "empty").is_dir() and (target / "kept.bin").exists()
+    assert not (real / ".codex" / ".tmp" / "empty").exists()
+    assert (real / ".codex" / ".tmp" / "full" / "young.bin").exists()
+
+
+def test_an_agent_whose_folder_is_a_link_is_reached_by_the_passes(temp_db, monkeypatch, tmp_path):
+    """The operator may move an agent's folder and leave a link in its place:
+    an aged chat's files and Codex's junk go beneath the real folder, and a
+    link below it still leads no removal out."""
+    import config
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    real = tmp_path / "disk2" / "a3"
+    real.mkdir(parents=True)
+    (Path(config.AGENTS_DIR) / "a3").symlink_to(real)
+    home = _home("a3", "alice")
+    sid, tid = _uuid(), _uuid()
+    temp_db.create_chat("c3", "user-admin", "a3")
+    temp_db.update_chat("c3", session_id=sid, codex_thread_id=tid)
+    _backdate_chat("c3", 60)
+    cf, rf = _mk_claude(home, sid), _mk_rollout(home, tid)
+    files = _mk_codex_junk(home)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "kept.bin").write_text("z" * 10)
+    _age_file(target / "kept.bin", 1)
+    (real / "users" / "alice" / ".codex" / ".tmp" / "ext").symlink_to(target)
+
+    stats = _sweep(days=30)
+
+    assert not cf.exists() and not rf.exists()
+    assert stats["session_files_deleted"] == 2
+    assert not files["logs"].exists() and not files["tmp_file"].exists()
+    assert not (real / "users" / "alice" / ".codex" / ".tmp" / "plugins").exists()
+    assert files["state"].exists()
+    assert (target / "kept.bin").exists()
+
+
+def test_a_file_of_no_agent_is_removed_beneath_the_agents_root(tmp_path, monkeypatch):
+    """A cache folder of the agents folder holds no agent: its file goes
+    beneath the agents root, and one behind a link stays."""
+    from services.infra import safe_fs
+    agents = tmp_path / "agents"
+    (agents / ".cache").mkdir(parents=True)
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    own = agents / ".cache" / "a.partial"
+    own.write_text("x")
+    retention._remove_beneath(own, tree=False)
+    assert not own.exists()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "kept.partial").write_text("z")
+    (agents / ".linked").symlink_to(elsewhere)
+    with pytest.raises(safe_fs.SymlinkRefused):
+        retention._remove_beneath(agents / ".linked" / "kept.partial", tree=False)
+    assert (elsewhere / "kept.partial").read_text() == "z"
+
+
+@pytest.mark.parametrize("shape", ["dot-dot", "relative"])
+def test_a_path_whose_parts_are_refused_removes_nothing(tmp_path, monkeypatch, shape):
+    """No pass builds such a path (each comes from a listing of the agents
+    folder, and a ``Path`` folds a dot or an empty part away); one that did
+    would be refused, never removed in place."""
+    from services.infra import safe_fs
+    agents = tmp_path / "agents"
+    (agents / "ag").mkdir(parents=True)
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    monkeypatch.chdir(tmp_path)
+    victim = agents / "victim.partial"
+    victim.write_text("x")
+    (agents / "ag" / "victim.partial").write_text("y")
+    path = {"dot-dot": Path(f"{agents}/ag/../victim.partial"),
+            "relative": Path("agents/victim.partial")}[shape]
+    with pytest.raises(safe_fs.SafeFsError):
+        retention._remove_beneath(path, tree=False)
+    assert victim.read_text() == "x"
+    assert (agents / "ag" / "victim.partial").read_text() == "y"
+
+
 def test_codex_junk_skips_busy_home_and_young_files(temp_db, monkeypatch):
     monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
     _set_username(temp_db, "user-admin", "alice")
@@ -460,6 +602,35 @@ def test_codex_junk_skips_busy_home_and_young_files(temp_db, monkeypatch):
     assert busy_files["logs"].exists()      # whole home skipped
     assert young["logs"].exists()           # too young
     assert not young["logs_wal"].exists()   # aged sibling still cleaned
+
+
+def test_codex_junk_keeps_the_logs_of_a_home_with_a_live_machine_session(temp_db, monkeypatch):
+    """The home of a session a compute machine runs is busy for as long as
+    the remote layer holds the session: its logs, its staging files and its
+    thread's month-old record stay, an idle home's go, and its own go once
+    the session closed."""
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    running = _mk_codex_junk(_home("a1", "alice"))
+    idle = _mk_codex_junk(_home("a2", "alice"))
+    sid, thread = _uuid(), _uuid()
+    record = _home("a1", "alice") / ".codex" / f"{thread}.text-sha256"
+    record.write_text("z")
+    _age_file(record, 31)
+    layer = _machine_session(monkeypatch, sid, agent="a1", username="alice", thread=thread)
+
+    _sweep(days=30, live=retention._build_live_snapshot())
+
+    assert running["logs"].exists() and running["logs_wal"].exists() and running["tmp_file"].exists()
+    assert record.exists()
+    assert not idle["logs"].exists() and not idle["tmp_file"].exists()
+
+    layer._sessions.pop(sid)
+    _sweep(days=30, live=retention._build_live_snapshot())
+
+    assert not running["logs"].exists() and not running["logs_wal"].exists()
+    assert not running["tmp_file"].exists() and not record.exists()
+    assert running["state"].exists()
 
 
 # ---------------------------------------------------------------------------
@@ -542,9 +713,10 @@ def test_live_snapshot_ignores_stale_security_contexts(temp_db, monkeypatch):
     unless the session is in a live registry. (The first live run-now
     deleted 0 of 292 MB junk because every recently-used home looked busy.)
     """
+    from types import SimpleNamespace
+
     import core.events.stream_pump as stream_pump
-    import core.layers.cli.session as cli_session
-    import core.layers.codex.session as codex_session
+    import core.layers.direct.session as direct_session
     import core.session.session_state as session_state
 
     class _Ctx:
@@ -552,14 +724,13 @@ def test_live_snapshot_ignores_stale_security_contexts(temp_db, monkeypatch):
             self.agent = agent
             self.username = username
 
-    class _Codex:
-        thread_id = "019eb403-603e-7a02-bbe2-39d5a84b9f2a"
-        config_dir = "/tmp/retention-test/.codex"
-
-    monkeypatch.setattr(cli_session, "_persistent_sessions", {"sid-live": object()})
-    monkeypatch.setattr(codex_session, "_codex_sessions", {"sid-codex": _Codex()})
+    thread = "019eb403-603e-7a02-bbe2-39d5a84b9f2a"
+    on_a_machine = SimpleNamespace(session_id="sid-codex", machine_id="m-1", resume_handle=thread)
+    monkeypatch.setattr(retention, "_remote_layer_for_sweep",
+                        lambda: _FakeRemoteLayer({"sid-codex": on_a_machine}))
+    monkeypatch.setattr(direct_session, "_direct_sessions", {"sid-live": object()})
     monkeypatch.setattr(session_state, "_session_security", {
-        "sid-live": _Ctx("a1", "alice"),     # live cli session → busy
+        "sid-live": _Ctx("a1", "alice"),     # a session the platform holds → busy
         "sid-stale": _Ctx("a2", "alice"),    # restart residue → ignored
     })
     monkeypatch.setattr(stream_pump, "_active_pumps", {})
@@ -569,7 +740,24 @@ def test_live_snapshot_ignores_stale_security_contexts(temp_db, monkeypatch):
     assert all(agent != "a2" for agent, _u in snap.busy_homes)
     assert "sid-stale" not in snap.session_ids
     assert "sid-live" in snap.session_ids and "sid-codex" in snap.session_ids
-    assert _Codex.thread_id in snap.codex_thread_ids
+    assert thread in snap.codex_thread_ids
+
+
+def test_a_session_a_machine_runs_makes_its_home_busy_and_its_thread_live(temp_db, monkeypatch):
+    """A session a machine runs is in no pool of the platform's own: the
+    remote layer's record makes its id and its thread live, and the context
+    of that session makes its home busy."""
+    import core.events.stream_pump as stream_pump
+    import core.layers.direct.session as direct_session
+    sid, thread = _uuid(), _uuid()
+    _machine_session(monkeypatch, sid, agent="a1", username="alice", thread=thread)
+    monkeypatch.setattr(direct_session, "_direct_sessions", {})
+    monkeypatch.setattr(stream_pump, "_active_pumps", {})
+
+    snap = retention._build_live_snapshot()
+
+    assert sid in snap.session_ids and thread in snap.codex_thread_ids
+    assert snap.busy_homes == {("a1", "alice")}
 
 
 def test_settings_helpers(temp_db):
@@ -733,12 +921,19 @@ def test_the_sweep_deletes_old_archives_only(temp_db):
     link = Path(config.AGENTS_DIR) / ".offboarded" / "linked"
     link.symlink_to(Path(config.AGENTS_DIR) / "a1")
     _retired("linked", archived_days=400)
+    from services.infra import git_writer
+    histories = git_writer.history_root() / "offboarded"
+    for name in ("old-pat", "young"):
+        (histories / name / "a1" / "context.git").mkdir(parents=True)
     stats = {"offboarded_deleted": 0, "offboarded_bytes": 0, "errors": 0}
     retention._pass_offboarded_archives(stats, dry_run=True)
     assert stats["offboarded_deleted"] == 1 and stats["offboarded_bytes"] >= 200 and old.exists()
+    assert (histories / "old-pat").is_dir()
     stats = {"offboarded_deleted": 0, "offboarded_bytes": 0, "errors": 0}
     retention._pass_offboarded_archives(stats, dry_run=False)
     assert stats["offboarded_deleted"] == 1 and not old.exists()
+    # The person's histories go with their archive, and nobody else's.
+    assert not (histories / "old-pat").exists() and (histories / "young" / "a1" / "context.git").is_dir()
     assert young.exists() and undated.exists() and odd.exists() and link.is_symlink()
     assert (target / "keep.txt").read_text() == "k"  # a link is never followed
     # 0 keeps for ever; the toggle off keeps too.
@@ -908,8 +1103,11 @@ class _FakeCM:
     def get_connected_machines(self):
         return list(self._machines)
 
-    def satellite_supports_session_retention(self, mid):
-        return tuple(int(p) for p in self._machines[mid].split(".")) >= (0, 5, 150)
+    def is_compute(self, machine_id):
+        return False
+
+    def shares_folders(self, machine_id):
+        return False
 
     def satellite_name(self, mid):
         return f"name-{mid}"
@@ -941,8 +1139,7 @@ def test_a_remote_chat_ages_out_and_its_machine_is_asked_with_its_keep_list(temp
     """An aged chat pinned to a machine is flagged like a local one; the
     machine then gets every id the rows still reference for it (its own
     pinned rows and the rows that name no place, the aged chat's ids gone),
-    never another machine's nor a sandbox chat's; an older machine is not
-    asked."""
+    never another machine's nor a sandbox chat's."""
     db = temp_db
     _set_username(db, "user-admin", "alice")
     aged_sid, aged_tid, fresh_sid, unpinned_sid, unplaced_sid, other_sid = (_uuid() for _ in range(6))
@@ -957,7 +1154,7 @@ def test_a_remote_chat_ages_out_and_its_machine_is_asked_with_its_keep_list(temp
     db.update_chat("unplaced", session_id=unplaced_sid, execution_target="")
     db.create_chat("other", "user-admin", "a1")
     db.update_chat("other", session_id=other_sid, execution_target="m-b")
-    cm = _FakeCM({"m-a": "0.5.150", "m-b": "0.5.149"}, {
+    cm = _FakeCM({"m-a": "0.5.150"}, {
         "m-a": {"files": 3, "bytes": 300, "deleted": 1, "deleted_bytes": 100, "candidates": ["x"]},
     })
 
@@ -1063,6 +1260,19 @@ def test_the_refs_by_target_split_the_pinned_rows_from_the_rest(temp_db):
     assert by_target[""] == set()   # the dynamic tasks' refs: none here
 
 
+def test_a_chat_on_a_compute_machine_on_another_host_is_on_that_machines_list(temp_db):
+    db = temp_db
+    a = _uuid()
+    db.create_chat("o", "user-admin", "a1")
+    db.update_chat("o", session_id=a, execution_target="local")
+    from storage import remote_store
+    remote_store.set_chat_compute_machine("o", "rack-two")
+    by_target = db.get_session_refs_by_target()
+    # Its pin stays 'local'; its engine record lives on the machine.
+    assert by_target["rack-two"] == {a}
+    assert a not in by_target.get("local", set())
+
+
 def test_storage_usage_shows_what_the_machines_held_at_the_last_sweep(temp_db):
     import json
     assert retention.compute_storage_usage()["remote_session_files_bytes"] is None
@@ -1106,3 +1316,366 @@ def test_a_report_goes_a_year_after_it_was_filed(temp_db, monkeypatch):
     assert stats["reply_reports_deleted"] == 1 and _report_ids() == [old, kept]
     stats = _sweep(enabled=False)
     assert stats["reply_reports_deleted"] == 1 and _report_ids() == [kept]
+
+
+def test_codex_junk_takes_a_crashed_sessions_files_and_old_records(temp_db, monkeypatch):
+    """A Codex home's per-session files outlive a session only after a
+    crash: an idle home loses them; a thread's record goes after a month."""
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    codex = _home("a1", "alice") / ".codex"
+    codex.mkdir(parents=True, exist_ok=True)
+    files = {name: codex / name for name in (
+        "s-1.config.toml", "s-1.session.json", "t-old.text-sha256", "t-new.text-sha256")}
+    for f in files.values():
+        f.write_text("z")
+        _age_file(f, 1)
+    _age_file(files["t-old.text-sha256"], 31 * 24)
+    _sweep(days=30)
+    assert not files["s-1.config.toml"].exists() and not files["s-1.session.json"].exists()
+    assert not files["t-old.text-sha256"].exists()
+    assert files["t-new.text-sha256"].exists()
+
+
+def test_codex_junk_keeps_the_files_of_a_running_session(temp_db, monkeypatch):
+    """A running session's own files stay whatever their age, in a home the
+    snapshot calls idle too (a terminal's is not in it): a terminal's and a
+    compute session's stay while they run; a closed session's go."""
+    from core.session import interactive_registry, session_manager
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    codex = _home("a1", "alice") / ".codex"
+    codex.mkdir(parents=True, exist_ok=True)
+    files = {name: codex / name for name in (
+        "s-term.config.toml", "s-term.session.json", "s-compute.session.json",
+        "s-closed.config.toml", "s-closed.session.json")}
+    for f in files.values():
+        f.write_text("z")
+        _age_file(f, 1)
+    monkeypatch.setitem(interactive_registry._sessions, "s-term", object())
+    real = session_manager.live_session
+    monkeypatch.setattr(session_manager, "live_session",
+                        lambda sid: object() if sid == "s-compute" else real(sid))
+    # A busy home (another session runs in it) still loses a closed
+    # session's files: one closed after a proxy restart left them behind.
+    busy = _home("a2", "alice") / ".codex"
+    busy.mkdir(parents=True, exist_ok=True)
+    gone, logs = busy / "s-gone.session.json", busy / "logs_1.sqlite"
+    for f in (gone, logs):
+        f.write_text("z")
+        _age_file(f, 1)
+    _sweep(days=30, live=LiveSnapshot(busy_homes={("a2", "alice")}))
+    assert files["s-term.config.toml"].exists() and files["s-term.session.json"].exists()
+    assert files["s-compute.session.json"].exists()
+    assert not files["s-closed.config.toml"].exists() and not files["s-closed.session.json"].exists()
+    assert not gone.exists() and logs.exists()
+
+
+def test_codex_junk_keeps_session_files_until_a_compute_machine_is_back(temp_db, monkeypatch):
+    """After a platform restart a session that runs on a compute machine is
+    in no registry until the machine's first complete report adopts it: its
+    own files stay while the start still waits for that machine
+    (``compute_bootstrap.waiting``), and a closed one's go after. A thread's
+    record keeps its own rule."""
+    from services.remote import compute_bootstrap
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    _set_username(temp_db, "user-admin", "alice")
+    codex = _home("a1", "alice") / ".codex"
+    codex.mkdir(parents=True, exist_ok=True)
+    held = codex / "s-on-compute.session.json"
+    held.write_text("z")
+    _age_file(held, 1)
+    record = codex / "t-old.text-sha256"
+    record.write_text("z")
+    _age_file(record, 31)
+    compute_bootstrap.reset_for_tests()
+    compute_bootstrap._expected.add("compute-1")
+    try:
+        _sweep(days=30)
+        assert held.exists()                   # the machine has not reported yet
+        assert not record.exists()             # a month-old record goes regardless
+        compute_bootstrap._expected.discard("compute-1")   # its report came
+        _sweep(days=30)
+        assert not held.exists()
+    finally:
+        compute_bootstrap.reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Sessions' homes (core/sandbox/session_home) in the platform's folders
+# ---------------------------------------------------------------------------
+
+def _homes(sids, *, age_s: float = 2 * 3600):
+    """Homes made ``age_s`` ago (their folder's time set back)."""
+    from core.sandbox import session_home
+    store = _home("pa", "alice") / ".claude"
+    store.mkdir(parents=True, exist_ok=True)
+    then = time.time() - age_s
+    for sid in sids:
+        home = session_home.prepare(store, sid, ("projects",))
+        (home / ".credentials.json").write_text(sid)
+        os.utime(home, (then, then))
+    return store
+
+
+def test_a_home_made_in_the_last_hour_is_left(temp_db, monkeypatch):
+    """A start makes its home long before its binding row (the files, the
+    tools, the machine's answer come first), and a terminal is in no
+    registry the pass reads: a home that changed in the last hour stays."""
+    from services.engines import subscription_pool
+    starting = "f" * 8 + "-1111-2222-3333-444444444444"
+    store = _homes([starting], age_s=60)
+    monkeypatch.setattr(subscription_pool, "within_boot_grace", lambda: False)
+    monkeypatch.setattr(subscription_pool, "session_gone", lambda sid: True)
+    stats = {"session_homes_removed": 0}
+    retention._pass_session_homes(LiveSnapshot(), stats, dry_run=False)
+    assert (store / "own" / starting).is_dir() and stats["session_homes_removed"] == 0
+
+
+def test_a_start_of_an_existing_home_touches_it(tmp_path):
+    """A chat started again in the home its last session left (the same id)
+    counts as fresh to the daily pass."""
+    from types import SimpleNamespace
+
+    from core.layers.cli.layer import CLIExecutionLayer
+    from core.sandbox import session_home
+    sid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    store = tmp_path / ".claude"
+    store.mkdir()
+    layer = CLIExecutionLayer.__new__(CLIExecutionLayer)
+    spec = layer.capabilities.auth.session_home
+    home = session_home.prepare(store, sid, spec.links, spec.seed_map())
+    then = time.time() - 2 * 3600
+    os.utime(home, (then, then))
+    layer._make_home(sid, SimpleNamespace(sandbox_host_claude_dir=str(store)))
+    assert time.time() - home.stat().st_mtime < 60
+
+
+def test_a_start_touches_its_home_with_no_link_followed(tmp_path, monkeypatch):
+    """The home's time is set through a handle opened beneath the agent's
+    real folder: a home whose name is a link at the touch refuses the start,
+    and the link's target keeps its time."""
+    from types import SimpleNamespace
+
+    import config as app_config
+    from core.layers.cli.layer import CLIExecutionLayer
+    from core.sandbox import session_home
+    sid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    agents = tmp_path / "agents"
+    store = agents / "pa" / "workspace" / ".claude"
+    (store / "own").mkdir(parents=True)
+    monkeypatch.setattr(app_config, "AGENTS_DIR", agents)
+    stand_in = tmp_path / "stand-in"
+    stand_in.mkdir()
+    then = time.time() - 2 * 3600
+    os.utime(stand_in, (then, then))
+    linked = store / "own" / sid
+    linked.symlink_to(stand_in)
+    monkeypatch.setattr(session_home, "prepare", lambda *a, **k: linked)
+    layer = CLIExecutionLayer.__new__(CLIExecutionLayer)
+    with pytest.raises(OSError):
+        layer._make_home(sid, SimpleNamespace(sandbox_host_claude_dir=str(store), agent_name="pa"))
+    assert time.time() - stand_in.stat().st_mtime > 3600
+
+
+def test_the_homes_of_gone_sessions_are_swept_and_live_ones_kept(temp_db, monkeypatch):
+    """One answer decides (``subscription_pool.session_gone``): a home
+    stays unless its session is gone."""
+    from services.engines import subscription_pool
+    gone, live, unknown = (f"{c * 8}-1111-2222-3333-444444444444" for c in "abc")
+    store = _homes([gone, live, unknown])
+    monkeypatch.setattr(subscription_pool, "within_boot_grace", lambda: False)
+    monkeypatch.setattr(subscription_pool, "session_gone", lambda sid: sid == gone)
+    dropped: list[str] = []
+    monkeypatch.setattr(subscription_pool, "drop_ghost_binding", dropped.append)
+    stats = {"session_homes_removed": 0}
+    retention._pass_session_homes(LiveSnapshot(), stats, dry_run=False)
+    assert stats["session_homes_removed"] == 1 and dropped == [gone]
+    assert sorted(p.name for p in (store / "own").iterdir()) == sorted([live, unknown])
+    assert (store / "projects").is_dir()
+
+
+def _pool_alone(monkeypatch, *, held=(), connected=(), reported=(), compute=()):
+    """The pool's liveness with its three sources as the test says: the
+    registries (``held``), the machines here and the machines that reported
+    since this start, and the compute machines' rows."""
+    from core.remote import satellite_connection, satellite_link
+    from core.session import session_state
+    from services.engines import subscription_pool
+    from storage import remote_store
+
+    class _Machines:
+        def is_connected(self, machine_id):
+            return machine_id in connected
+
+    monkeypatch.setattr(session_state, "session_is_held", lambda sid: sid in held)
+    monkeypatch.setattr(subscription_pool, "within_boot_grace", lambda: False)
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", _Machines)
+    monkeypatch.setattr(satellite_link, "reported_since_boot", lambda m: m in reported)
+    monkeypatch.setattr(remote_store, "list_compute_machines", lambda: [{"id": m} for m in compute])
+
+
+def _bind_row(db, sid: str, target: str, store) -> None:
+    from storage.billing import subscription_store
+    subscription_store.upsert_session_binding(
+        sid, "sub-of-the-test", layer="claude-code-cli", user_sub=None,
+        scope_key=f"{target}:{store / 'own' / sid}")
+
+
+def test_a_stored_row_with_no_session_keeps_no_home(temp_db, monkeypatch):
+    """Both units restarted together, or the platform declined the session
+    after a restart: no registry names it and nothing released its row.
+    Once its machine is back and has reported, the home goes with the row."""
+    from storage.billing import subscription_store
+    ghost, away, quiet = (f"{c * 8}-1111-2222-3333-444444444444" for c in "abc")
+    store = _homes([ghost, away, quiet])
+    _pool_alone(monkeypatch, connected={"c-here", "c-quiet"}, reported={"c-here"},
+                compute={"c-here"})
+    _bind_row(temp_db, ghost, "local", store)
+    _bind_row(temp_db, away, "c-away", store)
+    _bind_row(temp_db, quiet, "c-quiet", store)
+    stats = {"session_homes_removed": 0}
+    retention._pass_session_homes(LiveSnapshot(), stats, dry_run=False)
+    from services.engines import subscription_pool
+    subscription_pool.flush_binding_writes()
+    assert sorted(p.name for p in (store / "own").iterdir()) == sorted([away, quiet])
+    assert subscription_store.get_session_binding(ghost) is None
+    assert subscription_store.get_session_binding(away) and subscription_store.get_session_binding(quiet)
+    assert stats["session_homes_removed"] == 1
+
+
+def test_a_live_terminal_with_no_row_keeps_its_home(temp_db, monkeypatch):
+    """A terminal is in the interactive registry alone. One whose row the
+    startup prune took (older than a week at a restart) still runs from its
+    home."""
+    terminal, gone = (f"{c * 8}-1111-2222-3333-444444444444" for c in "ab")
+    store = _homes([terminal, gone])
+    _pool_alone(monkeypatch, held={terminal})
+    stats = {"session_homes_removed": 0}
+    retention._pass_session_homes(LiveSnapshot(), stats, dry_run=False)
+    assert [p.name for p in (store / "own").iterdir()] == [terminal]
+
+
+def test_a_home_that_cannot_be_removed_does_not_keep_the_next(temp_db, monkeypatch):
+    from core.sandbox import session_home
+    from services.engines import subscription_pool
+    stuck, next_one = (f"{c * 8}-1111-2222-3333-444444444444" for c in "ab")
+    store = _homes([stuck, next_one])
+    monkeypatch.setattr(subscription_pool, "within_boot_grace", lambda: False)
+    monkeypatch.setattr(subscription_pool, "session_gone", lambda sid: True)
+    monkeypatch.setattr(subscription_pool, "drop_ghost_binding", lambda sid: None)
+    real = session_home.drop
+
+    def _drop(folder, sid, links):
+        if sid == stuck:
+            raise OSError("a file that cannot be removed")
+        return real(folder, sid, links)
+    monkeypatch.setattr(session_home, "drop", _drop)
+    stats = {"session_homes_removed": 0, "errors": 0}
+    retention._pass_session_homes(LiveSnapshot(), stats, dry_run=False)
+    assert [p.name for p in (store / "own").iterdir()] == [stuck]
+    assert stats == {"session_homes_removed": 1, "errors": 1}
+
+
+def test_the_daily_run_waits_for_the_boot_grace(temp_db, monkeypatch):
+    """The first run after a start comes once the registries are whole: a
+    run inside the grace would pass over every home and the next would be a
+    day later, which an install that restarts every day never reaches."""
+    import asyncio
+
+    from services.engines import subscription_pool
+    sid = "a" * 8 + "-1111-2222-3333-444444444444"
+    store = _homes([sid])
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    monkeypatch.setattr(retention, "_build_live_snapshot", LiveSnapshot)
+    monkeypatch.setattr(retention, "_last_run", 0.0)
+    monkeypatch.setattr(subscription_pool, "session_gone", lambda s: True)
+    monkeypatch.setattr(subscription_pool, "drop_ghost_binding", lambda s: None)
+    monkeypatch.setattr(subscription_pool, "within_boot_grace", lambda: True)
+    asyncio.run(retention.maybe_run_daily())
+    assert retention._last_run == 0.0 and (store / "own" / sid).is_dir()
+    monkeypatch.setattr(subscription_pool, "within_boot_grace", lambda: False)
+    asyncio.run(retention.maybe_run_daily())
+    assert retention._last_run > 0 and not (store / "own" / sid).exists()
+
+
+def test_no_home_is_swept_inside_the_boot_grace_or_on_a_dry_run(temp_db, monkeypatch):
+    from services.engines import subscription_pool
+    sid = "e" * 8 + "-1111-2222-3333-444444444444"
+    store = _homes([sid])
+    monkeypatch.setattr(subscription_pool, "session_gone", lambda s: True)
+    dropped: list[str] = []
+    monkeypatch.setattr(subscription_pool, "drop_ghost_binding", dropped.append)
+    monkeypatch.setattr(subscription_pool, "within_boot_grace", lambda: True)
+    stats = {"session_homes_removed": 0}
+    retention._pass_session_homes(LiveSnapshot(), stats, dry_run=False)
+    assert (store / "own" / sid).is_dir() and stats["session_homes_removed"] == 0
+    monkeypatch.setattr(subscription_pool, "within_boot_grace", lambda: False)
+    retention._pass_session_homes(LiveSnapshot(), stats, dry_run=True)
+    assert (store / "own" / sid).is_dir() and stats["session_homes_removed"] == 1
+    assert dropped == []
+
+
+def test_the_histories_of_an_agent_that_is_gone_are_removed_and_no_other(temp_db, caplog):
+    """The backstop for a delete whose own removal failed: no row AND no
+    folder. A folder alone, or a row alone, keeps the histories."""
+    import logging
+
+    from services.infra import git_writer
+    from storage.agents import agent_store
+    agent_store.create_agent("hist-kept", "Kept")
+    root = git_writer.history_root()
+    (Path(config.AGENTS_DIR) / "hist-folder-only" / "config").mkdir(parents=True)
+    for name in ("hist-folder-only", "hist-gone"):
+        (root / "agents" / name / "config.git").mkdir(parents=True)
+    (root / "set-aside" / "hist-gone" / "config.old-git-1").mkdir(parents=True)
+    with caplog.at_level(logging.INFO):
+        retention._pass_orphan_histories({}, dry_run=True)
+    assert (root / "agents" / "hist-gone").is_dir() and "would remove 2 histories" in caplog.text
+    retention._pass_orphan_histories({}, dry_run=False)
+    assert not (root / "agents" / "hist-gone").exists() and not (root / "set-aside" / "hist-gone").exists()
+    assert (root / "agents" / "hist-kept" / "config.git").is_dir()
+    assert (root / "agents" / "hist-folder-only" / "config.git").is_dir()
+    assert any(name == "orphan-histories" for name in _pass_names())
+
+
+def _pass_names() -> list[str]:
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(retention))
+    return [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and node.value.startswith("orphan-")]
+
+
+def test_storage_usage_follows_no_link_in_a_home(temp_db, tmp_path):
+    """The admin card's sizes of a home's engine folders follow no link: a
+    sessions folder replaced by a link counts nothing of its target."""
+    _set_username(temp_db, "user-admin", "alice")
+    home = _home("a1", "alice")
+    stand_in = tmp_path / "stand-in"
+    (stand_in / "2026").mkdir(parents=True)
+    (stand_in / "2026" / "big.jsonl").write_bytes(b"z" * 5000)
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+    (home / ".codex" / "sessions").symlink_to(stand_in)
+    assert retention.compute_storage_usage()["session_files_bytes"] < 5000
+
+
+def test_a_homes_settings_come_from_the_store_with_no_link_followed(tmp_path, monkeypatch):
+    """A home's settings are the store's own bytes, read beneath the
+    agent's real folder: a store settings file that is a link is refused,
+    and its target never reaches the home."""
+    from types import SimpleNamespace
+
+    import config as app_config
+    from core.layers.cli.layer import CLIExecutionLayer
+    sid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    agents = tmp_path / "agents"
+    store = agents / "pa" / "workspace" / ".claude"
+    store.mkdir(parents=True)
+    monkeypatch.setattr(app_config, "AGENTS_DIR", agents)
+    (tmp_path / "elsewhere.json").write_text('{"theirs": true}')
+    (store / "settings.json").symlink_to(tmp_path / "elsewhere.json")
+    layer = CLIExecutionLayer.__new__(CLIExecutionLayer)
+    with pytest.raises(OSError):
+        layer._make_home(sid, SimpleNamespace(sandbox_host_claude_dir=str(store), agent_name="pa"))
+    assert not (store / "own" / sid / "settings.json").exists()

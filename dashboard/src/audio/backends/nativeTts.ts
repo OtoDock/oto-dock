@@ -1,9 +1,8 @@
 // Native TTS — Capacitor TextToSpeech on device, Web Speech (speechSynthesis)
 // in the browser. Mirrors the unlock/speak approach already proven in
-// useNotificationSound. createStream() adds the incremental voice-mode sink
-// (speak sentences as a reply streams) on top of the one-shot play().
+// useNotificationSound.
 
-import { type TTSBackend, type TTSPlayOptions, type TtsStream, isNativePlatform, probeWithTimeout } from '../types'
+import { type TTSBackend, type TTSPlayOptions, isNativePlatform, probeWithTimeout } from '../types'
 
 function pickVoice(language: string, voiceURI?: string): SpeechSynthesisVoice | null {
   const voices = window.speechSynthesis?.getVoices?.() || []
@@ -12,76 +11,6 @@ function pickVoice(language: string, voiceURI?: string): SpeechSynthesisVoice | 
     if (exact) return exact
   }
   return voices.find(v => v.lang.startsWith(language)) || voices.find(v => v.lang.startsWith('en')) || null
-}
-
-// Incremental sink: speak sentences in order as the reply streams. In the browser
-// speechSynthesis has its OWN utterance queue, so each sentence is just spoken
-// (no cancel() between them) — which also dodges Chrome's ~15 s single-utterance
-// truncation. On device the Capacitor plugin speaks one clip at a time, so we
-// drain a queue sequentially. cancel() = barge-in (stop + drop the queue).
-function createNativeStream(opts: TTSPlayOptions): TtsStream {
-  let cancelled = false
-  let finished = false
-  let settled = false
-  let resolveDone!: () => void
-  const done = new Promise<void>(r => { resolveDone = r })
-  const settle = () => { if (!settled) { settled = true; resolveDone() } }
-
-  if (isNativePlatform()) {
-    const queue: string[] = []
-    let draining = false
-    const drain = async () => {
-      if (draining) return
-      draining = true
-      try {
-        const { TextToSpeech } = await import('@capacitor-community/text-to-speech')
-        while (!cancelled && queue.length) {
-          const text = queue.shift() as string
-          try { await TextToSpeech.speak({ text, lang: opts.language, rate: 1.0 }) } catch { /* skip clip */ }
-        }
-      } finally {
-        draining = false
-        if (cancelled || (finished && queue.length === 0)) settle()
-      }
-    }
-    return {
-      push(text) { if (cancelled || finished || !text) return; queue.push(text); void drain() },
-      finish() { if (cancelled || finished) return; finished = true; if (!draining && queue.length === 0) settle() },
-      cancel() {
-        if (cancelled) return
-        cancelled = true; queue.length = 0
-        import('@capacitor-community/text-to-speech').then(({ TextToSpeech }) => TextToSpeech.stop()).catch(() => {})
-        settle()
-      },
-      done,
-    }
-  }
-
-  // Browser: queue utterances on speechSynthesis (built-in FIFO ordering).
-  const synth = typeof window !== 'undefined' ? window.speechSynthesis : undefined
-  let outstanding = 0
-  const maybeSettle = () => { if (finished && outstanding === 0) settle() }
-  return {
-    push(text) {
-      if (cancelled || finished || !text || !synth) return
-      const u = new SpeechSynthesisUtterance(text)
-      u.lang = opts.language
-      const v = pickVoice(opts.language, opts.voiceURI)
-      if (v) u.voice = v
-      outstanding++
-      u.onend = () => { outstanding--; maybeSettle() }
-      u.onerror = () => { outstanding--; maybeSettle() }
-      synth.speak(u)
-    },
-    finish() { if (cancelled || finished) return; finished = true; maybeSettle() },
-    cancel() {
-      if (cancelled) return
-      cancelled = true
-      try { synth?.cancel() } catch { /* ignore */ }
-      settle()
-    },
-    done,
-  }
 }
 
 // ── Availability probe ────────────────────────────────────────────
@@ -164,10 +93,6 @@ export const nativeTts: TTSBackend = {
         .then(({ TextToSpeech }) => TextToSpeech.stop())
         .catch(() => { /* ignore */ })
     }
-  },
-
-  createStream(opts: TTSPlayOptions) {
-    return createNativeStream(opts)
   },
 }
 

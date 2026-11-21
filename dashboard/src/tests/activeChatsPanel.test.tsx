@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import ActiveChatsPanel from '@/components/chat/ActiveChatsPanel'
 import { GLASS } from '@/components/ui/glass'
+import { useChatStore } from '@/store/chatStore'
+import { _resetReadMarksForTests, setReadSender } from '@/lib/chat/readMarks'
 
 // ─── ActiveChatsPanel (render logic; hook + agents mocked) ──────────────────
 
@@ -67,6 +69,17 @@ describe('ActiveChatsPanel', () => {
     expect(screen.queryByText('Doubled in history')).toBeNull()
     expect(screen.getByText('Nightly digest')).toBeTruthy()
     expect(screen.getByText('Foreign task')).toBeTruthy()
+  })
+
+  it('pinned view: an own live chat the pinned list does not show stays in the strip', () => {
+    rowsMock.mockReturnValue([
+      { id: 'c1', agent: 'alpha', title: 'Pinned and live', phase: 'streaming', sourceType: 'chat' },
+      { id: 'c2', agent: 'alpha', title: 'Live, not pinned', phase: 'streaming', sourceType: 'chat' },
+    ])
+    render(<ActiveChatsPanel currentAgent="alpha" activeChatId={null} onSelect={() => {}}
+                             shownIds={new Set(['c1'])} />)
+    expect(screen.getByText('Live, not pinned')).toBeTruthy()
+    expect(screen.queryByText('Pinned and live')).toBeNull()
   })
 
   it('task view flips the dedup: own live chats show, own tasks stay in the list below', () => {
@@ -213,6 +226,22 @@ describe('ActiveChatsPanel', () => {
     // Task runs render on the chat page — the row deep-links with task mode on.
     expect(onSelect).not.toHaveBeenCalled()
     expect(navigateMock).toHaveBeenCalledWith('/chat/beta/task-run-42?tasks=1')
+  })
+
+  it("a row's click marks the chat read only once a socket takes the frame", () => {
+    _resetReadMarksForTests()
+    useChatStore.setState({ byChat: {} })
+    useChatStore.getState().setUnread('c9', true)
+    rowsMock.mockReturnValue([{ id: 'c9', agent: 'beta', title: 'Finished lane', phase: 'finished' }])
+    render(<ActiveChatsPanel currentAgent="alpha" activeChatId={null} onSelect={() => {}} />)
+    // No socket is open: the dot stays, the mark is held.
+    fireEvent.click(screen.getByText('Finished lane'))
+    expect(useChatStore.getState().byChat.c9?.unread).toBe(true)
+    const sent: unknown[] = []
+    setReadSender((frame) => { sent.push(frame); return true })
+    expect(sent).toEqual([{ type: 'chat_read', chat_id: 'c9' }])
+    expect(useChatStore.getState().byChat.c9?.unread).toBe(false)
+    _resetReadMarksForTests()
   })
 
   it('finished task rows never carry the unread dot', () => {

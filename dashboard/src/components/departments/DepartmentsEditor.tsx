@@ -918,7 +918,7 @@ export default function DepartmentsEditor({ onInstallFromCommunity }: { onInstal
         <p className="text-xs text-secondary" data-testid="departments-install-line">
           Or install a ready-made department from the community.{' '}
           <button type="button" className="underline text-primary" onClick={onInstallFromCommunity}>
-            Browse the department sets
+            Browse the departments
           </button>
         </p>
       )}

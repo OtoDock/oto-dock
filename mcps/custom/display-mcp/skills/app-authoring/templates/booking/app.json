@@ -4,6 +4,13 @@
   "actions": [
     {"id": "notify", "label": "Tell the owner about a booking", "type": "platform", "method": "notifications.create"}
   ],
+  "exports": {
+    "methods": {
+      "slots": {"description": "Free times to book", "min_role": "external"},
+      "book": {"description": "Book a free time for the caller, by its starts_at", "min_role": "external"},
+      "mine": {"description": "The caller's own bookings", "min_role": "external"}
+    }
+  },
   "egress": ["api.stripe.com"],
   "secrets": [
     {

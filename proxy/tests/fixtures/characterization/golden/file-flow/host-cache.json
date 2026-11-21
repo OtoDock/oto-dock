@@ -1,0 +1,102 @@
+{
+ "a_broken_sidecar": false,
+ "a_changed_stat_pulls": {
+  "bytes": "host bytes v2",
+  "wire": [
+   {
+    "agent_slug": "",
+    "command_id": "<id>",
+    "path": "C:\\Users\\Ann\\Doc.TXT",
+    "path_kind": "satellite_host",
+    "type": "file_stat"
+   },
+   {
+    "agent_slug": "",
+    "path": "C:\\Users\\Ann\\Doc.TXT",
+    "path_kind": "satellite_host",
+    "request_id": "<id>",
+    "type": "file_pull"
+   }
+  ]
+ },
+ "a_failed_pull": null,
+ "a_sidecar_of_another_machine": false,
+ "a_twin_of_the_path_revalidates": {
+  "same_entry": true,
+  "wire": [
+   {
+    "agent_slug": "",
+    "command_id": "<id>",
+    "path": "c:/Users/Ann/Doc.TXT",
+    "path_kind": "satellite_host",
+    "type": "file_stat"
+   }
+  ]
+ },
+ "after_cleanup": false,
+ "first_read": {
+  "bytes": "host bytes",
+  "path": "<agents>/.remote-host-cache/flow-session/40791009d9992769aa2796163a655975/Doc.TXT",
+  "sidecar": {
+   "abs_path": "C:\\Users\\Ann\\Doc.TXT",
+   "machine_id": "sat-one-0",
+   "stat": {
+    "exists": true,
+    "mtime_ns": 41,
+    "size": 10
+   }
+  },
+  "wire": [
+   {
+    "agent_slug": "",
+    "command_id": "<id>",
+    "path": "C:\\Users\\Ann\\Doc.TXT",
+    "path_kind": "satellite_host",
+    "type": "file_stat"
+   },
+   {
+    "agent_slug": "",
+    "path": "C:\\Users\\Ann\\Doc.TXT",
+    "path_kind": "satellite_host",
+    "request_id": "<id>",
+    "type": "file_pull"
+   }
+  ]
+ },
+ "is_host_cache_path": {
+  "/etc/passwd": false,
+  "<agents>": false,
+  "<agents>/.remote-host-cache": true,
+  "<agents>/.remote-host-cache/flow-session": true,
+  "<agents>/.remote-host-cache/flow-session/x": true,
+  "<agents>/.remote-host-cachex": false
+ },
+ "local_session_pull": null,
+ "own_push": {
+  "ok": true,
+  "sidecar": {
+   "abs_path": "C:\\Users\\Ann\\Doc.TXT",
+   "machine_id": "sat-one-0"
+  },
+  "wire": [
+   {
+    "action": "write",
+    "agent_slug": "",
+    "body": "edited by a tool",
+    "command_id": "<id>",
+    "hash": "sha256:96e1c670c3b8443ee8b43b728237a0b52c0aa8bb62e33065421d146a337e445a",
+    "path": "C:\\Users\\Ann\\Doc.TXT",
+    "path_kind": "satellite_host",
+    "type": "file_push"
+   }
+  ]
+ },
+ "refused": {
+  "a_local_session": false,
+  "another_sessions_cache": false,
+  "climbing_out": false,
+  "the_root_itself": false
+ },
+ "refused_wire": [],
+ "session_root": "<agents>/.remote-host-cache/flow-session"
+}

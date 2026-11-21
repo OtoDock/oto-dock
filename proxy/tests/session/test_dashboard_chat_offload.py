@@ -6,7 +6,8 @@ Regression fence for the 2026-09-04 hardening slice: the converted frames
 through the real handler with the loop guard armed — any store call that
 still runs on the loop thread raises inside the handler and shows up as a
 missing/changed frame. The golden-master suites pin the frame sequences;
-this module pins WHERE the DB work happens.
+this module pins WHERE the DB work happens, and for a chat's open and a
+message's turn, that no disk write runs on the loop either.
 """
 
 from storage.pg import run_db
@@ -66,7 +67,8 @@ class TestBetweenTurnsFrames:
                 ws.client_send({"type": "close"})
         run_ws_scenario(scenario)
 
-    def test_resume_chat_reads_history_off_loop(self, temp_db, monkeypatch, loop_db_guard):
+    def test_resume_chat_reads_history_off_loop(self, temp_db, monkeypatch, loop_db_guard,
+                                                loop_disk_guard):
         layer = FakeExecutionLayer()
         stub_dashboard_seams(monkeypatch, layer)
         slug = make_test_agent()
@@ -77,7 +79,8 @@ class TestBetweenTurnsFrames:
                 await drain_startup(ws)
                 chat_id, _sid = await warm_new_chat(ws, layer, slug)
                 temp_db.add_chat_message(chat_id, "user", "Say hello")
-                with loop_db_guard.active():
+                # A chat's open writes nothing on the loop either.
+                with loop_db_guard.active(), loop_disk_guard.active():
                     ws.client_send({"type": "resume_chat", "chat_id": chat_id})
                     hist = await ws.expect({
                         "type": "chat_history", "chat_id": chat_id, "agent": slug,
@@ -94,7 +97,8 @@ class TestBetweenTurnsFrames:
 
 
 class TestSendPath:
-    def test_first_prompt_title_and_second_send_run_off_loop(self, temp_db, monkeypatch, loop_db_guard):
+    def test_first_prompt_title_and_second_send_run_off_loop(self, temp_db, monkeypatch, loop_db_guard,
+                                                             loop_disk_guard):
         from core.events.common_events import DONE, TEXT, CommonEvent
         layer = FakeExecutionLayer()
         layer.turn_events = [
@@ -136,7 +140,9 @@ class TestSendPath:
                                      "title": "WS Dash Test finished",
                                      "body": "Response ready"})
 
-                with loop_db_guard.active():
+                # A message saved and its turn's end write nothing on the loop
+                # either (the session index is written behind).
+                with loop_db_guard.active(), loop_disk_guard.active():
                     # First send: user row + conditional title, one lane job.
                     await turn_frames("Say hello", titled=True)
                     # done ⇒ persisted: rows readable with no barrier.
@@ -229,6 +235,42 @@ class TestTaskChatReads:
                 return await conn._task_pump_poll()
 
         assert asyncio.run(scenario()) is False
+
+    def test_an_editors_drive_gate_on_a_knowledge_run_reads_off_loop(
+            self, temp_db, monkeypatch, loop_db_guard):
+        """Every drive frame of a task chat asks the continue gate, terminal
+        keys included. An editor's answer reads the run's creator, so the
+        whole gate runs in the database job, and the editor reads why."""
+        import asyncio
+        import uuid
+
+        from core.session.visibility import KNOWLEDGE_RUN_REFUSED
+        from ws.dashboard import DashboardConnection
+        slug = make_test_agent()
+        rid = f"run-{uuid.uuid4().hex[:10]}"
+        temp_db.create_run(rid, "dyn-x", slug, "scheduled", None, "go",
+                           "scheduled", "agent", "user-admin")
+        temp_db.update_run(rid, status="completed", chat_id=f"task-{rid}")
+        temp_db.add_user_agent("user-viewer", slug, "editor", "test")
+        sent = []
+        conn = DashboardConnection.__new__(DashboardConnection)
+        conn.user_sub = "user-viewer"
+        conn.user = {"sub": "user-viewer", "role": "member"}
+
+        async def _send_error(message):
+            sent.append(message)
+        conn._send_error = _send_error
+
+        async def scenario():
+            with loop_db_guard.active():
+                quiet = await conn._deny_task_continue(f"task-{rid}", quiet=True)
+                loud = await conn._deny_task_continue(f"task-{rid}")
+                gone = await conn._deny_task_continue("task-run-unknown", quiet=True)
+                return quiet, loud, gone
+
+        assert asyncio.run(scenario()) == (
+            KNOWLEDGE_RUN_REFUSED, KNOWLEDGE_RUN_REFUSED, "Task run not found")
+        assert sent == [KNOWLEDGE_RUN_REFUSED]
 
     def test_resume_of_a_task_chat_reads_related_runs_off_loop(
             self, temp_db, monkeypatch, loop_db_guard):

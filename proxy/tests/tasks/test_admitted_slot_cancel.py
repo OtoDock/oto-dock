@@ -20,6 +20,7 @@ import pytest
 from services.scheduler import runner, scheduler, shared
 from storage import database as task_store
 from storage.automation import run_status
+from tests._compute import serve
 
 pytestmark = pytest.mark.asyncio
 
@@ -55,6 +56,9 @@ async def _cancel_parked(run_id: str, task_id: str, monkeypatch, *, user_stop: b
     monkeypatch.setattr(task_config_builder, "resolve_task_identity",
                         lambda *a, **k: task_config_builder.TaskIdentity("", "manager", "agent", None))
     monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
+    # A compute machine serves the platform's place, so the run reaches its
+    # slot and parks there (with none it would wait for one before the slot).
+    serve(monkeypatch)
     task = _task(task_id)
     task_store.create_run(run_id, task_id, task.agent, "schedule", None, task.prompt,
                           "scheduled", task.scope, None)
@@ -174,6 +178,7 @@ async def test_a_cancel_between_the_config_build_and_the_session_start_gives_the
                         lambda *a, **k: task_config_builder.TaskIdentity("", "manager", "agent", None))
     monkeypatch.setattr(session_manager, "get_execution_layer", lambda *a, **k: _Layer())
     monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
+    serve(monkeypatch)
     monkeypatch.setattr("configuration.models.get_cli_model", lambda agent, layer=None: "test-model")
     monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
     monkeypatch.setattr(config_builder, "release_config_seat",

@@ -40,7 +40,7 @@ export interface CardOutcome {
   text: string
   job_id?: string
   lines?: string[]
-  members?: { template: string; display_name: string; slug: string; status: string; detail: string }[]
+  members?: { template: string; display_name: string; slug: string; action?: string; status: string; detail: string }[]
   department_id?: string
   agent_slug?: string
 }

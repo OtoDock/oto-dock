@@ -6,6 +6,7 @@ mount just `collabora_proxy.router` on a minimal FastAPI app and exercise
 the route logic directly.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import psycopg
@@ -341,15 +342,19 @@ def _cookie(sub, *, iat=None, exp_in=3600, jti="sign-in-1"):
 
 @pytest.fixture
 def relay_people(temp_db, monkeypatch):
-    """Two local accounts: one free, one held by the forced password change."""
+    """Two local accounts: one free, an editor of agent ``a``, one held by
+    the forced password change."""
     from api.media import wopi
     from storage import database as task_store
-    wopi._holder_answers.clear()
+    wopi._holders.answers.clear()
+    wopi._documents.answers.clear()
     free = task_store.create_local_user("free@t.com", "Free", "Free", "member", "x")
+    task_store.add_user_agent(free, "a", "editor", "test")
     held = task_store.create_local_user("held@t.com", "Held", "Held", "member", "x",
                                         must_change_password=True)
     yield free, held
-    wopi._holder_answers.clear()
+    wopi._holders.answers.clear()
+    wopi._documents.answers.clear()
 
 
 def test_the_gate_judges_the_person_behind_the_cookie(app_with_router, subpath_mode, relay_people, monkeypatch):
@@ -375,7 +380,7 @@ def test_the_gate_judges_the_person_behind_the_cookie(app_with_router, subpath_m
         assert get(held) == 403
         assert get("gone-sub") == 403
         task_store.bump_token_epoch(free)
-        wopi._holder_answers.clear()
+        wopi._holders.answers.clear()
         assert get(free, iat=int(_time.time()) - 3) == 403
 
 
@@ -451,7 +456,7 @@ async def test_an_open_socket_is_rejudged_without_the_cookies_expiry(relay_peopl
     finally:
         session_revocation.reset_for_tests()
     task_store.bump_token_epoch(free)
-    wopi._holder_answers.clear()
+    wopi._holders.answers.clear()
     assert await collabora_proxy._socket_still_authorized(
         {}, {"session": _cookie(free, iat=now - 3, jti="other")}) is False
 
@@ -490,6 +495,271 @@ async def test_a_socket_whose_sign_in_ended_is_closed_at_its_recheck(monkeypatch
     await collabora_proxy._close_when_unauthorized(ws, upstream, {}, {}, "cool/x/ws")
     upstream.close.assert_awaited_once()
     ws.close.assert_awaited_once_with(code=1008, reason="sign-in ended")
+
+
+def test_the_gate_refuses_a_document_its_person_may_no_longer_read(
+        app_with_router, subpath_mode, relay_people, monkeypatch):
+    """A request or a socket whose token names a document its person may no
+    longer read is refused at the relay, before anything reaches Collabora,
+    as on the WOPI routes."""
+    from unittest.mock import AsyncMock
+    from urllib.parse import quote
+
+    from starlette.websockets import WebSocketDisconnect
+
+    from api.media import wopi
+    from storage import database as task_store
+    free, _held = relay_people
+    own, _ = wopi.create_wopi_token("a/workspace/x.docx", free, "N", "edit", "a")
+    upstream = MagicMock(status_code=200, content=b"x", headers={})
+    monkeypatch.setattr("httpx.AsyncClient.request", AsyncMock(return_value=upstream))
+    with TestClient(app_with_router) as client:
+        client.cookies.set("session", _cookie(free))
+        assert client.get(f"/collabora/cool/clipboard?access_token={own}").status_code == 200
+    task_store.set_user_agents(free, [], "test")
+    wopi.forget_person(free)
+    with TestClient(app_with_router) as client:
+        client.cookies.set("session", _cookie(free))
+        assert client.get(f"/collabora/cool/clipboard?access_token={own}").status_code == 403
+        assert client.get("/collabora/browser/dist/cool.html").status_code == 200
+    ws_client, _upstream, dials = _ws_rig(monkeypatch, app_with_router)
+    ws_client.cookies.set("session", _cookie(free))
+    src = quote("http://otodock-proxy:8400/wopi/files/YQ", safe="")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with ws_client.websocket_connect(f"/collabora/cool/ws?WOPISrc={src}&access_token={own}") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 1008
+    assert not dials
+
+
+def test_the_gate_refuses_a_new_request_when_the_store_cannot_be_read(
+        app_with_router, subpath_mode, relay_people, monkeypatch):
+    """A request or a handshake that carries a token is refused while what
+    its person may do with the document cannot be read: nothing new opens on
+    an answer nobody read (an open socket keeps, tested above)."""
+    from unittest.mock import AsyncMock
+    from urllib.parse import quote
+
+    from starlette.websockets import WebSocketDisconnect
+
+    from api.media import wopi
+    free, _held = relay_people
+    own, _ = wopi.create_wopi_token("a/workspace/x.docx", free, "N", "edit", "a")
+
+    def _down(*key):
+        raise psycopg.OperationalError("store down")
+
+    monkeypatch.setattr(wopi, "_standing_now", _down)
+    upstream = MagicMock(status_code=200, content=b"x", headers={})
+    monkeypatch.setattr("httpx.AsyncClient.request", AsyncMock(return_value=upstream))
+    with TestClient(app_with_router) as client:
+        client.cookies.set("session", _cookie(free))
+        assert client.get(f"/collabora/cool/clipboard?access_token={own}").status_code == 403
+        assert client.get("/collabora/browser/dist/cool.html").status_code == 200
+    ws_client, _upstream, dials = _ws_rig(monkeypatch, app_with_router)
+    ws_client.cookies.set("session", _cookie(free))
+    src = quote("http://otodock-proxy:8400/wopi/files/YQ", safe="")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with ws_client.websocket_connect(f"/collabora/cool/ws?WOPISrc={src}&access_token={own}") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 1008
+    assert not dials
+
+
+@pytest.mark.timeout(30)
+def test_an_open_socket_judges_the_documents_its_load_frames_open(
+        app_with_router, subpath_mode, relay_people, monkeypatch):
+    """A load frame names the document Collabora opens: the socket keeps its
+    token beside the handshake's, and closes when its person may no longer
+    read that document."""
+    from urllib.parse import quote
+
+    from starlette.websockets import WebSocketDisconnect
+
+    from api.media import collabora_proxy, wopi
+    free, _held = relay_people
+    first, _ = wopi.create_wopi_token("a/workspace/x.docx", free, "N", "edit", "a")
+    loaded, _ = wopi.create_wopi_token("a/workspace/y.docx", free, "N", "edit", "a")
+
+    async def _standing(claims):
+        return "" if claims["file_path"].endswith("y.docx") else "edit"
+
+    monkeypatch.setattr(wopi, "document_standing", _standing)
+    monkeypatch.setattr(collabora_proxy, "_RELAY_REVALIDATE_S", 0.05)
+    client, upstream, _dials = _ws_rig(monkeypatch, app_with_router)
+    client.cookies.set("session", _cookie(free))
+    src = quote("http://otodock-proxy:8400/wopi/files/YQ", safe="")
+    load = f"load url={quote(f'http://otodock-proxy:8400/wopi/files/eQ?access_token={loaded}', safe='')}"
+    with client.websocket_connect(f"/collabora/cool/ws?WOPISrc={src}&access_token={first}") as ws:
+        ws.send_text(load)
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_text()
+    assert exc_info.value.code == 1008
+    assert upstream.sent == [load]
+
+
+@pytest.mark.asyncio
+async def test_an_open_socket_judges_its_document_past_the_tokens_end(monkeypatch):
+    """A page stays open longer than its token's four hours: the open socket
+    judges the token's document without the expiry, so a removal still
+    closes it."""
+    from api.media import collabora_proxy, wopi
+    monkeypatch.setattr(wopi, "_WOPI_TOKEN_TTL", -60)
+    expired, _ = wopi.create_wopi_token("a/workspace/x.docx", "pat", "N", "edit", "a")
+    assert wopi.validate_wopi_token(expired) is None
+    standing = {"answer": "edit"}
+
+    async def _standing(claims):
+        return standing["answer"]
+
+    async def _signed_in(scope, cookies):
+        return True
+
+    monkeypatch.setattr(wopi, "document_standing", _standing)
+    monkeypatch.setattr(collabora_proxy, "_socket_still_authorized", _signed_in)
+    ws, upstream = MagicMock(), MagicMock()
+    ws.close, upstream.close = AsyncMock(), AsyncMock()
+    task = asyncio.ensure_future(collabora_proxy._close_when_unauthorized(
+        ws, upstream, {}, {}, "cool/x/ws", person="pat", documents={expired: None}))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    standing["answer"] = ""
+    wopi.forget_person("pat")
+    await asyncio.wait_for(task, 2)
+    ws.close.assert_awaited_once_with(code=1008, reason="access ended")
+
+
+@pytest.mark.asyncio
+async def test_an_open_socket_is_judged_as_soon_as_it_opens(monkeypatch):
+    """A drop that lands between the handshake and the socket's first wait
+    wakes nobody: the first judgement runs at once, not a tick later."""
+    from api.media import collabora_proxy, wopi
+    token, _ = wopi.create_wopi_token("a/workspace/x.docx", "pat", "N", "edit", "a")
+
+    async def _nothing(claims):
+        return ""
+
+    async def _signed_in(scope, cookies):
+        return True
+
+    monkeypatch.setattr(wopi, "document_standing", _nothing)
+    monkeypatch.setattr(collabora_proxy, "_socket_still_authorized", _signed_in)
+    ws, upstream = MagicMock(), MagicMock()
+    ws.close, upstream.close = AsyncMock(), AsyncMock()
+    await asyncio.wait_for(collabora_proxy._close_when_unauthorized(
+        ws, upstream, {}, {}, "cool/x/ws", person="pat", documents={token: None}), 2)
+    ws.close.assert_awaited_once_with(code=1008, reason="access ended")
+
+
+@pytest.mark.timeout(30)
+def test_a_socket_naming_more_documents_than_a_socket_loads_is_closed(
+        app_with_router, subpath_mode, relay_people, monkeypatch):
+    """The load frames come from the person the socket judges: a socket that
+    names more documents than an editor loads is closed, so the document it
+    opened with can never leave what it is judged on."""
+    from urllib.parse import quote
+
+    from starlette.websockets import WebSocketDisconnect
+
+    from api.media import collabora_proxy, wopi
+    free, _held = relay_people
+    first, _ = wopi.create_wopi_token("a/workspace/x.docx", free, "N", "edit", "a")
+    more = [wopi.create_wopi_token(f"a/workspace/{i}.docx", free, "N", "edit", "a")[0]
+            for i in range(collabora_proxy._SOCKET_DOCUMENTS_MAX)]
+    client, upstream, _dials = _ws_rig(monkeypatch, app_with_router)
+    client.cookies.set("session", _cookie(free))
+    src = quote("http://otodock-proxy:8400/wopi/files/YQ", safe="")
+    with client.websocket_connect(f"/collabora/cool/ws?WOPISrc={src}&access_token={first}") as ws:
+        for token in more:
+            ws.send_text(f"load url={quote(f'http://w/wopi/files/YQ?access_token={token}', safe='')}")
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_text()
+    assert exc_info.value.code == 1008
+    assert len(upstream.sent) == collabora_proxy._SOCKET_DOCUMENTS_MAX - 1
+
+
+def test_a_load_frame_behind_many_spaces_is_still_read():
+    """Collabora skips any run of leading spaces before a frame's first word:
+    so does the relay."""
+    from urllib.parse import quote
+
+    from api.media import wopi
+    from api.media.collabora_proxy import _frame_tokens, _load_frame_ok
+    own, _ = wopi.create_wopi_token("a/workspace/x.docx", "pat", "N", "edit", "a")
+    other, _ = wopi.create_wopi_token("a/workspace/x.docx", "kim", "N", "edit", "a")
+    frame = " " * 40 + f"load url={quote(f'http://w/wopi/files/YQ?access_token={own}', safe='')}"
+    assert _frame_tokens(frame) == [own] and _frame_tokens(frame.encode()) == [own]
+    assert not _load_frame_ok(frame.replace(own, other), "pat")
+
+
+def test_a_frame_that_gives_the_session_a_new_token_is_judged_as_a_load():
+    """Collabora takes ``resetaccesstoken <token> [ttl]`` from the client and
+    uses that token for its next WOPI calls: the token must name the
+    socket's person, and the socket judges its document as a loaded one's."""
+    from api.media import wopi
+    from api.media.collabora_proxy import _frame_tokens, _load_frame_ok
+    own, _ = wopi.create_wopi_token("a/workspace/x.docx", "pat", "N", "edit", "a")
+    other, _ = wopi.create_wopi_token("a/workspace/x.docx", "kim", "N", "edit", "a")
+    assert _frame_tokens(f"resetaccesstoken {own} 0") == [own]
+    assert _frame_tokens(f"  resetaccesstoken  {own}".encode()) == [own]
+    assert _load_frame_ok(f"resetaccesstoken {own}", "pat")
+    assert not _load_frame_ok(f"resetaccesstoken {other} 0", "pat")
+    assert _frame_tokens("resetaccesstoken") == [] and _frame_tokens("resetaccesstokens x") == []
+
+
+@pytest.mark.asyncio
+async def test_a_socket_closes_at_once_when_its_person_may_no_longer_read_its_document(monkeypatch):
+    """The person's answers dropped (an offboarding event, an epoch move)
+    wake their open sockets at once: a document they may no longer read
+    closes the socket, while reading only, or a store that cannot be read,
+    keeps it. A deleted agent wakes every socket."""
+    from api.media import collabora_proxy, wopi
+    standing: dict = {"pat": "view", "kim": "edit"}
+    judged: list = []
+
+    async def _standing(claims):
+        judged.append(claims["user_sub"])
+        return standing[claims["user_sub"]]
+
+    async def _signed_in(scope, cookies):
+        return True
+
+    monkeypatch.setattr(wopi, "document_standing", _standing)
+    monkeypatch.setattr(collabora_proxy, "_socket_still_authorized", _signed_in)
+
+    def _socket(sub):
+        token, _ = wopi.create_wopi_token("a/workspace/x.docx", sub, "N", "edit", "a")
+        ws, upstream = MagicMock(), MagicMock()
+        ws.close, upstream.close = AsyncMock(), AsyncMock()
+        task = asyncio.ensure_future(collabora_proxy._close_when_unauthorized(
+            ws, upstream, {}, {}, "cool/x/ws", person=sub, documents={token: None}))
+        return ws, task
+
+    async def _settle():
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    pat_ws, pat_task = _socket("pat")
+    kim_ws, kim_task = _socket("kim")
+    await _settle()
+    assert sorted(judged) == ["kim", "pat"]          # each socket judged as it opens
+    judged.clear()
+    for answer in ("view", None):
+        standing["pat"] = answer
+        wopi.forget_person("pat")
+        await _settle()
+        assert not pat_task.done(), answer
+    assert judged == ["pat", "pat"]                 # kim's socket slept on
+    standing["pat"] = ""
+    wopi.forget_person("pat")
+    await asyncio.wait_for(pat_task, 1)
+    pat_ws.close.assert_awaited_once_with(code=1008, reason="access ended")
+    assert "pat" not in collabora_proxy._open_sockets
+    standing["kim"] = ""
+    wopi.forget_agent("a")
+    await asyncio.wait_for(kim_task, 1)
+    kim_ws.close.assert_awaited_once_with(code=1008, reason="access ended")
+    assert not collabora_proxy._open_sockets
 
 
 def test_http_404_admin_and_metrics_endpoints(app_with_router, subpath_mode, authed):

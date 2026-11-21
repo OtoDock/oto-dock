@@ -9,6 +9,7 @@ ProxyClient-shaped LLM client's turn flow, and DuplexSession's wiring
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -428,10 +429,15 @@ class FakeSttQueue:
     """STT stub: an internal final queue + ownership-clear accounting."""
 
     latest_interim = ""
+    last_result_monotonic = 0.0
 
     def __init__(self, finals=None):
         self.finals = list(finals or [])
         self.cleared = 0
+
+    @property
+    def has_drainable_finals(self):
+        return bool(self.finals)
 
     def clear_queue(self):
         self.cleared += 1
@@ -452,8 +458,12 @@ def _bare_session():
     sess.conn = FakeConnForLlm()
     sess.conn.is_closed = False
     sess.conn.is_muted = False
+    from pipeline_fakes import FakeVAD
+
     sess.state = CallState()
+    sess.state._running = True
     sess.stt = FakeSttQueue()
+    sess.vad = FakeVAD()
     sess._typed_turn = None
     return sess
 
@@ -542,7 +552,7 @@ async def test_orphan_final_sweep_dispatches_and_queues():
 
     # Idle: sweep drains and starts the classify/dispatch timer.
     sess.stt.finals = ["it we're gonna have tomorrow?"]
-    task = asyncio.create_task(sess._sweep_orphan_final())
+    task = asyncio.create_task(sess._sweep_orphan_final(time.monotonic()))
     await asyncio.wait_for(task, 2)
     assert timers == ["it we're gonna have tomorrow?"]
     assert sess.state._turn_segments == ["it we're gonna have tomorrow?"]
@@ -558,7 +568,7 @@ async def test_orphan_final_sweep_dispatches_and_queues():
     sess.state._utterance_task = asyncio.create_task(_parked())
     try:
         await asyncio.wait_for(
-            asyncio.create_task(sess._sweep_orphan_final()), 2)
+            asyncio.create_task(sess._sweep_orphan_final(time.monotonic())), 2)
         assert list(sess.state._queued_speech) == ["and one more thing"]
         assert sess.llm.aborts == 1
     finally:
@@ -566,16 +576,50 @@ async def test_orphan_final_sweep_dispatches_and_queues():
         with pytest.raises(asyncio.CancelledError):
             await sess.state._utterance_task
 
-    # Consumed queue / user audibly speaking: sweep no-ops.
+    # Consumed queue: sweep no-ops.
     sess.state._queued_speech.clear()
     sess.state._utterance_task = None
     sess.stt.finals = []
-    await asyncio.wait_for(asyncio.create_task(sess._sweep_orphan_final()), 2)
+    await asyncio.wait_for(asyncio.create_task(sess._sweep_orphan_final(time.monotonic())), 2)
+    # User audibly speaking, the STT still producing results: the sweep
+    # waits, and the speech end that drains the final leaves it nothing.
     sess.stt.finals = ["mid speech final"]
     sess.state._user_silent.clear()
-    await asyncio.wait_for(asyncio.create_task(sess._sweep_orphan_final()), 2)
+    task = asyncio.create_task(sess._sweep_orphan_final(time.monotonic()))
+    for _ in range(4):
+        sess.stt.last_result_monotonic = time.monotonic()
+        await asyncio.sleep(0.25)
+    assert not task.done()
+    sess.stt.finals = []                          # the speech end's drain
+    sess.state._user_silent.set()
+    await asyncio.wait_for(task, 2)
     assert sess.state._queued_speech == []
     assert timers == ["it we're gonna have tomorrow?"]
+
+
+@pytest.mark.asyncio
+async def test_live_voices_sweep_logs_what_the_detector_scored(caplog):
+    """One function for both surfaces: live voice has no loudness rule, and
+    its sweep still says what the VAD scored on the words it takes."""
+    import logging
+
+    from audio.providers.vad.silero import Scored
+
+    sess = _bare_session()
+
+    async def fake_timer(joined):
+        pass
+
+    sess._turn_timeout_handler = fake_timer
+    sess.vad.scored = lambda since, until: Scored(
+        windows=40, over=3, speech=3, longest_run=1, needed_run=2, peak=0.44, bargein=0)
+    sess.stt.finals = ["soft words"]
+    with caplog.at_level(logging.INFO, logger="pipeline"):
+        await asyncio.wait_for(asyncio.create_task(sess._sweep_orphan_final(time.monotonic())), 2)
+    assert sess.state._turn_segments == ["soft words"]
+    assert ("Words with no speech start, 0.6 s after they landed. The detector scored 40 windows: "
+            "3 at or over its bar, 3 of them loud enough, longest run 1 of the 2 a speech start needs, "
+            "highest 0.44, 0 in barge-in mode") in caplog.text
 
 
 def test_duplex_complete_marker_shares_call_complete_machinery():
@@ -710,6 +754,10 @@ def test_duplex_session_wiring(monkeypatch):
          "language": "el", "chat_endpointing_ms": 1500},
     )
     assert (s._rate_in, s._rate_out, s._frame_bytes_out) == (16000, 24000, 960)
+    # The constructor never runs the call's: it registers the provider's
+    # final callback itself (the caption frames and the orphan sweep).
+    assert s.stt.on_partial_final == s._on_stt_partial_final
+    assert s._orphan_needs_loud_line is False
     assert s.vad.kwargs["sample_rate"] == 16000
     assert s._filler_key[-1] == 24000
     assert s._locked_language == "el"
@@ -864,7 +912,7 @@ async def test_orphan_sweep_and_partial_finals_eligible_under_pause():
     assert [e for e in sess.conn.events if e.get("type") == "interim_final"], \
         "paused playback's finals must reach the composer"
     sess.stt.finals = ["commit words"]
-    await asyncio.wait_for(asyncio.create_task(sess._sweep_orphan_final()), 2)
+    await asyncio.wait_for(asyncio.create_task(sess._sweep_orphan_final(time.monotonic())), 2)
     assert timers == ["commit words"]
 
     # Audible unpaused playback: echo window — both suppressed.
@@ -874,7 +922,7 @@ async def test_orphan_sweep_and_partial_finals_eligible_under_pause():
     sess._on_stt_partial_final("echo words")
     assert len(sess.conn.events) == events_before
     sess.stt.finals = ["echo words"]
-    await asyncio.wait_for(asyncio.create_task(sess._sweep_orphan_final()), 2)
+    await asyncio.wait_for(asyncio.create_task(sess._sweep_orphan_final(time.monotonic())), 2)
     assert timers == ["commit words"]
 
     # Cancel the sweep task the forwarded final spawned.

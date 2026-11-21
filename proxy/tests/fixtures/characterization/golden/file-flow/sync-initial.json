@@ -1,0 +1,393 @@
+{
+ "authors": [
+  {
+   "last_writer": "alice",
+   "rel_path": "workspace/big.bin"
+  },
+  {
+   "last_writer": "bob",
+   "rel_path": "workspace/clash-stale.txt"
+  },
+  {
+   "last_writer": "bob",
+   "rel_path": "workspace/clash.txt"
+  },
+  {
+   "last_writer": "alice",
+   "rel_path": "workspace/refused-save.txt"
+  },
+  {
+   "last_writer": "alice",
+   "rel_path": "workspace/sat-edit.txt"
+  },
+  {
+   "last_writer": "alice",
+   "rel_path": "workspace/sat-new.txt"
+  }
+ ],
+ "deferred_tasks": 1,
+ "fan_out_delete": [
+  {
+   "agent": "flow-agent",
+   "exclude": "sat-one-0",
+   "rel": "workspace/sat-gone.txt"
+  }
+ ],
+ "file_updated": [
+  "flow-agent/workspace/big.bin disk",
+  "flow-agent/workspace/refused-save.txt disk",
+  "flow-agent/workspace/sat-edit.txt disk",
+  "flow-agent/workspace/sat-gone.txt disk",
+  "flow-agent/workspace/sat-new.txt disk"
+ ],
+ "last_tick": [
+  15.0,
+  15
+ ],
+ "machine": {
+  "workspace/big.bin": "a large file",
+  "workspace/clash-stale.txt": "machine earlier",
+  "workspace/clash.txt": "platform later",
+  "workspace/plat-edit.txt": "platform edit",
+  "workspace/plat-new.txt": "new on the platform",
+  "workspace/plat-revived.txt": "back on the platform",
+  "workspace/refused-save.txt": "the machine's change",
+  "workspace/refused.txt": "base",
+  "workspace/revived.txt": "both again",
+  "workspace/same.txt": "same",
+  "workspace/sat-edit.txt": "machine edit",
+  "workspace/sat-new.txt": "new on the machine",
+  "workspace/stale.txt": "base"
+ },
+ "marks": {
+  "sat-one-0|flow-agent|workspace/clash-stale.txt": {
+   "in_flight_until": 0.0,
+   "machine": {
+    "exists": true,
+    "mtime_ns": 1700000000000000000,
+    "size": 15
+   },
+   "mtime_ns": 1700000010000000000,
+   "retry_at": 0.0,
+   "size": 14,
+   "stale": true
+  },
+  "sat-one-0|flow-agent|workspace/refused.txt": {
+   "in_flight_until": 0.0,
+   "machine": {
+    "exists": true,
+    "mtime_ns": 1700000000000000000,
+    "size": 4
+   },
+   "mtime_ns": 1700000000000000000,
+   "retry_at": 0.0,
+   "size": 13,
+   "stale": true
+  },
+  "sat-one-0|flow-agent|workspace/stale.txt": {
+   "in_flight_until": 0.0,
+   "machine": {
+    "exists": true,
+    "mtime_ns": 1700000000000000000,
+    "size": 4
+   },
+   "mtime_ns": 1700000000000000000,
+   "retry_at": 0.0,
+   "size": 13,
+   "stale": true
+  }
+ },
+ "notifications": [
+  {
+   "agent_slug": "flow-agent",
+   "body": "Your version of “clash.txt” was replaced by a newer version. It is in the Recover bin.",
+   "scope": "user",
+   "severity": "info",
+   "source": "file_conflict",
+   "target": "user-admin",
+   "title": "Recover your file"
+  }
+ ],
+ "platform": {
+  "workspace/big.bin": "a large file",
+  "workspace/clash-stale.txt": "platform later",
+  "workspace/clash.txt": "platform later",
+  "workspace/plat-edit.txt": "platform edit",
+  "workspace/plat-new.txt": "new on the platform",
+  "workspace/plat-revived.txt": "back on the platform",
+  "workspace/refused-save.txt": "the machine's change",
+  "workspace/refused.txt": "platform edit",
+  "workspace/revived.txt": "both again",
+  "workspace/same.txt": "same",
+  "workspace/sat-edit.txt": "machine edit",
+  "workspace/sat-new.txt": "new on the machine",
+  "workspace/stale.txt": "platform edit"
+ },
+ "recover_bin": [
+  {
+   "file_hash": "sha256:5e5b84f2c1e63f621a4c778aacc75992ba5f16e3addeb129e8e6f187fcad58a1",
+   "owner_sub": "",
+   "reason": "conflict",
+   "rel_path": "workspace/clash.txt",
+   "scope": "shared",
+   "size": 15
+  },
+  {
+   "file_hash": "sha256:303864cd8e2f40013bad761dc5cc4d0e6f56a4d583d8a08cde8b1b69a316889d",
+   "owner_sub": "",
+   "reason": "deleted",
+   "rel_path": "workspace/sat-gone.txt",
+   "scope": "shared",
+   "size": 22
+  },
+  {
+   "file_hash": "sha256:61949567d14d87ba10162230d5b133b61474dddb62c70c1b472ba56b237147c2",
+   "owner_sub": "",
+   "reason": "deleted",
+   "rel_path": "workspace/tomb.txt",
+   "scope": "shared",
+   "size": 23
+  }
+ ],
+ "sync_state": [
+  {
+   "base_hash": "sha256:683adcc31938cfea071a313d7ecf9d19a74583dd0640f3c6d664079d52feb15f",
+   "base_mtime": "<pull time>",
+   "rel_path": "workspace/big.bin"
+  },
+  {
+   "base_hash": "sha256:f67c573d8a1241fe09d8d772a61149953a7bd5e4042142b09c790344253b1aff",
+   "base_mtime": 1700000010.0,
+   "rel_path": "workspace/clash.txt"
+  },
+  {
+   "base_hash": "sha256:455d6af05dde319844cf9a4b51a95d179fecd8f51563a9fa8e378a8952810053",
+   "base_mtime": 1700000000.0,
+   "rel_path": "workspace/plat-edit.txt"
+  },
+  {
+   "base_hash": "sha256:232979dc9c8acbcaf01d132d75db1dc6ef737ba7612f8fdac8aa722b2a77c22d",
+   "base_mtime": 1700000000.0,
+   "rel_path": "workspace/plat-new.txt"
+  },
+  {
+   "base_hash": "sha256:8e5192ba8c1aff33c344b197bdcc47df1d8d42dcf1675c626975c7dc5c3516c3",
+   "base_mtime": 1700000000.0,
+   "rel_path": "workspace/plat-revived.txt"
+  },
+  {
+   "base_hash": "sha256:481d51fd8b5db98155c86a9dd24c1f79b8a73b95ec0344fe331e28ad2c25d930",
+   "base_mtime": "<pull time>",
+   "rel_path": "workspace/refused-save.txt"
+  },
+  {
+   "base_hash": "sha256:cae662172fd450bb0cd710a769079c05bfc5d8e35efa6576edc7d0377afdd4a2",
+   "base_mtime": 1700000000.0,
+   "rel_path": "workspace/refused.txt"
+  },
+  {
+   "base_hash": "sha256:4d185ca414df92f34ae0b75104e24318542fbc30d794604beeab198430fcb187",
+   "base_mtime": 1700000000.0,
+   "rel_path": "workspace/revived.txt"
+  },
+  {
+   "base_hash": "sha256:0967115f2813a3541eaef77de9d9d5773f1c0c04314b0bbfe4ff3b3b1c55b5d5",
+   "base_mtime": 1700000000.0,
+   "rel_path": "workspace/same.txt"
+  },
+  {
+   "base_hash": "sha256:3b6d85dbb0042c458a61205beb431060a7f6c668c7f7a521790c96f41369e86c",
+   "base_mtime": "<pull time>",
+   "rel_path": "workspace/sat-edit.txt"
+  },
+  {
+   "base_hash": "sha256:4f9a61c4211049d59997438965b06694c679da5f940baa1f29220ad2733cf359",
+   "base_mtime": "<pull time>",
+   "rel_path": "workspace/sat-new.txt"
+  },
+  {
+   "base_hash": "sha256:cae662172fd450bb0cd710a769079c05bfc5d8e35efa6576edc7d0377afdd4a2",
+   "base_mtime": 1700000000.0,
+   "rel_path": "workspace/stale.txt"
+  }
+ ],
+ "tombstones": [
+  {
+   "origin": "satellite-idle-delete",
+   "rel_path": "workspace/sat-gone.txt"
+  },
+  {
+   "origin": "dashboard",
+   "rel_path": "workspace/tomb.txt"
+  }
+ ],
+ "wire": [
+  {
+   "action": "delete",
+   "agent_slug": "flow-agent",
+   "path": "users/bob/workspace/leak.txt",
+   "type": "file_push"
+  },
+  {
+   "action": "delete",
+   "agent_slug": "flow-agent",
+   "path": "workspace/tomb.txt",
+   "type": "file_push"
+  },
+  {
+   "action": "write",
+   "agent_slug": "flow-agent",
+   "body": "back on the platform",
+   "command_id": "<id>",
+   "expect": "live",
+   "hash": "sha256:8e5192ba8c1aff33c344b197bdcc47df1d8d42dcf1675c626975c7dc5c3516c3",
+   "path": "workspace/plat-revived.txt",
+   "path_kind": "agent_tree",
+   "type": "file_push"
+  },
+  {
+   "action": "write",
+   "agent_slug": "flow-agent",
+   "body": "new on the platform",
+   "command_id": "<id>",
+   "expect": "live",
+   "hash": "sha256:232979dc9c8acbcaf01d132d75db1dc6ef737ba7612f8fdac8aa722b2a77c22d",
+   "path": "workspace/plat-new.txt",
+   "path_kind": "agent_tree",
+   "type": "file_push"
+  },
+  {
+   "action": "write",
+   "agent_slug": "flow-agent",
+   "body": "platform edit",
+   "command_id": "<id>",
+   "expect": {
+    "mtime_ns": 1700000000000000000,
+    "size": 4
+   },
+   "hash": "sha256:455d6af05dde319844cf9a4b51a95d179fecd8f51563a9fa8e378a8952810053",
+   "path": "workspace/plat-edit.txt",
+   "path_kind": "agent_tree",
+   "type": "file_push"
+  },
+  {
+   "action": "write",
+   "agent_slug": "flow-agent",
+   "body": "platform edit",
+   "command_id": "<id>",
+   "expect": {
+    "mtime_ns": 1700000000000000000,
+    "size": 4
+   },
+   "hash": "sha256:455d6af05dde319844cf9a4b51a95d179fecd8f51563a9fa8e378a8952810053",
+   "path": "workspace/refused.txt",
+   "path_kind": "agent_tree",
+   "type": "file_push"
+  },
+  {
+   "action": "write",
+   "agent_slug": "flow-agent",
+   "body": "platform edit",
+   "command_id": "<id>",
+   "expect": {
+    "mtime_ns": 1700000000000000000,
+    "size": 4
+   },
+   "hash": "sha256:455d6af05dde319844cf9a4b51a95d179fecd8f51563a9fa8e378a8952810053",
+   "path": "workspace/stale.txt",
+   "path_kind": "agent_tree",
+   "type": "file_push"
+  },
+  {
+   "action": "write",
+   "agent_slug": "flow-agent",
+   "body": "platform later",
+   "command_id": "<id>",
+   "expect": {
+    "mtime_ns": 1700000000000000000,
+    "size": 15
+   },
+   "hash": "sha256:f67c573d8a1241fe09d8d772a61149953a7bd5e4042142b09c790344253b1aff",
+   "path": "workspace/clash-stale.txt",
+   "path_kind": "agent_tree",
+   "type": "file_push"
+  },
+  {
+   "action": "write",
+   "agent_slug": "flow-agent",
+   "body": "platform later",
+   "command_id": "<id>",
+   "expect": {
+    "mtime_ns": 1700000000000000000,
+    "size": 15
+   },
+   "hash": "sha256:f67c573d8a1241fe09d8d772a61149953a7bd5e4042142b09c790344253b1aff",
+   "path": "workspace/clash.txt",
+   "path_kind": "agent_tree",
+   "type": "file_push"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "page_size": 4096,
+   "report_skipped": true,
+   "type": "request_manifest"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "path": "workspace/refused.txt",
+   "path_kind": "agent_tree",
+   "type": "file_stat"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "path": "workspace/big.bin",
+   "path_kind": "agent_tree",
+   "request_id": "<id>",
+   "type": "file_pull"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "path": "workspace/clash-stale.txt",
+   "path_kind": "agent_tree",
+   "request_id": "<id>",
+   "type": "file_pull"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "path": "workspace/clash.txt",
+   "path_kind": "agent_tree",
+   "request_id": "<id>",
+   "type": "file_pull"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "path": "workspace/refused-save.txt",
+   "path_kind": "agent_tree",
+   "request_id": "<id>",
+   "type": "file_pull"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "path": "workspace/sat-edit.txt",
+   "path_kind": "agent_tree",
+   "request_id": "<id>",
+   "type": "file_pull"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "path": "workspace/sat-new.txt",
+   "path_kind": "agent_tree",
+   "request_id": "<id>",
+   "type": "file_pull"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "path": "workspace/tomb.txt",
+   "path_kind": "agent_tree",
+   "request_id": "<id>",
+   "type": "file_pull"
+  }
+ ]
+}

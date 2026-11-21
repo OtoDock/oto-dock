@@ -1,0 +1,82 @@
+{
+  "_comment": "The files of this repository written for people, read by scripts/prose/prose_check.py. WRITING.md is the rules page. A markdown file no group claims and no entry excludes fails the check. A folder with its own .prose.json is judged by that file alone.",
+  "groups": [
+    {"name": "reader", "use": "reader", "files": ["README.md", "SECURITY.md"]},
+    {"name": "developer", "use": "developer", "files": [
+      "CONTRIBUTING.md", "WRITING.md", ".github/PULL_REQUEST_TEMPLATE.md",
+      "audio/README.md", "audio/CONTRIBUTING_PROVIDERS.md",
+      "dashboard/README.md", "dashboard/design/brand/README.md", "dashboard/ios/README.md",
+      "mcps/README.md", "mcps/_shared/README.md", "mcps/custom/checks-mcp/README.md",
+      "mcps/custom/checks-mcp/examples/app-server-review/README.md", "mcps/custom/ssh-hosts/README.md",
+      "phone/README.md", "phone/assets/ambience/README.md",
+      "proxy/README.md", "proxy/tests/README.md", "satellite/bin/README.md"]},
+    {"name": "contributors", "use": "developer", "files": ["CONTRIBUTORS.md"],
+     "skip": {"version": "it names the release that first carried each contribution"}},
+    {"name": "bundled models", "use": "developer", "files": ["audio/models/README.md"],
+     "skip": {"version": "it names the bundled models' own versions"}},
+    {"name": "waiting reader", "use": "reader", "files": ["scripts/README.md"], "level": "warn",
+     "reason": "its rewrite waits for the next release"},
+    {"name": "waiting developer", "use": "developer", "files": ["ARCHITECTURE.md", "satellite/README.md", "rig/README.md"],
+     "level": "warn", "reason": "their rewrite waits for the next release"},
+    {"name": "pins", "use": "developer", "extras": ["budget"], "files": ["VERSIONS.md"], "level": "warn",
+     "reason": "its rewrite waits for the next release",
+     "skip": {"version": "it holds the pins"}, "budgets": {"VERSIONS.md": 5600}},
+    {"name": "wire reference", "use": "developer", "files": ["satellite/PROTOCOL.md"], "level": "warn",
+     "reason": "its rewrite waits for the next release",
+     "skip": {"version": "it states the version each message arrived in"}},
+    {"name": "env example", "use": "reader", "read": "hash-comments", "files": ["config.env.example"]},
+    {"name": "manifest texts", "use": "developer", "read": "json-fields", "files": ["mcps/custom/*/manifest.json"],
+     "fields": ["description", "config[].help", "instances.fields[].help", "system_requirements.notes"]}
+  ],
+  "between": [
+    {"file": "SECURITY.md", "from": "<!-- supported-versions:begin -->", "to": "<!-- supported-versions:end -->",
+     "skip": {"version": "the table of supported release lines, which the release tooling writes"}}
+  ],
+  "excluded": {
+    "AGENTS.md": "read by coding agents",
+    "CLAUDE.md": "read by coding agents",
+    "CLA.md": "the legal text of the contributor agreement",
+    "CODE_OF_CONDUCT.md": "the Contributor Covenant, as its authors wrote it",
+    "CHANGELOG.md": "its own lint judges it, and a released section is never rewritten",
+    "mcps/custom/*/skills/**": "an agent loads these skills",
+    "mcps/custom/*/docs/**": "an agent loads these guides",
+    "proxy/core/layers/codex/codex_base_instructions.md": "an engine's instructions, read by the model",
+    "**/tests/fixtures/**": "test fixtures",
+    "mcps/custom/file-tools-mcp/__tests__/**": "test corpora",
+    "mcps/custom/file-tools-mcp/THIRD-PARTY-NOTICES.md": "third-party notices, as their licences require",
+    "phone/assets/*/SOURCES.md": "the licence records of the bundled sounds",
+    "dashboard/ios/App/CapApp-SPM/README.md": "Capacitor writes it"
+  },
+  "allowed": {
+    "SECURITY.md": [
+      {"phrase": "the credential broker", "rule": "plain-words",
+       "reason": "the policy names the three security boundaries, and a reporter needs their names"},
+      {"phrase": "From 1.8.0 every release image", "rule": "version",
+       "reason": "older images carry no attestation, and a person who verifies one must know"}
+    ],
+    "WRITING.md": [
+      {"phrase": "A Mac paired before 1.9.1", "rule": "version",
+       "reason": "a before example on the rules page"},
+      {"phrase": "from 0.5.160 the satellite", "rule": "version",
+       "reason": "a before example on the rules page"}
+    ],
+    ".github/PULL_REQUEST_TEMPLATE.md": [
+      {"phrase": "(CLA.md, version 1.0)", "rule": "version",
+       "reason": "the agreement's own version, which the cla check matches word for word"},
+      {"phrase": "(CLA.md Part B, version 1.0)", "rule": "version",
+       "reason": "the agreement's own version, which the cla check matches word for word"}
+    ],
+    "mcps/custom/agent-config-mcp/manifest.json": [
+      {"phrase": "Lets an agent mark post-install setup complete, and inspect and modify its own settings: its persona (config/agent.md), identity (display name, description, color), default model, default execution layer, default scope and per-agent memory toggles.", "rule": "long-sentence",
+       "reason": "each agent's prompt carries a description's first sentence whole, so it is not split"}
+    ],
+    "mcps/custom/agent-creator-mcp/manifest.json": [
+      {"phrase": "Create new agents: search the community catalog first and propose a template, a department set or a move as a card the person clicks, or author a template folder (persona, MCPs, skills, schedules, onboarding), validate it, then install it as a new agent on the platform.", "rule": "long-sentence",
+       "reason": "each agent's prompt carries a description's first sentence whole, so it is not split"}
+    ],
+    "mcps/custom/mcps-mcp/manifest.json": [
+      {"phrase": "Lets agents browse the community MCP and skills catalogs, see what is installed/enabled for the current agent, request the admin to install or enable an MCP or skill package, and check an MCP package an agent authored (editors and above).", "rule": "long-sentence",
+       "reason": "each agent's prompt carries a description's first sentence whole, so it is not split"}
+    ]
+  }
+}

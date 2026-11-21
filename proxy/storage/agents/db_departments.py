@@ -182,29 +182,163 @@ def find_by_set(community_set: str, name: str, created_by_sub: str | None = None
     return get_department(row["id"]) if row else None
 
 
-def member_slugs(department_id: str) -> list[str]:
-    """The agents placed in the department, by slug."""
+def members_by_department() -> dict[str, list[str]]:
+    """Every department's agents by slug, by department id: an agent counts
+    when its ``department_id`` names the department, with a level or not.
+    The one reading the visibility rule (``assignment.can_see_department``)
+    and the placement rule (``assignment.may_place_into``) judge a person
+    on."""
     with get_conn() as conn:
-        rows = conn.execute("SELECT slug FROM agents WHERE department_id = %s ORDER BY slug",
-                            (department_id,)).fetchall()
-    return [r["slug"] for r in rows]
+        rows = conn.execute("SELECT slug, department_id FROM agents WHERE department_id <> '' "
+                            "ORDER BY slug").fetchall()
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        out.setdefault(str(r["department_id"]), []).append(r["slug"])
+    return out
 
 
-def place_members(department_id: str, placements: list[tuple[str, str]]) -> None:
+def member_slugs(department_id: str) -> list[str]:
+    """The agents placed in the department, by slug (``members_by_department``
+    for one department)."""
+    return members_by_department().get(department_id, [])
+
+
+def place_members(department_id: str, placements: list[tuple[str, str]],
+                  members: dict[str, str | None] | None = None) -> None:
     """Assign every ``(agent slug, level id)`` to the department in one
     transaction: all or none, so a set install never leaves half of its
     members placed. The caller validated each level belongs and recompiles
-    the edges after."""
+    the edges after.
+
+    ``members`` (a set install's: every member template of its set → the
+    agent placed for it, or None where it placed none) becomes the
+    department's record of its set members in the same transaction: a
+    placed agent replaces what was recorded, a place left unfilled keeps its
+    record (empty when it had none), a template the set no longer names
+    goes. With ``fill_place`` (a hand placement's empty place), the only
+    writers of that record."""
     now = _now()
     with get_conn() as conn:
+        if members is not None:
+            # The record's rows before the agents' rows: the order a hand
+            # placement (``lock_place``) and an agent's delete keep too.
+            conn.execute("SELECT template FROM department_set_members WHERE department_id = %s "
+                         "ORDER BY template FOR UPDATE", (department_id,))
         for slug, level_id in placements:
             conn.execute(
                 "UPDATE agents SET department_id = %s, department_level_id = %s WHERE slug = %s",
                 (department_id, level_id, slug))
+        if members is not None:
+            conn.execute(
+                "DELETE FROM department_set_members WHERE department_id = %s AND NOT (template = ANY(%s))",
+                (department_id, list(members)))
+            for template, agent in members.items():
+                if agent is None:
+                    conn.execute(
+                        "INSERT INTO department_set_members (department_id, template, agent, updated_at) "
+                        "VALUES (%s, %s, '', %s) ON CONFLICT (department_id, template) DO NOTHING",
+                        (department_id, template, now))
+                else:
+                    conn.execute(
+                        "INSERT INTO department_set_members (department_id, template, agent, updated_at) "
+                        "VALUES (%s, %s, %s, %s) ON CONFLICT (department_id, template) "
+                        "DO UPDATE SET agent = EXCLUDED.agent, updated_at = EXCLUDED.updated_at",
+                        (department_id, template, agent, now))
         conn.execute("UPDATE departments SET updated_at = %s WHERE id = %s", (now, department_id))
         conn.commit()
     from storage.agents import agent_store
     agent_store._invalidate_cache()
+
+
+def lock_place(conn, slug: str, department_id: str) -> str:
+    """Before a hand placement of ``slug`` into the department writes the
+    agent's row, in its transaction: the department's recorded place for the
+    agent's template locked, so two placements of one template fill it one
+    after the other. Locked before the agent's row, the order
+    ``agent_store.delete_agent`` keeps too. Answers the template, '' when the
+    department records no place for it."""
+    row = conn.execute("SELECT community_template FROM agents WHERE slug = %s", (slug,)).fetchone()
+    template = str((row or {}).get("community_template") or "")
+    if not template or not department_id:
+        return ""
+    held = conn.execute(
+        "SELECT agent FROM department_set_members WHERE department_id = %s AND template = %s FOR UPDATE",
+        (department_id, template)).fetchone()
+    return template if held is not None else ""
+
+
+def fill_place(conn, slug: str, department_id: str, template: str) -> bool:
+    """After the agent's row is written, in the same transaction: the
+    place ``lock_place`` locked filled with ``slug`` when it is empty (no
+    agent recorded, or the recorded one is no longer a member of the
+    department from that template, the test ``binding_target`` reads with).
+    A filled place is never taken over. True when it filled it."""
+    if not template:
+        return False
+    me = conn.execute("SELECT department_id, department_level_id, community_template FROM agents WHERE slug = %s",
+                      (slug,)).fetchone()
+    if not member_from(me, department_id, template):
+        return False
+    held = conn.execute("SELECT agent FROM department_set_members WHERE department_id = %s AND template = %s",
+                        (department_id, template)).fetchone()
+    holder = str((held or {}).get("agent") or "")
+    if held is None or holder == slug:
+        return False
+    if holder:
+        them = conn.execute("SELECT department_id, department_level_id, community_template FROM agents "
+                            "WHERE slug = %s", (holder,)).fetchone()
+        if member_from(them, department_id, template):
+            return False
+    conn.execute("UPDATE department_set_members SET agent = %s, updated_at = %s "
+                 "WHERE department_id = %s AND template = %s", (slug, _now(), department_id, template))
+    return True
+
+
+def department_of(agent: dict | None) -> str:
+    """The department the agent is a member of: both ids set, the edge
+    compiler's own rule ('' for none)."""
+    if not agent or not agent.get("department_level_id"):
+        return ""
+    return str(agent.get("department_id") or "")
+
+
+def member_from(agent: dict | None, department_id: str, template: str) -> bool:
+    """A member of the department installed from ``template``: what a
+    department's recorded place needs of its agent (the binding's read and
+    a hand placement's fill ask the same)."""
+    return bool(department_id) and department_of(agent) == department_id \
+        and str((agent or {}).get("community_template") or "") == template
+
+
+def set_member(department_id: str, template: str) -> str | None:
+    """The agent recorded for ``template`` in the department:
+    its slug, '' when the place is empty, None when the department records
+    no such member (made by hand, or before the record existed)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT agent FROM department_set_members WHERE department_id = %s AND template = %s",
+            (department_id, template)).fetchone()
+    return None if row is None else str(row["agent"] or "")
+
+
+def filled_by(department_id: str, template: str) -> str:
+    """The agent that fills the department's place for ``template`` now:
+    the recorded one while it is a member from that template, else ''."""
+    held = set_member(department_id, template)
+    if not held:
+        return ""
+    with get_conn() as conn:
+        row = conn.execute("SELECT department_id, department_level_id, community_template FROM agents "
+                           "WHERE slug = %s", (held,)).fetchone()
+    return held if member_from(row, department_id, template) else ""
+
+
+def set_members_all() -> dict[tuple[str, str], str]:
+    """Every record, ``(department id, template) → agent``, read at once
+    for a pass over many apps."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT department_id, template, agent FROM department_set_members").fetchall()
+    return {(r["department_id"], r["template"]): str(r["agent"] or "") for r in rows}
 
 
 def update_department(department_id: str, **fields) -> dict | None:

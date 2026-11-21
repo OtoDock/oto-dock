@@ -56,6 +56,7 @@ from services.mcp import mcp_registry
 from storage.automation import webhook_subscription_store
 from storage.identity import credential_store, oauth_app_kinds
 from storage.mcp import mcp_store
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock.relay-events")
 
@@ -391,7 +392,7 @@ async def sync_all() -> None:
     """One register per provider in use (the boot's: an upgraded install
     sends its kinds, a mistaken switch-off is healed), then the unbinds
     waiting. Best effort."""
-    if not relay_client.is_available() or not config.DASHBOARD_PUBLIC_URL:
+    if not config.DASHBOARD_PUBLIC_URL or not await run_db(relay_client.is_available):
         return
     st = _now()
     async with st.lock:
@@ -496,8 +497,9 @@ def sync_provider_soon(provider_id: str) -> asyncio.Task[Any] | None:
     """``sync_provider`` in the background, coalesced: one run per provider
     in flight, plus one more when asked meanwhile (it reads the state at that
     moment). A ``rate_limited`` refusal runs again after ``RETRY_DELAY_S``.
-    The task that will carry this request, None when there is no relay."""
-    if not provider_id or not relay_client.is_available() or not config.DASHBOARD_PUBLIC_URL:
+    The task that will carry this request (it ends at once when the relay is
+    not available), None with no provider or no public URL."""
+    if not provider_id or not config.DASHBOARD_PUBLIC_URL:
         return None
     st = _now()
     running = st.running.get(provider_id)
@@ -512,11 +514,13 @@ def sync_provider_soon(provider_id: str) -> asyncio.Task[Any] | None:
 
 def sync_all_soon() -> None:
     """Every provider in use, each through ``sync_provider_soon``."""
-    if not relay_client.is_available() or not config.DASHBOARD_PUBLIC_URL:
+    if not config.DASHBOARD_PUBLIC_URL:
         return
     from core import background
 
     async def run() -> None:
+        if not await run_db(relay_client.is_available):
+            return
         for p in await asyncio.to_thread(providers_in_use):
             sync_provider_soon(p)
     background.spawn(run(), name="sync-all", owner="relay-events")
@@ -526,7 +530,7 @@ def sync_providers_of_mcp_soon(mcp_name: str) -> None:
     """After an MCP is switched on or off: the providers its manifest names
     that this install uses (``providers_in_use``). A provider nothing here
     uses is never registered: a switch alone must not reach the relay."""
-    if not relay_client.is_available() or not config.DASHBOARD_PUBLIC_URL:
+    if not config.DASHBOARD_PUBLIC_URL:
         return
     manifest = mcp_registry.get_manifest(mcp_name)
     if manifest is None:
@@ -535,6 +539,8 @@ def sync_providers_of_mcp_soon(mcp_name: str) -> None:
     from core import background
 
     async def run() -> None:
+        if not await run_db(relay_client.is_available):
+            return
         for p in sorted(named & set(await asyncio.to_thread(providers_in_use))):
             sync_provider_soon(p)
     background.spawn(run(), name=f"sync-{mcp_name}", owner="relay-events")
@@ -542,6 +548,10 @@ def sync_providers_of_mcp_soon(mcp_name: str) -> None:
 
 async def _run_soon(st: _LoopState, provider_id: str) -> None:
     try:
+        # The gate reads the licence: here, since ``sync_provider_soon`` cannot
+        # await and cannot run in a thread (the task needs the loop).
+        if not await run_db(relay_client.is_available):
+            return
         while True:
             st.dirty.discard(provider_id)
             try:
@@ -738,7 +748,7 @@ async def unbind_account(provider_id: str, token_data: dict, *, revoked: bool,
     exist) and its revoke failed. Queued, sent in the background: the caller
     never waits on the relay. Best effort."""
     extra = _dict(token_data.get("extra"))
-    if not provider_id or not extra.get("via_relay") or not relay_client.is_available():
+    if not provider_id or not extra.get("via_relay") or not await run_db(relay_client.is_available):
         return
     try:
         if extra.get("app_kind") == oauth_app_kinds.KIND_GITHUB_APP:

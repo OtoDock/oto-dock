@@ -4,10 +4,10 @@ Key format: ``otok_<base64-32>`` where the prefix part (first 12 chars after
 ``otok_``) is stored plaintext for UI display + DB index. The full key is
 bcrypt-hashed at rest. Plaintext is returned ONCE on creation.
 
-Used by the webhook trigger fire endpoint (Bearer auth) and by the admin
-CRUD endpoints. Master ``PROXY_API_KEY`` is REJECTED here — it never
-authenticates webhook fires (security boundary between internal ops and
-external webhooks).
+Used by the webhook trigger fire endpoints, by the key principal of the
+public routes (``auth/api_keys.py``) and by the key CRUD endpoints. Master
+``PROXY_API_KEY`` is REJECTED here — it never authenticates a key route
+(security boundary between internal ops and external callers).
 
 This module reads the storage layer (``storage.identity.api_key_store``) and adds:
 
@@ -21,6 +21,8 @@ This module reads the storage layer (``storage.identity.api_key_store``) and add
 import asyncio
 import logging
 import secrets
+import time
+from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import psycopg
@@ -42,10 +44,30 @@ KEY_PUBLIC_PREFIX = "otok_"
 KEY_INDEX_PREFIX_LEN = 12
 
 
-# All permission scopes that can appear on a user_api_keys row. v1 only
-# wires up `triggers`; the rest are placeholders for future input layers.
-ALL_USER_PERMISSIONS = ["triggers", "chat", "tasks", "notifications"]
-ENABLED_USER_PERMISSIONS_V1 = {"triggers"}
+# The permission scopes of a user_api_keys row: ``triggers`` fires the
+# person's webhooks; the rest reach the public routes
+# (``auth/api_key_endpoints.py``).
+ALL_USER_PERMISSIONS = ["triggers", "chat", "tasks", "files", "notifications"]
+ENABLED_USER_PERMISSIONS_V1 = set(ALL_USER_PERMISSIONS)
+# Minting a key with any of these, or one that runs without asking, takes
+# the password or the second step again (``auth.confirm.confirm_human``).
+CONFIRMED_USER_PERMISSIONS = frozenset(ALL_USER_PERMISSIONS) - {"triggers"}
+# A new key's lifetime, in days.
+KEY_MAX_DAYS = 365
+# A task's run has nobody to ask, so ``tasks`` goes only with a key made to
+# run without asking: refused at the mint, checked again on the task routes.
+TASKS_PERMISSION = "tasks"
+TASKS_NEED_UNASKED = ("The tasks permission needs a key that may run without asking. "
+                      "A task runs with nobody to ask.")
+
+# The two kinds of key (``user_api_keys``, ``agent_api_keys``).
+KEY_KIND_USER = "user"
+KEY_KIND_AGENT = "agent"
+
+# The platform setting that switches every key off for the install ("1").
+KEYS_OFF_SETTING = "api_keys_off"
+_KEYS_OFF_TTL_S = 5.0
+_keys_off_cache: tuple[bool, float] = (False, 0.0)
 
 
 # Permissions valid for agent_api_keys — same v1 scope.
@@ -168,22 +190,94 @@ def create_agent_key(
 
 
 def create_user_key(
-    *, user_sub: str, name: str, permissions: list[str],
+    *, user_sub: str, name: str, permissions: list[str], expires_in_days: int,
+    agents: list[str] | None = None, run_without_asking: bool = False,
 ) -> tuple[dict, str]:
     perms = validate_user_permissions(permissions or ["triggers"])
     if not perms:
-        raise ValueError("At least one permission required")
+        raise ValueError("Choose at least one permission.")
     if not name or not name.strip():
-        raise ValueError("Key name required")
+        raise ValueError("Give the key a name.")
+    if not 1 <= int(expires_in_days) <= KEY_MAX_DAYS:
+        raise ValueError(f"A key lasts from 1 to {KEY_MAX_DAYS} days.")
+    if TASKS_PERMISSION in perms and not run_without_asking:
+        raise ValueError(TASKS_NEED_UNASKED)
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=int(expires_in_days))).isoformat()
     raw_key, prefix = _generate_raw_key()
     key_hash = _hash_key(raw_key)
     row = api_key_store.create_user_api_key(
         user_sub=user_sub, name=name.strip(),
         key_hash=key_hash, prefix=prefix,
-        permissions=perms,
+        permissions=perms, agents=sorted(set(agents or [])), expires_at=expires_at,
+        run_without_asking=bool(run_without_asking),
     )
-    logger.info("Minted user_api_key id=%s user=%s", row['id'][:8], user_sub[:8])
+    logger.info("Minted user_api_key id=%s user=%s scopes=%s agents=%s days=%s",
+                row['id'][:8], user_sub[:8], ",".join(perms), len(agents or []), expires_in_days)
     return row, raw_key
+
+
+# =====================================================================
+# A key's standing: the install switch, the expiry, the person's sign-in
+# =====================================================================
+
+
+def keys_switched_off() -> bool:
+    """Whether an admin switched keys off for the install. Synchronous; the
+    answer is kept a few seconds."""
+    global _keys_off_cache
+    now = time.monotonic()
+    if _keys_off_cache[1] > now:
+        return _keys_off_cache[0]
+    from storage import database as task_store
+    off = task_store.get_platform_setting(KEYS_OFF_SETTING) == "1"
+    _keys_off_cache = (off, now + _KEYS_OFF_TTL_S)
+    return off
+
+
+def clear_keys_off_cache() -> None:
+    global _keys_off_cache
+    _keys_off_cache = (False, 0.0)
+
+
+def _iso(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def is_pre_2_0(row: dict) -> bool:
+    """A user key minted before keys had an expiry: it keeps working as it
+    did (no expiry, the password change does not end it)."""
+    return not row.get("expires_at")
+
+
+def key_row_refusal(row: dict, kind: str = KEY_KIND_USER, user: dict | None = None) -> str:
+    """Why this key may not be used now ("" when it may): revoked, switched
+    off for the install, expired, or (a user key with an expiry) its person
+    is gone or changed their password or signed out everywhere since the key
+    was made. ``user`` is the person's row, read by the caller. Synchronous."""
+    if row.get("revoked_at"):
+        return "This key was revoked."
+    if keys_switched_off():
+        return "API keys are switched off on this platform."
+    if kind != KEY_KIND_USER:
+        return ""
+    expires = _iso(row.get("expires_at"))
+    if expires is not None and expires <= datetime.now(timezone.utc):
+        return "This key has expired."
+    if is_pre_2_0(row):
+        return ""
+    if not user:
+        return "This key's account is gone."
+    created = _iso(row.get("created_at"))
+    from auth.providers import session_cookie_current
+    if created is None or not session_cookie_current(user, {"iat": int(created.timestamp())}):
+        return "This key ended when its account's password changed or it signed out everywhere."
+    return ""
 
 
 # =====================================================================
@@ -202,6 +296,8 @@ class KeyMismatch(Exception):
                           learns nothing from which of the three it was)
       - ``"scope"``     — key found but scope/owner doesn't match the URL
       - ``"permission"``— key valid but lacks the required permission scope
+      - ``"standing"``  — revoked meanwhile, switched off, expired, or its
+                          person's sign-in ended (``key_row_refusal``)
     """
 
     def __init__(self, code: str, message: str = ""):
@@ -262,6 +358,8 @@ def verify_bearer_for_agent(
             "permission",
             f"Key lacks {required_permission!r} permission",
         )
+    if key_row_refusal(matched, KEY_KIND_AGENT):
+        raise KeyMismatch("standing", "Key may not be used now")
 
     # last_used_at update is best-effort; never block the fire path on it.
     _schedule_last_used_update("agent", matched["id"])
@@ -316,6 +414,9 @@ def verify_bearer_for_user(
             "permission",
             f"Key lacks {required_permission!r} permission",
         )
+    from storage import database as task_store
+    if key_row_refusal(matched, KEY_KIND_USER, task_store.get_user(matched["user_sub"])):
+        raise KeyMismatch("standing", "Key may not be used now")
 
     _schedule_last_used_update("user", matched["id"])
     return matched

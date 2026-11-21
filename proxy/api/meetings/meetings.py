@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from auth.providers import UserContext, get_current_user, require_auth, require_user
+from core import drain
 from core.background import spawn
 from core.session.visibility import SCOPE_AGENT, SCOPE_USER, nouser_read_targets
 from storage import database as task_store
@@ -259,6 +260,15 @@ def _max_meeting_participants(raw) -> int:
     return value if value >= 0 else DEFAULT_MAX_MEETING_PARTICIPANTS
 
 
+def _refuse_while_updating() -> None:
+    """No meeting starts while the platform holds new work for an update
+    (``core.drain``): its turns would be cut by the stop."""
+    if drain.holding():
+        raise HTTPException(
+            503, drain.refusal("OtoDock is updating. Start the meeting again in a few minutes."),
+            headers={"Retry-After": "60"})
+
+
 @router.post("/v1/meetings")
 async def create_meeting(
     req: CreateMeetingRequest,
@@ -267,6 +277,7 @@ async def create_meeting(
 ):
     """Create a meeting record."""
     u = require_auth(user)
+    _refuse_while_updating()
 
     # Validate at least 2 agents
     if len(req.agents) < 2:
@@ -387,6 +398,7 @@ async def start_meeting_endpoint(
         raise HTTPException(403, "Only the creator, an admin or the moderator can start the meeting")
     if meeting["status"] != meeting_status.PENDING:
         raise HTTPException(400, f"Meeting status is '{meeting['status']}', expected 'pending'")
+    _refuse_while_updating()
 
     from services.meetings import meeting_orchestrator
     spawn(meeting_orchestrator.start_meeting(meeting_id), name="start_meeting", owner="meetings")

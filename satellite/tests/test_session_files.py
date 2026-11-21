@@ -1,11 +1,8 @@
-"""Tests for satellite/sessions/session_files.py — per-session secret files.
-
-Materialize (fetch stubbed), env mapping, traversal guard, wipe semantics.
-The fetch itself is a plain POST with the payload's capability token — the
-proxy-side endpoint/auth contract is covered in the proxy suite.
+"""Tests for satellite/sessions/session_files.py: a session's own folders on
+this machine, their wipe at the close and at the start, and the purge of the
+agent tree's credential folders.
 """
 
-import base64
 import sys
 from pathlib import Path
 
@@ -26,81 +23,10 @@ def temp_secrets_root(tmp_path, monkeypatch):
     yield tmp_path / "session-secrets"
 
 
-def _payload(files):
-    return {
-        "session_files_token": "tok",
-        "env": {"PROXY_URL": "http://127.0.0.1:9"},
-        "session_files_env": {"OTO_SSH_KEY_DIR": "ssh"},
-        "_files": files,  # consumed by the fetch stub below
-    }
-
-
-@pytest.fixture
-def stub_fetch(monkeypatch):
-    def _stub(proxy_url, token):
-        return _stub.files
-    _stub.files = None
-    monkeypatch.setattr(session_files, "_fetch", _stub)
-    return _stub
-
-
-def test_materialize_writes_0600_and_maps_env(stub_fetch, temp_secrets_root):
-    stub_fetch.files = {
-        "ssh/prod_key": {
-            "content_b64": base64.b64encode(b"PRIVATE").decode(),
-            "mode": 0o600,
-        },
-    }
-    env = session_files.materialize(_payload(stub_fetch.files), "sid-1")
-
-    dest = temp_secrets_root / "sid-1" / "ssh" / "prod_key"
-    assert dest.read_bytes() == b"PRIVATE"
-    assert dest.stat().st_mode & 0o777 == 0o600
-    assert dest.parent.stat().st_mode & 0o777 == 0o700
-    assert env == {"OTO_SSH_KEY_DIR": str(temp_secrets_root / "sid-1" / "ssh")}
-
-
-def test_materialize_refuses_traversal_paths(stub_fetch, temp_secrets_root):
-    stub_fetch.files = {
-        "../outside": {"content_b64": base64.b64encode(b"X").decode()},
-        "ssh/ok": {"content_b64": base64.b64encode(b"OK").decode()},
-    }
-    env = session_files.materialize(_payload(stub_fetch.files), "sid-2")
-
-    assert not (temp_secrets_root.parent / "outside").exists()
-    assert (temp_secrets_root / "sid-2" / "ssh" / "ok").exists()
-    assert env  # the legit file still landed
-
-
-def test_materialize_refuses_the_root_and_a_sibling_prefix(stub_fetch, temp_secrets_root):
-    """An empty relpath names the session dir itself (a write onto a directory)
-    and a sibling whose name extends the root is not under it."""
-    stub_fetch.files = {
-        "": {"content_b64": base64.b64encode(b"X").decode()},
-        "ssh/ok": {"content_b64": base64.b64encode(b"OK").decode()},
-    }
-    env = session_files.materialize(_payload(stub_fetch.files), "sid-2b")
-    assert (temp_secrets_root / "sid-2b" / "ssh" / "ok").exists()
-    assert env
-    assert not (temp_secrets_root / "sid-2bevil").exists()
-
-
-def test_materialize_noop_without_token(stub_fetch):
-    assert session_files.materialize({"env": {}}, "sid-3") == {}
-
-
-def test_materialize_failed_fetch_is_empty(stub_fetch, temp_secrets_root):
-    stub_fetch.files = None  # fetch error path
-    assert session_files.materialize(_payload(None), "sid-4") == {}
-    assert not (temp_secrets_root / "sid-4").exists()
-
-
-def test_wipe_and_wipe_all(stub_fetch, temp_secrets_root):
-    stub_fetch.files = {
-        "ssh/k": {"content_b64": base64.b64encode(b"K").decode()},
-    }
-    session_files.materialize(_payload(stub_fetch.files), "sid-5")
-    session_files.materialize(_payload(stub_fetch.files), "sid-6")
+def test_wipe_and_wipe_all(temp_secrets_root):
+    for sid in ("sid-5", "sid-6"):
+        (temp_secrets_root / sid / "ssh").mkdir(parents=True)
+        (temp_secrets_root / sid / "ssh" / "k.pub").write_text("ssh-ed25519 AAAA k\n")
 
     session_files.wipe("sid-5")
     assert not (temp_secrets_root / "sid-5").exists()
@@ -108,110 +34,6 @@ def test_wipe_and_wipe_all(stub_fetch, temp_secrets_root):
 
     session_files.wipe_all()
     assert not temp_secrets_root.exists()
-
-
-# ── agent-tree targets (OAuth credentials_dir token files) ─────────────────
-
-_TOKEN = base64.b64encode(b'{"access_token":"x"}').decode()
-_VPATH = "/users/alice/.credentials/google-tokens/alice@gmail.com.json"
-
-
-@pytest.fixture
-def agent_dir(tmp_path):
-    d = tmp_path / "agents" / "agentx"
-    (d / "users" / "alice" / "workspace").mkdir(parents=True)
-    return d
-
-
-def _cred_payload(files):
-    p = _payload(files)
-    p["cwd_relative"] = "users/alice"
-    return p
-
-
-def test_virtual_path_lands_in_agent_tree(stub_fetch, temp_secrets_root, agent_dir):
-    stub_fetch.files = {_VPATH: {"content_b64": _TOKEN}}
-    env = session_files.materialize(
-        _cred_payload(stub_fetch.files), "sid-v1", agent_dir,
-    )
-
-    dest = (
-        agent_dir / "users" / "alice" / ".credentials" / "google-tokens"
-        / "alice@gmail.com.json"
-    )
-    assert dest.read_bytes() == b'{"access_token":"x"}'
-    assert dest.stat().st_mode & 0o777 == 0o600
-    assert dest.parent.stat().st_mode & 0o777 == 0o700
-    # ssh env var still maps (blindly, from session_files_env) but no agent-
-    # tree path leaks into env — the MCP's own env already carries it.
-    assert list(env) == ["OTO_SSH_KEY_DIR"]
-    # The write is recorded for wipe().
-    assert session_files._agent_tree_files(
-        temp_secrets_root / "sid-v1"
-    ) == [str(dest)]
-
-
-def test_virtual_path_outside_agent_tree_refused(stub_fetch, temp_secrets_root, agent_dir, tmp_path):
-    stub_fetch.files = {
-        # Unknown prefix → translate_path passes it through → outside root.
-        "/etc/evil": {"content_b64": _TOKEN},
-        # Known prefix + traversal out of the agent dir.
-        "/users/../../evil.json": {"content_b64": _TOKEN},
-        "ssh/ok": {"content_b64": base64.b64encode(b"OK").decode()},
-    }
-    session_files.materialize(_cred_payload(stub_fetch.files), "sid-v2", agent_dir)
-
-    assert not (tmp_path / "evil.json").exists()
-    assert not (tmp_path / "agents" / "evil.json").exists()
-    assert (temp_secrets_root / "sid-v2" / "ssh" / "ok").exists()
-    assert session_files._agent_tree_files(temp_secrets_root / "sid-v2") == []
-
-
-def test_virtual_path_skipped_without_agent_dir(stub_fetch, temp_secrets_root):
-    stub_fetch.files = {_VPATH: {"content_b64": _TOKEN}}
-    assert session_files.materialize(
-        _cred_payload(stub_fetch.files), "sid-v3",
-    ) == {}
-
-
-def test_stale_sibling_token_files_removed(stub_fetch, temp_secrets_root, agent_dir):
-    stale_dir = agent_dir / "users" / "alice" / ".credentials" / "google-tokens"
-    stale_dir.mkdir(parents=True)
-    (stale_dir / "old-account@gmail.com.json").write_text("{}")
-
-    stub_fetch.files = {_VPATH: {"content_b64": _TOKEN}}
-    session_files.materialize(_cred_payload(stub_fetch.files), "sid-v4", agent_dir)
-
-    # Single-user-mode MCPs pick the first file in the dir — only the
-    # session's bound account's token may remain.
-    assert not (stale_dir / "old-account@gmail.com.json").exists()
-    assert (stale_dir / "alice@gmail.com.json").exists()
-
-
-def test_wipe_removes_agent_tree_files_and_prunes_dirs(stub_fetch, temp_secrets_root, agent_dir):
-    stub_fetch.files = {_VPATH: {"content_b64": _TOKEN}}
-    session_files.materialize(_cred_payload(stub_fetch.files), "sid-v5", agent_dir)
-
-    session_files.wipe("sid-v5")
-    creds_root = agent_dir / "users" / "alice" / ".credentials"
-    assert not creds_root.exists()  # file removed + empty dirs pruned
-    assert (agent_dir / "users" / "alice").is_dir()  # tree above untouched
-    assert not (temp_secrets_root / "sid-v5").exists()
-
-
-def test_wipe_refcounts_shared_target_across_sessions(stub_fetch, temp_secrets_root, agent_dir):
-    stub_fetch.files = {_VPATH: {"content_b64": _TOKEN}}
-    session_files.materialize(_cred_payload(stub_fetch.files), "sid-a", agent_dir)
-    session_files.materialize(_cred_payload(stub_fetch.files), "sid-b", agent_dir)
-
-    dest = (
-        agent_dir / "users" / "alice" / ".credentials" / "google-tokens"
-        / "alice@gmail.com.json"
-    )
-    session_files.wipe("sid-a")
-    assert dest.exists()  # sid-b still references it
-    session_files.wipe("sid-b")
-    assert not dest.exists()
 
 
 def test_purge_agent_tree_credentials(tmp_path):
@@ -237,77 +59,33 @@ def test_purge_agent_tree_credentials(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Interactive (PTY) sessions run the same materialize/wipe lifecycle
+# Interactive (PTY) sessions wipe the same folder at their close
 # ---------------------------------------------------------------------------
 
 def _pty_base(tmp_path):
     from satellite.terminal.pty_session_base import BasePtySession
-    return BasePtySession(
-        "pty-sess", tmp_path / "agents" / "demo", _payload(None),
-        object(), object(),
-    )
+    return BasePtySession("pty-sess", tmp_path / "agents" / "demo", {"env": {}}, object(), object())
 
 
-def test_pty_base_materializes_session_files(stub_fetch, temp_secrets_root, tmp_path):
-    # Regression: interactive sessions skipped the pre-spawn session-files
-    # step the headless paths run — a PTY session's bash had no ssh-hosts
-    # keys (no OTO_SSH_KEY_DIR) and credentials_dir MCPs had no token files.
+def test_pty_base_close_wipes_the_sessions_folder(temp_secrets_root, tmp_path):
     import asyncio
 
-    stub_fetch.files = {
-        "ssh/id_ed25519": {"content_b64": base64.b64encode(b"KEY").decode()},
-    }
-    env = asyncio.run(_pty_base(tmp_path)._materialize_session_files())
-    key = Path(env["OTO_SSH_KEY_DIR"]) / "id_ed25519"
-    assert key.read_bytes() == b"KEY"
-
-
-def test_pty_base_close_wipes_session_files(stub_fetch, temp_secrets_root, tmp_path):
-    import asyncio
-
-    stub_fetch.files = {
-        "ssh/id_ed25519": {"content_b64": base64.b64encode(b"KEY").decode()},
-    }
     sess = _pty_base(tmp_path)
-    env = asyncio.run(sess._materialize_session_files())
-    secrets_dir = Path(env["OTO_SSH_KEY_DIR"]).parent
-    assert secrets_dir.is_dir()
+    folder = temp_secrets_root / "pty-sess" / "ssh"
+    folder.mkdir(parents=True)
+    (folder / "id_ed25519.pub").write_text("ssh-ed25519 AAAA id\n")
     asyncio.run(sess.close())
-    assert not secrets_dir.exists()
+    assert not (temp_secrets_root / "pty-sess").exists()
 
 
-def test_the_fetch_goes_direct_whatever_proxy_the_environment_names(monkeypatch):
-    """PROXY_URL is this machine's own loopback tunnel: an environment proxy
-    (or Windows' Internet Options one, which never exempts 127.0.0.1) must
-    not capture the fetch."""
-    import json
-    import socket
-    import threading
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            data = json.dumps({"files": {"ssh/id": {"content_b64": "eA=="}}}).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def log_message(self, *args):
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        dead = f"http://127.0.0.1:{s.getsockname()[1]}"
-    for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY"):
-        monkeypatch.setenv(name, dead)
-    for name in ("NO_PROXY", "no_proxy"):
-        monkeypatch.delenv(name, raising=False)
-    try:
-        got = session_files._fetch(f"http://127.0.0.1:{server.server_address[1]}", "tok")
-    finally:
-        server.shutdown()
-        server.server_close()
-    assert got == {"ssh/id": {"content_b64": "eA=="}}
+def test_the_credentials_purge_never_removes_through_a_persons_link(tmp_path):
+    """A person's own link at their folder: the purge leaves what lies
+    behind it (it removes only a folder reached with no link)."""
+    outside = tmp_path / "elsewhere" / "alice"
+    (outside / ".credentials").mkdir(parents=True)
+    (outside / ".credentials" / "t.json").write_text("{}")
+    agents = tmp_path / "agents"
+    (agents / "a1" / "users").mkdir(parents=True)
+    (agents / "a1" / "users" / "alice").symlink_to(outside)
+    session_files.purge_agent_tree_credentials(agents)
+    assert (outside / ".credentials" / "t.json").exists()

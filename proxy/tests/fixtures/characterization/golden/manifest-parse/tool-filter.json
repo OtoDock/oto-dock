@@ -1,0 +1,49 @@
+{
+ "absent": {
+  "parsed": null
+ },
+ "agent env taken": {
+  "refused": "char-mcp: invalid tool_filter block — ENABLED_TOOLS_REGEX is also a declared env, config, credential, instance or path_env key"
+ },
+ "bad env": {
+  "refused": "char-mcp: invalid tool_filter block — tool_filter.env_var_name '1BAD' must match POSIX env var name pattern ^[A-Z_][A-Z0-9_]*$"
+ },
+ "bad regex env": {
+  "refused": "char-mcp: invalid tool_filter block — tool_filter.regex_env_var_name '1BAD' must match POSIX env var name pattern ^[A-Z_][A-Z0-9_]*$"
+ },
+ "config taken": {
+  "refused": "char-mcp: invalid tool_filter block — CFG is also a declared env, config, credential, instance or path_env key"
+ },
+ "credential taken": {
+  "refused": "char-mcp: invalid tool_filter block — CRED is also a declared env, config, credential, instance or path_env key"
+ },
+ "defaults": {
+  "parsed": {
+   "arg_name": "--enabled-tools"
+  }
+ },
+ "empty env": {
+  "refused": "char-mcp: invalid tool_filter block — tool_filter.env_var_name must be a non-empty string when declared"
+ },
+ "env taken": {
+  "refused": "char-mcp: invalid tool_filter block — ENABLED_TOOLS_FLAG is also a declared env, config, credential, instance or path_env key"
+ },
+ "instance taken": {
+  "refused": "char-mcp: invalid tool_filter block — INST is also a declared env, config, credential, instance or path_env key"
+ },
+ "no arg name": {
+  "refused": "char-mcp: invalid tool_filter block — tool_filter.arg_name is required (non-empty string)"
+ },
+ "not an object": {
+  "refused": "char-mcp: invalid tool_filter block — tool_filter must be an object, got list"
+ },
+ "path taken": {
+  "refused": "char-mcp: invalid tool_filter block — PATHY is also a declared env, config, credential, instance or path_env key"
+ },
+ "same names": {
+  "refused": "char-mcp: invalid tool_filter block — tool_filter.regex_env_var_name must differ from env_var_name"
+ },
+ "short flag": {
+  "refused": "char-mcp: invalid tool_filter block — tool_filter.arg_name '-t' must be a long-form CLI flag matching ^--[a-z0-9][a-z0-9-]*$"
+ }
+}

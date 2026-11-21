@@ -26,14 +26,16 @@ import base64
 import contextlib
 import logging
 import os
+import stat
 import time
 from collections import deque
 from collections.abc import Callable
+from json.encoder import encode_basestring_ascii
 from pathlib import Path
 
 from .. import config
 from .._vendored import layout, terminal_queries
-from ..host import env_hygiene, path_translator
+from ..host import env_hygiene, path_translator, safe_fs
 from ..transport import file_sync
 
 logger = logging.getLogger("satellite")
@@ -43,6 +45,16 @@ logger = logging.getLogger("satellite")
 # sub-second poll keeps history landing within a couple seconds of a turn end.
 # Cheap (a stat + delta read).
 _TRANSCRIPT_POLL_S = 0.8
+# A poll reads at most this much of the transcript; a line longer than it is
+# read past to its newline, never sent.
+_TRANSCRIPT_POLL_MAX_BYTES = 15 * 1024 * 1024
+# A frame carries the lines that fit this much once encoded (the link sends
+# ``json.dumps``, which escapes every non-ASCII character), the platform's
+# own relay cap under the link's 16 MiB; the rest goes at the next poll.
+_TRANSCRIPT_FRAME_MAX_BYTES = 12 * 1024 * 1024
+_TRANSCRIPT_SKIP_CHUNK = 1024 * 1024
+# The close reads what is left in at most this many polls.
+_FINAL_FLUSH_POLLS = 8
 
 # Server-prompt injection (proxy `pty_inject`): the PROXY owns the turn-state
 # decision (it parses end_turn from the forwarded transcript lines); this side
@@ -130,6 +142,14 @@ class BasePtySession:
         self.cols = cols
         self.pty = None
         self.pid: int | None = None
+        # The token the platform minted for this open (``pty_open``): the
+        # ack and the exit carry it, so an exit of a PTY closed under an id
+        # never reaches the one started again under that id. Empty from a
+        # platform that sends none.
+        self.open_token: str = ""
+        # Replaced by a later open under the same id: its close leaves the
+        # per-session files alone, since the successor rewrote them.
+        self.superseded = False
         self._cwd: Path | None = None
         self._file_snapshot: dict[str, str] = {}
         # File write-back: set when the transcript forwarded new lines (the CLI
@@ -140,7 +160,22 @@ class BasePtySession:
         self._tail_task: asyncio.Task | None = None
         self._tail_stop = False
         self._transcript_path: Path | None = None
+        # The same file as a path beneath the agent's folder: every read
+        # opens it there (``host/safe_fs``), never by the name above.
+        self._transcript_rel: str | None = None
         self._transcript_offset = 0
+        # Inside a line longer than a poll's cap: read past to its newline.
+        self._transcript_skipping = False
+        # Where that line starts: an ack is never held inside it.
+        self._skip_start = 0
+        # The offset up to which the platform said it took the lines
+        # (``transcript_ack``, 0.5.171). Lines sent on a link that was already
+        # gone (a machine paused past the platform's patience, its first
+        # frames after it ran again) are sent again from here at the next
+        # sign-in (``rewind_transcript``); a platform that never acks is
+        # never sent a line twice.
+        self._acked_offset = 0
+        self._acks_seen = False
         # On --resume the JSONL/rollout already holds the prior conversation (already
         # in the proxy DB), so skip past it on first locate and forward only new lines.
         self._transcript_skip_existing = False
@@ -165,6 +200,15 @@ class BasePtySession:
         self._input_carry = b""
         self._injecting = False
         self._recent_injects: deque[str] = deque(maxlen=8)
+        # A compute session (``sessions/sandbox_host``): the platform's
+        # files, the platform's sandbox, nothing written, translated or
+        # scanned here. The transcript tail reads the shared folder.
+        from ..sessions import sandbox_host
+        self._compute = sandbox_host.is_compute(config)
+        # A compute machine with its own copy (set at the start): the
+        # prepared files are written and the changes scanned, as on a
+        # paired machine.
+        self._own_copy = False
 
     # --- otodock-CLI local relay --------------------------------------------
     def attach_local_relay(
@@ -225,7 +269,7 @@ class BasePtySession:
             # composer tracking (dashboard input) is authoritative again —
             # injecting here would bypass it.
             return "not_attached"
-        if self._transcript_path is None:
+        if self._transcript_rel is None:
             return "not_ready"  # nothing established yet (fresh spawn)
         if self._files_dirty:
             return "transcript_busy"  # forwarding a burst — mid-turn
@@ -336,18 +380,17 @@ class BasePtySession:
             env.setdefault("COLORTERM", "truecolor")
         return env
 
-    async def _materialize_session_files(self) -> dict[str, str]:
-        """Fetch this session's secret files from the platform's session-file
-        broker BEFORE spawn — SSH keys (injects ``OTO_SSH_KEY_DIR``) + OAuth
-        token files landed at their agent-tree credentials_dir target — the
-        same step the headless sessions run (interactive sessions used to skip
-        it, so their bash had no ssh-hosts keys and credentials_dir MCPs had
-        no tokens). No token in the payload → no-op. Wiped in :meth:`close`."""
-        from ..sessions import session_files
-        return await asyncio.to_thread(
-            session_files.materialize, self.config, self.session_id,
-            self.agent_dir,
-        )
+    async def _session_agent_env(self) -> dict[str, str]:
+        """Before spawn, the step the headless sessions run too: the
+        session's SSH agent socket (the proxy signs), whose path and public
+        keys' dir are the variables answered, and the credential exit's door
+        from the payload's ``exit`` block. Both go in :meth:`close`."""
+        from ..sessions import credential_exit, ssh_agent
+        env: dict[str, str] = {}
+        agent_env = await asyncio.to_thread(ssh_agent.start, self.session_id, self.config)
+        ssh_agent.merge_env(env, agent_env, self.config)
+        await asyncio.to_thread(credential_exit.start, self.session_id, self.config)
+        return env
 
     def _translate_env(self, env: dict[str, str]) -> dict[str, str]:
         """Rewrite sandbox-virtual paths in the env to satellite-absolute (same
@@ -364,7 +407,7 @@ class BasePtySession:
         )
 
     # --- spawn + wire output/exit back over the WS ---------------------------
-    async def _wire_and_spawn(self, cmd: list[str], env: dict[str, str], cwd: str) -> None:
+    async def _wire_and_spawn(self, cmd: list[str], env: dict[str, str], cwd: str | None) -> None:
         """Spawn ``cmd`` under a PTY (OS-appropriate backend), stream its bytes to
         the proxy (``pty_output``), report exit (``pty_exit``), snapshot the agent
         dir (off-thread), and start the transcript tail loop."""
@@ -411,21 +454,24 @@ class BasePtySession:
                     self._on_dead()
                 except Exception:  # noqa: BLE001  # the on-dead hook must not skip reporting the exit to the proxy
                     logger.debug("pty _on_dead hook failed", exc_info=True)
-            return self._ws.enqueue_send({
-                "type": "pty_exit",
-                "session_id": self.session_id,
-                "code": code,
-            })
+            exit_frame = {"type": "pty_exit", "session_id": self.session_id, "code": code}
+            if self.open_token:
+                exit_frame["open_token"] = self.open_token
+            if getattr(self, "ended_for_memory", False):
+                exit_frame["reason"] = "memory"   # the memory guard ended the engine
+            return self._ws.enqueue_send(exit_frame)
 
-        self.pty = pty_relay.spawn_pty(
-            cmd,
-            env=env,
-            cwd=cwd,
-            rows=self.rows,
-            cols=self.cols,
-            on_output=_on_output,
-            on_exit=_on_exit,
-        )
+        from ..sessions import start_slots
+        async with start_slots.slot():
+            self.pty = pty_relay.spawn_pty(
+                cmd,
+                env=env,
+                cwd=cwd,
+                rows=self.rows,
+                cols=self.cols,
+                on_output=_on_output,
+                on_exit=_on_exit,
+            )
         self.pid = self.pty.pid
         logger.info(
             "PTY session started: pid=%s session=%s path=%s (%dx%d)",
@@ -433,61 +479,126 @@ class BasePtySession:
         )
         # Snapshot files for change detection (parity with CLISession).
         # Off-thread — the hash walk must not stall the loop at session start.
-        self._file_snapshot = await asyncio.to_thread(
-            file_sync.snapshot_agent_dir, self.agent_dir,
-        )
+        # A compute session beside the platform writes its folder itself: no
+        # snapshot.
+        if not self._compute or self._own_copy:
+            self._file_snapshot = await asyncio.to_thread(
+                file_sync.snapshot_agent_dir, self.agent_dir,
+            )
         # Tail the transcript JSONL + forward new lines to the proxy.
         self._tail_task = asyncio.create_task(self._transcript_tail_loop())
 
     # --- transcript forwarding (shared) --------------------------------------
-    def _locate_transcript_file(self) -> Path | None:  # pragma: no cover - abstract
-        """Find this session's JSONL on disk. Claude: ``<id>.jsonl`` by name;
-        Codex: discover the rollout. Returns None until the CLI has created it."""
+    def _locate_transcript_file(self) -> str | None:  # pragma: no cover - abstract
+        """Find this session's JSONL on disk, as a path beneath the agent's
+        folder. Claude: ``<id>.jsonl`` by name; Codex: discover the rollout.
+        Returns None until the CLI has created it."""
         raise NotImplementedError
 
     def _read_new_complete_lines(self) -> list[str]:
-        """Read whole JSONL lines appended since the last forward (by byte offset).
-        A trailing partial line is left for the next poll. Resets on a shrink (the
-        CLI only appends, so this is just defensive)."""
-        path = self._transcript_path
-        if path is None:
+        """Read whole JSONL lines appended since the last forward (by byte offset),
+        at most ``_TRANSCRIPT_POLL_MAX_BYTES`` a poll. The file is opened beneath
+        the agent's folder at the located path (a regular file, no link on the
+        way, a pipe refused at once) and its size read from the open file. A
+        trailing partial line is left for the next poll; a line longer than a
+        poll's cap is read past to its newline, never sent. Resets on a shrink
+        (the CLI only appends, so this is just defensive)."""
+        if self._transcript_rel is None:
             return []
         try:
-            size = path.stat().st_size
+            fd, st = safe_fs.open_regular_for_read(self.agent_dir, self._transcript_rel)
         except OSError:
             return []
+        try:
+            with os.fdopen(fd, "rb") as fh:
+                return self._lines_from(fh, st.st_size)
+        except OSError:
+            return []
+
+    def _lines_from(self, fh, size: int) -> list[str]:
         if size < self._transcript_offset:
             self._transcript_offset = 0  # rotated/truncated → re-read
+            self._transcript_skipping = False
+            # The old ack names no line's start in the new file.
+            self._acked_offset = 0
+            self._skip_start = 0
         if size <= self._transcript_offset:
             return []
-        try:
-            with open(path, "rb") as fh:
-                fh.seek(self._transcript_offset)
-                data = fh.read()
-        except OSError:
+        fh.seek(self._transcript_offset)
+        if self._transcript_skipping:
+            self._skip_long_line(fh)
             return []
+        data = fh.read(min(size - self._transcript_offset, _TRANSCRIPT_POLL_MAX_BYTES))
         last_nl = data.rfind(b"\n")
         if last_nl < 0:
+            if len(data) >= _TRANSCRIPT_POLL_MAX_BYTES:
+                logger.warning("PTY %s: a transcript line over %d bytes is skipped, not sent",
+                               self.session_id[:8], _TRANSCRIPT_POLL_MAX_BYTES)
+                self._skip_start = self._transcript_offset
+                self._transcript_offset += len(data)
+                self._transcript_skipping = True
             return []  # only a partial line so far
-        complete = data[: last_nl + 1]
-        self._transcript_offset += len(complete)
-        text = complete.decode("utf-8", errors="replace")
-        return [ln for ln in text.split("\n") if ln.strip()]
+        lines, taken = self._frame_lines(data[: last_nl + 1])
+        self._transcript_offset += taken
+        return lines
+
+    def _frame_lines(self, complete: bytes) -> tuple[list[str], int]:
+        """The whole lines of ``complete`` that fit one frame once encoded,
+        and the bytes they take: the offset stops at the end of the last line
+        taken. Each line is measured by the encoder the send uses, once. A
+        line that alone encodes past the frame is passed over, never sent."""
+        lines: list[str] = []
+        budget = _TRANSCRIPT_FRAME_MAX_BYTES
+        taken = 0
+        for raw in complete.split(b"\n")[:-1]:
+            text = raw.decode("utf-8", errors="replace")
+            if text.strip():
+                size = len(encode_basestring_ascii(text)) + 2  # and its separator in the list
+                if size > _TRANSCRIPT_FRAME_MAX_BYTES:
+                    logger.warning("PTY %s: a transcript line of %d bytes once encoded is skipped, not sent",
+                                   self.session_id[:8], size)
+                elif size > budget:
+                    break
+                else:
+                    budget -= size
+                    lines.append(text)
+            taken += len(raw) + 1
+        return lines, taken
+
+    def _skip_long_line(self, fh) -> None:
+        """Read on past the long line, at most a poll's cap, never holding
+        more than a chunk; the offset stops after its newline once seen."""
+        budget = _TRANSCRIPT_POLL_MAX_BYTES
+        while budget > 0:
+            chunk = fh.read(min(_TRANSCRIPT_SKIP_CHUNK, budget))
+            if not chunk:
+                return
+            nl = chunk.find(b"\n")
+            if nl >= 0:
+                self._transcript_offset += nl + 1
+                self._transcript_skipping = False
+                return
+            self._transcript_offset += len(chunk)
+            budget -= len(chunk)
 
     async def _forward_transcript_delta(self) -> bool:
         """Forward newly appended transcript lines. Returns True when lines were
         forwarded — the tail loop's signal that the CLI is mid-turn (arms the
         quiescence file scan below)."""
-        if self._transcript_path is None:
-            self._transcript_path = self._locate_transcript_file()
-            if self._transcript_path is None:
+        if self._transcript_rel is None:
+            rel = self._locate_transcript_file()
+            if rel is None:
                 return False
+            self._transcript_rel = rel
+            self._transcript_path = self.agent_dir.joinpath(*rel.split("/"))
             if self._transcript_skip_existing:
                 # Resume: prior history is already in the proxy DB → start past it.
                 try:
-                    self._transcript_offset = self._transcript_path.stat().st_size
+                    st = safe_fs.lstat_beneath(self.agent_dir, rel)
+                    self._transcript_offset = st.st_size if stat.S_ISREG(st.st_mode) else 0
                 except OSError:
                     self._transcript_offset = 0
+                self._acked_offset = self._transcript_offset
                 self._transcript_skip_existing = False
                 return False
         lines = self._read_new_complete_lines()
@@ -496,8 +607,53 @@ class BasePtySession:
                 "type": "transcript_lines",
                 "session_id": self.session_id,
                 "lines": lines,
+                "offset": self._transcript_offset,
             })
         return bool(lines)
+
+    #: The troubles this session already said once (the poll repeats them).
+    _warned: frozenset[str] = frozenset()
+
+    def _warn_once(self, key: str, msg: str, *args) -> None:
+        """One warning a session for a trouble the poll meets again and again."""
+        if key in self._warned:
+            return
+        self._warned = self._warned | {key}
+        logger.warning(msg, *args)
+
+    def note_transcript_ack(self, offset: int) -> None:
+        """The platform took the lines up to ``offset``, never past what was
+        read and never inside a line being read past."""
+        self._acks_seen = True
+        held = self._skip_start if self._transcript_skipping else self._transcript_offset
+        self._acked_offset = max(self._acked_offset, min(offset, held))
+
+    def rewind_transcript(self, platform_acks: bool = False) -> bool:
+        """A new sign-in: the lines past the platform's last ack go again.
+        The platform's tail takes a line it already holds once. A terminal
+        the platform acked nothing of yet goes again from the ack's base (0,
+        or the end of a resumed history) only when the new link's platform
+        says it acks (``transcript_acks``): a link that went in a terminal's
+        first second took its first lines with it, and a platform that never
+        acks is never sent a line twice. True when the offset moved back."""
+        if not (self._acks_seen or platform_acks) or self._acked_offset >= self._transcript_offset:
+            return False
+        if not self._acks_seen:
+            logger.info("PTY %s: %d bytes of lines the platform acked nothing of go again",
+                        self.session_id[:8], self._transcript_offset - self._acked_offset)
+        self._transcript_offset = self._acked_offset
+        self._transcript_skipping = False
+        return True
+
+    async def send_again(self, platform_acks: bool, drop_queued: Callable[[], object]) -> None:
+        """This terminal's part of a sign-in, right after the terminal report
+        (``ws_client._authenticate``): when it rewinds, the lines it queued
+        before the sign-in are dropped (``drop_queued``), since they go again
+        from the ack, and it reads at once, so they follow the report instead
+        of the next poll. A line goes once."""
+        if self.rewind_transcript(platform_acks):
+            drop_queued()
+            await self._forward_transcript_delta()
 
     async def _scan_and_forward_files(self) -> None:
         """Detect + forward agent-tree file changes — the PTY twin of the ``-p``
@@ -512,6 +668,8 @@ class BasePtySession:
         event loop; ``detect_changes`` refreshes the snapshot in place, and
         incoming platform pushes refresh it too (``session_manager.file_push``)
         so a push never echoes back as a phantom write-back."""
+        if self._compute and not self._own_copy:
+            return
         try:
             changes = await asyncio.to_thread(
                 file_sync.detect_changes, self.agent_dir, self._file_snapshot,
@@ -575,7 +733,8 @@ class BasePtySession:
 
     async def close(self) -> None:
         # Stop the tail loop, then do a FINAL forward so the last lines the CLI
-        # wrote before teardown still reach the proxy.
+        # wrote before teardown still reach the proxy: a poll's cap at a time,
+        # until nothing moves (a bounded number of polls).
         self._tail_stop = True
         if self._tail_task is not None:
             self._tail_task.cancel()
@@ -583,7 +742,11 @@ class BasePtySession:
                 await self._tail_task
             self._tail_task = None
         try:
-            await self._forward_transcript_delta()
+            for _ in range(_FINAL_FLUSH_POLLS):
+                before = (self._transcript_rel, self._transcript_offset)
+                await self._forward_transcript_delta()
+                if (self._transcript_rel, self._transcript_offset) == before:
+                    break
         except Exception:  # noqa: BLE001  # the final transcript flush must not skip the PTY's teardown
             logger.debug(
                 "PTY %s: final transcript flush failed", self.session_id, exc_info=True
@@ -596,13 +759,36 @@ class BasePtySession:
             logger.debug(
                 "PTY %s: final file scan failed", self.session_id, exc_info=True
             )
-        self._on_close()
-        if self.pty is not None:
-            self.pty.terminate()
+        try:
+            self._on_close()
+        except Exception:  # noqa: BLE001  # a subclass's teardown must never keep the terminal's process alive
+            logger.warning("PTY %s: teardown failed", self.session_id, exc_info=True)
+        finally:
+            if self.pty is not None:
+                self.pty.terminate()
         # Same teardown the headless sessions run — the CLI is gone, so its
-        # session-secret files (ssh keys / OAuth token files) go too.
-        from ..sessions import session_files
-        session_files.wipe(self.session_id)
+        # session-secret files (ssh keys / OAuth token files) go too. Not for
+        # a PTY a later open replaced: the files under the id are its
+        # successor's now.
+        if not self.superseded:
+            from ..sessions import credential_exit, session_files, ssh_agent
+            try:
+                await asyncio.to_thread(ssh_agent.stop, self.session_id)
+                credential_exit.stop(self.session_id)
+            finally:
+                # Whatever a step above raised, the session's files go.
+                if not self._compute:
+                    session_files.wipe(self.session_id)
+                    # A Codex terminal's own profile and text (no-op otherwise).
+                    from .._vendored import session_text
+                    session_text.forget(self.session_id)
+                elif self._own_copy:
+                    await asyncio.to_thread(session_files.wipe_agent_files, self.session_id)
+                    from ..sessions import session_homes
+                    rel = self.config.get("claude_dir_relative") or self.config.get("codex_dir_relative")
+                    if rel:
+                        session_homes.close_home(self.agent_dir / rel, self.session_id,
+                                                 self.config.get("session_home"))
 
     def _on_close(self) -> None:
         """Subclass hook for teardown that must run before the PTY is terminated

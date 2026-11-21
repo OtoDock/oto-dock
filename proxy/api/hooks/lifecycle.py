@@ -10,10 +10,10 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from typing import TYPE_CHECKING, cast
+from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Header
+from pydantic import BaseModel, Field
 
 import config
 from api.hooks import routing
@@ -23,21 +23,16 @@ from core.session.session_state import (
     _push_to_chat,
     _sessions,
     get_permission_queue,
-    get_permission_request_session,
     get_session_security,
     get_subagent_registry,
     mark_subagent_done,
     push_pump_event,
     record_hook_activity,
-    resolve_permission,
     wait_for_location,
 )
 from services.infra import pinned_http
 from storage import database as task_store
 from ws import wire_events as wire
-
-if TYPE_CHECKING:
-    from core.session.interactive_session import InteractiveSession
 
 logger = logging.getLogger("otodock")
 router = APIRouter()
@@ -78,7 +73,9 @@ class HookToolResultRequest(BaseModel):
 
 @router.post("/v1/hooks/tool-result")
 async def hook_tool_result(req: HookToolResultRequest, authorization: str | None = Header(None)):
-    """Called by PostToolUse hook to push a tool result summary to the chat.
+    """Called by PostToolUse hook to push a tool result summary to the chat,
+    and by Claude Code's PostToolUseFailure for a call that failed (the same
+    body, ``is_error`` set): a failed call's card shows what the model read.
 
     For a tool an MCP's ``result_files`` names, the answer says so
     (``result_files: true``) and the script sends the result's pictures and
@@ -144,41 +141,48 @@ class HookStopRequest(BaseModel):
     # The agent's final message (capped by the script) — for a turn_end
     # handler that judges the answer, not only the files.
     last_assistant_message: str = ""
+    # A Claude terminal's ``background_tasks`` as the script reduces it: the
+    # kind labels of the work still in flight. None from Codex and from an
+    # older script. Any type: a stray value must never refuse the Stop, a
+    # terminal's one turn-end signal, and the route reads only a list.
+    background_kinds: Any = None
+
+
+# The kinds a Stop report keeps (a forged post's list is cut to these).
+_KIND_MAX = 40
+_KINDS_MAX = 16
 
 
 @router.post("/v1/hooks/stop")
 async def hook_stop(req: HookStopRequest, authorization: str | None = Header(None)):
     """Called by the Stop hook at turn end, on both engines.
 
-    Two jobs (HOOKS.md "Shapes per event"):
+    The platform's ``turn_end`` verdict (HOOKS.md "Shapes per event"): for a
+    TERMINAL session (the CLI drives the turn) the hook is the one point that
+    can hold the turn open, so the verdict is answered here as
+    ``{"decision": "block", "reason": …}`` and the script prints it; for a
+    proxy-driven session the hook is an observation and the layer's loop
+    delivers the verdict.
 
-    * A Claude INTERACTIVE session (PTY-backed, no pump) has no other
-      turn-end signal + transcript pointer, so the proxy reads the JSONL at
-      ``transcript_path`` and appends new user/assistant messages to
-      chat_messages. A Codex terminal's rollout tailer does its own reading;
-      headless sessions are persisted by the pump.
-    * The platform's ``turn_end`` verdict: for a TERMINAL session (the CLI
-      drives the turn) the hook is the one point that can hold the turn
-      open, so the verdict is answered here as ``{"decision": "block",
-      "reason": …}`` and the script prints it; for a proxy-driven session
-      the hook is an observation and the layer's loop delivers the verdict.
+    The hook reads no transcript. ``transcript_path`` is the session's own
+    text (the path inside its sandbox), passed on to ``turn_end`` as text:
+    the terminal's own tails find its transcript in its engine folder and
+    fold each batch into the session, and a tail here would move the cursor
+    past the turn's end without folding it.
+
+    A Claude terminal's Stop also says which background work is still in
+    flight (``background_kinds``): the idle reaper spares the terminal while
+    it waits on that work (``interactive_session.note_background_report``).
     """
     await verify_session_match_async(authorization, req.session_id)
     record_hook_activity(req.session_id)
 
     from core.session import interactive_session, session_events
     sess = interactive_session.get(req.session_id)
-    stats: dict = {}
-    # The session's own tailer (the engine's ``transcript_tailer()``) says
-    # whether the hook's transcript pointer is for it: Claude's tailer takes
-    # the CLI's session JSONL here (``tail_transcript``); Codex's rollout
-    # tailer reads on its own and has no such entry point.
-    tail = getattr(sess._tailer(), "tail_transcript", None) if sess is not None else None
-    if tail is not None:
-        # Blocking file read + DB writes → off the event loop.
-        stats = await asyncio.to_thread(
-            tail, req.session_id, cast("InteractiveSession", sess).chat_id, req.transcript_path,
-        )
+    if sess is not None and isinstance(req.background_kinds, list):
+        # Before the verdict's wait: the idle reaper reads it.
+        interactive_session.note_background_report(req.session_id, [
+            k[:_KIND_MAX] for k in req.background_kinds if isinstance(k, str)][:_KINDS_MAX])
 
     engine = getattr(sess, "transcript_kind", "") if sess is not None else ""
     verdict = await session_events.turn_end(
@@ -188,11 +192,45 @@ async def hook_stop(req: HookStopRequest, authorization: str | None = Header(Non
         last_message=req.last_assistant_message,
         stop_hook_active=req.stop_hook_active,
     )
-    out: dict = {"status": "ok", "interactive": sess is not None, **stats}
+    out: dict = {"status": "ok", "interactive": sess is not None}
     if verdict.should_continue:
         out["decision"] = "block"
-        out["reason"] = verdict.continue_reason
+        # A check's reason reaches the model as the platform's text.
+        from core.session.start_context import fence_turn
+        out["reason"] = fence_turn(verdict.continue_reason)
     return out
+
+
+class HookStartContextRequest(BaseModel):
+    session_id: str
+    # The engine's conversation: the Claude session, the Codex thread.
+    conversation: str = Field("", max_length=128)
+    source: str = Field("", max_length=32)
+    part: int = Field(1, ge=1, le=64)
+    parts: int = Field(1, ge=1, le=64)
+
+
+@router.post("/v1/hooks/start-context")
+async def hook_start_context(req: HookStartContextRequest,
+                             authorization: str | None = Header(None)):
+    """An engine's ``SessionStart`` hook asks for its part of the start's
+    riding part (``core/session/start_context.py``): the parts are rendered
+    once per start, a part counts as delivered when it is served, and
+    ``text`` is "" for a part the start does not need. The token's session
+    is the only one served, whatever conversation the body names. The part
+    renders off the loop and writes nothing; the record is stored here, on
+    the loop, and a store that fails never costs the hook its part."""
+    await verify_session_match_async(authorization, req.session_id)
+    from core.session import start_context
+    text, changed = await asyncio.to_thread(
+        start_context.hook_part, req.session_id, req.conversation, req.source, req.part, req.parts)
+    if changed:
+        try:
+            start_context.store(req.session_id)
+        except Exception:
+            # The part was served: the hook must print it.
+            logger.exception("start context: the record of %s was not stored", req.session_id[:8])
+    return {"text": text}
 
 
 class HookSubagentRequest(BaseModel):
@@ -279,18 +317,21 @@ async def hook_file_written(
     Docker MCPs should log but not fail on a False result — the write has
     already happened on the platform side.
     """
-    await verify_session_match_async(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id, accept_callback=True)
     from core.remote import remote_file_flow
     if not remote_file_flow.is_remote_session(req.session_id):
         ctx = get_session_security(req.session_id)
         slug = getattr(ctx, "agent", "") if ctx is not None else ""
         rel = req.path.lstrip("/")
         if slug and rel.startswith(f"{slug}/"):
-            await _announce_written(slug, rel[len(slug) + 1:],
-                                    await _note_written(slug, rel[len(slug) + 1:]))
+            rel = rel[len(slug) + 1:]
+            changed = await _note_written(slug, rel)
+            await _announce_written(slug, rel, changed)
+            if changed and _session_may_write(ctx, slug, rel):
+                await _hand_to_machines(slug, rel)
         return {"ok": True, "local": True}
     # Satellite-host cache paths push back to the original
-    # absolute path via the sidecar metadata instead of the agent-tree
+    # absolute path via the pull's record instead of the agent-tree
     # flush. file-tools posts the agents-relative form; the proxy
     # normalizes back to absolute under AGENTS_DIR before checking.
     abs_form = req.path
@@ -329,16 +370,7 @@ async def hook_file_written(
     # paired machine.
     ctx = get_session_security(req.session_id)
     slug = getattr(ctx, "agent", "") if ctx is not None else ""
-    from auth.path_policy import check_host_path_access
-    from core.remote.file_sync import is_engine_machinery_path
-    try:
-        agent_dir = config.get_agent_dir(slug) if slug else None
-    except ValueError:
-        agent_dir = None
-    if (ctx is None or agent_dir is None or not is_canonical_rel_path(rel)
-            or is_engine_machinery_path(rel)
-            or not check_host_path_access((agent_dir / rel).resolve(), ctx,
-                                          writing=True).allowed):
+    if not _session_may_write(ctx, slug, rel):
         # Routine, not an attack: file-tools posts this for every preview,
         # of a read-only file too. Nothing is pushed.
         logger.info("file-written: %r not pushed, session %s may not write it",
@@ -357,6 +389,35 @@ async def hook_file_written(
     if slug:
         await _announce_written(slug, rel, changed)
     return {"ok": bool(ok)}
+
+
+def _session_may_write(ctx, agent_slug: str, rel: str) -> bool:
+    """Whether ``rel`` of the session's own agent is a path the session could
+    have written itself, judged where the path resolves. What a machine then
+    receives never goes further than the session's own rights, so the token
+    alone cannot fetch another user's file to a machine. Engine machinery and
+    credentials never travel this way."""
+    from auth.path_policy import check_host_path_access
+    from core.remote.file_sync import is_canonical_rel_path, is_engine_machinery_path
+    try:
+        agent_dir = config.get_agent_dir(agent_slug) if agent_slug else None
+    except ValueError:
+        return False
+    return (ctx is not None and agent_dir is not None and is_canonical_rel_path(rel)
+            and not is_engine_machinery_path(rel)
+            and check_host_path_access((agent_dir / rel).resolve(), ctx, writing=True).allowed)
+
+
+async def _hand_to_machines(agent_slug: str, rel: str) -> None:
+    """A local chat's file-tools write, handed to the machines of the agent
+    that may hold it, as a tool's ``Write`` is. The fan-out judges each machine
+    and opens the path as written with no link followed."""
+    from services.remote import workspace_fanout
+    shared_only = await workspace_fanout.shared_only_of(agent_slug, rel)
+    if workspace_fanout.has_fanout_candidates(agent_slug, rel, include_idle=True,
+                                              shared_only=shared_only):
+        await workspace_fanout.fan_out_write(agent_slug, rel, config.get_agent_dir(agent_slug) / rel,
+                                             include_idle=True)
 
 
 async def _note_written(agent_slug: str, rel: str) -> bool:
@@ -395,35 +456,6 @@ async def _announce_written(agent_slug: str, rel: str, changed: bool) -> None:
         return
     from services.notifications import notification_manager
     await notification_manager.broadcast_file_updated(agent_slug, rel, source="disk")
-
-
-class PermissionResponseRequest(BaseModel):
-    request_id: str
-    approved: bool = True
-
-
-@router.post("/v1/sessions/{session_id}/permission-response")
-async def permission_response(
-    session_id: str,
-    req: PermissionResponseRequest,
-    authorization: str | None = Header(None),
-):
-    """Called by the pipe function when the user responds to a permission dialog."""
-    await verify_session_match_async(authorization, session_id)
-
-    # The session JWT authorizes THIS session only — it must not resolve
-    # another session's pending request. (404, not 403, so a guessed
-    # request_id can't be probed for existence.)
-    bound_sid = get_permission_request_session(req.request_id)
-    if bound_sid is not None and bound_sid != session_id:
-        raise HTTPException(status_code=404, detail="No pending permission request with that ID")
-
-    found = resolve_permission(req.request_id, req.approved)
-    if not found:
-        raise HTTPException(status_code=404, detail="No pending permission request with that ID")
-
-    logger.info("Permission resolved: session=%s, request=%s, approved=%s", session_id, req.request_id, req.approved)
-    return {"status": "ok"}
 
 
 # --- Location bridge (MCP -> proxy -> WS -> dashboard -> WS -> proxy -> MCP) ---

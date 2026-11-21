@@ -17,6 +17,7 @@ import pytest
 import config
 from core.remote import remote_file_flow, satellite_file_transfer as sft
 from core.remote.satellite_connection import SatelliteConnectionManager
+from tests._timing import bound
 
 
 def _sec(machine_id="machine-1", agent="my-agent", role="manager"):
@@ -30,9 +31,13 @@ def _frame(i, session="sess-1", agent="my-agent", path=None):
     return {
         "type": "file_changed", "agent_slug": agent,
         "path": path or f"workspace/f{i:04d}.txt", "action": "write",
-        "session_id": session, "hash": f"sha256:{i:064x}",
+        "session_id": session, "hash": _X_HASH,
         "content_b64": base64.b64encode(b"x").decode(),
     }
+
+
+# An inline write's hash is the hash of the bytes it carries.
+_X_HASH = "sha256:" + __import__("hashlib").sha256(b"x").hexdigest()
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +52,7 @@ class _Counter:
         self.running = 0
         self.peak = 0
         self.total = 0
+        self.pulling = 0
 
 
 def _parked_applier(cm, gate: asyncio.Event, counter: _Counter):
@@ -87,8 +93,34 @@ async def test_appliers_are_bounded_per_machine(monkeypatch):
     assert cm._fc_lanes["machine-1"].inflight == 0
 
 
+def _parked_platform_work(cm, gate: asyncio.Event, counter: _Counter, *, pull_first=None):
+    """The applier's own step, parked: it runs inside the path lock and the
+    fleet slot, so its count is the count of fleet slots in use.
+    ``pull_first``: an event a "large file" waits on with its slot given back,
+    as a pull from its machine does."""
+    async def _inner(agent_dir, msg, machine_id, agent_slug, action, *, slot=None):
+        if pull_first is not None and "content_b64" not in msg:
+            async with slot.released():
+                counter.pulling += 1
+                await pull_first.wait()
+        counter.running += 1
+        counter.peak = max(counter.peak, counter.running)
+        counter.total += 1
+        await gate.wait()
+        counter.running -= 1
+        return True
+    return patch.object(cm, "_apply_file_changed_inner", new=_inner)
+
+
+def _big(i, session, path=None):
+    return {"type": "file_changed", "agent_slug": "my-agent", "action": "write",
+            "path": path or f"workspace/big{i:04d}.bin", "session_id": session,
+            "hash": f"sha256:{i:064x}", "size": 5_000_000}
+
+
 @pytest.mark.asyncio
-async def test_the_global_bound_holds_across_machines(monkeypatch):
+async def test_the_global_bound_holds_across_machines(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     monkeypatch.setattr(config, "SAT_FILE_CHANGED_MAX_INFLIGHT_PER_MACHINE", 0)
     monkeypatch.setattr(config, "SAT_FILE_CHANGED_CONCURRENCY_PER_MACHINE", 4)
     monkeypatch.setattr(config, "SAT_FILE_CHANGED_CONCURRENCY_GLOBAL", 6)
@@ -97,18 +129,89 @@ async def test_the_global_bound_holds_across_machines(monkeypatch):
     secs = {"sess-1": _sec("machine-1"), "sess-2": _sec("machine-2")}
     with patch("core.session.session_state.get_session_security",
                side_effect=secs.get), \
-         _parked_applier(cm, gate, counter):
-        for i in range(100):
-            await cm.handle_message("machine-1", _frame(i, session="sess-1"))
-            await cm.handle_message("machine-2", _frame(i, session="sess-2"))
-        await _settle()
-        assert counter.peak <= 6
-        gate.set()
-        for _ in range(300):
-            await asyncio.sleep(0)
-            if counter.total == 200 and counter.running == 0:
+         _parked_platform_work(cm, gate, counter):
+        for i in range(20):
+            await cm.handle_message("machine-1", _frame(i, session="sess-1", path=f"workspace/a{i}.txt"))
+            await cm.handle_message("machine-2", _frame(i, session="sess-2", path=f"workspace/b{i}.txt"))
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if counter.running == 6:
                 break
-    assert counter.total == 200 and counter.peak <= 6
+        assert counter.peak == 6
+        gate.set()
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if counter.total == 40 and counter.running == 0:
+                break
+    assert counter.total == 40 and counter.peak <= 6
+
+
+@pytest.mark.asyncio
+async def test_machines_that_wait_on_their_own_pulls_hold_no_fleet_slot(monkeypatch, tmp_path):
+    """Two machines each report four large files and are slow to send them:
+    every fleet slot stays free, and a healthy machine's change is applied
+    at once. Measured before the change: it waited the pull's whole stall."""
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    monkeypatch.setattr(config, "SAT_FILE_CHANGED_MAX_INFLIGHT_PER_MACHINE", 0)
+    monkeypatch.setattr(config, "SAT_FILE_CHANGED_CONCURRENCY_PER_MACHINE", 4)
+    monkeypatch.setattr(config, "SAT_FILE_CHANGED_CONCURRENCY_GLOBAL", 8)
+    cm = SatelliteConnectionManager()
+    gate, counter, pulling = asyncio.Event(), _Counter(), asyncio.Event()
+    gate.set()
+    secs = {"s-slow1": _sec("m-slow1"), "s-slow2": _sec("m-slow2"), "s-ok": _sec("m-ok")}
+    with patch("core.session.session_state.get_session_security", side_effect=secs.get), \
+         _parked_platform_work(cm, gate, counter, pull_first=pulling):
+        for n, mid in enumerate(("m-slow1", "m-slow2")):
+            for i in range(4):
+                await cm.handle_message(mid, _big(n * 10 + i, f"s-slow{n + 1}"))
+        async with asyncio.timeout(10):
+            # Eight appliers wait on their machines, and every slot is free.
+            while counter.pulling < 8 or cm._fc_global_sem._value != 8:  # noqa: ASYNC110  # the appliers' own counters: no event to wait on
+                await asyncio.sleep(0.01)
+        assert sft.file_changed_in_flight("m-slow1", "my-agent") == 4
+        started = asyncio.get_running_loop().time()
+        await cm.handle_message("m-ok", _frame(1, session="s-ok", path="workspace/small.txt"))
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if counter.total == 1:
+                break
+        assert counter.total == 1
+        assert asyncio.get_running_loop().time() - started < bound(1.0)
+        pulling.set()
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if counter.total == 9 and not sft._IN_FLIGHT:
+                break
+    assert counter.total == 9 and sft._IN_FLIGHT == {}
+
+
+@pytest.mark.asyncio
+async def test_many_frames_of_one_large_path_never_stop_the_fleets_slots(monkeypatch, tmp_path):
+    """The order is the path lock, then the fleet slot: an applier that pulls
+    a large file gives its slot back and takes one again while it still
+    holds the path lock, and the frames of the same path that wait for that
+    lock hold no slot meanwhile. With the slot taken first, nine frames of
+    one path and a bound of two would wait on each other for good."""
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    monkeypatch.setattr(config, "SAT_FILE_CHANGED_MAX_INFLIGHT_PER_MACHINE", 0)
+    monkeypatch.setattr(config, "SAT_FILE_CHANGED_CONCURRENCY_PER_MACHINE", 8)
+    monkeypatch.setattr(config, "SAT_FILE_CHANGED_CONCURRENCY_GLOBAL", 2)
+    cm = SatelliteConnectionManager()
+    gate, counter, pulling = asyncio.Event(), _Counter(), asyncio.Event()
+    gate.set()
+    secs = {"s-1": _sec("m-1"), "s-2": _sec("m-2")}
+    with patch("core.session.session_state.get_session_security", side_effect=secs.get), \
+         _parked_platform_work(cm, gate, counter, pull_first=pulling):
+        for i in range(9):
+            mid = "m-1" if i % 2 else "m-2"
+            await cm.handle_message(mid, _big(i, "s-1" if i % 2 else "s-2",
+                                              path="workspace/shared.bin"))
+        await _settle()
+        pulling.set()
+        async with asyncio.timeout(10):
+            while counter.total < 9 or sft._IN_FLIGHT:  # noqa: ASYNC110  # the appliers' own counters: no event to wait on
+                await asyncio.sleep(0.01)
+    assert counter.total == 9 and cm._fc_global_sem._value == 2
 
 
 @pytest.mark.asyncio
@@ -364,6 +467,7 @@ async def test_same_path_fan_outs_never_overlap(tmp_path, monkeypatch):
         for i in range(4):
             f = _frame(i, path="workspace/same.txt")
             f["content_b64"] = base64.b64encode(bytes([65 + i])).decode()
+            f["hash"] = "sha256:" + __import__("hashlib").sha256(bytes([65 + i])).hexdigest()
             frames.append(f)
         await asyncio.gather(*(cm._apply_file_changed("machine-1", f) for f in frames))
     finally:
@@ -371,3 +475,54 @@ async def test_same_path_fan_outs_never_overlap(tmp_path, monkeypatch):
             p.stop()
     assert state["peak"] == 1
     assert state["order"] == [b"A", b"B", b"C", b"D"]
+
+
+@pytest.mark.asyncio
+async def test_a_judge_waits_while_a_change_is_queued_however_old_its_stamp(monkeypatch):
+    """A frame that waits for a slot, or a large file still being pulled,
+    stamps the quiet window only at its start and its end: the judge reads
+    the count in flight too."""
+    from services.checks.kinds import judge_kind
+    monkeypatch.setattr(judge_kind, "SYNC_QUIET_S", 0.05)
+    monkeypatch.setattr(judge_kind, "SYNC_WAIT_MAX_S", 5.0)
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(judge_kind.asyncio, "sleep", lambda s: real_sleep(0.01))
+    sft._in_flight("m-1", "my-agent", +1)
+    waiting = asyncio.ensure_future(judge_kind._wait_sync_quiet("m-1", "my-agent"))
+    await real_sleep(0.2)
+    assert not waiting.done()               # the stamp is long past quiet, a frame is not
+    sft._in_flight("m-1", "my-agent", -1)
+    await asyncio.wait_for(waiting, 2)
+    assert sft._IN_FLIGHT == {}
+
+
+@pytest.mark.asyncio
+async def test_an_inline_write_whose_bytes_are_not_its_hash_is_not_applied(tmp_path, monkeypatch):
+    """The frame's hash becomes the merge base: an inline write applies only
+    when it is the hash of the bytes it carries. Nothing is written, recorded
+    or fanned out otherwise; a frame with no hash applies as before."""
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    cm = SatelliteConnectionManager()
+    fanned: list = []
+    written: list = []
+
+    async def fan_out(agent_slug, rel_path, source, **kw):
+        fanned.append(rel_path)
+    patches = _real_applier_patches(fan_out, ["m2"]) + [
+        patch("core.remote.file_sync.apply_incoming_file",
+              lambda agent_dir, rel, action, content: written.append(rel))]
+    for p in patches:
+        p.start()
+    try:
+        bad = _frame(1, path="workspace/bad.txt")
+        bad["hash"] = "sha256:" + "0" * 64
+        await cm._apply_file_changed("machine-1", bad)
+        good = _frame(2, path="workspace/good.txt")
+        await cm._apply_file_changed("machine-1", good)
+        bare = _frame(3, path="workspace/bare.txt")
+        del bare["hash"]
+        await cm._apply_file_changed("machine-1", bare)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    assert written == fanned == ["workspace/good.txt", "workspace/bare.txt"]

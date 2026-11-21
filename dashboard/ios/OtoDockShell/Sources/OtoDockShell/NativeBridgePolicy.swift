@@ -391,8 +391,36 @@ public enum NativeBridgePolicy {
         guard let parts = parse(url), parts.scheme.lowercased() == "https" else { return nil }
         guard let authority = parts.authority, !authority.contains("@"), let host = asciiHost(authority) else { return nil }
         guard let port = port(of: authority) else { return nil }
-        let rest = parts.path.addingPercentEncoding(withAllowedCharacters: .urlPathQueryFragment) ?? parts.path
-        return "https://\(host)" + (port == -1 ? "" : ":\(port)") + rest
+        return "https://\(host)" + (port == -1 ? "" : ":\(port)") + percentEncodeRest(parts.path)
+    }
+
+    /// The path, query and fragment with every character outside their set
+    /// percent-encoded once. A valid `%XX` escape is kept as it is: the
+    /// server writes the callback as `redirect_uri=otodock%3A%2F%2F...`, and
+    /// a provider refuses a redirect URI whose escapes were escaped again
+    /// (`addingPercentEncoding` does that, `%` being outside every set).
+    static func percentEncodeRest(_ rest: String) -> String {
+        let scalars = Array(rest.unicodeScalars)
+        var out = String.UnicodeScalarView()
+        var i = 0
+        while i < scalars.count {
+            let scalar = scalars[i]
+            if scalar == "%", i + 2 < scalars.count,
+               scalars[i + 1].properties.isASCIIHexDigit, scalars[i + 2].properties.isASCIIHexDigit {
+                out.append(contentsOf: scalars[i...(i + 2)])
+                i += 3
+                continue
+            }
+            if CharacterSet.urlPathQueryFragment.contains(scalar) {
+                out.append(scalar)
+            } else {
+                for byte in String(scalar).utf8 {
+                    out.append(contentsOf: String(format: "%%%02X", byte).unicodeScalars)
+                }
+            }
+            i += 1
+        }
+        return String(out)
     }
 
     /// True when the address is not on the active install's origin, so the

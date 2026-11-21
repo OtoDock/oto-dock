@@ -108,7 +108,7 @@ You can combine both: a trigger with `task_id` AND `notify` enabled fires both o
 
 For vendors connected via OAuth you do NOT configure a raw webhook URL + API key — the platform auto-registers the webhook. Workflow:
 
-1. The user subscribes to events in the dashboard (Connected Accounts → expand the account → **Subscribe to events**, choosing **Subscribe as: Me** for a personal subscription or an agent for one the agent's triggers can use; the agent option also lives in Agent Settings → MCPs → **Subscribe to events for this agent**). Subscriptions are read-only from this tool. A subscription's scope must match the trigger's: `[personal]` rows link to user-scope triggers, `[agent <name>]` rows to that agent's agent-scope triggers (a shared app is woken by an agent-scope trigger, so it needs the agent's subscription); the server refuses any other pairing and its message names the surface to use.
+1. The user subscribes to events in the dashboard (Connected Accounts → expand the account → **Subscribe to events**, choosing **Subscribe as: Me** for a personal subscription or an agent for one the agent's triggers can use; the agent option also lives in Agent Settings → MCPs, under each of the agent's accounts → **Subscribe to events**). Subscriptions are read-only from this tool. A subscription's scope must match the trigger's: `[personal]` rows link to user-scope triggers, `[agent <name>]` rows to that agent's agent-scope triggers (a shared app is woken by an agent-scope trigger, so it needs the agent's subscription); the server refuses any other pairing and its message names the surface to use.
 2. `list_subscriptions()` → each row shows `events=<…>`. **Those are the valid `event_type` values** for that subscription (the manifest event_catalog keys) — e.g. Linear `events=Issue, Comment, Project, Cycle, Reaction`; GitHub `events=push, pull_request, issue_comment, …`.
 3. `create_trigger(subscription_id=<id from list_subscriptions>, event_filter={…}, notify={…} or task_id=…)`.
 
@@ -138,8 +138,8 @@ When the external system POSTs JSON to the webhook URL, every top-level key beco
 After `create_trigger` succeeds, the response includes the webhook URL (path). The full URL is `https://<your-platform-host><webhook_path>`. The user needs to:
 
 1. **Mint an API key** in the dashboard:
-   - For `scope='user'`: User Settings → API Keys → Create → tick `triggers` → save the key (shown ONCE).
-   - For `scope='agent'`: Agent Settings → API Keys → Create → save the key.
+   - For `scope='user'`: User Settings → Integrations → API Keys → + Create key → tick `triggers` ("Fire your own webhook triggers") → save the key (shown ONCE). A personal key ends after 7, 30, 90 or 365 days, so a webhook's key needs renewing before then.
+   - For `scope='agent'`: Agent Settings → Monitoring → Triggers → Agent API Keys (a manager) → + Create key → save the key.
 
 2. **Configure the external system** to POST to the webhook URL with header:
    ```

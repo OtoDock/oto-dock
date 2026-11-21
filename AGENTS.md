@@ -72,6 +72,7 @@ cd dashboard && npm run build && npx vitest run  # dashboard: tsc, build, tests
 proxy/venv/bin/ruff check .                      # lint, the whole tree
 cd proxy && venv/bin/mypy                        # proxy types
 cd dashboard && npm run lint                     # dashboard lint
+python3 scripts/prose/prose_check.py .           # the writing rules (WRITING.md)
 cd dashboard && npm run build && npx cap sync android && cd android && ./gradlew assembleDebug testDebugUnitTest
 cd dashboard/ios/OtoDockShell && swift test      # the iOS shell's rules (a Mac)
 ```

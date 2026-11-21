@@ -196,17 +196,17 @@ class TestAgentBinding:
         assert credential_store.set_account_agent_binding(
             user_sub, mcp_name, "agent", "A", repositories=[" octo/a ", "octo/a", "octo/b"], read_only=True)
         row = credential_store.get_account_agent_binding(user_sub, mcp_name, "agent")
-        assert row == ("A", ("octo/a", "octo/b"), True)
+        assert row == ("A", ("octo/a", "octo/b"), True, True)
         # A client that sends no reach never widens it, on any account.
         assert credential_store.set_account_agent_binding(user_sub, mcp_name, "agent", "B")
         assert credential_store.get_account_agent_binding(user_sub, mcp_name, "agent") == (
-            "B", ("octo/a", "octo/b"), True)
+            "B", ("octo/a", "octo/b"), True, True)
         assert credential_store.list_agent_account_bindings(user_sub, mcp_name) == [{
             "agent_name": "agent", "account_label": "B", "set_at": ANY,
-            "repositories": ["octo/a", "octo/b"], "read_only": True}]
+            "repositories": ["octo/a", "octo/b"], "read_only": True, "is_default": True}]
         assert credential_store.set_account_agent_binding(
             user_sub, mcp_name, "agent", "B", repositories=[], read_only=False)
-        assert credential_store.get_account_agent_binding(user_sub, mcp_name, "agent") == ("B", (), False)
+        assert credential_store.get_account_agent_binding(user_sub, mcp_name, "agent") == ("B", (), False, True)
 
     def test_remove_binding_reverts_to_default(self, user_sub, mcp_name):
         credential_store.set_user_credentials(

@@ -1,0 +1,60 @@
+{
+ "ending": {
+  "a limit": {
+   "reason": "limit",
+   "resets_at": "2030-01-01T00:00:00Z"
+  },
+  "declined": {
+   "reason": "declined",
+   "resets_at": ""
+  },
+  "none": {}
+ },
+ "extras": {
+  "a verdict": {
+   "verdict": {
+    "check": "answer",
+    "round": 2
+   }
+  },
+  "all of it": {
+   "background_pending": 1,
+   "files": [
+    {
+     "name": "out.pdf",
+     "path": "workspace/out.pdf"
+    }
+   ],
+   "files_skipped": [
+    "big.bin"
+   ],
+   "report_missing": true,
+   "verdict": {
+    "check": "answer"
+   }
+  },
+  "empty lists": {},
+  "files": {
+   "files": [
+    {
+     "name": "out.pdf",
+     "path": "workspace/out.pdf"
+    }
+   ],
+   "files_skipped": []
+  },
+  "no report": {
+   "report_missing": true
+  },
+  "nothing": {},
+  "skipped files": {
+   "files": [],
+   "files_skipped": [
+    "big.bin"
+   ]
+  },
+  "work left running": {
+   "background_pending": 2
+  }
+ }
+}

@@ -38,12 +38,12 @@ person changes it in the card).
 | Setting | Control | What it does | Who | Card |
 | --- | --- | --- | --- | --- |
 | **Add an account** (Add another account) `user.integrations.add-account` | a button | Signs you in to a service your agents use on your behalf, or saves its credentials. A service that takes one account offers no second. *A service is listed when a tool of one of your agents uses it.* | any | no |
-| **Connected account** (Set as default, This is the default account, Edit, Close, Connect, Reconnect, Disconnect, Remove, Save, Add account, Save token, Grant for whole tenant, Get device code) `user.integrations.account` | per a connected account of a service | One account of a service: its label, the services it reaches, the default star, and Reconnect, Disconnect or Remove. Agents not bound to another account use the default. *A personal access token takes an optional account label. An account whose sign-in can no longer be renewed shows Reconnect needed with the reason.* | any | no |
-| **Use this account for specific agents** (Change, Read only, All repositories the account reaches, Search repositories) `user.integrations.agent-binding` | per an agent the account serves | Binds one of your agents to this account. On GitHub you can limit the repositories the agent reaches in your chats, or make it read only. | any | no |
+| **Connected account** (Set as default, This is the default account, Edit, Close, Connect, Reconnect, Disconnect, Remove, Save, Add account, Save token, Grant for whole tenant, Get device code) `user.integrations.account` | per a connected account of a service | One account of a service: its label, the services it reaches, the default star, and Reconnect, Disconnect or Remove. An agent you gave no account of the service uses the default. *A personal access token takes an optional account label. An account whose sign-in can no longer be renewed shows Reconnect needed with the reason.* | any | no |
+| **Use this account for specific agents** (Make default, Change, Read only, All repositories the account reaches, Search repositories) `user.integrations.agent-binding` | per an agent the account serves | Lets one of your agents use this account. An agent can have several accounts of a service and starts on its default one. On GitHub you can limit the repositories the agent reaches in your chats, or make it read only. | any | no |
 | **Install on GitHub** (Change on GitHub, Refresh) `user.integrations.installations` | per a GitHub App installation | Picks the repositories on GitHub this account reaches. Until the app is installed somewhere, the account reaches nothing. *A GitHub account connected through a GitHub App.* | any | no |
 | **+ Subscribe to events** (Subscribe as, Subscribe to, Event types, Create subscription) `user.integrations.subscribe-to-events` | a button | Subscribes to a service's events, for yourself or for an agent this account serves. A personal subscription fires your own triggers and apps. *A service with an event API. Subscribing as an agent needs the manager role on it, and a Personal-only agent is not offered.* | any | no |
 | **Subscription** (Copy URL, Copy secret, Delete) `user.integrations.subscription` | per an event subscription | One event subscription: its address and secret to copy, and Delete. | any | no |
-| **+ Create key** (Create, Name, triggers: fire your own webhook triggers, Copy to clipboard) `user.integrations.create-api-key` | a button | Makes a personal API key for your webhook triggers. The key shows once. | any | no |
+| **+ Create key** (Create, Name, Which agents, It ends after, May run without asking, Copy to clipboard) `user.integrations.create-api-key` | a button | Makes a personal API key: what it may do, on which agents, and when it ends. The key shows once. | any | no |
 | **API key** (Revoke) `user.integrations.api-key` | per a personal API key | One of your personal API keys, with when it was made and last used. Revoke ends it at once. | any | no |
 
 ### User Settings, Remote Machines
@@ -54,7 +54,7 @@ person changes it in the card).
 | **Remove machine** (Confirm) `user.remote-machines.remove-machine` | per a machine you paired | Unpairs the machine. A machine an administrator paired for the platform is removed under Admin, Remote Machines. | any | no |
 | **Allow full FS** `user.remote-machines.allow-full-fs` | per a machine you paired | On, agents can read and write any path your OS user can reach. Off, they stay in their agent folders and your home folder. The home folder limit is a guardrail, not full isolation. | any | no |
 | **Computer control** (Browser control, App connectors, Grant) `user.remote-machines.device-control` | per a machine you paired | Grants agents the mouse, keyboard and screen, a browser on this computer, or the applications on it. Turn one on only on a computer you trust them with. | any | no |
-| **Browser mode** (Playwright Extension token, Save token, Clear, Browser profile, Also let unattended runs like scheduled tasks, triggers, calls and meetings use this browser. Off, they cannot use it at all.) `user.remote-machines.browser-mode` | per a machine with browser control | A dedicated profile, or your own browser through the Playwright Extension and its token. Browser profile names the profile that has the extension. With a saved token you can also let unattended runs use it. *Shown once browser control is granted.* | any | no |
+| **Browser mode** (Playwright Extension token, Save token, Clear, Browser profile, Also let unattended runs like scheduled tasks, triggers, calls, meetings and API keys use this browser. Off, they cannot use it at all.) `user.remote-machines.browser-mode` | per a machine with browser control | A dedicated profile, or your own browser through the Playwright Extension and its token. Browser profile names the profile that has the extension. With a saved token you can also let unattended runs use it. *Shown once browser control is granted.* | any | no |
 | **Run these agents on this machine** `user.remote-machines.run-agents` | per an agent of yours | Ticks the agents whose chats run on this machine for you. An agent already on another machine says so. | any | no |
 
 ### User Settings, AI Engines
@@ -136,10 +136,9 @@ person changes it in the card).
 | **Interactive terminal sessions** `admin.platform.interactive-terminals` | on or off | Chats and tasks can run Claude Code or Codex as a live dashboard terminal. Off, every session runs the standard way and the interactive switches are hidden. | admin | yes |
 | **Read subscription usage from the provider** `admin.platform.subscription-windows` | on or off | OtoDock asks Claude and ChatGPT for each connected account's session and weekly usage and prefers the account that resets first. Off, the shared subscriptions balance by recorded cost only. | admin | yes |
 | **Clean up old chat session files** `admin.platform.session-cleanup` | on or off | Chats left untouched for the set period lose their session files, here and on the machines they ran on. Their full history stays saved. | admin | yes |
+| **Clean up old uploads** `admin.platform.working-files-cleanup` | on or off | Uploads left untouched for the set period spend 7 days in the Recover bin, then go for good. | admin | yes |
 | **Archive of removed people** (Enabled) `admin.platform.archive-cleanup` | on or off | A removed person's folders are kept in an archive for the set number of days, then deleted. | admin | yes |
 | **Automatic MCP Updates** (Enabled) `admin.platform.mcp-auto-updates` | on or off | Once a week, in a quiet window, OtoDock applies available updates to community MCPs. Only failures notify admins. | admin | yes |
-| **Ask for a store rating** `admin.platform.store-review` | on or off | The Android and iOS apps ask each person to rate OtoDock in Google Play or the App Store. They ask twice at most, after something went well. | admin | yes |
-| **Days before the second ask** `admin.platform.store-review-days` | a number | The second store rating ask comes at least this many days after the first. From 30 to 730. | admin | yes |
 
 ### Admin, Users
 
@@ -159,6 +158,8 @@ person changes it in the card).
 | Setting | Control | What it does | Who | Card |
 | --- | --- | --- | --- | --- |
 | **MCP server** (Check Updates, Install, Browse Community, Update, Switch, Revert to catalog, Forget) `admin.mcp-servers.server` | per an installed MCP | Every installed tool with its switch, settings, instances and updates. Install takes a ZIP, Browse Community the catalog. | admin | no |
+| **Keep running** `admin.mcp-servers.keep-running` | per a tool in its own container | A tool in its own container stops after 15 idle minutes by default. It starts again at its next use. Keep running keeps it up and uses memory all the time. *Not on a hosted install, where every tool sleeps when idle. A tool that runs with the platform has no switch.* | admin | no |
+| **Let the browser open pages on your local network** `admin.mcp-servers.browser-local-network` | on or off | Turned on, the browser reaches what this server reaches. Changing it restarts the browser. *Not on a hosted install. Callers and outside people lose the browser while it is on.* | admin | no |
 
 ### Admin, Skills
 
@@ -179,6 +180,8 @@ person changes it in the card).
 | **Pair New Machine** `admin.remote-machines.pair` | a button | Pairs a machine for the whole platform, where agents run by default. | admin | no |
 | **Machine** (Max sessions, Auto-update, Filesystem access, Device control, Remove) `admin.remote-machines.machine` | per a paired machine | A machine's capabilities, versions, capacity, updates and grants. The people's own machines are listed too, each removable. | admin | no |
 | **Every role of its agents runs here** `admin.remote-machines.all-roles` | per a machine an admin paired | Off, the chats of editors, contributors and viewers run on the OtoDock platform, as the machine has no sandbox. On, they run on the machine with its access. An outside caller always runs on the platform. *Only the agents whose default place is this machine. Turning it on asks first.* | admin | no |
+| **Add a compute machine** (Add machine) `admin.remote-machines.compute-add` | a button | Adds a server you control as a compute machine. You give it a name, then run one command on that server. *Only an install that runs in Docker can add one. Otherwise the card says why.* | admin | no |
+| **Compute machine** (Pair again, Lock to this address, Remove) `admin.remote-machines.compute-machine` | per a compute machine | A machine the platform runs itself, with no owner. Chats, terminals, tasks, calls and meetings on the platform run on these machines. Apps run on the one beside the platform. *The one beside the platform cannot be removed. Lock to this address refuses a sign-in from another address and tells every admin.* | admin | no |
 
 ### Admin, Shares
 

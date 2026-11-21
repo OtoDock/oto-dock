@@ -38,7 +38,7 @@ def _make_chat(agent: str, *, session_id: str | None = None,
                user_sub: str = "user-admin", source_type: str = "chat") -> str:
     from storage import database as task_store
     cid = str(uuid.uuid4())
-    task_store.create_chat(cid, user_sub, agent, "default",
+    task_store.create_chat(cid, user_sub, agent, "ask",
                            model=TEST_MODEL,
                            execution_path="claude-code-cli",
                            source_type=source_type)
@@ -92,7 +92,11 @@ class TestResumeValidation:
         mode itself decides nothing."""
         stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
         from core.session import session_kind
-        from core.session.visibility import PHONE_CHAT_OWNER, shared_chat_owner
+        from core.session.visibility import (
+            PHONE_CHAT_OWNER,
+            PHONE_CHAT_READ_ONLY,
+            shared_chat_owner,
+        )
         from storage import database as task_store
         slug = make_test_agent(collaborative=False, default_scope="agent")
         task_store.add_user_agent("user-viewer", slug, "editor", "test")
@@ -127,7 +131,8 @@ class TestResumeValidation:
                 await drain_startup(ws)
                 ws.client_send({"type": "resume_chat", "chat_id": call})
                 # The call's view is announced, then its history, nothing else.
-                await ws.expect({"type": "chat_view_only", "chat_id": call, "kind": "phone"})
+                await ws.expect({"type": "chat_view_only", "chat_id": call, "kind": "phone",
+                             "lock": PHONE_CHAT_READ_ONLY})
                 frame = await ws.next_frame()
                 assert (frame["type"], frame["chat_id"]) == ("chat_history", call), frame
                 await asyncio.sleep(0.2)
@@ -176,7 +181,7 @@ class TestByIdFramesFollowTheOpenRule:
             async with dashboard_connection(editor) as ws:
                 await drain_startup(ws)
                 for frame in (
-                    {"type": "mode_change", "mode": "acceptEdits", "chat_id": pre_switch},
+                    {"type": "mode_change", "mode": "autoReview", "chat_id": pre_switch},
                     {"type": "model_change", "model": TEST_MODEL, "chat_id": pre_switch},
                     {"type": "execution_mode_change", "execution_mode": "interactive",
                      "chat_id": pre_switch},
@@ -222,7 +227,7 @@ class TestByIdFramesFollowTheOpenRule:
         task_store.add_user_agent("user-manager", slug, "manager", "test")
         live_sid = "sid-pool-live"
         layer.alive.add(live_sid)  # the manager's warm headless session
-        set_session_mode(live_sid, "default")
+        set_session_mode(live_sid, "ask")
         pool = _make_chat(slug, user_sub=shared_chat_owner(slug), session_id=live_sid,
                           messages=(("user", "shared history"),))
         contributor = session_cookie(sub="user-viewer", email="viewer@test.com",
@@ -612,6 +617,9 @@ class _FakeTerminal:
         self.username = username
         self.agent_name = agent_name
         self.alive = True
+        self.created_at = 0.0
+        self.limit_mark = None
+        self._prompt_queue: list = []
         self.inputs: list = []
         self.resized: list = []
         self.interrupted = 0
@@ -673,6 +681,7 @@ def _bare_connection(chat_id, session_id, *, user_sub, agent, layer=None):
     return conn
 
 
+
 class TestBoundTaskChatFramesPassTheContinueGate:
     """A viewer may open an agent-scope task run's chat and watch it, never
     drive it: every frame that acts on the BOUND chat's session (terminal
@@ -681,11 +690,11 @@ class TestBoundTaskChatFramesPassTheContinueGate:
     frame naming another chat is refused, and a read-only viewer never
     changes a colleague's live terminal's mode."""
 
-    def _task_chat(self, slug):
+    def _task_chat(self, slug, created_by="user-admin"):
         from storage import database as task_store
         run_id = f"run-{uuid.uuid4().hex[:12]}"
         task_store.create_run(run_id, "dyn-x", slug, "manual", None, "go",
-                              "one-time", "agent", "user-admin")
+                              "one-time", "agent", created_by)
         return f"task-{run_id}"
 
     def test_terminal_frames_on_a_task_terminal(self, temp_db, monkeypatch):
@@ -696,7 +705,7 @@ class TestBoundTaskChatFramesPassTheContinueGate:
         slug = make_test_agent()
         task_store.add_user_agent("user-viewer", slug, "viewer", "test")
         task_store.add_user_agent("user-viewer2", slug, "editor", "test")
-        cid = self._task_chat(slug)
+        cid = self._task_chat(slug, created_by="user-viewer2")  # holds no knowledge write
         term = _FakeTerminal(cid, "sid-task-term")
         monkeypatch.setitem(interactive_session._sessions, "sid-task-term", term)
 
@@ -752,7 +761,7 @@ class TestBoundTaskChatFramesPassTheContinueGate:
         pool = _make_chat(slug, user_sub=shared_chat_owner(slug), session_id="sid-pool")
         term = _FakeTerminal(pool, "sid-pool", user_sub="user-admin")
         monkeypatch.setitem(interactive_session._sessions, "sid-pool", term)
-        set_session_mode("sid-pool", "default")
+        set_session_mode("sid-pool", "ask")
 
         async def scenario():
             conn = _bare_connection(pool, "sid-pool", user_sub="user-viewer",
@@ -814,7 +823,7 @@ class TestResumeIdleChat:
                 history = await ws.expect({
                     "type": "chat_history", "chat_id": cid, "agent": ANY,
                     "messages": ANY, "has_more": False,
-                    "restore": {"todos": [], "meeting": None, "goal": None},
+                    "restore": {"todos": [], "meeting": None, "goal": None, "cost": {"billed": True, "fees": 0}},
                     "plans": [], "total_cost": 0,
                     "context_used": 0, "context_max": 0,
                     "cache_read": 0, "cache_write": 0, "output_tokens": 0,
@@ -846,7 +855,7 @@ class TestResumeIdleChat:
         slug = make_test_agent()
         live_sid = str(uuid.uuid4())
         layer.alive.add(live_sid)
-        set_session_mode(live_sid, "acceptEdits")  # as a real spawn would
+        set_session_mode(live_sid, "autoReview")  # as a real spawn would
         cid = _make_chat(slug, session_id=live_sid,
                          messages=(("user", "hi"),))
 
@@ -857,7 +866,7 @@ class TestResumeIdleChat:
                 await ws.expect({
                     "type": "chat_history", "chat_id": cid, "agent": ANY,
                     "messages": ANY, "has_more": False,
-                    "restore": {"todos": [], "meeting": None, "goal": None},
+                    "restore": {"todos": [], "meeting": None, "goal": None, "cost": {"billed": True, "fees": 0}},
                     "plans": [], "total_cost": 0,
                     "context_used": 0, "context_max": 0,
                     "cache_read": 0, "cache_write": 0, "output_tokens": 0,
@@ -1024,15 +1033,6 @@ class TestModeModelChange:
                 assert layer.mode_changes == [(sid, "dontAsk")]
                 assert temp_db.get_chat(chat_id)["permission_mode"] == "dontAsk"
 
-                # A tab opened before 1.9 sends the old word: it lands as
-                # the current one.
-                ws.client_send({"type": "mode_change", "mode": "acceptEdits",
-                                "chat_id": chat_id})
-                await ws.expect({"type": "mode_changed",
-                                 "mode": "autoReview", "chat_id": chat_id})
-                await sync_dispatch(ws)
-                assert temp_db.get_chat(chat_id)["permission_mode"] == "autoReview"
-
                 ws.client_send({"type": "mode_change", "mode": "yolo",
                                 "chat_id": chat_id})
                 await ws.expect({"type": "error",
@@ -1162,7 +1162,7 @@ class TestModeModelChange:
                 await ws.expect({
                     "type": "chat_history", "chat_id": chat_b, "agent": ANY,
                     "messages": ANY, "has_more": False,
-                    "restore": {"todos": [], "meeting": None, "goal": None},
+                    "restore": {"todos": [], "meeting": None, "goal": None, "cost": {"billed": True, "fees": 0}},
                     "plans": [], "total_cost": 0,
                     "context_used": 0, "context_max": 0,
                     "cache_read": 0, "cache_write": 0, "output_tokens": 0,
@@ -1761,9 +1761,9 @@ class TestStreamingTurnControls:
                 # cohort clears ride along (clear_session_liveness → notify).
                 # The queued turn-start "streaming" broadcast is dropped as stale at
                 # drain time (the turn already ended) — only the "ready" flows.
-                await ws.expect({"type": "bg_agents_complete", "count": 0})
-                await ws.expect({"type": "bg_commands_complete", "count": 0})
-                await ws.expect({"type": "fg_agents_complete"})
+                await ws.expect({"type": "bg_agents_complete", "count": 0, "chat_id": chat_id})
+                await ws.expect({"type": "bg_commands_complete", "count": 0, "chat_id": chat_id})
+                await ws.expect({"type": "fg_agents_complete", "chat_id": chat_id})
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 ws.client_send({"type": "close"})
@@ -2148,7 +2148,7 @@ class TestWedgedPumpReap:
                               None, "do things")
         task_store.update_run(f"run-{run_id}", status="running",
                               chat_id=chat_id)
-        task_store.create_chat(chat_id, "user-admin", slug, "default",
+        task_store.create_chat(chat_id, "user-admin", slug, "ask",
                                model=TEST_MODEL,
                                execution_path="claude-code-cli")
 
@@ -2428,7 +2428,7 @@ class TestPhoneChatReadOnly:
 
     def test_a_manager_opens_the_call_and_cannot_send_between_its_turns(
             self, temp_db, monkeypatch):
-        from ws.dashboard_chat_support import PHONE_CHAT_READ_ONLY
+        from core.session.visibility import PHONE_CHAT_READ_ONLY
         layer, cid, sid = self._call(monkeypatch)
 
         async def scenario():
@@ -2440,7 +2440,8 @@ class TestPhoneChatReadOnly:
                 # The viewer is told the chat is a call's before the history,
                 # then the history and nothing else: no warmup_ready binds
                 # this socket to the call's live session.
-                await ws.expect({"type": "chat_view_only", "chat_id": cid, "kind": "phone"})
+                await ws.expect({"type": "chat_view_only", "chat_id": cid, "kind": "phone",
+                             "lock": PHONE_CHAT_READ_ONLY})
                 frame = await ws.next_frame()
                 assert (frame["type"], frame["chat_id"]) == ("chat_history", cid), frame
                 await asyncio.sleep(0.2)
@@ -2450,7 +2451,8 @@ class TestPhoneChatReadOnly:
                 # may have missed the full resume's.
                 ws.client_send({"type": "client_info", "platform": "web", "history_deltas": True})
                 ws.client_send({"type": "resume_chat", "chat_id": cid, "delta": True})
-                await ws.expect({"type": "chat_view_only", "chat_id": cid, "kind": "phone"})
+                await ws.expect({"type": "chat_view_only", "chat_id": cid, "kind": "phone",
+                             "lock": PHONE_CHAT_READ_ONLY})
                 frame = await ws.next_frame()
                 assert (frame["type"], frame["chat_id"]) == ("chat_history_delta", cid), frame
                 await asyncio.sleep(0.2)
@@ -2465,7 +2467,7 @@ class TestPhoneChatReadOnly:
         from core.events import input_queue, stream_pump
         from core.events.common_events import PRODUCER_DONE, TEXT, CommonEvent
         from core.session import session_kind
-        from ws.dashboard_chat_support import PHONE_CHAT_READ_ONLY
+        from core.session.visibility import PHONE_CHAT_READ_ONLY
         layer, cid, sid = self._call(monkeypatch)
 
         async def scenario():

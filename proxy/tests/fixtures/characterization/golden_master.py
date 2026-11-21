@@ -31,6 +31,7 @@ def check_golden(name: str, got) -> None:
     path = GOLD / f"{name}.json"
     text = dump(got)
     if WRITE:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
         pytest.fail(f"golden {name} written; run again without CHARACTERIZATION_WRITE")
     assert path.exists(), f"no golden for {name}: write it with CHARACTERIZATION_WRITE=1"
@@ -38,7 +39,9 @@ def check_golden(name: str, got) -> None:
     if want != text:
         diff = "".join(difflib.unified_diff(
             want.splitlines(True), text.splitlines(True), "golden", "live", n=4))
-        pytest.fail(f"{name} drifted from its golden:\n{diff[:30000]}")
+        cut = f"\n(the diff is cut at 30000 of its {len(diff)} characters)" if len(diff) > 30000 else ""
+        pytest.fail(f"{name} drifted from its golden. A refactor changes no golden: find what moved. A change "
+                    f"you mean: run with CHARACTERIZATION_WRITE=1 and say why in the commit.\n{diff[:30000]}{cut}")
 
 
 def load_lines(name: str) -> list[str]:

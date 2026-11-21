@@ -13,7 +13,7 @@ DB-free (mirrors test_browser_mcp.py). Covers:
 import pytest
 
 from core import placement
-from services.mcp import mcp_installer as inst, mcp_registry as reg
+from services.mcp import mcp_installer as inst, mcp_manifest_store, mcp_registry as reg
 from tests._paths import REPO_ROOT as _ROOT
 
 _MANIFEST = _ROOT / "mcps" / "community" / "blender" / "manifest.json"
@@ -97,16 +97,17 @@ def test_manifest_companion_app(manifest):
 
 def test_the_code_tools_take_the_manifests_tier(manifest):
     # The two arbitrary-Python tools follow the chat's mode like the server's
-    # other tools (no permissions block: the sensitive fallback); a catalog
-    # entry that still lists them under the retired device_high_risk_tools
-    # key pins nothing.
-    from services.mcp import mcp_permissions
-    reg._manifests[manifest.name] = manifest
+    # other tools (no permissions block: the sensitive fallback). The entry
+    # names no tool of its own any more: the retired device_high_risk_tools
+    # key pinned them before 1.9.0, and a manifest that still carries it
+    # pins nothing.
+    from services.mcp import mcp_manifest_store, mcp_permissions
+    mcp_manifest_store._manifests[manifest.name] = manifest
     try:
         for tool in ("execute_blender_code", "execute_blender_code_for_cli", "get_scene_info"):
             assert mcp_permissions.resolve_tool_tier("blender", tool) == "sensitive"
     finally:
-        reg._manifests.pop(manifest.name, None)
+        mcp_manifest_store._manifests.pop(manifest.name, None)
 
 
 def test_manifest_declares_git_system_requirement(manifest):
@@ -120,7 +121,7 @@ def test_manifest_declares_git_system_requirement(manifest):
 # ---------------------------------------------------------------------------
 
 def _reason(m, *, r=False, d=None, g=None):
-    return reg._device_placement_reason(m, placement=placement.PlacementCapabilities(
+    return mcp_manifest_store._device_placement_reason(m, placement=placement.PlacementCapabilities(
         kind=placement.KIND_ADMIN_REMOTE if r else placement.KIND_LOCAL,
         machine_id="m" if r else "", has_display=d, device_grants=g or set(),
     ))
@@ -145,11 +146,11 @@ def test_gate_excluded_when_known_headless(manifest):
 
 
 def test_capability_helper(manifest):
-    reg._manifests[manifest.name] = manifest
+    mcp_manifest_store._manifests[manifest.name] = manifest
     try:
         assert reg.device_capability_for_server("blender") == "app"
     finally:
-        reg._manifests.pop(manifest.name, None)
+        mcp_manifest_store._manifests.pop(manifest.name, None)
 
 
 # ---------------------------------------------------------------------------

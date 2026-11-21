@@ -1,0 +1,201 @@
+[
+ {
+  "fallback": [],
+  "held": [],
+  "path": null,
+  "step": "a session the layer does not know",
+  "tree": {},
+  "wire": []
+ },
+ {
+  "fallback": [],
+  "held": [],
+  "path": null,
+  "step": "not canonical",
+  "tree": {},
+  "wire": []
+ },
+ {
+  "fallback": [],
+  "held": [],
+  "path": null,
+  "step": "traversal",
+  "tree": {},
+  "wire": []
+ },
+ {
+  "fallback": [],
+  "held": [
+   "knowledge/k.md"
+  ],
+  "path": "<agents>/flow-agent/knowledge/k.md",
+  "step": "held: the platform copy",
+  "tree": {
+   "knowledge/k.md": "authoritative"
+  },
+  "wire": []
+ },
+ {
+  "fallback": [],
+  "held": [
+   "knowledge/none.md"
+  ],
+  "path": null,
+  "step": "held: no platform copy",
+  "tree": {
+   "knowledge/k.md": "authoritative"
+  },
+  "wire": []
+ },
+ {
+  "fallback": [],
+  "held": [],
+  "path": "<agents>/flow-agent/workspace/r.txt",
+  "step": "the first read pulls",
+  "tree": {
+   "knowledge/k.md": "authoritative",
+   "workspace/r.txt": "machine v1"
+  },
+  "wire": [
+   {
+    "agent_slug": "flow-agent",
+    "command_id": "<id>",
+    "path": "workspace/r.txt",
+    "path_kind": "agent_tree",
+    "type": "file_stat"
+   },
+   {
+    "agent_slug": "flow-agent",
+    "path": "workspace/r.txt",
+    "path_kind": "agent_tree",
+    "request_id": "<id>",
+    "type": "file_pull"
+   }
+  ]
+ },
+ {
+  "fallback": [],
+  "held": [],
+  "path": "<agents>/flow-agent/workspace/r.txt",
+  "step": "the same stat is served without a transfer",
+  "tree": {
+   "knowledge/k.md": "authoritative",
+   "workspace/r.txt": "machine v1"
+  },
+  "wire": [
+   {
+    "agent_slug": "flow-agent",
+    "command_id": "<id>",
+    "path": "workspace/r.txt",
+    "path_kind": "agent_tree",
+    "type": "file_stat"
+   }
+  ]
+ },
+ {
+  "fallback": [],
+  "held": [],
+  "path": "<agents>/flow-agent/workspace/r.txt",
+  "step": "a changed stat pulls",
+  "tree": {
+   "knowledge/k.md": "authoritative",
+   "workspace/r.txt": "machine v2"
+  },
+  "wire": [
+   {
+    "agent_slug": "flow-agent",
+    "command_id": "<id>",
+    "path": "workspace/r.txt",
+    "path_kind": "agent_tree",
+    "type": "file_stat"
+   },
+   {
+    "agent_slug": "flow-agent",
+    "path": "workspace/r.txt",
+    "path_kind": "agent_tree",
+    "request_id": "<id>",
+    "type": "file_pull"
+   }
+  ]
+ },
+ {
+  "fallback": [
+   "workspace/r.txt"
+  ],
+  "held": [],
+  "path": "<agents>/flow-agent/workspace/r.txt",
+  "step": "a failed pull serves the mirror",
+  "tree": {
+   "knowledge/k.md": "authoritative",
+   "workspace/r.txt": "machine v2"
+  },
+  "wire": [
+   {
+    "agent_slug": "flow-agent",
+    "command_id": "<id>",
+    "path": "workspace/r.txt",
+    "path_kind": "agent_tree",
+    "type": "file_stat"
+   },
+   {
+    "agent_slug": "flow-agent",
+    "path": "workspace/r.txt",
+    "path_kind": "agent_tree",
+    "request_id": "<id>",
+    "type": "file_pull"
+   }
+  ]
+ },
+ {
+  "fallback": [],
+  "held": [],
+  "path": null,
+  "step": "no such file on either side",
+  "tree": {
+   "knowledge/k.md": "authoritative",
+   "workspace/r.txt": "machine v2"
+  },
+  "wire": [
+   {
+    "agent_slug": "flow-agent",
+    "command_id": "<id>",
+    "path": "workspace/none.txt",
+    "path_kind": "agent_tree",
+    "type": "file_stat"
+   },
+   {
+    "agent_slug": "flow-agent",
+    "path": "workspace/none.txt",
+    "path_kind": "agent_tree",
+    "request_id": "<id>",
+    "type": "file_pull"
+   }
+  ]
+ },
+ {
+  "fallback": [],
+  "held": [],
+  "path": "<agents>/flow-agent/workspace/r.txt",
+  "step": "a failed probe pulls",
+  "tree": {
+   "knowledge/k.md": "authoritative",
+   "workspace/r.txt": "machine v3"
+  },
+  "wire": [
+   {
+    "agent_slug": "flow-agent",
+    "command_id": "<id>",
+    "path": "workspace/r.txt",
+    "path_kind": "agent_tree",
+    "type": "file_stat"
+   },
+   {
+    "agent_slug": "flow-agent",
+    "path": "workspace/r.txt",
+    "path_kind": "agent_tree",
+    "request_id": "<id>",
+    "type": "file_pull"
+   }
+  ]
+ }
+]

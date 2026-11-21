@@ -143,17 +143,6 @@ def test_a_refusal_is_passed_on_as_its_sentence(monkeypatch, status, payload, ex
     assert text.endswith(expected)
 
 
-def test_an_older_satellite_is_named_by_each_tool(monkeypatch):
-    """Both routes joined the tunnel in one satellite version, so an older
-    one refuses the catalog read first: each tool says so and what to do."""
-    srv = _reload(monkeypatch)
-    srv.TRANSPORT = _Proxy(catalog=(403, {"error": "path-not-allowlisted"})).transport()
-    assert _call(srv, "find_settings", query="wake") == srv.OLDER_SATELLITE_SEARCH
-    assert _call(srv, "get_setting", id="user.general.wake-word") == srv.OLDER_SATELLITE_CARD
-    assert srv.OLDER_SATELLITE_SEARCH.startswith(srv.OLDER_SATELLITE)
-    assert srv.OLDER_SATELLITE_CARD.startswith(srv.OLDER_SATELLITE)
-
-
 def test_a_catalog_refusal_and_a_dead_platform_answer_sentences(monkeypatch, caplog):
     srv = _reload(monkeypatch)
     srv.TRANSPORT = _Proxy(catalog=(403, {"detail": "No person is signed in here."})).transport()

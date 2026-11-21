@@ -8,29 +8,41 @@ platform answers on the port and address .env publishes it on. backup.sh's
 apps copy opens every app database read-only whatever its file name.
 install.sh and compose.sh create the secrets file private from its first
 byte, and install.sh checks the free disk where Docker keeps its images. dev-setup.sh stops before its first step while the otodock-proxy unit
-is active (otodock-phone too with --phone).
+is active (otodock-phone too with --phone). The bare-metal unit, the
+template and the one dev-setup.sh writes, stops the server before its
+engines.
 """
 from __future__ import annotations
 
 import contextlib
+import http.server
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
 import stat
 import subprocess
 import tarfile
+import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "scripts"
 
-from tests.deploy.fake_docker import FAKE_DOCKER
+from tests.deploy.fake_docker import (
+    FAKE_DOCKER,
+    host_calls,
+    host_commands_named,
+    write_host_fakes,
+)
 
 PG_T2 = {"id": "pg-t2", "name": "otodock-otodock-postgres-1",
          "labels": {"com.docker.compose.project": "otodock",
@@ -68,7 +80,27 @@ def fakebin(tmp_path):
         p = b / name
         p.write_text(body)
         p.chmod(0o755)
-    return b
+    write_host_fakes(b)
+    yield b
+    assert host_calls(b) == [], "a script reached a command that acts on the host"
+
+
+# The scripts this suite runs whole with the host's PATH behind its fakes.
+RUN_BEHIND_THE_HOST_PATH = ("backup.sh", "restore.sh", "install.sh", "compose.sh")
+
+
+def test_no_script_run_here_names_a_host_command_without_a_fake(tmp_path, fakebin):
+    """A script that reaches systemctl, loginctl or sudo finds this suite's
+    refusing fake, never the host's own: a script may name one only while
+    the fake folder holds it, and the fake is what the name resolves to."""
+    fakes = {p.name for p in fakebin.iterdir()}
+    for script in RUN_BEHIND_THE_HOST_PATH:
+        assert host_commands_named(SCRIPTS / script) <= fakes, script
+    env = _env(tmp_path, fakebin, [])
+    for name in sorted(fakes):
+        found = subprocess.run(["bash", "-c", f"command -v {name}"], env=env, capture_output=True,
+                               text=True, timeout=10).stdout.strip()
+        assert found == str(fakebin / name), name
 
 
 def _env(tmp_path, fakebin, containers, **extra):
@@ -1078,6 +1110,7 @@ def _dev_setup(tmp_path, *flags, active="", systemctl=True, node_major=None,
 
 @pytest.mark.parametrize("flags, active, unit", [
     ((), "otodock-proxy", "otodock-proxy"),
+    ((), "otodock-compute", "otodock-compute"),
     (("--phone",), "otodock-phone", "otodock-phone"),
     (("--phone",), "otodock-proxy otodock-phone", "otodock-proxy"),
 ])
@@ -1099,7 +1132,8 @@ def test_dev_setup_goes_on_past_the_guard(tmp_path, active, systemctl):
     r, asked, calls = _dev_setup(tmp_path, active=active, systemctl=systemctl)
     assert r.returncode == 7, r.stdout + r.stderr
     assert "is running" not in r.stderr
-    assert asked == (["systemctl is-active --quiet otodock-proxy"] if systemctl else [])
+    assert asked == (["systemctl is-active --quiet otodock-proxy",
+                      "systemctl is-active --quiet otodock-compute"] if systemctl else [])
     # The Node step ran, then the stub installer ended the run.
     assert calls[-1] == "installer" and calls[:-1] and set(calls[:-1]) == {"node -v"}
 
@@ -1129,6 +1163,223 @@ def test_dev_setup_moves_node_through_one_nodesource_source(tmp_path):
         "sudo apt-get install -y nodejs",
     ], steps
     assert calls[-1] == "installer"
+
+
+# ── the bare-metal unit stops the server before its engines ────────────
+
+# A stand-in for sudo: every call is logged and nothing runs. `sudo tee
+# <file>` keeps what it is fed under FAKE_UNITS, by the file's name.
+FAKE_SUDO_TEE = r'''#!/bin/sh
+echo "sudo $*" >> "$FAKE_CALLS"
+if [ "$1" = tee ]; then
+    while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done > "$FAKE_UNITS/${2##*/}"
+fi
+exit 0
+'''
+
+
+def _dev_setup_unit(tmp_path, name: str = "otodock-proxy", fakes_extra: dict[str, str] | None = None,
+                    root: str = "/srv/otodock", env_extra: dict[str, str] | None = None,
+                    data: str | None = None) -> str:
+    """The otodock-proxy unit (or ``name``) `dev-setup.sh --service` writes for a checkout
+    at ``root`` (/srv/otodock): the script's own install_service, run with a PATH that
+    holds bash and the fake sudo (and ``fakes_extra``, name to script) and
+    nothing else, so no unit is written, reloaded or started on this host.
+    ``data`` is the data folder the unit is expected to take (the checkout)."""
+    text = (SCRIPTS / "dev-setup.sh").read_text()
+    fn = re.search(r"^install_service\(\) \{\n.*?^\}\n", text, re.S | re.M)
+    assert fn, "dev-setup.sh has no install_service"
+    fakes, tools, units = tmp_path / "unitbin", tmp_path / "unittools", tmp_path / "units"
+    for d in (fakes, tools, units):
+        d.mkdir()
+    (fakes / "sudo").write_text(FAKE_SUDO_TEE)
+    (fakes / "sudo").chmod(0o755)
+    # The one folder the script makes itself: logged, never made on this host.
+    (fakes / "mkdir").write_text('#!/bin/sh\necho "mkdir $*" >> "$FAKE_CALLS"\n')
+    (fakes / "mkdir").chmod(0o755)
+    for fake, body in (fakes_extra or {}).items():
+        (fakes / fake).write_text(body)
+        (fakes / fake).chmod(0o755)
+    (tools / "bash").symlink_to(shutil.which("bash"))
+    calls = tmp_path / "unit-calls.log"
+    env = {"PATH": f"{fakes}:{tools}", "FAKE_CALLS": str(calls), "FAKE_UNITS": str(units), **(env_extra or {})}
+    found = subprocess.run([str(tools / "bash"), "-c", "command -v sudo; command -v systemctl"],
+                           env=env, capture_output=True, text=True, timeout=10).stdout.split()
+    assert found == [str(fakes / "sudo")], "sudo is not the fake, or a systemctl is in reach: not running"
+    script = ("set -euo pipefail\ninfo() { :; }; ok() { :; }; die() { echo \"die: $1\" >&2; exit 1; }\n"
+              f"SUDO=sudo; INSTALL_SERVICE=1; WITH_PHONE=0; PLATFORM_ROOT={root}; USER=tester\n"
+              + fn.group(0) + "install_service\n")
+    r = subprocess.run([str(tools / "bash"), "-c", script], env=env, cwd=tmp_path,
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = data or root
+    assert calls.read_text().splitlines() == [
+        "sudo tee /etc/systemd/system/otodock-proxy.service",
+        f"mkdir -p {root}/mcps/community",
+        f"mkdir -m 700 {data}/host-media-cache",
+        f"mkdir -m 700 {root}/backups",
+        "sudo tee /etc/systemd/system/otodock-compute.service",
+        "sudo systemctl daemon-reload", "sudo systemctl enable --now otodock-proxy",
+        "sudo systemctl enable --now otodock-compute"]
+    return (units / f"{name}.service").read_text()
+
+
+def _service_section(unit: str) -> dict[str, list[str]]:
+    """Every value each directive of a unit's [Service] section is given."""
+    out: dict[str, list[str]] = {}
+    section = ""
+    for line in unit.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            section = line
+        elif section == "[Service]" and line and not line.startswith("#"):
+            key, _, value = line.partition("=")
+            out.setdefault(key, []).append(value)
+    return out
+
+
+def test_the_units_stop_the_server_alone_first_and_let_it_wait_for_open_work(tmp_path):
+    """Both unit texts: the stop signals the server alone and its engines
+    last (mixed), one ExecStop runs the drain with the unit's own
+    interpreter from the unit's own folder, its failure never fails the
+    stop (the leading dash), and the stop may take the default wait, the
+    server's own stop and the time the sockets need."""
+    template = _service_section((REPO / "proxy" / "proxy.service").read_text())
+    written = _service_section(_dev_setup_unit(tmp_path))
+    for svc, root in ((template, "/opt/otodock"), (written, "/srv/otodock")):
+        assert svc["KillMode"] == ["mixed"]
+        assert svc["TimeoutStopSec"] == ["780"]
+        assert svc["WorkingDirectory"] == [f"{root}/proxy"]
+        (start,), (stop,) = svc["ExecStart"], svc["ExecStop"]
+        python = f"{root}/proxy/venv/bin/python"
+        assert start == f"{python} app.py"
+        assert stop == f"-{python} {root}/proxy/admin_cli.py drain --quiet"
+    assert (REPO / "proxy" / "admin_cli.py").is_file()
+    # The two are one unit but for the paths, the account and the template's Group line.
+    assert "Group" in template and "Group" not in written
+    assert set(template) - {"Group"} == set(written)
+    for text in ((REPO / "proxy" / "proxy.service").read_text(), (SCRIPTS / "dev-setup.sh").read_text()):
+        assert not re.search(r"^\s*KillMode=(control-group|process)\b", text, re.M)
+    assert len(re.findall(r"^KillMode=", (REPO / "proxy" / "proxy.service").read_text(), re.M)) == 1
+    # The proxy's unit and the compute unit's.
+    assert len(re.findall(r"^KillMode=", (SCRIPTS / "dev-setup.sh").read_text(), re.M)) == 2
+    # Both write the compute machine's credential where the compute unit reads it.
+    assert written["Environment"][0] == '"OTODOCK_COMPUTE_LINK_DIR=/srv/otodock/compute-link"'
+    assert template["Environment"][0] == '"OTODOCK_COMPUTE_LINK_DIR=/opt/otodock/compute-link"'
+    compute = _service_section((REPO / "proxy" / "compute.service").read_text())
+    assert template["Environment"][0] in compute["Environment"]
+    assert "proxy/compute.service" in (REPO / "proxy" / "proxy.service").read_text()
+
+
+def test_dev_setup_builds_the_bundled_tools_with_the_proxys_venv(tmp_path):
+    """The server builds no tool at its start. The install's script runs the
+    build entry from the proxy folder with its venv, once the venv and
+    config.env exist and before a unit starts the server. A tool that does
+    not build never stops the install."""
+    text = (SCRIPTS / "dev-setup.sh").read_text()
+    steps = re.findall(r"^(setup_proxy|build_bundled_tools|start_postgres|install_service)$", text, re.M)
+    assert steps == ["setup_proxy", "build_bundled_tools", "start_postgres", "install_service"]
+    fn = re.search(r"^build_bundled_tools\(\) \{\n.*?^\}\n", text, re.S | re.M)
+    assert fn, "dev-setup.sh has no build_bundled_tools"
+    root = tmp_path / "srv"
+    (root / "proxy" / "venv" / "bin").mkdir(parents=True)
+    python = root / "proxy" / "venv" / "bin" / "python"
+    python.write_text('#!/bin/sh\necho "$PWD: $*" >> "$FAKE_CALLS"\nexit "$FAKE_BUILD_RC"\n')
+    python.chmod(0o755)
+    calls = tmp_path / "build-calls.log"
+    script = ('set -euo pipefail\ninfo() { :; }; ok() { echo "ok: $*"; }; warn() { echo "warn: $*"; }\n'
+              f"PLATFORM_ROOT={root}\n" + fn.group(0) + "build_bundled_tools\necho reached\n")
+    for rc, said in (("0", "ok: Bundled tools ready"), ("1", "warn: A bundled tool did not build")):
+        r = subprocess.run([shutil.which("bash"), "-c", script], cwd=tmp_path, capture_output=True, text=True,
+                           timeout=30, env={"PATH": "/usr/bin:/bin", "FAKE_CALLS": str(calls), "FAKE_BUILD_RC": rc})
+        assert r.returncode == 0, r.stderr
+        assert said in r.stdout and r.stdout.rstrip().endswith("reached")
+    assert calls.read_text().splitlines() == [f"{root}/proxy: -m services.mcp.mcp_venv_bootstrap --build"] * 2
+    # The entry the script names is the module's own.
+    assert '"--build"' in (REPO / "proxy" / "services" / "mcp" / "mcp_venv_bootstrap.py").read_text()
+
+
+def test_the_proxys_unit_keeps_the_default_oom_score(tmp_path):
+    """The control plane stays at the default: tools and sessions go first."""
+    assert "OOMScoreAdjust" not in (REPO / "proxy" / "proxy.service").read_text()
+    assert "OOMScoreAdjust" not in _dev_setup_unit(tmp_path, "otodock-proxy")
+
+
+def test_the_compute_unit_runs_the_platforms_sessions_behind_its_walls(tmp_path):
+    """The template and the unit dev-setup writes: the same lines but for the
+    paths, the account and the template's Group; no EnvironmentFile (it never
+    reads config.env); its own home; the code read-only, the agents folder
+    writable, the platform's secrets, sessions, recover bin, SSH keys and the
+    Docker socket out of reach; a stop that ends its link first."""
+    template = _service_section((REPO / "proxy" / "compute.service").read_text())
+    written = _service_section(_dev_setup_unit(tmp_path, "otodock-compute"))
+    assert "Group" in template and "Group" not in written
+    assert set(template) - {"Group"} == set(written)
+    for svc, root in ((template, "/opt/otodock"), (written, "/srv/otodock")):
+        assert "EnvironmentFile" not in svc
+        assert svc["ExecStart"] == [f"{root}/satellite/venv/bin/python {root}/proxy/compute_start.py"]
+        assert svc["ProtectSystem"] == ["strict"] and svc["ProtectHome"] == ["tmpfs"]
+        # The sandbox's launch regains its capabilities inside its own user
+        # namespace at an exec: NoNewPrivileges would fail every session's start.
+        assert "NoNewPrivileges" not in svc and svc["PrivateTmp"] == ["yes"]
+        assert svc["BindReadOnlyPaths"] == [root]
+        # The community tools are the unit's own: a folder of its state
+        # directory over mcps/community alone. A bind over mcps whole would
+        # hide the bundled tools and their interpreters.
+        assert svc["BindPaths"] == [f"{root}/agents", f"/var/lib/otodock-compute/tools:{root}/mcps/community"]
+        for bind in " ".join(svc["BindPaths"]).split():
+            assert bind.split(":")[-1].rstrip("/") != f"{root}/mcps", bind
+        hidden = " ".join(svc["InaccessiblePaths"]).split()
+        for path in (f"{root}/sessions", f"{root}/config.env", f"-{root}/recover-bin",
+                     f"-{root}/mcps/custom/ssh-hosts/keys", "-/run/docker.sock", "-/run/user",
+                     *_walled_beside(root)):
+            assert path in hidden, path
+        assert svc["KillMode"] == ["mixed"] and svc["TimeoutStopSec"] == ["120"]
+        # Above the proxy, below its sessions (the satellite raises those to 500).
+        assert svc["OOMScoreAdjust"] == ["250"]
+        assert '"HOME=/var/lib/otodock-compute"' in svc["Environment"]
+        assert svc["StateDirectory"] == ["otodock-compute otodock-compute/tools"]
+        assert f'"OTODOCK_COMPUTE_LINK_DIR={root}/compute-link"' in svc["Environment"]
+        assert f'"OTODOCK_COMPUTE_AGENTS_DIR={root}/agents"' in svc["Environment"]
+
+
+def _walled_beside(root: str, data: str | None = None) -> tuple[str, ...]:
+    """The walls a compute unit adds beside the sessions and the keys: the
+    exit's signing key, the media pulled from people's own computers, the
+    default backup folder, the env files beside the code, the quota helper
+    and sudo (question 20: the unit shares the server's account and keeps no
+    NoNewPrivileges, so it would reach the server's sudo rule)."""
+    data = data or root
+    return (f"-{data}/credential-exit", f"-{data}/host-media-cache", f"-{root}/backups", f"-{root}/.env",
+            f"-{root}/phone/.env", f"-{root}/proxy/scripts/oto-quota", "-/usr/bin/sudo")
+
+
+def test_the_folder_the_compute_unit_binds_its_tools_over_comes_with_the_checkout():
+    """systemd binds onto a folder that is there: the checkout tracks it, and
+    dev-setup.sh makes it again before it writes the unit."""
+    assert (REPO / "mcps" / "community" / ".gitkeep").is_file()
+    text = (SCRIPTS / "dev-setup.sh").read_text()
+    assert text.index('mkdir -p "$PLATFORM_ROOT/mcps/community"') < text.index(
+        "/etc/systemd/system/otodock-compute.service")
+
+
+def test_the_compute_unit_reaches_the_python_and_the_engines_its_walls_would_hide(tmp_path):
+    """The folder of uv's Pythons (the user's home, which the unit's ProtectHome
+    hides; a venv links the minor-version name there, not the folder it
+    resolves to) and an npm prefix of the person's own (the engines) are bound
+    read-only, the prefix's bin first on its PATH; a Python under /usr and a
+    system prefix add nothing."""
+    uv = tmp_path / "home" / ".local" / "share" / "uv" / "python" / "cpython-3.13.18"
+    npm = tmp_path / "home" / ".npm-global"
+    fakes = {"readlink": f"#!/bin/sh\necho {uv}/bin/python3.13\n", "npm": f"#!/bin/sh\necho {npm}\n"}
+    svc = _service_section(_dev_setup_unit(tmp_path, "otodock-compute", fakes))
+    assert svc["BindReadOnlyPaths"] == [f"/srv/otodock {uv.parent} {npm}"]
+    assert f'"PATH={npm}/bin:/usr/local/bin:/usr/bin:/bin"' in svc["Environment"]
+    system = {"readlink": "#!/bin/sh\necho /usr/bin/python3.13\n", "npm": "#!/bin/sh\necho /usr/local\n"}
+    (tmp_path / "system").mkdir()
+    svc = _service_section(_dev_setup_unit(tmp_path / "system", "otodock-compute", system))
+    assert svc["BindReadOnlyPaths"] == ["/srv/otodock"]
+    assert '"PATH=/usr/local/bin:/usr/bin:/bin"' in svc["Environment"]
 
 
 # ── install.sh: free disk where Docker keeps its images ────────────────
@@ -1327,6 +1578,9 @@ def test_a_run_directory_restores_the_database_and_the_tree_into_the_volume(tmp_
     assert first_check < first_psql, "the archives are checked before the database is touched"
     assert any(a[:1] == ["exec"] and "DELETE FROM platform_settings WHERE key = 'credential_key_fingerprints'" in " ".join(a)
                for a in calls), "the restored record of the source's keys is cleared"
+    # A restore takes up nothing the dump left open.
+    assert any(a[:1] == ["exec"] and "'platform_alive_at', 'platform_held_at', 'platform_clean_stop'" in " ".join(a)
+               for a in calls), "the restored marks of the source's last boot are cleared"
     assert any("vol-agents:/opt/otodock/agents" in a for a in runs), "the tree goes into the volume"
     assert (vol / "helper" / "workspace" / "notes.md").read_text() == "restored"
     assert os.readlink(vol / "helper" / "py") == "/usr/bin/python3"
@@ -1358,7 +1612,51 @@ def test_a_run_without_a_sessions_archive_restores_the_rest_and_says_so(tmp_path
     assert said in r.stderr and "connect the accounts again" in r.stderr
     assert (vol / "helper" / "workspace" / "notes.md").read_text() == "restored"
     assert (tmp_path / "vol-sessions" / "stale-index.json").exists()
-    assert not any("vol-sessions" in " ".join(a) for a in _one_offs(tmp_path))
+    # Nothing of the sessions tree is replaced, and with no histories in it
+    # nothing is said about them.
+    assert not any(".tar.gz" in " ".join(a) or "sessions:ro" in " ".join(a) for a in _one_offs(tmp_path))
+    assert "kept aside" not in r.stdout and not list((tmp_path / "vol-sessions").glob("history*"))
+
+
+def test_histories_that_did_not_come_with_the_run_are_set_aside_never_deleted(tmp_path, fakebin):
+    """The histories of memory and settings live in the sessions tree. A run
+    that brings back the agents tree alone would leave this install's own
+    beside folders they do not belong to: one rename keeps them aside, and
+    the next start takes what the restored folders hold."""
+    containers, vol = _stack(tmp_path)
+    sessions = tmp_path / "vol-sessions"
+    entry = sessions / "history" / "agents" / "helper" / "config.git"
+    entry.mkdir(parents=True)
+    (entry / "HEAD").write_text("ref: refs/heads/main\n")
+    (sessions / "history" / "legacy-taken").write_text("2026-11-13\n")
+    d = _run_dir(tmp_path, keys={KEY_A: "JWT_SECRET"}, sessions=None)
+    r = _restore(tmp_path, fakebin, containers, d)
+    assert r.returncode == 0, r.stderr
+    assert (vol / "helper" / "workspace" / "notes.md").read_text() == "restored"
+    assert not (sessions / "history").exists(), "no marker is left: the next start takes the folders' own"
+    [aside] = list(sessions.glob("history.before-restore-*"))
+    assert (aside / "agents" / "helper" / "config.git" / "HEAD").is_file() and (aside / "legacy-taken").is_file()
+    assert f"kept aside as {aside.name} in the sessions tree" in r.stdout
+    assert (sessions / "stale-index.json").exists()
+    runs = [a for a in _one_offs(tmp_path) if "vol-sessions:/opt/otodock/sessions" in a]
+    assert len(runs) == 1 and "--network" in runs[0] and "none" in runs[0]
+    order = [" ".join(a) for a in _one_offs(tmp_path) if "-v" in a and ":ro" not in " ".join(a)]
+    assert "vol-agents" in order[0] and "vol-sessions" in order[-1], "after the agents tree is in place"
+
+
+def test_histories_that_came_with_the_run_replace_this_installs_own(tmp_path, fakebin):
+    containers, _vol = _stack(tmp_path)
+    sessions = tmp_path / "vol-sessions"
+    (sessions / "history" / "agents" / "stale" / "config.git").mkdir(parents=True)
+    d = _run_dir(tmp_path, keys={KEY_A: "JWT_SECRET"})
+    _archive(d / "sessions.tar.gz", {TOKEN_FILE: '{"access_token": "restored"}', "./index.json": "{}",
+                                     "./history/agents/helper/config.git/HEAD": "ref: refs/heads/main\n"})
+    r = _restore(tmp_path, fakebin, containers, d)
+    assert r.returncode == 0, r.stderr
+    # The run's own histories are in place, and nothing was set aside.
+    assert (sessions / "history" / "agents" / "helper" / "config.git" / "HEAD").is_file()
+    assert not (sessions / "history" / "agents" / "stale").exists()
+    assert not list(sessions.glob("history.before-restore-*")) and "kept aside" not in r.stdout
 
 
 def test_a_proxy_without_a_sessions_volume_restores_the_rest_and_says_so(tmp_path, fakebin):
@@ -1545,6 +1843,21 @@ def test_a_set_agents_dir_restores_onto_this_host_beside_a_stack(tmp_path, fakeb
     assert (vol / "stale.txt").exists() and not _one_offs(tmp_path)
 
 
+def test_on_this_host_histories_that_did_not_come_with_the_run_are_set_aside(tmp_path, fakebin):
+    containers, _vol = _stack(tmp_path)
+    d = _run_dir(tmp_path, version="1.7.0", keys={KEY_A: "JWT_SECRET"}, sessions=None)
+    host_sessions = tmp_path / "host-sessions"
+    (host_sessions / "history" / "agents" / "helper" / "config.git").mkdir(parents=True)
+    (host_sessions / "index.json").write_text("{}")
+    r = _restore(tmp_path, fakebin, containers, d, OTODOCK_AGENTS_DIR=str(tmp_path / "agents"),
+                 OTODOCK_SESSIONS_DIR=str(host_sessions))
+    assert r.returncode == 0, r.stderr
+    [aside] = list(host_sessions.glob("history.before-restore-*"))
+    assert (aside / "agents" / "helper" / "config.git").is_dir() and not (host_sessions / "history").exists()
+    assert (host_sessions / "index.json").exists() and not _one_offs(tmp_path)
+    assert f"kept aside as {aside.name}" in r.stdout
+
+
 @pytest.mark.parametrize("status", ["running", "restarting", "paused"])
 def test_a_running_restarting_or_paused_proxy_refuses_the_restore_on_docker(tmp_path, fakebin, status):
     """A crash-looping proxy comes back mid-restore and migrates a half-restored
@@ -1554,7 +1867,7 @@ def test_a_running_restarting_or_paused_proxy_refuses_the_restore_on_docker(tmp_
     r = _restore(tmp_path, fakebin, containers, d)
     assert r.returncode == 1
     assert f"the platform is running (container proxy-t2, state {status})" in r.stderr
-    assert "docker compose stop otodock-proxy" in r.stderr
+    assert "Stop it first. In the install folder, run: docker compose stop otodock-proxy otodock-compute" in r.stderr
     assert not _fed(tmp_path)
 
 
@@ -1646,6 +1959,42 @@ def test_the_postgres_container_can_be_named_outright(tmp_path, fakebin):
     assert r.returncode == 1 and "OTODOCK_POSTGRES_CONTAINER=nope is not a container" in r.stderr
 
 
+# A stand-in for systemctl in a restore: logs its arguments and answers
+# is-active for the units FAKE_ACTIVE names (rc 3, inactive, for any other).
+RESTORE_SYSTEMCTL = r'''#!/bin/sh
+echo "$*" >> "$FAKE_SYSTEMCTL_LOG"
+case "$1" in is-active) for u in $FAKE_ACTIVE; do [ "$u" = "$3" ] && exit 0; done; exit 3 ;; esac
+exit 97
+'''
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_restore_on_bare_metal_refuses_while_the_compute_unit_runs(tmp_path, fakebin, active):
+    """S-B4 on bare metal: the compute unit outlives a stop of the proxy's, and
+    its sessions write the agents tree. systemctl here is this test's fake,
+    which answers a unit's state and refuses every verb that acts (97); the
+    test checks that the script asked it and only asked."""
+    sysctl = fakebin / "systemctl"
+    sysctl.write_text(RESTORE_SYSTEMCTL)
+    sysctl.chmod(0o755)
+    log = tmp_path / "systemctl.log"
+    containers, _ = _stack(tmp_path)
+    d = _run_dir(tmp_path, version="1.7.0", keys={KEY_A: "JWT_SECRET"}, tree=False)
+    r = _restore(tmp_path, fakebin, containers + [PG_T1], d, OTODOCK_COMPOSE_PROJECT="oto-dock",
+                 OTODOCK_POSTGRES_CONTAINER="otodock-postgres", FAKE_SYSTEMCTL_LOG=str(log),
+                 FAKE_ACTIVE="otodock-compute" if active else "")
+    asked = log.read_text().splitlines()
+    assert "is-active --quiet otodock-compute" in asked
+    assert all(line.startswith("is-active ") for line in asked), asked
+    if active:
+        assert r.returncode == 1
+        assert "stop it first: sudo systemctl stop otodock-proxy otodock-compute" in r.stderr
+        assert not _fed(tmp_path)
+    else:
+        assert r.returncode == 0, r.stderr
+        assert _fed(tmp_path)
+
+
 def test_the_manifest_names_the_dump(tmp_path, fakebin):
     containers, _ = _stack(tmp_path)
     d = _run_dir(tmp_path, keys={KEY_A: "JWT_SECRET"}, tree=False, db_name="otodock-otodock-20261030-120000.sql.gz")
@@ -1722,6 +2071,7 @@ def test_compose_sh_derives_collaboras_scheme_and_needs_engine_26(tmp_path, conf
     bindir.mkdir()
     (bindir / "docker").write_text(FAKE_COMPOSE_DOCKER)
     (bindir / "docker").chmod(0o755)
+    write_host_fakes(bindir)
     log = tmp_path / "docker.log"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("COLLABORA_", "OTODOCK_"))}
     env.update({"PATH": f"{bindir}:{env['PATH']}", "FAKE_LOG": str(log), "FAKE_API": api, **shell})
@@ -1747,6 +2097,7 @@ def test_compose_sh_needs_compose_2_26(tmp_path):
     bindir.mkdir()
     (bindir / "docker").write_text(FAKE_COMPOSE_DOCKER)
     (bindir / "docker").chmod(0o755)
+    write_host_fakes(bindir)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("COLLABORA_", "OTODOCK_"))}
     env.update({"PATH": f"{bindir}:{env['PATH']}", "FAKE_LOG": str(tmp_path / "log"),
                 "FAKE_COMPOSE": "2.25.0"})
@@ -1819,3 +2170,275 @@ def test_the_image_boot_check_reads_pastas_first_line():
         r = subprocess.run(["bash", "-c", f'set -euo pipefail\ngot="$1"\n{cut}\nprintf %s "$got"', "_", output],
                            capture_output=True, text=True, timeout=30)
         assert r.stdout == first, r.stderr
+
+
+def _health_of_a_proxy_alone(monkeypatch, **changed) -> dict:
+    """What GET /health answers on a proxy that runs alone, built by the
+    server's own code: every part works but the compute machine, which is
+    not there. ``changed`` gives a part another word."""
+    from services.infra import health_parts
+    of = {part: health_parts.OK for part in health_parts.PARTS} | {"compute": health_parts.DOWN} | changed
+    monkeypatch.setattr(health_parts, "parts", lambda: dict(of))
+    return health_parts.answer("")
+
+
+@contextlib.contextmanager
+def _answering(body: dict):
+    """A server on loopback whose every GET answers ``body``. Yields its URL."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            data = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}/health"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _boot_probe(fakebin, url: str, *pairs: str) -> bool:
+    """image-boot-check.sh's probe on its own: whether the URL answers every
+    KEY=VALUE. The fake docker runs the probe's Python on this host, so the
+    request is a real one."""
+    boot = (SCRIPTS / "image-boot-check.sh").read_text()
+    probe = re.search(r"^probe\(\) \{.*?^\}\n", boot, re.S | re.M)
+    assert probe
+    env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+    env["PATH"] = f"{fakebin}:{env.get('PATH', '/usr/bin:/bin')}"
+    r = subprocess.run(["bash", "-c", probe.group(0) + 'probe proxy "$@"', "_", url, *pairs],
+                       env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode in (0, 1) and not r.stdout and not r.stderr, r
+    return r.returncode == 0
+
+
+def test_the_image_boot_checks_probe_reads_a_key_inside_a_block(fakebin, monkeypatch):
+    """``parts.tools=ok`` asks for the tools' word inside the parts. A key
+    that is not there is a plain no, at either depth."""
+    with _answering(_health_of_a_proxy_alone(monkeypatch)) as url:
+        for pairs, answers in (
+            (("status=ok",), True),
+            (("parts.database=ok", "parts.tools=ok", "parts.scheduler=ok"), True),
+            (("ready=false",), True),   # a JSON true or false, as the file tools' render=true
+            (("parts.compute=ok",), False),
+            (("parts.database=ok", "parts.compute=ok"), False),
+            (("parts.none=ok",), False),
+            (("status.deeper=ok",), False),   # a word holds no key
+            (("none.deeper=ok",), False),
+        ):
+            assert _boot_probe(fakebin, url, *pairs) is answers, pairs
+
+
+def _proxy_wait_pairs() -> list[str]:
+    """The KEY=VALUE pairs image-boot-check.sh waits for on the proxy's /health."""
+    boot = (SCRIPTS / "image-boot-check.sh").read_text()
+    wait = re.search(r'^wait_for "\$PROXY_WAIT_S" "the proxy" (?:.*\\\n)*.*\n', boot, re.M)
+    assert wait
+    words = shlex.split(wait.group(0).replace("\\\n", " "))
+    assert words[4].endswith(":8400/health"), words
+    return words[5:]
+
+
+@pytest.mark.parametrize("changed, answers", [
+    ({}, True),
+    ({"database": "down"}, False),
+    ({"tools": "preparing"}, False),
+    ({"tools": "failed"}, False),
+    ({"scheduler": "down"}, False),
+])
+def test_the_image_boot_check_waits_for_what_a_proxy_alone_can_answer(fakebin, monkeypatch, changed, answers):
+    """The check boots the proxy image beside a Postgres and nothing else.
+    No compute machine signs in there, so that proxy never says it is ready
+    for work. The check waits for the parts a proxy brings up alone, and it
+    still fails while the database is down, the tools are not ready or the
+    scheduler is down."""
+    with _answering(_health_of_a_proxy_alone(monkeypatch, **changed)) as url:
+        assert _boot_probe(fakebin, url, *_proxy_wait_pairs()) is answers
+
+
+def _boot_run(boot: str, opener: str, end: str) -> list[str]:
+    """The words of one `docker run` of image-boot-check.sh, between ``opener`` and ``end``."""
+    start = boot.index(opener)
+    return shlex.split(boot[start + len(opener):boot.index(end, start)].replace("\\\n", " "))
+
+
+def test_the_image_boot_check_gives_the_proxy_no_privilege_and_the_compute_run_the_compose_files():
+    """The proxy boots as the compose file runs it, with no security option
+    and no device. The sandbox is asked for twice: in that container, where
+    it must not start, and in the image started with the compute service's
+    own options, where it must."""
+    boot = (SCRIPTS / "image-boot-check.sh").read_text()
+    proxy = _boot_run(boot, 'docker run -d --name "$PROXY"', ">/dev/null")
+    assert proxy[-1] == "$PROXY_IMAGE"
+
+    def held(words: list[str]) -> list[str]:
+        """The words that hand a container a privilege, in either spelling (``--device X``, ``--device=X``)."""
+        return [w for w in words if w.split("=", 1)[0] in ("--security-opt", "--device", "--cap-add", "--privileged")]
+    assert held(["-e", "A=--device", "--security-opt=seccomp=unconfined", "--device=/dev/net/tun", "--privileged",
+                 "--cap-add", "SYS_ADMIN"]) == ["--security-opt=seccomp=unconfined", "--device=/dev/net/tun",
+                                               "--privileged", "--cap-add"]
+    assert held(proxy) == []
+    compute = _boot_run(boot, "COMPUTE_OPTS=(", ")\n")
+    assert 'AS_COMPUTE=(docker run "${COMPUTE_OPTS[@]}" "$PROXY_IMAGE")' in boot
+    options = [compute[i + 1] for i, w in enumerate(compute) if w == "--security-opt"]
+    devices = [compute[i + 1] for i, w in enumerate(compute) if w == "--device"]
+    service = yaml.safe_load((REPO / "docker-compose.yml").read_text())["services"]["otodock-compute"]
+    assert options == [o.replace("${OTODOCK_APPARMOR_PROFILE:-unconfined}", "$APPARMOR")
+                       for o in service["security_opt"]]
+    assert devices == service["devices"] == ["/dev/net/tun"]
+    assert compute[compute.index("--user") + 1] == service["user"] == "1000:1000"
+    # One shape, asked for in both places, and the proxy's answer is a refusal.
+    assert boot.count('"${SHAPE[@]}"') == 2
+    assert 'if timeout 60 docker exec "$PROXY" "${SHAPE[@]}" >/dev/null 2>&1; then\n    fail ' in boot
+    assert 'if ! out="$(timeout 60 "${AS_COMPUTE[@]}" "${SHAPE[@]}" 2>&1)"; then\n    fail ' in boot
+
+
+def test_the_image_boot_check_runs_the_compute_services_own_start_check():
+    """An image whose satellite does not import, or whose real start check
+    fails, booted its proxy and ran a hand-written shape, and no chat ran on
+    it. The check now runs the compute service's own start check, as the
+    remote host's script runs it before it starts a machine, with the compute
+    service's options and the platform's satellite version, and its last
+    line must be ok."""
+    boot = (SCRIPTS / "image-boot-check.sh").read_text()
+    host = (SCRIPTS / "otodock-remote-compute.sh").read_text()
+    run = _boot_run(boot, "checked=\"$(timeout 120 docker run", "2>&1")
+    assert run[:1] == ["${COMPUTE_OPTS[@]}"]
+    at = run.index("$PROXY_IMAGE")
+    assert run[at + 1:] == ["/opt/otodock/satellite/venv/bin/python", "/opt/otodock/proxy/compute_start.py",
+                            "--check", "$SAT_VERSION"]
+    env = [run[i + 1] for i, w in enumerate(run[:at]) if w == "-e"]
+    assert env == ["HOME=/tmp/otodock-check", "OTODOCK_COMPUTE_MCPS_DIR=/opt/otodock/mcps"]
+    # The remote host's own run of the check takes the same environment and the same command.
+    for word in (*env, "/opt/otodock/proxy/compute_start.py --check"):
+        assert word in " ".join(host.split())
+    # The same options as the image's other compute runs, and the platform's own satellite version.
+    assert "AS_COMPUTE=(docker run \"${COMPUTE_OPTS[@]}\" \"$PROXY_IMAGE\")" in boot
+    (read_version,) = [ln for ln in boot.splitlines() if ln.startswith("SAT_VERSION=")]
+    assert "satellite/config.py" in read_version
+    # Only a last line of ok passes, anything else fails with the check's own words.
+    assert 'checked="${checked##*$\'\\n\'}"' in boot
+    assert '[ "$checked" = ok ] || fail ' in boot
+
+
+def test_the_image_boot_check_reads_the_boots_own_words_for_a_tool_to_build():
+    """An image without a bundled tool's environment: the boot says so in
+    one sentence, which the check reads. The words are the server's own."""
+    from services.mcp import mcp_venv_bootstrap
+    boot = (SCRIPTS / "image-boot-check.sh").read_text()
+    (words,) = re.findall(r"grep -q '([^']+)' <<<\"\$boot_log\"", boot)
+    plan = types.SimpleNamespace(names=["notes-mcp"], labels={"notes-mcp": "Notes"})
+    assert words in mcp_venv_bootstrap.build_notice(plan)
+    # Read once the proxy answers and before the wait for its tools.
+    assert boot.index("the proxy's database") < boot.index(words) < boot.index('"the proxy" "$PROXY"')
+
+
+# ── install.sh waits for the server, then the compute machine ─────────────────
+
+_PROXY_UP = {"id": "proxy-t2", "labels": {"com.docker.compose.project": "inst",
+                                          "com.docker.compose.service": "otodock-proxy"}}
+_COMPUTE_UP = {"id": "compute-t2", "labels": {"com.docker.compose.project": "inst",
+                                              "com.docker.compose.service": "otodock-compute"}}
+
+
+def _install(tmp_path, fakebin, containers, **extra):
+    """install.sh's wait after its docker compose up, run on its own (the
+    fetches before it need the network)."""
+    text = (SCRIPTS / "install.sh").read_text()
+    block = text[text.index('_wait="${OTODOCK_UPGRADE_WAIT_S:-300}"'):text.index("# PROXY_PORT moves")]
+    env = _env(tmp_path, fakebin, containers, **extra)
+    return subprocess.run(["bash", "-c", 'set -euo pipefail\nsay() { echo "install.sh: $*"; }\n' + block
+                           + '\nsay "done."'], cwd=tmp_path, env=env, stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=120)
+
+
+def test_install_waits_for_the_server_then_the_compute_machine(tmp_path, fakebin):
+    r = _install(tmp_path, fakebin, [_PROXY_UP, _COMPUTE_UP],
+                 FAKE_ADMIN_COMPUTE="The compute machine is signed in.")
+    assert r.returncode == 0, r.stdout + r.stderr
+    said = " ".join(r.stdout.split())
+    assert said.index("waiting for the server to start") < said.index(
+        "waiting for the compute machine to sign in") < said.index("install.sh: done.")
+    assert "install.sh: The compute machine is signed in." in r.stdout
+    assert "waiting for the server to start. A first start can take a few minutes." in said
+
+
+def test_install_says_that_nothing_runs_when_the_compute_machine_does_not_sign_in(tmp_path, fakebin):
+    line = "The compute machine is not signed in. Chats, tasks and calls cannot run until it is."
+    r = _install(tmp_path, fakebin, [_PROXY_UP, _COMPUTE_UP], FAKE_ADMIN_COMPUTE=line,
+                 FAKE_ADMIN_COMPUTE_RC="1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert line in r.stdout and ("It may still be preparing its tools. To see why, run docker compose logs "
+                                 "otodock-compute in ") in r.stdout
+
+
+# ── restore.sh and the compute service (S-B4), --yes, --marks-only ────────────
+
+COMPUTE_T2 = {"id": "compute-t2", "name": "otodock-otodock-compute-1",
+              "labels": {"com.docker.compose.project": "otodock",
+                         "com.docker.compose.service": "otodock-compute"}}
+
+
+@pytest.mark.parametrize("status", ["running", "restarting", "paused"])
+def test_restore_refuses_while_the_compute_service_runs(tmp_path, fakebin, status):
+    containers, vol = _stack(tmp_path)
+    d = _run_dir(tmp_path, keys={KEY_A: "JWT_SECRET"})
+    r = _restore(tmp_path, fakebin, [*containers, {**COMPUTE_T2, "status": status}], d)
+    assert r.returncode == 1
+    assert "the compute service is running (container compute-t2): stop it first" in r.stderr
+    assert "docker compose stop otodock-proxy otodock-compute" in r.stderr
+    assert not any(a[:1] == ["exec"] and "psql" in a and "-v" in a for a in _calls(tmp_path))
+    assert (vol / "stale.txt").exists()
+
+
+def test_restore_with_the_compute_service_stopped_restores_and_says_it_gets_a_new_sign_in(tmp_path, fakebin):
+    containers, _vol = _stack(tmp_path)
+    d = _run_dir(tmp_path, keys={KEY_A: "JWT_SECRET"})
+    r = _restore(tmp_path, fakebin, [*containers, {**COMPUTE_T2, "running": False}], d)
+    assert r.returncode == 0, r.stderr
+    assert ("Restore complete. Start the platform with: docker compose up -d. It reads the .env you edited, "
+            "updates the database as it starts, and gives the compute service a new sign-in if it needs one. "
+            "Community tools are in no backup: on a new host, install them again under Admin, MCP Servers."
+            in r.stdout)
+
+
+def test_restore_yes_asks_nothing(tmp_path, fakebin):
+    containers, _vol = _stack(tmp_path)
+    d = _run_dir(tmp_path, keys={KEY_A: "JWT_SECRET"})
+    r = _run("restore.sh", tmp_path, fakebin, containers, str(d), "--yes", stdin="",
+             FAKE_VOLUMES=json.dumps({"vol-agents": str(tmp_path / "vol-agents"),
+                                      "vol-sessions": str(tmp_path / "vol-sessions")}),
+             FAKE_IMAGE_VERSION="1.8.0", FAKE_KEYS=json.dumps({KEY_A: "JWT_SECRET"}), OTODOCK_AGENTS_DIR="")
+    assert r.returncode == 0, r.stderr
+    assert "Type 'yes' to continue" not in r.stdout and "Restore complete" in r.stdout
+
+
+def test_marks_only_clears_the_continuity_marks_and_nothing_else(tmp_path, fakebin):
+    """After a database restored by other means (a point-in-time start), the
+    marks step alone: the next boot takes up nothing the database left open."""
+    containers, vol = _stack(tmp_path)
+    r = _run("restore.sh", tmp_path, fakebin, containers, "--marks-only", OTODOCK_AGENTS_DIR="")
+    assert r.returncode == 0, r.stderr
+    assert "the continuity marks are cleared" in r.stdout
+    changes = [a for a in _calls(tmp_path) if a[:1] in (["exec"], ["run"]) and "DELETE" in " ".join(a)]
+    assert len(changes) == 2
+    assert "'platform_alive_at', 'platform_held_at', 'platform_clean_stop'" in " ".join(changes[1])
+    assert not any(a[:1] == ["run"] for a in _calls(tmp_path))
+    assert (vol / "stale.txt").exists()
+
+
+def test_marks_only_refuses_while_the_platform_runs(tmp_path, fakebin):
+    containers, _vol = _stack(tmp_path, running=True)
+    r = _run("restore.sh", tmp_path, fakebin, containers, "--marks-only", OTODOCK_AGENTS_DIR="")
+    assert r.returncode == 1 and "stop the proxy first" in r.stderr
+    assert not any("DELETE" in " ".join(a) for a in _calls(tmp_path))
+

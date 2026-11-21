@@ -1,12 +1,19 @@
 """The Silero VAD model behind ONNX Runtime, one 32 ms window per call.
 
 ``models/silero_vad.onnx`` is Silero VAD v5.1.2 (MIT, see ``models/README.md``).
-The feed mirrors the binding the phone pipeline was tuned against: exactly one
-32 ms window per call (256 samples at 8 kHz, 512 at 16 kHz), no context
-prefix, the recurrent ``state`` carried between calls and zeroed on
-``reset()``. Upstream's own Python package prepends the previous 64 samples
-to every window; that shifts the probabilities the endpointing thresholds
-were set against, so this wrapper deliberately does not.
+One window per call (256 samples at 8 kHz, 512 at 16 kHz), the recurrent
+``state`` carried between calls and zeroed on ``reset()``. This module is the
+one place the model's input is built (``SileroModel._input``), and it has
+one feed: each window with the 4 ms of audio just before it in front, 32
+samples at 8 kHz and 64 at 16 kHz, zeros after a reset. That is the model's
+contract: upstream's own Python package feeds it so, and silero-vad-lite
+does from 0.3.0, which calls that context required. An older binding fed the
+window alone, and at 8 kHz the model then scored far fewer windows of speech
+as speech.
+
+Every detector reads this feed: a phone call's, a voice conversation's, and
+the second listen's speech check. No caller can ask for another, and a test
+fails on a module of the product that reaches around this one.
 """
 
 from __future__ import annotations
@@ -15,6 +22,8 @@ from importlib.resources import files
 
 SUPPORTED_RATES = (8000, 16000)
 WINDOW_MS = 32
+#: The audio in front of each window in the model's contract.
+CONTEXT_MS = 4
 
 
 def default_model_path() -> str:
@@ -39,6 +48,8 @@ class SileroModel:
         self._np = np
         self.sample_rate = sample_rate
         self.window_size_samples = sample_rate * WINDOW_MS // 1000
+        self._context_samples = sample_rate * CONTEXT_MS // 1000
+        self._context = np.zeros(self.context_samples, dtype=np.float32)
         # Single-threaded inference: the phone serialises VAD on one worker
         # thread and runs several sessions per host. ONNX Runtime releases the
         # GIL during run(), which is what lets that worker unblock the loop.
@@ -52,9 +63,26 @@ class SileroModel:
         self._sr = np.array(sample_rate, dtype=np.int64)
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
 
+    @property
+    def context_samples(self) -> int:
+        """The samples in front of each window, the rate's 4 ms. Read only:
+        the feed is the model's, never a caller's to set."""
+        return self._context_samples
+
     def reset(self) -> None:
-        """Zero the recurrent state: the next window starts a fresh sequence."""
+        """Zero the recurrent state and the kept context: the next window
+        starts a fresh sequence, with silence in front of it."""
         self._state = self._np.zeros((2, 1, 128), dtype=self._np.float32)
+        self._context = self._np.zeros(self.context_samples, dtype=self._np.float32)
+
+    def _input(self, x):
+        """What the session reads for one window: the kept samples in front,
+        then the window. The joined array's own tail is kept for the next
+        window: an array this model owns, never a view of the caller's
+        buffer, which the caller may reuse."""
+        joined = self._np.concatenate([self._context, x])
+        self._context = joined[-self.context_samples:]
+        return joined.reshape(1, -1)
 
     def process(self, samples) -> float:
         """Speech probability (0..1) of one window of float32 PCM in [-1, 1].
@@ -76,6 +104,6 @@ class SileroModel:
                 f"Silero VAD at {self.sample_rate} Hz takes {self.window_size_samples} samples per window, got {x.size}"
             )
         output, self._state = self._session.run(
-            None, {"input": x.reshape(1, -1), "state": self._state, "sr": self._sr},
+            None, {"input": self._input(x), "state": self._state, "sr": self._sr},
         )
         return float(output[0, 0])

@@ -44,17 +44,26 @@ from api.media.ui import (
     wrap_fragment,
 )
 from auth import roles
+from auth.external_endpoints import SESSION_ROUTE_DETAIL
 from auth.lan_check import get_client_ip
-from auth.providers import UserContext, get_current_user, require_auth, require_human
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_auth,
+    require_human,
+    session_row_role,
+)
 from auth.request_path import has_traversal
 from auth.session_token import validate_session_token
 from services.apps import app_supervisor, app_tokens, releases
 from services.apps.app_handlers import _inflight_checks
 from services.apps.app_supervisor import forward
+
+# The one token bucket of every app route (and its table, which the tests clear).
+from services.apps.call_rate import _buckets, take as _take  # noqa: F401
 from storage import database as task_store, db_apps
 from storage.automation import notification_severity
 from storage.pg import run_db
-from ws import wire_events as wire
 
 logger = logging.getLogger("otodock.apps")
 router = APIRouter()
@@ -112,6 +121,10 @@ _NEVER_ASSETS = (".html", ".htm", ".xhtml", ".xml")
 # ── the caller ──────────────────────────────────────────────────────────────
 
 
+#: The basis of a caller that presents an agent session's token.
+_BASIS_AGENT = "agent"
+
+
 @dataclass
 class Caller:
     basis: str                  # viewer | external | agent | app
@@ -148,6 +161,9 @@ class Caller:
             return f"app:{self.sub}:{self.instance}"
         if self.basis == "step":
             return f"step:{str(self.extra.get('delivery') or '')[:8]}"
+        if self.basis == "external" and self.extra.get("outside"):
+            # An outside person's session: its own bucket.
+            return f"outside:{self.extra['outside']}"
         if self.basis == "external":
             # A link's viewers are actors by their app session (APPS.md
             # "External links"), else by their client IP (the link routes
@@ -216,8 +232,12 @@ async def _agent_caller(payload: dict, row: dict) -> Caller:
     user's personal apps on that same agent (a personal app lives in its
     agent's tree, and a session never crosses one), and, through a share
     that placed the app in the session's agent, the app's signed exports
-    at the capped role (SHARING.md "Agents use a placed app"); never an
-    external session."""
+    at the capped role (SHARING.md "Agents use a placed app"). A session of
+    an outside person (``ext`` and no person) is ``app_outside.outside_caller``; a
+    route tied to a person carries ``ext`` too and is that person's."""
+    if payload.get("ext") and not payload.get("user_sub"):
+        from api.apps.app_outside import outside_caller
+        return await outside_caller(payload, row)
     if payload.get("ext"):
         raise _refuse(401, "external sessions cannot call apps")
     # The session must be live and the token of its current life (the app
@@ -251,12 +271,12 @@ async def _agent_caller(payload: dict, row: dict) -> Caller:
         # The row alone, never the owner's platform role: a bearer principal
         # presents its per-agent row to an app (viewer without one) so a
         # prompt never carries an admin's standing into a floored button.
-        role = (roles.row_role(user.agent_roles, row.get("agent") or "") or roles.VIEWER) if user else roles.SERVICE
+        role = await run_db(session_row_role, user.sub, payload) if user else roles.SERVICE
         claim = app_tokens.mint(row["id"], app_tokens.PURPOSE_CALLER, {
             "principal": app_tokens.PRINCIPAL_AGENT, "sub": sub, "username": username, "role": role,
             "agent": agent, "session": sid, "external": False,
         }, app_tokens.CALLER_TTL_S)
-        return Caller(basis="agent", sub=sub, username=username, role=role, claim=claim,
+        return Caller(basis=_BASIS_AGENT, sub=sub, username=username, role=role, claim=claim,
                       exp=int(time.time()) + app_tokens.CALLER_TTL_S, user=user)
     # A placed app: the role the share gives on the receiving agent; the
     # marker is what every guard tests, and the claim names the placement.
@@ -264,7 +284,7 @@ async def _agent_caller(payload: dict, row: dict) -> Caller:
               "from_agent": row.get("agent") or "", "agent": agent, "role_cap": placement["role_cap"]}
     role = placement["role"]
     claim = _placement_claim(row, sub, username, role, agent, sid, marker)
-    return Caller(basis="agent", sub=sub, username=username, role=role, claim=claim,
+    return Caller(basis=_BASIS_AGENT, sub=sub, username=username, role=role, claim=claim,
                   exp=int(time.time()) + app_tokens.CALLER_TTL_S, user=user,
                   extra={"placement": marker})
 
@@ -290,17 +310,24 @@ def _agent_principal(payload: dict, row: dict, person_scope: bool
     agent's unscoped row: the share placing it in the token's agent and the
     role the session acts at (``share_store.placement_role``), the person's
     own placement only when the session mounts their scope. Synchronous."""
-    from auth.providers import session_token_holder_ok, user_context_for_sub
+    from auth.providers import (
+        session_principal,
+        session_token_holder_ok,
+        user_context_for_sub,
+    )
     if not session_token_holder_ok(payload):
         return False, None, "", None
     user_sub = payload.get("user_sub") or ""
-    user = user_context_for_sub(user_sub) if user_sub else None
+    person = user_context_for_sub(user_sub) if user_sub else None
+    # The person as the session acts for them: a session built below their
+    # role presents that role to the app.
+    user = session_principal(person, payload) if person is not None else None
     username = ((task_store.get_user(user.sub) or {}).get("username") or "") if user else ""
     placement = None
     agent = payload.get("agent") or ""
     if agent and row.get("agent") != agent and not (row.get("scope_chat_id") or row.get("scope_project_id")):
         from storage.sharing import share_store
-        own = (roles.row_role(user.agent_roles, agent) or roles.VIEWER) if user else roles.SERVICE
+        own = session_row_role(user.sub, payload) if user else roles.SERVICE
         person_sub = user.sub if (user is not None and person_scope) else None
         placement = share_store.placement_role(row["id"], agent, person_sub, own)
     return True, user, username, placement
@@ -311,24 +338,6 @@ async def resolve_caller(request: Request, row: dict) -> Caller:
 
 
 # ── limits and paths ────────────────────────────────────────────────────────
-
-_buckets: dict[str, tuple[float, float]] = {}
-
-
-def _take(key: str, rate: float, burst: float) -> bool:
-    now = time.monotonic()
-    tokens, at = _buckets.get(key, (burst, now))
-    tokens = min(burst, tokens + (now - at) * rate)
-    if tokens < 1.0:
-        _buckets[key] = (tokens, now)
-        return False
-    _buckets[key] = (tokens - 1.0, now)
-    if len(_buckets) > 4096:
-        stale = [k for k, (_t, a) in _buckets.items() if now - a > 120]
-        for k in stale:
-            _buckets.pop(k, None)
-    return True
-
 
 def check_rate(app_id: str, actor: str) -> None:
     if not _take(f"{app_id}|{actor}", RATE_PER_ACTOR, RATE_PER_ACTOR) \
@@ -459,6 +468,10 @@ async def proxy_request(row: dict, caller: Caller, request: Request, rest: str):
         path += "?" + (query.decode("latin-1") if isinstance(query, bytes) else str(query))
     try:
         upstream = await forward(inst, request.method, path, headers, body)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        # The server's compute machine went away: the page's runtime retries a 503.
+        return _unavailable(app_supervisor.AppUnavailable("the app's server is starting again", 1,
+                                                          state=app_supervisor.STARTING))
     except httpx.HTTPError as e:
         logger.warning("App %s: upstream error on %s: %s", row.get("slug"), rest, e)
         raise _refuse(502, "the app's server did not answer") from e
@@ -494,15 +507,19 @@ async def preflight_api(app_id: str, path: str) -> Response:
 async def proxy_api(app_id: str, path: str, request: Request):
     row = await run_db(_row_or_404, app_id)
     caller = await resolve_caller(request, row)
-    if caller.basis == "external":
+    if caller.basis == "external" and not caller.extra.get("outside"):
         # A link's claim works under the link's own prefix, where the share
         # is re-read on every request (SHARING.md); lifted here it would
         # outlive a revoke.
         raise _refuse(401, "a link's claim is for the link's own routes")
     rest = _rest_path(request, app_id, path)
     check_app_path(path, rest)
-    if caller.extra.get("placement"):
-        _check_placed_export(row, path, caller)
+    if caller.extra.get("placement") or caller.extra.get("outside"):
+        if caller.extra.get("outside"):
+            from api.apps.app_outside import check_outside_method
+            check_outside_method(row, path)
+        else:
+            _check_placed_export(row, path, caller)
         # The exported method's own route, where the broker forwards a
         # binding's call too (``app_bindings.broker``): one route answers
         # both, so an app that offers a method serves it once.
@@ -612,11 +629,18 @@ async def proxy_ws(websocket: WebSocket, app_id: str, path: str):
         await _close(websocket, 4400, "auth frame expected")
         return
     if caller.basis == "external":
-        await _close(websocket, 4401, "a link's claim is for the link's own routes")
+        # A link's claim works under the link's own prefix; an outside
+        # person's session reaches the opened methods alone, never a socket.
+        await _close(websocket, 4401 if not caller.extra.get("outside") else 1008,
+                     "a link's claim is for the link's own routes" if not caller.extra.get("outside")
+                     else "an app answers outside people through its methods only")
         return
-    if caller.extra.get("placement"):
-        # Exports are HTTP methods; a placed agent's session opens no socket.
-        await _close(websocket, 1008, "a placed app answers its exported methods only")
+    if caller.basis == _BASIS_AGENT:
+        # The socket bridge is the browser's alone: an agent reaches an
+        # app through its methods, and a session's token is off this route
+        # (``auth/external_endpoints.SESSION_ROUTES``), which no middleware
+        # judges for a socket.
+        await _close(websocket, 4403, SESSION_ROUTE_DETAIL)
         return
     try:
         raw = websocket.scope.get("raw_path") or b""
@@ -645,17 +669,18 @@ async def bridge_ws(websocket: WebSocket, row: dict, path: str, caller: Caller) 
             await _close(websocket, 1008, "this app has no server")
             return
         query = websocket.scope.get("query_string") or b""
-        url = f"ws://127.0.0.1:{inst.host_port}/{path}"
+        url = inst.ws_url(path)
         if query:
             url += "?" + (query.decode("latin-1") if isinstance(query, bytes) else str(query))
         headers = [("X-OtoDock-Viewer", caller.claim)] if caller.claim else []
         headers.append(("X-OtoDock-Basis", caller.basis))
         headers.append(("X-Forwarded-For", get_client_ip(websocket)))
         try:
-            upstream = await websockets.connect(url, additional_headers=headers,
+            upstream = await websockets.connect(url, additional_headers=headers, proxy=None,
                                                 max_size=WS_MAX_FRAME, open_timeout=10)
         except (OSError, TimeoutError, websockets.WebSocketException) as e:
             logger.info("App %s: upstream socket refused: %s", row.get("slug"), e)
+            app_supervisor.unreachable(inst)
             await _close(websocket, 1011, "the app's server did not accept the socket")
             return
         app_supervisor.ws_opened(app_id)
@@ -678,6 +703,9 @@ async def bridge_ws(websocket: WebSocket, row: dict, path: str, caller: Caller) 
                                 str((json.loads(text) or {}).get("token") or ""), row)
                         except (HTTPException, ValueError):
                             await _close(websocket, 4401, "token refused")
+                            return
+                        if fresh.basis == _BASIS_AGENT:
+                            await _close(websocket, 4403, SESSION_ROUTE_DETAIL)
                             return
                         # The upstream socket was opened for one identity: a
                         # token naming anyone else (another link, a person
@@ -1018,9 +1046,19 @@ async def read_logs(app_id: str, tail: int = 200,
     return {"log": text, **app_supervisor.status(app_id)}
 
 
-# ── platform methods and feeds for servers (APPS.md) ──────────────────────
+# ── platform methods for servers (APPS.md) ────────────────────────────────
 
-PLATFORM_RATE = 4.0
+def _platform_actor(request_headers, row: dict, caller: Caller) -> str:
+    """Whose reserve a platform call takes from (``call_rate``): the viewer
+    of a claim the app's server forwards (the signature alone, no store
+    read: the call is paced before any work), so a person's page and a
+    server that relays for them share one reserve, else the caller."""
+    if caller.basis == "app":
+        forwarded = request_headers.get("x-otodock-viewer", "")
+        claims = app_tokens.verify(forwarded, row["id"], app_tokens.PURPOSE_VIEWER) if forwarded else None
+        if claims and claims.get("sub") and not claims.get("external"):
+            return f"user:{claims['sub']}"
+    return caller.actor
 
 
 async def inflight_delivery(claim: str, row: dict) -> dict:
@@ -1081,6 +1119,11 @@ async def _viewer_behind(request_headers, row: dict, caller: Caller):
         claims = app_tokens.verify(forwarded, row["id"], app_tokens.PURPOSE_VIEWER)
         if not claims:
             relayed = app_tokens.verify(forwarded, row["id"], app_tokens.PURPOSE_CALLER) or {}
+            if relayed.get("principal") == app_tokens.PRINCIPAL_EXTERNAL or relayed.get("external"):
+                # An outside person's call reaches the methods opened to them,
+                # and the claim the server passes on reaches no more: never
+                # the app's own identity.
+                raise _refuse(403, "not available to outside people")
             if relayed.get("placement"):
                 # A placed agent's session reaches the exports alone, and its
                 # claim passed on by the server reaches no more than that.
@@ -1152,9 +1195,10 @@ async def preflight_platform(app_id: str, method: str) -> Response:
 async def platform_method(app_id: str, method: str, request: Request):
     """A platform method for an app's server or an agent: reads as the
     viewer behind the call when one is forwarded, else as the app identity;
-    a write with no viewer is refused; four calls per second per caller."""
+    a write with no viewer is refused; paced by ``call_rate.platform_call``,
+    the rule a page's own call takes."""
     from api.apps.apps import _catalog_entry, finish_platform_result
-    from services.apps import catalog, manifest as _mf
+    from services.apps import call_rate, catalog, manifest as _mf
     row = await run_db(_row_or_404, app_id)
     stepping = await step_caller(request.headers, row)
     if stepping is not None:
@@ -1176,8 +1220,16 @@ async def platform_method(app_id: str, method: str, request: Request):
         raise _refuse(403, "not available to a placed agent's session")
     if method not in catalog.METHODS:
         raise _refuse(404, "unknown platform method")
-    if not _take(f"{app_id}|platform|{caller.actor}", PLATFORM_RATE, PLATFORM_RATE):
-        raise _refuse(429, "too many requests")
+    # A media link is an address that needs no credential: it is made for a
+    # person's own page alone, never for a server (which has egress) or an
+    # agent, whatever claim the call forwards.
+    if method in catalog.PAGE_METHODS:
+        raise _refuse(403, "a media link is made on a person's own page")
+    actor = _platform_actor(request.headers, row, caller)
+    try:
+        call_rate.platform_call(app_id, actor, method)
+    except call_rate.TooFast as e:
+        raise _refuse_with_retry(429, "too many requests", e.retry_after_s) from e
     if caller.basis == "step":
         principal, has_viewer, basis, floor_role = catalog.app_principal(row), False, "platform", None
     else:
@@ -1189,19 +1241,28 @@ async def platform_method(app_id: str, method: str, request: Request):
     # own people (the members, or the owner of a personal app), which is how
     # a server says "a booking landed" from a customer's request or a
     # vendor's event alike (APPS.md "Secrets" / "Inbound hooks").
+    on_platform = basis == "platform"   # a handler's wake or a step in flight
     own_notify = method == "notifications.create" and basis == "app" and not has_viewer
     # The app reads its own audience the same way, and so does a session of
     # its own agent with no person behind it: the approval is the floor (a
     # person is judged at editor or above).
     own_audience = method == catalog.AUDIENCE_METHOD and not has_viewer and basis in ("app", "agent")
+    # Removing the database copies is the app's own act alone: its server,
+    # or a wake of its own (its nightly purge); never a person, an agent's
+    # session (which the row's identity also serves) or an inbound event.
+    own_forget = method == catalog.FORGET_METHOD and not has_viewer and (basis == "app" or on_platform)
+    if method == catalog.FORGET_METHOD and not own_forget:
+        raise _refuse(403, "only the app's own server may remove its old copies")
     if own_notify and caller.instance != app_supervisor.LIVE:
         raise _refuse(403, "the preview copy never notifies the app's people")
     if own_audience and caller.instance != app_supervisor.LIVE:
         raise _refuse(403, "the preview copy never reads the app's audience")
-    if method == "files.write" and not has_viewer and basis != "platform":
+    if own_forget and caller.instance != app_supervisor.LIVE:
+        raise _refuse(403, "the preview copy never removes the app's old copies")
+    if method == "files.write" and not has_viewer and not on_platform:
         raise _refuse(403, "a viewer claim is required for a write"
                       if basis != "inbound" else "not available to an inbound wake")
-    if method == "notifications.create" and not has_viewer and basis != "platform" and not own_notify:
+    if method == "notifications.create" and not has_viewer and not on_platform and not own_notify:
         raise _refuse(403, "a viewer claim is required for a write"
                       if basis != "inbound" else "not available to an inbound wake")
     # A person's setup is theirs: the page's own call, or a server call that
@@ -1215,7 +1276,7 @@ async def platform_method(app_id: str, method: str, request: Request):
         floor_role = await run_db(_mf.caller_role, row, principal)
     try:
         entry = _catalog_entry(row, principal, method=method,
-                               unattended=(basis == "platform" or own_notify or own_audience),
+                               unattended=(on_platform or own_notify or own_audience or own_forget),
                                role=floor_role)
     except HTTPException as e:
         raise _refuse(e.status_code, str(e.detail)) from e
@@ -1236,7 +1297,7 @@ async def platform_method(app_id: str, method: str, request: Request):
         if err:
             raise _refuse(400, err)
         args = validated
-    if method == "notifications.create" and (basis == "platform" or own_notify):
+    if method == "notifications.create" and (on_platform or own_notify):
         out = await _notify_from_handler(row, args if isinstance(args, dict) else {})
         return JSONResponse(out, headers=dict(_CORS))
 
@@ -1250,106 +1311,13 @@ async def platform_method(app_id: str, method: str, request: Request):
         except (ValueError, PermissionError) as e:
             return {"ok": False, "reason": str(e)}
 
-    out = await asyncio.to_thread(_run)
+    try:
+        async with call_rate.slot(app_id, actor):
+            out = await asyncio.to_thread(_run)
+    except call_rate.TooFast as e:
+        raise _refuse_with_retry(429, "too many requests", e.retry_after_s) from e
     await finish_platform_result(out, principal.sub)
     return JSONResponse(out, headers=dict(_CORS))
-
-
-def _row_declaring_feed(app_id: str, feed: str) -> dict | None:
-    """The app's row as it is now when its approved manifest declares
-    ``feed`` as a ``data_feed``, else None: a server reads only the feeds
-    its approval card listed, the rule the page's own feed reads follow
-    (``_catalog_entry``, with the approval as the floor). Read afresh per
-    frame, so an approval that lands or a manifest that changes while the
-    socket is open counts at once."""
-    from api.apps.apps import _catalog_entry
-    try:
-        row = _row_or_404(app_id)
-        _catalog_entry(row, None, feed=feed, unattended=True)
-    except HTTPException:
-        return None
-    return row
-
-
-@router.websocket("/v1/apps/{app_id}/platform/ws")
-async def platform_ws(websocket: WebSocket, app_id: str):
-    """An app server's own subscription socket: the launch token first,
-    then ``catalog_subscribe`` / ``catalog_unsubscribe`` / ``catalog_snapshot``
-    frames; deltas of the agent-scope slice arrive as ``catalog`` frames
-    with a sequence per feed. Never counts as viewer activity."""
-    from services.apps import catalog
-    await websocket.accept()
-    try:
-        row = await run_db(_row_or_404, app_id)
-    except HTTPException:
-        await _close(websocket, 1008, "unknown app")
-        return
-    try:
-        first = await asyncio.wait_for(websocket.receive_text(), timeout=WS_AUTH_TIMEOUT_S)
-        msg = json.loads(first)
-        caller = await caller_from_token(str((msg or {}).get("token") or ""), row)
-    except HTTPException:
-        await _close(websocket, 4401, "the launch token is required")
-        return
-    except (asyncio.TimeoutError, ValueError, WebSocketDisconnect):
-        await _close(websocket, 4400, "auth frame expected")
-        return
-    if caller.basis != "app":
-        await _close(websocket, 4401, "the launch token is required")
-        return
-    agent = row.get("agent") or ""
-    # The launch claim names the process: the preview copy's server keeps
-    # its own subscriptions and never takes the live server's down.
-    sub = catalog.open_app_subscription(app_id, agent, caller.instance)
-
-    async def reader() -> None:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                frame = json.loads(raw)
-            except ValueError:
-                continue
-            if not isinstance(frame, dict):
-                continue
-            kind = str(frame.get("type") or "")
-            feed = str(frame.get("feed") or "")
-            if kind in (wire.IN_CATALOG_SUBSCRIBE, wire.IN_CATALOG_UNSUBSCRIBE):
-                on = kind == wire.IN_CATALOG_SUBSCRIBE
-                # Dropping a feed is always allowed; taking one needs it declared.
-                ok = ((not on or await run_db(_row_declaring_feed, app_id, feed) is not None)
-                      and catalog.app_subscribe(sub, feed, on))
-                await websocket.send_json({"type": "catalog_ack", "feed": feed, "ok": ok})
-            elif kind == "catalog_snapshot":
-                current = (await run_db(_row_declaring_feed, app_id, feed)
-                           if feed in catalog.FEEDS and feed not in catalog.CLIENT_FEEDS else None)
-                if current is None:
-                    await websocket.send_json({"type": "catalog_ack", "feed": feed, "ok": False})
-                    continue
-                rows = await asyncio.to_thread(catalog.snapshot_for_app, feed, agent, current)
-                await websocket.send_json({
-                    "type": wire.CATALOG, "agent": agent, "feed": feed, "snapshot": rows,
-                    "seq": catalog.current_seq(sub.seq_key, agent, feed),
-                })
-
-    async def writer() -> None:
-        # Polled: the queue is filled from whichever thread emits, and this
-        # socket must not bind a waiter to its loop.
-        while True:
-            frame = sub.queue.get_nowait()
-            if frame is None:
-                await asyncio.sleep(0.2)
-                continue
-            await websocket.send_json(frame)
-
-    tasks = [asyncio.create_task(reader()), asyncio.create_task(writer())]
-    try:
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        for t in tasks:
-            t.cancel()
-        catalog.close_app_subscription(sub)
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            await _close(websocket, 1000)
 
 
 # ── the REST twins of push and state ───────────────────────────────────────

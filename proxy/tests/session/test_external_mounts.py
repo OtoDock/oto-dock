@@ -1,9 +1,10 @@
 """The `/caller` home: mount table, cwd, config dirs, path roles, OTO env.
 
-An external session (a phone caller who is not a platform user) rides the
-agent-scope mount branch plus two additions — the shared memory mask and
-the caller's own tree — and the Direct-LLM file resolver sees exactly the
-same decisions.
+An outside session (a caller who is not a platform user) gets a mount
+table of its own: its home, the knowledge folders a manager picked, no
+shared workspace and no knowledge root, the person's folders writable only
+with the files pick and the memory never; the Direct-LLM file resolver
+sees exactly the same decisions.
 """
 
 from __future__ import annotations
@@ -40,8 +41,8 @@ def agent_tree(tmp_path, monkeypatch):
     return agent_dir, home
 
 
-def _cfg(agent_dir: Path, *, role="viewer", external=True, home: Path | None = None,
-         knowledge_rw=False) -> SandboxConfig:
+def _cfg(agent_dir: Path, *, role="external", external=True, home: Path | None = None,
+         knowledge_rw=False, files_write=False, knowledge=(), libraries=()) -> SandboxConfig:
     return SandboxConfig(
         role=role, username="", agent_name="support", is_admin_agent=False,
         host_agents_dir=agent_dir.parent, host_mcps_dir=agent_dir.parent,
@@ -49,6 +50,8 @@ def _cfg(agent_dir: Path, *, role="viewer", external=True, home: Path | None = N
         config_visible=False, knowledge_rw=knowledge_rw,
         net_forwards=["8400"], external=external,
         external_home=str(home) if home else "",
+        outside_files_write=files_write, outside_knowledge=tuple(knowledge),
+        knowledge_libraries=list(libraries),
     )
 
 
@@ -57,53 +60,120 @@ def _by_dest(mounts):
 
 
 class TestMountTable:
-    def test_viewer_caller_with_tree(self, agent_tree):
+    def test_nothing_picked_is_the_home_alone(self, agent_tree):
+        """An outside session with nothing picked: its own home read-only,
+        the CLI state dirs read-write, no shared workspace, no knowledge, the
+        agent scope's CLI state masked."""
         agent_dir, home = agent_tree
+        (home / ".claude").mkdir()
         b = SandboxBuilder(_cfg(agent_dir, home=home))
         mounts = _by_dest(b.workspace_mount_table())
-        assert mounts["/workspace"].rw is False
-        assert mounts["/knowledge"].rw is False
-        # Shared memory masked by the platform-owned empty dir (later bind wins).
-        assert mounts["/knowledge/memory"].host == str(empty_mount_dir())
-        assert mounts["/knowledge/memory"].rw is False
+        assert "/workspace" not in mounts and "/knowledge" not in mounts
+        assert not any(d.startswith("/knowledge/") for d in mounts)
+        assert "/config" not in mounts and not any(d.startswith("/users") for d in mounts)
         assert mounts[EXTERNAL_SANDBOX_HOME] == mounts["/caller"]
         assert mounts["/caller"].rw is False and mounts["/caller"].host == str(home)
-        assert mounts["/caller/workspace"].rw and mounts["/caller/context"].rw
-        assert (home / "workspace").is_dir() and (home / "context").is_dir()
-        assert "/config" not in mounts and not any(d.startswith("/users") for d in mounts)
+        # The files pick at Read only: nothing of the person's tree is writable.
+        assert "/caller/workspace" not in mounts and "/caller/context" not in mounts
+        assert mounts["/caller/.claude"].rw is True
+        assert (home / "workspace").is_dir() and (home / "context" / "memory").is_dir()
+        assert mounts["/workspace/.claude"].host == str(empty_mount_dir())
         assert b.get_cwd() == "/caller"
         assert b.get_env_overrides()["CLAUDE_CONFIG_DIR"] == "/caller/.claude"
 
-    def test_roles_follow_the_route(self, agent_tree):
+    def test_the_files_pick_opens_the_persons_folders_but_never_the_memory(self, agent_tree):
         agent_dir, home = agent_tree
-        editor = _by_dest(SandboxBuilder(_cfg(agent_dir, role="editor", home=home)).workspace_mount_table())
-        assert editor["/workspace"].rw is True and editor["/knowledge"].rw is False
-        manager = _by_dest(SandboxBuilder(
-            _cfg(agent_dir, role="manager", home=home, knowledge_rw=True)).workspace_mount_table())
-        assert manager["/workspace"].rw and manager["/knowledge"].rw
-        assert "/config" not in manager
-        assert manager["/knowledge/memory"].host == str(empty_mount_dir())
+        mounts = _by_dest(SandboxBuilder(_cfg(agent_dir, home=home, files_write=True)).workspace_mount_table())
+        assert mounts["/caller"].rw is False
+        assert mounts["/caller/workspace"].rw and mounts["/caller/context"].rw
+        assert mounts["/caller/context/memory"].rw is False
+        assert mounts["/caller/context/memory"].host == str(home / "context" / "memory")
+        assert "/workspace" not in mounts
 
-    def test_shared_mode_has_no_tree_but_masks_memory(self, agent_tree):
+    def test_the_knowledge_picks_bind_at_their_own_place(self, agent_tree):
+        agent_dir, home = agent_tree
+        for sub in ("faq", "prices", "knowledge/shared/lib-a/docs"):
+            (agent_dir / "knowledge" / sub if "/" not in sub else agent_dir / sub).mkdir(parents=True, exist_ok=True)
+        cfg = _cfg(agent_dir, home=home,
+                   knowledge=("faq", "shared/lib-a/docs", "memory", "gone", "../etc", ".credentials",
+                              "shared/lib-b", "faq/sub"),
+                   libraries=[("lib-a", "docs", False)])
+        mounts = _by_dest(SandboxBuilder(cfg).workspace_mount_table())
+        assert mounts["/knowledge/faq"].rw is False and mounts["/knowledge/faq"].host == str(agent_dir / "knowledge" / "faq")
+        assert mounts["/knowledge/shared/lib-a/docs"].rw is False
+        assert "/knowledge" not in mounts and "/knowledge/prices" not in mounts
+        # The memory, a missing folder, a path outside, the credentials, an
+        # unattached library and a nested path bind nothing.
+        for bad in ("/knowledge/memory", "/knowledge/gone", "/knowledge/.credentials", "/knowledge/shared/lib-b",
+                    "/knowledge/faq/sub"):
+            assert bad not in mounts
+        assert not any(".." in d for d in mounts)
+
+    def test_a_linked_knowledge_folder_binds_nothing(self, agent_tree, tmp_path):
+        agent_dir, home = agent_tree
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        os.symlink(outside, agent_dir / "knowledge" / "linked")
+        mounts = _by_dest(SandboxBuilder(_cfg(agent_dir, home=home, knowledge=("linked",))).workspace_mount_table())
+        assert "/knowledge/linked" not in mounts
+
+    def test_a_subfolder_binds_alone_at_its_own_place(self, agent_tree):
+        """A folder inside a top-level folder or inside an attached library
+        binds alone, read-only: its parent and its siblings stay out."""
+        agent_dir, home = agent_tree
+        k = agent_dir / "knowledge"
+        for sub in ("projects/alpha/specs", "projects/beta", "shared/lib-a/docs/api", "shared/lib-a/docs/old"):
+            (k / sub).mkdir(parents=True)
+        cfg = _cfg(agent_dir, home=home, knowledge=("projects/alpha", "shared/lib-a/docs/api"),
+                   libraries=[("lib-a", "docs", False)])
+        mounts = _by_dest(SandboxBuilder(cfg).workspace_mount_table())
+        knowledge = sorted(d for d in mounts if d.startswith("/knowledge"))
+        assert knowledge == ["/knowledge/projects/alpha", "/knowledge/shared/lib-a/docs/api"]
+        assert mounts["/knowledge/projects/alpha"].host == str(k / "projects" / "alpha")
+        assert all(mounts[d].rw is False for d in knowledge)
+
+    def test_a_subfolder_never_reaches_the_memory_the_credentials_or_a_folder_gone(self, agent_tree, tmp_path):
+        agent_dir, home = agent_tree
+        k = agent_dir / "knowledge"
+        (k / "memory" / "topics").mkdir()
+        (k / ".credentials" / "github").mkdir(parents=True)
+        (k / "projects").mkdir()
+        outside = tmp_path / "outside"
+        (outside / "inner").mkdir(parents=True)
+        os.symlink(outside, k / "projects" / "link")
+        # Folders on disk outside every attachment (a mirror a detach left
+        # behind): the attachment rule alone refuses them.
+        (k / "shared" / "lib-a" / "other").mkdir(parents=True)
+        (k / "shared" / "lib-b").mkdir(parents=True)
+        cfg = _cfg(agent_dir, home=home,
+                   knowledge=("memory/topics", ".credentials/github", "projects/link", "projects/link/inner",
+                              "projects/gone", "shared/lib-a/docs/missing", "shared/lib-a/other", "shared/lib-b",
+                              "/projects", "projects/../memory"),
+                   libraries=[("lib-a", "docs", False)])
+        mounts = _by_dest(SandboxBuilder(cfg).workspace_mount_table())
+        assert not any(d.startswith("/knowledge") for d in mounts)
+        # A library's folder that is not there is never made.
+        assert not (k / "shared" / "lib-a" / "docs" / "missing").exists()
+
+    def test_the_role_word_changes_nothing(self, agent_tree):
+        """A legacy context carrying a member's role word: still no shared workspace."""
+        agent_dir, home = agent_tree
+        for role in ("viewer", "editor", "manager"):
+            mounts = _by_dest(SandboxBuilder(_cfg(agent_dir, role=role, home=home, knowledge_rw=True)).workspace_mount_table())
+            assert "/workspace" not in mounts and "/knowledge" not in mounts and "/config" not in mounts
+
+    def test_no_home_binds_the_masks_alone(self, agent_tree):
+        """A context with no home (a remote target's, defensive): nothing of
+        the agent is bound."""
         agent_dir, _home = agent_tree
         b = SandboxBuilder(_cfg(agent_dir))
         mounts = _by_dest(b.workspace_mount_table())
-        assert "/caller" not in mounts
-        assert mounts["/knowledge/memory"].host == str(empty_mount_dir())
-        assert b.get_cwd() == "/workspace"
-        assert b.get_env_overrides()["CLAUDE_CONFIG_DIR"] == "/workspace/.claude"
-
-    def test_no_memory_dir_no_mask(self, agent_tree):
-        agent_dir, home = agent_tree
-        import shutil
-        shutil.rmtree(agent_dir / "knowledge" / "memory")
-        mounts = _by_dest(SandboxBuilder(_cfg(agent_dir, home=home)).workspace_mount_table())
-        assert "/knowledge/memory" not in mounts
+        assert set(mounts) == {"/workspace/.claude", "/workspace/.codex"}
 
     def test_non_external_sessions_are_untouched(self, agent_tree):
         agent_dir, _home = agent_tree
         mounts = _by_dest(SandboxBuilder(_cfg(agent_dir, role="manager", external=False)).workspace_mount_table())
-        assert "/knowledge/memory" not in mounts and "/caller" not in mounts
+        assert mounts["/workspace"].rw and mounts["/knowledge"].rw is False and "/caller" not in mounts
 
     def test_symlinked_home_is_refused(self, agent_tree, tmp_path):
         agent_dir, home = agent_tree
@@ -114,20 +184,45 @@ class TestMountTable:
         with pytest.raises(RuntimeError):
             SandboxBuilder(_cfg(agent_dir, home=link)).workspace_mount_table()
 
-    def test_direct_resolver_sees_the_same_decisions(self, agent_tree):
+    def test_the_direct_text_check_sees_the_same_decisions(self, agent_tree):
+        """The Direct LLM file tools read this table as text for an early
+        refusal, and their program runs under its mounts: the text check
+        admits and refuses what the table says, and the record of a written
+        file names its place on the server."""
         agent_dir, home = agent_tree
-        cfg = _cfg(agent_dir, home=home)
+        (agent_dir / "knowledge" / "faq").mkdir()
+        (agent_dir / "knowledge" / "faq" / "a.md").write_text("a")
+        cfg = _cfg(agent_dir, home=home, files_write=True, knowledge=("faq",))
         mounts = direct_files.mount_table(cfg)
         cwd = direct_files.session_cwd(cfg)
         assert cwd == "/caller"
-        r = direct_files.resolve(mounts, "workspace/notes.txt", cwd=cwd, writing=True)
-        assert Path(r.host) == home / "workspace" / "notes.txt"
-        r = direct_files.resolve(mounts, "/knowledge/memory/MEMORY.md", cwd=cwd, writing=False)
-        assert Path(r.host) == empty_mount_dir() / "MEMORY.md"   # the mask, not the shared file
+
+        def host_of(table, raw, *, writing):
+            vpath, _row = direct_files.locate(table, raw, cwd=cwd, writing=writing)
+            return direct_files.record_place(table, vpath, "support")[1]
+
+        assert host_of(mounts, "workspace/notes.txt", writing=True) == home / "workspace" / "notes.txt"
+        assert host_of(mounts, "/knowledge/faq/a.md", writing=False) == agent_dir / "knowledge" / "faq" / "a.md"
         with pytest.raises(direct_files.FileToolError):
-            direct_files.resolve(mounts, "/caller/stray.txt", cwd=cwd, writing=True)
+            direct_files.locate(mounts, "/knowledge/memory/MEMORY.md", cwd=cwd)
         with pytest.raises(direct_files.FileToolError):
-            direct_files.resolve(mounts, "/workspace/shared.txt", cwd=cwd, writing=True)
+            direct_files.locate(mounts, "/caller/context/memory/x.md", cwd=cwd, writing=True)
+        with pytest.raises(direct_files.FileToolError):
+            direct_files.locate(mounts, "/workspace/shared.txt", cwd=cwd)
+        sub = _cfg(agent_dir, home=home, knowledge=("projects/alpha",))
+        (agent_dir / "knowledge" / "projects" / "alpha").mkdir(parents=True)
+        (agent_dir / "knowledge" / "projects" / "beta").mkdir()
+        (agent_dir / "knowledge" / "projects" / "alpha" / "a.md").write_text("a")
+        sub_mounts = direct_files.mount_table(sub)
+        assert str(host_of(sub_mounts, "/knowledge/projects/alpha/a.md", writing=False)).endswith("projects/alpha/a.md")
+        for refused in ("/knowledge/projects/beta", "/knowledge/projects", "/knowledge/faq/a.md"):
+            with pytest.raises(direct_files.FileToolError):
+                direct_files.locate(sub_mounts, refused, cwd=cwd)
+        with pytest.raises(direct_files.FileToolError):
+            direct_files.locate(sub_mounts, "/knowledge/projects/alpha/new.md", cwd=cwd, writing=True)
+        read_only = direct_files.mount_table(_cfg(agent_dir, home=home))
+        with pytest.raises(direct_files.FileToolError):
+            direct_files.locate(read_only, "workspace/notes.txt", cwd=cwd, writing=True)
 
 
 class TestConfigDirs:
@@ -145,8 +240,8 @@ class TestConfigDirs:
         from core.layers.cli.layer import CLIExecutionLayer
         deny = CLIExecutionLayer().session_denied_tools(external=True, read_only=False)
         assert {"Bash", "Monitor", "PowerShell"} <= set(deny)
-        # The web tools are deliberately not denied (2026-09-08).
-        assert not {"WebFetch", "WebSearch"} & set(deny)
+        # The web tools are denied until a manager picks the web for outside people.
+        assert {"WebFetch", "WebSearch"} <= set(deny)
         from core.sandbox.session_config_dir import sandbox_python
         assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == (
             f'{sandbox_python()} -I "/caller/.claude/permission_gate.py"')
@@ -154,7 +249,34 @@ class TestConfigDirs:
             "support", execution_path="codex-cli", external_home=home,
         )
         assert codex_dir == home / ".codex"
+        # Codex's hooks file is the start's (``config_dir.write_hooks``, in the
+        # folder the engine reads), naming the scripts by the folder as the
+        # caller's sandbox sees it; the funnel lays the scripts down.
+        from core.layers.codex.config_dir import write_hooks
+        from core.sandbox.session_config_dir import scope_config_dir
+        assert not (codex_dir / "hooks.json").exists() and (codex_dir / "permission_gate.py").is_file()
+        _host, seen = scope_config_dir("support", ".codex", external_home=home)
+        write_hooks(codex_dir, seen)
         assert "/caller/.codex/" in (codex_dir / "hooks.json").read_text()
+
+    def test_the_outside_homes_skills_follow_the_picks(self, agent_tree, monkeypatch):
+        """Both config dir builders hand the picks to the materializer for an
+        outside home, so the skills a caller can load are the picked tools'."""
+        from core.layers.cli.config_dir import ensure_persistent_claude_dir
+        from core.layers.codex.config_dir import ensure_persistent_codex_dir
+        from core.sandbox import skills_materializer
+        from services.mcp import outside_picks
+        _agent_dir, home = agent_tree
+        seen: list = []
+        monkeypatch.setattr(skills_materializer, "materialize_skills_for_sandbox",
+                            lambda agent, config_dir, **kw: seen.append((config_dir.name, kw)))
+        picks = outside_picks.OutsidePicks(tools={"crm": outside_picks.ToolPick("read_only", ())})
+        ensure_persistent_claude_dir("support", external_home=home, outside_picks=picks)
+        ensure_persistent_codex_dir("support", external_home=home, outside_picks=picks)
+        ensure_persistent_claude_dir("support", username="", scope="agent")
+        assert seen == [(".claude", {"username": "", "outside_picks": picks, "kind_rule": None}),
+                        (".codex", {"username": "", "outside_picks": picks, "kind_rule": None}),
+                        (".claude", {"username": "", "outside_picks": None, "kind_rule": None})]
 
     def test_symlinked_home_is_refused(self, agent_tree, tmp_path):
         from core.layers.cli.config_dir import ensure_persistent_claude_dir
@@ -177,7 +299,6 @@ class TestPathRolesAndEnv:
         assert path_roles.resolve_role("shared_workspace", user_role="editor", external=True) == "/workspace"
         assert path_roles.resolve_role("config", user_role="manager", external=True) == ""
         assert path_roles.resolve_role("knowledge_dir", external=True) == "/knowledge"
-        assert path_roles.resolve_role("credentials_dir", subpath="x", external=True) == "/knowledge/.credentials/x"
 
     def test_oto_env_with_and_without_tree(self):
         env = build_oto_env(
@@ -207,3 +328,49 @@ class TestPathRolesAndEnv:
         assert env["OTO_MEMORY_USER_ENABLED"] == "false"
         assert env["OTO_MEMORY_AGENT_ENABLED"] == "false"
         assert env["OTO_DEFAULT_SCOPE"] == "agent"
+
+
+class TestCodexConfig:
+    def test_enabled_tools_follow_the_grants(self):
+        from core.layers.codex.layer import _inject_enabled_tools_toml
+        content = (
+            '[mcp_servers.crm]\ncommand = "x"\n\n'
+            '[mcp_servers.crm.env]\nA = "1"\n\n'
+            '[mcp_servers.files]\ncommand = "y"\n'
+        )
+        out = _inject_enabled_tools_toml(content, (("crm", ("find", "list")), ("files", None)))
+        lines = out.splitlines()
+        assert lines[lines.index("[mcp_servers.crm]") + 1] == 'enabled_tools = ["find", "list"]'
+        assert out.count("enabled_tools") == 1
+        # A pick naming no server, or picks naming servers whole, change nothing.
+        assert _inject_enabled_tools_toml(content, ()) == content
+        assert _inject_enabled_tools_toml(content, (("files", None),)) == content
+
+    def test_the_apps_connector_is_off_for_an_outside_session(self, tmp_path):
+        from core.layers.codex.layer import CodexCLIExecutionLayer
+        for apps_off in (True, False):
+            config_dir = tmp_path / ("outside" if apps_off else "own")
+            config_dir.mkdir()
+            _text, own = CodexCLIExecutionLayer._write_config_toml(config_dir, "P", apps_off=apps_off)
+            # The session's own switch, never in the home's shared file.
+            assert (own.get("features", {}).get("apps") is False) is apps_off
+            assert "apps =" not in (config_dir / "config.toml").read_text()
+
+    def test_the_web_key_is_written_only_for_an_outside_session_without_the_pick(self, tmp_path):
+        from core.layers.codex.layer import CodexCLIExecutionLayer
+        for web_off in (True, False):
+            config_dir = tmp_path / ("off" if web_off else "on")
+            config_dir.mkdir()
+            _text, own = CodexCLIExecutionLayer._write_config_toml(
+                config_dir, "P", no_shell=True, web_off=web_off, session_id="s-1", interactive=True)
+            # The session's own keys: its profile (root keys before its
+            # tables) and its thread map; the home's file has neither.
+            profile = (config_dir / "s-1.config.toml").read_text()
+            lines = profile.splitlines()
+            first_table = next(i for i, line in enumerate(lines) if line.startswith("["))
+            assert ('web_search = "disabled"' in lines[:first_table]) is web_off
+            assert (own.get("web_search") == "disabled") is web_off
+            assert own["features"]["shell_tool"] is False
+            shared = (config_dir / "config.toml").read_text()
+            assert "web_search" not in shared and "shell_tool" not in shared
+            assert shared.count("[tools]") == 1

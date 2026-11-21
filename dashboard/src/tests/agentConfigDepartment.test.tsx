@@ -130,6 +130,36 @@ describe('AgentConfig — department row', () => {
     expect(screen.getByRole('tooltip').textContent).toMatch(/Auto-wires delegation within the department/)
   })
 
+  const theirs = () => ({ ...h.departments[0], id: 'd2', name: 'Theirs', can_place: false,
+    place_refusal: 'Only an admin, this department\u2019s creator, or someone who manages all its agents can add an agent to it.' })
+
+  it('offers only the departments this person may place in', () => {
+    const before = h.departments
+    h.departments = [{ ...before[0], can_place: true }, theirs()] as typeof before
+    try {
+      renderConfig()
+      const names = Array.from((screen.getByLabelText('Department') as HTMLSelectElement).options).map((o) => o.text)
+      expect(names).toEqual(['None', 'Engineering'])
+    } finally {
+      h.departments = before
+    }
+  })
+
+  it('keeps the department it is in offered, with its level picker off', () => {
+    const before = h.departments
+    h.agentInfo.department_id = 'd2'
+    h.agentInfo.department_level_id = 'lvl-lead'
+    h.departments = [{ ...before[0], can_place: true }, theirs()] as typeof before
+    try {
+      renderConfig()
+      const names = Array.from((screen.getByLabelText('Department') as HTMLSelectElement).options).map((o) => o.text)
+      expect(names).toEqual(['None', 'Engineering', 'Theirs'])
+      expect((screen.getByLabelText('Level') as HTMLSelectElement).disabled).toBe(true)
+    } finally {
+      h.departments = before
+    }
+  })
+
   it('selecting a department sends BOTH ids in one PATCH (first level by rank)', () => {
     renderConfig()
     fireEvent.change(screen.getByLabelText('Department'), { target: { value: 'd1' } })

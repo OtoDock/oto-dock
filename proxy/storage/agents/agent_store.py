@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import config
 from auth import roles
 from core import layout
+from storage.agents import db_departments
 from storage.agents.schema import DEFAULT_EXECUTION_PATH
 from storage.pg import get_conn
 
@@ -301,6 +302,8 @@ def create_agent(
     default_scope: str = "user",
     collaborative: bool = True,
     execution_paths: list[str] | None = None,
+    team_account: bool = False,
+    team_account_floor: str = "editor",
 ) -> dict:
     """Insert a new agent and return its record.
 
@@ -334,13 +337,14 @@ def create_agent(
                 default_model, default_effort, created_by,
                 color, description, created_at, updated_at,
                 community_template, community_template_version, default_scope,
-                collaborative, execution_paths)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                collaborative, execution_paths, team_account, team_account_floor)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (slug, display_name, admin_only,
              execution_path, default_model, default_effort,
              created_by, color, description, now, now,
              community_template, community_template_version, default_scope,
-             collaborative, json.dumps(extras) if extras else ""),
+             collaborative, json.dumps(extras) if extras else "",
+             bool(team_account), team_account_floor or "editor"),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM agents WHERE slug = %s", (slug,)).fetchone()
@@ -476,6 +480,7 @@ def update_agent(slug: str, **fields) -> dict | None:
         "color", "description", "execution_target", "default_scope",
         "default_for_new_users_role", "collaborative",
         "default_execution_mode", "department_id", "department_level_id",
+        "history_retention_days", "team_account", "team_account_floor",
     }
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if "default_scope" in updates and updates["default_scope"] not in ("user", "agent"):
@@ -502,8 +507,16 @@ def update_agent(slug: str, **fields) -> dict | None:
     set_clause = ", ".join(f"{k} = %s" for k in updates)
     values = list(updates.values()) + [slug]
 
+    placing = str(updates.get("department_id") or "")
     with get_conn() as conn:
-        conn.execute(f"UPDATE agents SET {set_clause} WHERE slug = %s", values)
+        # A placement into a department (validated by the caller, the
+        # placement rule's: services/departments/assignment) fills the
+        # department's empty place for the agent's template in the same
+        # transaction, the place locked first.
+        template = db_departments.lock_place(conn, slug, placing) if placing else ""
+        written = conn.execute(f"UPDATE agents SET {set_clause} WHERE slug = %s", values).rowcount
+        if template and written:
+            db_departments.fill_place(conn, slug, placing, template)
         conn.commit()
         row = conn.execute("SELECT * FROM agents WHERE slug = %s", (slug,)).fetchone()
         result = _row_to_dict(row) if row else None
@@ -524,6 +537,8 @@ def delete_agent(slug: str) -> bool:
       - MCP + RBAC: agent_mcps, agent_skills, user_agents,
         agent_delegation_targets, agent_browser_origins, agent_account_bindings
         (per-user MCP creds), service_agent_bindings, mcp_assignment_requests.
+      - department_set_members: the places the agent filled are emptied
+        (``agent=''``), the department's record of its set stays.
       - Scheduled items: dynamic_tasks, triggers, notifications +
         notification_deliveries; task_runs (execution history).
       - Chats: chat_search (no FK) + chats — the latter cascades to
@@ -567,10 +582,23 @@ def delete_agent(slug: str) -> bool:
         conn.execute("DELETE FROM user_agents WHERE agent = %s", (slug,))
         conn.execute("DELETE FROM agent_delegation_targets WHERE agent_name = %s", (slug,))
         conn.execute("DELETE FROM agent_delegation_targets WHERE target_agent = %s", (slug,))
+        # A department's place the agent filled is emptied, never left naming
+        # a slug a later agent may take.
+        conn.execute("UPDATE department_set_members SET agent = '' WHERE agent = %s", (slug,))
         conn.execute("DELETE FROM knowledge_libraries WHERE source_agent = %s", (slug,))
         conn.execute("DELETE FROM knowledge_library_attachments WHERE source_agent = %s", (slug,))
         conn.execute("DELETE FROM knowledge_library_attachments WHERE consumer_agent = %s", (slug,))
         conn.execute("DELETE FROM agent_browser_origins WHERE agent_name = %s", (slug,))
+        conn.execute("DELETE FROM agent_outside WHERE agent_name = %s", (slug,))
+        conn.execute("DELETE FROM agent_outside_tools WHERE agent_name = %s", (slug,))
+        conn.execute("DELETE FROM agent_outside_apps WHERE agent_name = %s", (slug,))
+        conn.execute("DELETE FROM external_identities WHERE agent = %s", (slug,))
+        conn.execute("DELETE FROM conversation_records WHERE agent = %s", (slug,))
+        conn.execute("DELETE FROM outside_notes WHERE agent = %s", (slug,))
+        # A chat's choice among the agent's accounts goes with the accounts
+        # (its foreign key cascades too: named here for the delete's own list).
+        conn.execute("DELETE FROM chat_account_choices WHERE agent_name = %s", (slug,))
+        conn.execute("DELETE FROM chat_service_account_choices WHERE agent_name = %s", (slug,))
         conn.execute("DELETE FROM agent_account_bindings WHERE agent_name = %s", (slug,))
         conn.execute("DELETE FROM service_agent_bindings WHERE agent_name = %s", (slug,))
         conn.execute("DELETE FROM mcp_assignment_requests WHERE agent_slug = %s", (slug,))

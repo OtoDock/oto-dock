@@ -11,6 +11,7 @@ with their row.
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from unittest.mock import patch
 
@@ -184,6 +185,19 @@ def test_reconcile_reaps_release_dirs_without_a_row(agent_tree):
     assert releases.reconcile()["reaped"] == 1
     assert not orphan.exists()
     assert (agent_tree / task_store.get_app(app_id)["release_path"]).is_file()
+
+
+def test_reconcile_never_reads_a_release_it_could_not_look_at_as_missing(agent_tree, tmp_path):
+    # The releases folder reached through a link below the agent's folder (a
+    # stand-in in the test's own folder): the boot keeps the row's release
+    # instead of clearing it.
+    app_id = _pin({"slug": "s", "html": "<p>1</p>"}).json()["app_id"]
+    release = task_store.get_app(app_id)["release_path"]
+    moved = tmp_path / "moved-releases"
+    (agent_tree / "app-releases").rename(moved)
+    (agent_tree / "app-releases").symlink_to(moved)
+    assert releases.reconcile()["cleared"] == 0
+    assert task_store.get_app(app_id)["release_path"] == release
 
 
 def test_rows_from_before_releases_serve_the_working_file(agent_tree):
@@ -464,3 +478,105 @@ def test_a_file_named_data_at_the_root_is_a_refusal_not_a_server_error(agent_tre
     dest = agent_tree / "app-releases" / "shared" / "x" / "1"
     with pytest.raises(releases.ReleaseInvalid, match="reserved"):
         releases.copy_tree(src, dest)
+
+
+# An agent's folder may itself be a link the install's operator made
+# (core/agent_folder.py): what was deployed before is served, rolled back and
+# cleaned up through that one link, as on 1.9.1. A new release still opens
+# from the agents folder, and stays refused there as on 1.9.1.
+
+
+def _link_the_agents_folder(agent_tree, tmp_path):
+    real = tmp_path / "disk2" / AGENT
+    real.parent.mkdir()
+    agent_tree.rename(real)
+    agent_tree.symlink_to(real)
+    return real
+
+
+def test_a_linked_agents_app_is_served_rolled_back_and_removed(agent_tree, tmp_path):
+    app_id = _pin({"slug": "s", "html": "<p>1</p>"}).json()["app_id"]
+    assert _pin({"slug": "s", "html": "<p>2</p>"}).json()["release"] == 2
+    real = _link_the_agents_folder(agent_tree, tmp_path)
+    assert "<p>2</p>" in _served(app_id)
+    assert releases.release_numbers(task_store.get_app(app_id)) == [1, 2]
+    assert client.post(f"/v1/apps/{app_id}/rollback").json()["release"] == 1
+    assert "<p>1</p>" in _served(app_id)
+    row = task_store.get_app(app_id)
+    assert _hook("unpin", {"slug": "s"}).status_code == 200
+    assert not (real / releases.app_release_dir(row).relative_to(agent_tree)).exists()
+
+
+def test_a_linked_agents_old_copies_are_pruned_and_swept(agent_tree, tmp_path):
+    app_id = _pin({"slug": "s", "html": "<p>1</p>"}).json()["app_id"]
+    for i in (2, 3, 4):
+        _pin({"slug": "s", "html": f"<p>{i}</p>"})
+    row = task_store.get_app(app_id)
+    base = releases.app_release_dir(row)
+    (base / "1").mkdir()
+    (base / "1" / "index.html").write_text("<p>1</p>")
+    stale = base / f"{releases.SCRATCH_DATA_PREFIX}old"
+    stale.mkdir()
+    os.utime(stale, (0, 0))
+    from services.apps import app_deploy
+    snaps = [f"rollback-2026010{i}T000000.sqlite" for i in range(1, app_deploy.KEEP_ROLLBACK_SNAPSHOTS + 3)]
+    for name in snaps:
+        (base / name).write_text("old")
+    _link_the_agents_folder(agent_tree, tmp_path)
+    releases.prune(row)
+    assert releases.release_numbers(row) == [2, 3, 4]
+    releases.sweep_stale(base, releases.SCRATCH_DATA_PREFIX, 60)
+    assert not stale.exists()
+    app_deploy._prune_rollback_snapshots(row)
+    assert sorted(p.name for p in base.glob("rollback-*")) == snaps[-app_deploy.KEEP_ROLLBACK_SNAPSHOTS:]
+    assert releases.drop_db_copies(row) == app_deploy.KEEP_ROLLBACK_SNAPSHOTS
+    assert not list(base.glob("rollback-*"))
+
+
+def test_the_boot_reconcile_looks_through_a_linked_agents_folder(agent_tree, tmp_path):
+    app_id = _pin({"slug": "s", "html": "<p>1</p>"}).json()["app_id"]
+    release = task_store.get_app(app_id)["release_path"]
+    orphan = agent_tree / "app-releases" / "users" / "alice" / str(uuid.uuid4()) / "1"
+    orphan.mkdir(parents=True)
+    _link_the_agents_folder(agent_tree, tmp_path)
+    assert releases.reconcile() == {"cleared": 0, "reaped": 1}
+    assert task_store.get_app(app_id)["release_path"] == release
+    assert not orphan.exists()
+
+
+def test_a_new_release_on_a_linked_agents_folder_stays_refused(agent_tree, tmp_path):
+    app_id = _pin({"slug": "s", "html": "<p>1</p>"}).json()["app_id"]
+    real = _link_the_agents_folder(agent_tree, tmp_path)
+    row = task_store.get_app(app_id)
+    with pytest.raises(OSError):
+        releases.write_atomic(agent_tree / row["rel_path"], "<p>2</p>")
+    with pytest.raises(releases.ReleaseInvalid):
+        releases.cut_release(row, agent_tree / row["rel_path"])
+    assert releases.release_numbers(task_store.get_app(app_id)) == [1]
+    assert "<p>1</p>" in _served(app_id)
+    assert not list(real.glob("app-releases/users/alice/*/2"))
+
+
+def test_a_link_below_a_linked_agents_folder_serves_and_removes_nothing(agent_tree, tmp_path):
+    app_id = _pin({"slug": "s", "html": "<p>1</p>"}).json()["app_id"]
+    real = _link_the_agents_folder(agent_tree, tmp_path)
+    moved = tmp_path / "moved-releases"
+    (real / "app-releases").rename(moved)
+    (real / "app-releases").symlink_to(moved)
+    row = task_store.get_app(app_id)
+    assert releases.read_release(row) is None
+    assert releases.release_numbers(row) == []
+    releases.remove_release_dir(row)
+    assert releases.reconcile()["cleared"] == 0
+    assert list(moved.glob("users/alice/*/1/index.html"))
+
+
+def test_the_boot_reconcile_keeps_the_releases_of_an_agent_whose_folder_is_away(agent_tree, tmp_path, caplog):
+    app_id = _pin({"slug": "s", "html": "<p>1</p>"}).json()["app_id"]
+    release = task_store.get_app(app_id)["release_path"]
+    real = _link_the_agents_folder(agent_tree, tmp_path)
+    real.rename(real.with_name(AGENT + ".away"))
+    with caplog.at_level("WARNING"):
+        assert releases.reconcile()["cleared"] == 0
+    assert task_store.get_app(app_id)["release_path"] == release
+    assert any("App release not looked at, kept" in r.getMessage() for r in caplog.records)

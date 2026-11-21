@@ -235,6 +235,17 @@ def test_hook_ui_broadcasts_file_updated_for_update_in_place(agent_tree, monkeyp
     assert (agent_tree / "workspace" / "trip.html").read_text() == "<p>flight booked</p>"
 
 
+def test_hook_ui_makes_its_folder_off_the_loop(agent_tree, monkeypatch):
+    """Every display_ui call reaches this hook: the page is judged and written
+    in the thread that writes the file, never on the loop."""
+    from api.hooks import artifacts
+    monkeypatch.setattr(artifacts, "_save_page", _off_loop(artifacts._save_page))
+    r = _post_ui({"html": "<p>lane</p>", "save_path": "/workspace/fresh-folder/board.html"})
+    assert r.status_code == 200
+    assert (agent_tree / "users" / "alice" / "workspace" / "fresh-folder" / "board.html").exists() or \
+        (agent_tree / "workspace" / "fresh-folder" / "board.html").exists()
+
+
 def test_hook_ui_mints_its_token_off_the_loop(agent_tree, monkeypatch):
     monkeypatch.setattr(task_store, "create_media_token",
                         _off_loop(task_store.create_media_token))
@@ -913,3 +924,381 @@ def test_client_fonts_carry_the_cors_header_on_both_routes(agent_tree):
     twin = app_proxy.asset_response(row, sha, "fonts/brand.woff2")
     assert twin.media_type == "font/woff2" and twin.headers["access-control-allow-origin"] == "*"
     assert "access-control-allow-origin" not in app_proxy.asset_response(row, sha, "app.js").headers
+
+
+# ---- the page is written where it was authorized (stand-in folders only) ----
+
+
+def _session(sid: str, *, role: str, username: str, scope: str = "user"):
+    ctx = SecurityContext(role=role, username=username, agent=AGENT,
+                          is_admin_agent=False, session_scope=scope)
+    session_state._session_security[sid] = ctx
+    return sid
+
+
+def test_hook_ui_relative_dots_are_judged_where_they_land(agent_tree):
+    sid = _session("sess-ui-contrib", role="contributor", username="carol")
+    try:
+        r = _post_ui({"html": "<p>x</p>", "display": False, "session_id": sid,
+                      "save_path": "../../../config/agent.html"})
+        assert r.status_code == 200
+        assert r.json()["path"] == "/users/carol/workspace/generated-ui/agent.html"
+        assert not (agent_tree / "config" / "agent.html").exists()
+    finally:
+        session_state._session_security.pop(sid, None)
+
+
+def test_hook_ui_a_linked_folder_is_judged_where_it_lands(agent_tree):
+    mine = agent_tree / "users" / "alice" / "workspace"
+    theirs = agent_tree / "users" / "bob" / "workspace"
+    mine.mkdir(parents=True, exist_ok=True)
+    theirs.mkdir(parents=True, exist_ok=True)
+    (mine / "out").symlink_to(theirs)
+    r = _post_ui({"html": "<p>x</p>", "display": False, "save_path": "out/page.html"})
+    assert r.status_code == 200
+    assert r.json()["path"] == "/users/alice/workspace/generated-ui/page.html"
+    assert not (theirs / "page.html").exists()
+
+
+def test_hook_ui_never_writes_a_page_over_another_kind_of_file(agent_tree):
+    mine = agent_tree / "users" / "alice" / "workspace"
+    mine.mkdir(parents=True, exist_ok=True)
+    (mine / "notes.md").write_text("# notes\n")
+    (mine / "notes.html").symlink_to("notes.md")
+    r = _post_ui({"html": "<p>x</p>", "display": False, "save_path": "notes.html"})
+    assert r.status_code == 200
+    assert r.json()["path"] == "/users/alice/workspace/generated-ui/notes.html"
+    assert (mine / "notes.md").read_text() == "# notes\n"
+
+
+def test_hook_ui_the_fallback_never_follows_a_link(agent_tree):
+    mine = agent_tree / "users" / "alice" / "workspace"
+    theirs = agent_tree / "users" / "bob" / "workspace"
+    mine.mkdir(parents=True, exist_ok=True)
+    theirs.mkdir(parents=True, exist_ok=True)
+    (mine / "generated-ui").symlink_to(theirs)
+    r = _post_ui({"html": "<p>x</p>", "display": False,
+                  "save_path": "/users/bob/workspace/theirs.html"})
+    assert r.status_code == 403
+    assert r.json()["detail"] == "That page could not be saved there."
+    assert list(theirs.iterdir()) == []
+
+
+def test_hook_ui_the_fallback_asks_no_role(agent_tree):
+    """The fallback is the platform's own choice of place and asks no role.
+    No person's chat has this shape (a Shared-only chat starts at the editor
+    role): it is what an outside session with no folder of its own would
+    meet."""
+    sid = _session("sess-ui-shared-viewer", role="viewer", username="dave", scope="agent")
+    try:
+        r = _post_ui({"html": "<p>x</p>", "display": False, "session_id": sid,
+                      "save_path": "board.html"})
+        assert r.status_code == 200
+        assert r.json()["path"] == "/workspace/generated-ui/board.html"
+        assert (agent_tree / "workspace" / "generated-ui" / "board.html").is_file()
+    finally:
+        session_state._session_security.pop(sid, None)
+
+
+def test_hook_ui_an_editor_on_a_shared_only_agent_gets_the_page_in_the_shared_one(agent_tree):
+    """An editor's chat on a Shared-only agent asks for a place in the
+    agent's knowledge, which its role may not write: the page is in the
+    shared workspace's ``generated-ui/``, and nothing is in the knowledge."""
+    sid = _session("sess-ui-shared-editor", role="editor", username="erin", scope="agent")
+    try:
+        r = _post_ui({"html": "<p>x</p>", "display": False, "session_id": sid,
+                      "save_path": "/knowledge/board.html"})
+        assert r.status_code == 200
+        assert r.json()["path"] == "/workspace/generated-ui/board.html"
+        assert (agent_tree / "workspace" / "generated-ui" / "board.html").is_file()
+        assert not (agent_tree / "knowledge").exists()
+    finally:
+        session_state._session_security.pop(sid, None)
+
+
+def test_hook_ui_an_in_scope_link_is_written_at_its_place(agent_tree):
+    mine = agent_tree / "users" / "alice" / "workspace"
+    (mine / "drafts").mkdir(parents=True, exist_ok=True)
+    (mine / "site").symlink_to("drafts")
+    r = _post_ui({"html": "<p>x</p>", "display": False, "save_path": "site/p.html"})
+    assert r.status_code == 200
+    assert r.json()["path"] == "/users/alice/workspace/drafts/p.html"
+    assert (mine / "drafts" / "p.html").read_text() == "<p>x</p>"
+    assert (mine / "site").is_symlink()
+
+
+def test_hook_ui_a_folder_swapped_after_the_judgement_is_never_followed(agent_tree, monkeypatch):
+    """The page is written at the judged place with no link followed: a folder
+    turned into a link after the judgement refuses the save."""
+    from api.hooks import paths
+    mine = agent_tree / "users" / "alice" / "workspace"
+    theirs = agent_tree / "users" / "bob" / "workspace"
+    (mine / "reports").mkdir(parents=True)
+    theirs.mkdir(parents=True)
+    real_judge = paths._judge
+
+    def judge_then_swap(*a, **kw):
+        answer = real_judge(*a, **kw)
+        if (mine / "reports").is_dir() and not (mine / "reports").is_symlink():
+            (mine / "reports").rmdir()
+            (mine / "reports").symlink_to(theirs)
+        return answer
+    monkeypatch.setattr(paths, "_judge", judge_then_swap)
+    r = _post_ui({"html": "<p>x</p>", "display": False, "save_path": "reports/q.html"})
+    assert r.status_code == 403
+    assert list(theirs.iterdir()) == []
+
+
+def test_hook_ui_a_save_path_naming_no_file_takes_the_title(agent_tree):
+    r = _post_ui({"html": "<p>x</p>", "display": False, "title": "Board", "save_path": "/users/bob/.."})
+    assert r.status_code == 200
+    assert r.json()["path"].startswith("/users/alice/workspace/generated-ui/board-")
+
+
+@pytest.mark.parametrize("asked,answer_name,shown", [
+    ("latest.png", "v3.png", "latest.png"),
+    ("C:\\Users\\alice\\Desktop\\report.docx", "f3a1-report.docx", "report.docx"),
+    ("/users/alice/workspace/a.png/.", "a.png", "a.png"),
+    ("/users/alice/workspace/a.png/..", "b.png", "b.png"),
+], ids=["in-scope-link", "windows-path", "dot", "dot-dot"])
+def test_hook_file_shows_the_name_as_it_was_asked(agent_tree, monkeypatch, asked, answer_name, shown):
+    """A download card names the file as the session asked for it, never the
+    place a link led to; a Windows path from a paired computer keeps its last
+    part, and a path that ends in a dot name shows the file's own name."""
+    from adapters import register_adapter
+    from adapters.dashboard import DashboardAdapter
+    from api.hooks import paths
+    register_adapter(DashboardAdapter())
+    session_state._record_session_use(SID, client_type="dashboard", agent=AGENT)
+    answer = agent_tree / "users" / "alice" / "workspace" / answer_name
+    answer.write_text("hello")
+
+    async def _judged(session_id, raw):
+        return answer, None
+    monkeypatch.setattr(paths, "_classify_and_pull", _judged)
+    try:
+        with patch("api.hooks.artifacts.verify_session_match_async"):
+            r = client.post("/v1/hooks/file", json={"session_id": SID, "path": asked}, headers=_BEARER)
+        assert r.status_code == 200
+        assert r.json()["filename"] == shown
+    finally:
+        session_state._sessions.pop(SID, None)
+
+
+# ---- an agent folder that is the operator's link (stand-in folders only) ----
+
+
+@pytest.fixture
+def linked_agent_tree(tmp_path, monkeypatch):
+    """The test agent's folder is a link the operator made to a folder
+    elsewhere; alice's manager session is registered for SID."""
+    agents_root = tmp_path / "agents"
+    agents_root.mkdir()
+    real = tmp_path / "big-disk" / AGENT
+    (real / "users" / "alice" / "workspace").mkdir(parents=True)
+    (real / "workspace").mkdir()
+    (real / "users" / "alice" / "workspace" / "own.png").write_bytes(b"own")
+    (agents_root / AGENT).symlink_to(real)
+    monkeypatch.setattr(config, "AGENTS_DIR", agents_root)
+    monkeypatch.setattr("auth.path_policy._AGENTS_DIR", agents_root.resolve())
+    monkeypatch.setitem(session_state._session_security, SID,
+                        SecurityContext(role="manager", username="alice", agent=AGENT, is_admin_agent=False))
+    return agents_root / AGENT, real
+
+
+def test_hook_ui_a_linked_agent_folder_still_saves_its_page(linked_agent_tree):
+    """The hooks refuse the asked place, as 1.9.1 did, and the page takes the
+    caller's own ``generated-ui/``, written beneath the agent's real folder."""
+    _agent, real = linked_agent_tree
+    r = _post_ui({"html": "<p>x</p>", "display": False, "save_path": "reports/x.html"})
+    assert r.status_code == 200
+    assert r.json()["path"] == "/users/alice/workspace/generated-ui/x.html"
+    assert (real / "users" / "alice" / "workspace" / "generated-ui" / "x.html").read_text() == "<p>x</p>"
+
+
+def test_the_hooks_still_refuse_a_linked_agent_folder(linked_agent_tree):
+    from api.hooks import paths
+    agent, _real = linked_agent_tree
+    ctx = session_state._session_security[SID]
+    for writing in (False, True):
+        answer, _why = paths._judge(SID, ctx, agent / "users" / "alice" / "workspace" / "own.png", writing=writing)
+        assert answer is None
+
+
+def test_hook_ui_a_linked_data_folder_still_saves_its_page(tmp_path, monkeypatch):
+    real = tmp_path / "real-agents"
+    (real / AGENT / "users" / "alice" / "workspace").mkdir(parents=True)
+    agents_root = tmp_path / "data-link"
+    agents_root.symlink_to(real)
+    monkeypatch.setattr(config, "AGENTS_DIR", agents_root)
+    monkeypatch.setattr("auth.path_policy._AGENTS_DIR", agents_root.resolve())
+    monkeypatch.setitem(session_state._session_security, SID,
+                        SecurityContext(role="manager", username="alice", agent=AGENT, is_admin_agent=False))
+    r = _post_ui({"html": "<p>x</p>", "display": False, "save_path": "reports/x.html"})
+    assert r.status_code == 200
+    assert r.json()["path"] == "/users/alice/workspace/reports/x.html"
+    assert (real / AGENT / "users" / "alice" / "workspace" / "reports" / "x.html").read_text() == "<p>x</p>"
+
+
+def test_hook_ui_a_page_never_lands_in_the_sessions_host_cache(agent_tree):
+    """A save path that leads into the session's own host cache takes the
+    fallback: the cache holds copies of the machine's files only."""
+    mine = agent_tree / "users" / "alice" / "workspace"
+    cache = config.AGENTS_DIR / ".remote-host-cache" / SID
+    cache.mkdir(parents=True)
+    (mine / "c").symlink_to(cache)
+    r = _post_ui({"html": "<p>x</p>", "display": False, "save_path": "c/p.html"})
+    assert r.status_code == 200
+    assert r.json()["path"] == "/users/alice/workspace/generated-ui/p.html"
+    assert list(cache.iterdir()) == []
+
+
+def test_hook_ui_a_read_only_session_saves_no_page(agent_tree):
+    """A check's judge writes no files, as through the files routes: no page
+    at the asked place and none in the fallback."""
+    sid = "sess-ui-judge"
+    session_state._session_security[sid] = SecurityContext(
+        role="manager", username="", agent=AGENT, is_admin_agent=False,
+        session_scope="agent", read_only=True)
+    try:
+        for save_path in ("board.html", "/knowledge/board.html"):
+            r = _post_ui({"html": "<p>x</p>", "display": False, "session_id": sid,
+                          "save_path": save_path})
+            assert r.status_code == 403, save_path
+        assert list((agent_tree / "workspace").iterdir()) == []
+    finally:
+        session_state._session_security.pop(sid, None)
+
+
+# ---- a file from a paired computer outlives its session's copy ----
+
+
+def _from_the_machine(monkeypatch, cached: Path, origin: str, machine_id: str = "m1"):
+    """``_classify_and_pull`` answers a file of a paired computer, pulled into
+    the session's own cache, and the session runs on ``machine_id``."""
+    from api.hooks import paths
+    from core.remote import remote_file_flow
+    from services.path_policy_v2 import PathRef, PathResolution
+
+    async def _pulled(session_id, raw):
+        return cached, PathResolution(access_path=str(cached), allowed=True,
+                                      path_ref=PathRef("satellite_host", origin))
+    monkeypatch.setattr(paths, "_classify_and_pull", _pulled)
+    monkeypatch.setattr(remote_file_flow, "_get_remote_session_info",
+                        lambda sid: type("Info", (), {"machine_id": machine_id})())
+
+
+def test_hook_file_from_a_machine_names_where_the_file_lives(agent_tree, monkeypatch):
+    """A file card of a paired computer's file records the computer and the
+    file's place there, so its download fetches it again once the session's
+    copy is gone (the session's close removes its cache)."""
+    from adapters import register_adapter
+    from adapters.dashboard import DashboardAdapter
+    register_adapter(DashboardAdapter())
+    session_state._record_session_use(SID, client_type="dashboard", agent=AGENT)
+    cached = agent_tree.parent / ".remote-host-cache" / SID / "d1" / "report.pdf"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"%PDF-")
+    _from_the_machine(monkeypatch, cached, "/home/alice/Desktop/report.pdf")
+    try:
+        with patch("api.hooks.artifacts.verify_session_match_async"):
+            r = client.post("/v1/hooks/file", json={"session_id": SID, "path": "/home/alice/Desktop/report.pdf"},
+                            headers=_BEARER)
+        assert r.status_code == 200
+        token = r.json()["download_url"].removeprefix("/v1/media/").split("?")[0]
+        info = task_store.get_media_token(token)
+        assert info["origin_path"] == "/home/alice/Desktop/report.pdf"
+        assert info["machine_id"] == "m1"
+    finally:
+        session_state._sessions.pop(SID, None)
+
+
+def test_hook_file_of_the_agents_own_folder_names_no_machine_place(agent_tree):
+    """A file of the agent's synced folder is kept by the platform: its card
+    records no place on a computer."""
+    from adapters import register_adapter
+    from adapters.dashboard import DashboardAdapter
+    register_adapter(DashboardAdapter())
+    session_state._record_session_use(SID, client_type="dashboard", agent=AGENT)
+    report = agent_tree / "users" / "alice" / "workspace" / "own.txt"
+    report.write_text("hello")
+    try:
+        with patch("api.hooks.artifacts.verify_session_match_async"):
+            r = client.post("/v1/hooks/file", json={"session_id": SID, "path": str(report)}, headers=_BEARER)
+        token = r.json()["download_url"].removeprefix("/v1/media/").split("?")[0]
+        assert task_store.get_media_token(token)["origin_path"] == ""
+    finally:
+        session_state._sessions.pop(SID, None)
+
+
+def _machine_file_row(agent_tree, monkeypatch, tmp_path, kind: str = "file"):
+    """A row of a machine's own file (a file card's, or a clip's) whose copy
+    in the session's cache is gone (the session closed), and the host media
+    cache it is fetched again into."""
+    from services.media import media_pipeline
+    host_cache = tmp_path / "host-media-cache"
+    host_cache.mkdir()
+    monkeypatch.setattr(media_pipeline, "_HOST_CACHE_DIR", host_cache)
+    gone = agent_tree.parent / ".remote-host-cache" / SID / "d1" / "report.pdf"
+    import secrets as _secrets
+    token = _secrets.token_urlsafe(32)
+    task_store.create_media_token(
+        token, str(gone), media_kind=kind, chat_id=None, session_id=SID,
+        machine_id="m1", cache_owned=False, expires_at="",
+        origin_path="/home/alice/Desktop/report.pdf", agent=AGENT,
+    )
+    return token, host_cache
+
+
+def test_a_machine_files_card_fetches_it_again_after_its_session(agent_tree, monkeypatch, tmp_path):
+    from core.remote import satellite_connection
+    from services.media import media_pipeline
+    token, host_cache = _machine_file_row(agent_tree, monkeypatch, tmp_path)
+
+    class _Machine:
+        def get_connection(self, machine_id):
+            return object() if machine_id == "m1" else None
+
+        async def pull_file_to_path(self, machine_id, ref, dest):
+            assert (machine_id, ref.kind, ref.value) == ("m1", "satellite_host", "/home/alice/Desktop/report.pdf")
+            await asyncio.to_thread(Path(dest).write_bytes, b"%PDF-again")
+            return True
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", _Machine)
+
+    async def _never(*a, **kw):
+        raise AssertionError("a file card's file is no clip to make playable")
+    monkeypatch.setattr(media_pipeline, "ensure_playable_async", _never)
+    resp = client.get(f"/v1/media/{token}?download=1&fn=report.pdf")
+    assert resp.status_code == 200
+    assert resp.content == b"%PDF-again"
+    assert 'filename="report.pdf"' in resp.headers["content-disposition"]
+    assert Path(task_store.get_media_token(token)["abs_path"]).parent == host_cache
+
+
+@pytest.mark.parametrize("kind", ["file", "video"])
+@pytest.mark.parametrize(("connected", "status", "detail"), [
+    (False, 503, "This file lives on the remote machine, which is offline. Reconnect it and try again."),
+    (True, 404, "media file no longer exists"),
+], ids=["machine-away", "pull-failed-while-connected"])
+def test_a_machine_files_answer_says_only_what_is_true(agent_tree, monkeypatch, tmp_path,
+                                                       kind, connected, status, detail):
+    """Only a machine with no connection is called offline. A pull that gave
+    nothing while the machine is connected (the file deleted or moved there,
+    a refused read) answers the plain 404, for a file card and a clip alike,
+    and nothing more."""
+    from core.remote import satellite_connection
+    token, _ = _machine_file_row(agent_tree, monkeypatch, tmp_path, kind)
+    pulls: list[str] = []
+
+    class _Machine:
+        def get_connection(self, machine_id):
+            return object() if connected else None
+
+        async def pull_file_to_path(self, machine_id, ref, dest):
+            pulls.append(ref.value)
+            return False
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", _Machine)
+    resp = client.get(f"/v1/media/{token}?download=1&fn=report.pdf")
+    assert resp.status_code == status
+    assert resp.json()["detail"] == detail
+    assert pulls == (["/home/alice/Desktop/report.pdf"] if connected else [])

@@ -21,7 +21,7 @@ from core.session import session_kind
 
 # Child-env variable that carries a key-protected LOCAL endpoint's bearer into
 # the Codex process — the custom provider's ``env_key`` names it. Never
-# ``CODEX_API_KEY`` (that switches Codex into API-key auth against its built-in
+# Codex's own sign-in (``api_key_auth_json``: that authenticates its built-in
 # OpenAI provider). Shared by the local layer (sandbox env + config.toml) and the
 # remote start payload (``local_model_provider.env_key`` + the satellite env).
 LOCAL_ENDPOINT_KEY_ENV = "OTO_LOCAL_API_KEY"
@@ -35,7 +35,13 @@ LOCAL_ENDPOINT_KEY_ENV = "OTO_LOCAL_API_KEY"
 # minutes covers a CPU-bound prefill of a whole context; Stop still interrupts.
 LOCAL_ENDPOINT_STREAM_IDLE_TIMEOUT_MS = 1_800_000
 
-# AGENTS.md section appended ONLY for Codex sessions on a LOCAL endpoint. Codex
+#: The ack budget of a session on a local model: the Codex app-server acks
+#: after its pre-turn MCP warm gate, which waits for every server with a
+#: 90 s cap on a local model (a changed tool list re-prefills for minutes
+#: there), on top of the daemon spawn. Hosted sessions keep 60 s.
+LOCAL_MODEL_START_TIMEOUT_S = 180.0
+
+# A section of the session's text appended ONLY for Codex sessions on a LOCAL endpoint. Codex
 # sends every MCP server's tools to the model as one Responses-API ``namespace``
 # tool and no ``tool_search`` on a custom provider (identical on 0.149.1 and
 # 0.153.4, request captures 2026-09-07; nothing in Codex's config flattens it).
@@ -92,7 +98,7 @@ def local_provider_note(provider: str = "") -> str:
 
 
 def with_local_provider_note(system_prompt: str, provider: str = "") -> str:
-    """The AGENTS.md text for a local-endpoint Codex session: the system prompt
+    """The session's text for a local-endpoint Codex session: the system prompt
     followed by the provider's note (appended once)."""
     prompt = system_prompt or ""
     if _NOTE_HEADER in prompt:
@@ -114,13 +120,12 @@ def codex_hooks_floor(client_type: str, interactive: bool = False) -> bool:
     (task / phone / meeting / trigger / internal / app — ``session_kind.attended()``
     answers; an unrecorded kind counts as attended): nobody answers an
     approval, so the hook is the gate in every mode. False for attended
-    dashboard chats, whose hook judges only the turns Codex runs under
-    ``never`` (Don't Ask, auto: ``OTO_HOOK_BRIDGED``) while the bridge asks
-    the person in the others, and for the interactive TUI, which trusts its
-    hook by CLI flag instead. ONE rule for the local layer (``layer.py``) and
-    the remote start payload (``codex_hooks_floor`` field, satellite >=
-    0.5.118; ``codex_attended_floor`` for the attended rest, 0.5.143) so a
-    session is floored the same way wherever it runs.
+    dashboard chats, whose hook judges every call too while the bridge
+    takes what crosses the sandbox, and for the interactive TUI, which
+    trusts its hook by CLI flag instead. ONE rule for the local layer (``layer.py``) and
+    the remote start payload (the ``codex_hooks_floor`` field, and
+    ``codex_attended_floor`` for the attended rest) so a session is floored
+    the same way wherever it runs.
     """
     return not session_kind.attended(client_type) and not interactive
 
@@ -137,16 +142,15 @@ def permission_to_sandbox(permission_mode: str, allow_full_fs: bool = False) -> 
     - ``plan`` / ``judge``   → ``read-only`` (reads only)
     - Auto                  → ``workspace-write``, on every machine: the
       sandbox is the boundary Codex's reviewer judges crossings of
-    - everything else       → ``workspace-write`` (Ask, and the words a
-      satellite before 1.9 is sent: ``default`` / ``acceptEdits``)
+    - everything else       → ``workspace-write`` (Ask)
 
     ``allow_full_fs`` is the machine pairing's full-filesystem grant
     (``security_context.target_allow_full_fs`` — remote targets only). It
-    lifts Ask (and the words before 1.9) to ``danger-full-access``: Claude
-    runs unsandboxed on such pairings and Codex's own workspace-write
-    boundary would re-confine what the admin already granted (OtoDock's
-    permission floor + path policy still gate every call). ``plan`` stays
-    read-only, Auto keeps its boundary.
+    lifts Ask to ``danger-full-access``: Claude runs unsandboxed on such
+    pairings and Codex's own workspace-write boundary would re-confine what
+    the admin already granted (OtoDock's permission floor + path policy
+    still gate every call). ``plan`` stays read-only, Auto keeps its
+    boundary.
     """
     if permission_mode in (DONT_ASK_MODE, UNATTENDED_MODE):
         return "danger-full-access"
@@ -165,6 +169,64 @@ def permission_to_sandbox(permission_mode: str, allow_full_fs: bool = False) -> 
 
 
 # ---------------------------------------------------------------------------
+# The network inside Codex's own box
+# ---------------------------------------------------------------------------
+#
+# Codex's ``workspace-write`` box starts every command with the network off,
+# and it stays off: in every mode, in a chat and in a terminal, on the
+# platform and on a machine. A command that needs a host (git's credential
+# helper, ``gh``, a push) crosses the box, and the crossing is judged: by the
+# platform's card in Ask, by Codex's reviewer in Auto, by the terminal's own
+# prompt. An open box in Ask would look safe, since the platform's card
+# judges each command before it runs, and it is not: Codex calls no hook for
+# text typed into a running terminal, and a pager starts with no card, so a
+# typed command would reach the network with nobody asked. A model left
+# alone reports the blocked call instead of asking to cross, which is what
+# the note below is for.
+
+#: The Codex config key of the box's network switch, for the terminal's ``-c``.
+BOX_NETWORK_KEY = "sandbox_workspace_write.network_access"
+
+
+_BOX_NOTE_HEADER = "# Network in your shell"
+#: What a Codex session reads about its box, on every placement. Inside the
+#: box a command that needs a host fails, and a model left alone reports the
+#: failure instead of asking to cross. Asked for, the crossing is judged.
+#: Once, so a host that is down is not asked for twice. Worded for every
+#: mode (Don't Ask has no box), so a mode change mid-session leaves it right.
+BOX_NETWORK_NOTE = f"""{_BOX_NOTE_HEADER}
+
+In some modes your shell commands run in a sandbox with no network. When a
+command fails there because it cannot reach a host (a `git push`, `gh`,
+`curl`, the platform itself), or git's credential helper says the platform
+cannot be reached, request the same command again, once, with escalated
+permissions instead of giving up, reporting the failure or working around
+it. The request is reviewed, and the command then runs with the network.
+If it fails again, say so."""
+
+
+def with_box_network_note(system_prompt: str) -> str:
+    """The session's text of a Codex session: the system prompt followed by
+    the note on its shell's network (appended once)."""
+    prompt = system_prompt or ""
+    if _BOX_NOTE_HEADER in prompt:
+        return prompt
+    head = prompt.rstrip() + "\n\n" if prompt.strip() else ""
+    return head + BOX_NETWORK_NOTE + "\n"
+
+
+def tui_box_network_flags() -> list[str]:
+    """The Codex terminal's switch for its box's network: off, in every
+    mode, as a chat's turn sends it (``build_sandbox_policy``). In a
+    terminal the platform's hook does not judge a command at all (it defers
+    everything above the read tier to the terminal's own prompt, and Codex's
+    hook only prints a refusal), and Codex asks only when a command crosses
+    its box. Off, the terminal's own prompt judges the crossing. Said
+    outright, so a resumed thread never keeps another answer."""
+    return ["-c", f"{BOX_NETWORK_KEY}=false"]
+
+
+# ---------------------------------------------------------------------------
 # Platform effort → Codex effort
 # ---------------------------------------------------------------------------
 
@@ -179,10 +241,10 @@ def permission_to_sandbox(permission_mode: str, allow_full_fs: bool = False) -> 
 # wire "ultra" is not a bigger reasoning budget but Codex-native multi-agent
 # orchestration (the model proactively spawns parallel sub-agent workstreams;
 # codex-rs sends the API the model's multi-agent effort — "max" on the
-# retired 5.6 Terra and GPT-6 and 5.6 Sols, "xhigh" on GPT-6.1 Sol, GPT-6.1
-# Terra and Astra — and flips MultiAgentMode::Proactive). It is offered
-# per-model in the dashboard (supports_ultra — GPT-6.1 Sol, GPT-6.1 Terra and
-# gpt-6-astra; OpenAI's own manifest caps Luna at "max") and clamps to the
+# retired 5.6 Terra and GPT-6 and 5.6 Sols, "xhigh" on the 6.1 and 6.2 Sols,
+# GPT-6.1 Terra and both Astras — and flips MultiAgentMode::Proactive). It is
+# offered per-model in the dashboard (supports_ultra — GPT-6.2 Sol, GPT-6.1
+# Terra and GPT-6.2 Astra; OpenAI's own manifest caps Luna at "max") and clamps to the
 # model's ceiling everywhere else, so a stored "ultra" can never reach a
 # model/CLI that rejects it. It complements the platform's own delegation
 # feature: delegate coordinates OtoDock sessions, ultra parallelizes WITHIN
@@ -200,25 +262,27 @@ _EFFORT_TO_CODEX: dict[str, str] = {
 # NOTE: keep _ULTRA in sync with the ``supports_ultra`` flags in
 # config.MODEL_REGISTRY (the dashboard gate) — this is the wire-level truth.
 # Exact GPT-6 ids rather than "gpt-6": a future GPT-6 tier without "max"
-# must not inherit the unlock, and "gpt-6-sol" does not match "gpt-6.1-sol".
+# must not inherit the unlock, and "gpt-6-sol" does not match "gpt-6.2-sol".
 # Each tuple holds the registry's current ids first, then the retired ids
 # that are MODEL_SUCCESSORS keys ("gpt-5.6" covers 5.6 Sol, Luna and Terra):
 # a pin can still name one (a custom re-add the boot walk leaves alone, a
 # live session adopted before its row remaps, a pin written after the boot),
-# and it keeps its ceiling. Codex 0.166.0 still serves every one of them
-# (GPT-6.1 Sol and Terra, GPT-6 Sol and 5.6 Sol and Terra low…max + ultra,
-# GPT-6 Luna and 5.6 Luna low…max). An id that is neither leaves its tuple.
-_MAX_EFFORT_MODEL_PREFIXES = ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna",
-                              "gpt-5.6", "gpt-6-sol")
-_ULTRA_EFFORT_MODEL_PREFIXES = ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra",
-                                "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-sol")
+# and it keeps its ceiling. Codex 0.169.1 still serves every one of them
+# (both Astras, the 6.2, 6.1, 6 and 5.6 Sols, 6.1 and 5.6 Terra low…max +
+# ultra, GPT-6 Luna and 5.6 Luna low…max). An id that is neither leaves its
+# tuple.
+_MAX_EFFORT_MODEL_PREFIXES = ("gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6-luna",
+                              "gpt-6.1-sol", "gpt-6-astra", "gpt-5.6", "gpt-6-sol")
+_ULTRA_EFFORT_MODEL_PREFIXES = ("gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra",
+                                "gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra",
+                                "gpt-6-sol")
 
 
 def map_effort_to_codex(effort: str, model: str = "") -> str:
     """Map platform effort level to Codex ``model_reasoning_effort`` value.
 
     ``model`` (when given) unlocks the wire values newer families support —
-    platform "ultra" → wire "ultra" on the Sols, Terra and gpt-6-astra,
+    platform "ultra" → wire "ultra" on the Sols, Terra and the Astras,
     platform "max" → wire "max" on gpt-5.6* and the GPT-6 ids; without it (or on
     older models) both clamp down the scale ("ultra" → the model's max tier,
     "max" → "xhigh"). Returns an empty string when the effort is
@@ -233,37 +297,6 @@ def map_effort_to_codex(effort: str, model: str = "") -> str:
     if effort == "max" and m.startswith(_MAX_EFFORT_MODEL_PREFIXES):
         return "max"
     return _EFFORT_TO_CODEX.get(effort, "")
-
-
-# The reasoning summary every turn asks for (``turn/start`` ``summary``,
-# which holds for later turns too; thread/start has no such field). Codex's
-# catalog defaults every hosted model to "none" (0.162.1 to 0.166.0), so without it no
-# reasoning text ever streams. The satellite's turn params send the same.
-REASONING_SUMMARY = "auto"
-
-# How the Responses API refuses a reasoning summary (an organization that is
-# not verified, on an API key): a 400 naming the parameter.
-_SUMMARY_REFUSAL = "verified to generate reasoning summaries"
-_SUMMARY_PARAM = "reasoning.summary"
-
-
-def summary_refused(params) -> bool:
-    """Whether an ``error`` notification or a failed ``turn/completed``
-    reports the API's refusal of the reasoning summary: the turn runs again
-    once without it and the session stops asking (the satellite twin reads
-    the same words)."""
-    if not isinstance(params, dict):
-        return False
-    err = params.get("error")
-    if not isinstance(err, dict):
-        turn = params.get("turn")
-        err = turn.get("error") if isinstance(turn, dict) else None
-    if not isinstance(err, dict):
-        return False
-    text = f"{err.get('message') or ''} {err.get('additionalDetails') or ''}".lower()
-    if _SUMMARY_REFUSAL in text:
-        return True
-    return _SUMMARY_PARAM in text and ("400" in text or err.get("codexErrorInfo") == "badRequest")
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +328,16 @@ def build_auth_json(token: str, *, auth_blob: dict) -> dict:
     auth_data["tokens"] = tokens
     auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
     return auth_data
+
+
+def api_key_auth_json(api_key: str) -> dict:
+    """The ``auth.json`` of an OpenAI API key, as Codex's own ``login
+    --with-api-key`` writes it. The app-server sends a key it finds there
+    and ignores one in the environment (``CODEX_API_KEY`` and
+    ``OPENAI_API_KEY`` both, proved on 0.166.0 and 0.170.0), so the file is
+    the one way a key reaches a session. A stored key is sent as the bearer,
+    so a space or a line end pasted with it goes."""
+    return {"auth_mode": "apikey", "OPENAI_API_KEY": api_key.strip()}
 
 
 def will_retry(params) -> bool:

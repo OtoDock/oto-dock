@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import AfterValidator, BaseModel
 
 import config
-from api.tasks import run_stream, task_quota
+from api.tasks import continuations, run_stream, task_quota
 from auth import roles
 from auth.providers import (
     UserContext,
@@ -31,11 +31,12 @@ from auth.providers import (
     require_auth,
     require_user,
 )
+from core.config import spender
 from core.permission_modes import AUTO_REVIEW_MODE, DONT_ASK_MODE
 from core.session import visibility as _vis
 from core.session.session_state import get_user_tz
 from core.session.visibility import nouser_read_targets
-from services.scheduler import schedule_text, scheduler, task_kinds
+from services.scheduler import schedule_text, scheduler, task_fields, task_kinds
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.automation import notification_severity, run_status, trigger_store
@@ -232,18 +233,10 @@ def _stored_task_mode(agent: str, layer: str | None, mode: str | None) -> str:
     """A task's permission mode as stored: '' for Don't Ask, the Auto word
     for Auto, refused (400) on an agent whose run engine offers no Auto (its
     engine has no reviewer: Direct LLM)."""
-    if mode != AUTO_REVIEW_MODE:
-        return ""
-    from core.session.session_manager import (
-        get_layer_capabilities,
-        resolve_execution_path,
-    )
-    path = layer or resolve_execution_path(agent)
-    caps = get_layer_capabilities(path)
-    if caps is None or AUTO_REVIEW_MODE not in caps.permission_modes:
-        raise HTTPException(400, f"Auto needs an engine with its own review; {path} has none. "
-                                 "Use Don't Ask for this task, or pin an engine that offers Auto.")
-    return AUTO_REVIEW_MODE
+    problem = task_fields.mode_problem(agent, layer, mode)
+    if problem:
+        raise HTTPException(400, problem)
+    return AUTO_REVIEW_MODE if mode == AUTO_REVIEW_MODE else ""
 
 
 async def _validate_task_overrides(
@@ -440,11 +433,10 @@ def _check_task_permission(task_data: dict, user: UserContext) -> None:
         if task_data.get("created_by") != acting:
             raise HTTPException(403, "Cannot modify another user's task")
     elif task_scope == _vis.SCOPE_AGENT:
-        acting_user = task_store.get_user(acting)
-        if not acting_user:
+        if not task_store.get_user(acting):
             raise HTTPException(403, "Unknown user")
-        role = roles.effective_role(
-            acting_user["role"], task_store.get_user_agent_roles(acting), task_data.get("agent", ""))
+        # The principal's role: a session's cap included.
+        role = user.effective_role(task_data.get("agent", ""))
         if roles.is_admin(role):
             return  # platform admin: full mutation rights
         if roles.may_mutate_shared(role, own=task_data.get("created_by") == acting):
@@ -888,19 +880,49 @@ def _make_model_resolver():
     holdings: dict[str, engine_resolution.Holdings] = {}
     catalog: list[engine_resolution.EngineCatalog] = []
     pooled: dict[str, bool] = {}
+    notices: dict[tuple, str] = {}
+    payers: dict[tuple, spender.Spender] = {}
 
     def _agent(slug: str) -> dict:
         if slug not in agent_rows:
             agent_rows[slug] = agent_store.get_agent(slug) or {}
         return agent_rows[slug]
 
+    def _payer(t) -> spender.Spender:
+        """Who the task's runs spend (``core/config/spender.py``), read
+        once per kind of row."""
+        key = (t.agent, getattr(t, "created_by", None), getattr(t, "scope", ""),
+               getattr(t, "task_type", ""), getattr(t, "spender_sub", None),
+               bool(getattr(t, "target_chat_id", None)))
+        if key not in payers:
+            try:
+                payers[key] = spender.run_spender(t)
+            except psycopg.Error:
+                payers[key] = spender.POOL
+        return payers[key]
+
+    def _engine_notice(t, path: str) -> str:
+        """The refusal's own sentence for a task whose payer cannot run on
+        ``path`` (``spender.refusal``), '' otherwise: a task the shared
+        subscriptions pay runs on the pool."""
+        payer = _payer(t)
+        if not path or not (payer.sub or payer.refused):
+            return ""
+        key = (payer, path)
+        if key not in notices:
+            try:
+                notices[key] = spender.refusal(payer, path, agent=t.agent,
+                                               lane=spender.run_kind(t) is spender.Kind.CHAT_LANE)
+            except psycopg.Error:
+                notices[key] = ""
+        return notices[key]
+
     def _person_engine(t) -> tuple[str, str]:
-        """The creator's engine and model on the task's agent for an
-        unpinned user-scope task; ("", "") when nothing resolves (a
-        Shared-only agent's runs draw on the pool: the agent's default)."""
-        from core.session.visibility import is_shared_only
-        creator = getattr(t, "created_by", None) or ""
-        if getattr(t, "scope", "user") != _vis.SCOPE_USER or not creator or is_shared_only(t.agent):
+        """The payer's engine and model on the task's agent for an unpinned
+        task a person pays; ("", "") when nothing resolves (a task the
+        shared subscriptions pay takes the agent's default)."""
+        creator = _payer(t).sub or ""
+        if not creator:
             return "", ""
         try:
             if creator not in holdings:
@@ -928,7 +950,12 @@ def _make_model_resolver():
                 layer_rows[layer] = []
         return layer_rows[layer]
 
+    chats: dict[str, dict] = {}
+
     def resolve(t) -> dict:
+        if task_kinds.of(t).fires == task_kinds.WAKE:
+            view = continuations.listed_model(t, chats, _agent(t.agent).get("execution_path") or "")
+            return {**view, "engine_notice": _engine_notice(t, view["effective_execution_path"])}
         # getattr, not attribute access: the listing also renders duck-typed
         # task defs (the scoping tests' minimal stubs), and task_config_builder
         # reads the same fields the same way.
@@ -962,8 +989,7 @@ def _make_model_resolver():
         warnings: list[str] = []
         if override_path and override_path not in _get_execution_paths(_agent(t.agent)):
             warnings.append(f"the pinned engine '{override_path}' is not enabled for this agent")
-        if (override_path and getattr(t, "scope", "user") == _vis.SCOPE_AGENT
-                and not _pool_has(override_path)):
+        if override_path and not _payer(t).sub and not _pool_has(override_path):
             warnings.append(f"the platform has no '{override_path}' subscription for the "
                             "agent's own runs")
         if override_model:
@@ -979,6 +1005,7 @@ def _make_model_resolver():
             "effective_model_tier": tier,
             "tier_label": tier_label,
             "pin_warnings": warnings,
+            "engine_notice": _engine_notice(t, path),
         }
 
     return resolve
@@ -995,6 +1022,11 @@ def _task_view(t, u: UserContext, resolve, job: dict | None,
     d["permission_mode"] = d.get("permission_mode") or DONT_ASK_MODE
     d["transferred_from_name"] = (moved_from or {}).get(d.get("transferred_from") or "", "")
     d["next_run_time"] = job["next_run_time"] if job else None
+    # The truth beside ``enabled``: a row that can no longer fire by itself
+    # (a one-shot whose time passed with no job left), and a recurring
+    # wake's skips in a row while its chat had not taken the previous one.
+    d["will_not_fire"] = scheduler.will_not_fire(t, job is not None)
+    d["wake_skips"] = scheduler.wake_skips(t.id)
     # The zone the cron and a naive run_at are read in: the row's own, else
     # the platform's — no non-admin endpoint carries the platform zone, and
     # a tab showing "Daily at 08:00" beside a browser-zone "Next" needs it.
@@ -1005,9 +1037,12 @@ def _task_view(t, u: UserContext, resolve, job: dict | None,
         # An app handler row runs no LLM turn: no model claim on it.
         d.update({"effective_model": "", "effective_execution_path": "",
                   "effective_model_source": "", "effective_model_tier": None,
-                  "tier_label": "", "pin_warnings": []})
+                  "tier_label": "", "pin_warnings": [], "engine_notice": ""})
     else:
         d.update(resolve(t))
+        # The notice speaks to the person whose engine is missing.
+        if t.created_by != u.sub:
+            d["engine_notice"] = ""
     d.update(_machine_view(getattr(t, "target_machine", "") or ""))
 
     # Permission metadata for UI (3-tier per-agent model).
@@ -1207,11 +1242,9 @@ def _manages_agent(user: UserContext, agent: str) -> bool:
     acting = user.acting_sub
     if not acting:
         return False
-    row = task_store.get_user(acting)
-    if not row:
+    if not task_store.get_user(acting):
         return False
-    return roles.can_manage(
-        roles.effective_role(row["role"], task_store.get_user_agent_roles(acting), agent))
+    return roles.can_manage(user.effective_role(agent))  # a session's cap included
 
 
 async def _edit_task_impl(
@@ -1236,6 +1269,20 @@ async def _edit_task_impl(
     nulled = [k for k in _EDIT_REQUIRED if k in fields and fields[k] is None]
     if nulled:
         raise HTTPException(status_code=400, detail=f"{', '.join(nulled)} cannot be null")
+    if user.is_no_user_session:
+        # A session with no person manages its agent's tasks, and an editor
+        # can start one: it changes the prompt, mode or checks of a task
+        # that fires with a manager's knowledge write only when it holds
+        # that write itself, and a wake's only when it drives the chat the
+        # wake targets.
+        from core.config.task_config_builder import (
+            changes_what_runs,
+            prompt_edit_refusal,
+        )
+        if changes_what_runs(dyn, fields):
+            refusal = await run_db(prompt_edit_refusal, dyn, user.session_id)
+            if refusal:
+                raise HTTPException(status_code=403, detail=refusal)
     # schedule / run_at / interval_seconds can be explicitly None (mode switch
     # signal) — the service layer handles cross-field NULL-ing. But at least
     # one editable field must be present.
@@ -1812,6 +1859,65 @@ async def list_schedules(user: UserContext | None = Depends(get_current_user)):
     return {"schedules": visible}
 
 
+async def run_event_stream(run_id: str):
+    """The run's live output as server-sent events: everything so far, then
+    each frame as it comes, ending on ``done`` (``GET /v1/tasks/runs/{id}/stream``
+    and the public route ``GET /v1/api/runs/{id}/stream``)."""
+    # Check if already completed — send full output and done event
+    run = await asyncio.to_thread(task_store.get_run, run_id)
+    if not run:
+        yield f"data: {json.dumps({'type': 'error', 'message': 'Run not found'})}\n\n"
+        return
+
+    if run_status.is_terminal(run["status"]):
+        if run.get("output_text"):
+            yield run_stream.sse(run_stream.text_frame(run["output_text"]))
+        yield run_stream.sse(run_stream.done_frame(run["status"]))
+        return
+
+    # Tell the subscriber what state it is joining — a parked run
+    # ("pending", waiting on the memory-admission slot) otherwise streams
+    # nothing but keep-alives for minutes with no explanation.
+    yield f"data: {json.dumps({'type': 'status', 'status': run['status']})}\n\n"
+
+    # Subscribe to live updates from scheduler. The runner's ``done``
+    # (sent after the row is stamped) is the normal end; the row is the
+    # backstop — read once after the subscribe (the run may have ended in
+    # between, its frame already popped with its buffer) and on every
+    # keep-alive tick (a writer with no scheduler task behind it: a
+    # dashboard-resumed turn's flip, a recovery after a restart).
+    q = await scheduler.subscribe_run(run_id)
+    saw_text = False
+    try:
+        ended = await run_stream.row_end(run_id)
+        while True:
+            if ended is None:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=run_stream.KEEPALIVE_S)
+                except asyncio.TimeoutError:
+                    # Keep-alive comment to prevent proxy timeout
+                    yield ": keep-alive\n\n"
+                    ended = await run_stream.row_end(run_id)
+                    continue
+            else:
+                # The row has ended: hand over what the queue still holds
+                # (the subscribe's replay), then the row's own verdict —
+                # unless a ``done`` was queued, which is the same verdict.
+                try:
+                    event = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    if not saw_text and ended.get("output_text"):
+                        yield run_stream.sse(run_stream.text_frame(ended["output_text"]))
+                    yield run_stream.sse(run_stream.done_frame(ended["status"]))
+                    break
+            yield run_stream.sse(event)
+            saw_text = saw_text or run_stream.is_text(event)
+            if run_stream.is_done(event):
+                break
+    finally:
+        scheduler.unsubscribe_run(run_id, q)
+
+
 @router.get("/v1/tasks/runs/{run_id}/stream")
 async def stream_run_output(
     run_id: str,
@@ -1830,63 +1936,8 @@ async def stream_run_output(
     if pre_run:
         _check_run_access(pre_run, user)
 
-    async def _event_gen():
-        # Check if already completed — send full output and done event
-        run = await asyncio.to_thread(task_store.get_run, run_id)
-        if not run:
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Run not found'})}\n\n"
-            return
-
-        if run_status.is_terminal(run["status"]):
-            if run.get("output_text"):
-                yield run_stream.sse(run_stream.text_frame(run["output_text"]))
-            yield run_stream.sse(run_stream.done_frame(run["status"]))
-            return
-
-        # Tell the subscriber what state it is joining — a parked run
-        # ("pending", waiting on the memory-admission slot) otherwise streams
-        # nothing but keep-alives for minutes with no explanation.
-        yield f"data: {json.dumps({'type': 'status', 'status': run['status']})}\n\n"
-
-        # Subscribe to live updates from scheduler. The runner's ``done``
-        # (sent after the row is stamped) is the normal end; the row is the
-        # backstop — read once after the subscribe (the run may have ended in
-        # between, its frame already popped with its buffer) and on every
-        # keep-alive tick (a writer with no scheduler task behind it: a
-        # dashboard-resumed turn's flip, a recovery after a restart).
-        q = await scheduler.subscribe_run(run_id)
-        saw_text = False
-        try:
-            ended = await run_stream.row_end(run_id)
-            while True:
-                if ended is None:
-                    try:
-                        event = await asyncio.wait_for(q.get(), timeout=run_stream.KEEPALIVE_S)
-                    except asyncio.TimeoutError:
-                        # Keep-alive comment to prevent proxy timeout
-                        yield ": keep-alive\n\n"
-                        ended = await run_stream.row_end(run_id)
-                        continue
-                else:
-                    # The row has ended: hand over what the queue still holds
-                    # (the subscribe's replay), then the row's own verdict —
-                    # unless a ``done`` was queued, which is the same verdict.
-                    try:
-                        event = q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        if not saw_text and ended.get("output_text"):
-                            yield run_stream.sse(run_stream.text_frame(ended["output_text"]))
-                        yield run_stream.sse(run_stream.done_frame(ended["status"]))
-                        break
-                yield run_stream.sse(event)
-                saw_text = saw_text or run_stream.is_text(event)
-                if run_stream.is_done(event):
-                    break
-        finally:
-            scheduler.unsubscribe_run(run_id, q)
-
     return StreamingResponse(
-        _event_gen(),
+        run_event_stream(run_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

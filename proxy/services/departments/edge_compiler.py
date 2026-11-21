@@ -88,8 +88,16 @@ def compute_desired_edges() -> set[tuple[str, str]]:
 
 
 def recompile() -> int:
-    """Swap the compiled edge set; returns the number of desired edges."""
-    desired = compute_desired_edges()
-    agent_store.replace_department_edges(desired)
+    """Swap the compiled edge set; returns the number of desired edges.
+
+    Every writer of a department's members calls this, so it also marks the
+    apps' event index stale: a binding that reads a member of its
+    department may now reach another agent (services/apps/binding_target.py)."""
+    from services.apps import app_handlers
+    try:
+        desired = compute_desired_edges()
+        agent_store.replace_department_edges(desired)
+    finally:
+        app_handlers.mark_dirty()
     logger.info("department edge compiler: %d edge(s) compiled", len(desired))
     return len(desired)

@@ -13,7 +13,8 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from services.mcp import compose_progress, mcp_updater as mu
+import config
+from services.mcp import compose_progress, mcp_manifest_store, mcp_updater as mu
 
 
 @pytest.fixture(autouse=True)
@@ -334,7 +335,7 @@ def test_the_update_route_answers_202_and_the_state_carries_the_job(monkeypatch,
 
     monkeypatch.setattr(mcp_registry, "get_manifest",
                         lambda n: _manifest("pkg", runtime="node") if n == "pkg" else None)
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
 
     async def _quick(name, **kw):
         return {"status": "updated", "version": "1.1.0", "runtime": "node", "install_log": "ok"}
@@ -430,3 +431,76 @@ def test_a_control_waits_for_a_change_that_holds_the_lock(monkeypatch, temp_db):
         r = client.post("/v1/admin/mcps/camoufox/docker/restart")
     assert r.status_code == 409
     assert r.json()["detail"] == "Another change to this MCP is running: wait for it to finish."
+
+
+def test_stop_puts_a_tool_to_sleep_until_its_next_use(monkeypatch, temp_db):
+    from services.containers import lifecycle, state
+    from services.mcp import docker_manager
+    _docker_controls(monkeypatch)
+    slept: list[str] = []
+    monkeypatch.setattr(lifecycle, "sleep_container", lambda m: slept.append(m.name) or True)
+    monkeypatch.setattr(docker_manager, "stop_container", lambda m: pytest.fail("Stop removed the container"))
+    state.reset_for_tests()
+    with _client() as client:
+        r = client.post("/v1/admin/mcps/camoufox/docker/stop")
+    assert r.status_code == 200
+    assert slept == ["camoufox"]
+    assert state.of("camoufox").asleep
+
+
+def test_keep_running_is_saved_and_wakes_a_sleeping_tool(monkeypatch, temp_db):
+    from api.mcp import mcp_containers
+    from auth.providers import UserContext, get_current_user
+    from services.containers import door, lifecycle, state
+    from services.mcp import mcp_registry
+    from storage.mcp import mcp_store
+    monkeypatch.setattr(mcp_registry, "get_manifest", lambda n: _manifest())
+    monkeypatch.setattr(lifecycle, "managed", lambda m: True)
+    monkeypatch.setattr(mcp_store, "get_mcp_state", lambda n: {"enabled": True})
+    saved: list = []
+    monkeypatch.setattr(mcp_store, "set_keep_running", lambda n, keep: saved.append((n, keep)))
+    woken: list[str] = []
+    monkeypatch.setattr(door, "wake_in_background", lambda m: woken.append(m.name))
+    state.reset_for_tests()
+    state.of("camoufox").asleep = True
+
+    async def _admin():
+        return UserContext(sub="user-admin", email="admin@test.com", name="A", role="admin",
+                           agents=[], agent_roles={}, is_api_key=False)
+
+    app = FastAPI()
+    app.include_router(mcp_containers.router)
+    app.dependency_overrides[get_current_user] = _admin
+    with TestClient(app) as client:
+        r = client.put("/v1/admin/mcps/camoufox/docker/keep-running", json={"keep": True})
+        assert r.status_code == 200
+        r = client.put("/v1/admin/mcps/camoufox/docker/keep-running", json={"keep": False})
+    assert saved == [("camoufox", True), ("camoufox", False)]
+    assert woken == ["camoufox"]
+    # A hosted install keeps no tool running: the switch is refused, nothing saved.
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
+    with TestClient(app) as client:
+        r = client.put("/v1/admin/mcps/camoufox/docker/keep-running", json={"keep": True})
+    assert r.status_code == 400
+    assert r.json()["detail"] == "Keep running is unavailable on hosted OtoDock."
+    assert saved == [("camoufox", True), ("camoufox", False)] and woken == ["camoufox"]
+
+
+@pytest.mark.parametrize("asleep_word, failed, waking", [
+    ("sleeping", "", False),
+    ("did_not_start", "start", False),
+    ("did_not_start", "image", False),
+    ("starting", "", True),
+])
+def test_a_stopped_tool_reads_sleeping_or_did_not_start(monkeypatch, asleep_word, failed, waking):
+    from api.mcp import mcp_containers
+    from services.containers import lifecycle, state
+    from services.mcp import docker_manager
+    monkeypatch.setattr(lifecycle, "managed", lambda m: True)
+    state.reset_for_tests()
+    state.of("camoufox").failed = failed
+    state.of("camoufox").waking = waking
+    assert mcp_containers.status_word(_manifest(), docker_manager.STOPPED) == asleep_word
+    assert mcp_containers.status_word(_manifest(), docker_manager.RUNNING) == docker_manager.RUNNING
+    monkeypatch.setattr(lifecycle, "managed", lambda m: False)
+    assert mcp_containers.status_word(_manifest(), docker_manager.STOPPED) == docker_manager.STOPPED

@@ -1,9 +1,10 @@
-import { useId, type ReactNode } from 'react'
+import type { ReactNode } from 'react'
 import type { DelegateCardMark, MessageBlock } from './types'
 import { delegatePreviewText } from '../../lib/messageBlocks'
 import { useSearch } from '../../contexts/useSearch'
 import { WIRE } from '../../api/wireEvents'
 import { DelegateResultFiles } from './DelegateTaskInfo'
+import CollapsedCard from '../ui/CollapsedCard'
 
 interface Props {
   card: DelegateCardMark
@@ -30,7 +31,6 @@ interface Props {
  * lasts, so its matches register in the list's order.
  */
 export default function DelegateCard({ card, blocks, open, onToggle, header, actions, children }: Props) {
-  const bodyId = useId()
   const { query } = useSearch()
   const needle = query.trim().toLowerCase()
   const searchHit = !!needle && blocks.some(
@@ -43,35 +43,16 @@ export default function DelegateCard({ card, blocks, open, onToggle, header, act
   const files = blocks.find((b): b is Extract<MessageBlock, { type: 'delegate_files' }> => b.type === 'delegate_files')
 
   return (
-    <div
-      className="rounded-card bg-surface-card shadow-elevation-1"
-      data-testid="delegate-card"
-      data-kind={card.kind}
-    >
-      <button
-        type="button"
-        onClick={onToggle}
-        aria-expanded={expanded}
-        aria-controls={bodyId}
-        className="w-full text-left rounded-control px-3 py-2 hover:bg-surface-hover transition-colors
-                   focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring/60"
-      >
-        <div className="flex items-center gap-2 min-w-0">
-          {header}
-          <svg
-            className={`ml-auto w-4 h-4 shrink-0 text-tertiary transition-transform ${expanded ? 'rotate-90' : ''}`}
-            fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"
-          >
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-          </svg>
-        </div>
-        {preview && (
-          <p className="mt-1.5 text-sm text-secondary line-clamp-2" data-testid="delegate-card-preview">
-            {preview}
-          </p>
-        )}
-      </button>
-      {(actions || (!expanded && files && files.files.length > 0)) && (
+    <CollapsedCard
+      open={expanded}
+      onToggle={onToggle}
+      header={header}
+      preview={preview && (
+        <p className="mt-1.5 text-sm text-secondary line-clamp-2" data-testid="delegate-card-preview">
+          {preview}
+        </p>
+      )}
+      aside={(actions || (!expanded && files && files.files.length > 0)) && (
         <div className="px-3 pb-2 flex flex-wrap items-center gap-x-3 gap-y-1">
           {!expanded && files && files.files.length > 0 && (
             <DelegateResultFiles files={files.files} skipped={[]} compact />
@@ -79,9 +60,10 @@ export default function DelegateCard({ card, blocks, open, onToggle, header, act
           {actions}
         </div>
       )}
-      <div id={bodyId} hidden={!expanded} className="px-3 pb-3 pt-1">
-        {expanded ? children : null}
-      </div>
-    </div>
+      bodyClassName="px-3 pb-3 pt-1"
+      rootProps={{ 'data-testid': 'delegate-card', 'data-kind': card.kind }}
+    >
+      {children}
+    </CollapsedCard>
   )
 }

@@ -248,7 +248,7 @@ def test_the_states_update_merge_and_none(two_agents):
     assert releases.current_number(copy) == 2
     assert app_follow.state(copy)["update"] == {"release": 2, "mode": "merge"}
     # A rollback on the source offers nothing.
-    asyncio.run(app_deploy.rollback_folder(task_store.get_app(src["id"])))
+    asyncio.run(app_deploy.rollback_folder(task_store.get_app(src["id"]), by_person=True))
     assert releases.current_number(task_store.get_app(src["id"])) == 1
     assert app_follow.state(copy)["update"] is None
     # Stop following: the row keeps nothing.
@@ -791,3 +791,39 @@ def test_the_column_is_added_to_a_table_from_before(temp_db):
         conn.commit()
     pg.close_pool()
     assert task_store.get_app(old["id"])["follows"] == '{"id": "x"}'
+
+
+def test_the_note_is_never_read_or_removed_through_a_link(two_agents, tmp_path):
+    """The source's note sits beside its releases, which only the server
+    writes: read and removed beneath the agent's real folder, never through
+    a link at the note or above it."""
+    src = _deploy(SRC, "board", {"client/index.html": "<p>v1</p>"})
+    out = tmp_path / "outside"
+    out.mkdir()
+    (out / app_follow.SENT_BACK_NAME).write_text(json.dumps({"release": 7, "copy": "elsewhere"}))
+    note = releases.app_release_dir(src) / app_follow.SENT_BACK_NAME
+    note.symlink_to(out / app_follow.SENT_BACK_NAME)
+    assert app_follow._note(src) == {}
+    note.unlink()
+    folder = releases.app_release_dir(src)
+    folder.rename(folder.with_name(folder.name + "-moved"))
+    folder.symlink_to(out, target_is_directory=True)
+    assert app_follow._note(src) == {}
+    app_follow._drop_note(src, 7)
+    assert json.loads((out / app_follow.SENT_BACK_NAME).read_text())["release"] == 7
+
+
+def test_a_note_is_never_removed_through_a_link_above_it(two_agents, tmp_path, monkeypatch):
+    """The note names its release; the removal is beneath the agent's real
+    folder all the same, so a folder swapped for a link keeps what it
+    points at."""
+    src = _deploy(SRC, "board", {"client/index.html": "<p>v1</p>"})
+    out = tmp_path / "outside"
+    out.mkdir()
+    (out / app_follow.SENT_BACK_NAME).write_text(json.dumps({"release": 7}))
+    folder = releases.app_release_dir(src)
+    folder.rename(folder.with_name(folder.name + "-moved"))
+    folder.symlink_to(out, target_is_directory=True)
+    monkeypatch.setattr(app_follow, "_note_release", lambda _row: 7)
+    app_follow._drop_note(src, 7)
+    assert (out / app_follow.SENT_BACK_NAME).is_file()

@@ -1,0 +1,7 @@
+{
+ "audio_transcribe": true,
+ "audio_tts": false,
+ "no_such_capability": false,
+ "none": true,
+ "phone_calls": true
+}

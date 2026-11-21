@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from core.remote.satellite_connection import SatelliteConnection
     from core.remote.satellite_file_transfer import _FileChangedLane, _PullStream
+    from core.remote.satellite_grace import HeldLines
+    from core.remote.satellite_link import MachineLinks
 
 
 class SatelliteManagerHost(Protocol):
@@ -27,13 +29,12 @@ class SatelliteManagerHost(Protocol):
     _fc_lanes: dict[str, _FileChangedLane]
     _grace_sessions: dict[str, dict[str, tuple[asyncio.Queue[Any], str]]]
     _grace_timers: dict[str, asyncio.Task[Any]]
-    _lock: asyncio.Lock
+    _held_lines: dict[str, HeldLines]
+    _links: MachineLinks
     _pending_acks: dict[str, tuple[str, asyncio.Future[Any], SatelliteConnection | None]]
     _pending_pulls: dict[str, _PullStream]
     _pty_grace_timers: dict[str, asyncio.Task[Any]]
 
-    def effective_sync_cap(self, machine_id: str) -> int: ...
-    def satellite_supports_paced_transfers(self, machine_id: str) -> bool: ...
     async def send_command(
         self,
         machine_id: str,

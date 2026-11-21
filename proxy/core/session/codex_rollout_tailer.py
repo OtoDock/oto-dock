@@ -59,9 +59,11 @@ see ``_process_rollout_lines``).
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -80,7 +82,7 @@ from core.session.transcript_tool_events import (
     persist_event,
     record_batch_usage,
 )
-from storage.chat.chat_titles import title_from_prompt
+from storage.chat.chat_titles import title_from_prompt, without_start_context
 from ws import wire_events as wire
 
 logger = logging.getLogger("otodock.codex_rollout_tailer")
@@ -114,6 +116,11 @@ _thread_saved: set[str] = set()
 # usage-row model (token_count events carry no model). Falls back to the chat
 # row's model in record_batch_usage when no turn_context arrived yet.
 _usage_models: dict[str, str] = {}
+# session_id → the (model, collaboration mode) of the last MAIN turn: a main
+# turn on another model in the same mode is a person's pick (``/model``), the
+# batch's ``model_chosen``. Each mode carries its own model, so a mode toggle
+# is no pick; the session's first turn is the model it started on, never one.
+_turn_models: dict[str, tuple[str, str]] = {}
 
 # Fresh-spawn lower bound slack: Codex writes its rollout within ~1 s of spawn; allow
 # clock/race slack so we never miss it but still exclude a sibling chat's older rollout.
@@ -162,34 +169,111 @@ def forget(session_id: str) -> None:
     _thread_saved.discard(session_id)
     _tool_events.pop(session_id, None)
     _usage_models.pop(session_id, None)
+    _turn_models.pop(session_id, None)
     _tail_locks.forget(session_id)
 
 
-def rollout_exists(host_codex_home: str, thread_id: str) -> bool:
-    """True if the thread's rollout JSONL is still on disk under this CODEX_HOME.
+# What a search of a home's rollouts answers.
+FOUND, MISSING, UNDECIDED = "found", "missing", "undecided"
+# A thread id names a file: Codex's ids are UUIDs.
+_THREAD_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+# How many entries a search reads before it answers UNDECIDED.
+_FIND_MAX_ENTRIES = 100_000
+# A rollout sits three folders below ``sessions`` (YYYY/MM/DD): deeper
+# folders are not entered.
+_FIND_MAX_DEPTH = 8
+# A ``session_meta`` record is under 2 KiB; a longer first record reads as
+# unknown.
+_META_MAX_BYTES = 64 * 1024
 
-    ``codex resume <thread_id>`` needs the rollout, so this decides whether an
-    interactive Codex spawn resumes the thread or starts fresh. The thread + its
-    rollout persist independently of the in-memory app-server session, so a
-    ``-p`` ⇄ terminal switch (which closes the in-memory session) can still
-    resume the same conversation."""
-    if not host_codex_home or not thread_id:
-        return False
-    pattern = os.path.join(host_codex_home, "sessions", "**", f"rollout-*-{thread_id}.jsonl")
-    return bool(glob.glob(pattern, recursive=True))
 
+def find_rollout(codex_home: str, thread_id: str, agent: str = "") -> tuple[str, str | None]:
+    """Where the rollout of ``thread_id`` is under a Codex home:
+    ``(FOUND, path)``, ``(MISSING, None)`` or ``(UNDECIDED, None)``.
 
-def _read_session_meta(path: str) -> dict | None:
-    """Parse the first line (session_meta payload) of a rollout, or None."""
+    The search walks ``<home>/sessions`` beneath the agent's real folder
+    (``core.agent_folder``), entering no link below it and the newest dated
+    folders first (Codex files a rollout under ``YYYY/MM/DD``), and stops at
+    the first ``rollout-*-<thread>.jsonl`` that is a regular file; no folder
+    more than ``_FIND_MAX_DEPTH`` below ``sessions`` is entered. The path
+    is ``codex_home`` as given, joined. A home in no agent's folder, a link
+    at ``sessions`` or above it, a missing folder or an id that cannot name
+    a file is MISSING. A search past ``_FIND_MAX_ENTRIES`` entries, in all
+    or in one folder, or one that met a folder it could not read, is
+    UNDECIDED: a caller never takes it for a missing thread. ``agent`` is
+    the agent whose folder holds the home, when the caller knows it: the
+    owner then needs no listing of the agents folder to find it. Blocking:
+    off the event loop."""
+    import fnmatch
+
+    from core.agent_folder import beneath_agent
+    from services.infra import safe_fs
+    if not codex_home or not _THREAD_RE.fullmatch(thread_id or ""):
+        return MISSING, None
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            first = fh.readline()
-        obj = json.loads(first)
-    except (OSError, json.JSONDecodeError, ValueError):
+        root, rel = beneath_agent(codex_home, agent)
+    except (safe_fs.SafeFsError, ValueError):
+        return MISSING, None
+    pattern = f"rollout-*-{thread_id}.jsonl"
+    unread: list[OSError] = []
+    seen = 0
+    base = posixpath.join(rel, "sessions")
+    try:
+        for step in safe_fs.walk_beneath(root, base, onerror=unread.append, max_entries=_FIND_MAX_ENTRIES):
+            if step.rel.count("/") - base.count("/") >= _FIND_MAX_DEPTH:
+                del step.dirs[:]
+            step.dirs.reverse()
+            for name in step.files:
+                if fnmatch.fnmatchcase(name, pattern):
+                    return FOUND, os.path.join(codex_home, step.rel[len(rel):].lstrip("/"), name)
+            seen += len(step.dirs) + len(step.files) + len(step.symlinks) + len(step.other)
+            if seen > _FIND_MAX_ENTRIES:
+                logger.warning("rollout of thread %s: the search passed %d entries in %s",
+                               thread_id[:8], _FIND_MAX_ENTRIES, codex_home)
+                return UNDECIDED, None
+    except safe_fs.TooManyEntries:
+        logger.warning("rollout of thread %s: a folder of %s holds more than %d entries",
+                       thread_id[:8], codex_home, _FIND_MAX_ENTRIES)
+        return UNDECIDED, None
+    except (FileNotFoundError, NotADirectoryError, safe_fs.SafeFsError):
+        return MISSING, None
+    except OSError:
+        logger.warning("rollout of thread %s: %s could not be searched", thread_id[:8], codex_home,
+                       exc_info=True)
+        return UNDECIDED, None
+    if unread:
+        logger.warning("rollout of thread %s: %d folder(s) of %s could not be read",
+                       thread_id[:8], len(unread), codex_home)
+        return UNDECIDED, None
+    return MISSING, None
+
+
+def read_session_meta(path: str, agent: str = "") -> dict | None:
+    """The first record's ``session_meta`` payload of a rollout, or None.
+    The file is read beneath the agent's real folder (``core.agent_folder``)
+    with no link at any part below it (a pipe is refused at once), at most
+    ``_META_MAX_BYTES``. Blocking."""
+    from core.agent_folder import beneath_agent
+    from services.infra import safe_fs
+    try:
+        fd, _st = safe_fs.open_regular_for_read(*beneath_agent(path, agent))
+    except (OSError, ValueError):
         return None
-    if obj.get("type") == "session_meta":
-        return obj.get("payload") or {}
-    return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            first = fh.readline(_META_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(first) > _META_MAX_BYTES:
+        return None
+    try:
+        obj = json.loads(first.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or obj.get("type") != "session_meta":
+        return None
+    payload = obj.get("payload")
+    return payload if isinstance(payload, dict) else {}
 
 
 def resolve_rollout_path(session_id: str, chat_id: str) -> str | None:
@@ -233,7 +317,7 @@ def resolve_rollout_path(session_id: str, chat_id: str) -> str | None:
         for path in candidates:
             if path in others or not os.path.basename(path).endswith(suffix):
                 continue
-            meta = _read_session_meta(path)
+            meta = read_session_meta(path)
             if meta and meta.get("thread_source") != "subagent":
                 _resolved[session_id] = path
                 return path
@@ -251,7 +335,7 @@ def resolve_rollout_path(session_id: str, chat_id: str) -> str | None:
             continue
         if not tid and mtime < started_at - _RESOLVE_MTIME_MARGIN_S:
             continue
-        meta = _read_session_meta(path)
+        meta = read_session_meta(path)
         if not meta:
             continue
         if meta.get("originator") != "codex-tui":
@@ -325,8 +409,11 @@ def _user_row_key(text: str) -> str:
     persisted it at send time (the cold first prompt, a composer send) and
     the STAMPED one where this tailer persisted it (a line typed straight
     into the PTY); the rollout holds the stamped line, single-lined on a
-    satellite. All of those are one row."""
-    out = text or ""
+    satellite. All of those are one row. The rollout holds a headless
+    turn's own text fenced (``start_context.fence_turn``) and the row holds
+    it as typed: both sides are fenced before the compare."""
+    from core.session.start_context import fence_turn
+    out = fence_turn(without_start_context(text or ""))
     while True:
         stripped = ROW_PRELUDE_RE.sub("", out, count=1)
         if stripped == out:
@@ -428,6 +515,23 @@ def tail_rollout(session_id: str, chat_id: str, rollout_path: str) -> dict:
     result["from_line"] = start
     result["to_line"] = processed
     return result
+
+
+def _turn_context_pick(b: _RolloutBatch, payload: dict) -> None:
+    """A main turn's ``turn_context`` (its ``turn_id`` is its root's, or it
+    names none): its model and mode become the session's last, and a model
+    other than the last one in the same mode is a pick. A batch that re-reads
+    the rollout from its start (``calibrate_usage``) replays old turns: it
+    sets the last one and names no pick."""
+    root = payload.get("root_turn_id")
+    if root and root != payload.get("turn_id"):
+        return
+    model = str(payload.get("model") or "")
+    mode = str((payload.get("collaboration_mode") or {}).get("mode") or "")
+    last = _turn_models.get(b.session_id)
+    _turn_models[b.session_id] = (model, mode)
+    if last is not None and not b.calibrate_usage and last[1] == mode and last[0] != model:
+        b.model_chosen = model
 
 
 def tail_lines(session_id: str, chat_id: str, lines: list[str]) -> dict:
@@ -679,6 +783,8 @@ class _RolloutBatch:
     known_events: set | None
     calibrate_usage: bool
     ptr: int = 0
+    # The model a person picked in this batch (``_turn_models``), or "".
+    model_chosen: str = ""
     persisted: int = 0
     message_rows: int = 0
     # Early-title counters (interactive_session accumulates them across
@@ -712,6 +818,8 @@ class _RolloutBatch:
     open_questions: set[str] = field(default_factory=set)
     # compacted rollout item seen this batch (see the handler below).
     compacted: bool = False
+    # The typed ending a failed turn's ``task_complete`` carried.
+    ending: Any = None
     # Provider usage newly consumed this batch (single accumulator — the model
     # rides _usage_models, keyed per turn_context). Flushed once at batch end.
     usage_acc: dict[str, int] = field(default_factory=lambda: {
@@ -783,6 +891,7 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             # (token_count events don't carry one).
             if payload.get("model"):
                 _usage_models[session_id] = str(payload["model"])
+                _turn_context_pick(b, payload)
             continue
 
         if otype == "event_msg":
@@ -850,19 +959,24 @@ def _rollout_event_msg(b: _RolloutBatch, obj: dict, payload: dict) -> None:
                                 obj.get("timestamp"))
         return
     if payload.get("type") in ("error", "stream_error"):
-        # CLI-reported stream/API error (its own marker — never model
-        # prose): a provider limit rests the account and fails the scope
-        # over now. Claude twin: transcript_tailer's isApiErrorMessage hook.
+        # CLI-reported stream/API error (its own marker, never model prose;
+        # a ``stream_error`` is its retry notice): no ending, a transient
+        # overload's brief nudge only. A turn's real failure, a limit among
+        # them, rides its ``task_complete`` below.
         try:
-            from services.engines.subscription_pool import throttle_from_cli_error
-            throttle_from_cli_error(
-                b.session_id, str(payload.get("message") or ""))
+            from services.engines.subscription_pool import nudge_from_cli_error
+            nudge_from_cli_error(b.session_id, str(payload.get("message") or ""))
         except Exception:
             logger.exception(
-                "codex tail %s: limit-detection failed", b.session_id[:8])
+                "codex tail %s: overload nudge failed", b.session_id[:8])
         return
     if payload.get("type") == "task_complete":
-        # Per-turn completion marker — the agent finished this turn.
+        # Per-turn completion marker — the agent finished this turn, or its
+        # error ended it (the typed ending the session folds, Claude's twin
+        # is transcript_tailer's API-error row). The batch's last turn end
+        # decides: a clean one after a failed one in the same batch clears it.
+        from core.layers.codex.translator import task_complete_ending
+        b.ending = task_complete_ending(payload)
         b.saw_task_complete = True
         b.last_signal = "end_turn"
         b.last_signal_at = line_time(obj)
@@ -973,9 +1087,11 @@ def _rollout_message(b: _RolloutBatch, obj: dict, payload: dict) -> None:
         return  # developer (perms) + any other synthetic role
     text = _extract_text(payload.get("content"))
     if role == "user":
-        # Drop any restored-history digest the reseed prepended to the
-        # cold prompt — only the real prompt belongs in chat_messages.
-        text = strip_seed_prefix(text)
+        # Only the real prompt belongs in chat_messages: the platform's start
+        # block (a headless first message carries one where the start hook
+        # did not answer) and any restored-history digest the reseed
+        # prepended to the cold prompt go.
+        text = strip_seed_prefix(without_start_context(text))
     if not text.strip():
         return
     if role == "user" and _is_synthetic_user(text):
@@ -994,6 +1110,14 @@ def _rollout_message(b: _RolloutBatch, obj: dict, payload: dict) -> None:
     # Prefix-merge: already persisted (resume/restart) → consume + skip.
     if b.ptr < len(b.prefix) and _same_persisted_row(b.prefix[b.ptr], role, text):
         b.ptr += 1
+        return
+
+    # Claimed by the line's time, role and text (the twin of the Claude
+    # tailer's line uuid): a machine sends a line again at a sign-in when its
+    # ack was lost, and the forwarded path has no prefix merge.
+    stamp = obj.get("timestamp")
+    if stamp and not b.buf.claim(
+            f"msg:{stamp}:{role}:{hashlib.sha256(text.encode('utf-8', 'replace')).hexdigest()}"):
         return
 
     # A prompt whose row exists (the dashboard's own send, a prompt the
@@ -1055,7 +1179,8 @@ def _finish_rollout_batch(b: _RolloutBatch) -> dict:
         "persisted": b.persisted,
         "title_set": title_set,
         # Interactive completion signal (consumed by interactive_session).
-        "turn_complete": b.saw_task_complete,
+        # A turn that ended short is no completion: its ending acts instead.
+        "turn_complete": b.saw_task_complete and b.ending is None,
         "last_message": b.last_agent_message,
         "last_signal": b.last_signal,
         "last_signal_at": b.last_signal_at,
@@ -1069,6 +1194,10 @@ def _finish_rollout_batch(b: _RolloutBatch) -> dict:
         # Early-title counters (see the init comment above).
         "assistant_chars": b.assistant_chars,
         "tool_rows": b.tool_rows,
+        # The model a person picked inside the terminal, only when one was.
+        **({"model_chosen": b.model_chosen} if b.model_chosen else {}),
+        # A turn that ended short: its typed ending.
+        **({"ending": b.ending.as_dict()} if b.ending is not None else {}),
     }
 
 

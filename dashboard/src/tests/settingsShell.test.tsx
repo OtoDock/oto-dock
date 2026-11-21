@@ -27,9 +27,8 @@ vi.mock('@/contexts/AuthContext', () => ({
 }))
 vi.mock('@/components/RequireAuth', () => ({ default: () => <Outlet /> }))
 vi.mock('@/components/AgentGuard', () => ({ default: () => <Outlet /> }))
-vi.mock('@/components/PlatformSetupGuard', () => ({
-  default: () => <Outlet />,
-  SetupBanner: () => <div data-testid="setup-banner">connect an engine</div>,
+vi.mock('@/components/SetupBanner', () => ({
+  default: () => <div data-testid="setup-banner">connect an engine</div>,
 }))
 vi.mock('@/components/DefaultAgentRedirect', () => ({ default: () => <p>default chat</p> }))
 vi.mock('@/components/admin/ForwardingBanner', () => ({ ForwardingBanner: () => null }))
@@ -150,6 +149,13 @@ const click = async (label: string) => {
 const back = async () => {
   await act(async () => { window.history.back() })
   await settle()
+}
+/** One end of a swipe on `el`, at a fixed clock. */
+const touch = (el: Element, type: 'touchstart' | 'touchend', x: number, at: number) => {
+  vi.spyOn(Date, 'now').mockReturnValue(at)
+  const e = new Event(type)
+  Object.defineProperty(e, type === 'touchend' ? 'changedTouches' : 'touches', { value: [{ clientX: x, clientY: 200 }] })
+  el.dispatchEvent(e)
 }
 
 async function coldLoad(at: string) {
@@ -282,6 +288,13 @@ describe('the phone list', () => {
     expect(screen.getByRole('heading', { name: 'Ops Agent' })).toBeTruthy()
   })
 
+  it('a member with no engine reaches an agent with no gate', async () => {
+    h.user = { ...member(), has_own_engine: false }
+    await coldLoad('/agents/ops')
+    expect(screen.getByRole('heading', { name: 'Ops Agent' })).toBeTruthy()
+    expect(screen.queryByText('Platform Setup Required')).toBeNull()
+  })
+
   it('a member deep-linked to Configuration gets the page', async () => {
     h.user = member()
     await coldLoad('/agents/ops/config')
@@ -317,16 +330,10 @@ describe('the phone list', () => {
     await click('Shares')
     expect(await screen.findByText('admin shares')).toBeTruthy()
     const main = screen.getByRole('main')
-    const touch = (type: string, x: number, at: number) => {
-      vi.spyOn(Date, 'now').mockReturnValue(at)
-      const e = new Event(type)
-      Object.defineProperty(e, type === 'touchend' ? 'changedTouches' : 'touches', { value: [{ clientX: x, clientY: 200 }] })
-      main.dispatchEvent(e)
-    }
-    await act(async () => { touch('touchstart', 4, 1000); touch('touchend', 180, 1200) })
+    await act(async () => { touch(main, 'touchstart', 4, 1000); touch(main, 'touchend', 180, 1200) })
     await settle()
     expect(path()).toBe('/admin/shares')
-    await act(async () => { touch('touchstart', 80, 2000); touch('touchend', 260, 2200) })
+    await act(async () => { touch(main, 'touchstart', 80, 2000); touch(main, 'touchend', 260, 2200) })
     await settle()
     expect(path()).toBe('/admin')
   })
@@ -428,6 +435,21 @@ describe('Back to Chat', () => {
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Back' })) })
     await settle()
     await click('Back to Chat')
+    expect(screen.getByText('chat page')).toBeTruthy()
+    expect(idx()).toBe(0)
+  })
+
+  it('a swipe to the right on the phone list is Back to Chat, and one from the edge is left to the system', async () => {
+    narrow = true
+    await coldLoad('/chat/ops')
+    await click('open admin')
+    expect(path()).toBe('/admin')
+    const main = screen.getByRole('main')
+    await act(async () => { touch(main, 'touchstart', 4, 1000); touch(main, 'touchend', 180, 1200) })
+    await settle()
+    expect(path()).toBe('/admin')
+    await act(async () => { touch(main, 'touchstart', 80, 2000); touch(main, 'touchend', 260, 2200) })
+    await settle()
     expect(screen.getByText('chat page')).toBeTruthy()
     expect(idx()).toBe(0)
   })

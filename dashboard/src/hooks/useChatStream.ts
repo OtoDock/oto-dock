@@ -18,11 +18,12 @@ import { useChatHistory } from './chatStream/useChatHistory'
 import { useTurnEnd } from './chatStream/useTurnEnd'
 import { useStreamBlocks } from './chatStream/useStreamBlocks'
 import { useArtifactChannels } from './chatStream/useArtifactChannels'
-import { DELEGATE_RESULT, RUN_STATUS } from '../lib/status/run'
+import { RUN_STATUS } from '../lib/status/run'
 import { backgroundSpawnOf, runningFor } from '../lib/chat/runningBackground'
 import { BG_COMMAND_BLOCK } from '../lib/kinds/block'
 import { errorText } from '../lib/http/apiJson'
 import { ASK_MODE, AUTO_REVIEW_MODE } from '../lib/engines/modes'
+import { isForShownChat } from '../lib/chat/shownChat'
 
 export { warmupFailSubtype } from './chatStream/useTurnEnd'
 
@@ -113,15 +114,21 @@ export function useChatStream(options: UseChatStreamOptions) {
         }
       }
     }
-    // Background work the history says still runs whose spawn is not in the
-    // loaded rows (started turns back): its badge, with no block behind it.
-    // A spawn with a block, running or not, is that block's to show.
+    // Work the history says still runs whose spawn is not in the loaded rows
+    // (started turns back): its badge, with no block behind it. A spawn with
+    // a block, running or not, is that block's to show.
     const running = runningFor(runningBackground, chatId)
     const shown = new Set<string>()
     for (const msg of messages) {
       for (const b of msg.blocks) {
         const spawn = backgroundSpawnOf(b)
         if (spawn) shown.add(spawn.id)
+      }
+    }
+    // A delegation started before the loaded page: its block's own badge.
+    for (const e of running.delegates) {
+      if (!shown.has(e.id)) {
+        out.push({ id: `delegate-${e.id}`, description: `${e.description} → ${e.agent || ''}`, type: 'delegate', startTime: 0 })
       }
     }
     for (const e of running.agents) {
@@ -202,10 +209,14 @@ export function useChatStream(options: UseChatStreamOptions) {
   // list for nothing). Cleared at the next send and on a chat switch.
   const erroredRef = useRef(false)
   // A chat switch (the page's, or a minted chat's) leaves the error card
-  // with the chat it belongs to.
+  // with the chat it belongs to. The ref moves with the pick at once, not
+  // at the next render: a frame that arrives in between is judged against
+  // the chat the page now shows.
   const setChatId = useCallback((next: SetStateAction<string | null>) => {
     erroredRef.current = false
-    setChatIdState(next)
+    const value = typeof next === 'function' ? next(chatIdRef.current) : next
+    chatIdRef.current = value
+    setChatIdState(value)
   }, [])
   // What the concern hooks under hooks/chatStream/ share (core.ts): one
   // plain object per render, so every handler closes over this render.
@@ -241,9 +252,10 @@ export function useChatStream(options: UseChatStreamOptions) {
   const { seedDbHistory } = history
 
   /** Shared cleanup for a stopped turn. Marks any still-running tool /
-   * subagent / delegate blocks as `failed` (red X) across all assistant
+   * foreground subagent blocks as `failed` (red X) across all assistant
    * messages, clears thinking/compressing/meeting state, and empties the
-   * activity sidebars. Idempotent — safe to call multiple times.
+   * activity sidebars. Background work and delegations outlive a Stop and
+   * keep running. Idempotent — safe to call multiple times.
    *
    * Called proactively from the page's handleAbort so the UI clears
    * immediately even if the server's `aborted` event is delayed or dropped,
@@ -262,8 +274,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         const hasRunning = msg.blocks.some(
           (b) =>
             (b.type === 'tool' && b.status === 'running')
-            || (b.type === 'subagent' && b.isActive && !b._background)
-            || (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING),
+            || (b.type === 'subagent' && b.isActive && !b._background),
         )
         if (!hasRunning) return msg
         return {
@@ -271,9 +282,9 @@ export function useChatStream(options: UseChatStreamOptions) {
           blocks: msg.blocks.map((b) => {
             if (b.type === 'tool' && b.status === 'running') return { ...b, status: 'failed' as const }
             // Background work outlives a Stop (the engine keeps it): its own
-            // done frame, or the session's end, clears it.
+            // done frame, or the session's end, clears it. A delegation
+            // too: a Stop cancels no worker, its result ends it.
             if (b.type === 'subagent' && b.isActive && !b._background) return { ...b, isActive: false, failed: true }
-            if (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING) return { ...b, status: DELEGATE_RESULT.FAILED }
             return b
           }),
         }
@@ -305,6 +316,12 @@ export function useChatStream(options: UseChatStreamOptions) {
     flushPendingSteer,
     onMeetingSystem: meeting.onMeetingSystem,
     meetingParticipants,
+    // Same staleness rule as onChatMoved: the frame names the chat whose
+    // terminal came back, and only that chat's view attaches to it.
+    onTerminalReloaded: (data) => {
+      if (!isForShownChat(data.chat_id, chatIdRef.current)) return
+      options.onTerminalReloaded?.(data)
+    },
   })
 
   // --- WebSocket callbacks ---
@@ -319,6 +336,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     onPreWarmupReady: (data) => {
       if (discardingRef.current) return
       options.onPreWarmupReady?.(data)
+    },
+    onPreWarmupRefused: (data) => {
+      if (discardingRef.current) return
+      options.onPreWarmupRefused?.(data)
     },
 
     onTurnComplete: (data) => {
@@ -350,10 +371,10 @@ export function useChatStream(options: UseChatStreamOptions) {
       // the time this fires — refetch the sidebar so it picks up the new chat.
       if (data.chat_id) options.onWarmupRefetch?.()
 
-      // Stale: this warmup is for a different chat than the one we're on.
-      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
-        return
-      }
+      // Stale: this warmup is for a different chat than the one on screen.
+      // The new-chat view owns only the chat its own send minted (adopted at
+      // its warmup_started), never one it would be carried away to.
+      if (!isForShownChat(data.chat_id, chatIdRef.current)) return
 
       // First event for this chat — clear the new-chat / switch transition flag.
       discardingRef.current = false
@@ -373,41 +394,31 @@ export function useChatStream(options: UseChatStreamOptions) {
     onChatMoved: (data) => {
       // The move op acts on the connection's open chat — drop the ack if the
       // user already navigated elsewhere (that chat re-warms on next open).
-      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
-        return
-      }
+      if (!isForShownChat(data.chat_id, chatIdRef.current)) return
       options.onChatMoved?.(data)
     },
 
     onChatViewOnly: (data) => {
       // The frame names the viewed chat (per-chat routed); a stale one for a
       // chat the user left is dropped like a moved ack.
-      if (data && data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
-        return
-      }
+      if (data && !isForShownChat(data.chat_id, chatIdRef.current)) return
       options.onChatViewOnly?.(data)
     },
 
     onEngineSwitched: (data) => {
       // Same staleness rule as onChatMoved — the frame also arrives via a
       // per-user broadcast, so a sibling tab viewing another chat drops it.
-      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
-        return
-      }
+      if (!isForShownChat(data.chat_id, chatIdRef.current)) return
       options.onEngineSwitched?.(data)
     },
 
     onSwitchEngineDenied: (data) => {
-      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
-        return
-      }
+      if (!isForShownChat(data.chat_id, chatIdRef.current)) return
       options.onSwitchEngineDenied?.(data)
     },
 
     onLiveness: (data) => {
-      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
-        return
-      }
+      if (!isForShownChat(data.chat_id, chatIdRef.current)) return
       options.onLiveness?.(data)
     },
 
@@ -425,7 +436,11 @@ export function useChatStream(options: UseChatStreamOptions) {
     },
 
     ...turnEnd.callbacks,
-    onModeChanged: (m) => { if (discardingRef.current) return; setMode(m) },
+    onModeChanged: (m, refusal) => {
+      if (discardingRef.current) return
+      setMode(m)
+      options.onModeAnswered?.(refusal)
+    },
     onModelChanged: (m) => { if (discardingRef.current) return; setModel(m) },
     // Not a per-chat frame on the wire (a new chat's pick carries no id), so
     // the chat is matched here: only the viewed chat's stored mode applies.
@@ -472,6 +487,15 @@ export function useChatStream(options: UseChatStreamOptions) {
   // The artifact channels (chatStream/useArtifactChannels.ts): subscribed
   // through the socket's registry, so they come after it.
   const { sendArtifactInteraction, sendAppAction } = useArtifactChannels(core, ws)
+
+  // The view left its chat for the new-chat view: the socket is told, so
+  // nothing of the chat left (a result, a server turn) counts as on screen.
+  const leftFromRef = useRef(chatId)
+  useEffect(() => {
+    const left = leftFromRef.current
+    leftFromRef.current = chatId
+    if (left && !chatId) ws.leaveChat()
+  }, [chatId, ws])
 
   // --- Shared handlers ---
 

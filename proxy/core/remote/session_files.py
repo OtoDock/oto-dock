@@ -62,14 +62,16 @@ _WINDOWS_DEVICES = frozenset(
 class TransferError(RuntimeError):
     """The files could not move; ``why`` is the move's summary reason,
     ``place`` the place that refused, ``committed`` whether the target may
-    already hold placed files."""
+    already hold placed files, ``changed`` whether the source's files
+    changed during the copy (an engine still writing: worth one more try)."""
 
     def __init__(self, why: str, detail: str = "", *, place: str = "",
-                 committed: bool = False) -> None:
+                 committed: bool = False, changed: bool = False) -> None:
         super().__init__(detail or why)
         self.why = why
         self.place = place
         self.committed = committed
+        self.changed = changed
 
 
 @dataclass(frozen=True)
@@ -453,16 +455,30 @@ async def remote_pull(machine_id: str, scope: SessionScope, move_id: str, f: Ses
 
 
 async def remote_push(machine_id: str, scope: SessionScope, move_id: str, rel: str,
-                      src: Path, digest: str, *,
+                      digest: str, *,
                       progress: Callable[[int, int], object] | None = None) -> None:
-    """Push one staged file; ``progress(bytes_sent, bytes_total)`` after
-    each acked chunk."""
+    """Push one staged file, read from its own descriptor beneath the agents
+    root (no link followed, no other hard link: the staging's rule);
+    ``progress(bytes_sent, bytes_total)`` after each acked chunk."""
+    import asyncio
+
+    from services.infra import safe_fs
     from services.path_policy_v2 import PathRef
-    ok = await _cm().push_file(
-        machine_id, PathRef(kind="agent_tree", value=rel), src, agent_slug=scope.agent,
-        content_hash=digest, frame_fields=scope.frame(OP_PUSH, rel=rel, move_id=move_id),
-        progress_cb=progress,
-    )
+    check_rel(scope, rel)
+    try:
+        fd, _st = await asyncio.to_thread(
+            safe_fs.open_regular_for_read, _agents_root(), f"{_staging_rel(scope, move_id)}/{rel}",
+            single_link=True)
+    except OSError as e:
+        raise TransferError("transfer_failed", f"the staged {rel} cannot be read: {e}") from e
+    try:
+        ok = await _cm().push_file(
+            machine_id, PathRef(kind="agent_tree", value=rel), Path(safe_fs.fd_path(fd)),
+            agent_slug=scope.agent, content_hash=digest,
+            frame_fields=scope.frame(OP_PUSH, rel=rel, move_id=move_id), progress_cb=progress,
+        )
+    finally:
+        os.close(fd)
     if not ok:
         raise TransferError("transfer_failed", f"push of {rel} failed")
 
@@ -510,6 +526,46 @@ async def list_files(place: str, scope: SessionScope) -> list[SessionFile]:
     return await remote_list(place, scope)
 
 
+async def sizes(place: str, scope: SessionScope) -> list[tuple[str, int]]:
+    """``(rel, size)`` of the session file itself at a place, from sizes
+    only (``local_stat``, ``remote_stat``)."""
+    import asyncio
+    if placement.is_local(place):
+        return await asyncio.to_thread(local_stat, scope)
+    return await remote_stat(place, scope)
+
+
+async def wait_quiet(place: str, scope: SessionScope, *, quiet_s: float = 1.0,
+                     every_s: float = 0.5, bound_s: float = 10.0) -> bool:
+    """Wait until the session's file at ``place`` stops growing: two reads of
+    its size ``quiet_s`` apart agree (an engine a close just ended may still
+    write its last lines; the close returns before the machine reaped it).
+    True at once when there is no file. False when ``bound_s`` passes first
+    or a read fails: the copy then goes ahead, and its own list before the
+    commit still refuses a session that changed."""
+    import asyncio
+    import time
+    deadline = time.monotonic() + bound_s
+    last: list[tuple[str, int]] | None = None
+    since = 0.0
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        try:
+            now = sorted(await asyncio.wait_for(sizes(place, scope), timeout=left))
+        except Exception:  # noqa: BLE001  # the wait only helps: the copy's own checks decide
+            return False
+        if not now:
+            return True
+        at = time.monotonic()
+        if now != last:
+            last, since = now, at
+        elif at - since >= quiet_s:
+            return True
+        await asyncio.sleep(max(0.0, min(every_s, deadline - time.monotonic())))
+
+
 async def delete_files(place: str, scope: SessionScope) -> int:
     import asyncio
     if placement.is_local(place):
@@ -529,14 +585,26 @@ def _same_set(a: list[SessionFile], b: list[SessionFile]) -> bool:
     return sorted((f.size, f.sha256) for f in a) == sorted((f.size, f.sha256) for f in b)
 
 
+async def _listed_differently(place: str, scope: SessionScope, files: list[SessionFile]) -> bool:
+    """Whether ``place`` now lists other files than ``files`` (a list that
+    fails says nothing)."""
+    try:
+        return not _same_set(files, await list_files(place, scope))
+    except Exception:  # noqa: BLE001  # the pull's own failure stands
+        return False
+
+
 async def copy_session(scope: SessionScope, *, source: str, target: str, move_id: str,
                        progress: Callable[[int, int, str], object] | None = None,
                        ) -> CopyResult:
     """Copy the chat's session files from ``source`` to ``target`` (each
     ``local`` or a machine id) and put them in place there. The source is
     listed again before the commit (a writer that slipped in fails the
-    copy) and the placed set is compared with the one read. Raises
-    ``TransferError``; the caller discards both stagings on a failure.
+    copy) and the placed set is compared with the one read; a file staged or
+    pulled while the engine still wrote fails it too, marked ``changed``.
+    Raises ``TransferError``; the caller discards both stagings on a
+    failure. ``move_id`` names the stagings and the commit (a second try
+    passes its own).
 
     ``progress(done, total, phase)`` follows the whole move: ``total`` is
     the listed bytes once per leg on the wire (twice from a machine to a
@@ -565,18 +633,30 @@ async def copy_session(scope: SessionScope, *, source: str, target: str, move_id
         if placement.is_local(source):
             _tell(done, wire.MOVE_PHASE_STAGE)
             staged[f.rel] = await asyncio.to_thread(local_stage_from_home, scope, move_id, f.rel)
+            if staged[f.rel].stat().st_size != f.size:
+                raise TransferError("transfer_failed", f"{f.rel} changed at the source during the "
+                                    "move", changed=True)
         else:
-            staged[f.rel] = await remote_pull(source, scope, move_id, f,
-                                              progress=_from(done, wire.MOVE_PHASE_COPY))
+            try:
+                staged[f.rel] = await remote_pull(source, scope, move_id, f,
+                                                  progress=_from(done, wire.MOVE_PHASE_COPY))
+            except TransferError as e:
+                # The pull stops at the listed size: a file the engine wrote
+                # since fails it, and the source then lists differently.
+                if await _listed_differently(source, scope, files):
+                    raise TransferError("transfer_failed", f"{f.rel} changed at the source during "
+                                        "the move", changed=True) from e
+                raise
             done += f.size
     if not placement.is_local(target):
         for f in files:
-            await remote_push(target, scope, move_id, f.rel, staged[f.rel], f.sha256,
+            await remote_push(target, scope, move_id, f.rel, f.sha256,
                               progress=_from(done, wire.MOVE_PHASE_COPY))
             done += f.size
     again = await list_files(source, scope)
     if not _same_set(files, again):
-        raise TransferError("transfer_failed", "the session changed at the source during the move")
+        raise TransferError("transfer_failed", "the session changed at the source during the move",
+                            changed=True)
     _tell(total, wire.MOVE_PHASE_COMMIT)
     try:
         if placement.is_local(target):
@@ -604,11 +684,7 @@ async def main_size(place: str, scope: SessionScope, main_rel: str) -> int | Non
     there), from sizes only. The move's proof: the engine appended to the
     file it placed (found under any project key: the engine resumes it
     wherever it lies)."""
-    import asyncio
-    if placement.is_local(place):
-        files = await asyncio.to_thread(local_stat, scope)
-    else:
-        files = await remote_stat(place, scope)
+    files = await sizes(place, scope)
     name = main_rel.rsplit("/", 1)[-1]
     for rel, size in files:
         if rel.rsplit("/", 1)[-1] == name:

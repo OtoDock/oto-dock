@@ -249,3 +249,25 @@ async def test_a_push_is_acknowledged_before_it_is_applied(monkeypatch):
         for _ in range(3):
             await asyncio.sleep(0)
         assert order == expect, insecure
+
+
+@pytest.mark.asyncio
+async def test_the_auth_phase_refuses_an_update_to_the_running_version(actions):
+    from satellite import config
+
+    c = _client(insecure=False)
+    c._ws = _AuthWS({**_UPDATE, "target_version": config.SATELLITE_VERSION})
+    with pytest.raises(ConnectionError, match="it already runs"):
+        await c._authenticate()
+    assert actions["update"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_auth_phase_apply_that_comes_back_frees_the_claim(actions):
+    from satellite.transport import lifecycle_update
+
+    c = _client(insecure=False)
+    c._ws = _AuthWS(_UPDATE)
+    with pytest.raises(ConnectionError, match="without restart"):
+        await c._authenticate()
+    assert lifecycle_update.claim_update(_UPDATE) == ""

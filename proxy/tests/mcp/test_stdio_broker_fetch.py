@@ -3,7 +3,9 @@
 When given a per-(session, mcp) capability token (``OTO_MCP_FETCH_TOKEN``), the
 universal wrapper fetches that MCP's secrets at spawn, merges them into the child
 env, then strips every broker-only var (the token, ``OTO_STRIP_KEYS``-named keys,
-``OTO_BEARER_*``) before exec. Fail-closed: a failed fetch injects nothing.
+``OTO_BEARER_*``) before exec. Fail-closed: a failed fetch injects nothing. A
+platform that restarts is waited for (the permission gate's hold), so a tool
+started meanwhile still gets its secrets.
 
 Pure logic — no real MCP spawn, no network (``_fetch_mcp_credentials`` /
 ``urlopen`` are stubbed).
@@ -11,6 +13,9 @@ Pure logic — no real MCP spawn, no network (``_fetch_mcp_credentials`` /
 
 import sys
 import urllib.error
+import urllib.request
+
+import pytest
 
 from tests._paths import PROXY_DIR
 
@@ -35,7 +40,7 @@ def test_pop_ci_case_insensitive():
 def test_apply_merges_creds_and_strips_token(monkeypatch):
     monkeypatch.setattr(
         itc, "_fetch_mcp_credentials",
-        lambda token, **kw: {"env": {"GH_TOKEN": "secret"}},
+        lambda token, **kw: ({"env": {"GH_TOKEN": "secret"}}, False),
     )
     env = {"OTO_MCP_FETCH_TOKEN": "captok", "PATH": "/bin"}
     itc._apply_broker_credentials(env)
@@ -45,9 +50,9 @@ def test_apply_merges_creds_and_strips_token(monkeypatch):
 
 
 def test_apply_fail_closed_injects_nothing(monkeypatch):
-    monkeypatch.setattr(itc, "_fetch_mcp_credentials", lambda token, **kw: None)
+    monkeypatch.setattr(itc, "_fetch_mcp_credentials", lambda token, **kw: (None, True))
     env = {"OTO_MCP_FETCH_TOKEN": "captok"}
-    itc._apply_broker_credentials(env)
+    assert itc._apply_broker_credentials(env) == (False, True)
     assert env == {}                          # token stripped, nothing injected
 
 
@@ -55,16 +60,16 @@ def test_apply_no_token_skips_fetch(monkeypatch):
     called = []
     monkeypatch.setattr(
         itc, "_fetch_mcp_credentials",
-        lambda token, **kw: called.append(token) or {"env": {}},
+        lambda token, **kw: called.append(token) or ({"env": {}}, False),
     )
     env = {"PATH": "/bin"}
-    itc._apply_broker_credentials(env)
+    assert itc._apply_broker_credentials(env) == (True, False)
     assert env == {"PATH": "/bin"}
     assert called == []                       # no token → no fetch
 
 
 def test_apply_strips_strip_keys_and_bearers(monkeypatch):
-    monkeypatch.setattr(itc, "_fetch_mcp_credentials", lambda token, **kw: {"env": {}})
+    monkeypatch.setattr(itc, "_fetch_mcp_credentials", lambda token, **kw: ({"env": {}}, False))
     env = {
         "OTO_MCP_FETCH_TOKEN": "t",
         "OTO_STRIP_KEYS": "GH_TOKEN, GIT_CONFIG_COUNT",
@@ -98,25 +103,107 @@ def test_fetch_returns_env_on_200(monkeypatch):
     import json
     monkeypatch.setenv("PROXY_URL", "http://127.0.0.1:9")
     monkeypatch.setattr(
-        itc.urllib.request, "urlopen",
+        urllib.request, "urlopen",
         lambda req, timeout=0: _Resp(json.dumps({"env": {"K": "V"}}).encode()),
     )
-    assert itc._fetch_mcp_credentials("tok") == {"env": {"K": "V"}}
+    assert itc._fetch_mcp_credentials("tok") == ({"env": {"K": "V"}}, False)
 
 
-def test_fetch_terminal_on_401_no_retry(monkeypatch):
-    monkeypatch.setenv("PROXY_URL", "http://127.0.0.1:9")
+class _Clock:
+    """``time`` as the fetch reads it: a sleep moves the clock and is kept."""
+
+    def __init__(self, monkeypatch):
+        self.now, self.slept = 1000.0, []
+        monkeypatch.setattr(itc.time, "monotonic", lambda: self.now)
+        monkeypatch.setattr(itc.time, "sleep", self._sleep)
+
+    def _sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def _answers(monkeypatch, seq):
+    """``urlopen`` answering from ``seq``: a status (an error), 0 (no
+    answer) or a dict (a 200 with that body); the last one repeats."""
+    import io
+    import json
     calls = []
 
-    def _raise(req, timeout=0):
+    def _open(req, timeout=0):
         calls.append(1)
-        raise urllib.error.HTTPError(req.full_url, 401, "denied", {}, None)
+        item = seq[min(len(calls) - 1, len(seq) - 1)]
+        if isinstance(item, dict):
+            return _Resp(json.dumps(item).encode())
+        if item == 0:
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        body = io.BytesIO(b'{"error": "tunnel-not-connected"}')
+        raise urllib.error.HTTPError(req.full_url, item, "no", {}, body)
 
-    monkeypatch.setattr(itc.urllib.request, "urlopen", _raise)
-    assert itc._fetch_mcp_credentials("tok", attempts=3) is None
-    assert len(calls) == 1                     # 401 is terminal → no retry/backoff
+    monkeypatch.setenv("PROXY_URL", "http://127.0.0.1:9")
+    monkeypatch.setattr(urllib.request, "urlopen", _open)
+    return calls
+
+
+def test_a_restart_is_waited_for_and_the_secrets_arrive(monkeypatch):
+    """The machine's local link answers 503 at once while the platform
+    restarts (about 20 s): the fetch waits with the gate's backoff and gets
+    the secrets once the platform is back, where four tries over 3.5 s
+    gave the tool nothing for its whole session."""
+    clock = _Clock(monkeypatch)
+    calls = _answers(monkeypatch, [503, 504, 0, 502, 503, {"env": {"K": "V"}}])
+    assert itc._fetch_mcp_credentials("tok") == ({"env": {"K": "V"}}, True)
+    assert clock.slept == [2.0, 4.0, 8.0, 15.0, 15.0] and len(calls) == 6
+
+
+def test_the_wait_ends_after_two_minutes_and_injects_nothing(monkeypatch):
+    clock = _Clock(monkeypatch)
+    _answers(monkeypatch, [503])
+    assert itc._fetch_mcp_credentials("tok") == (None, True)
+    # 2 + 4 + 8 + 15 x 7: the last wait that ends inside two minutes.
+    assert sum(clock.slept) == 119.0 and clock.slept[-1] == 15.0
+
+
+def test_a_refused_token_or_no_bundle_right_after_a_restart_is_asked_again_briefly(monkeypatch):
+    """The machine's sessions are taken back a moment after it signs in
+    again: until then the token is refused or the bundle is missing. The
+    gate's short ladder, then the answer stands."""
+    clock = _Clock(monkeypatch)
+    _answers(monkeypatch, [503, 401, 404, {"env": {"K": "V"}}])
+    assert itc._fetch_mcp_credentials("tok") == ({"env": {"K": "V"}}, True)
+    assert clock.slept == [2.0, 2.0, 4.0]
+    clock = _Clock(monkeypatch)
+    calls = _answers(monkeypatch, [404])
+    assert itc._fetch_mcp_credentials("tok") == (None, True)
+    assert clock.slept == list(itc._AUTH_LADDER) and len(calls) == 4
+
+
+@pytest.mark.parametrize("status", [500, 501, 505])
+def test_a_fault_of_the_platform_is_final_at_once(monkeypatch, status):
+    """A 500 from a platform that answers is the route's own fault: no
+    restart is waited for, as the permission gate waits for none."""
+    clock = _Clock(monkeypatch)
+    calls = _answers(monkeypatch, [status, {"env": {"K": "V"}}])
+    assert itc._fetch_mcp_credentials("tok") == (None, False)
+    assert clock.slept == [] and len(calls) == 1
+
+
+def test_another_refusal_is_final(monkeypatch):
+    clock = _Clock(monkeypatch)
+    calls = _answers(monkeypatch, [400])
+    assert itc._fetch_mcp_credentials("tok") == (None, False)
+    assert clock.slept == [] and len(calls) == 1
+
+
+def test_a_fetch_that_needs_nothing_asks_once(monkeypatch):
+    """A tool with no secret to fetch never waits for the platform."""
+    clock = _Clock(monkeypatch)
+    calls = _answers(monkeypatch, [503])
+    assert itc._fetch_mcp_credentials("tok", hold=False) == (None, False)
+    calls404 = _answers(monkeypatch, [404])
+    assert itc._fetch_mcp_credentials("tok", hold=False) == (None, False)
+    assert clock.slept == [] and len(calls) == 1 and len(calls404) == 1
 
 
 def test_fetch_no_proxy_url_returns_none(monkeypatch):
     monkeypatch.delenv("PROXY_URL", raising=False)
-    assert itc._fetch_mcp_credentials("tok") is None
+    assert itc._fetch_mcp_credentials("tok") == (None, False)

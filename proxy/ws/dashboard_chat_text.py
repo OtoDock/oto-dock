@@ -6,6 +6,7 @@ statement order.
 """
 
 import config
+from core import placement
 
 
 def interactive_prelude(text: str, *, user_tz: str | None, focus_line: str = "") -> str:
@@ -120,6 +121,10 @@ MACHINE_BUSY_NOT_SENT = ("The machine running this chat is not answering. Your m
 MACHINE_GONE_NOT_SENT = ("The computer this chat runs on stopped answering. Your message "
                          "above was not sent. Reconnect it, then send the message again.")
 MACHINE_GONE = "The computer this chat runs on stopped answering. Reconnect it, then try again."
+# The card a start ends with when no compute machine can take the chat
+# (``placement.NoComputeMachine``) and a person's message rides it: the
+# refusal's own sentence, then what became of the message.
+NO_COMPUTE_NOT_SENT = placement.NO_COMPUTE_SENTENCE + " Your message above was not sent."
 # The same, for a chat whose session files are on this server and could not
 # be read (a disk fault): nothing of the chat changes.
 SESSION_FILES_UNREAD_NOT_SENT = ("The files of this chat could not be read. Your message "
@@ -170,5 +175,6 @@ def grace_layer(session_id: str, fallback):
     """The layer to ask whether ``session_id``'s machine is reconnecting: the
     one that holds the session (a chat's resolved layer can be another, e.g.
     the local one for a chat with no pinned target), else ``fallback``."""
-    from core.session.session_manager import find_layer_for_session
-    return find_layer_for_session(session_id) or fallback
+    from core.session.session_manager import live_session
+    live = live_session(session_id)
+    return live.layer if live is not None else fallback

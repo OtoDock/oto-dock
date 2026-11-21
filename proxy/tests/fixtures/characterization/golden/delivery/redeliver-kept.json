@@ -1,0 +1,237 @@
+{
+ "a machine that runs one of the sessions": {
+  "layer": [
+   [
+    "can_resume_session",
+    "s-keep",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "can_resume_session",
+    "s-keep",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "is_session_alive",
+    "s-keep"
+   ]
+  ],
+  "pending": {
+   "c-keep": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "KEEP ONE",
+     "role": ""
+    },
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "KEEP TWO",
+     "role": ""
+    }
+   ],
+   "c-other": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "NOT THIS SWEEP",
+     "role": ""
+    }
+   ],
+   "c-pinned": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "FOR THAT MACHINE",
+     "role": ""
+    }
+   ],
+   "c-so": [
+    {
+     "by": "",
+     "person": "",
+     "prompt": "NO PERSON BELOW EDITOR",
+     "role": "viewer"
+    }
+   ],
+   "c-task": []
+  },
+  "woken": 0
+ },
+ "a rung that raises keeps them": {
+  "layer": [],
+  "pending": {
+   "c-keep": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "KEEP ONE",
+     "role": ""
+    },
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "KEEP TWO",
+     "role": ""
+    }
+   ],
+   "c-other": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "NOT THIS SWEEP",
+     "role": ""
+    }
+   ],
+   "c-pinned": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "FOR THAT MACHINE",
+     "role": ""
+    }
+   ],
+   "c-so": [
+    {
+     "by": "",
+     "person": "",
+     "prompt": "NO PERSON BELOW EDITOR",
+     "role": "viewer"
+    }
+   ],
+   "c-task": []
+  },
+  "woken": 0
+ },
+ "all of them": {
+  "layer": [
+   [
+    "can_resume_session",
+    "s-keep",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "can_resume_session",
+    "s-keep",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "is_session_alive",
+    "s-keep"
+   ],
+   [
+    "is_session_alive",
+    "s-other2"
+   ],
+   [
+    "is_session_alive",
+    "s-pinned"
+   ],
+   [
+    "is_session_alive",
+    "s-so"
+   ],
+   [
+    "is_session_alive",
+    "s-task2"
+   ]
+  ],
+  "pending": {
+   "c-keep": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "KEEP ONE",
+     "role": ""
+    },
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "KEEP TWO",
+     "role": ""
+    }
+   ],
+   "c-other": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "NOT THIS SWEEP",
+     "role": ""
+    }
+   ],
+   "c-pinned": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "FOR THAT MACHINE",
+     "role": ""
+    }
+   ],
+   "c-so": [
+    {
+     "by": "",
+     "person": "",
+     "prompt": "NO PERSON BELOW EDITOR",
+     "role": "viewer"
+    }
+   ],
+   "c-task": []
+  },
+  "woken": 0
+ },
+ "one machine's": {
+  "layer": [
+   [
+    "is_session_alive",
+    "s-pinned"
+   ]
+  ],
+  "pending": {
+   "c-keep": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "KEEP ONE",
+     "role": ""
+    },
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "KEEP TWO",
+     "role": ""
+    }
+   ],
+   "c-other": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "NOT THIS SWEEP",
+     "role": ""
+    }
+   ],
+   "c-pinned": [
+    {
+     "by": "",
+     "person": "user-viewer",
+     "prompt": "FOR THAT MACHINE",
+     "role": ""
+    }
+   ],
+   "c-so": [
+    {
+     "by": "",
+     "person": "",
+     "prompt": "NO PERSON BELOW EDITOR",
+     "role": "viewer"
+    }
+   ],
+   "c-task": []
+  },
+  "woken": 0
+ }
+}

@@ -13,6 +13,80 @@ migration, a changed default, is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-21
+
+### Upgrade notes
+
+- **Before you update.** Take a backup with `backup.sh`. Update when nobody works: running chats and tasks end. The update saves the database first. If it fails, it puts the old release back or prints how to go back. An install older than 1.9.1 first runs `bash upgrade.sh --to 1.9.1`.
+- **Docker installs.** Chats, tasks and tools now run in a new container, `otodock-compute`. The update copies your tools into it, so the first start takes a few minutes. The new images need about 11 GB of free disk.
+- **Docker installs with their own settings.** If `.env` sets `OTODOCK_PROXY_MEM_LIMIT`, that cap no longer covers chats and tools: set `OTODOCK_COMPUTE_MEM_LIMIT` for them. If `docker-compose.override.yml` adds folders to `otodock-proxy`, add them to `otodock-compute` too.
+- **Installs from source.** Stop OtoDock, run `scripts/dev-setup.sh --service`, then start it again. Without it no chat runs.
+- **Paired computers** update themselves and restart once. With automatic updates off, press Update now under Admin, Remote Machines. Keep Windows laptops plugged in. A Windows computer with Python older than 3.11.4 (`python --version`) needs Python 3.12 and a new pairing.
+- **SSH keys.** An agent's SSH key opens only the hosts an admin gave it. It no longer signs git commits.
+- **New models.** GPT-6.2 Sol and Astra replace GPT-6.1 Sol and GPT-6 Astra. Claude Fable 5.2 replaces 5.1. Agents, chats and tasks move by themselves. If you turned an old GPT model off, turn the new one off too.
+- **Video and pictures.** Video now defaults to Gemini Omni Flash. Veo needs a fal.ai key on Video Generation, under Admin, MCP Servers. Pictures now count toward the limits under Admin, Usage.
+- **Agents with a phone line.** Callers get only what a manager ticks on the External identities card, in Agent Settings, Configuration. Until then they get the call tools and their notes. A notification names these agents. Each call now ends with a model summary, which the card turns off.
+- **Apps shared by link.** A link to an app that reads the agent's files stops opening. After the update a notification names these apps and says how to open them again. If a button stops working for link visitors, ask the agent to update the app.
+- **Personal only agents** can no longer have accounts of their own, such as a Google account connected for the agent. The update removes them. People's own accounts stay. To keep them, set the agent's visibility to Personal + shared in Agent Settings, Configuration before you update.
+- **Old uploads are deleted.** Files uploaded into chats and untouched for 180 days go to the Recover bin for 7 days, then are deleted. This starts 30 days after the update. Change the days or turn it off under Admin, Setup, System Settings.
+- **Delegated work.** A result that comes back to a chat in Ask mode waits for your approval. Chats an agent starts for you use your own AI account.
+- **Check your settings.** In 1.9.1 a field could save its default by mistake. Under Admin, Setup, check that General, Security, System Settings and Phone show the values you set.
+- **Tools in their own container,** such as File Tools, stop after 15 idle minutes and start again when used.
+- **Browser (Camoufox)** stops reaching your local network once it updates. Its Internal network access switch, on its card under Admin, MCP Servers, allows it again.
+- **Rare setups.** A login gateway in front of OtoDock must let `/v1/api/` through. Behind a SOCKS proxy, set an http proxy in `HTTPS_PROXY`, or tools that need a key are off. Symbolic links to folders inside an agent's folder are ignored: move the folders back.
+
+### Added
+
+- **Outside people.** On an agent's External identities card, a manager picks what a caller or a link visitor gets. The Conversations tab lists every caller.
+- **Chats go on after a restart.** Later updates wait up to ten minutes for open work.
+- **Your own API key,** under User Settings, Integrations, API Keys. Another agent or a script can use OtoDock with it.
+- **Compute machines on other servers.** Admin, Remote Machines, Add a compute machine gives the command to run there.
+- **Several accounts of one tool for an agent,** for example a work and a private mailbox.
+- **Community agents and departments** share one list.
+- **Pin a chat** from your chat history.
+- **Apps play the workspace's video, audio and pictures.**
+- **SSH hosts** now work in chats on your own paired computer, Windows too.
+- **People with no AI account** can open agents, apps and files.
+- **Delete old history,** a new setting per agent. Off by default, in Agent Settings, Configuration.
+
+### Changed
+
+- **Computer control is faster.** The agent can do several actions in one go.
+- **AI accounts.** A chat picks an AI account by its model. It moves to another only near a limit.
+- **Claude Code 2.1.325 and Codex 0.170.0.** In Ask, a Codex command that needs the internet asks first. In a chat's terminal, Shift+Tab only makes Claude Code ask for approval more often. The mode menu makes it ask less.
+- **A small server runs fewer chats.** A chat starts only while enough memory is free.
+- **Calls** hear first words and interruptions better. A call on a person's line shows in that person's chats.
+- **A silent paired computer** shows as offline within 90 seconds. On Linux, a command that uses too much memory is stopped.
+
+### Fixed
+
+- **Your files.** The Recover your files notice appears only for a file changed in two places at once. Deleted files stay deleted. A failed upload no longer loses your change.
+- **Reminders** an agent set for itself arrive on time.
+- **Failed steps.** When a command, a file read or a tool fails in a Claude Code chat, the chat shows its error.
+- **Terminal chats** on a paired computer keep their answers in the history when the connection drops for a moment.
+- **Long tool jobs.** A long document job or video render in a Claude Code chat no longer stops after five quiet minutes.
+- **Tools on a remote machine** now show in User Settings, Integrations, where you add your account.
+- **Codex** now signs in with an OpenAI API key.
+- **GPT Image** works again.
+
+### Security
+
+- **Keys stay on the server.** Chats no longer hold your tools' keys or SSH keys, except picture search's SerpAPI key. Google sign-ins stay on the server too.
+- **Callers** get no shell and no shared workspace.
+- **A phone line tied to an admin.** A call on it now acts with the manager role of its agent everywhere, never as an admin.
+- **Role changes.** An open chat keeps the role its person had when it started. After you raise a role, that person starts a new chat.
+- **Agent knowledge.** An editor can no longer write into a manager's running task, which has the right to change the agent's knowledge.
+- **Departments.** Only an admin, the department's creator or someone who manages all its agents can add an agent to it.
+- **Chat modes.** An agent cannot make its terminal ask you less. A message sent right after switching chats lands in the chat you see.
+- **Server files.** Installing a tool cannot read the server's secrets, and memory history cannot run commands. After the update, look for `set aside` in `docker compose logs otodock-proxy`. If a line shows it, read the advisories on the Security tab of OtoDock/oto-dock on GitHub.
+- **Files others wrote.** A file or shortcut placed by another person, a session or a paired computer can no longer make the server read or change a file outside its folder. It cannot stop the sync either.
+- **App buttons.** Typed text acts with the rights of the person who typed it, never the app's.
+- **Direct LLM chats** reach only the folders they were given.
+- **GitHub.** For an agent limited to chosen repositories, its git and GitHub commands are checked against that list.
+- **Phone call logs** keep no words of a call. On Docker the update clears the old ones. From source, `phone/phone-server.log` keeps them until it rotates.
+- **Open documents** close or turn read only within seconds when a person loses access.
+- **Security updates:** PostgreSQL 16.16 and Node 26.13.1, on a newer Debian 13 base. The database keeps its data.
+
 ## [1.9.1] - 2026-11-04
 
 ### Upgrade notes
@@ -1217,7 +1291,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.9.1...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/OtoDock/oto-dock/compare/v1.9.1...v2.0.0
 [1.9.1]: https://github.com/OtoDock/oto-dock/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/OtoDock/oto-dock/compare/v1.8.1...v1.9.0
 [1.8.1]: https://github.com/OtoDock/oto-dock/compare/v1.8.0...v1.8.1

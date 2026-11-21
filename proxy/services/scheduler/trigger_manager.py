@@ -349,7 +349,7 @@ def _validate_subscription_linkage(
             raise TriggerValidationError(
                 f"this subscription is personal; an agent trigger needs a "
                 f"subscription created for the agent: Agent Settings → MCPs "
-                f"→ {mcp} → Subscribe to events for this agent"
+                f"→ {mcp} → one of its accounts → Subscribe to events"
             )
         if sub.get("agent") != trigger_agent:
             raise TriggerValidationError(

@@ -13,6 +13,8 @@ Reconciliation protocol (audit-hardened, plan §2):
 - **Identical set everywhere** — the enabled set comes from
   ``get_on_demand_skills_for_materialization`` (context-free,
   placement-free), so concurrent ensures for the same dir can't ping-pong.
+  An outside session's own dir (a caller's tree, used by nothing else)
+  takes the set the one rule admits with the Outside people picks.
 - **Serialized per dir**: ``flock`` on a lock file under
   ``SESSIONS_DIR/skills-locks/`` (ensures run in threads across several
   builders, and multiple proxy workers may race). The lock lives OUTSIDE
@@ -227,19 +229,23 @@ def _quarantine(skills_rel: str, name: str) -> None:
 
 
 def materialize_skills_for_sandbox(agent_name: str, config_dir: Path, *,
-                                   username: str = "") -> None:
+                                   username: str = "", outside_picks=None,
+                                   kind_rule=None) -> None:
     """Reconcile ``<config_dir>/skills/`` to the agent's enabled on-demand set.
 
     ``username`` is the person whose own config dir this is: a skill whose
     ``audience`` their role on the agent fails is left out (one person, one
     role, so every session sharing the dir computes the same set); the
-    agent-level dir keeps the role-free set.
+    agent-level dir keeps the role-free set. ``outside_picks`` names an
+    outside session's own dir: the set is the picked tools' skills.
+    ``kind_rule`` names a wrap-up's own scratch dir: its kind's tools'.
 
     Fail-soft at every level: any error logs and leaves the session start
     unaffected (hooks stay fail-hard; skills never block a session).
     """
     try:
-        _materialize_locked(agent_name, Path(config_dir), username=username)
+        _materialize_locked(agent_name, Path(config_dir), username=username,
+                            outside_picks=outside_picks, kind_rule=kind_rule)
     except Exception:
         logger.exception(
             "skills materialization failed for agent=%s dir=%s — session "
@@ -257,12 +263,13 @@ def _lock_path(config_dir: Path) -> Path:
     return locks / f"{digest}.lock"
 
 
-def _materialize_locked(agent_name: str, config_dir: Path, *, username: str = "") -> None:
+def _materialize_locked(agent_name: str, config_dir: Path, *, username: str = "",
+                        outside_picks=None, kind_rule=None) -> None:
     import config
     from services.mcp import mcp_registry
 
     wanted = mcp_registry.get_on_demand_skills_for_materialization(
-        agent_name, username=username or None)
+        agent_name, username=username or None, outside_picks=outside_picks, kind_rule=kind_rule)
     skills_dir = config_dir / "skills"
     if not wanted and not skills_dir.is_dir():
         return  # nothing to add, nothing to reconcile — don't create churn

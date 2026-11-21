@@ -13,9 +13,11 @@ pipe). These tests cover the explicit release primitive that fixes it:
   * ``cleanup_session_permission_state(session_id)`` releases pending waiters.
   * A waiter for a *different* session is never touched.
   * No leak: the index / event maps are empty after release.
+  * The close of a session on a machine and a Stop of its turn release its
+    waiters (``RemoteExecutionLayer.close_session``, ``.abort``).
 
-Pure-asyncio against ``core.session.session_state`` — no DB, so this file is immune to
-the conftest DB-pool flake.
+The primitive's tests are pure asyncio against ``core.session.session_state``
+(no DB); the last two close and stop a session through the remote layer.
 """
 
 import asyncio
@@ -191,145 +193,63 @@ async def test_timeout_denies():
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# PersistentSession.close: a parked turn is interrupted and released first
+# A session on a machine: its close and a Stop release its parked card
 # ─────────────────────────────────────────────────────────────────────────
 
 
-class _CloseStdin:
-    """Records the interrupt frames and, when closed, whether the session's
-    waiters had been released by then; ``wedged`` never drains."""
+def _on_a_machine(session_id: str = "sess-park"):
+    """The remote layer holding one Claude Code session, and its record."""
+    from unittest.mock import AsyncMock, MagicMock
 
-    def __init__(self, proc: "_CloseProc", *, wedged: bool = False):
-        self.proc = proc
-        self.lines: list[dict] = []
-        self.wedged = wedged
-        self.closed_after_release: bool | None = None
-
-    def write(self, data: bytes) -> None:
-        import json
-        self.lines.append(json.loads(data))
-
-    async def drain(self) -> None:
-        if self.wedged:
-            await asyncio.Event().wait()
-
-    def close(self) -> None:
-        self.closed_after_release = not _session_permission_requests.get(self.proc.sid)
-        self.proc.returncode = 0   # the CLI exits at its stdin's end
-        self.proc.exited.set()
-
-
-class _CloseProc:
-    def __init__(self, sid: str, *, returncode: int | None = None, wedged: bool = False):
-        self.sid = sid
-        self.pid = 4343
-        self.returncode = returncode
-        self.exited = asyncio.Event()
-        self.stdin = _CloseStdin(self, wedged=wedged)
-
-    async def wait(self) -> int:
-        await self.exited.wait()
-        return self.returncode
-
-
-@pytest.fixture
-def parked(monkeypatch):
-    """A session with a fake CLI; ``kills`` records the close's kill."""
-    import types
-
-    from core.layers.cli import session as cli_session_mod
-    from core.layers.cli.session import PersistentSession
-
-    kills: list[str] = []
-
-    async def _kill(proc, sid):
-        kills.append(sid)
-    monkeypatch.setattr(cli_session_mod, "_kill_process", _kill)
-
-    def _make(sid: str, **proc_kw) -> PersistentSession:
-        s = PersistentSession(session_id=sid, agent_prompt=None, mcp_config_path=None,
-                              model="claude-sonnet-5-5", agent_name="agent")
-        s.proc = _CloseProc(sid, **proc_kw)
-        s._started = True
-        s._translator = types.SimpleNamespace(interrupted=False)
-        return s
-    _make.kills = kills
-    return _make
-
-
-def _interrupts(session) -> list[dict]:
-    return [f for f in session.proc.stdin.lines
-            if f.get("type") == "control_request" and f["request"]["subtype"] == "interrupt"]
+    from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
+    cm = MagicMock()
+    cm.send_command = AsyncMock()
+    cm.send_fire_and_forget = AsyncMock()
+    layer = RemoteExecutionLayer(cm)
+    info = RemoteSessionInfo(session_id=session_id, machine_id="m-1", agent_name="agent",
+                             execution_path="claude-code-cli", event_queue=asyncio.Queue())
+    layer._sessions[session_id] = info
+    return layer, info
 
 
 @pytest.mark.asyncio
-async def test_close_interrupts_a_parked_turn_and_releases_it_before_stdin_closes(parked):
-    s = parked("sess-park")
-    s._turn_active = True
-    waiter = await _spawn_waiter("rid-card", "sess-park")
-    await s.close()
-    assert len(_interrupts(s)) == 1
-    assert s._translator.interrupted is True   # the interrupted result ends quietly
-    assert s.proc.stdin.closed_after_release is True
-    assert await asyncio.wait_for(waiter, 1) is False
-    assert parked.kills == []
+@pytest.mark.parametrize("machine_answers", (True, False), ids=("closed", "machine-silent"))
+async def test_the_close_of_a_session_on_a_machine_releases_its_parked_card(machine_answers):
+    """The close denies the card the turn is parked on, so nothing waits out
+    the card's own bound on a session that is gone, whether the machine
+    took the close or never answered it."""
+    layer, _info = _on_a_machine()
+    if not machine_answers:
+        layer._cm.send_command.side_effect = RuntimeError("the machine did not answer")
+    parked = await _spawn_waiter("rid-card", "sess-park")
+    other = await _spawn_waiter("rid-other", "sess-other")
+    await layer.close_session("sess-park")
+    assert layer._cm.send_command.await_args.args[1]["type"] == "close_session"
+    assert await asyncio.wait_for(parked, 1) is False
+    assert "sess-park" not in _session_permission_requests
+    assert not other.done()   # another session's card still waits
+    resolve_session_permissions("sess-other")
+    assert await other is False
 
 
 @pytest.mark.asyncio
-async def test_close_interrupts_for_the_engines_own_request_between_turns(parked):
-    """Claude's own stdio request, read between our turns, holds the CLI's
-    turn open and its release writes nothing back: the interrupt ends it."""
-    from core.session.session_state import open_permission_wait
-    s = parked("sess-engine")
-    s._turn_active = False
-    open_permission_wait("rid-engine", "sess-engine")
-    await s.close()
-    assert len(_interrupts(s)) == 1
-    assert s.proc.stdin.closed_after_release is True
-    assert "sess-engine" not in _session_permission_requests
-
-
-@pytest.mark.asyncio
-async def test_close_without_a_prompt_writes_nothing(parked):
-    s = parked("sess-idle")
-    s._turn_active = True
-    await s.close()
-    assert s.proc.stdin.lines == []
-    assert s.proc.stdin.closed_after_release is True
-    assert parked.kills == []
-
-
-@pytest.mark.asyncio
-async def test_close_of_a_dead_process_still_releases_its_waiter(parked):
-    s = parked("sess-dead", returncode=1)
-    waiter = await _spawn_waiter("rid-dead", "sess-dead")
-    await s.close()
-    assert s.proc.stdin.lines == []
-    assert s.proc.stdin.closed_after_release is None   # stdin never touched
-    assert await asyncio.wait_for(waiter, 1) is False
-
-
-@pytest.mark.asyncio
-async def test_a_wedged_pipe_does_not_hold_the_close(parked, monkeypatch):
-    from core.layers.cli import session as cli_session_mod
-    monkeypatch.setattr(cli_session_mod, "_CLOSE_INTERRUPT_S", 0.1)
-    s = parked("sess-wedged", wedged=True)
-    s._turn_active = True
-    waiter = await _spawn_waiter("rid-wedged", "sess-wedged")
-    await asyncio.wait_for(s.close(), timeout=2)
-    assert await asyncio.wait_for(waiter, 1) is False
-    assert s.proc.stdin.closed_after_release is True
-    # Written but not drained: the frame may still reach the CLI, and its
-    # result must read as the interrupt.
-    assert s._translator.interrupted is True and s._post_interrupt_watch is True
-
-
-@pytest.mark.asyncio
-async def test_a_second_close_does_nothing(parked):
-    s = parked("sess-twice")
-    s._turn_active = True
-    waiter = await _spawn_waiter("rid-twice", "sess-twice")
-    await s.close()
-    await s.close()
-    assert len(_interrupts(s)) == 1
-    assert await asyncio.wait_for(waiter, 1) is False
+@pytest.mark.parametrize("turn_live", (True, False), ids=("soft-interrupt", "hard-abort"))
+async def test_a_stop_of_a_session_on_a_machine_releases_its_parked_card(turn_live):
+    """A Stop denies the card the turn is parked on, with the soft interrupt
+    of a live turn and on the hard path alike: the turn it asked to close
+    is not left waiting on a person."""
+    layer, info = _on_a_machine()
+    info.turn_active = turn_live
+    info.current_send_command_id = "cmd-1"
+    parked = await _spawn_waiter("rid-card", "sess-park")
+    other = await _spawn_waiter("rid-other", "sess-other")
+    assert await layer.abort("sess-park") is turn_live
+    assert await asyncio.wait_for(parked, 1) is False
+    assert [c.args[1]["type"] for c in layer._cm.send_fire_and_forget.await_args_list] == [
+        "interrupt_turn" if turn_live else "abort"]
+    assert not other.done()
+    resolve_session_permissions("sess-other")
+    assert await other is False
+    # The turn closed: the watchdog the soft interrupt armed stands down.
+    info.turn_active = False
+    await asyncio.sleep(0.3)

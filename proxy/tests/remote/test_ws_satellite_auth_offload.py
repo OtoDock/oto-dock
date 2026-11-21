@@ -92,10 +92,17 @@ async def _row(machine_id):
     return await run_db(remote_store.get_remote_machine, machine_id)
 
 
-def _auth(machine_id, secret, version=None):
+def _one_below(version: str) -> str:
+    """A satellite one patch below ``version``: below the platform's latest,
+    so the sign-in pushes the update."""
+    head, _, last = version.rpartition(".")
+    return f"{head}.{int(last) - 1}"
+
+
+def _auth(machine_id, secret, version=None, capabilities=None):
     return {
         "type": "auth", "machine_id": machine_id, "machine_secret": secret,
-        "capabilities": {"os": "linux", "installed_clis": ["claude-code"]},
+        "capabilities": {"os": "linux", "installed_clis": ["claude-code"], **(capabilities or {})},
         "satellite_version": version or sat_ws.SATELLITE_VERSION_LATEST,
     }
 
@@ -184,7 +191,7 @@ async def test_update_push_4007_and_rollback_bookkeeping(loop_db_guard, monkeypa
 
     # 1. Old satellite → auth ok first (its 5 s wait is over before the
     #    tarball goes), then the tarball push + close 4007, target remembered.
-    ws = FakeSatelliteWS(_auth(mid, secret, version=sat_ws.MIN_SATELLITE_VERSION))
+    ws = FakeSatelliteWS(_auth(mid, secret, version=_one_below(sat_ws.SATELLITE_VERSION_LATEST)))
     with loop_db_guard.active():
         await sat_ws.ws_satellite_handler(ws)
     assert [f["type"] for f in ws.sent] == ["auth_result", "update_required"]
@@ -196,7 +203,7 @@ async def test_update_push_4007_and_rollback_bookkeeping(loop_db_guard, monkeypa
 
     # 2. It reconnects BELOW the target → rollback recorded off-loop, no
     #    re-push, connects on the old version.
-    ws2 = FakeSatelliteWS(_auth(mid, secret, version=sat_ws.MIN_SATELLITE_VERSION))
+    ws2 = FakeSatelliteWS(_auth(mid, secret, version=_one_below(sat_ws.SATELLITE_VERSION_LATEST)))
     with loop_db_guard.active():
         await sat_ws.ws_satellite_handler(ws2)
         await _settle()
@@ -204,6 +211,34 @@ async def test_update_push_4007_and_rollback_bookkeeping(loop_db_guard, monkeypa
     row = await _row(mid)
     assert int(row["update_rollback_count"]) == 1
     assert row["update_rollback_target"] == sat_ws.SATELLITE_VERSION_LATEST
+
+
+@pytest.mark.asyncio
+async def test_below_the_floor_the_push_stops_at_the_rollback_that_reaches_the_limit(loop_db_guard, monkeypatch):
+    """A satellite below the floor is pushed at each sign-in until its
+    rollbacks of the target reach ``MAX_AUTO_UPDATE_ROLLBACKS``. The sign-in
+    that records the last one reads the count it just wrote, so it pushes
+    nothing and refuses the machine until Update now."""
+    from api.remote import remote_machines as rm
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "deadbeef"))
+    monkeypatch.setattr(sat_ws, "MIN_SATELLITE_VERSION", sat_ws.SATELLITE_VERSION_LATEST)
+    mid, secret = await _make_machine()
+    old = _one_below(sat_ws.SATELLITE_VERSION_LATEST)
+    for rolled_back in range(sat_ws.MAX_AUTO_UPDATE_ROLLBACKS):
+        ws = FakeSatelliteWS(_auth(mid, secret, version=old))
+        with loop_db_guard.active():
+            await sat_ws.ws_satellite_handler(ws)
+            await _settle()
+        assert [f["type"] for f in ws.sent] == ["auth_result", "update_required"]
+        assert int((await _row(mid))["update_rollback_count"] or 0) == rolled_back
+    last = FakeSatelliteWS(_auth(mid, secret, version=old))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(last)
+        await _settle()
+    assert "update_required" not in [f.get("type") for f in last.sent]
+    assert last.closed is not None and last.closed[0] == 4001
+    assert int((await _row(mid))["update_rollback_count"]) == sat_ws.MAX_AUTO_UPDATE_ROLLBACKS
+    assert mid not in sat_ws._pending_pushed_updates
 
 
 @pytest.mark.asyncio
@@ -219,7 +254,7 @@ async def test_a_push_whose_socket_was_gone_counts_no_rollback(loop_db_guard, mo
         banners.append(a)
     monkeypatch.setattr(sat_ws, "_broadcast_satellite_updating", _updating)
     mid, secret = await _make_machine()
-    old = sat_ws.MIN_SATELLITE_VERSION
+    old = _one_below(sat_ws.SATELLITE_VERSION_LATEST)
     ws = FakeSatelliteWS(_auth(mid, secret, version=old), gone_code=1005)
     with loop_db_guard.active():
         await sat_ws.ws_satellite_handler(ws)
@@ -243,11 +278,13 @@ async def test_an_acknowledged_push_counts_and_a_lost_ack_falls_back_to_the_sock
     socket's state decides, so a lost ack never switches the budget off."""
     from api.remote import remote_machines as rm
     monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "deadbeef"))
-    monkeypatch.setattr(sat_ws, "UPDATE_ACK_SATELLITE_VERSION", sat_ws.MIN_SATELLITE_VERSION)
     monkeypatch.setattr(sat_ws, "_UPDATE_ACK_WAIT_S", 0.2)
     mid, secret = await _make_machine()
-    old = sat_ws.MIN_SATELLITE_VERSION
+    old = _one_below(sat_ws.SATELLITE_VERSION_LATEST)
     target = sat_ws.SATELLITE_VERSION_LATEST
+    # The satellite under test is one below the floor, so the acknowledging
+    # generation is set to it: the test is about the ack, not the floor.
+    monkeypatch.setattr(sat_ws, "UPDATE_ACK_SATELLITE_VERSION", old)
     acked = FakeSatelliteWS(_auth(mid, secret, version=old), gone_code=1005, frames=[
         {"type": "heartbeat"}, {"type": "update_received", "target_version": target}])
     with loop_db_guard.active():
@@ -272,7 +309,7 @@ async def test_an_update_waits_out_the_proxys_start_and_drops_a_socket_that_ends
     monkeypatch.setattr(sat_ws, "UPDATE_HOLD_S", 0.3)
     monkeypatch.setattr(sat_ws, "_serving_since", None)
     mid, secret = await _make_machine()
-    old = sat_ws.MIN_SATELLITE_VERSION
+    old = _one_below(sat_ws.SATELLITE_VERSION_LATEST)
 
     class _EndsInTheHold(FakeSatelliteWS):
         async def receive(self):
@@ -489,3 +526,290 @@ async def test_a_fault_building_the_answer_is_not_read_as_a_gone_machine(loop_db
     mid, secret = await _make_machine()
     with pytest.raises(RuntimeError, match="policy builder"):
         await sat_ws.ws_satellite_handler(FakeSatelliteWS(_auth(mid, secret)))
+
+
+@pytest.mark.asyncio
+async def test_the_answer_names_the_sign_in_and_the_version_is_written_only_when_it_changed(monkeypatch):
+    """Each sign-in's answer carries a fresh ``report_id`` (the alive report's
+    identity), and a machine that signs in again on the version its row
+    already holds writes nothing for it."""
+    from storage import remote_store
+    mid, secret = await _make_machine()
+    writes: list[str] = []
+    real = remote_store.set_satellite_version
+    monkeypatch.setattr(remote_store, "set_satellite_version",
+                        lambda machine_id, version: writes.append(version) or real(machine_id, version))
+    ids = []
+    for _ in range(3):
+        ws = FakeSatelliteWS(_auth(mid, secret))
+        await sat_ws.ws_satellite_handler(ws)
+        await _settle()
+        ids.append(ws.sent[0].get("report_id"))
+    assert all(ids) and len(set(ids)) == 3
+    assert writes == [sat_ws.SATELLITE_VERSION_LATEST]
+    assert (await _row(mid))["satellite_version"] == sat_ws.SATELLITE_VERSION_LATEST
+
+
+@pytest.mark.asyncio
+async def test_a_busy_machine_connects_on_its_version_and_its_update_waits_for_an_idle_moment(
+    loop_db_guard, monkeypatch,
+):
+    """A machine running a session takes the update when it is idle (the
+    push would end the session): it connects on its version and is marked.
+    At zero sessions, on "Update now", and from a satellite that sends no
+    count it is pushed at the sign-in."""
+    from api.remote import remote_machines as rm
+    from core.remote.satellite_connection import get_connection_manager
+    from storage import remote_store
+    from storage.pg import run_db
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "deadbeef"))
+    mid, secret = await _make_machine()
+    old = _one_below(sat_ws.SATELLITE_VERSION_LATEST)
+    # Above the floor: below it the update is pushed at the sign-in whatever runs.
+    monkeypatch.setattr(sat_ws, "MIN_SATELLITE_VERSION", old)
+    links = get_connection_manager().links
+
+    async def sign_in(**caps):
+        ws = FakeSatelliteWS(_auth(mid, secret, version=old, capabilities=caps))
+        with loop_db_guard.active():
+            await sat_ws.ws_satellite_handler(ws)
+            await _settle()
+        return [f["type"] for f in ws.sent]
+
+    assert await sign_in(active_sessions=2) == ["auth_result"]
+    assert links.update_waiting(mid) == sat_ws.SATELLITE_VERSION_LATEST
+    assert mid not in sat_ws._pending_pushed_updates
+    assert await sign_in(active_sessions=0) == ["auth_result", "update_required"]
+    assert links.update_waiting(mid) == ""
+    sat_ws._pending_pushed_updates.pop(mid, None)
+    assert await sign_in() == ["auth_result", "update_required"]
+    sat_ws._pending_pushed_updates.pop(mid, None)
+    await run_db(remote_store.set_pending_update, mid, True)
+    assert await sign_in(active_sessions=2) == ["auth_result", "update_required"]
+    sat_ws._pending_pushed_updates.pop(mid, None)
+    # A sign-in on the target version clears a mark.
+    links.update_waits(mid, sat_ws.SATELLITE_VERSION_LATEST)
+    ws = FakeSatelliteWS(_auth(mid, secret, capabilities={"active_sessions": 1}))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+        await _settle()
+    assert links.update_waiting(mid) == ""
+
+
+@pytest.mark.asyncio
+async def test_a_machine_a_start_is_on_its_way_to_takes_its_update_once_the_start_is_in(
+    loop_db_guard, monkeypatch,
+):
+    """A sign-in with no live session but a session start on its way to the
+    machine (a build placed it there) connects on its version and is marked:
+    the push would end that session as it begins."""
+    from api.remote import remote_machines as rm
+    from core.remote.satellite_connection import get_connection_manager
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "deadbeef"))
+    mid, secret = await _make_machine()
+    old = _one_below(sat_ws.SATELLITE_VERSION_LATEST)
+    monkeypatch.setattr(sat_ws, "MIN_SATELLITE_VERSION", old)
+    links = get_connection_manager().links
+    links.hold_for_start(mid, 60.0)
+    try:
+        ws = FakeSatelliteWS(_auth(mid, secret, version=old, capabilities={"active_sessions": 0}))
+        with loop_db_guard.active():
+            await sat_ws.ws_satellite_handler(ws)
+            await _settle()
+        assert [f["type"] for f in ws.sent] == ["auth_result"]
+        assert links.update_waiting(mid) == sat_ws.SATELLITE_VERSION_LATEST
+    finally:
+        links.get(mid).start_held_until = 0.0
+        links.update_waits(mid, "")
+
+
+@pytest.mark.asyncio
+async def test_a_sign_in_on_the_newest_version_clears_a_queued_update(loop_db_guard, monkeypatch):
+    """A press while the machine restarted queued an update, and it signed in
+    on the version its row already held: the sign-in clears the mark. A
+    sign-in on an older version keeps it: that sign-in is pushed the update."""
+    from api.remote import remote_machines as rm
+    from storage import remote_store
+    from storage.pg import run_db
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "deadbeef"))
+    mid, secret = await _make_machine()
+    latest = sat_ws.SATELLITE_VERSION_LATEST
+    await run_db(remote_store.set_satellite_version, mid, latest)
+    await run_db(remote_store.set_pending_update, mid, True)
+    ws = FakeSatelliteWS(_auth(mid, secret, version=latest))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+        await _settle()
+    assert [f["type"] for f in ws.sent] == ["auth_result"]
+    row = await _row(mid)
+    assert row["pending_update"] is False and row["satellite_version"] == latest
+
+    await run_db(remote_store.set_pending_update, mid, True)
+    ws = FakeSatelliteWS(_auth(mid, secret, version=_one_below(latest)))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+        await _settle()
+    assert [f["type"] for f in ws.sent] == ["auth_result", "update_required"]
+    assert (await _row(mid))["pending_update"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_sign_in_that_cannot_take_the_update_clears_a_queued_one(loop_db_guard, monkeypatch):
+    """A plaintext link takes no update: a mark left from before would push
+    at once the day its link turns secure, whatever runs there then. (A
+    floor below the newest version, as between two major releases.)"""
+    from storage import remote_store
+    from storage.pg import run_db
+    monkeypatch.setattr(sat_ws, "MIN_SATELLITE_VERSION", "0.5.171")
+    mid, secret = await _make_machine()
+    await run_db(remote_store.set_pending_update, mid, True)
+    ws = FakeSatelliteWS(_auth(mid, secret, version=_one_below(sat_ws.SATELLITE_VERSION_LATEST),
+                               capabilities={"insecure_transport": True}))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+        await _settle()
+    assert [f["type"] for f in ws.sent] == ["auth_result"]
+    assert (await _row(mid))["pending_update"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_sign_ins_push_marks_the_update_running_before_it_sends(loop_db_guard, monkeypatch):
+    """A press while the machine restarts after the push at its sign-in finds
+    the update running; its next sign-in ends the mark."""
+    from api.remote import remote_machines as rm
+    from core.remote.satellite_connection import get_connection_manager
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "deadbeef"))
+    mid, secret = await _make_machine()
+    links = get_connection_manager().links
+    latest = sat_ws.SATELLITE_VERSION_LATEST
+    seen_at_send: list[str] = []
+
+    class _Watching(FakeSatelliteWS):
+        async def send_text(self, text):
+            if json.loads(text).get("type") == "update_required":
+                seen_at_send.append(links.update_running(mid))
+            await super().send_text(text)
+
+    ws = _Watching(_auth(mid, secret, version=_one_below(latest)))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+    assert seen_at_send == [latest]
+    assert links.update_running(mid) == latest
+    machine = await _row(mid)
+    assert rm.machine_update_state(mid, machine, None) == "running"
+    ws = FakeSatelliteWS(_auth(mid, secret, version=latest))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+        await _settle()
+    assert links.update_running(mid) == ""
+
+    # A push whose send failed never left: no update runs.
+    class _PushFails(FakeSatelliteWS):
+        async def send_text(self, text):
+            if json.loads(text).get("type") == "update_required":
+                raise RuntimeError("the socket is gone")
+            await super().send_text(text)
+
+    ws = _PushFails(_auth(mid, secret, version=_one_below(latest)))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+        await _settle()
+    assert links.update_running(mid) == ""
+
+
+@pytest.mark.asyncio
+async def test_the_idle_hook_pushes_the_waiting_update_once(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from api.remote import remote_machines as rm
+    from core.remote import satellite_link
+    from core.remote.satellite_connection import get_connection_manager
+    mid, _secret = await _make_machine()
+    pushed = AsyncMock(return_value=True)
+    monkeypatch.setattr(rm, "push_update_online", pushed)
+    satellite_link.reset_hooks()
+    sat_ws.register()
+    try:
+        links = get_connection_manager().links
+        links.update_waits(mid, "")
+        links.idle(mid)
+        await asyncio.sleep(0.05)
+        pushed.assert_not_awaited()
+        links.update_waits(mid, sat_ws.SATELLITE_VERSION_LATEST)
+        links.idle(mid)
+        links.idle(mid)
+        await asyncio.sleep(0.1)
+        assert pushed.await_count == 1
+        assert pushed.await_args.args[0] == mid and pushed.await_args.args[1]["id"] == mid
+        assert links.update_waiting(mid) == ""
+    finally:
+        satellite_link.reset_hooks()
+
+
+class _ComputeSocket(FakeSatelliteWS):
+    """A compute machine's socket: from loopback on the main listener, as the
+    bare-metal unit dials it."""
+
+    scope = {"client": ("127.0.0.1", 40000), "server": ("127.0.0.1", 8400), "headers": []}
+
+
+@pytest.mark.asyncio
+async def test_a_compute_machine_signs_in_only_on_the_platforms_own_version(loop_db_guard, monkeypatch):
+    """During an update the old compute container may sign in to the new
+    server: any version but the server's own is refused, so no session
+    reaches a render that does not know its description."""
+    from core.config import deployment
+    from storage import remote_store
+    from storage.pg import run_db
+    monkeypatch.setattr(deployment.config, "RUNNING_IN_DOCKER", False, raising=False)
+
+    def _mk():
+        remote_store.create_remote_machine("c-auth-1", "Compute", "", pairing_scope="compute")
+        return remote_store.mint_compute_secret("c-auth-1")
+
+    secret = await run_db(_mk)
+    caps = {"compute": True}
+    older = _ComputeSocket(_auth("c-auth-1", secret, version=_one_below(sat_ws.SATELLITE_VERSION_LATEST),
+                                 capabilities=caps))
+    await sat_ws.ws_satellite_handler(older)
+    assert older.closed is not None and older.closed[0] == 4001
+    assert "not the platform's own" in older.sent[-1].get("reason", "")
+    assert not any(f.get("type") == "update_required" for f in older.sent)
+    same = _ComputeSocket(_auth("c-auth-1", secret, capabilities=caps))
+    await sat_ws.ws_satellite_handler(same)
+    await _settle()
+    assert same.sent[0]["type"] == "auth_result" and same.sent[0]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_a_machine_refused_for_its_version_is_recorded_and_its_next_sign_in_clears_it(loop_db_guard,
+                                                                                         monkeypatch):
+    """Below the floor with automatic updates off the link is refused, and
+    the refusal is kept, so the machine's card and every chat aimed at it
+    say it needs an update; a plaintext link is kept as one the installer
+    updates; an accepted sign-in clears it."""
+    from api.remote import machine_update
+    from services.remote import machine_away
+    from storage import remote_store
+    from storage.pg import run_db
+    mid, secret = await _make_machine()
+    await run_db(remote_store.set_auto_update_enabled, mid, False)
+    old = _one_below(sat_ws.MIN_SATELLITE_VERSION)
+    try:
+        for caps, plaintext in (({}, False), ({"insecure_transport": True}, True)):
+            ws = FakeSatelliteWS(_auth(mid, secret, version=old, capabilities=caps))
+            with loop_db_guard.active():
+                await sat_ws.ws_satellite_handler(ws)
+                await _settle()
+            assert machine_away.refused_version(mid) == (old, plaintext)
+        row = await run_db(remote_store.get_remote_machine, mid)
+        assert machine_update.machine_update_state(mid, row, None) == "manual"
+        machine_away.note_refused(mid, old, plaintext=False)
+        assert machine_update.machine_update_state(mid, row, None) == "refused"
+        ws = FakeSatelliteWS(_auth(mid, secret, version=sat_ws.SATELLITE_VERSION_LATEST))
+        with loop_db_guard.active():
+            await sat_ws.ws_satellite_handler(ws)
+            await _settle()
+        assert machine_away.refused_version(mid) is None
+    finally:
+        machine_away.clear_refused(mid)

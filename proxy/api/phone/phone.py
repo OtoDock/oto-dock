@@ -38,6 +38,7 @@ from auth.providers import (
     require_admin,
     require_user,
 )
+from core.session import session_kind
 from services.phone import phone_adapters, phone_settings
 from services.phone.phone_config import (
     OUTBOUND_PIN_CAPABILITY,
@@ -46,11 +47,12 @@ from services.phone.phone_config import (
     ensure_register_secret,
     notify_phone_config_changed,
 )
-from services.phone.phone_identity import EXTERNAL_ROUTE_ROLE, pin_allowed
+from services.phone.phone_identity import agent_line_problem, pin_allowed
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.automation import trigger_store
 from storage.identity import credential_store
+from storage.pg import run_db
 from storage.phone import phone_call_log_store, phone_route_store, phone_server_store
 
 logger = logging.getLogger("otodock")
@@ -118,6 +120,9 @@ class PhoneRouteCreate(BaseModel):
     identity_user_sub: str | None = None
     role: str = "viewer"
     remember_callers: bool = True
+    # The agent's own line (``identity_mode`` 'agent'): the management tools
+    # the route ticks open (``mcp_session_filter.AGENT_LINE_TICKABLE``).
+    line_tools: list[str] = []
     # Request-only, never on the row or in a response: an inbound PIN set
     # with the route (the phone-server secret shape, stored encrypted like
     # the sub-resource does), and the acknowledgement a user-mode inbound
@@ -156,6 +161,7 @@ class PhoneRouteUpdate(BaseModel):
     identity_user_sub: str | None = None
     role: str | None = None  # accepted, ignored (always viewer) — see PhoneRouteCreate
     remember_callers: bool | None = None
+    line_tools: list[str] | None = None
     # Request-only (see PhoneRouteCreate); ``pin: null`` means no change.
     pin: str | None = None
     acknowledge_no_pin: bool = False
@@ -194,8 +200,12 @@ class SecretSet(BaseModel):
 # ---------------------------------------------------------------------------
 
 async def _load_adapter(server: dict):
-    """Build the control-plane adapter for a server row (off the event loop)."""
-    return await asyncio.to_thread(phone_adapters.load_adapter, server)
+    """Build the control-plane adapter for a server row (off the event loop);
+    a type this install does not offer is a 400."""
+    try:
+        return await asyncio.to_thread(phone_adapters.load_adapter, server)
+    except phone_adapters.PhoneAdapterError as e:
+        raise _adapter_http_error(e) from e
 
 
 def _adapter_http_error(e: phone_adapters.PhoneAdapterError) -> HTTPException:
@@ -286,15 +296,16 @@ def _decorate_routes_with_pin(routes: list[dict]) -> list[dict]:
 # agent IS the shared space (id kept, no per-caller memory) and
 # ``remember_callers`` off covers "no memory" elsewhere, so it added nothing.
 # A stored legacy value resolves as ``caller`` and is upgraded on the next save.
-_IDENTITY_MODES = ("caller", "user")
+_IDENTITY_MODES = ("caller", "user", "agent")
 _LEGACY_IDENTITY_MODE = "shared"
 # The body keys whose presence on a PUT re-runs the identity rules on the
 # post-edit row (the route form sends every field; the table's enable toggle
 # sends ``enabled`` alone).
-_IDENTITY_KEYS = ("identity_mode", "identity_user_sub", "agent", "direction")
-# The only role an external caller runs with; the route column is written
-# as this on every save (services/phone/phone_identity.py ignores it anyway).
-_ROUTE_ROLE = EXTERNAL_ROUTE_ROLE
+_IDENTITY_KEYS = ("identity_mode", "identity_user_sub", "agent", "direction", "line_tools")
+# The legacy ``phone_routes.role`` column, written as viewer on every save:
+# its CHECK knows three member words, and the identity resolver ignores it
+# (an external caller acts as ``roles.EXTERNAL``, never a stored role).
+_ROUTE_ROLE = roles.VIEWER
 # A PIN being set is 6 digits; one stored earlier with 4 or 5 keeps working
 # (the daemon compares whatever is stored) until it is changed.
 _PIN_RE = re.compile(r"^\d{6}$")
@@ -349,19 +360,21 @@ def _require_no_pin_acknowledged(route: dict, *, has_pin: bool, acknowledged: bo
     carries ``acknowledge_no_pin``: whoever dials it acts as the tied user.
     Judged on the post-save row; ``has_pin`` counts a stored PIN and one set
     by the same request."""
-    if (route.get("identity_mode") or "caller") != "user":
+    mode = route.get("identity_mode") or "caller"
+    if mode not in ("user", "agent"):
         return
     if route.get("direction", INBOUND) != INBOUND or has_pin or acknowledged:
         return
-    who = _tied_user_label(route.get("identity_user_sub") or "")
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            f"This route has no PIN: anyone who calls it acts as {who}, with all "
-            "their tools and credentials. Set a PIN, or send "
-            "acknowledge_no_pin=true to save it without one."
-        ),
-    )
+    if mode == "agent":
+        detail = ("This route has no PIN. Anyone who calls it acts as the agent itself. They "
+                  "can change its shared files and use its tools, its accounts and the tools "
+                  "you ticked. Set a PIN, or send acknowledge_no_pin=true to save it without one.")
+    else:
+        who = _tied_user_label(route.get("identity_user_sub") or "")
+        detail = (f"This route has no PIN: anyone who calls it acts as {who}, with all "
+                  "their tools and credentials. Set a PIN, or send "
+                  "acknowledge_no_pin=true to save it without one.")
+    raise HTTPException(status_code=400, detail=detail)
 
 
 def _tied_user_problem(sub: str, agent: str) -> str:
@@ -405,9 +418,44 @@ def _validate_route_identity(merged: dict) -> None:
                 status_code=400,
                 detail="identity_mode 'user' needs identity_user_sub (the platform user to run as)",
             )
-        problem = _tied_user_problem(sub, agent)
+        problem = _tied_user_problem(sub, agent) or _shared_only_tie_problem(sub, agent)
         if problem:
             raise HTTPException(status_code=400, detail=problem)
+    if mode == "agent":
+        if agent_line_problem(agent):
+            raise HTTPException(status_code=400, detail=(
+                "This agent has no shared space, so a route cannot run as the agent itself."))
+        offered = set(line_tools_offered())
+        unknown = [t for t in (merged.get("line_tools") or []) if t not in offered]
+        if unknown:
+            raise HTTPException(status_code=400, detail=(
+                f"{', '.join(unknown)} cannot be opened on the agent's own line."))
+
+
+def _shared_only_tie_problem(sub: str, agent: str) -> str:
+    """On a Shared-only agent a person has no folder of their own and the
+    agent's own state takes the editor role: a tie to a viewer or a
+    contributor there would fail every call, so it is refused at save."""
+    from core.session.visibility import is_shared_only
+    if not is_shared_only(agent):
+        return ""
+    from auth.providers import acting_role_of
+    if roles.can_edit(acting_role_of(sub, agent)):
+        return ""
+    return "On a Shared-only agent only an editor or a manager can talk with the agent by phone."
+
+
+def line_tools_offered() -> list[str]:
+    """The management tools a route on the agent's own line may tick: the
+    tickable ones whose manifest takes calls."""
+    from services.mcp import mcp_registry
+    from services.mcp.mcp_session_filter import AGENT_LINE_TICKABLE
+    out = []
+    for name in sorted(AGENT_LINE_TICKABLE):
+        manifest = mcp_registry.get_manifest(name)
+        if manifest is not None and session_kind.PHONE.name not in (manifest.exclude_from or []):
+            out.append(name)
+    return out
 
 
 def _route_warnings(route: dict, *, pin_configured: bool | None = None) -> list[str]:
@@ -429,6 +477,13 @@ def _route_warnings(route: dict, *, pin_configured: bool | None = None) -> list[
     warnings: list[str] = []
     mode = route.get("identity_mode") or "caller"
     agent = route.get("agent") or ""
+    if mode == "agent":
+        if agent_line_problem(agent):
+            warnings.append("This agent has no shared space: calls fall back to the per-caller identity.")
+        elif not (bool(phone_route_store.get_route_pin(route["id"])) if pin_configured is None
+                  else pin_configured) and not is_outbound(route.get("direction")):
+            warnings.append("This line has no PIN: anyone who dials it acts as the agent itself.")
+        return warnings
     if mode == "user":
         sub = route.get("identity_user_sub") or ""
         problem = _tied_user_problem(sub, agent)
@@ -610,6 +665,8 @@ async def create_phone_route(
         data["audiosocket_uuid"] = str(uuid.uuid4())
 
     route = await asyncio.to_thread(phone_route_store.create_route, data)
+    from services.phone.outside_upgrade import give_conversations_tool
+    await asyncio.to_thread(give_conversations_tool, route["agent"])
     if req.pin is not None:
         # The PBX is never pointed at a row the admin meant to be PIN-gated
         # and is not: the PIN lands first, or the route is not created.
@@ -795,6 +852,9 @@ async def update_phone_route(
 
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
+    if route["agent"] != existing["agent"]:
+        from services.phone.outside_upgrade import give_conversations_tool
+        await asyncio.to_thread(give_conversations_tool, route["agent"])
     logger.info("Admin %s updated phone route: %s", mask_email(u.email), route_id)
     if req.pin is not None:
         logger.info("Admin %s set the PIN on phone route %s", mask_email(u.email), route_id)
@@ -907,9 +967,12 @@ async def delete_phone_route_pin(
 async def preview_route_mcps(
     agent: str,
     identity_mode: str = "caller",
+    line_tools: str = "",
     user: UserContext | None = Depends(get_current_user),
 ):
-    """What a session on a route with this agent + identity would attach.
+    """What a session on a route with this agent + identity would attach
+    (``line_tools``, comma-separated: the agent line's ticks), and the
+    management tools the agent's own line may tick (``line_tools_offered``).
 
     Manifest-level view (no processes started): the agent's configured MCPs
     minus the phone exclusions and, for an external identity (``caller`` /
@@ -921,12 +984,21 @@ async def preview_route_mcps(
         raise HTTPException(status_code=400, detail=f"Unknown identity_mode {identity_mode!r}")
     if not await asyncio.to_thread(agent_store.agent_exists, agent):
         raise HTTPException(status_code=404, detail="Agent not found")
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_registry, outside_picks
+    from services.mcp.mcp_session_filter import agent_line_rule
+    external = identity_mode not in ("user", "agent")
+    ticks = [t for t in line_tools.split(",") if t]
     attached, excluded = await asyncio.to_thread(
-        mcp_registry.preview_session_mcps, agent,
-        contexts={"phone"}, external=identity_mode != "user",
+        lambda: mcp_registry.preview_session_mcps(
+            agent, contexts={"phone"}, external=external,
+            picks=outside_picks.load(agent) if external else None,
+            kind_rule=agent_line_rule(ticks) if identity_mode == "agent" else None,
+        ),
     )
     return {
+        "line_tools_offered": [
+            {"name": n, "label": getattr(mcp_registry.get_manifest(n), "label", n) or n}
+            for n in await asyncio.to_thread(line_tools_offered)],
         "attached": [{"name": m.name, "label": m.label} for m in attached],
         "excluded": [
             {
@@ -979,11 +1051,17 @@ def _decorate_server(server: dict) -> dict:
     }
 
 
+def _decorated_servers() -> list[dict]:
+    return [_decorate_server(s) for s in phone_server_store.get_all_servers()]
+
+
 @router.get("/v1/admin/phone-servers")
 async def list_phone_servers(user: UserContext | None = Depends(get_current_user)):
     require_admin(user)
-    servers = await asyncio.to_thread(phone_server_store.get_all_servers)
-    return {"servers": [_decorate_server(s) for s in servers]}
+    # ``types``: what this install offers for a new server (the page offers
+    # those, and hides the PBX's fields when no PBX type is offered).
+    return {"servers": await run_db(_decorated_servers),
+            "types": phone_adapters.available_adapter_types()}
 
 
 @router.post("/v1/admin/phone-servers")
@@ -1022,7 +1100,7 @@ async def create_phone_server(
         )
     logger.info("Admin %s created phone server: %s (%s)", mask_email(u.email), server['name'], server['adapter_type'])
     await notify_phone_config_changed()
-    return _decorate_server(server)
+    return await run_db(_decorate_server, server)
 
 
 @router.put("/v1/admin/phone-servers/{server_id}")
@@ -1031,14 +1109,16 @@ async def update_phone_server(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_admin(user)
-    server = await asyncio.to_thread(
-        phone_server_store.update_server, server_id, req.model_dump(exclude_unset=True),
-    )
+    fields = req.model_dump(exclude_unset=True)
+    if "adapter_type" in fields and fields["adapter_type"] not in phone_adapters.available_adapter_types():
+        raise HTTPException(status_code=400,
+                            detail="This phone server's type is not available on this install.")
+    server = await asyncio.to_thread(phone_server_store.update_server, server_id, fields)
     if not server:
         raise HTTPException(status_code=404, detail="Phone server not found")
     logger.info("Admin %s updated phone server: %s", mask_email(u.email), server_id)
     await notify_phone_config_changed()
-    return _decorate_server(server)
+    return await run_db(_decorate_server, server)
 
 
 @router.delete("/v1/admin/phone-servers/{server_id}")
@@ -1075,7 +1155,7 @@ async def set_phone_server_default(
         raise HTTPException(status_code=404, detail=str(e)) from e
     logger.info("Admin %s set default phone server: %s", mask_email(u.email), server_id)
     await notify_phone_config_changed()
-    return _decorate_server(server)
+    return await run_db(_decorate_server, server)
 
 
 @router.put("/v1/admin/phone-servers/{server_id}/ami-secret")
@@ -1208,7 +1288,7 @@ async def verify_phone_server_bootstrap(
     ))
     logger.info("Admin %s verified phone server %s: %s", mask_email(u.email), server_id, result.status)
     await notify_phone_config_changed()
-    return _decorate_server(server)
+    return await run_db(_decorate_server, server)
 
 
 @router.post("/v1/admin/phone-servers/{server_id}/bootstrap/apply")
@@ -1238,7 +1318,7 @@ async def apply_phone_server_bootstrap(
     ))
     logger.info("Admin %s applied bootstrap on phone server %s: %s", mask_email(u.email), server_id, result.status)
     await notify_phone_config_changed()
-    return _decorate_server(server)
+    return await run_db(_decorate_server, server)
 
 
 @router.post("/v1/admin/phone-servers/{server_id}/health")
@@ -1261,7 +1341,7 @@ async def check_phone_server_health(
             "last_health_detail": status.detail,
         },
     ))
-    return _decorate_server(server)
+    return await run_db(_decorate_server, server)
 
 
 # ---------------------------------------------------------------------------

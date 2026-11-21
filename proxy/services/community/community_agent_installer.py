@@ -47,7 +47,7 @@ from fastapi import HTTPException
 
 import config
 from auth import roles
-from core import layout
+from core import agent_folder, layout
 from services.community.community_agent_template_store import (
     CommunityAgentTemplate,
     TaskItem,
@@ -57,7 +57,8 @@ from services.community.community_agent_template_store import (
     substitute_template_vars,
     template_to_persistable_dict,
 )
-from services.scheduler import task_kinds
+from services.infra import safe_fs
+from services.scheduler import task_fields, task_kinds
 
 logger = logging.getLogger("otodock.community-agent-installer")
 
@@ -77,6 +78,7 @@ async def install_from_catalog(
     check_consent: dict[str, str] | None = None,
     consent_by: str = "",
     consent_all: bool = False,
+    server_consent: list[str] | None = None,
 ) -> dict:
     """Fetch + install a template from ``OtoDock/community-agents``.
 
@@ -140,6 +142,7 @@ async def install_from_catalog(
             app_consent=app_consent,
             check_consent=check_consent,
             consent_by=consent_by,
+            server_consent=server_consent,
         )
     finally:
         # extracted dir is a tempdir owned by the catalog fetcher
@@ -163,6 +166,7 @@ async def install_from_extracted_template(
     app_consent: dict[str, str] | None = None,
     check_consent: dict[str, str] | None = None,
     consent_by: str = "",
+    server_consent: list[str] | None = None,
 ) -> dict:
     """Install a parsed template into an agent. ``display_name`` is the
     installer's name for it; empty means the template's.
@@ -184,7 +188,8 @@ async def install_from_extracted_template(
     REGISTRY.md "Consent"): a matching signature approves the copies that
     person's authority covers; anything else lands on a card, or as an
     offered check. The agent-creator route passes none (a bearer never
-    consents).
+    consents). ``server_consent`` names the apps whose server the dialog
+    showed (``template_app_seeder.record_consent``).
 
     Returns an install envelope::
 
@@ -287,6 +292,8 @@ async def install_from_extracted_template(
             community_template_version=template.version,
             default_scope=template.default_scope,
             collaborative=template.collaborative,
+            team_account=template.team_account,
+            team_account_floor=template.team_account_floor,
         )
     except Exception as exc:
         logger.exception("Saving the record of agent %s failed", target_slug)
@@ -306,7 +313,7 @@ async def install_from_extracted_template(
     template_data = template_to_persistable_dict(template, agent_slug=target_slug)
     stamp_core_mcps(template_data, template)
     consent_ignored = template_app_seeder.record_consent(
-        template_data, template, app_consent, check_consent, consent_by)
+        template_data, template, app_consent, check_consent, consent_by, servers=server_consent)
     await asyncio.to_thread(
         agent_store.set_community_template_data, target_slug, template_data,
     )
@@ -349,6 +356,11 @@ async def install_from_extracted_template(
         installer_role=installer_role,
         batch_id=batch_id,
     )
+    # 4a. The template's tool limits (mcps.json ``limits``): written now,
+    # whether or not the tool is enabled yet, so a limit holds from the
+    # tool's first session (services/mcp/tool_limits.py).
+    if template.tool_limits:
+        await asyncio.to_thread(_seed_tool_limits, target_slug, template)
     # 4b. Skill packages: admins install-if-missing directly; managers get a
     # ``kind: "skill"`` request queued for anything not yet installed
     # (request-flow parity with MCPs, 2026-08-27 — preflight no longer
@@ -663,31 +675,32 @@ def _copy_template_context(
     intentionally narrow — `{agent_slug}` only for v1 — to avoid
     accidentally mangling content that uses braces for other reasons.
     """
-    context_target = agent_dir / layout.CONFIG / layout.CONTEXT
-    context_target.mkdir(parents=True, exist_ok=True)
+    # Written beneath the new agent's real folder with no link followed: a
+    # session of the agent may already run while its install finishes.
+    from core import agent_folder
+    from services.infra import safe_fs
+    root, base = agent_folder.beneath_agent(agent_dir / layout.CONFIG, target_slug)
+    context = f"{base}/{layout.CONTEXT}"
+    safe_fs.mkdirs_beneath(root, context)
+
+    def _write(rel: str, text: str) -> None:
+        safe_fs.atomic_write_beneath(root, rel, substitute_template_vars(text, target_slug).encode("utf-8"),
+                                     mkdirs=True, fsync=False)
     count = 0
     for rel, content in template.context_files.items():
         # rel is something like "context/methodology.md" — strip the leading "context/"
         rel_stripped = rel.split("/", 1)[1] if rel.startswith("context/") else rel
-        dest = context_target / rel_stripped
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(substitute_template_vars(content, target_slug), encoding="utf-8")
+        _write(f"{context}/{rel_stripped}", content)
         count += 1
     setup_copied = False
     if template.setup_md is not None:
-        (context_target / "setup.md").write_text(
-            substitute_template_vars(template.setup_md, target_slug),
-            encoding="utf-8",
-        )
+        _write(f"{context}/setup.md", template.setup_md)
         setup_copied = True
     # Per-user onboarding: the canonical copy lives at config ROOT — NOT in
     # context/, so it never auto-loads agent-wide. Substituted once here;
     # per-user seeds are plain copies of this file.
     if template.user_setup_md is not None:
-        (agent_dir / layout.CONFIG / _USER_SETUP_FILENAME).write_text(
-            substitute_template_vars(template.user_setup_md, target_slug),
-            encoding="utf-8",
-        )
+        _write(f"{base}/{_USER_SETUP_FILENAME}", template.user_setup_md)
     return count, setup_copied
 
 
@@ -710,23 +723,18 @@ def _seed_dashboards(
     upsert key. Returns the number of pins created."""
     if not template.dashboards:
         return 0
-    import config as app_config
     from storage import database as task_store
 
-    agent_dir = app_config.get_agent_dir(agent_slug)
-    src_dir = agent_dir / layout.CONFIG / "community" / "dashboards"
-    src_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for item in template.dashboards:
         html = substitute_template_vars(item.html or "", agent_slug)
         if not html.strip():
             logger.warning("dashboard %s: empty html — skipped", item.slug)
             continue
-        (src_dir / f"{item.slug}.html").write_text(html, encoding="utf-8")
+        _write_seed(agent_slug, f"{layout.CONFIG}/community/dashboards/{item.slug}.html", html)
         if item.visibility == "agent":
-            target = agent_dir / layout.WORKSPACE / "apps" / f"{item.slug}.html"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(html, encoding="utf-8")
+            if not _write_seed(agent_slug, f"{layout.WORKSPACE}/apps/{item.slug}.html", html):
+                continue
             task_store.upsert_app(
                 agent_slug, "", None, item.slug,
                 title=item.title,
@@ -772,23 +780,52 @@ def _pin_user_dashboard(
     """One per-user dashboard pin: the file under
     ``users/<u>/workspace/apps/`` + a personal pinned_apps row. Returns 1
     on success, 0 when the sub has no username row (nothing to anchor)."""
-    import config as app_config
     from storage import database as task_store
 
     username = task_store.get_username_by_sub(user_sub)
     if not username:
         return 0
-    agent_dir = app_config.get_agent_dir(agent_slug)
-    target = layout.user_dir(agent_dir, username) / layout.WORKSPACE / "apps" / f"{slug}.html"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(html, encoding="utf-8")
+    rel = f"{layout.user_rel(username)}/{layout.WORKSPACE}/apps/{slug}.html"
+    # The person's sessions write their workspace: a link at the name is
+    # replaced, a link on the way refuses the copy (no row is pinned).
+    if not _write_seed(agent_slug, rel, html):
+        return 0
     task_store.upsert_app(
         agent_slug, username, user_sub, slug,
         title=title or slug,
-        rel_path=f"{layout.user_rel(username)}/{layout.WORKSPACE}/apps/{slug}.html",
+        rel_path=rel,
         actions_json="[]",
     )
     return 1
+
+
+def _write_seed(agent_slug: str, rel: str, text: str, *, exclusive: bool = False) -> bool:
+    """A template's copy written beneath the agent's real folder
+    (``core/agent_folder.py``) with no link below it followed
+    (``safe_fs``). False when a link on the way, or with ``exclusive``
+    anything already at the name, refuses it."""
+    try:
+        safe_fs.atomic_write_beneath(agent_folder.agent_root(agent_slug), rel, text.encode("utf-8"),
+                                     mkdirs=True, exclusive=exclusive)
+    except FileExistsError:
+        return False
+    except (OSError, ValueError):
+        logger.warning("template copy %s/%s was not written: a link or a file is in its way",
+                       agent_slug, rel, exc_info=True)
+        return False
+    return True
+
+
+def _read_seed(agent_slug: str, rel: str, *, max_size: int) -> str | None:
+    """A template's source copy under ``config/`` (a manager's session
+    writes there), read beneath the agent's real folder with no link below
+    it followed. None when it is missing, a link, not a plain file or over
+    ``max_size``."""
+    try:
+        return safe_fs.read_bytes_beneath(agent_folder.agent_root(agent_slug), rel,
+                                          max_size=max_size).decode("utf-8")
+    except (OSError, ValueError):
+        return None
 
 
 def _seed_dashboards_for_user(
@@ -799,21 +836,15 @@ def _seed_dashboards_for_user(
     under ``config/community/dashboards/`` (already slug-substituted).
     Re-fires upsert idempotently; a user's OWN per-user hide of a shared
     template dashboard is never touched (different table)."""
-    import config as app_config
-
     count = 0
-    src_dir = (app_config.get_agent_dir(agent_slug)
-               / "config" / "community" / "dashboards")
     for item in template.dashboards:
         if item.visibility != "user" or not item.auto_pin_for_new_users:
             continue
-        src = src_dir / f"{item.slug}.html"
-        if not src.is_file():
+        html = _read_seed(agent_slug, f"{layout.CONFIG}/community/dashboards/{item.slug}.html",
+                          max_size=_DASHBOARD_SEED_MAX_BYTES)
+        if html is None:
             continue
-        count += _pin_user_dashboard(
-            agent_slug, item.slug, item.title,
-            src.read_text(encoding="utf-8"), user_sub,
-        )
+        count += _pin_user_dashboard(agent_slug, item.slug, item.title, html, user_sub)
     return count
 
 
@@ -966,6 +997,9 @@ async def _cascade_required_mcps(
             )
             created_requests.append(row)
 
+    if ready_mcps:
+        from services.remote import tools_ahead
+        tools_ahead.after_enable(target_slug)  # the agent's machines install them now
     return {"created_requests": created_requests, "ready_mcps": ready_mcps}
 
 
@@ -998,6 +1032,23 @@ async def _admin_inline_install(
         # Re-fetch the row in whatever state it landed.
         latest = await asyncio.to_thread(mcp_request_store.get_request, row["id"])
         return latest or row
+
+
+def _seed_tool_limits(agent_slug: str, template: CommunityAgentTemplate) -> None:
+    """The template's limits as rows of the picks table: a Read only limit
+    records what the labels give today (its first listing fills it when the
+    tool is unlisted). A limit on a tool the template does not require
+    waits in the table for the tool to be enabled."""
+    from services.mcp import outside_picks, tool_listing
+    from storage.agents import outside_store
+    rows = []
+    for lim in template.tool_limits:
+        granted = (outside_picks.read_only_functions(tool_listing.server_key_of(lim.mcp))
+                   if lim.access == outside_picks.READ_ONLY else [])
+        rows.append({"mcp_name": lim.mcp, "access": lim.access, "functions": list(lim.functions),
+                     "granted": granted, "governs": lim.governs})
+    outside_store.update(agent_slug, upsert_tools=rows)
+    logger.info("install %s: %d tool limit(s) written from the template", agent_slug, len(rows))
 
 
 async def _seed_skills_for_mcp(agent_slug: str, mcp_name: str, skills: list[str]) -> None:
@@ -1067,17 +1118,19 @@ def resolve_task_pins(
     notes: list[str] = []
     tasks: list[TaskItem] = []
     for item in template.tasks:
-        if not (item.override_model or item.layer):
-            tasks.append(item)
-            continue
-        problem = task_pin_problem(agent_slug, item.override_model, item.layer)
-        if problem:
-            notes.append(f"The task '{item.slug}' runs with no model choice, on its person's own engine "
-                         f"or the agent's default engine. {problem}")
-            tasks.append(dataclasses.replace(item, override_model=None, layer=None))
-        else:
-            tasks.append(dataclasses.replace(
-                item, override_model=config.live_model_id(item.override_model or "") or None))
+        if item.override_model or item.layer:
+            problem = task_pin_problem(agent_slug, item.override_model, item.layer)
+            if problem:
+                notes.append(f"The task '{item.slug}' runs with no model choice, on its person's own engine "
+                             f"or the agent's default engine. {problem}")
+                item = dataclasses.replace(item, override_model=None, layer=None)
+            else:
+                item = dataclasses.replace(
+                    item, override_model=config.live_model_id(item.override_model or "") or None)
+        if task_fields.mode_problem(agent_slug, item.layer, item.permission_mode):
+            notes.append(f"The task '{item.slug}' runs on Don't Ask. The engine it runs on has no reviewer.")
+            item = dataclasses.replace(item, permission_mode="")
+        tasks.append(item)
     if not notes and tasks == template.tasks:
         return template, notes
     return dataclasses.replace(template, tasks=tasks), notes
@@ -1095,6 +1148,16 @@ def _seed_pins(item: TaskItem, agent_slug: str) -> tuple[str, str]:
                     item.slug, agent_slug, problem)
         return "", ""
     return config.live_model_id(item.override_model or ""), item.layer or ""
+
+
+def _seed_mode(item: TaskItem, agent_slug: str) -> str:
+    """The row's ``permission_mode``: the item's while the agent still runs
+    it; a mode the engine lost since is seeded as Don't Ask."""
+    if task_fields.mode_problem(agent_slug, item.layer, item.permission_mode):
+        logger.info("template task %s on %s seeded on Don't Ask: its engine has no Auto",
+                    item.slug, agent_slug)
+        return ""
+    return item.permission_mode
 
 
 def _seed_tasks(
@@ -1182,7 +1245,8 @@ def _create_task_idempotent(
             prompt=item.prompt, llm_mode="cli", task_type=task_type,
             schedule=schedule, run_at=run_at,
             delay_seconds=None, interval_seconds=interval,
-            timeout_seconds=600, created_by=created_by, scope=item.scope,
+            timeout_seconds=item.timeout_seconds or task_fields.DEFAULT_TIMEOUT_S,
+            created_by=created_by, scope=item.scope,
             on_complete_agent=None, on_complete_prompt=None,
             on_complete_session_id=None, on_complete_chat_id=None,
             continue_session=None, use_persistent=False,
@@ -1192,6 +1256,7 @@ def _create_task_idempotent(
             community_template_item_slug=item.slug,
             override_model=override_model, override_execution_path=override_layer,
             notify_audience=item.audience or roles.EDITOR,
+            permission_mode=_seed_mode(item, agent_slug),
         )
         # Set enabled flag if needed (default in CREATE TABLE is TRUE; pause
         # via an UPDATE when default_state='paused').
@@ -1471,6 +1536,10 @@ def _seed_notifs_for_user(
 # ---------------------------------------------------------------------------
 
 _USER_SETUP_FILENAME = "user-setup.md"
+# What a seed reads from the agent's own copies: a dashboard at the template
+# store's cap on one, the setup file at a release file's.
+_DASHBOARD_SEED_MAX_BYTES = 1024 * 1024
+_USER_SETUP_MAX_BYTES = 2 * 1024 * 1024
 
 
 def stamp_core_mcps(data: dict, template: CommunityAgentTemplate) -> None:
@@ -1501,21 +1570,14 @@ def seed_user_setup_file(agent_slug: str, user_sub: str) -> int:
     username = user_db.get_username_by_sub(user_sub) or ""
     if not username:
         return 0
-    agent_dir = config.AGENTS_DIR / agent_slug
-    canonical = agent_dir / layout.CONFIG / _USER_SETUP_FILENAME
-    if not canonical.is_file():
+    text = _read_seed(agent_slug, f"{layout.CONFIG}/{_USER_SETUP_FILENAME}",
+                      max_size=_USER_SETUP_MAX_BYTES)
+    if text is None:
         return 0
     rel = f"{layout.user_rel(username)}/{layout.CONTEXT}/{_USER_SETUP_FILENAME}"
-    dest = layout.context_dir(agent_dir, username) / _USER_SETUP_FILENAME
-    if dest.exists():
-        return 0
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(canonical.read_text(encoding="utf-8"), encoding="utf-8")
-    except OSError:
-        logger.exception(
-            "user-setup seed failed for (%s, %s)", agent_slug, username,
-        )
+    # Only when the person has no copy: anything at the name (a file, a
+    # link) is a copy, and nothing is written through a link.
+    if not _write_seed(agent_slug, rel, text, exclusive=True):
         return 0
     # A completed-then-re-attached user has a live delete tombstone for this
     # path — drop it, or the next sync merge would delete the fresh seed.

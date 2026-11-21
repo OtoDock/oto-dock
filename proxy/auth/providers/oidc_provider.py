@@ -22,6 +22,14 @@ from auth.providers.base import AuthProvider, AuthResult
 
 logger = logging.getLogger("otodock")
 
+
+def _client(timeout: float) -> httpx.AsyncClient:
+    """The sign-in provider's discovery, keys, token and userinfo calls, at a
+    checked address (``admin_host``: a provider on this machine or the LAN
+    passes, a hosted install reaches public ones only)."""
+    from services.infra import pinned_http
+    return pinned_http.checked_pool(pinned_http.admin_host, timeout=timeout)
+
 # Lazy re-discovery guard — module-level so it is shared across all callers
 # and provider instances. `at` is the monotonic time of the LAST attempt
 # (success or failure); attempts are spaced at least the interval apart so a
@@ -58,7 +66,7 @@ async def ensure_oidc_discovery() -> None:
             return
         _discovery_guard["at"] = now
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with _client(5) as client:
                 resp = await client.get(
                     config.OIDC_DISCOVERY_URL,
                     headers={"User-Agent": config.OIDC_DISCOVERY_USER_AGENT},
@@ -108,7 +116,7 @@ def _origin(url: str) -> str:
 
 
 async def _get_json(url: str) -> dict:
-    async with httpx.AsyncClient(timeout=5) as client:
+    async with _client(5) as client:
         resp = await client.get(url, headers={"User-Agent": config.OIDC_DISCOVERY_USER_AGENT})
         resp.raise_for_status()
         doc = resp.json()
@@ -395,7 +403,7 @@ class OIDCAuthProvider(AuthProvider):
                              code_verifier: str = "") -> dict:
         """Exchange authorization code for tokens (with the PKCE verifier
         the authorization request's challenge was made from)."""
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with _client(10) as client:
             resp = await client.post(
                 config.OIDC_TOKEN_URL,
                 data={
@@ -412,7 +420,7 @@ class OIDCAuthProvider(AuthProvider):
 
     async def _fetch_userinfo(self, access_token: str) -> dict:
         """Fetch user profile from OIDC userinfo endpoint."""
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with _client(10) as client:
             resp = await client.get(
                 config.OIDC_USERINFO_URL,
                 headers={"Authorization": f"Bearer {access_token}"},

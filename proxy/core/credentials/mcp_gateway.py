@@ -28,6 +28,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,16 +36,18 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 
 import config
+from core.credentials.exit_relay import MAX_BODY_BYTES
 
 logger = logging.getLogger("otodock.mcp-gateway")
 
 GATEWAY_PATH_PREFIX = "/v1/mcp-gateway"
+#: The kind of a Docker tool's entry (``GatewayCredential.kind``).
+CONTAINER = "container"
 
 # The request body cap on both gateways. The gateway carries MCP JSON-RPC
 # (a tool call, a result with an inline image) — kilobytes to a few MB, never
 # a file upload, so the cap is far below the tunnel's own 128 MB: a session's
 # own code cannot park a large buffer in the proxy or the satellite through it.
-MAX_BODY_BYTES = 16 * 1024 * 1024
 # The refusal shape reads the request's JSON-RPC id to answer in kind; it never
 # parses more than this (a refused request is not forwarded, so a huge body is
 # just dropped with a generic 202).
@@ -56,6 +59,20 @@ LEASE_S = 15 * 60
 # The tick re-pushes when the lease has less than this left.
 RENEW_BEFORE_S = 10 * 60
 
+# The names the platform sets beside a tool's account token (``token_env``,
+# ``mcp_broker.provision``), part of the catalog's contract.
+TOKEN_EXPIRES_ENV = "OTO_TOKEN_EXPIRES_AT"
+TOKEN_SCOPES_ENV = "OTO_TOKEN_SCOPES"
+TOKEN_ACCOUNT_ENV = "OTO_TOKEN_ACCOUNT"
+TOKEN_RENEWAL_ENV = "OTO_TOKEN_RENEWAL"
+TOKEN_ENV_NAMES = (TOKEN_EXPIRES_ENV, TOKEN_SCOPES_ENV, TOKEN_ACCOUNT_ENV, TOKEN_RENEWAL_ENV)
+# A token that expires within this life is renewed by its tool, and a tool's
+# renewal lasts this long (the life of the session's own token).
+TOKEN_RENEWAL_LIFE_S = 24 * 3600
+# Under this much life a renewal answers "again in a moment" (the token could
+# not be refreshed yet), past the Google library's own 225-second margin.
+TOKEN_MIN_LIFE_S = 240
+
 _ALLOWLIST_MEMO_S = 30.0
 _EGRESS_MEMO_S = 30.0
 
@@ -63,8 +80,6 @@ _EGRESS_MEMO_S = 30.0
 # MCP's manifest names ``localhost`` (m365's), and in a containerised
 # deployment the sidecar is dialled by its service name.
 _SIDECAR_ALLOWLIST_HOST = "localhost"
-# The name RFC 6761 reserves for this machine, with every name under it.
-_LOOPBACK_NAME = "localhost"
 
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,160}")
 
@@ -118,6 +133,20 @@ class GatewayCredential:
     # A narrowed GitHub reach of the agent's service binding
     # (``auth/github_reach.Reach.to_dict``): every request is judged by it.
     reach: dict | None = None
+    # ``CONTAINER`` for every Docker tool the platform runs: its requests are
+    # its door's (``services/containers/door.py``), with this credential when
+    # it has one (a token reference or a header key) and none when not. For
+    # such a tool, whether it calls the proxy back (``server.proxy_callbacks``:
+    # the door adds the session's callback token) and whether it wakes at the
+    # session's handshake (a call's tool).
+    kind: str = ""
+    callbacks: bool = False
+    wakes_early: bool = False
+
+    @property
+    def secretless(self) -> bool:
+        """A credential that adds nothing: a Docker tool with no sign-in."""
+        return self.token_ref is None and not self.value and not self.value_from
 
     @property
     def forwarded_here(self) -> bool:
@@ -153,6 +182,8 @@ class GatewayCredential:
             manifest=str(d.get("manifest") or ""),
             value_from=str(d.get("value_from") or ""),
             reach=d.get("reach") if isinstance(d.get("reach"), dict) else None,
+            kind=str(d.get("kind") or ""), callbacks=bool(d.get("callbacks")),
+            wakes_early=bool(d.get("wakes_early")),
         )
 
 
@@ -173,6 +204,11 @@ class CliCredential:
     # A narrowed GitHub reach (``auth/github_reach``): each command's request
     # names its repository and is judged by it.
     reach: dict | None = None
+    # The helper hands the token itself per command: on a paired macOS or
+    # Windows computer, where git and gh verify with the system store and
+    # cannot trust the machine's exit (``mcp_session_config.cli_per_command``).
+    # Everywhere else the session holds a placeholder and nothing else.
+    per_command: bool = False
 
     def descriptor(self) -> dict:
         d = asdict(self)
@@ -191,6 +227,134 @@ class CliCredential:
             env_names=tuple(str(n) for n in (d.get("env_names") or [])),
             manifest=str(d.get("manifest") or ""),
             reach=d.get("reach") if isinstance(d.get("reach"), dict) else None,
+            per_command=d.get("per_command") is True,
+        )
+
+
+@dataclass
+class TokenCredential:
+    """An account's access token a stdio tool holds in its own environment
+    (the manifest's ``mcp_env_injection``): the names it lands under and the
+    token file by reference, read at every fetch. ``renews``: the token
+    expires within a session's life, so the tool gets a renewal token and
+    reads the bundle again when the hour ends (``mcp_broker.mint_renewal``)."""
+
+    env_names: tuple[str, ...]
+    token_ref: TokenRef
+    manifest: str = ""
+    renews: bool = False
+
+    def descriptor(self) -> dict:
+        d = asdict(self)
+        d["env_names"] = list(self.env_names)
+        return d
+
+    @classmethod
+    def from_descriptor(cls, d: dict) -> TokenCredential | None:
+        ref = d.get("token_ref")
+        if not isinstance(ref, dict) or not d.get("env_names"):
+            return None
+        return cls(
+            env_names=tuple(str(n) for n in d["env_names"]),
+            token_ref=TokenRef(**ref),
+            manifest=str(d.get("manifest") or ""),
+            renews=bool(d.get("renews")),
+        )
+
+
+@dataclass(frozen=True)
+class ExitCredential:
+    """One secret the session holds as a placeholder, which the credential
+    exit (``core/credentials/credential_exit.py``) swaps for the value in
+    ``header`` alone, toward ``hosts`` alone (literal names or ``*.domain``).
+    The value is a static one as the build resolved it (``value``), or the
+    account's token file by reference (``token_ref``, read fresh per
+    request), or the command-line credential's (``cli``: git and gh, whose
+    host is the authority the manifest named). ``env_name`` is where the
+    placeholder sits in the tool's environment ("" for the command-line
+    credential, which the helper hands git per command).
+    ``streams_declared``: the manifest's entry asked for the larger path
+    (``streams``)."""
+
+    placeholder: str
+    header: str
+    hosts: tuple[str, ...]
+    allowlist_key: str
+    manifest: str
+    env_name: str = ""
+    prefix: str = ""
+    value: str = ""
+    token_ref: TokenRef | None = None
+    cli: CliCredential | None = None
+    streams_declared: bool = False
+
+    @property
+    def key(self) -> str:
+        """The name the log calls this credential by: its env name, else its
+        manifest, else its allowlist key."""
+        return self.env_name or self.manifest or self.allowlist_key
+
+    @property
+    def streams(self) -> bool:
+        """Whether a large body, or one of unknown length, passes the exit as
+        it arrives (the relay's ``Entry.streams``): the command-line
+        credential's does, since a push's pack has no bound, and a tool's
+        whose manifest entry asked for it."""
+        return self.cli is not None or self.streams_declared
+
+    @property
+    def judged(self) -> bool:
+        """Whether the exit asks about each request that carries this
+        placeholder (the relay's ``Entry.judged``): a command-line credential
+        whose reach narrows (``auth/github_reach.judge_request``)."""
+        if self.cli is None:
+            return False
+        from auth import github_reach
+        reach = github_reach.Reach.from_dict(self.cli.reach)
+        return reach is not None and reach.narrows
+
+    def takes_host(self, host: str) -> bool:
+        """Whether ``host`` is one the value may be sent to (the relay's rule)."""
+        from core.credentials.exit_relay import host_matches
+        return host_matches(self.hosts, host)
+
+    def gateway_for(self, host: str) -> GatewayCredential:
+        """The gateway's shape of this credential toward ``host``, for
+        ``resolve_credential`` (the allowlist, the egress guard, the value)."""
+        return GatewayCredential(
+            upstream=f"https://{host}", path="/", allowlist_key=self.allowlist_key,
+            header=self.header, prefix=self.prefix, value=self.value, token_ref=self.token_ref,
+            manifest=self.manifest, value_from=self.env_name,
+        )
+
+    def descriptor(self) -> dict:
+        """The secret-free shape: the value replaced by the fact that one
+        existed. The placeholder stays (a random string nothing swaps
+        without the exit's admission, and a machine session taken back
+        after a restart holds it in its tools' environments); the
+        command-line credential is the bundle's, so its entry is the fact
+        that there is one."""
+        d = asdict(self)
+        d["value"] = ""
+        d["has_value"] = bool(self.value)
+        d["cli"] = self.cli is not None
+        return d
+
+    @classmethod
+    def from_descriptor(cls, d: dict, *, cli: CliCredential | None = None) -> ExitCredential | None:
+        """The entry back from its descriptor, the value to be resolved again
+        (``has_value``) and the bundle's own command-line credential set."""
+        if not isinstance(d, dict) or not d.get("placeholder") or not d.get("header"):
+            return None
+        ref = d.get("token_ref")
+        return cls(
+            placeholder=str(d["placeholder"]), header=str(d["header"]),
+            hosts=tuple(str(h) for h in (d.get("hosts") or [])),
+            allowlist_key=str(d.get("allowlist_key") or ""), manifest=str(d.get("manifest") or ""),
+            env_name=str(d.get("env_name") or ""), prefix=str(d.get("prefix") or ""), value="",
+            token_ref=TokenRef(**ref) if isinstance(ref, dict) else None,
+            cli=cli if d.get("cli") else None,
+            streams_declared=d.get("streams_declared") is True,
         )
 
 
@@ -217,9 +381,45 @@ class ResolvedCli:
 
 
 @dataclass
+class ResolvedToken:
+    """A tool's account token as the file holds it now."""
+
+    secret: str
+    expires_at: str
+    expires_in: float | None
+    scopes: tuple[str, ...]
+    account: str
+
+
+@dataclass
 class Refusal:
     reason: str
     detail: str
+
+
+@dataclass
+class Answered:
+    """What a Docker tool's door answers itself (``services/containers/
+    door.py``): shaped as the upstream response a carrier streams back, its
+    body whole or a stream. The door's use count is the stream's own: its
+    end, however it ends, gives it back."""
+
+    status_code: int
+    headers: dict[str, str]
+    body: bytes = b""
+    stream: Any = None
+
+    async def aiter_raw(self):
+        if self.stream is None:
+            if self.body:
+                yield self.body
+            return
+        async for chunk in self.stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        if self.stream is not None:
+            await self.stream.aclose()
 
 
 def entry_url(key: str, path: str) -> str:
@@ -239,6 +439,16 @@ def internal_entry_url(url: str) -> str:
     if parts.hostname != "127.0.0.1" or parts.port == port:
         return url
     return url.replace(f"//127.0.0.1:{parts.port}/", f"//127.0.0.1:{port}/", 1)
+
+
+def is_own_entry(url: str) -> bool:
+    """A gateway URL on this proxy's own loopback listener (the main port or
+    the internal one): the platform's own hop, never a manifest's host."""
+    if gateway_key_of(url) is None:
+        return False
+    parts = urlsplit(url)
+    ports = {config.PORT, int(getattr(config, "INTERNAL_LISTENER_PORT", 0) or 0)} - {0}
+    return parts.hostname == "127.0.0.1" and parts.port in ports
 
 
 def gateway_key_of(url: str) -> str | None:
@@ -288,6 +498,60 @@ def credentials_of(session_id: str) -> dict[str, GatewayCredential]:
     return out
 
 
+def token_credentials_of(session_id: str) -> dict[str, TokenCredential]:
+    """Every tool's account token a session holds, by MCP key."""
+    from core.credentials import mcp_broker
+    out: dict[str, TokenCredential] = {}
+    for key, bundle in (mcp_broker.bundles_of(session_id) or {}).items():
+        cred = getattr(bundle, "token", None)
+        if cred is not None:
+            out[key] = cred
+    return out
+
+
+def account_text(ref) -> str:
+    """An account as a session's records name it: ``"<owner's sub>|<label>"``
+    of a resolver's ``AccountRef``, "" for none. Never a value."""
+    return f"{ref.owner_sub}|{ref.label}" if ref is not None else ""
+
+
+def env_names_of(session_id: str) -> dict[str, list[str]]:
+    """Per tool key, the names a stdio tool's bundle sets in its environment
+    (names alone: the values never leave memory), less the account token's
+    names and the two beside them, which every fetch reads fresh and the
+    provision mints again. A re-adoption resolves them again
+    (``env_values_for``)."""
+    from core.credentials import mcp_broker
+    out: dict[str, list[str]] = {}
+    for key, bundle in (mcp_broker.bundles_of(session_id) or {}).items():
+        token = getattr(bundle, "token", None)
+        skip = {TOKEN_EXPIRES_ENV, TOKEN_RENEWAL_ENV, *(token.env_names if token is not None else ())}
+        names = sorted(n for n in (getattr(bundle, "env", None) or {}) if n not in skip)
+        if names:
+            out[key] = names
+    return out
+
+
+def accounts_of(session_id: str) -> dict[str, str]:
+    """Per tool key, the account its bundle was built on (``account_text``:
+    the owner's sub and the label, never a value), for the bundles built on
+    one. A re-adoption takes a tool's secrets again only on it."""
+    from core.credentials import mcp_broker
+    return {key: bundle.account for key, bundle in (mcp_broker.bundles_of(session_id) or {}).items()
+            if getattr(bundle, "account", "")}
+
+
+def exit_credentials_of(session_id: str) -> dict[str, tuple[ExitCredential, ...]]:
+    """Every exit half a session holds, by MCP key (the bundles with one)."""
+    from core.credentials import mcp_broker
+    out: dict[str, tuple[ExitCredential, ...]] = {}
+    for key, bundle in (mcp_broker.bundles_of(session_id) or {}).items():
+        creds = tuple(getattr(bundle, "exit", ()) or ())
+        if creds:
+            out[key] = creds
+    return out
+
+
 def cli_credentials_of(session_id: str) -> dict[str, CliCredential]:
     """Every command-line credential a session holds, by MCP key."""
     from core.credentials import mcp_broker
@@ -328,13 +592,6 @@ def _host_allowed(key: str, host: str) -> bool:
     return allowed
 
 
-def _names_this_machine(host: str) -> bool:
-    """``localhost`` and every ``*.localhost`` name (RFC 6761: they resolve
-    to loopback, whatever a resolver answers)."""
-    name = host.lower().rstrip(".")
-    return name == _LOOPBACK_NAME or name.endswith("." + _LOOPBACK_NAME)
-
-
 def _egress_refusal(upstream: str) -> str | None:
     """The self-SSRF guard on a vendor origin: the admin's allowlist is the
     authority on WHICH host the gateway may reach (an approved LAN or
@@ -351,7 +608,7 @@ def _egress_refusal(upstream: str) -> str | None:
     import socket
     from urllib.parse import urlsplit
 
-    from services.infra import pinned_http
+    from services.infra import outbound_url, pinned_http
     now = time.monotonic()
     with _lock:
         hit = _egress_memo.get(upstream)
@@ -367,7 +624,7 @@ def _egress_refusal(upstream: str) -> str | None:
     # platform's own space, and a name that only ever means this machine,
     # are still refused (a proxy on this machine would dial its loopback).
     proxied = _proxied(upstream)
-    if proxied and _names_this_machine(host):
+    if proxied and outbound_url.names_this_machine(host):
         verdict = f"the MCP server host {host} names this machine"
         with _lock:
             _egress_memo[upstream] = (verdict, now + _EGRESS_MEMO_S)
@@ -387,8 +644,9 @@ def _egress_refusal(upstream: str) -> str | None:
                 verdict = f"the MCP server host {host} resolves to an unreadable address"
                 break
             if pinned_http.control_plane(ip):
-                verdict = (f"the MCP server host {host} resolves to the platform's own "
-                           f"address space ({ip})")
+                where = ("a private address, which a hosted install never reaches"
+                         if config.OTODOCK_CLOUD else "the platform's own address space")
+                verdict = f"the MCP server host {host} resolves to {where} ({ip})"
                 break
     with _lock:
         _egress_memo[upstream] = (verdict, now + _EGRESS_MEMO_S)
@@ -433,7 +691,10 @@ def _expires_in(raw: dict) -> float | None:
 
 
 def resolve_credential(cred: GatewayCredential) -> Resolved | Refusal:
-    """The header to add for ``cred`` right now, or why not."""
+    """The header to add for ``cred`` right now, or why not. A Docker
+    tool with no sign-in adds none."""
+    if cred.kind == CONTAINER and cred.secretless:
+        return Resolved(header="", value="", upstream=cred.upstream, path=cred.path, proxy_local=True)
     host = cred.host
     allow_host = _SIDECAR_ALLOWLIST_HOST if cred.proxy_local else host
     if not _host_allowed(cred.allowlist_key, allow_host):
@@ -524,6 +785,44 @@ def resolve_cli_credential(cred: CliCredential) -> ResolvedCli | Refusal:
     return ResolvedCli(username=cred.username, secret=got[0], env_names=cred.env_names)
 
 
+def resolved_token_of(raw: dict, ref: TokenRef) -> ResolvedToken:
+    """What a token file gives a tool: the secret, its expiry, the scopes the
+    sign-in granted, the account's label (its address, for Google)."""
+    scopes = raw.get("scopes")
+    return ResolvedToken(
+        secret=_secret_of(raw, ref), expires_at=str(raw.get("expires_at") or ""),
+        expires_in=_expires_in(raw),
+        scopes=tuple(str(s) for s in scopes) if isinstance(scopes, list) else (),
+        account=ref.account_label,
+    )
+
+
+def resolve_token_credential(cred: TokenCredential) -> ResolvedToken | Refusal:
+    """The token a tool gets for ``cred`` right now, or why not (the same
+    reader and the same reconnect rule as the gateway's)."""
+    got = _token_secret(cred.token_ref, cred.manifest)
+    if isinstance(got, Refusal):
+        return got
+    raw = _read_token(cred.token_ref)
+    if not raw:
+        return Refusal("no_value", _REFUSAL_NO_VALUE)
+    return resolved_token_of(raw, cred.token_ref)
+
+
+def token_env(cred: TokenCredential, token: ResolvedToken) -> dict[str, str]:
+    """The env a tool's process gets for its account token: the value under
+    the manifest's names, and beside it what the tool needs to know when to
+    ask again and what it was granted."""
+    env = {name: token.secret for name in cred.env_names}
+    if token.expires_at:
+        env[TOKEN_EXPIRES_ENV] = token.expires_at
+    if token.scopes:
+        env[TOKEN_SCOPES_ENV] = " ".join(token.scopes)
+    if token.account:
+        env[TOKEN_ACCOUNT_ENV] = token.account
+    return env
+
+
 def resolve(session_id: str, mcp: str) -> Resolved | Refusal:
     """The header for the MCP ``mcp`` of ``session_id``, or why not."""
     cred = credential(session_id, mcp)
@@ -560,17 +859,29 @@ def _descriptor_path(session_id: str) -> Path | None:
 def write_descriptor(
     session_id: str, credentials: dict[str, GatewayCredential], *,
     cli: dict[str, CliCredential] | None = None,
+    tokens: dict[str, TokenCredential] | None = None,
+    exits: dict[str, tuple[ExitCredential, ...]] | None = None,
     machine_id: str = "", token_hash: str = "", agent: str = "", user_sub: str = "",
-    task_scope: str = "",
+    task_scope: str = "", account_choices: Mapping[str, str] | None = None, person_sub: str = "",
+    envs: Mapping[str, list[str]] | None = None, accounts: Mapping[str, str] | None = None,
 ) -> None:
     """Record what a session was provisioned with, by reference (the gateway
-    credentials and the command-line ones), plus the identity its static
-    values resolve under (the agent, the person, the scope). Nothing to
-    record removes an earlier descriptor."""
+    credentials, the command-line ones, the tools' account tokens and the
+    credential exit's entries), plus the identity its static values resolve
+    under (the agent, the person, the scope, the chat's choice of account
+    per MCP), and ``person_sub``, the person in the chat when that is not
+    whose accounts it used (the hosted relay's token is minted for the
+    person). A descriptor without a choice carries no ``account_choices``
+    key. ``envs`` names, per tool key, what each stdio tool's bundle sets in
+    its environment (``env_names_of``: names, never values), so a tool that
+    first starts after a restart gets them again; ``accounts`` the account
+    each tool key was built on (``accounts_of``), the only one a re-adoption
+    takes its values on again. Nothing to record removes an earlier
+    descriptor."""
     path = _descriptor_path(session_id)
     if path is None:
         return
-    if not credentials and not cli:
+    if not credentials and not cli and not tokens and not exits and not envs:
         remove_descriptor(session_id)
         return
     doc = {
@@ -581,7 +892,17 @@ def write_descriptor(
         "task_scope": task_scope,
         "credentials": {k: c.descriptor() for k, c in credentials.items()},
         "cli": {k: c.descriptor() for k, c in (cli or {}).items()},
+        "tokens": {k: c.descriptor() for k, c in (tokens or {}).items()},
+        "exits": {k: [c.descriptor() for c in v] for k, v in (exits or {}).items() if v},
     }
+    if account_choices:
+        doc["account_choices"] = {str(k): str(v) for k, v in account_choices.items()}
+    if envs:
+        doc["envs"] = {str(k): [str(n) for n in v] for k, v in envs.items() if v}
+    if accounts:
+        doc["accounts"] = {str(k): str(v) for k, v in accounts.items() if v}
+    if person_sub:
+        doc["person_sub"] = person_sub
     tmp = path.with_suffix(".json.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -609,44 +930,124 @@ def read_descriptor(session_id: str) -> dict | None:
         c = CliCredential.from_descriptor(d) if isinstance(d, dict) else None
         if c is not None:
             cli[str(key)] = c
+    token_creds: dict[str, TokenCredential] = {}
+    for key, d in (doc.get("tokens") or {}).items():
+        tc = TokenCredential.from_descriptor(d) if isinstance(d, dict) else None
+        if tc is not None:
+            token_creds[str(key)] = tc
+    choices = doc.get("account_choices")
+    exits_raw = doc.get("exits")
+    exits = ({str(k): [d for d in v if isinstance(d, dict)] for k, v in exits_raw.items() if isinstance(v, list)}
+             if isinstance(exits_raw, dict) else {})
+    envs_raw = doc.get("envs")
+    envs = ({str(k): [str(n) for n in v if isinstance(n, str) and n] for k, v in envs_raw.items()
+             if isinstance(v, list)} if isinstance(envs_raw, dict) else {})
+    accounts_raw = doc.get("accounts")
+    accounts = ({str(k): v for k, v in accounts_raw.items() if isinstance(v, str) and v}
+                if isinstance(accounts_raw, dict) else {})
     return {
         "machine_id": str(doc.get("machine_id") or ""),
         "token_hash": str(doc.get("token_hash") or ""),
         "agent": str(doc.get("agent") or ""),
         "user_sub": str(doc.get("user_sub") or ""),
+        "person_sub": str(doc.get("person_sub") or doc.get("user_sub") or ""),
         "task_scope": str(doc.get("task_scope") or ""),
+        "account_choices": ({str(k): str(v) for k, v in choices.items() if k and v}
+                            if isinstance(choices, dict) else {}),
         "credentials": out,
         "cli": cli,
+        "tokens": token_creds,
+        "envs": {k: v for k, v in envs.items() if v},
+        "accounts": accounts,
+        # The exit entries as written: the re-adoption rebuilds them with the
+        # bundle's command-line credential (``ExitCredential.from_descriptor``).
+        "exits": exits,
     }
 
 
 def static_values_for(
     agent: str, user_sub: str, task_scope: str, creds: dict[str, GatewayCredential],
+    account_choices: Mapping[str, str] | None = None, built: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """The static values (header-style keys) of ``creds`` resolved again for
     the identity a descriptor names, by MCP key; a token-file credential
     needs none. As the session build does: the MCP's resolved secrets, then
     the field values of the env-delivered instance the agent takes
-    (``mcp_registry.env_instance_values``), the instance's winning. Blocking
-    (the credential resolver's and the instance store's reads)."""
+    (``mcp_registry.env_instance_values``), the instance's winning. The
+    secrets are the account the chat chose (``account_choices``, the
+    descriptor's) when the agent's set holds it, and only the account each
+    MCP was built on (``built``, ``_resolved_envs``). Blocking (the
+    credential resolver's and the instance store's reads)."""
     wanted = {k: c for k, c in creds.items() if c.token_ref is None and c.value_from}
     if not wanted:
         return {}
-    from services.mcp import mcp_registry
-    from services.oauth import credential_resolver
-    result = credential_resolver.resolve_credentials(
-        agent, user_sub or None, task_scope=task_scope or "user",
-    )
+    envs = _resolved_envs(agent, user_sub, task_scope, {c.manifest or k for k, c in wanted.items()},
+                          account_choices, built)
     out: dict[str, str] = {}
     for key, cred in wanted.items():
-        name = cred.manifest or key
+        value = envs.get(cred.manifest or key, {}).get(cred.value_from, "")
+        if value:
+            out[key] = value
+    return out
+
+
+def env_values_for(
+    agent: str, user_sub: str, task_scope: str, wanted: Mapping[str, tuple[str, tuple[str, ...]]],
+    account_choices: Mapping[str, str] | None = None, built: Mapping[str, str] | None = None,
+) -> dict[str, dict[str, str]]:
+    """A stdio tool's environment values resolved again for the identity a
+    descriptor names, as ``static_values_for`` resolves a gateway's, on the
+    account each was built on: per tool key, ``wanted`` maps it to its
+    manifest's name and the names to resolve; the answer holds the names
+    that resolved, host-self addresses rewritten as the build rewrites
+    them. Blocking."""
+    if not wanted:
+        return {}
+    from services.mcp import mcp_registry
+    from services.mcp.mcp_egress import _rewrite_host_self_targets_to_loopback
+    envs = _resolved_envs(agent, user_sub, task_scope, {m for m, _names in wanted.values()},
+                          account_choices, built)
+    out: dict[str, dict[str, str]] = {}
+    for key, (manifest_name, names) in wanted.items():
+        env = {n: v for n, v in envs.get(manifest_name, {}).items() if n in names and v}
+        manifest = mcp_registry.get_manifest(manifest_name)
+        if manifest is not None and env:
+            _rewrite_host_self_targets_to_loopback(manifest, env, agent, user_sub=user_sub or None,
+                                                   task_scope=task_scope or "user")
+        out[key] = env
+    return out
+
+
+def _resolved_envs(agent: str, user_sub: str, task_scope: str, manifests: set[str],
+                   account_choices: Mapping[str, str] | None,
+                   built: Mapping[str, str] | None) -> dict[str, dict[str, str]]:
+    """The secrets the session build resolves per MCP for this identity and
+    choice of account, then the field values of the env-delivered instance
+    the agent takes (``mcp_registry.env_instance_values``), the instance's
+    winning. Only on the account each MCP was built on (``built``, per MCP,
+    ``account_text``; one not named was built on none): an MCP this
+    resolution takes another account for, or none, gets nothing, so a
+    session taken back never moves to another account by itself (another
+    lender's of the agent's set, whose secret the build's owner filter kept
+    off a person's own computer, or another of the person's own). The
+    account compared is the one this same resolution read the values from."""
+    from services.mcp import mcp_registry
+    from services.oauth import credential_resolver
+    from services.oauth.credential_resolver import choice_kw
+    result = credential_resolver.resolve_credentials(
+        agent, user_sub or None, task_scope=task_scope or "user", **choice_kw(account_choices),
+    )
+    out: dict[str, dict[str, str]] = {}
+    for name in manifests:
+        if account_text(result.accounts.get(name)) != (built or {}).get(name, ""):
+            logger.info("mcp-gateway: %s resolves on another account than its session was built on: "
+                        "not taken back", name)
+            continue
         env = dict(result.env_by_mcp.get(name, {}))
         manifest = mcp_registry.get_manifest(name)
         if manifest is not None:
             env.update(mcp_registry.env_instance_values(manifest, agent))
-        value = env.get(cred.value_from, "")
-        if value:
-            out[key] = value
+        out[name] = env
     return out
 
 
@@ -818,6 +1219,64 @@ def judge_reach(
     return verdict.refusal, verdict.body
 
 
+OUTSIDE_METHOD_REFUSED = "Outside people may not use this request of the tool."
+LIMIT_METHOD_REFUSED = "This tool is limited for this agent, and it may not use this request."
+OUTSIDE_UNREADABLE = "This request to the tool could not be read, so it was refused."
+
+
+def judge_outside(grants, mcp: str, method: str, body: bytes, inbound_headers=(),
+                  *, refused: str = "") -> str:
+    """An outside session's request to an attached server, judged by the
+    functions its Outside people pick granted (``outside_picks``, by server
+    key): the refusal sentence, or "" to forward the body as it came. Every
+    function granted (a Read and write pick, a channel tool) passes
+    whole. Otherwise a bodiless GET or DELETE passes (the stream, the
+    session's end), a POST body is read with the reach judge's strict parser
+    (one message or a batch): the plain methods pass, a ``tools/call`` whose
+    name is granted passes, everything else is refused, an unreadable body
+    with it. Blocking (the JSON): the caller runs it in a thread. ``refused``
+    words a refused function for a tool limit (the outside sentence
+    otherwise)."""
+    from auth import github_reach
+    from services.mcp import outside_picks
+    names = outside_picks.granted(grants, mcp)
+    if names is outside_picks.EVERY_FUNCTION:
+        return ""
+    verb = (method or "").upper()
+    if verb in _BODILESS_METHODS and not body:
+        return ""
+    if verb != _POST:
+        return OUTSIDE_METHOD_REFUSED
+    encodings = [v.strip().lower() for k, v in inbound_headers if k.lower() == "content-encoding"]
+    if any(e and e != _IDENTITY_ENCODING for e in encodings) or len(body) > MAX_BODY_BYTES:
+        return OUTSIDE_UNREADABLE
+    try:
+        doc = json.loads(body.decode("utf-8"), object_pairs_hook=github_reach._strict_object,
+                         parse_constant=github_reach._no_constant)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return OUTSIDE_UNREADABLE
+    if not isinstance(doc, (dict, list)) or (isinstance(doc, list) and not doc):
+        return OUTSIDE_UNREADABLE
+    for msg in doc if isinstance(doc, list) else [doc]:
+        if not isinstance(msg, dict):
+            return OUTSIDE_UNREADABLE
+        name = msg.get("method")
+        if name is None:
+            continue  # the client's answer to the server
+        if not isinstance(name, str):
+            return OUTSIDE_UNREADABLE
+        if name in github_reach._PLAIN_METHODS or name.startswith(github_reach._PLAIN_PREFIXES):
+            continue
+        if name == github_reach._METHOD_CALL:
+            params = msg.get("params")
+            function = str(params.get("name") or "") if isinstance(params, dict) else ""
+            if function and function in names:
+                continue
+            return refused or "This function of the tool is not open to outside people on this line."
+        return refused or OUTSIDE_METHOD_REFUSED
+    return ""
+
+
 def _reach_headers(cred: GatewayCredential, headers: dict[str, str]) -> None:
     """A narrowed credential forwards none of the server's option headers
     the session sent (two copies of one name read as the first); under a
@@ -865,8 +1324,10 @@ def client(proxy_local: bool, upstream: str = ""):
     the environment's proxy carries; no redirects, no read timeout (a
     standing stream), a 10 s connect. The vendor pool connects only to
     addresses that pass ``_egress_refusal``'s rule, resolved at the dial
-    (``pinned_http.control_plane``); the pool limits sit on its transport,
-    the only place a custom transport reads them."""
+    (``pinned_http.control_plane``), and on a hosted install the sidecar
+    pool only to the install's own tool networks (``docker_tool``); the
+    pool limits sit on the transport, the only place a custom transport
+    reads them."""
     import asyncio
 
     import httpx
@@ -886,6 +1347,9 @@ def client(proxy_local: bool, upstream: str = ""):
                 transport=pinned_http.CheckedTransport(pinned_http.control_plane, limits=limits),
                 timeout=timeout, follow_redirects=False,
             )
+        elif kind == "sidecar":
+            c = httpx.AsyncClient(**pinned_http.tool_transport(
+                timeout=timeout, limits=limits, follow_redirects=False))
         else:
             c = httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False)
         _clients[key] = c
@@ -914,12 +1378,14 @@ def upstream_url(res: Resolved, query: bytes, session_id: str):
 async def prepare_forward(
     session_id: str, mcp: str, method: str, rest: str, query: bytes, inbound_headers,
     body: bytes = b"",
-) -> Prepared | Refusal:
+) -> Prepared | Refusal | Answered:
     """Everything a front door needs to forward one request of ``session_id``
     for ``mcp``: the credential resolved in a thread, the path confined to
     the declared endpoint, a narrowed reach's judgment of ``body``, the
     headers filtered and the credential header added, the client picked. A
-    refusal carries the sentence the client reads."""
+    refusal carries the sentence the client reads. A Docker tool's request
+    is the door's (``Answered``), once the session's grants and limits
+    passed."""
     import asyncio
     cred = credential(session_id, mcp)
     if cred is None:
@@ -928,6 +1394,26 @@ async def prepare_forward(
         return Refusal("path_refused", _REFUSAL_PATH)
     content: bytes | None = None
     inbound = list(inbound_headers)
+    # An outside session: each call judged by the function its pick granted,
+    # before the reach (the context is the session's, registered at its build).
+    from core.session.external_identity import is_external_ctx
+    from core.session.session_state import get_session_security
+    ctx = get_session_security(session_id)
+    if is_external_ctx(ctx):
+        refusal = await asyncio.to_thread(
+            judge_outside, getattr(ctx, "outside_grants", ()), mcp, method, body, inbound)
+        if refusal:
+            return Refusal("outside_refused", refusal)
+    # The agent's tool limits (services/mcp/tool_limits): a limited server's
+    # call judged by its function name the same way, every session kind.
+    from services.mcp import tool_limits
+    limited = tool_limits.limited(getattr(ctx, "tool_limits", ()) or (), mcp)
+    if limited is not None:
+        refusal = await asyncio.to_thread(
+            judge_outside, ((mcp, limited),), mcp, method, body, inbound,
+            refused=LIMIT_METHOD_REFUSED)
+        if refusal:
+            return Refusal("limit_refused", refusal)
     if cred.reach:
         refusal, content = await asyncio.to_thread(judge_reach, cred, mcp, method, body, inbound)
         if refusal:
@@ -935,6 +1421,14 @@ async def prepare_forward(
     res = await asyncio.to_thread(resolve_credential, cred)
     if isinstance(res, Refusal):
         return res
+    if cred.kind == CONTAINER:
+        # Every Docker tool: its door, after the grants, the limits and the
+        # credential (a person whose sign-in cannot be used wakes nothing),
+        # with the credential to add, none for a tool with no sign-in.
+        from services.containers import door
+        signed = ((res.header, res.value),) if res.header else ()
+        return await door.step(session_id, mcp, cred, method, rest, query, inbound, body,
+                               credential=signed)
     res.path = _reach_path(cred, res.path)
     headers = forward_request_headers(inbound)
     _reach_headers(cred, headers)
@@ -965,7 +1459,9 @@ def on_purge(session_id: str) -> None:
     """The broker purged a session: forget its descriptor and tell the
     hooks. Never raises into the session cleanup."""
     try:
-        remove_descriptor(session_id)
+        # Off the event loop; the next start of the id waits for it.
+        from core import file_commit
+        file_commit.behind(remove_descriptor, session_id, name="descriptor_removal", key=session_id)
     except Exception:
         logger.exception("mcp-gateway: purge of %s failed", session_id[:8])
     for fn in list(_purge.hooks):

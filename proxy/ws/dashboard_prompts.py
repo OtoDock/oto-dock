@@ -45,9 +45,6 @@ logger = logging.getLogger("otodock")
 #: A plan review's implement actions and the mode each moves the chat to
 #: ("Start in Auto", "Start in Ask").
 _IMPLEMENT_MODES = {"implement_auto": AUTO_REVIEW_MODE, "implement_ask": ASK_MODE}
-#: The action names before 1.9 (an older page's answer, a stored card).
-PLAN_ACTIONS_BEFORE_1_9 = {"implement_accept_edits": "implement_auto",
-                           "implement_default": "implement_ask"}
 #: The implement message, sent only when nothing waits on the review's
 #: answer (a Codex plan between turns, a card whose wait ended): an answer that
 #: resumes the engine's waiting call (Claude's ExitPlanMode) needs none.
@@ -206,7 +203,7 @@ class PromptController(_Host):
             # Claimed before anything is awaited: a second tab's answer to a
             # card nobody waits on finds it answered (one implement turn).
             _note_answered(rid)
-        action = PLAN_ACTIONS_BEFORE_1_9.get(msg.get("action", ""), msg.get("action", ""))
+        action = msg.get("action", "")
         plan_fn = msg.get("filename", "")
         implement_mode = _IMPLEMENT_MODES.get(action, "")
         # Approve ExitPlanMode for implement only. Edit and Cancel deny it, so

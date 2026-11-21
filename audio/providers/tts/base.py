@@ -20,7 +20,13 @@ from audio.capabilities import BillingUnit, TTSCapabilities
 from audio.providers.credential_resolver import CredentialResolver
 from audio.providers.model_succession import successor_of
 
-__all__ = ["TTSProvider", "VoiceInfo", "UnsupportedProviderOperation"]
+__all__ = ["TTSProvider", "VoiceInfo", "UnsupportedProviderOperation", "speakable"]
+
+
+def speakable(text: str) -> bool:
+    """Whether ``text`` holds anything to say: a letter or a digit, in any
+    script. Punctuation, markup and blanks alone are nothing to say."""
+    return any(ch.isalnum() for ch in text)
 
 
 class UnsupportedProviderOperation(Exception):
@@ -232,7 +238,14 @@ class TTSProvider(ABC):
 
     @abstractmethod
     async def send_text_chunk(self, text: str, is_last: bool = False) -> None:
-        """Send a text chunk to the current streaming context."""
+        """Send a text chunk to the current streaming context.
+
+        The bridge ends every context with ``is_last``, also one it never
+        sent text to (a reply that was a marker alone, a tool call with no
+        words after it). Such an end reaches no vendor, and the context's
+        ``receive_audio`` ends at once with no audio: a vendor may refuse an
+        end with nothing before it, and a receiver left waiting holds the
+        turn. After the end of input a chunk changes nothing."""
 
     async def flush(self) -> None:  # noqa: B027 — a default no-op: an engine that generates as the text arrives has nothing to release
         """Synthesize what the context holds without ending the utterance.

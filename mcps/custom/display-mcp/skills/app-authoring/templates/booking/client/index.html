@@ -201,7 +201,8 @@
     $("customers").textContent = "· " + data.customers + " customer" + (data.customers === 1 ? "" : "s");
     data.bookings.forEach(function (b) {
       var tr = document.createElement("tr");
-      [["When", b.label], ["Who", b.name + ", " + b.email], ["Status", STATUS_WORDS[b.status] || b.status]].forEach(function (cell) {
+      var who = b.source === "call" ? "A caller, by phone" : b.name + ", " + b.email;
+      [["When", b.label], ["Who", who], ["Status", STATUS_WORDS[b.status] || b.status]].forEach(function (cell) {
         var td = document.createElement("td");
         td.dataset.label = cell[0];
         td.textContent = cell[1];

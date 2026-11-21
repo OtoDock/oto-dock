@@ -11,7 +11,8 @@ import { useEffect } from 'react'
 
 import ErrorBoundary from '@/components/ErrorBoundary'
 import RouteBoundary, { PageBoundary } from '@/components/RouteBoundary'
-import { copyText, crashReport } from '@/lib/crash/crashReport'
+import { copyText } from '@/lib/copyText'
+import { crashReport } from '@/lib/crash/crashReport'
 
 const mounts = vi.hoisted(() => ({ count: 0 }))
 

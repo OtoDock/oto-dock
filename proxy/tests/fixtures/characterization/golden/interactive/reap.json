@@ -1,0 +1,183 @@
+[
+ {
+  "choices": {
+   "reap-dead-pty": {
+    "closed": false,
+    "reaped": false,
+    "spare": null
+   },
+   "reap-fresh": {
+    "closed": false,
+    "reaped": false,
+    "spare": null
+   },
+   "reap-hook-activity": {
+    "closed": false,
+    "reaped": false,
+    "spare": "hook-activity"
+   },
+   "reap-idle": {
+    "closed": true,
+    "reaped": true,
+    "spare": null
+   },
+   "reap-otodock": {
+    "closed": false,
+    "reaped": false,
+    "spare": null
+   },
+   "reap-parked": {
+    "closed": false,
+    "reaped": false,
+    "spare": "question-parked"
+   },
+   "reap-parked-past-wait": {
+    "closed": true,
+    "reaped": true,
+    "spare": null
+   },
+   "reap-parked-token-over": {
+    "closed": true,
+    "reaped": true,
+    "spare": null
+   },
+   "reap-prompt-pending": {
+    "closed": false,
+    "reaped": false,
+    "spare": "prompt-pending"
+   },
+   "reap-remote-gone": {
+    "closed": true,
+    "reaped": true,
+    "spare": null
+   },
+   "reap-remote-grace": {
+    "closed": false,
+    "reaped": false,
+    "spare": null
+   },
+   "reap-turn-open": {
+    "closed": false,
+    "reaped": false,
+    "spare": "turn-open"
+   },
+   "reap-turn-stuck": {
+    "closed": true,
+    "reaped": true,
+    "spare": null
+   },
+   "reap-viewed": {
+    "closed": false,
+    "reaped": false,
+    "spare": null
+   }
+  },
+  "pty_close": [
+   {
+    "signal_child": true
+   },
+   {
+    "signal_child": true
+   },
+   {
+    "signal_child": true
+   },
+   {
+    "signal_child": true
+   },
+   {
+    "signal_child": true
+   }
+  ],
+  "reaped": 5,
+  "slots_released": [
+   "reap-idle",
+   "reap-parked-past-wait",
+   "reap-parked-token-over",
+   "reap-remote-gone",
+   "reap-turn-stuck"
+  ],
+  "step": "the sweep"
+ },
+ {
+  "reaped": 0,
+  "step": "a second sweep finds no more"
+ },
+ {
+  "fresh": false,
+  "gone": true,
+  "idle": true,
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "reaped": 1,
+  "slot_released": [
+   "reap-prompt-pending"
+  ],
+  "spared": true,
+  "step": "the prompt's wait ended"
+ },
+ {
+  "fresh_stays": true,
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "reaped": 1,
+  "slot_acquired": [
+   [
+    "reap-past-the-platform-timeout",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "slot_released": [
+   "reap-past-the-platform-timeout"
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "reap-past-the-platform-timeout": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "with no timeout given: the platform's",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ],
+  "turn_stays": true
+ }
+]

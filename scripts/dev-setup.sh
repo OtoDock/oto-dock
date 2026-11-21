@@ -56,7 +56,7 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 # shellcheck source=versions.sh
 source "$PLATFORM_ROOT/scripts/versions.sh"
 PYTHON_VERSION="$(otodock_version_get PYTHON_VERSION)"; PYTHON_VERSION="${PYTHON_VERSION:-3.13.18}"
-NODE_VERSION="$(otodock_version_get NODE_VERSION)";   NODE_VERSION="${NODE_VERSION:-26.13.0}"
+NODE_VERSION="$(otodock_version_get NODE_VERSION)";   NODE_VERSION="${NODE_VERSION:-26.13.1}"
 NODE_MAJOR="${NODE_VERSION%%.*}"                               # 26
 UV_VERSION="$(otodock_version_get UV_VERSION)";       export UV_VERSION   # honored by install-baseline-tools.sh
 PNPM_VERSION="$(otodock_version_get PNPM_VERSION)";   export PNPM_VERSION
@@ -75,6 +75,9 @@ refuse_running_units() {
     command -v systemctl >/dev/null 2>&1 || return 0
     if systemctl is-active --quiet otodock-proxy; then
         die "otodock-proxy is running: stop the proxy first (sudo systemctl stop otodock-proxy), then re-run"
+    fi
+    if systemctl is-active --quiet otodock-compute; then
+        die "otodock-compute is running: stop it first (sudo systemctl stop otodock-compute), then re-run"
     fi
     if [ "$WITH_PHONE" = 1 ] && systemctl is-active --quiet otodock-phone; then
         die "otodock-phone is running: stop the phone daemon first (sudo systemctl stop otodock-phone), then re-run"
@@ -190,11 +193,27 @@ setup_proxy() {
     ok "Proxy venv on Python $("$venv/bin/python" -V 2>&1 | awk '{print $2}')"
 }
 
+# ── 4b. The bundled tools' environments ───────────────────────────────────
+# The server builds no tool at its start. Each bundled tool with packages of
+# its own gets its environment here, as this user and outside the sandbox: the
+# trust this script already gives the server's own packages. Only what reads
+# stale is built, so a re-run after an update builds what the update changed.
+# A tool that does not build is left out of sessions and named at the
+# server's start: it never stops the install.
+build_bundled_tools() {
+    info "Building the bundled tools' environments (first run: several minutes)..."
+    if ( cd "$PLATFORM_ROOT/proxy" && venv/bin/python -m services.mcp.mcp_venv_bootstrap --build ); then
+        ok "Bundled tools ready"
+    else
+        warn "A bundled tool did not build (its line is above). It is left out of sessions until it does: fix the cause and re-run this script."
+    fi
+}
+
 # ── 5. Postgres in Docker ─────────────────────────────────────────────────
 start_postgres() {
     [ -f "$PLATFORM_ROOT/config.env" ] || die "config.env missing — proxy/setup.sh should have created it"
     local DC="docker"; docker info >/dev/null 2>&1 || DC="sudo docker"
-    info "Starting Postgres (${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab}) in Docker..."
+    info "Starting Postgres (${POSTGRES_IMAGE:-postgres:16.16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e}) in Docker..."
     $DC compose --env-file "$PLATFORM_ROOT/config.env" -f "$PLATFORM_ROOT/docker-compose.t1.yml" up -d postgres
     ok "Postgres up on 127.0.0.1:5432 (container otodock-postgres)"
 }
@@ -258,6 +277,14 @@ User=$USER
 WorkingDirectory=$PLATFORM_ROOT/proxy
 EnvironmentFile=$PLATFORM_ROOT/config.env
 ExecStart=$PLATFORM_ROOT/proxy/venv/bin/python app.py
+# The folder it writes the compute machine's credential into (otodock-compute).
+Environment="OTODOCK_COMPUTE_LINK_DIR=$PLATFORM_ROOT/compute-link"
+# The stop reaches the server alone first, so it can wait for open work
+# (ExecStop, up to OTODOCK_DRAIN_BOUND_S seconds, then the server's own
+# stop). Its engines are ended last.
+KillMode=mixed
+ExecStop=-$PLATFORM_ROOT/proxy/venv/bin/python $PLATFORM_ROOT/proxy/admin_cli.py drain --quiet
+TimeoutStopSec=780
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536:524288
@@ -266,6 +293,100 @@ Environment="NODE_PATH=/usr/lib/node_modules"
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=otodock-proxy
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    # What the compute unit runs that its walls would hide: the folder holding
+    # the Python its venv was made from (uv keeps its Pythons under the user's
+    # home, and a venv links its minor-version name there) and an npm prefix
+    # of the person's own (the engines), each read-only, the prefix's bin first.
+    local compute_ro="" compute_path="/usr/local/bin:/usr/bin:/bin" py npm_prefix p
+    py="$(readlink -f "$PLATFORM_ROOT/satellite/venv/bin/python" 2>/dev/null || true)"
+    py="${py%/bin/*}"
+    py="${py%/*}"
+    npm_prefix="$(npm prefix -g 2>/dev/null || true)"
+    for p in "$py" "$npm_prefix"; do
+        case "$p" in ""|/usr|/usr/*|"$PLATFORM_ROOT"|"$PLATFORM_ROOT"/*) ;; *) compute_ro="$compute_ro $p" ;; esac
+    done
+    case "$npm_prefix" in ""|/usr|/usr/*) ;; *) compute_path="$npm_prefix/bin:$compute_path" ;; esac
+    # The compute unit builds and keeps the community tools in a folder of its
+    # state directory, bound over mcps/community alone: never over mcps, which
+    # holds the bundled tools and their interpreters. The bind needs the
+    # folder it lands on.
+    mkdir -p "$PLATFORM_ROOT/mcps/community"
+    # The data folders where the server keeps them: config.env's last line for
+    # PLATFORM_DATA_DIR (the proxy's unit reads that file alone), else the
+    # checkout. A value in this shell alone would give the compute unit other
+    # folders than the server's, so it stops the script. The unit's agents
+    # folder and its walls follow it, so a moved data folder is never walled at
+    # its old place.
+    local data="" line shell="${PLATFORM_DATA_DIR:-}"
+    if [ -r "$PLATFORM_ROOT/config.env" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            case "$line" in PLATFORM_DATA_DIR=*) data="${line#PLATFORM_DATA_DIR=}" ;; esac
+        done < "$PLATFORM_ROOT/config.env"
+        case "$data" in \"*\"|\'*\') data="${data:1:${#data}-2}" ;; esac
+    fi
+    if [ -n "$shell" ] && [ "${shell%/}" != "${data%/}" ]; then
+        die "PLATFORM_DATA_DIR is set in this shell and not in config.env. The units read config.env: add the line there."
+    fi
+    data="${data:-$PLATFORM_ROOT}"
+    data="${data%/}"
+    case "$data/" in
+        *[[:space:]]*|*/../*|*/./*|*//*|/) die "PLATFORM_DATA_DIR ($data) must be an absolute folder path with no space, . or .. in it for the compute unit" ;;
+        /*) ;;
+        *) die "PLATFORM_DATA_DIR ($data) must be an absolute path for the compute unit" ;;
+    esac
+    # Walled below, and made first: a folder made after the unit started is
+    # not walled until its next start (the media pulled from people's own
+    # computers, the default backup folder). The wall on credential-exit
+    # stays for an earlier release's folder, which the platform's boot
+    # removes.
+    local wall
+    for wall in "$data/host-media-cache" "$PLATFORM_ROOT/backups"; do
+        [ -d "$wall" ] || mkdir -m 700 "$wall"
+    done
+    info "Installing systemd unit otodock-compute.service (the platform's own sessions)..."
+    $SUDO tee /etc/systemd/system/otodock-compute.service >/dev/null <<EOF
+# With this unit the proxy makes itself not dumpable at its start: it writes no
+# core dump, and to inspect it use sudo (sudo py-spy dump --pid <pid>).
+[Unit]
+Description=OtoDock compute machine: the platform's own sessions
+After=network.target otodock-proxy.service
+
+[Service]
+Type=simple
+User=$USER
+StateDirectory=otodock-compute otodock-compute/tools
+Environment="HOME=/var/lib/otodock-compute"
+Environment="OTODOCK_COMPUTE_LINK_DIR=$PLATFORM_ROOT/compute-link"
+Environment="OTODOCK_COMPUTE_PLATFORM_URL=http://127.0.0.1:${PROXY_PORT:-8400}"
+Environment="OTODOCK_COMPUTE_AGENTS_DIR=$data/agents"
+Environment="OTODOCK_COMPUTE_MCPS_DIR=$PLATFORM_ROOT/mcps"
+ExecStart=$PLATFORM_ROOT/satellite/venv/bin/python $PLATFORM_ROOT/proxy/compute_start.py
+ProtectSystem=strict
+ProtectHome=tmpfs
+PrivateTmp=yes
+BindReadOnlyPaths=$PLATFORM_ROOT$compute_ro
+BindPaths=$data/agents
+BindPaths=/var/lib/otodock-compute/tools:$PLATFORM_ROOT/mcps/community
+InaccessiblePaths=$data/sessions $PLATFORM_ROOT/config.env -$PLATFORM_ROOT/proxy/sessions
+InaccessiblePaths=-$data/recover-bin -$data/upload-staging -$data/preview-snapshots
+InaccessiblePaths=-$PLATFORM_ROOT/mcps/custom/ssh-hosts/keys -/run/docker.sock -/run/user
+InaccessiblePaths=-$data/credential-exit -$data/host-media-cache -$PLATFORM_ROOT/backups
+InaccessiblePaths=-$PLATFORM_ROOT/.env -$PLATFORM_ROOT/phone/.env -$PLATFORM_ROOT/proxy/scripts/oto-quota -/usr/bin/sudo
+KillMode=mixed
+TimeoutStopSec=120
+OOMScoreAdjust=250
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536:524288
+Environment="PATH=$compute_path"
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=otodock-compute
 
 [Install]
 WantedBy=multi-user.target
@@ -297,6 +418,8 @@ EOF
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable --now otodock-proxy
     ok "otodock-proxy.service enabled + started"
+    $SUDO systemctl enable --now otodock-compute
+    ok "otodock-compute.service enabled + started"
     if [ "$WITH_PHONE" = 1 ]; then
         $SUDO systemctl enable --now otodock-phone
         ok "otodock-phone.service enabled + started"
@@ -308,6 +431,7 @@ install_node
 install_baseline
 install_docker
 setup_proxy
+build_bundled_tools
 start_postgres
 build_dashboard
 setup_phone
@@ -334,9 +458,10 @@ else
     echo "    2) dashboard:  cd dashboard && npm run dev        # hot-reload; or use the built dist/ served by the proxy"
     [ "$WITH_PHONE" = 1 ] && echo "    3) phone:      cd phone && venv/bin/python main.py"
     echo
-    info "Long-running dev box? Re-run with --service to register systemd unit(s) for this checkout."
+    warn "Chats, tasks, calls and tools run in the compute unit, which --service installs. Without it the server answers and nothing runs."
+    info "Re-run with --service to register the systemd units for this checkout (otodock-proxy, otodock-compute)."
 fi
 echo
 info "Health check:   curl http://localhost:8400/health"
 echo
-warn "First proxy boot runs the sandbox preflight — it needs unprivileged user namespaces enabled + passt/bubblewrap (installed above)."
+warn "The compute unit checks the sandbox at its start — it needs unprivileged user namespaces enabled + passt/bubblewrap (installed above). scripts/sandbox-doctor.sh says what is missing."

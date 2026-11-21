@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import NotificationBell from '../components/chat/notifications/NotificationBell'
 import NotificationPanel from '../components/chat/notifications/NotificationPanel'
@@ -14,6 +14,7 @@ import type {
   NotificationCountFrame, NotificationFrame, NotificationSilentFrame, ShareInboxFrame,
 } from '../api/wireEvents'
 import { isTaskChatId, runIdOfChat } from '../lib/session/kind'
+import { agentLinkHere } from '../lib/chat/agentLink'
 
 /**
  * Shared notification surface for the chat page (AgentChat).
@@ -30,10 +31,13 @@ import { isTaskChatId, runIdOfChat } from '../lib/session/kind'
  * Deep-link rule (single source of truth): every notification routes to the
  * chat page — task notifications (`task-…` chat_id) open it with task mode
  * toggled on (?tasks=1). Mirrors the backend `click_url` builder in
- * `proxy/services/notifications/notification_manager.py`.
+ * `proxy/services/notifications/notification_manager.py`. A link to an
+ * agent's page with no chat opens over the chat of that agent on screen
+ * (`lib/chat/agentLink.ts`).
  */
 export function useChatNotifications() {
   const navigate = useNavigate()
+  const location = useLocation()
   const qc = useQueryClient()
   const notif = useNotifications()
   const notifSound = useNotificationSound()
@@ -67,22 +71,24 @@ export function useChatNotifications() {
   // page a row names itself (a shared app or chat).
   const handleNotifNavigate = useCallback((agentSlug: string, chatId: string, href?: string) => {
     closePanel()
+    const go = (path: string) => navigate(agentLinkHere(path, location))
     if (href && href.startsWith('/') && !href.startsWith('//')) {
-      navigate(href)
+      go(href)
     } else if (!chatId) {
-      // No chat_id (e.g. a file-conflict notification) → open the agent and the
-      // workspace Recover bin via the ?recover deep-link.
-      navigate(`/chat/${agentSlug}?recover=1`)
+      // No chat_id (e.g. a file-conflict notification) → the agent's
+      // workspace Recover bin via the ?recover deep-link, over the chat on
+      // screen when it is one of that agent's.
+      go(`/chat/${agentSlug}?recover=1`)
     } else if (isTaskChatId(chatId)) {
       // Task chats open on the chat page with task mode toggled on; without
       // an agent slug the /runs resolver redirect figures it out.
-      navigate(agentSlug
+      go(agentSlug
         ? `/chat/${agentSlug}/${chatId}?tasks=1`
         : `/runs/${runIdOfChat(chatId)}`)
     } else {
-      navigate(`/chat/${agentSlug}/${chatId}`)
+      go(`/chat/${agentSlug}/${chatId}`)
     }
-  }, [navigate, closePanel])
+  }, [navigate, closePanel, location])
 
   const runShare = useCallback((item: ShareInboxItem, run: () => Promise<unknown>) => {
     setInboxBusyId(item.id)

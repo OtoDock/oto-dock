@@ -498,6 +498,16 @@ async def admin_delete_user(
         logger.exception(
             "Chat snapshot cleanup raised for user %s (continuing with user delete)", sub,
         )
+    # What their sessions' tools answered (it can name an account's email).
+    try:
+        from services.mcp import tool_listing
+        person = await asyncio.to_thread(task_store.get_username_by_sub, sub)
+        if person:
+            await asyncio.to_thread(tool_listing.forget, person=person)
+    except Exception:
+        logger.exception(
+            "Saved tool answers cleanup raised for user %s (continuing with user delete)", sub,
+        )
     rows_before = await asyncio.to_thread(task_store.get_user_agent_roles, sub)
     all_agents = await asyncio.to_thread(agent_store.get_agent_slugs)
     deleted = await asyncio.to_thread(task_store.delete_user, sub)
@@ -663,6 +673,9 @@ async def admin_set_local_only(
 ):
     """Toggle local-only network restriction for a user. Admin only."""
     u = require_admin(user)
+    if req.local_only and config.OTODOCK_CLOUD:
+        raise HTTPException(status_code=400,
+                            detail="A hosted install has no local network to limit a sign-in to.")
     target = await asyncio.to_thread(task_store.get_user, sub)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")

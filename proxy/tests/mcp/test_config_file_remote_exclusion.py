@@ -18,6 +18,7 @@ if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
 from core import placement
+from services.mcp import mcp_session_config
 from tests.mcp.test_mcp_broker_activation import (
     _FakeManifest,
     _stub_assembly,
@@ -52,14 +53,13 @@ def test_config_file_mcp_excluded_on_remote(monkeypatch, tmp_path):
 
 
 def test_config_file_mcp_included_locally(monkeypatch, tmp_path):
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_registry, mcp_session_config
     _stub_assembly(
         monkeypatch, [_ssh_like_manifest()], env_by_mcp={}, tmp_path=tmp_path,
     )
     hosts = tmp_path / "hosts.json"
     hosts.write_text('{"hosts": []}')
-    monkeypatch.setattr(
-        mcp_registry, "_generate_instance_config_file",
+    monkeypatch.setattr(mcp_session_config, "_generate_instance_config_file",
         lambda *a, **k: hosts,
     )
 
@@ -77,14 +77,13 @@ def test_the_config_file_is_written_whole(monkeypatch, tmp_path):
     partial one, and no temp file stays behind."""
     import json
 
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_registry, mcp_session_config
     _stub_assembly(
         monkeypatch, [_ssh_like_manifest()], env_by_mcp={}, tmp_path=tmp_path,
     )
     hosts = tmp_path / "hosts.json"
     hosts.write_text('{"hosts": []}')
-    monkeypatch.setattr(
-        mcp_registry, "_generate_instance_config_file",
+    monkeypatch.setattr(mcp_session_config, "_generate_instance_config_file",
         lambda *a, **k: hosts,
     )
 
@@ -103,7 +102,6 @@ def test_two_writers_of_one_path_never_tear_it_or_fail(tmp_path):
     text or the other."""
     import threading
 
-    from services.mcp import mcp_registry
     path = tmp_path / "cfg.json"
     texts = ["A" * 20000, "B" * 20000]
     errors: list[BaseException] = []
@@ -111,7 +109,7 @@ def test_two_writers_of_one_path_never_tear_it_or_fail(tmp_path):
     def writer(text: str) -> None:
         try:
             for _ in range(200):
-                mcp_registry._write_whole(path, text)
+                mcp_session_config._write_whole(path, text)
                 assert path.read_text() in texts
         except BaseException as exc:  # noqa: BLE001  # the thread's failure is the test's finding
             errors.append(exc)

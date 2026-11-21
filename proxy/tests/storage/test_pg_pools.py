@@ -444,3 +444,26 @@ async def test_arm_loop_pool_routes_the_calling_thread():
     assert pg.loop_pool() is None
     with pg.get_conn() as conn:
         assert conn._pool.name == "shared"
+
+
+@pytest.mark.asyncio
+async def test_a_loop_pool_armed_while_postgres_refuses_keeps_connecting(proxy_url, monkeypatch):
+    """A boot whose database refuses for its first seconds: the loop's pool
+    stays open and fills by itself once Postgres answers, so the first
+    on-loop read finds it alive (psycopg's own wait closes it on its
+    timeout, and the breaker then had to build another)."""
+    px, url = proxy_url
+    px.mode = "cut"
+    monkeypatch.setattr(config, "DATABASE_URL", url)
+    lp = pg.arm_loop_pool(open_wait_s=0.3)
+    try:
+        assert not lp._pool.closed
+        px.mode = "pass"
+        for _ in range(100):
+            if lp._pool.get_stats().get("pool_available"):
+                break
+            await asyncio.sleep(0.1)
+        assert _read() == 1
+        assert lp.trips == 0
+    finally:
+        pg.disarm_loop_pool()

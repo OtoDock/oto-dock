@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { attachmentsLine, classify, frameSrc, linkQuery, listPlaceholder, openAllowed, pickTheme, readConfig, resultMessage, sessionUrl, settingsPlaceholder, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, webUrl } from '@/sharehost/host'
+import { afterEach, describe, it, expect, vi } from 'vitest'
+import { attachmentsLine, classify, frameSrc, linkQuery, listPlaceholder, openAllowed, pickTheme, readConfig, resultMessage, sendLinkBatch, sessionUrl, settingsPlaceholder, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, webUrl, type ActionCall } from '@/sharehost/host'
 
 // The external link's host is a smaller AppFrame: a link is a viewer of one
 // page. The pure half is pinned here; the DOM half is exercised on T1.
@@ -95,6 +95,10 @@ describe('share host', () => {
     expect(settled.c).toEqual({ status: 'denied', reason: 'no answer' })
     expect(resultMessage(calls[0], settled.a)).toMatchObject({ type: 'action_result', id: 'go', call_id: 'a', ok: true })
     expect(resultMessage(calls[1], settled.b)).toMatchObject({ ok: false, result: 'no answer' })
+    // A tool button that ran answers done (with its text); a call that ran out of time is an error.
+    expect(resultMessage(calls[0], { status: 'done', result: 'rendered' })).toMatchObject({ ok: true, result: 'rendered' })
+    expect(resultMessage(calls[0], { status: 'error', reason: 'The tool did not finish within 60 seconds.' }))
+      .toMatchObject({ ok: false, result: 'The tool did not finish within 60 seconds.' })
   })
 })
 
@@ -143,5 +147,51 @@ describe('share host — folder apps (APPS.md)', () => {
     expect(linkQuery('?paid=1&b=2')).toBe('paid=1&b=2')
     expect(linkQuery('')).toBe('')
     expect(linkQuery('?' + 'x'.repeat(600))).toHaveLength(512)
+  })
+})
+
+// A link's visitor presses as a member does: a call the platform paced goes
+// once more after the wait it names (a batch refused whole, a tool call
+// inside its gap), through the dashboard's own sendPaced; a refusal that
+// names no wait (a task pressed twice) never again.
+describe('share host — a paced press', () => {
+  afterEach(() => { vi.useRealTimers() })
+  const lines = (...rows: Record<string, unknown>[]) => new Response(rows.map((r) => JSON.stringify(r)).join('\n'))
+  const tooFast = { status: 'denied', reason: 'Too fast — try again in a moment', code: 429 }
+
+  it('sends a batch refused whole once more after its wait', async () => {
+    vi.useFakeTimers()
+    const sent: string[][] = []
+    const send = vi.fn(async (calls: ActionCall[]) => {
+      sent.push(calls.map((k) => k.call_id))
+      return sent.length === 1
+        ? new Response(JSON.stringify({ detail: tooFast.reason, retry_after_ms: 300 }), { status: 429 })
+        : lines({ call_id: 'a', status: 'ok' }, { call_id: 'b', status: 'done', result: 'x' })
+    })
+    const done = sendLinkBatch([{ call_id: 'a', id: 'go' }, { call_id: 'b', id: 'tool' }], send)
+    await vi.advanceTimersByTimeAsync(200)
+    expect(sent).toEqual([['a', 'b']])
+    await vi.advanceTimersByTimeAsync(200)
+    const settled = await done
+    expect(sent).toEqual([['a', 'b'], ['a', 'b']])
+    expect([settled.a.status, settled.b.status]).toEqual(['ok', 'done'])
+  })
+
+  it('sends only the calls that name a wait, once, and keeps a second refusal', async () => {
+    vi.useFakeTimers()
+    const sent: string[][] = []
+    const send = vi.fn(async (calls: ActionCall[]) => {
+      sent.push(calls.map((k) => k.call_id))
+      return sent.length === 1
+        ? lines({ call_id: 'a', ...tooFast }, { call_id: 'b', ...tooFast, retry_after_ms: 120 }, { call_id: 'c', status: 'ok' })
+        : lines({ call_id: 'b', ...tooFast, retry_after_ms: 90 })
+    })
+    const done = sendLinkBatch([{ call_id: 'a', id: 'go' }, { call_id: 'b', id: 'tool' }, { call_id: 'c', id: 'go2' }], send)
+    await vi.advanceTimersByTimeAsync(5000)
+    const settled = await done
+    expect(sent).toEqual([['a', 'b', 'c'], ['b']])
+    expect(settled.a).toMatchObject({ status: 'denied', code: 429 })
+    expect(settled.b).toMatchObject({ status: 'denied', retry_after_ms: 90 })
+    expect(settled.c.status).toBe('ok')
   })
 })

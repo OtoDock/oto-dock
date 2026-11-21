@@ -134,12 +134,12 @@ async def create_temp_image_url(
         if resolution is not None and not resolution.allowed:
             raise HTTPException(status_code=403, detail=resolution.error)
         raise HTTPException(status_code=404, detail=f"file not found: {req.abs_path}")
-    target = target.resolve(strict=False)
 
-    # Final security check: resolved disk path MUST live under this agent's
-    # platform agent_dir. The hook resolver returns the original path on miss,
-    # so even if translation failed we still reject anything outside scope.
-    agent_dir = config.get_agent_dir(ctx.agent).resolve()
+    # The gate's answer is the authorized place with no link left in it; it
+    # is read as text here and opened strictly below, never resolved again.
+    # It MUST live under this agent's folder (a host-cache file is not
+    # served on a public URL).
+    agent_dir = config.get_agent_dir(ctx.agent)
     try:
         target.relative_to(agent_dir)
     except ValueError as exc:
@@ -159,7 +159,7 @@ async def create_temp_image_url(
                    "served on a temporary URL",
         )
 
-    # Snapshot the bytes now: the resolved path was authorized, so it is the
+    # Snapshot the bytes now: the gate's answer was authorized, so it is the
     # path opened, beneath the agents root with no symlink followed.
     try:
         rel = safe_fs.rel_under(target, config.AGENTS_DIR)

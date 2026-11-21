@@ -34,14 +34,19 @@ export const ROLE = {
   EDITOR: 'editor',
   CONTRIBUTOR: 'contributor',
   VIEWER: 'viewer',
+  /** An outside person (a caller, a visitor of a shared link): below every member floor, never stored. */
+  EXTERNAL: 'external',
 } as const
 
 export type PlatformRole = 'admin' | 'creator' | 'member'
 export type AgentRole = 'manager' | 'editor' | 'contributor' | 'viewer'
 /** The role a principal acts with on one agent: the admin's, or a per-agent row. */
 export type EffectiveRole = AgentRole | 'admin'
-/** The floors a manifest may name for an action or an export (the default floor is every viewer). */
-export type ActionFloor = Exclude<AgentRole, 'viewer'>
+/**
+ * The floors a manifest may name for an action or an export (the default floor is every viewer):
+ * a member's role, or `external`, which opens a tool or task button or a method to outside people too.
+ */
+export type ActionFloor = Exclude<AgentRole, 'viewer'> | 'external'
 
 /** The `users.role` CHECK, in its order. */
 export const PLATFORM_ROLES: readonly PlatformRole[] = ['admin', 'creator', 'member']
@@ -137,16 +142,18 @@ export function actingRole(user: User | null | undefined, agent: string): Effect
 }
 
 export function rank(role: string | null | undefined): number {
+  if (role === ROLE.EXTERNAL) return -1
   return ROLE_RANK[role ?? ''] ?? 0
 }
 
 /**
  * Whether `role` clears the action's floor (the server judges the same way):
- * an empty floor is the viewer floor; a floor the table does not know is
- * unreachable.
+ * an empty floor is the viewer floor, `external` opens it to everyone; a
+ * floor the table does not know is unreachable.
  */
 export function meetsFloor(action: { min_role?: string | null }, role: string | null | undefined): boolean {
   const wanted = action.min_role || ROLE.VIEWER
+  if (wanted === ROLE.EXTERNAL) return true
   return wanted in ROLE_RANK && rank(role) >= ROLE_RANK[wanted]
 }
 

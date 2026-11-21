@@ -124,8 +124,8 @@ fetch() { # fetch <url> <dest>
     mv "$2.tmp" "$2"
 }
 
-# Free disk where Docker keeps its images, before a pull of about 11 GB: a
-# first start adds about 1.5 GB more, and the server refuses uploads while
+# Free disk where Docker keeps its images, before a pull of about 12 GB: a
+# first start adds a little more, and the server refuses uploads while
 # less than the larger of 5 GB and 5 % of the disk is free. Linux with a local
 # daemon only (a remote daemon, or Docker Desktop's VM, keeps the images
 # elsewhere); an answer that cannot be read skips the check.
@@ -156,8 +156,8 @@ disk_preflight() {
             return 0
         fi
         fail "only ${free_gb} GB free where Docker keeps its images ($root). The install
-  needs about ${floor_gb} GB: about 11 GB of release images and 1.5 GB for the
-  first start. Free some space (docker system prune removes unused images and
+  needs about ${floor_gb} GB: about 12 GB of release images and a little more for
+  the first start. Free some space (docker system prune removes unused images and
   build cache), or run with OTODOCK_MIN_FREE_GB=0 to install anyway."
     fi
     upload_k=$((total_k / 20))
@@ -419,6 +419,27 @@ say "starting OtoDock — the first run pulls the release images, which can take
 docker compose up -d || fail "docker compose up failed (the message above). The compose files and .env
   stay in $(pwd), and install.sh refuses a folder that holds them: fix the
   cause, then run docker compose up -d in that folder."
+
+# The server's health, then the compute machine's sign-in (chats, tasks and
+# calls run there): never fatal, the line says that they are refused until
+# it signs in. OTODOCK_UPGRADE_WAIT_S raises the wait, as for an update.
+_wait="${OTODOCK_UPGRADE_WAIT_S:-300}"
+_proxy="$(docker compose ps -q otodock-proxy 2>/dev/null || true)"
+if [ -n "$_proxy" ]; then
+    say "waiting for the server to start. A first start can take a few minutes."
+    _waited=0
+    until [ "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$_proxy" 2>/dev/null)" = healthy ] \
+            || [ "$_waited" -ge "$_wait" ]; do
+        sleep 5
+        _waited=$((_waited + 5))
+    done
+    if [ -n "$(docker compose ps -q otodock-compute 2>/dev/null || true)" ]; then
+        say "waiting for the compute machine to sign in"
+        docker exec "$_proxy" /opt/otodock/proxy/venv/bin/python /opt/otodock/proxy/admin_cli.py \
+            compute --wait "$_wait" 2>&1 | while IFS= read -r _line; do say "$_line"; done \
+            || say "It may still be preparing its tools. To see why, run docker compose logs otodock-compute in $(pwd)."
+    fi
+fi
 
 # PROXY_PORT moves the published port; the shell environment wins over .env,
 # matching how docker compose itself resolves it.

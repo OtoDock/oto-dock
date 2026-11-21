@@ -43,7 +43,7 @@ const CALLBACK_KEYS = [
   'onImageGenFailed', 'onImageGenerating', 'onImages', 'onLimitReached', 'onLimitWarning', 'onListCard', 'onLiveState',
   'onLiveness', 'onLocationRequest', 'onMcpCost', 'onMediaFailed', 'onMediaProcessing', 'onMetadata',
   'onModeChanged', 'onModelChanged', 'onNotification', 'onNotificationCount', 'onNotificationSilent',
-  'onPermissionPrompt', 'onPermissionResolved', 'onPlanMode', 'onPlanReview', 'onPlanStatus', 'onPreWarmupReady',
+  'onPermissionPrompt', 'onPermissionResolved', 'onPlanMode', 'onPlanReview', 'onPlanStatus', 'onPreWarmupReady', 'onPreWarmupRefused',
   'onPromptRetired',
   'onQuestion', 'onQueueEditReturn', 'onQueueRemoved', 'onQueueSent', 'onQueued', 'onScheduleWake', 'onServerTurnStart', 'onSettingsCard',
   'onSteered',

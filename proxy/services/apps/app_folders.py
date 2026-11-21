@@ -23,8 +23,7 @@ import stat
 
 import psycopg
 
-import config
-from core import layout
+from core import agent_folder, layout
 from services.infra import path_confinement, safe_fs
 
 logger = logging.getLogger("otodock.apps")
@@ -181,11 +180,10 @@ def ensure_created_dirs(row: dict) -> dict[str, list]:
         return out
     if not approved:
         return out
-    agent = row.get("agent") or ""
+    root = agent_folder.agent_root(row.get("agent") or "")
     for rel in declared_folders(row):
-        target = f"{agent}/{rel}"
         try:
-            st = safe_fs.lstat_beneath(config.AGENTS_DIR, target)
+            st = safe_fs.lstat_beneath(root, rel)
         except FileNotFoundError:
             st = None
         except OSError as e:
@@ -199,7 +197,7 @@ def ensure_created_dirs(row: dict) -> dict[str, list]:
                 out[FOLDERS_SKIPPED].append({"path": rel, "reason": _why(blocker)})
             continue
         try:
-            safe_fs.mkdirs_beneath(config.AGENTS_DIR, target)
+            safe_fs.mkdirs_beneath(root, rel)
         except OSError as e:
             out[FOLDERS_SKIPPED].append({"path": rel, "reason": _why(e)})
             continue
@@ -213,11 +211,11 @@ def ensure_created_dirs(row: dict) -> dict[str, list]:
 def folder_states(row: dict) -> list[dict]:
     """Each declared ``create`` folder as it stands now: present, missing
     or blocked (a file or a link in the way)."""
-    agent = row.get("agent") or ""
+    root = agent_folder.agent_root(row.get("agent") or "")
     out = []
     for rel in declared_folders(row):
         try:
-            st = safe_fs.lstat_beneath(config.AGENTS_DIR, f"{agent}/{rel}")
+            st = safe_fs.lstat_beneath(root, rel)
         except FileNotFoundError:
             state = FOLDER_MISSING
         except OSError:
@@ -233,3 +231,22 @@ def declares_folders(row: dict) -> bool:
     stored block, no owner lookup)."""
     from services.apps import manifest as _mf
     return bool(_mf.parse_files(row)[FILES_CREATE])
+
+
+def outside_folder_problem(row: dict, knowledge: tuple[str, ...] | list[str]) -> str:
+    """The first folder the row's manifest names that outside people may
+    not read, "" when there is none. An app that serves outside people (a
+    caller's session, a visitor of its link) may name only knowledge
+    folders the agent's External identities card admits (``knowledge``,
+    paths inside the knowledge folder, ``outside_picks.knowledge_parts``):
+    a workspace folder never, a personal app's folders never. Lexical:
+    which folders the picks admit is the picks' own rule."""
+    from services.apps import manifest as _mf
+    from services.mcp import outside_picks
+    picked = [parts for parts in (outside_picks.knowledge_parts(k) for k in knowledge) if parts]
+    for mode in FILES_KEYS:
+        for stored in _mf.parse_files(row)[mode]:
+            parts = tuple(stored.strip("/").split("/"))
+            if parts[0] != layout.KNOWLEDGE or not any(parts[1:len(p) + 1] == p for p in picked):
+                return stored.strip("/")
+    return ""

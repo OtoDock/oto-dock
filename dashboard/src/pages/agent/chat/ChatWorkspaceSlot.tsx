@@ -60,6 +60,8 @@ export default function ChatWorkspaceSlot({
                     : ['my-workspace', 'my-context']
             }
             defaultScope={isAgentScope ? 'agent-workspace' : 'my-workspace'}
+            initialRecover={recoverRequested}
+            onRecoverConsumed={() => setRecoverRequested(false)}
           />
         )
       })()}

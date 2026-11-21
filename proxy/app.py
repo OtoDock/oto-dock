@@ -39,6 +39,7 @@ from uvicorn.protocols.utils import ClientDisconnected
 from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
 
 import config
+from api.remote.compute_machines import compute_machine_refused
 from auth import lan_check
 from core import log_queue
 from middleware import register_middlewares
@@ -49,6 +50,7 @@ from static_assets import (
     is_hashed_asset,
     negotiated_file_response,
 )
+from storage.remote_store import ComputeMachineRefused
 
 # --- Logging ---
 
@@ -124,6 +126,9 @@ async def _no_such_agent(request: Request, exc: PathOutsideRoot):
 
 
 app.add_exception_handler(PathOutsideRoot, _no_such_agent)  # type: ignore[arg-type]  # Starlette types an exception handler as taking Exception; the handler registered for PathOutsideRoot receives one
+
+
+app.add_exception_handler(ComputeMachineRefused, compute_machine_refused)  # type: ignore[arg-type]  # Starlette types an exception handler as taking Exception; the handler registered for ComputeMachineRefused receives one
 
 
 # The ASGI scope types a request arrives as (a lifespan scope is neither).
@@ -416,8 +421,9 @@ def _build_server(asgi_app):
         # with satellite/ws_client.py _WS_PING_TIMEOUT.
         ws_ping_timeout=WS_PING_TIMEOUT_S,
         # Force-close lingering connections (satellite / dashboard / phone
-        # WebSockets) 10s after SIGTERM so `systemctl restart` doesn't hang in
-        # uvicorn's graceful drain until systemd's 90s TimeoutStopSec SIGKILL.
+        # WebSockets) 10s after the stop signal so `systemctl restart` doesn't hang
+        # in uvicorn's graceful drain until the unit's TimeoutStopSec (780 s as
+        # shipped, 90 s without it) ends it.
         timeout_graceful_shutdown=10,
     )
     main = cfg.bind_socket()
@@ -458,6 +464,7 @@ class _EveryFewSeconds(logging.Filter):
 
 from api.admin import (
     admin_storage as admin_storage_router,
+    api_keys as admin_api_keys_router,
     execution_layers as execution_layers_router,
     title_generation as title_generation_router,
 )
@@ -473,6 +480,7 @@ from api.apps import (
     app_egress as app_egress_router,
     app_follow as app_follow_router,
     app_inbound as app_inbound_router,
+    app_media as app_media_router,
     app_proxy as app_proxy_router,
     app_secrets as app_secrets_router,
     apps as apps_router,
@@ -506,7 +514,7 @@ from api.events import (
     webhooks as webhooks_router,
 )
 from api.hooks import hooks as hooks_router
-from api.internal import internal as internal_router
+from api.internal import internal as internal_router, metrics as metrics_router
 from api.mcp import (
     bearer_allowlist as bearer_allowlist_router,
     community as community_router,
@@ -514,10 +522,12 @@ from api.mcp import (
     gateway as mcp_gateway_router,
     icons as mcp_icons_router,
     local_templates as local_templates_router,
+    mcp_containers as mcp_containers_router,
     mcps as mcps_router,
 )
 from api.media import (
     collabora_proxy as collabora_proxy_router,
+    document_downloads as document_downloads_router,
     images as images_router,
     media as media_router,
     ui as ui_router,
@@ -533,6 +543,13 @@ from api.phone import (
     phone_relay as phone_relay_router,
     phone_usage as phone_usage_router,
     twilio_relay as twilio_relay_router,
+)
+from api.public import (
+    chats as public_chats_router,
+    files as public_files_router,
+    me as public_me_router,
+    notifications as public_notifications_router,
+    tasks as public_tasks_router,
 )
 from api.remote import remote_machines as remote_machines_router
 from api.sessions import sessions as sessions_router
@@ -557,6 +574,10 @@ app.include_router(webhooks_router.router)
 app.include_router(subscriptions_router.router)
 app.include_router(agent_api_keys_router.router)
 app.include_router(user_api_keys_router.router)
+# The public routes a person's API key reaches (auth/api_key_endpoints.py).
+for _public in (public_me_router, public_chats_router, public_tasks_router,
+                public_files_router, public_notifications_router):
+    app.include_router(_public.router)
 app.include_router(billing_router.router)
 app.include_router(account_router.router)
 app.include_router(agents_router.router)
@@ -578,6 +599,7 @@ app.include_router(openai_oauth_router.router)
 app.include_router(oauth_router.router)
 app.include_router(oauth_app_router.router)
 app.include_router(mcps_router.router)
+app.include_router(mcp_containers_router.router)
 app.include_router(community_router.router)
 app.include_router(mcp_icons_router.router)
 app.include_router(local_templates_router.router)
@@ -589,6 +611,7 @@ app.include_router(ui_router.router)
 app.include_router(apps_router.router)
 app.include_router(app_follow_router.router)
 app.include_router(app_actions_router.router)
+app.include_router(app_media_router.router)
 app.include_router(app_proxy_router.router)
 app.include_router(app_bindings_router.router)
 app.include_router(app_secrets_router.router)
@@ -599,8 +622,10 @@ app.include_router(notebook_router.router)
 app.include_router(shares_router.router)
 app.include_router(external_shares_router.router)
 app.include_router(wopi_router.router)
+app.include_router(document_downloads_router.router)
 app.include_router(usage_router.router)
 app.include_router(admin_storage_router.router)
+app.include_router(admin_api_keys_router.router)
 app.include_router(meetings_router.router)
 app.include_router(phone_router.router)
 app.include_router(phone_relay_router.router)
@@ -611,6 +636,7 @@ app.include_router(audio_router.router)
 app.include_router(duplex_router.router)
 app.include_router(title_generation_router.router)
 app.include_router(internal_router.router)
+app.include_router(metrics_router.router)
 app.include_router(memory_router.router)
 app.include_router(git_history_router.router)
 app.include_router(remote_machines_router.router)
@@ -766,6 +792,16 @@ if __name__ == "__main__":
         # the boot just to log agent slugs — they exist once the app serves.
         logger.info("Agents: (schema not yet initialized — %s)", type(e).__name__)
     logger.info("Working dir: %s", config.AGENTS_DIR)
+    # The platform's own agents folder is marked: a paired satellite pointed
+    # at it refuses to start (its sweeps and its sync would purge and rewrite
+    # the platform's files); a compute machine runs on it by design.
+    # Its content is a token the compute machine's start compares with its
+    # credential's (``compute_bootstrap``).
+    from services.remote import compute_bootstrap
+    try:
+        compute_bootstrap.ensure_marker()
+    except OSError as e:
+        logger.warning("The platform marker could not be written at %s: %s", config.AGENTS_DIR, e)
     logger.info("MCP configs: per-agent (in agents/<name>/mcp-config.json)")
     # uvicorn re-raises the SIGTERM/SIGINT it served once its graceful
     # shutdown is done (the process exits by the signal, so atexit never

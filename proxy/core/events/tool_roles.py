@@ -45,12 +45,41 @@ WORKFLOW = "workflow"        # runs a workflow script
 PLAN_ENTER = "plan_enter"
 PLAN_EXIT = "plan_exit"
 QUESTION = "question"        # asks the human
+MESSAGE = "message"          # tells the human something during the turn; no effect on anything
 ESCALATION = "escalation"    # Codex's privileged approvals presented as tools: a sandbox escalation, terminal input to an elevated command
+# Engine tools with no role of their own that an outside session (a caller
+# who is not a platform user) never gets: the messages between a session's
+# agents, a worktree of the person's folder, a design sync over the network,
+# Codex's image generation and its own agents (the names its tool list shows
+# them under). Named here, not as a role: an ordinary chat's answer for them
+# does not move (a name with no role asks in Ask). Codex joins a namespace
+# and a tool with a dot, a double underscore or nothing (``clock.sleep``,
+# ``clock__curr_time``, and its hook's ``collaborationspawn_agent``), so the
+# floor compares by a key with both separators removed (``outside_never``).
+OUTSIDE_NEVER_NAMES = frozenset({
+    "SendMessage", "ListAgents", "EnterWorktree", "ExitWorktree", "DesignSync",
+    "image_gen__imagegen",
+    "collaboration.spawn_agent", "collaboration.send_message", "collaboration.wait_agent",
+    "collaboration.interrupt_agent", "collaboration.followup_task", "collaboration.list_agents",
+})
+
+
+def _joined(name: str) -> str:
+    return name.replace("__", "").replace(".", "")
+
+
+_OUTSIDE_NEVER_KEYS = frozenset(_joined(n) for n in OUTSIDE_NEVER_NAMES)
+
+
+def outside_never(name: str) -> bool:
+    """Whether ``name`` is one an outside session never gets, under any of
+    the engine's spellings of it."""
+    return _joined(name) in _OUTSIDE_NEVER_KEYS
 
 ROLES: tuple[str, ...] = (
     SHELL, READ, GLOB, SEARCH, WRITE, DELETE, WEB_FETCH, WEB_SEARCH, SUBAGENT,
     CHECKLIST, TASK_READ, TASK_WRITE, DISCOVERY, SKILL, WORKFLOW, PLAN_ENTER,
-    PLAN_EXIT, QUESTION, ESCALATION,
+    PLAN_EXIT, QUESTION, ESCALATION, MESSAGE,
 )
 
 # --- Payload kinds: what a call carries -------------------------------------
@@ -130,6 +159,7 @@ TOOL_ROLES: dict[str, str] = {
     "AskUserQuestion": "question",
     "request_user_input": "question",
     "request_user_input_async": "question",
+    "send_message_to_user_async": "message",
     "CodexEscalation": "escalation",
     "CodexTerminalInput": "escalation",
     "view_image": "read",
@@ -178,6 +208,7 @@ TOOL_PAYLOADS: dict[str, str] = {
     "AskUserQuestion": NONE,
     "request_user_input": NONE,
     "request_user_input_async": NONE,
+    "send_message_to_user_async": NONE,
     "CodexEscalation": NONE,
     "CodexTerminalInput": NONE,
     "view_image": SEARCH_PATH,

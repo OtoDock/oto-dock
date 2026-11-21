@@ -50,6 +50,9 @@ dist/
 # ── Runtime data ──
 proxy/sessions/
 sessions/
+# The credential exit's authority (its private key included): under
+# PLATFORM_DATA_DIR, which on a source install is the checkout root.
+credential-exit/
 # The MCP tool hints cache the proxy keeps beside its data
 mcp-tool-hints.json
 # …but api/sessions/ is SOURCE (route subpackage), not runtime session data:
@@ -111,6 +114,11 @@ recover-bin/
 # preview-snapshots = version-pinned document-preview copies (user file
 # contents) — proxy-private runtime cache, never source.
 preview-snapshots/
+# build-scratch = a tool build's downloads and temporary files, swept at boot.
+build-scratch/
+# compute-link = the compute machine's sign-in, written by the proxy at its
+# start (a bare-metal install's; the compose file keeps it in a volume).
+compute-link/
 # Full DB dumps + media caches — user data, never source.
 backups/
 host-media-cache/

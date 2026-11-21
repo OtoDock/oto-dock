@@ -82,6 +82,16 @@ venv/bin/pip install --quiet -r requirements.txt
 # phone-only). Without this the proxy crashes at boot: `No module named
 # 'audio'` (app.py imports api.audio → audio.providers).
 venv/bin/pip install --quiet -e "$PLATFORM_ROOT/audio"
+# The compute machine (otodock-compute.service) runs the satellite from a venv
+# of its own (psutil, setproctitle), as the compose service does.
+[ -d "$PLATFORM_ROOT/satellite/venv" ] || venv/bin/python -m venv "$PLATFORM_ROOT/satellite/venv"
+"$PLATFORM_ROOT/satellite/venv/bin/pip" install --quiet -r "$PLATFORM_ROOT/satellite/requirements.txt"
+# The credential exit's packages: the install's own compute machine runs
+# every session, and without them no tool that needs a key runs anywhere,
+# so the setup stops here as the image's build does.
+"$PLATFORM_ROOT/satellite/venv/bin/pip" install --quiet --only-binary :all: \
+    -r "$PLATFORM_ROOT/satellite/requirements-exit.txt" \
+    || { echo "  ERROR: the credential exit's packages did not install for the compute machine." >&2; exit 1; }
 echo "  Done"
 
 # 4. Generate config.env DB credentials if needed

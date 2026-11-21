@@ -87,29 +87,38 @@ def _relative_of(raw: str, security) -> str:
     return rel
 
 
-def _local_git_root(host_path: str, agent_dir: Path) -> str:
-    """Walk up from a host path for a real checkout (``.git/HEAD`` — the
-    empty ``.git`` mountpoint a user tree carries is not one), staying
-    inside the agent's tree; the tree-relative root or ``""``."""
-    if not host_path:
+def _local_git_root(host_path: str, agent: str) -> str:
+    """Walk up from a host path for a real checkout (``.git/HEAD`` a regular
+    file — the empty ``.git`` mountpoint a user tree carries is not one),
+    never above the agent's own folder; the tree-relative root (``.`` for
+    the agent's folder itself) or ``""``. Each probe is a rel beneath the
+    agent's real folder (``core.agent_folder``) with no link on the way
+    below it, so a folder linked elsewhere is never a checkout and no
+    answer names a host path."""
+    import stat
+
+    from core.agent_folder import beneath_agent
+    from services.infra import safe_fs
+    if not host_path or not os.path.isabs(host_path):
         return ""
     try:
-        p = Path(host_path)
-        if not p.is_absolute():
-            return ""
-        base = agent_dir.resolve()
-        cur = p if p.is_dir() else p.parent
-        for _ in range(64):
-            if (cur / ".git" / "HEAD").is_file():
-                try:
-                    return cur.resolve().relative_to(base).as_posix()
-                except ValueError:
-                    return cur.as_posix()
-            if cur == base or cur == cur.parent:
-                return ""
-            cur = cur.parent
-    except OSError:
+        root, rel = beneath_agent(host_path, agent)
+    except (safe_fs.SafeFsError, ValueError):
         return ""
+    parts = rel.split("/") if rel else []
+    try:
+        is_dir = bool(parts) and stat.S_ISDIR(safe_fs.lstat_beneath(root, rel).st_mode)
+    except OSError:
+        is_dir = False
+    here = parts if is_dir else parts[:-1]
+    for depth in range(len(here), -1, -1):
+        folder = "/".join(here[:depth])
+        try:
+            head = safe_fs.lstat_beneath(root, "/".join(p for p in (folder, ".git/HEAD") if p))
+        except OSError:
+            continue
+        if stat.S_ISREG(head.st_mode):
+            return folder or "."
     return ""
 
 
@@ -120,7 +129,7 @@ async def _remote_git_root(machine_id: str, native_path: str, agent: str, cache:
         from core.remote.satellite_connection import get_connection_manager
         from services.path_policy_v2 import PathRef
         cm = get_connection_manager()
-        if not cm.is_connected(machine_id) or not cm.satellite_supports_file_stat(machine_id):
+        if not cm.is_connected(machine_id):
             return ""
         cur = native_path.replace("\\", "/")
         if not cur.startswith("/") and not re.match(r"^[A-Za-z]:/", cur):
@@ -183,7 +192,7 @@ async def build(target: Target, records: list, *, check_name: str, round_no: int
                     # The tool saw the sandbox-virtual form; the walk runs
                     # over the platform's own copy of the tree.
                     root = await asyncio.to_thread(
-                        _local_git_root, str(agent_dir / rel) if rel else "", agent_dir)
+                        _local_git_root, str(agent_dir / rel) if rel else "", target.agent)
                 else:
                     root = await _remote_git_root(target.placement.machine_id, raw, target.agent,
                                                   remote_cache)

@@ -357,6 +357,20 @@ class TestSessionJwtTriggerScoping:
             asyncio.run(trig_mod.fire_test_endpoint(t4["id"], _Req(), user=_nouser_session()))
         assert e.value.status_code == 403
 
+    def test_mutation_authority_judges_a_sessions_cap(self, temp_db):
+        """A session that acts below its person (a capped call) is judged at
+        its cap: an admin acting as an editor manages only their own."""
+        from api.events.triggers import _check_trigger_mutation_authority
+        from auth.providers import capped_principal
+        self._seed()
+        theirs = trigger_store.create_trigger(slug="tr-m-ag", name="mag", scope="agent", agent=AG,
+                                              created_by=M)
+        admin = UserContext(sub="user-admin", email="a@t.com", name="Admin", role="admin",
+                            is_api_key=True, session_id="sess-a", agent=AG)
+        _check_trigger_mutation_authority(theirs, admin)  # the admin's own session: allowed
+        with pytest.raises(HTTPException):
+            _check_trigger_mutation_authority(theirs, capped_principal(admin, AG, "editor"))
+
     def test_mutation_authority_nouser_own_agent_only(self, temp_db):
         from api.events.triggers import (
             _can_manage_trigger,

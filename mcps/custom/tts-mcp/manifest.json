@@ -1,7 +1,7 @@
 {
   "name": "tts-mcp",
   "label": "Text-to-Speech",
-  "description": "Voice-over generation from text via the platform's TTS providers — browse voices, mix and match per language and style, save WAV files to the workspace.",
+  "description": "Voice-over generation from text via the platform's TTS providers: browse voices, mix and match per language and style, save WAV files to the workspace.",
   "version": "1.0.0",
   "category": "custom",
   "server": {

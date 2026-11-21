@@ -316,3 +316,60 @@ class TestLocalEndpointApi:
         assert [(m["layer"], m["model_id"]) for m in out["models"]] == [
             ("direct-llm", "m1"), ("codex-cli", "m1"),
         ]
+
+
+# ── a hosted install has no local endpoint by any door ────────────────────
+
+
+def _admin_user():
+    return SimpleNamespace(sub="admin-1", role="admin", is_api_key=False, api_key_id="",
+                           is_service=False)
+
+
+def test_a_vendor_provider_with_an_admins_address_is_refused_on_a_hosted_install():
+    """``auth_type=local_endpoint`` on openai or anthropic names an address
+    of the admin's choosing: refused as the local providers are."""
+    from fastapi import HTTPException
+
+    import api.admin.execution_layers as api_mod
+    req = api_mod.AddSubscriptionRequest(provider="openai", auth_type="local_endpoint",
+                                         endpoint_url="http://192.168.1.8:8080/v1")
+    with patch.object(api_mod.config, "OTODOCK_CLOUD", True), \
+            patch.object(api_mod, "require_admin", lambda u: u):
+        with pytest.raises(HTTPException) as ei:
+            asyncio.run(api_mod.admin_add_subscription("direct-llm", req, user=_admin_user()))
+    assert ei.value.status_code == 400 and ei.value.detail == api_mod._CLOUD_LOCAL_MSG
+
+
+def test_discovery_refuses_a_stored_local_endpoint_on_a_hosted_install():
+    from fastapi import HTTPException
+
+    import api.admin.execution_layers as api_mod
+    row = {"id": "s1", "layer": "direct-llm", "provider": "openai", "auth_type": "local_endpoint"}
+    with patch.object(api_mod.config, "OTODOCK_CLOUD", True), \
+            patch.object(api_mod, "require_admin", lambda u: u), \
+            patch.object(api_mod.subscription_store, "get_subscription", lambda _i: row), \
+            patch.object(api_mod.subscription_store, "get_credential_data",
+                         lambda _i: {"endpoint_url": "http://10.0.0.4:8080/v1"}):
+        with pytest.raises(HTTPException) as ei:
+            asyncio.run(api_mod.admin_discover_models(
+                "direct-llm", api_mod.DiscoverModelsRequest(subscription_id="s1"),
+                user=_admin_user()))
+    assert ei.value.status_code == 400
+
+
+def test_an_endpoint_the_sdk_dials_is_checked_at_the_dial(monkeypatch):
+    """The chat stream and the model list of an endpoint dial through the
+    platform's checked transport; a vendor's own host keeps the SDK's."""
+    import config
+    from core.layers.providers import openai_adapter
+    from services.infra import pinned_http
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    checked = openai_adapter._checked_http("http://192.168.1.8:8080/v1")["http_client"]
+    assert isinstance(checked._transport, pinned_http.CheckedTransport)
+    assert checked._transport.policy is pinned_http.admin_host
+    assert openai_adapter._checked_http(None) == {}
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
+    assert pinned_http.admin_host("192.168.1.8")
+    asyncio.run(checked.aclose())

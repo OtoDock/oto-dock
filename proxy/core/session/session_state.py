@@ -10,22 +10,19 @@ import contextlib
 import dataclasses
 import json
 import logging
-import os
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
 
 import psycopg
 
 import config
-from core.permission_modes import ASK_MODE, PLAN_MODE, current_mode, terminal_mode
+from core import file_commit
+from core.permission_modes import ASK_MODE, PLAN_MODE, terminal_mode
 from storage.automation import run_status
 from ws import wire_events as wire
-
-if TYPE_CHECKING:
-    from core.sandbox.pty_relay import PipedProcess
 
 logger = logging.getLogger("otodock")
 
@@ -56,11 +53,6 @@ _TASK_SESSION_REAP_TTL_SECONDS = 6 * 3600  # 6h
 # Without this, a client retry can spawn a second Claude process on a session
 # that already has one running.
 _session_locks: dict[str, asyncio.Lock] = {}
-
-# Active running processes by session_id (for abort support)
-_active_processes: "dict[str, PipedProcess]" = {}
-# Sessions explicitly aborted via abort endpoint (don't save pending results)
-_aborted_sessions: set[str] = set()
 
 # Permission gate state (for hook-based permission system)
 _session_modes: dict[str, str] = {}  # session_id -> permission_mode (core/permission_modes)
@@ -95,7 +87,7 @@ _permission_request_sessions: dict[str, str] = {}  # request_id -> session_id (r
 # close released it. Only watched ids are recorded, and the caller always
 # takes its id back (``took_no_answer``), so the table holds live waits only.
 _prompt_watch: dict[str, bool] = {}
-# SSE emitters: when a hook requests permission in "default" mode, this callback
+# SSE emitters: when a hook requests permission in Ask, this callback
 # emits the permission_request/question event to the downstream SSE stream
 _permission_emitters: dict[str, asyncio.Queue] = {}  # session_id -> queue of permission requests
 
@@ -116,13 +108,16 @@ _session_security_ts: dict = {}  # session_id -> float (warmup epoch; for the lo
 # restart (its permission mode and token floor), read when its satellite
 # re-adopts it: session_id -> (mode or "", floor or 0).
 _reloaded_state: dict[str, tuple[str, int]] = {}
+# A session's start arguments and record, hashes and flags only, persisted with
+# its security context (``core/session/start_context.py`` owns the fields).
+_session_start_args: dict[str, dict] = {}
 _SECURITY_INDEX = config.SESSIONS_DIR / "security_index.json"
 # Drop persisted contexts older than the session-JWT lifetime — one that old
 # can't be replayed anyway, so this bounds the file across non-graceful crashes.
 _SECURITY_TTL_S = 24 * 3600
 
 # Per-session persistent .claude/ directory path (host path).
-# Used by plan API and can_resume_session to find session-specific data.
+# Read by can_resume_session and the terminal's transcript tailer.
 _session_claude_dirs: dict[str, str] = {}  # session_id -> host path to .claude/
 
 # Per-session Codex interactive context for the rollout tailer (CODEX_HOME is
@@ -143,6 +138,7 @@ from core.session.location_bridge import (  # noqa: F401
 # Used by settle mode to detect that internal background agents are still working
 # (they fire hooks but don't produce stdout stream events).
 _session_hook_activity: dict[str, float] = {}  # session_id -> monotonic timestamp
+_session_terminal_ask: dict[str, dict[str, float]] = {}  # session_id -> {tool_use_id: monotonic}
 
 # Per-session notification queue for server-initiated events (bg agent completion,
 # task delegation results) to reach the dashboard WebSocket between turns.
@@ -160,12 +156,6 @@ _meeting_session_info: dict[str, dict] = {}  # agent_session_id → {parent_sess
 # (both in ws/dashboard.py).
 _chat_streaming_state: dict[str, dict] = {}  # chat_id → state dict
 
-
-def streaming_chat_ids() -> list[str]:
-    """Chat ids with an ACTIVE pump turn (bg residuals excluded — their turn
-    ended). The pump half of the dashboard connect-time ``chat_status_snapshot``;
-    the interactive half is ``interactive_session.streaming_chat_ids``."""
-    return [cid for cid, st in _chat_streaming_state.items() if st.get("streaming")]
 
 # Per-user IANA timezone (browser-detected). In-memory only; reseeded by the next
 # `client_info` WS message after a restart. Session-scoped TZ lives on
@@ -188,6 +178,41 @@ def get_hook_activity(session_id: str) -> float:
     return _session_hook_activity.get(session_id, 0)
 
 
+def note_terminal_ask(session_id: str, tool_use_id: str = "") -> None:
+    """The hook handed a call to a terminal's engine, which may ask the
+    person on screen: the moment, per call, read by a woken terminal's wait
+    and ended when that call ran (``end_terminal_ask``)."""
+    _session_terminal_ask.setdefault(session_id, {})[tool_use_id] = time.monotonic()
+
+
+def end_terminal_ask(session_id: str, tool_use_id: str = "") -> None:
+    """A call finished (``session_events.post_tool``, every placement's
+    result of a call, a terminal's tailers included): its question, if it was
+    one, is answered. A record with no call id ends at any call that ran."""
+    asks = _session_terminal_ask.get(session_id)
+    if not asks:
+        return
+    asks.pop(tool_use_id, None)
+    asks.pop("", None)
+    if not asks:
+        _session_terminal_ask.pop(session_id, None)
+
+
+def clear_terminal_asks(session_id: str) -> None:
+    """The turn ended: no call of it waits on the person any more (a
+    sub-agent's spawn, or an engine whose hook id differs from its result's,
+    never reaches ``end_terminal_ask``)."""
+    _session_terminal_ask.pop(session_id, None)
+
+
+def terminal_ask_since(session_id: str) -> float:
+    """When the oldest call still waiting on the terminal's engine was
+    handed to it, 0 when none waits. The tailers end records from a worker
+    thread: the values are copied before they are read."""
+    asks = _session_terminal_ask.get(session_id)
+    return min(list(asks.values()), default=0.0) if asks else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Subagent registry — deterministic spawn/finish tracking (BOTH layers)
 # ---------------------------------------------------------------------------
@@ -196,7 +221,7 @@ def get_hook_activity(session_id: str) -> float:
 #  - Claude CLI: the translator on `task_started` + the SubagentStop hook on
 #    completion.
 #  - Codex: the per-thread background-sub-agent supervisor (`register_spawn` /
-#    `mark_done` in core/layers/codex/session.py).
+#    `mark_done` in core/layers/codex/remote.py).
 # `reg.has_pending` / `reg.wait_all_done()` then drive the shared
 # `_bg_agent_monitor` (chat nudge) + `ExecutionLayer.wait_for_bg_subagents`
 # (tasks/delegation) for either layer. Replaces the old FIFO `task_notification`
@@ -537,10 +562,9 @@ def resolve_bg_subagent(session_id: str, sub_tid: str, translator=None) -> bool:
     Marks the per-session ``SubagentRegistry`` done, clears the sub-agent's
     dashboard badge (live-state + WS ``bg_agent_done``), and tombstones it in the
     translator so a later ``collabAgentToolCall`` snapshot can't re-open a phantom
-    badge. The single source of truth shared by BOTH Codex bg supervisors — the
-    local session's ``notif_queue`` supervisor (``core/layers/codex/session.py``)
-    and the remote adapter's WS-forwarded supervisor (``core/layers/codex/remote.py``)
-    — so completion behaves identically on local and satellite agents.
+    badge. The single source of truth of the Codex bg supervisor (the remote
+    adapter's, ``core/layers/codex/remote.py``, fed by the events a machine
+    forwards).
 
     Idempotent: ``reg.mark_done`` returns True only on the resolving transition,
     so the badge/WS clear fires exactly once across a supervisor's ``finally`` and
@@ -696,9 +720,9 @@ def clear_session_liveness(session_id: str, *, reason: str = "") -> None:
     The normal clears ride the session's own lifecycle signals (SubagentStop
     hooks, stdout ``task_updated`` frames, the ``*_complete`` WS frames), which
     a dead CLI can no longer emit — so every place the proxy declares a session
-    dead calls this instead: the layer close paths (``close_persistent_session``
-    / ``close_codex_session`` locally; ``cleanup_session_permission_state``
-    covers the remote/interactive/meeting closes), the explicit dashboard Stop
+    dead calls this instead: the layer close paths
+    (``cleanup_session_permission_state`` covers the remote, terminal and
+    meeting closes), the explicit dashboard Stop
     (CLI only — the abort kills the whole process group), and the warmup fresh
     branch that replaces a dead session. Death-only by design: background work
     legitimately outlives turn ends, so this must NEVER run on a mere turn end
@@ -898,125 +922,28 @@ def _load_sessions() -> None:
             _save_sessions()
 
 
-def _atomic_write(path, blob: str, *, fsync: bool) -> bool:
-    """Replace ``path`` with ``blob`` through a sibling temp file, so a crash
-    mid-write leaves the old file, never a truncated one. False on failure
-    (logged; the temp file is removed)."""
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(blob)
-            if fsync:
-                f.flush()
-                os.fsync(f.fileno())
-        os.replace(tmp, path)
-        return True
-    except OSError as e:
-        logger.error("Failed to save %s: %s", path.name, e)
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        return False
+def _encode_sessions() -> str:
+    return json.dumps(_sessions, separators=(",", ":"))
 
 
-class _IndexWriter:
-    """The session index, written behind ``_sessions``: at most one write per
-    ``config.SESSION_INDEX_FLUSH_S``, the encode on the owner loop (the C
-    encoder holds the GIL anyway, and on the loop nothing can mutate the dict
-    mid-encode), the write in a thread. With no owner loop (import, sync
-    tests, scripts) the write is synchronous; a call from another thread is
-    handed to the owner loop. Every write carries a generation and only a
-    newer one is installed, so a slow thread write never lands over a later
-    synchronous one (the shutdown flush)."""
-
-    def __init__(self) -> None:
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._handle: asyncio.TimerHandle | None = None
-        self._task: asyncio.Task | None = None
-        self._dirty = False
-        self._gen = 0
-        self._installed_gen = 0
-        self._lock = threading.Lock()
-
-    def mark_dirty(self) -> None:
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        owner = self._loop
-        if owner is not None and (owner.is_closed() or (
-                owner is not running and not owner.is_running())):
-            self._loop = owner = None
-            self._handle = self._task = None
-        if owner is not None and owner is not running:
-            try:
-                owner.call_soon_threadsafe(self.mark_dirty)
-                return
-            except RuntimeError:  # the owner closed in between
-                self._loop = None
-                self._handle = self._task = None
-        self._dirty = True
-        if running is None:
-            self.flush_sync()
-            return
-        self._loop = running
-        if self._handle is None and self._task is None:
-            self._handle = running.call_later(
-                max(0.0, config.SESSION_INDEX_FLUSH_S), self._start_flush)
-
-    def _encode(self) -> tuple[str, int]:
-        self._dirty = False
-        self._gen += 1
-        return json.dumps(_sessions, separators=(",", ":")), self._gen
-
-    def _install(self, blob: str, gen: int) -> None:
-        with self._lock:
-            if gen <= self._installed_gen:
-                return
-            if _atomic_write(_SESSION_INDEX, blob, fsync=True):
-                self._installed_gen = gen
-
-    def _start_flush(self) -> None:
-        self._handle = None
-        if not self._dirty or self._loop is None:
-            return
-        blob, gen = self._encode()
-        self._task = self._loop.create_task(self._write(blob, gen))
-
-    async def _write(self, blob: str, gen: int) -> None:
-        try:
-            await asyncio.to_thread(self._install, blob, gen)
-        except Exception:
-            logger.exception("session index write failed")
-        finally:
-            self._task = None
-            loop = self._loop
-            if self._dirty and loop is not None and not loop.is_closed():
-                self._handle = loop.call_later(
-                    max(0.0, config.SESSION_INDEX_FLUSH_S), self._start_flush)
-
-    def flush_sync(self) -> None:
-        """Write the current state now, on the calling thread, when dirty."""
-        if self._handle is not None:
-            self._handle.cancel()
-            self._handle = None
-        if not self._dirty:
-            return
-        blob, gen = self._encode()
-        self._install(blob, gen)
-
-
-_index_writer = _IndexWriter()
+# The session index, written behind ``_sessions``: at most one write per
+# ``config.SESSION_INDEX_FLUSH_S``, fsynced (``file_commit.StateFile``).
+_index_writer = file_commit.StateFile(
+    "session-index", lambda: _SESSION_INDEX, _encode_sessions, fsync=True,
+    delay=lambda: max(0.0, config.SESSION_INDEX_FLUSH_S),
+)
 
 
 def _save_sessions() -> None:
-    """Persist the session index (written behind; see ``_IndexWriter``)."""
+    """Persist the session index (written behind; see ``file_commit.StateFile``)."""
     _index_writer.mark_dirty()
 
 
 def flush_session_index() -> None:
-    """Write any pending index change now, synchronously (graceful shutdown:
-    the write must not depend on a free executor thread)."""
-    _index_writer.flush_sync()
+    """Write any pending change of every state file now, synchronously: the
+    session index, the security index and the others ``file_commit`` holds
+    (graceful shutdown: the write must not depend on a free executor thread)."""
+    file_commit.flush_all()
 
 
 def mark_recover_pending(session_id: str) -> None:
@@ -1069,7 +996,8 @@ def session_exists(session_id: str) -> bool:
 
 
 def _record_session_use(session_id: str, client_type: str = "", agent: str = "") -> None:
-    """Record that a session was used, optionally storing its client_type and agent."""
+    """Record that a session was used, optionally storing its client_type and
+    agent."""
     if session_id not in _sessions:
         _sessions[session_id] = {"created": True, "message_count": 0}
     _sessions[session_id]["message_count"] = _sessions[session_id].get("message_count", 0) + 1
@@ -1207,6 +1135,20 @@ def recorded_session_mode(session_id: str) -> str:
     return mode or ""
 
 
+def runs_for_nobody(session_id: str, chat_id: str, *, lane: bool = False) -> bool:
+    """A session built the unattended way on a chat people open: its
+    recorded mode (every start records its config's, ``register_session_state``)
+    is a word no person picks. Nobody drives it: a person's message,
+    keystroke or attachment never reaches it. A run's chat keeps its own
+    rule, steered by role: a task run's (its id's shape) and a delegated
+    lane's (``lane``: the chat's origin is ``delegated``, whatever its id)."""
+    from core.permission_modes import STORED_ONLY_MODES
+    from core.session import session_kind
+    if lane or session_kind.is_task_chat_id(chat_id):
+        return False
+    return recorded_session_mode(session_id) in STORED_ONLY_MODES
+
+
 def get_session_mode(session_id: str) -> str:
     """Get the permission mode for a session: its recorded mode, else
     ``auto`` (a task or phone session never records one)."""
@@ -1255,7 +1197,6 @@ def set_session_mode(session_id: str, mode: str) -> None:
     its satellite keeps across a restart comes back in its own mode.
     """
     prev = _session_modes.get(session_id)
-    mode = current_mode(mode)
     _session_modes[session_id] = mode
     if prev != mode:
         _review_paused.discard(session_id)
@@ -1275,6 +1216,12 @@ def remember_session_tool_allow(session_id: str, tool_name: str) -> None:
 def is_session_tool_allowed(session_id: str, tool_name: str) -> bool:
     """True if the user already clicked Allow for this tool this session."""
     return tool_name in _session_tool_allows.get(session_id, ())
+
+
+def remembers_tool_allows(session_id: str) -> bool:
+    """True if this session holds any tool the user allowed: such a tool
+    runs with no card for as long as the session lives."""
+    return bool(_session_tool_allows.get(session_id))
 
 
 # The security index's keys for the placement (FROZEN — a pre-upgrade file
@@ -1298,6 +1245,7 @@ _PLACEMENT_KEYS = {
     "target_mcps_dir": "mcps_dir",
     "target_unresolved_home_dir": "unresolved_home_dir",
     "target_unresolved_otodock_dir": "unresolved_otodock_dir",
+    "target_own_copy": "own_copy",
 }
 
 
@@ -1335,9 +1283,19 @@ def _deserialize_security_ctx(d: dict):
     kw["placement"] = PlacementCapabilities(**pkw) if pkw else PlacementCapabilities()
     # JSON has no tuple type — restore the tuple-typed fields so a reloaded
     # context compares equal to a freshly-built one.
-    for _tup in ("session_allowed_roots", "available_scopes"):
+    for _tup in ("session_allowed_roots", "available_scopes", "outside_knowledge", "outside_apps"):
         if isinstance(kw.get(_tup), list):
             kw[_tup] = tuple(kw[_tup])
+    # outside_grants is a tuple of (server key, names | None) PAIRS, and
+    # tool_limits one of (server key, names) pairs.
+    if isinstance(kw.get("outside_grants"), list):
+        kw["outside_grants"] = tuple(
+            (p[0], None if p[1] is None else tuple(p[1])) for p in kw["outside_grants"]
+        )
+    if isinstance(kw.get("tool_limits"), list):
+        kw["tool_limits"] = tuple((p[0], tuple(p[1] or ())) for p in kw["tool_limits"])
+    if isinstance(kw.get("agent_accounts"), list):
+        kw["agent_accounts"] = tuple(tuple(t) for t in kw["agent_accounts"])
     # knowledge_libraries is a tuple of (slug, subdir, writable) TRIPLES —
     # restore both levels or the reloaded context stops comparing equal. A
     # PRE-SUBDIR persisted pair (slug, writable) — a session that survived
@@ -1351,16 +1309,13 @@ def _deserialize_security_ctx(d: dict):
     return SecurityContext(**kw)
 
 
-def _save_session_security() -> None:
-    """Persist the session security index for crash recovery. Whole-file
-    rewrite from memory, synchronous on purpose: a close's removal must be on
-    disk when the close returns (it keeps a replayed session token dead
-    across a crash). The live set is small (idle-reaped at 15min).
-    Best-effort: a write failure must never break a warmup/close, so it
-    only logs."""
+def _encode_session_security() -> str:
+    """The security index's whole file from memory, each entry encoded on its
+    own: one the encoder refuses is skipped with a warning, the others are
+    still written."""
     now = time.time()
     entries = []
-    for sid, ctx in _session_security.items():
+    for sid, ctx in list(_session_security.items()):
         # A reloaded session not re-adopted yet keeps what the index held.
         kept_mode, kept_floor = _reloaded_state.get(sid, ("", 0))
         try:
@@ -1369,13 +1324,57 @@ def _save_session_security() -> None:
                 "_saved_at": _session_security_ts.get(sid, now),
                 "_mode": _session_modes.get(sid, kept_mode),
                 "_floor": _session_token_floor.get(sid, kept_floor),
+                **({"_start": _session_start_args[sid]} if sid in _session_start_args else {}),
             }, separators=(",", ":"))
         except (TypeError, ValueError) as e:
             # One entry that cannot be written must not lose the others.
             logger.warning("Session security index: skipped session %s (%s)", sid[:8], e)
             continue
         entries.append(f"{json.dumps(sid)}:{entry}")
-    _atomic_write(_SECURITY_INDEX, "{" + ",".join(entries) + "}", fsync=False)
+    return "{" + ",".join(entries) + "}"
+
+
+# The security index: rewritten whole on every start and close, encoded at
+# the change and written at once on its own thread, not fsynced.
+_security_writer = file_commit.StateFile(
+    "security-index", lambda: _SECURITY_INDEX, _encode_session_security, fsync=False,
+)
+# How long a close waits for its removal to reach the disk before it goes on.
+SECURITY_WRITE_WAIT_S = 30.0
+
+
+def _save_session_security() -> None:
+    """Persist the session security index for crash recovery. The snapshot is
+    taken now and the write leaves the loop at once. A close's removal must
+    be on disk when the close returns (it keeps a replayed session token dead
+    across a crash): a close of a session that can live on a machine awaits
+    :func:`security_index_written`. A write failure never breaks a warmup or
+    a close: it only logs."""
+    _security_writer.mark_dirty()
+
+
+async def security_index_written() -> bool:
+    """Wait, without holding the loop, until every change of the security
+    index made before this call is on disk (at most ``SECURITY_WRITE_WAIT_S``).
+    False when the write failed or the wait ran out (logged): the memory
+    already refuses a closed session's token, and the removal lands when the
+    disk answers."""
+    return await _security_writer.written(SECURITY_WRITE_WAIT_S)
+
+
+def compute_machines_placed(keep: Callable[[str], bool] | None = None) -> set[str]:
+    """The compute machines the held session contexts are placed on (the
+    boot reads it after ``load_session_security``: a proxy restart left
+    those sessions running there), of the sessions ``keep`` answers for."""
+    from core import placement
+    out: set[str] = set()
+    for sid, ctx in list(_session_security.items()):
+        if keep is not None and not keep(sid):
+            continue
+        pl = getattr(ctx, "placement", None)
+        if pl is not None and pl.kind == placement.KIND_COMPUTE and pl.machine_id:
+            out.add(str(pl.machine_id))
+    return out
 
 
 def load_session_security() -> None:
@@ -1391,6 +1390,7 @@ def load_session_security() -> None:
         return
     now = time.time()
     loaded = 0
+    started: list[str] = []
     for sid, d in (raw or {}).items():
         try:
             saved_at = float(d.get("_saved_at", 0) or 0)
@@ -1402,10 +1402,15 @@ def load_session_security() -> None:
                 continue
             _session_security[sid] = _deserialize_security_ctx(d)
             _session_security_ts[sid] = saved_at or now
-            _reloaded_state[sid] = (current_mode(str(d.get("_mode") or "")), int(d.get("_floor") or 0))
+            _reloaded_state[sid] = (str(d.get("_mode") or ""), int(d.get("_floor") or 0))
+            if isinstance(d.get("_start"), dict):
+                _session_start_args[sid] = d["_start"]
+                started.append(sid)
             loaded += 1
         except (AttributeError, TypeError, ValueError):
             logger.warning("Skipping unreadable security index entry %s", sid[:8])
+    from core.session import start_context
+    start_context.restore(started)
     if loaded:
         logger.info("Reloaded %d session security context(s) from disk", loaded)
         _save_session_security()  # drop the pruned/unreadable entries from disk
@@ -1430,6 +1435,11 @@ def set_session_security(session_id: str, ctx) -> None:
         with contextlib.suppress(ValueError, AttributeError, TypeError):
             uuid.UUID(session_id)
             ctx = dataclasses.replace(ctx, cli_session_id=session_id.lower())
+    with _built_accounts_lock:
+        built = _built_accounts.pop(session_id, None)
+    if built is not None:
+        with contextlib.suppress(TypeError):
+            ctx = dataclasses.replace(ctx, agent_accounts=built[1])
     _session_security[session_id] = ctx
     _session_security_ts[session_id] = time.time()
     _save_session_security()
@@ -1438,6 +1448,84 @@ def set_session_security(session_id: str, ctx) -> None:
 def get_session_security(session_id: str):
     """Get the security context for a session, or None if not set."""
     return _session_security.get(session_id)
+
+
+# The agent's own accounts a build took, per session id: ``(agent, ((tool,
+# lender's sub, label), ...))``. Noted by the build (off the loop) and folded
+# into the session's context when it registers, so the index keeps it across
+# a restart; a build that runs after the registration stays noted here.
+_built_accounts: dict[str, tuple[str, tuple]] = {}
+_built_accounts_lock = threading.Lock()
+
+
+def note_built_agent_accounts(session_id: str, agent: str, accounts: tuple) -> None:
+    """Record which of the agent's own accounts a build of ``session_id``
+    took (``accounts``: ``(tool, lender's sub, label)`` triples, empty when
+    it took none). Any thread."""
+    with _built_accounts_lock:
+        _built_accounts[session_id] = (agent, tuple(accounts))
+
+
+def sessions_built_on(agent: str, mcp_name: str, accounts: set[tuple[str, str]]) -> list[str]:
+    """The sessions of ``agent`` whose tools were built on one of
+    ``accounts`` (``(lender's sub, label)`` pairs of its own set of
+    ``mcp_name``): registered ones, a context the index kept across a restart
+    included. On the loop."""
+    with _built_accounts_lock:
+        noted = dict(_built_accounts)
+    out = []
+    for sid in set(_session_security) | set(noted):
+        ctx = _session_security.get(sid)
+        owner, built = noted.get(sid) or (getattr(ctx, "agent", ""),
+                                          getattr(ctx, "agent_accounts", ()) or ())
+        if owner == agent and any(t[0] == mcp_name and (t[1], t[2]) in accounts for t in built):
+            out.append(sid)
+    return sorted(out)
+
+
+def placed_on(session_id: str, chat_id: str = "") -> str | None:
+    """The machine a session runs on by its OWN record, never its chat's pin:
+    ``""`` for the proxy, a machine id, or None when nothing records it. The
+    security index first; then the chat's open turn, whose row names the
+    session's machine and outlives the index's 24-hour prune. A pin agrees
+    with it by ``placement.runs_on``. Synchronous (the open turn is a store
+    read)."""
+    if not session_id:
+        return None
+    ctx = _session_security.get(session_id)
+    pl = getattr(ctx, "placement", None) if ctx is not None else None
+    if pl is not None and not pl.is_remote:
+        return ""
+    # A machine's kind with no id (a meeting participant's, a row since gone)
+    # names no machine: it says nothing, and never reads as the proxy.
+    machine = getattr(pl, "machine_id", "") or ""
+    if machine:
+        return machine
+    if chat_id:
+        from storage.chat import open_turns
+        row = open_turns.get_open(chat_id) or {}
+        if row.get("session_id") == session_id and row.get("machine_id"):
+            return str(row["machine_id"])
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class SessionFacts:
+    """What a cut turn's record is made of: the session's person (their
+    username), its client kind and its mode. A close forgets all three, so
+    they are read while the session is still held."""
+
+    username: str = ""
+    kind: str = ""
+    mode: str = ""
+
+
+def session_facts(session_id: str) -> SessionFacts:
+    """The session's facts as this process holds them now (memory only)."""
+    ctx = get_session_security(session_id)
+    return SessionFacts(username=getattr(ctx, "username", "") or "",
+                        kind=get_session_client_type(session_id),
+                        mode=recorded_session_mode(session_id))
 
 
 def register_session_state(session_id: str, permission_mode: str, security_context,
@@ -1467,7 +1555,7 @@ def register_session_state(session_id: str, permission_mode: str, security_conte
         entry = _sessions.get(session_id)
         if entry is not None and entry.pop("recover_pending", False):
             _save_sessions()
-    _session_modes[session_id] = current_mode(permission_mode)
+    _session_modes[session_id] = permission_mode
     _reloaded_state.pop(session_id, None)
     if security_context is not None:
         set_session_security(session_id, security_context)  # persists mode + floor
@@ -1524,7 +1612,7 @@ def restore_session_state(session_id: str, permission_mode: str, token_floor: in
     the floor to "now", which would refuse the running process's own token.
     The context is the reloaded one; its load-time stamp is kept, so a
     restart never extends the index's prune window."""
-    _session_modes[session_id] = current_mode(permission_mode)
+    _session_modes[session_id] = permission_mode
     if token_floor:
         _session_token_floor[session_id] = int(token_floor)
     else:
@@ -1580,6 +1668,11 @@ def mark_starting(session_id: str, ttl_s: float) -> None:
 
 def clear_starting(session_id: str) -> None:
     _starting.pop(session_id, None)
+
+
+def is_starting(session_id: str) -> bool:
+    """A layer is starting this session right now (:func:`mark_starting`)."""
+    return _in_window(_starting, session_id, _now())
 
 
 def mark_closing(session_id: str, ttl_s: float | None = None) -> None:
@@ -1697,7 +1790,7 @@ def refresh_target_allow_full_fs(machine_id: str, allow_full_fs: bool) -> int:
     import dataclasses
     updated = 0
     for sid, ctx in list(_session_security.items()):
-        if ctx.placement.machine_id != machine_id:
+        if ctx.placement.machine_id != machine_id or not ctx.placement.offers_device_tools:
             continue
         if bool(ctx.placement.allow_full_fs) == bool(allow_full_fs):
             continue
@@ -1734,7 +1827,7 @@ def refresh_target_device_grants(machine_id: str, device_grants: set) -> int:
     grants = set(device_grants or set())
     updated = 0
     for sid, ctx in list(_session_security.items()):
-        if ctx.placement.machine_id != machine_id:
+        if ctx.placement.machine_id != machine_id or not ctx.placement.offers_device_tools:
             continue
         if set(ctx.placement.device_grants) == grants:
             continue
@@ -1998,8 +2091,26 @@ def cleanup_meeting_session_info(agent_session_id: str) -> None:
     _meeting_session_info.pop(agent_session_id, None)
 
 
-def cleanup_session_permission_state(session_id: str) -> None:
-    """Clean up permission state when a session's stream ends."""
+def set_start_args(session_id: str, args: dict | None) -> None:
+    """Record the arguments of a session's riding part (None drops them); written
+    to the index with the next save of its security context, or now when it has one."""
+    if args is None:
+        _session_start_args.pop(session_id, None)
+    else:
+        _session_start_args[session_id] = args
+    if session_id in _session_security:
+        _save_session_security()
+
+
+def get_start_args(session_id: str) -> dict | None:
+    return _session_start_args.get(session_id)
+
+
+def cleanup_session_permission_state(session_id: str) -> bool:
+    """Clean up permission state when a session's stream ends. True when the
+    removed context named a machine (``forget_session`` waits for its
+    removal on disk then). A close calls ``forget_session``; a direct call
+    is the one-door list's exception, with its reason."""
     # Release any waiter still blocked on this session FIRST (deny) so a close
     # that races an in-flight prompt doesn't strand it (and its MCP pipe).
     resolve_session_permissions(session_id, approved=False)
@@ -2007,16 +2118,24 @@ def cleanup_session_permission_state(session_id: str) -> None:
     # left behind (also pops both registries, incl. the bg-command one).
     clear_session_liveness(session_id, reason="session_closed")
     _session_modes.pop(session_id, None)
+    _session_terminal_ask.pop(session_id, None)
+    _session_hook_activity.pop(session_id, None)
     _pre_plan_modes.pop(session_id, None)
     _review_paused.discard(session_id)
     _review_reentries.pop(session_id, None)
     _live_words.pop(session_id, None)
     _session_tool_allows.pop(session_id, None)
     _permission_emitters.pop(session_id, None)
-    _had_security = _session_security.pop(session_id, None) is not None
+    removed = _session_security.pop(session_id, None)
+    _had_security = removed is not None
+    with _built_accounts_lock:
+        _built_accounts.pop(session_id, None)
     _session_security_ts.pop(session_id, None)
     _session_token_floor.pop(session_id, None)
     _reloaded_state.pop(session_id, None)
+    _session_start_args.pop(session_id, None)
+    from core.session import start_context
+    start_context.ended(session_id)
     if _had_security:
         _save_session_security()  # drop from disk so a replayed JWT is denied
     _session_claude_dirs.pop(session_id, None)
@@ -2031,12 +2150,26 @@ def cleanup_session_permission_state(session_id: str) -> None:
     # hub module free of core-package deps at load time.
     from core.credentials import mcp_broker
     mcp_broker.purge_session(session_id)
-    # Tear down any browser (camoufox) context bound to this session so a killed
-    # proxy session frees its browser tab immediately — the router's idle-GC is
-    # the backstop. Best-effort, fire-and-forget; never blocks teardown.
+    # The session's server sessions with the Docker tools end with it (the
+    # browser's pages close at once). Best-effort, fire-and-forget; never
+    # blocks teardown, never wakes a tool.
     with contextlib.suppress(Exception):
-        from services.infra import browser_session
-        browser_session.schedule_close(session_id)
+        from services.containers import door
+        door.schedule_end(session_id)
+    placement = getattr(removed, "placement", None)
+    return bool(placement is not None and placement.is_remote)
+
+
+async def forget_session(session_id: str) -> None:
+    """Forget a closed session (``cleanup_session_permission_state``). When
+    its context named a machine, wait off the loop for its removal to reach
+    the disk: after a crash, that machine's report must find no record. The
+    wait follows the context, not the engine. A context that names no machine
+    never waits. A Direct LLM session and an app button's tool manager are
+    built on the compute machine's placement, so their forgets wait too,
+    though no machine reports them."""
+    if cleanup_session_permission_state(session_id):
+        await security_index_written()
 
 
 # ---------------------------------------------------------------------------

@@ -214,3 +214,313 @@ describe('widgets', () => {
     expect(when('not a date')).toBe('not a date')
   })
 })
+
+// The media widget and `mediaLink`: a file's
+// short lease is kept only while it is used, a lapsed one is asked again
+// on the same address, and the player's own API is what a timeline drives.
+describe('widgets: media', () => {
+  let el: HTMLElement
+  let asked: unknown[]
+  let answer: (args: Record<string, unknown>) => unknown
+  const link = (n: number, lease = 120) => ({ path: `workspace/m/${n}`, url: `/v1/apps/a/client/media?t=secret-${n}`, expires_in: lease, kind: 'video', mime: 'video/mp4', size: 9 })
+
+  beforeEach(async () => {
+    vi.useFakeTimers()
+    el = document.createElement('div')
+    document.body.appendChild(el)
+    asked = []
+    answer = () => link(1)
+    window.otodock = {
+      platform: vi.fn(async (_method: string, args?: unknown) => { asked.push(args); return answer(args as Record<string, unknown>) }),
+      open: () => {},
+    }
+    // jsdom plays nothing: the element's verbs are stubs the test drives.
+    for (const proto of [HTMLMediaElement.prototype]) {
+      proto.play = vi.fn(async function (this: HTMLMediaElement) {
+        Object.defineProperty(this, 'paused', { value: false, configurable: true })
+        this.dispatchEvent(new Event('play'))
+      })
+      proto.pause = vi.fn(function (this: HTMLMediaElement) {
+        Object.defineProperty(this, 'paused', { value: true, configurable: true })
+        this.dispatchEvent(new Event('pause'))
+      })
+      proto.load = vi.fn()
+    }
+  })
+  afterEach(() => { vi.useRealTimers(); el.remove(); delete (window as { otodock?: unknown }).otodock })
+
+  const tick = async (ms = 0) => {
+    await vi.advanceTimersByTimeAsync(ms)
+    for (let i = 0; i < 8; i++) await Promise.resolve()
+  }
+
+  it('asks in one call for every file of a tick, and gives each its link or its reason', async () => {
+    const { mediaLink } = await import('@/uikit/widgets')
+    answer = (args) => ({ links: (args.paths as string[]).map((p, i) => (p.endsWith('missing.png') ? { path: p, error: 'not a file' } : { ...link(i), kind: 'image' })) })
+    const links = ['a.png', 'missing.png', 'c.png'].map((n) => mediaLink(`workspace/m/${n}`))
+    const failed = links[1].ready.then(() => 'ok', (e: Error) => e.message)
+    await tick()
+    expect(asked).toEqual([{ paths: ['workspace/m/a.png', 'workspace/m/missing.png', 'workspace/m/c.png'] }])
+    expect(await failed).toBe('not a file')
+    expect([links[0].url, links[2].url]).toEqual(['/v1/apps/a/client/media?t=secret-0', '/v1/apps/a/client/media?t=secret-2'])
+    links.forEach((l) => l.release())
+    // One file alone is asked by its path.
+    const one = mediaLink('workspace/m/v.mp4')
+    await tick()
+    expect(asked[1]).toEqual({ path: 'workspace/m/v.mp4' })
+    one.release()
+  })
+
+  it('keeps the lease only while the file plays or was just touched, never in a hidden tab', async () => {
+    const { mediaLink } = await import('@/uikit/widgets')
+    const video = document.createElement('video')
+    const l = mediaLink('workspace/m/v.mp4')
+    l.attach(video)
+    await tick()
+    expect(video.getAttribute('src')).toBe(link(1).url)
+    expect(video.crossOrigin).toBe('anonymous')
+    expect(video.getAttribute('controlslist')).toBe('nodownload noremoteplayback')
+    expect(video.hasAttribute('playsinline') && video.hasAttribute('disableremoteplayback')).toBe(true)
+    await tick(30_000)
+    video.dispatchEvent(new Event('pointerdown'))        // the person touches it
+    await tick(42_000)                                   // 60 % of the lease, touched under a minute ago
+    expect(asked.length).toBe(2)
+    await tick(72_000)                                   // idle and paused for over a minute: it is left to lapse
+    expect(asked.length).toBe(2)
+    await tick(60_000)                                   // the lease ran out
+    await video.play()                                   // played again: asked at once
+    await tick()
+    expect(asked.length).toBe(3)
+    await tick(72_000)                                   // still playing: kept
+    expect(asked.length).toBe(4)
+    Object.defineProperty(document, 'hidden', { value: true, configurable: true })
+    await tick(72_000)
+    expect(asked.length).toBe(5)                         // it plays on in a hidden tab (a song): kept
+    video.pause()
+    video.dispatchEvent(new Event('pointerdown'))
+    await tick(144_000)
+    expect(asked.length).toBe(5)                         // paused in a hidden tab: nothing is kept
+    Object.defineProperty(document, 'hidden', { value: false, configurable: true })
+    // Touched again with time left on no lease at all: asked at once.
+    video.dispatchEvent(new Event('pointerdown'))
+    await tick()
+    expect(asked.length).toBe(6)
+    l.release()
+    await tick(500_000)
+    expect(asked.length).toBe(6)
+  })
+
+  it('swaps a new address at a pause and puts the time, the speed and the playing state back', async () => {
+    const { mediaLink } = await import('@/uikit/widgets')
+    const video = document.createElement('video')
+    const changes: string[] = []
+    const l = mediaLink('workspace/m/v.mp4')
+    l.onchange = (url) => changes.push(url)
+    l.attach(video)
+    await tick()
+    await video.play()
+    video.currentTime = 42
+    video.playbackRate = 1.5
+    answer = () => link(2)                               // half an hour on: the address changed
+    const again = l.refresh()
+    await tick()
+    await again
+    expect(changes).toEqual([link(1).url, link(2).url])
+    expect(video.getAttribute('src')).toBe(link(1).url)  // it plays on: nothing reloads under it
+    video.pause()
+    expect(video.getAttribute('src')).toBe(link(2).url)
+    video.currentTime = 0
+    video.dispatchEvent(new Event('loadedmetadata'))
+    expect([video.currentTime, video.playbackRate]).toEqual([42, 1.5])
+    // An error asks again, at most once in three seconds, and reloads on the address it gets.
+    const before = asked.length
+    video.dispatchEvent(new Event('error'))
+    video.dispatchEvent(new Event('error'))
+    await tick()
+    expect(asked.length).toBe(before + 1)
+    expect(HTMLMediaElement.prototype.load).toHaveBeenCalled()
+    l.release()
+  })
+
+  it('mounts a player a timeline can drive, with its own bar', async () => {
+    const handle = mount(el, { widget: 'media', path: 'workspace/m/v.mp4', fps: 25 }) as import('@/uikit/widgets').MediaHandle
+    await tick()
+    const video = el.querySelector('video') as HTMLVideoElement
+    expect(video.getAttribute('src')).toBe(link(1).url)
+    expect(el.querySelector('.odw-media')?.getAttribute('data-kind')).toBe('video')
+    Object.defineProperty(video, 'duration', { value: 120, configurable: true })
+    const times: number[] = []
+    const seen: string[] = []
+    handle.on('time', (t) => times.push(t))
+    for (const name of ['ready', 'play', 'pause'] as const) handle.on(name, () => seen.push(name))
+    video.dispatchEvent(new Event('loadedmetadata'))
+    handle.seek(90)
+    video.dispatchEvent(new Event('seeked'))
+    expect([handle.currentTime, handle.duration, handle.paused]).toEqual([90, 120, true])
+    expect(times).toEqual([90])
+    expect(el.querySelector('.odw-time')?.textContent).toBe('1:30 / 2:00')
+    handle.step(1)                                       // one frame at 25 a second
+    expect(handle.currentTime).toBeCloseTo(90.04)
+    handle.step(-2)
+    expect(handle.currentTime).toBeCloseTo(89.96)
+    handle.seek(500)
+    expect(handle.currentTime).toBe(120)                 // never past the end
+    expect(handle.rate(2)).toBe(2)
+    expect(handle.rate()).toBe(2)
+    handle.play()
+    await tick()
+    handle.pause()
+    expect(seen).toEqual(['ready', 'play', 'pause'])
+    // The scrubber gives way on a phone: its own width never widens the app's layout.
+    expect(document.getElementById('otodock-widgets-style')!.textContent).toContain('input.odw-seek{flex:1 1 0;width:0;min-width:40px;')
+    const [playBtn, , , rateBtn] = [...el.querySelectorAll('.odw-bar > *')] as HTMLElement[]
+    expect(playBtn.getAttribute('aria-label')).toBe('Play')
+    video.playbackRate = 1
+    rateBtn.click()
+    expect(video.playbackRate).toBe(1.5)
+    const stop = handle.on('ended', () => seen.push('ended'))
+    stop()
+    video.dispatchEvent(new Event('ended'))
+    expect(seen).not.toContain('ended')
+    handle.destroy()
+    expect(el.children.length).toBe(0)
+    // No bar for an app that draws its own; audio has no picture.
+    mount(el, { widget: 'media', path: 'workspace/m/v.mp4', controls: false })
+    expect(el.querySelector('.odw-bar')).toBeNull()
+    mount(el, { widget: 'media', path: 'workspace/m/song.mp3' })
+    expect(el.querySelector('audio')).toBeTruthy()
+    expect(el.querySelector('.odw-media')?.getAttribute('data-kind')).toBe('audio')
+  })
+
+  it('loops a range while it plays', async () => {
+    const handle = mount(el, { widget: 'media', path: 'workspace/m/v.mp4' }) as import('@/uikit/widgets').MediaHandle
+    await tick()
+    const video = el.querySelector('video') as HTMLVideoElement
+    Object.defineProperty(video, 'duration', { value: 120, configurable: true })
+    handle.loop(10, 20)
+    handle.play()
+    video.currentTime = 20.5
+    await tick(50)                                       // the next frame the screen draws
+    expect(video.currentTime).toBe(10)
+    handle.loop(null)
+    video.currentTime = 30
+    await tick(50)
+    expect(video.currentTime).toBe(30)
+    handle.destroy()
+  })
+
+  it('shows a picture, two with a split, and says when a file is not available', async () => {
+    answer = (args) => ({ links: (args.paths as string[]).map((_p, i) => ({ ...link(i), kind: 'image' })) })
+    const handle = mount(el, { widget: 'media', path: 'workspace/m/before.jpg', compare: 'workspace/m/after.jpg', fit: 'cover' }) as import('@/uikit/widgets').MediaHandle
+    await tick()
+    const [under, over] = [...el.querySelectorAll('img')] as HTMLImageElement[]
+    expect([under.getAttribute('src'), over.getAttribute('src')]).toEqual([link(0).url, link(1).url])
+    expect(el.querySelector('.odw-media')?.getAttribute('data-fit')).toBe('cover')
+    expect(over.style.clipPath).toBe('inset(0 0 0 50%)')
+    handle.split(0.25)
+    expect(over.style.clipPath).toBe('inset(0 0 0 25%)')
+    expect((el.querySelector('.odw-line') as HTMLElement).style.left).toBe('25%')
+    const drag = el.querySelector('input.odw-split') as HTMLInputElement
+    drag.value = '800'
+    drag.dispatchEvent(new Event('input'))
+    expect(over.style.clipPath).toBe('inset(0 0 0 80%)')
+    handle.zoom(2)
+    expect([under.style.transform, over.style.transform]).toEqual(['scale(2)', 'scale(2)'])
+    handle.destroy()
+    answer = () => { throw new Error('not available: the agent\'s files are for its members') }
+    const errors: number[] = []
+    const gone = mount(el, { widget: 'media', path: 'workspace/m/x.png' }) as import('@/uikit/widgets').MediaHandle
+    gone.on('error', () => errors.push(1))
+    await tick()
+    expect(el.textContent).toContain('not available')
+    expect(errors).toEqual([1])
+    delete (window as { otodock?: unknown }).otodock
+    mount(el, { widget: 'media', path: 'workspace/m/y.png' })
+    await tick()
+    expect(el.textContent).toContain('not ready')
+  })
+
+  it('names the place and the speed for a screen reader, and keeps the speed button at every width', async () => {
+    const handle = mount(el, { widget: 'media', path: 'workspace/m/v.mp4' }) as import('@/uikit/widgets').MediaHandle
+    await tick()
+    const video = el.querySelector('video') as HTMLVideoElement
+    Object.defineProperty(video, 'duration', { value: 120, configurable: true })
+    handle.seek(90)
+    video.dispatchEvent(new Event('seeked'))
+    expect((el.querySelector('input.odw-seek') as HTMLElement).getAttribute('aria-valuetext')).toBe('1:30 of 2:00')
+    const rateBtn = el.querySelector('.odw-rate') as HTMLElement
+    expect(rateBtn.getAttribute('aria-label')).toBe('Speed 1x')
+    rateBtn.click()
+    video.dispatchEvent(new Event('ratechange'))
+    expect(rateBtn.getAttribute('aria-label')).toBe('Speed 1.5x')
+    expect(document.getElementById('otodock-widgets-style')!.textContent).not.toContain('odw-rate{display:none}')
+  })
+
+  it('says when a file a person was watching is no longer theirs, and stays quiet on a passing failure', async () => {
+    const handle = mount(el, { widget: 'media', path: 'workspace/m/v.mp4' }) as import('@/uikit/widgets').MediaHandle
+    await tick()
+    const video = el.querySelector('video') as HTMLVideoElement
+    const errors: number[] = []
+    handle.on('error', () => errors.push(1))
+    // The network drops: the element fails, so does the ask, and nothing is said.
+    answer = () => { throw new Error('network error') }
+    video.dispatchEvent(new Event('error'))
+    await tick()
+    expect(el.textContent).not.toContain('no longer available')
+    // The platform is busy for longer than the kit asks again: nothing is said either.
+    answer = () => { throw Object.assign(new Error('Too fast — try again in a moment'), { retry_after_ms: 300 }) }
+    await tick(3100)
+    video.dispatchEvent(new Event('error'))
+    for (let i = 0; i < 5; i++) await tick(400)
+    expect(el.textContent).not.toContain('no longer available')
+    expect(el.querySelector('video')).toBeTruthy()
+    expect(errors).toEqual([])
+    // The person was removed from the agent: the platform refuses the ask.
+    answer = () => { throw new Error("not available: the agent's files are for its members") }
+    await tick(3100)
+    video.dispatchEvent(new Event('error'))
+    await tick()
+    expect(el.textContent).toContain('This file is no longer available to you.')
+    expect(el.querySelector('video')).toBeNull()
+    expect(el.querySelector('.odw-media')?.hasAttribute('data-gone')).toBe(true)
+    expect(errors).toEqual([1])
+  })
+
+  it('asks again when the platform says to wait, three times at most, and in one call', async () => {
+    const { mediaLink } = await import('@/uikit/widgets')
+    let refusals = 2
+    answer = (args) => {
+      if (refusals-- > 0) throw Object.assign(new Error('Too fast — try again in a moment'), { retry_after_ms: 400 })
+      return { links: (args.paths as string[]).map((_p, i) => ({ ...link(i), kind: 'image' })) }
+    }
+    const links = ['a.png', 'b.png'].map((n) => mediaLink(`workspace/m/${n}`))
+    await tick()
+    expect(asked.length).toBe(1)
+    await tick(460)                                      // the wait it was told, then both again in one call
+    expect(asked.length).toBe(2)
+    expect(asked[1]).toEqual({ paths: ['workspace/m/a.png', 'workspace/m/b.png'] })
+    await tick(460)
+    expect(links.map((l) => l.url)).toEqual([link(0).url, link(1).url])
+    links.forEach((l) => l.release())
+    // Told to wait every time: it gives up after three more asks and says why.
+    refusals = 99
+    const never = mediaLink('workspace/m/c.png')
+    const said = never.ready.then(() => 'ok', (e: Error) => e.message)
+    for (let i = 0; i < 6; i++) await tick(500)
+    expect(await said).toContain('Too fast')
+    expect(asked.length).toBe(3 + 4)
+    // A refusal with no wait in it (not a member, not a file) is not asked again.
+    answer = () => { throw new Error('not a file') }
+    const gone = mediaLink('workspace/m/d.png')
+    const why = gone.ready.then(() => 'ok', (e: Error) => e.message)
+    await tick(2000)
+    expect(await why).toBe('not a file')
+    expect(asked.length).toBe(3 + 4 + 1)
+  })
+
+  it('is version 4', async () => {
+    const { api } = await import('@/uikit/widgets')
+    expect(api.version).toBe(4)
+    expect(typeof api.mediaLink).toBe('function')
+  })
+})

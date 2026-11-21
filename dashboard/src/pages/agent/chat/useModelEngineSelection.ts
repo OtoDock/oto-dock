@@ -5,7 +5,7 @@
  * that point:
  *
  * - useModelEngineSelection: per-user engine access (canRunLayer,
- *   visiblePaths, zeroAccessible, preWarmPath), the COMMITTED chatActiveLayer
+ *   visiblePaths, preWarmPath), the COMMITTED chatActiveLayer
  *   vs the SELECTED selectedLayer, session-process liveness, the provisional
  *   cross-engine switch state and parseModelValue. Runs before the stream
  *   hook — the stream callbacks read its setters.
@@ -20,7 +20,7 @@ import type { useChatStream } from '../../../hooks/useChatStream'
 import type { AgentSummary, LayerCapabilities } from '../../../api/agents'
 import { useUserExecutionLayers } from '../../../api/executionLayers'
 import { computeModelGroups, inPersonOrder, pickSeedModel, visibleAgentPaths } from '../../../lib/modelGroups'
-import { currentMode, seedMode } from '../../../lib/engines/modes'
+import { seedMode } from '../../../lib/engines/modes'
 import { useAgentPrefsStore } from '../../../store/agentPrefsStore'
 
 type Stream = ReturnType<typeof useChatStream>
@@ -48,16 +48,12 @@ export function useModelEngineSelection({ agentExecutionPaths, agentExecutionPat
     return m
   }, [enginesForMe, userLayers])
   // The agent's enabled engines this user can run — unfiltered fallback when
-  // that would be empty (an empty selector is a dead-end; the inline notice
-  // below explains instead).
+  // that would be empty (an empty selector is a dead-end; the warm-up's
+  // refusal says why, on the new chat and on a send).
   const visiblePaths = useMemo(
     () => visibleAgentPaths(agentExecutionPaths, canRunLayer),
     [agentExecutionPaths, canRunLayer],
   )
-  const zeroAccessible = agentExecutionPaths.length > 0
-    && (enginesForMe ? true : (userLayers?.length ?? 0) > 0)
-    && agentExecutionPaths.every(p => canRunLayer[p] === false)
-
   // The execution layer the chat has COMMITTED to. null until the chat actually
   // starts (warmup_ready) or is restored from DB (chat_history) — only then does
   // the model dropdown lock to a single layer. While null (a fresh, unsent chat)
@@ -103,7 +99,7 @@ export function useModelEngineSelection({ agentExecutionPaths, agentExecutionPat
   }, [agentExecutionPath])
 
   return {
-    canRunLayer, visiblePaths, zeroAccessible, preWarmPath,
+    canRunLayer, visiblePaths, preWarmPath,
     chatActiveLayer, setChatActiveLayer, selectedLayer, setSelectedLayer,
     processAlive, setProcessAlive,
     pendingEngineSwitch, setPendingEngineSwitch,
@@ -293,18 +289,14 @@ const STORED_ONLY_MODES: ReadonlySet<string> = new Set(['auto', 'judge'])
 /** Never leave the permission mode on one the engine does not declare (a
  *  stale per-agent sticky "plan" restored onto Codex / Direct LLM, Auto on
  *  an engine with no reviewer, a model switch across engines): the first
- *  declared mode wins. A word from before 1.9 reads as its current one
- *  first. A stored-only mode is the chat's own fact and stays. */
+ *  declared mode wins. A stored-only mode is the chat's own fact and stays. */
 export function usePermissionModeInvariant(
   mode: string, permissionModes: string[] | undefined, setMode: (m: string) => void,
 ) {
   useEffect(() => {
     if (STORED_ONLY_MODES.has(mode)) return
-    const current = currentMode(mode)
-    if (permissionModes && permissionModes.length > 0 && !permissionModes.includes(current)) {
+    if (permissionModes && permissionModes.length > 0 && !permissionModes.includes(mode)) {
       setMode(permissionModes[0])
-    } else if (current !== mode) {
-      setMode(current)
     }
   }, [mode, permissionModes, setMode])
 }

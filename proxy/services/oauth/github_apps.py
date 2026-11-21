@@ -504,14 +504,16 @@ def _mcp_names_of(provider_id: str) -> list[str]:
 def standing_bindings(
     mcp_names: list[str], installation_id: str | int, *, reach: Reach | None = None,
 ) -> list[dict]:
-    """The bindings that still hand out ``installation_id``: their owner
-    manages the agent (the store's rule) and still owns the installation
-    (the meta). With ``reach``, only the bindings of that reach (the ones
-    a narrowed file serves; ``Reach()`` = the unnarrowed ones)."""
+    """The rows of agents' own sets that still hand out ``installation_id``,
+    each judged on its own (a set holds other accounts beside it): its
+    lender manages the agent (the store's rule) and still owns the
+    installation (the meta). With ``reach``, only the rows of that reach
+    (the ones a narrowed file serves; ``Reach()`` = the unnarrowed ones)."""
     out: list[dict] = []
     want = reach.digest() if reach is not None and reach.narrows else ""
     for row in credential_store.bindings_naming_installation(mcp_names, installation_id):
-        live = credential_store.get_service_agent_binding(row["mcp_name"], row["agent_name"])
+        live = credential_store.get_service_agent_binding(
+            row["mcp_name"], row["agent_name"], account_label=row["account_label"])
         if live is None or live.installation_id != str(installation_id):
             continue
         if reach is not None:
@@ -661,11 +663,8 @@ def _reconfirm_lenders(names: list[str], installation_id: str) -> list[dict]:
     demoted or departed owner stops lending the installation. A re-check
     the token cannot make (the user token died) drops that lender."""
     for row in standing_bindings(names, installation_id):
-        live = credential_store.get_service_agent_binding(row["mcp_name"], row["agent_name"])
-        if live is None:
-            continue
         try:
-            _reconfirm_owner(row["mcp_name"], live.account_owner_sub, live.account_label, installation_id)
+            _reconfirm_owner(row["mcp_name"], row["account_owner_sub"], row["account_label"], installation_id)
         except _reconnect_cls():
             continue
     return standing_bindings(names, installation_id)

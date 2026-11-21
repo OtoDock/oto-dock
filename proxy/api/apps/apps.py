@@ -27,7 +27,7 @@ from typing import Any, cast
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from api.media.ui import (
@@ -48,7 +48,7 @@ from auth.providers import (
 )
 from core import placement
 from core.session.visibility import VisibilityUnavailable
-from services.apps import manifest as _mf
+from services.apps import binding_target, manifest as _mf
 from services.apps.audience import announce_deploy, app_access
 from services.apps.manifest import _manifest_target_error
 from services.apps.releases import _deploy_lock
@@ -259,7 +259,7 @@ addEventListener('message', function(e){
       delete preg.pending[String(e.data.call_id || '')];
       try {
         if (e.data.ok) p.resolve(e.data.result);
-        else p.reject(new Error(String(e.data.reason || 'unavailable')));
+        else { var perr = new Error(String(e.data.reason || 'unavailable')); perr.retry_after_ms = Number(e.data.retry_after_ms || 0); p.reject(perr); }
       } catch (err) {}
     }
   }
@@ -390,6 +390,19 @@ _FIRE_MIN_INTERVAL_S = 2.0
 _fire_rate: dict[tuple[str, str, str], float] = {}
 
 
+class PressTooFast(HTTPException):
+    """A call inside its gap: 429 with the words pages match, ``Retry-After``
+    and the rest of the gap in milliseconds (``retry_after_ms``), so the
+    host sends the call again once it would pass."""
+
+    def __init__(self, wait_s: float) -> None:
+        from services.apps.call_rate import TOO_FAST, TooFast
+        paced = TooFast(wait_s)
+        super().__init__(status_code=429, detail=TOO_FAST,
+                         headers={"Retry-After": str(paced.retry_after_s)})
+        self.retry_after_ms = paced.retry_after_ms
+
+
 def _check_fire_rate(app_id: str, action_id: str, sub: str,
                      args_key: str = "",
                      interval: float = _FIRE_MIN_INTERVAL_S) -> None:
@@ -406,7 +419,7 @@ def _check_fire_rate(app_id: str, action_id: str, sub: str,
     # a host restart (ten minutes for a warm).
     last = _fire_rate.get(key)
     if last is not None and now - last < interval:
-        raise HTTPException(status_code=429, detail="Too fast — try again in a moment")
+        raise PressTooFast(interval - (now - last))
     _fire_rate[key] = now
     if len(_fire_rate) > 1024:
         for k in [k for k, t in _fire_rate.items() if now - t > 300]:
@@ -588,16 +601,16 @@ async def cut_and_point(row: dict, source) -> dict:
     return fresh or row
 
 
-async def rollback_app_row(row: dict) -> dict:
+async def rollback_app_row(row: dict, *, by_person: bool) -> dict:
     """Point the row at the release before the current one; 409 when there
-    is none. Shared by the REST route and the session hook."""
+    is none. Shared by the REST route (``by_person``) and the session hook."""
     from services.apps import releases
     if db_apps.app_kind_of(row).keeps_data:
         # A folder app rolls its database back with its code (APPS.md).
         from services.apps import app_deploy
         async with _deploy_lock(row["id"]):
             try:
-                return await app_deploy.rollback_folder(row)
+                return await app_deploy.rollback_folder(row, by_person=by_person)
             except app_deploy.DeployError as e:
                 raise HTTPException(status_code=409, detail=str(e)) from e
     async with _deploy_lock(row["id"]):
@@ -624,7 +637,7 @@ async def rollback_app(
         raise HTTPException(status_code=404, detail="App not found")
     if not _can_manage(row, u):
         raise HTTPException(status_code=403, detail="Not authorized to roll back this app")
-    return {"status": "ok", **await rollback_app_row(row)}
+    return {"status": "ok", **await rollback_app_row(row, by_person=True)}
 
 
 # ── Folder deploys waiting for a human (APPS.md "Deploy pipeline") ─────────
@@ -648,6 +661,7 @@ async def deploy_status(
 class DeployApproveRequest(BaseModel):
     release: int | None = None
     sig: str | None = None
+    sha: str | None = None
 
 
 @router.post("/v1/apps/{app_id}/deploy/approve")
@@ -680,7 +694,7 @@ async def approve_deploy(
     try:
         return {"status": "ok", **await app_deploy.approve_pending(
             row, u.sub, expect_sig=req.sig if req else None,
-            expect_release=req.release if req else None)}
+            expect_release=req.release if req else None, expect_sha=req.sha if req else None)}
     except app_deploy.DeployError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
 
@@ -807,6 +821,9 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
             "handlers": _mf.parse_handlers(row),
             "exports": _mf.parse_exports(row),
             "bindings": _mf.parse_bindings(row),
+            # The bindings read inside the app's department, for the card's
+            # words: beside the declaration, never in it.
+            "bindings_follow": binding_target.following(row),
             "requires": requires,
             "requires_status": _requires_status(agent, requires, u, mcps_by_agent, row),
             "manifest_empty": task_store.canonical_manifest(row) == "[]",
@@ -975,18 +992,19 @@ def _runtime_fields(row: dict, u: UserContext) -> dict:
         pd = releases.preview_dir(row)
         if (pd / releases.MANIFEST_NAME).is_file():
             preview_sha = releases.tree_sha(pd)
-    try:
-        live = releases.live_release_dir(row)
-    except releases.ReleaseDamaged:
-        live = None
     status = app_supervisor.status(row["id"])
+    pending = int(row.get("pending_release") or 0)
     return {
         "kind": db_apps.APP_KIND_FOLDER,
         "release_sha": row.get("release_sha256") or "",
         "preview_sha": preview_sha,
-        "has_server": bool(live is not None and app_sandbox.server_entry(live)),
+        "has_server": releases.live_runs_server(row),
         "deploy_state": row.get("deploy_state") or db_apps.DEPLOY_IDLE,
-        "pending_release": int(row.get("pending_release") or 0),
+        "pending_release": pending,
+        # The approval card judges the release that waits, which may bring
+        # a server the live one has not (or drop one).
+        "pending_has_server": bool(pending and app_sandbox.server_entry(
+            releases.app_release_dir(row) / str(pending))),
         "deploying": _deploy_lock(row["id"]).locked(),
         "server": status["server"],
         "server_error": status["error"],
@@ -1199,6 +1217,26 @@ class PlatformCallRequest(BaseModel):
     args: Any = None
 
 
+def method_gate(app_id: str, u: UserContext, method: str, args: Any) -> tuple[dict, str, Any]:
+    """The route's gates of a platform method, in one place: the row the
+    viewer may reach, the role their floors are judged at, the declared and
+    approved entry with its floor, and the entry's argument schema.
+    ``(row, role, args)``. A media link's every request passes here again
+    (``api/apps/app_media.py``), so what a page's call is refused, a link
+    that is already out is refused too. Sync: call it off the loop."""
+    row = _visible_row(app_id, u)
+    if not row:
+        raise HTTPException(status_code=404, detail="App not found")
+    role = _mf.caller_role(row, u)
+    entry = _catalog_entry(row, u, method=method, role=role)
+    if entry.get("args_schema"):
+        validated, err = _mf.validate_args(entry["args_schema"], args)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        args = validated
+    return row, role, args
+
+
 @router.post("/v1/apps/{app_id}/catalog/{method}")
 async def call_catalog_method(
     app_id: str,
@@ -1207,28 +1245,29 @@ async def call_catalog_method(
     user: UserContext | None = Depends(get_current_user),
 ):
     """One platform method as the viewer: ``{ok, result}`` or ``{ok: false,
-    reason}``; four calls per second per (app, viewer)."""
-    from services.apps import catalog
+    reason}``. Paced before any work (``call_rate.platform_call``: a
+    reserve for a page that opens, then the steady rate); a refusal says
+    how long to wait."""
+    from services.apps import call_rate, catalog
     u = require_auth(user)
     if method not in catalog.METHODS:
         raise HTTPException(status_code=404, detail="unknown platform method")
-    row = await asyncio.to_thread(_visible_row, app_id, u)
-    if not row:
-        raise HTTPException(status_code=404, detail="App not found")
-    role = await asyncio.to_thread(_mf.caller_role, row, u)
-    entry = _catalog_entry(row, u, method=method, role=role)
     args = req.args if req else None
-    if entry.get("args_schema"):
-        validated, err = _mf.validate_args(entry["args_schema"], args)
-        if err:
-            raise HTTPException(status_code=400, detail=err)
-        args = validated
-    _check_fire_rate(app_id, f"\x00platform:{method}", u.sub, interval=0.25)
+    actor = f"user:{u.sub}"
+    def too_fast(e: call_rate.TooFast) -> JSONResponse:
+        return JSONResponse({"detail": call_rate.TOO_FAST, "retry_after_ms": e.retry_after_ms},
+                            status_code=429, headers={"Retry-After": str(e.retry_after_s)})
+
+    try:
+        call_rate.platform_call(app_id, actor, method, catalog.call_cost(method, args))
+    except call_rate.TooFast as e:
+        return too_fast(e)
 
     def _run() -> dict:
         from api.agents import files as files_api
+        row, role, gated = method_gate(app_id, u, method, args)
         try:
-            return {"ok": True, "result": catalog.run_method(method, row.get("agent") or "", row, u, args,
+            return {"ok": True, "result": catalog.run_method(method, row.get("agent") or "", row, u, gated,
                                                               role=role,
                                                               path_gate=files_api.safe_agent_path)}
         except ValueError as e:
@@ -1236,9 +1275,30 @@ async def call_catalog_method(
         except PermissionError as e:
             return {"ok": False, "reason": str(e)}
 
-    out = await asyncio.to_thread(_run)
+    try:
+        async with call_rate.slot(app_id, actor):
+            out = await asyncio.to_thread(_run)
+    except call_rate.TooFast as e:
+        return too_fast(e)
     await finish_platform_result(out, u.sub)
     return out
+
+
+async def _forget_db_copies(out: dict, row: dict) -> None:
+    """``app.forget_copies``: the removal holds the deploy lock, so a release
+    or a rollback never starts under it. The lock is taken only when free,
+    never waited on: a release going live holds it while its server starts,
+    and an app that purges at boot would stall that start, so it is told to
+    call again at its next purge. A running preview holds a copy open, so it
+    stops first."""
+    from services.apps import app_supervisor, releases
+    lock = releases._deploy_lock(row["id"])
+    if lock.locked():
+        out["ok"], out["reason"] = False, "a release is going live, try again after it"
+        return
+    async with lock:
+        await app_supervisor.stop(row["id"], app_supervisor.PREVIEW)
+        out["result"]["removed"] = await asyncio.to_thread(releases.drop_db_copies, row)
 
 
 async def finish_platform_result(out: dict, user_sub: str) -> None:
@@ -1247,6 +1307,8 @@ async def finish_platform_result(out: dict, user_sub: str) -> None:
     method wrote is announced like a pin's (dashboards and satellites)."""
     if not out.get("ok") or not isinstance(out.get("result"), dict):
         return
+    if (forget := out["result"].pop("_forget", None)) is not None:
+        await _forget_db_copies(out, forget)
     delivery = out["result"].pop("_delivery", None)
     if delivery:
         from services.notifications import notification_manager
@@ -1311,9 +1373,14 @@ async def warm_app(
     except HTTPException:
         return Response(status_code=204)
 
+    # The classes this opener's own presses take (a press below the app's
+    # identity runs in a session of its own).
+    reaches = await asyncio.to_thread(headless_exec.warm_reaches, row, u)
+
     async def _build() -> None:
         try:
-            await headless_exec.warm(row)
+            for reach in reaches:
+                await headless_exec.warm(row, reach)
         except Exception:
             logger.exception("app warm failed: app=%s", row.get('slug'))
 
@@ -1383,6 +1450,8 @@ async def unpin_app(
     # copies with them (the database owns the rows, not the files).
     pruned: list[dict] = []
     await asyncio.to_thread(task_store.set_app_hidden, app_id, True, pruned=pruned)
+    from services.apps import media_links
+    media_links.drop_app(app_id)
     if pruned:
         from services.apps import app_lifecycle, releases
         await app_lifecycle.forget_rows(pruned)
@@ -1413,5 +1482,6 @@ async def purge_app(
         raise HTTPException(status_code=403, detail="Not authorized to delete this app")
     if (req.confirm or "").strip().lower() != row["slug"]:
         raise HTTPException(status_code=400, detail="Type the app's ID to confirm.")
-    from services.apps import app_lifecycle
+    from services.apps import app_lifecycle, media_links
+    media_links.drop_app(app_id)
     return await app_lifecycle.purge(row)

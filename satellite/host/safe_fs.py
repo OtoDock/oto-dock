@@ -1,7 +1,7 @@
 """Filesystem access beneath a trusted root on a satellite, no component
 followed: the twin of the proxy's ``services/infra/safe_fs`` for the subset
-the file-push applier, the pull and the stat use, on the three host families
-the daemon runs on.
+the file-push applier, the pull, the stat and the sessions' own folders use,
+on the three host families the daemon runs on.
 
 A path string checked once and opened again later is a race: between the
 check and the use a process that can write under the root swaps a component
@@ -41,16 +41,19 @@ import errno
 import os
 import secrets
 import stat
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from .. import config
 
 __all__ = [
     "SafeFsError", "UnsafePathError", "SymlinkRefused", "NotRegularFile", "FileTooLarge",
-    "Root", "open_root", "atomic_write_beneath", "open_append_beneath", "mkdirs_beneath",
-    "unlink_beneath", "rmdir_beneath", "rename_beneath", "lstat_beneath",
+    "TooManyEntries", "Root", "Listing", "open_root", "atomic_write_beneath",
+    "open_append_beneath", "mkdirs_beneath", "unlink_beneath", "rmdir_beneath",
+    "rmtree_beneath", "rename_beneath", "lstat_beneath", "list_beneath",
     "open_regular_for_read", "read_bytes_beneath", "commit_partial", "is_link_like",
+    "sweep_temps_beneath",
 ]
 
 
@@ -75,6 +78,10 @@ class NotRegularFile(SafeFsError):
 
 class FileTooLarge(SafeFsError):
     """The file is bigger than the caller's cap."""
+
+
+class TooManyEntries(SafeFsError):
+    """A folder's listing would pass the caller's cap on its entries."""
 
 
 # A temp name is ``.<name>.<12 hex>.partial`` and must fit NAME_MAX (255);
@@ -108,9 +115,12 @@ def _components(rel) -> list[str]:
     return parts
 
 
+def _temp_prefix(name: str) -> str:
+    return f".{os.fsdecode(os.fsencode(name)[:_TEMP_NAME_BYTES])}."
+
+
 def _temp_name(name: str) -> str:
-    base = os.fsdecode(os.fsencode(name)[:_TEMP_NAME_BYTES])
-    return f".{base}.{secrets.token_hex(6)}.partial"
+    return f"{_temp_prefix(name)}{secrets.token_hex(6)}.partial"
 
 
 class Root:
@@ -122,6 +132,22 @@ class Root:
     def __init__(self, fd: int = -1, path: str = "") -> None:
         self.fd = fd
         self.path = path
+
+
+class Listing:
+    """One folder's names by kind, each sorted, as its listing reported them
+    (a caller that opens one goes through the helpers, which check again):
+    ``links`` holds the links (on Windows every name surrogate, a junction
+    too), ``other`` a pipe, a socket, a device or a name that could not be
+    told."""
+
+    __slots__ = ("dirs", "files", "links", "other")
+
+    def __init__(self) -> None:
+        self.dirs: list[str] = []
+        self.files: list[str] = []
+        self.links: list[str] = []
+        self.other: list[str] = []
 
 
 def _root_path(root) -> str:
@@ -182,6 +208,76 @@ def _parent_posix(rootfd: int, parts: list[str], *, mkdirs: bool = False) -> int
         raise
 
 
+def _listing_fd(fd: int) -> int:
+    """A handle that can list the folder ``fd`` names (the walk's handle may
+    only name it: ``O_PATH``); the caller closes it."""
+    return os.open(".", os.O_RDONLY | os.O_DIRECTORY | _O_CLOEXEC, dir_fd=fd)
+
+
+def _clear_files_posix(fd: int) -> str | None:
+    """Unlink every entry of the folder ``fd`` that is not a folder (a link
+    among them, never followed); the name of one folder left, if any."""
+    lfd = _listing_fd(fd)
+    try:
+        names = os.listdir(lfd)
+    finally:
+        os.close(lfd)
+    folder = None
+    for name in names:
+        try:
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            folder = folder or name
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=fd)
+    return folder
+
+
+def _empty_posix(top: int, shown: str) -> None:
+    """Empty the folder ``top`` holds with no recursion and no link followed:
+    each pass removes the files of the folder it stands in, steps down into
+    a folder while there is one, and removes the empty folder it reached
+    from its parent. Two handles at a time; going back up opens the names
+    again from ``top``, so no ``..`` is ever followed. An entry another
+    process removed meanwhile is passed over."""
+    path: list[str] = []
+    while True:
+        try:
+            cur = _parent_posix(top, path)
+        except FileNotFoundError:
+            if not path:
+                raise
+            path.pop()
+            continue
+        parent: int | None = None
+        try:
+            while True:
+                sub = _clear_files_posix(cur)
+                if sub is None:
+                    break
+                try:
+                    nxt = _step_dir(cur, sub, "/".join([shown, *path, sub]))
+                except FileNotFoundError:
+                    continue
+                if parent is not None:
+                    os.close(parent)
+                parent, cur = cur, nxt
+                path.append(sub)
+            if not path:
+                return
+            if parent is None:
+                parent = _parent_posix(top, path[:-1])
+            with contextlib.suppress(FileNotFoundError):
+                os.rmdir(path.pop(), dir_fd=parent)
+        finally:
+            os.close(cur)
+            if parent is not None:
+                os.close(parent)
+
+
 def _open_leaf_posix(pfd: int, name: str, flags: int, mode: int, shown: str) -> int:
     try:
         fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK | _O_NOCTTY | _O_CLOEXEC,
@@ -233,6 +329,15 @@ def _w_rmdir(path: str) -> None:
     os.rmdir(path)
 
 
+def _w_rmtree(path: str) -> None:
+    config.force_rmtree(Path(path))
+
+
+def _w_entry_lstat(entry: os.DirEntry) -> os.stat_result:
+    # The listing's own record: the reparse tag comes with it, no second call.
+    return entry.stat(follow_symlinks=False)
+
+
 def _is_surrogate(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_reparse_tag", 0) & _NAME_SURROGATE)
 
@@ -244,6 +349,17 @@ def is_link_like(path) -> bool:
         return _is_surrogate(os.lstat(path))
     except OSError:
         return False
+
+
+def _w_kind(entry: os.DirEntry) -> str:
+    st = _w_entry_lstat(entry)
+    if _is_surrogate(st):
+        return "links"
+    if stat.S_ISDIR(st.st_mode):
+        return "dirs"
+    if stat.S_ISREG(st.st_mode):
+        return "files"
+    return "other"
 
 
 def _w_check_dir(path: str, shown: str) -> None:
@@ -329,11 +445,11 @@ def _leaf(rel) -> tuple[list[str], str, str]:
 
 
 def atomic_write_beneath(root, rel, data: bytes, *, mkdirs: bool = False,
-                         fsync: bool = True) -> None:
-    """Replace ``rel`` with ``data``: a temp created ``O_EXCL`` next to it and
-    renamed onto the name within the parent (a link at the name is replaced,
-    never written through; a dangling one never creates its target); the
-    temp is removed on any failure."""
+                         fsync: bool = True, mode: int = 0o644) -> None:
+    """Replace ``rel`` with ``data``: a temp created ``O_EXCL`` with ``mode``
+    next to it and renamed onto the name within the parent (a link at the
+    name is replaced, never written through; a dangling one never creates
+    its target); the temp is removed on any failure."""
     parents, name, shown = _leaf(rel)
     with open_root(root) as r:
         if _posix():
@@ -341,7 +457,7 @@ def atomic_write_beneath(root, rel, data: bytes, *, mkdirs: bool = False,
             try:
                 tmp = _temp_name(name)
                 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _O_CLOEXEC,
-                             0o644, dir_fd=pfd)
+                             mode, dir_fd=pfd)
                 done = False
                 try:
                     with os.fdopen(fd, "wb") as fh:
@@ -361,7 +477,7 @@ def atomic_write_beneath(root, rel, data: bytes, *, mkdirs: bool = False,
         parent = _w_parent(r.path, parents, mkdirs=mkdirs)
         target = os.path.join(parent, name)
         tmp = os.path.join(parent, _temp_name(name))
-        fd = _w_open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        fd = _w_open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         done = False
         try:
             with os.fdopen(fd, "wb") as fh:
@@ -379,6 +495,46 @@ def atomic_write_beneath(root, rel, data: bytes, *, mkdirs: bool = False,
             if not done:
                 with contextlib.suppress(OSError):
                     _w_unlink(tmp)
+
+
+def sweep_temps_beneath(root, rel, *, older_than_s: float) -> int:
+    """Remove the temps ``atomic_write_beneath`` left beside ``rel`` (a write
+    a killed process never finished) once older than ``older_than_s``:
+    regular files only, by descriptor, never through a link. The number
+    removed; POSIX only, a missing parent removes nothing."""
+    if not _posix():
+        return 0
+    parents, name, _shown = _leaf(rel)
+    # The temp's two ends as ``_temp_name`` writes them, twelve hex between.
+    prefix = _temp_prefix(name)
+    suffix = _temp_name(name)[len(prefix) + 12:]
+    cutoff = time.time() - older_than_s
+    removed = 0
+    with open_root(root) as r:
+        try:
+            pfd = _parent_posix(r.fd, parents)
+        except FileNotFoundError:
+            return 0
+        try:
+            # The walk's descriptor may only name the folder (O_PATH): its
+            # listing opens the same folder for reading.
+            lfd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | _O_CLOEXEC, dir_fd=pfd)
+            try:
+                names = os.listdir(lfd)
+            finally:
+                os.close(lfd)
+            for entry in names:
+                if not (entry.startswith(prefix) and entry.endswith(suffix)
+                        and len(entry) == len(prefix) + 12 + len(suffix)):
+                    continue
+                with contextlib.suppress(FileNotFoundError):
+                    st = os.stat(entry, dir_fd=pfd, follow_symlinks=False)
+                    if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                        os.unlink(entry, dir_fd=pfd)
+                        removed += 1
+        finally:
+            os.close(pfd)
+    return removed
 
 
 def open_append_beneath(root, rel, *, truncate: bool = False, mkdirs: bool = True,
@@ -450,6 +606,58 @@ def lstat_beneath(root, rel) -> os.stat_result:
         return _w_lstat(os.path.join(_w_parent(r.path, parents), name))
 
 
+def _sort_entries(entries, max_entries: int, shown: str,
+                  kind: Callable[[os.DirEntry], str]) -> Listing:
+    out = Listing()
+    seen = 0
+    for entry in entries:
+        seen += 1
+        if seen > max_entries:
+            raise TooManyEntries(errno.EFBIG, "more entries than the listing's cap", shown)
+        try:
+            bucket = kind(entry)
+        except OSError:
+            bucket = "other"
+        getattr(out, bucket).append(entry.name)
+    for names in (out.dirs, out.files, out.links, out.other):
+        names.sort()
+    return out
+
+
+def _posix_kind(entry: os.DirEntry) -> str:
+    if entry.is_symlink():
+        return "links"
+    if entry.is_dir(follow_symlinks=False):
+        return "dirs"
+    if entry.is_file(follow_symlinks=False):
+        return "files"
+    return "other"
+
+
+def list_beneath(root, rel: str = "", *, max_entries: int) -> Listing:
+    """The names in the folder ``rel`` (the root itself for ``""``) by kind,
+    the folder reached as every call here reaches it; a folder of more than
+    ``max_entries`` entries raises ``TooManyEntries`` as it is read, before
+    its names are held or sorted. A link at ``rel`` is refused."""
+    parts = _components(rel)
+    shown = "/".join(parts)
+    with open_root(root) as r:
+        if _posix():
+            fd = _parent_posix(r.fd, parts)
+            try:
+                lfd = _listing_fd(fd)
+            finally:
+                os.close(fd)
+            try:
+                with os.scandir(lfd) as it:
+                    return _sort_entries(it, max_entries, shown, _posix_kind)
+            finally:
+                os.close(lfd)
+        folder = _w_parent(r.path, parts)
+        with os.scandir(folder) as it:
+            return _sort_entries(it, max_entries, shown, _w_kind)
+
+
 def unlink_beneath(root, rel, *, missing_ok: bool = False) -> None:
     """Remove the file or link at ``rel`` (a link goes, its target stays)."""
     parents, name, shown = _leaf(rel)
@@ -495,6 +703,54 @@ def rmdir_beneath(root, rel) -> None:
         if _is_surrogate(st):
             raise SymlinkRefused(errno.ELOOP, "symlink refused", shown)
         _w_rmdir(target)
+
+
+def rmtree_beneath(root, rel, *, missing_ok: bool = False) -> None:
+    """Remove the folder ``rel`` and everything in it. POSIX: entry by entry
+    from held handles, no recursion, no link followed (a link inside goes,
+    its target stays; the 3.10 floor's ``rmtree`` takes no ``dir_fd``).
+    Windows: the chain checked and the name's own status read, then
+    ``config.force_rmtree`` (its retries outlast an antivirus's hold). A
+    link at ``rel`` itself is refused (``unlink_beneath`` removes one), a
+    file there is ``NotADirectoryError``; a missing folder raises unless
+    ``missing_ok``."""
+    parents, name, shown = _leaf(rel)
+    with open_root(root) as r:
+        if _posix():
+            try:
+                pfd = _parent_posix(r.fd, parents)
+            except FileNotFoundError:
+                if missing_ok:
+                    return
+                raise
+            try:
+                try:
+                    # A link here is refused, a file is NotADirectoryError.
+                    top = _step_dir(pfd, name, shown)
+                except FileNotFoundError:
+                    if missing_ok:
+                        return
+                    raise
+                try:
+                    _empty_posix(top, shown)
+                finally:
+                    os.close(top)
+                os.rmdir(name, dir_fd=pfd)
+            finally:
+                os.close(pfd)
+            return
+        try:
+            target = os.path.join(_w_parent(r.path, parents), name)
+            st = _w_leaf_stat(target, shown)
+        except FileNotFoundError:
+            st = None
+        if st is None:
+            if missing_ok:
+                return
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), shown)
+        if not stat.S_ISDIR(st.st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), shown)
+        _w_rmtree(target)
 
 
 def rename_beneath(root, src_rel, dst_rel, *, replace: bool = False, mkdirs: bool = False) -> None:

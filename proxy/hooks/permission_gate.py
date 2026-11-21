@@ -33,18 +33,16 @@ import urllib.request
 # _HOLD_S, then denied; any answer from the platform ends the hold at once.
 _HOLD_S = 120.0
 _BACKOFF = (2.0, 4.0, 8.0, 15.0)  # then 15 s steps until the hold ends
+# A machine the platform told it is away for an update repeats how long it
+# still expects that to last in its tunnel's 502/503 (``hold_s``): the call
+# is held at least that long from then, never longer than _HOLD_MAX_S.
+_HOLD_MAX_S = 3600.0
 # A refused session token right after a restart: the satellite reports its
 # sessions a moment after it reconnects. A short ladder, then a deny.
 _AUTH_LADDER = (2.0, 4.0, 8.0)
 # A decision that waits on a person is streamed with whitespace keepalives
 # every 30 s, so a few intervals of silence mean the stream is gone.
 _SOCKET_TIMEOUT_S = 150
-# The permission_mode values Codex reports for a turn under an asking
-# approval policy ("default"; "bypassPermissions" means never). A satellite
-# before 1.9 runs its attended Codex chats on the retired "untrusted"
-# policy with OTO_HOOK_BRIDGED set: every command reaches its bridge, so
-# the gate stands aside on such a turn. Nothing else sets the switch.
-_BRIDGE_ASKS = frozenset({"default", "acceptEdits", "plan"})
 # What the hold met last and for how long, for the deny reason: the class of
 # the failure and its address, so a refused call says which link failed
 # (``_failure_of``). ``_where`` is PROXY_URL's host and port (``main``).
@@ -53,20 +51,30 @@ _last_failure = ""
 _held_s = 0.0
 
 
-def _error_word(e):
-    """The ``error`` word of a synthetic tunnel answer, "" for any other body."""
+def _body_of(e):
+    """The JSON object a refusal carries (a synthetic tunnel answer names its
+    ``error`` and, during an update, ``hold_s``), {} for any other body."""
     try:
-        return str(json.loads(e.read().decode("utf-8", "replace") or "{}").get("error") or "")
+        body = json.loads(e.read().decode("utf-8", "replace") or "{}")
     except (OSError, ValueError, AttributeError):
-        return ""
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
-def _failure_of(exc):
+def _hold_named(body):
+    """The seconds a tunnel answer asks the call to be held for, 0 for none."""
+    value = body.get("hold_s")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return 0.0
+    return min(float(value), _HOLD_MAX_S)
+
+
+def _failure_of(exc, body=None):
     """One failure of the hold in words: its class and address, never a
     traceback (the reason reaches the model and the chat)."""
     where = _where or "the platform"
     if isinstance(exc, urllib.error.HTTPError):
-        word = _error_word(exc)
+        word = str((body or {}).get("error") or "")
         if exc.code == 503 and word == "tunnel-not-connected":
             return "this machine's link to OtoDock was down: 503"
         if exc.code == 502 and word == "tunnel-disconnected":
@@ -92,9 +100,10 @@ def _request_decision(req):
     None when the platform stayed unreachable for the whole hold, counted
     from the first failure (a prompt may wait days before its stream drops)."""
     global _last_failure, _held_s
-    deadline = None
+    started = deadline = None
     unreachable = auth = 0
     while True:
+        named = 0.0
         try:
             with urllib.request.urlopen(req, timeout=_SOCKET_TIMEOUT_S) as resp:
                 text = resp.read().decode("utf-8", "replace").strip()
@@ -110,15 +119,20 @@ def _request_decision(req):
             if e.code not in (502, 503, 504):
                 return {"decision": "deny",
                         "reason": f"OtoDock refused this tool call (HTTP {e.code})"}
-            _last_failure = _failure_of(e)
+            body = _body_of(e)
+            named = _hold_named(body)
+            _last_failure = _failure_of(e, body)
         except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
             # Unreachable, or a streamed answer cut before its JSON.
             _last_failure = _failure_of(e)
         wait = _BACKOFF[min(unreachable, len(_BACKOFF) - 1)]
-        if deadline is None:
-            deadline = time.monotonic() + _HOLD_S
-        if time.monotonic() + wait > deadline:
-            _held_s = time.monotonic() - (deadline - _HOLD_S)
+        now = time.monotonic()
+        if started is None:
+            started, deadline = now, now + _HOLD_S
+        if named:
+            deadline = max(deadline, now + named)
+        if now + wait > deadline:
+            _held_s = now - started
             return None
         time.sleep(wait)
         unreachable += 1
@@ -167,14 +181,6 @@ def main():
         inp = json.loads(sys.stdin.read())
     except (OSError, ValueError):
         inp = {}
-
-    # An attended Codex chat on a satellite before 1.9 (OTO_HOOK_BRIDGED):
-    # its approval requests carry the person's cards, so the gate stands
-    # aside on a turn Codex says will raise them, and judges every other one
-    # (Don't Ask and auto run under never: "bypassPermissions"). An unknown
-    # or missing value is judged: a turn with no judge is the failure to avoid.
-    if os.environ.get("OTO_HOOK_BRIDGED") and inp.get("permission_mode") in _BRIDGE_ASKS:
-        return
 
     session_id = os.environ.get("OTO_SESSION_ID", "")
     proxy_url = os.environ.get("PROXY_URL", "")

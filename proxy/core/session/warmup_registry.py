@@ -72,6 +72,18 @@ async def register(chat_id: str, user_sub: str, agent: str) -> InflightWarmup:
         return rec
 
 
+async def register_new(chat_id: str, user_sub: str, agent: str) -> InflightWarmup | None:
+    """Register an in-flight entry only when the chat has none: None when it
+    has one, in one step under the lock. For a holder that must own its
+    entry (it unregisters at its end, which would remove another's)."""
+    async with _lock:
+        if chat_id in _inflight:
+            return None
+        rec = InflightWarmup(chat_id=chat_id, user_sub=user_sub, agent=agent)
+        _inflight[chat_id] = rec
+        return rec
+
+
 async def attach_listener(chat_id: str, send_fn: SendFn) -> InflightWarmup | None:
     """Attach a WS send-callable as a listener. Returns the entry (so caller
     can replay event_history) or None if no in-flight warmup exists.

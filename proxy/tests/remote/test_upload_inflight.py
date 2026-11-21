@@ -218,3 +218,78 @@ async def test_a_push_bound_for_other_machines_does_not_hold_a_turn():
     assert await upload_inflight.wait_settled("agent-y", timeout=1) is True
     await asyncio.sleep(0)
     assert not upload_inflight._bound_for
+
+
+# ---------------------------------------------------------------------------
+# What a person reads when a bound is reached
+# ---------------------------------------------------------------------------
+
+
+async def _goes_on(monkeypatch, *, connected=("m-1",), machine=None):
+    """``turn_goes_on_without_files`` over a fake manager and machine row."""
+    from types import SimpleNamespace
+
+    from core.remote import satellite_connection as sc
+    from storage import remote_store
+    monkeypatch.setattr(sc, "get_connection_manager",
+                        lambda: SimpleNamespace(is_connected=lambda mid: mid in connected))
+    monkeypatch.setattr(remote_store, "get_remote_machine", lambda mid: machine)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("machine", "place"), [({"name": "Dimitris laptop"}, "Dimitris laptop"),
+                                                (None, "its machine")],
+                         ids=["named", "no name known"])
+async def test_a_turn_that_goes_on_without_its_files_tells_the_agent_and_the_chat(temp_db, monkeypatch, machine, place):
+    """One line each: a row a reload shows, sent to the chat's open tabs, and at
+    the head of what the agent reads. The line names the machine where it can."""
+    import json
+
+    from core.session import session_state
+    from storage import database as task_store
+    from ws import wire_events as wire
+    chat_id = "chat-late"
+    task_store.create_chat(chat_id, "user-admin", "test-agent", "default")
+    task_store.update_chat(chat_id, session_id="s-late")
+    frames: list = []
+    monkeypatch.setattr(session_state, "broadcast_chat_frame", lambda cid, frame: frames.append((cid, frame)))
+    await _goes_on(monkeypatch, machine=machine)
+    text = await upload_inflight.turn_goes_on_without_files("s-late", "m-1", "test-agent", "the message")
+    assert text == f"{upload_inflight.FILES_LATE_PROMPT}\n\nthe message"
+    rows = task_store.get_chat_messages(chat_id)
+    block = json.loads(rows[-1]["event_data"])
+    assert block["subtype"] == wire.SUBTYPE_FILES_LATE
+    assert block["message"] == (f"The agent started before all the files reached {place}. "
+                                "They are still on their way, so it may not see them yet.")
+    assert frames == [(chat_id, {**block, "chat_id": chat_id})]
+
+
+def test_the_agents_line_holds_for_a_missing_file_and_an_older_copy():
+    line = upload_inflight.FILES_LATE_PROMPT
+    assert "missing" in line and "older copy" in line and "Check it" in line
+
+
+@pytest.mark.asyncio
+async def test_a_machine_that_has_gone_gets_no_line(temp_db, monkeypatch):
+    """No turn starts there, and the chat says that itself."""
+    from core.remote import machine_push_lane
+    from storage import database as task_store
+    task_store.create_chat("chat-gone", "user-admin", "test-agent", "default")
+    task_store.update_chat("chat-gone", session_id="s-gone")
+    released: list = []
+    monkeypatch.setattr(machine_push_lane, "release_turns", lambda *a: released.append(a))
+    await _goes_on(monkeypatch, connected=())
+    assert await upload_inflight.turn_goes_on_without_files("s-gone", "m-gone", "test-agent", "m") == "m"
+    assert task_store.get_chat_messages("chat-gone") == [] and released == []
+
+
+@pytest.mark.asyncio
+async def test_a_session_with_no_chat_of_its_own_still_tells_the_agent(temp_db, monkeypatch):
+    """A meeting participant: the prompt's line with no row anywhere."""
+    from core.remote import machine_push_lane
+    released: list = []
+    monkeypatch.setattr(machine_push_lane, "release_turns", lambda *a: released.append(a))
+    await _goes_on(monkeypatch)
+    text = await upload_inflight.turn_goes_on_without_files("s-meeting", "m-1", "test-agent", "your turn")
+    assert text == f"{upload_inflight.FILES_LATE_PROMPT}\n\nyour turn"
+    assert released == [("m-1", "test-agent")]

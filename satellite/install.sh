@@ -235,6 +235,7 @@ elif [ -n "$SATELLITE_REPO" ] && [ -d "$SATELLITE_REPO/satellite" ]; then
     info "Copying satellite package from $SATELLITE_REPO (repo-local install)..."
     cp -r "$SATELLITE_REPO/satellite" "$SATELLITE_DIR/"
     cp "$SATELLITE_REPO/satellite/requirements.txt" "$SATELLITE_DIR/"
+    cp "$SATELLITE_REPO/satellite/requirements-exit.txt" "$SATELLITE_DIR/"
     cp "$SATELLITE_REPO/satellite/uninstall.sh" "$SATELLITE_DIR/"
     ok "Satellite package copied"
 else
@@ -258,6 +259,13 @@ if [ ! -d "$SATELLITE_DIR/venv" ]; then
 fi
 "$SATELLITE_DIR/venv/bin/pip" install -q --upgrade pip
 "$SATELLITE_DIR/venv/bin/pip" install -q -r "$SATELLITE_DIR/requirements.txt"
+# The credential exit's packages, best effort and from wheels alone: a host
+# with no wheel for one of them still installs and runs every tool that
+# needs no key; the tools that need one stay off there.
+if [ -f "$SATELLITE_DIR/requirements-exit.txt" ]; then
+    "$SATELLITE_DIR/venv/bin/pip" install -q --only-binary :all: -r "$SATELLITE_DIR/requirements-exit.txt" \
+        || warn "Some packages have no build for this computer. Tools that need a key stay off on it."
+fi
 ok "Python dependencies installed"
 
 # --- Step 5b: bootstrap uv (needed for MCPs that pin a non-system Python) ---
@@ -348,6 +356,9 @@ WorkingDirectory=$SATELLITE_DIR
 Restart=always
 RestartSec=5
 # One child the OOM killer ends must not stop every session the unit parents.
+# No OOMScoreAdjust below zero and no MemoryMin: a user unit cannot set either
+# (measured). The satellite's memory guard keeps this machine's reserve free,
+# and every session's process starts at OOM score 500, above the satellite.
 OOMPolicy=continue
 Environment=HOME=$HOME
 

@@ -1,0 +1,56 @@
+{
+ "absent": {
+  "parsed": []
+ },
+ "bad requires": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].requires must be a list of non-empty strings"
+ },
+ "bad scope": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].scope contains invalid values ['team']; allowed: ['agent', 'user']"
+ },
+ "block not an object": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0] must be an object, got str"
+ },
+ "builder not an object": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].builder must be an object, got list"
+ },
+ "credential token": {
+  "parsed": [
+   {
+    "requires": [
+     "credential.OTHER"
+    ],
+    "template": "${credential.TOKEN}"
+   }
+  ],
+  "warnings": [
+   "char-mcp: agent_context names credential.OTHER, credential.TOKEN: no credential value enters a prompt, so each renders empty and a requires on one skips its block"
+  ]
+ },
+ "empty template": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].template must be a non-empty string"
+ },
+ "good": {
+  "parsed": [
+   {
+    "requires": [
+     "a"
+    ],
+    "scope": [
+     "user",
+     "agent"
+    ],
+    "template": "t"
+   }
+  ]
+ },
+ "not a list": {
+  "refused": "char-mcp: invalid agent_context block — agent_context must be a list, got dict"
+ },
+ "scope not a list": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].scope must be a list of strings"
+ },
+ "unknown key": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0] has unknown keys: ['when']"
+ }
+}

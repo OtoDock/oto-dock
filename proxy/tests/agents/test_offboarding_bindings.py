@@ -18,7 +18,7 @@ from services.webhooks import subscription_manager
 from storage import database as db
 from storage.agents import agent_store
 from storage.automation import webhook_subscription_store
-from storage.identity import credential_store, oauth_app_kinds
+from storage.identity import credential_store, oauth_app_kinds, service_account_set
 
 A, B = "sb-a", "sb-b"
 MCP = "github-mcp"
@@ -36,8 +36,8 @@ def world(temp_db, monkeypatch):
     db.set_user_agents(pat, [A, B], admin, agent_roles={A: "manager", B: "manager"})
     credential_store.set_user_credentials(pat, MCP, {"k": "v"}, account_label="acct")
     for agent in (A, B):
-        assert credential_store.set_service_agent_binding(
-            MCP, agent, account_label="acct", owner_sub=pat, set_by=pat)
+        assert service_account_set.add_service_account_to_agent(
+            MCP, agent, account_label="acct", owner_sub=pat, set_by=pat) == ""
     subs = {agent: _sub(agent, pat)["id"] for agent in (A, B)}
     deleted: list[tuple] = []
 
@@ -103,8 +103,8 @@ async def test_a_deletion_sweeps_the_subscriptions_whose_bindings_were_dropped(w
     other = db.create_local_user("mo@t.com", "Mo Manager", "Mo", "member", "x")
     db.set_user_agents(other, [B], w.admin, agent_roles={B: "manager"})
     credential_store.set_user_credentials(other, MCP, {"k": "v"}, account_label="theirs")
-    assert credential_store.set_service_agent_binding(
-        MCP, B, account_label="theirs", owner_sub=other, set_by=other)
+    assert service_account_set.add_service_account_to_agent(
+        MCP, B, account_label="theirs", owner_sub=other, set_by=other) == ""
     keep = _sub(B, other, label="theirs")["id"]
     # The admin delete route drops the bindings and the person before the event.
     credential_store.cleanup_service_agent_bindings_for_owner(w.pat)
@@ -227,8 +227,8 @@ async def test_a_platform_role_drop_clears_the_bindings_it_takes_away(world, mon
     db.set_user_agents(boss, [A], w.admin, agent_roles={A: "viewer"})
     credential_store.set_user_credentials(boss, MCP, {"k": "v"}, account_label="boss")
     credential_store.remove_service_agent_binding(MCP, A)
-    assert credential_store.set_service_agent_binding(
-        MCP, A, account_label="boss", owner_sub=boss, set_by=boss)
+    assert service_account_set.add_service_account_to_agent(
+        MCP, A, account_label="boss", owner_sub=boss, set_by=boss) == ""
 
     async def _held(*a, **k):
         return None
@@ -284,8 +284,8 @@ async def test_a_rebind_while_the_clear_runs_is_kept(world, monkeypatch):
     real = subscription_manager.cleanup_account_subscriptions
 
     async def _rebinding(**kw):
-        assert credential_store.set_service_agent_binding(
-            MCP, A, account_label="mos", owner_sub=mo, set_by=mo)
+        assert service_account_set.add_service_account_to_agent(
+            MCP, A, account_label="mos", owner_sub=mo, set_by=mo) == ""
         return await real(**kw)
 
     monkeypatch.setattr(subscription_manager, "cleanup_account_subscriptions", _rebinding)
@@ -316,22 +316,73 @@ async def test_the_sweep_keeps_a_hosted_installation_row_and_drops_an_uncovered_
     credential_store.set_account_meta(w.pat, MCP, "acct", {
         "kind": oauth_app_kinds.KIND_GITHUB_APP, "hosted": True, "installations": [owned]})
     hosted_row = _installation_sub(A, w.pat, "10")["id"]
-    # B: a self-managed account bound to installation 12, with a row left
-    # on 10 from before the rebind and one on 12.
+    # B: beside its plain account, a self-managed one acting as installation
+    # 12, with a row on 10 it does not cover and one on 12.
     credential_store.set_user_credentials(w.pat, MCP, {"k": "v"}, account_label="self")
     credential_store.set_account_meta(w.pat, MCP, "self", {
         "kind": oauth_app_kinds.KIND_GITHUB_APP, "hosted": False,
         "installations": [owned, {**owned, "id": 12}]})
-    assert credential_store.set_service_agent_binding(
-        MCP, B, account_label="self", owner_sub=w.pat, set_by=w.pat, installation_id="12")
+    assert service_account_set.add_service_account_to_agent(
+        MCP, B, account_label="self", owner_sub=w.pat, set_by=w.pat, installation_id="12") == ""
     stale = _installation_sub(B, w.pat, "10", label="self")["id"]
     kept = _installation_sub(B, w.pat, "12", label="self")["id"]
-    assert await bindings._sweep_orphans() == 2      # the stale row, and B's old "acct" row
+    # Each account of B's set keeps its own subscriptions: the stale row alone goes.
+    assert await bindings._sweep_orphans() == 1
     ids = {r["id"] for r in _rows(A)} | {r["id"] for r in _rows(B)}
-    assert hosted_row in ids and kept in ids and w.subs[A] in ids
-    assert stale not in ids and w.subs[B] not in ids
+    assert hosted_row in ids and kept in ids and w.subs[A] in ids and w.subs[B] in ids
+    assert stale not in ids
     # The hosted person no longer owns 10: that row alone goes.
     credential_store.set_account_meta(w.pat, MCP, "acct", {
         "kind": oauth_app_kinds.KIND_GITHUB_APP, "hosted": True, "installations": []})
     assert await bindings._sweep_orphans() == 1
     assert [r["id"] for r in _rows(A)] == [w.subs[A]]
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_keeps_a_subscription_on_an_account_that_is_not_the_default(world):
+    """Every account of the agent's set keeps its own subscriptions: one on a
+    second account stays at the sweep (it went when it was not the default),
+    and goes once its lender stops managing the agent, the vendor delete
+    reading that lender's own token."""
+    w = world
+    mo = db.create_local_user("mo3@t.com", "Mo Manager", "Mo", "member", "x")
+    db.set_user_agents(mo, [A], w.admin, agent_roles={A: "manager"})
+    credential_store.set_user_credentials(mo, MCP, {"k": "v"}, account_label="mos")
+    assert service_account_set.add_service_account_to_agent(
+        MCP, A, account_label="mos", owner_sub=mo, set_by=mo) == ""
+    second = _sub(A, mo, label="mos")["id"]
+    assert await bindings._sweep_orphans() == 0
+    assert {r["id"] for r in _rows(A)} == {w.subs[A], second}
+    db.set_user_agents(mo, [A], w.admin, agent_roles={A: "editor"})
+    assert await bindings._sweep_orphans() == 1
+    assert [r["id"] for r in _rows(A)] == [w.subs[A]]
+    assert w.deleted == [(A, mo)]
+
+
+@pytest.mark.asyncio
+async def test_a_lender_who_leaves_takes_their_account_alone_out_of_the_agents_set(world, monkeypatch):
+    """Two lenders' accounts in A's own set: the one who loses the manager
+    tier takes their own row out, the other's stays and becomes the
+    default, and a chat that chose the leaver's account is closed and told
+    (``chat_reload.remove_service_account``)."""
+    from services.remote import chat_reload
+    from storage.identity import service_account_set
+    w = world
+    other = db.create_local_user("oli@t.com", "Oli Other", "Oli", "member", "x")
+    db.set_user_agents(other, [A], w.admin, agent_roles={A: "manager"})
+    credential_store.set_user_credentials(other, MCP, {"k": "v"}, account_label="oli-acct")
+    assert service_account_set.add_service_account_to_agent(
+        MCP, A, account_label="oli-acct", owner_sub=other) == ""
+    seen: list = []
+    real = chat_reload.remove_service_account
+
+    async def _spy(*a, **kw):
+        seen.append((a, kw))
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(chat_reload, "remove_service_account", _spy)
+    db.set_user_agents(w.pat, [A, B], w.admin, agent_roles={A: "editor", B: "manager"})
+    await bindings.on_offboard(_event(w, offboarding.DEMOTED, AgentLoss(A, "manager", "editor")))
+    assert seen == [((MCP, A), {"owner_sub": w.pat, "account_label": "acct"})]
+    assert [(b.account_label, b.is_default)
+            for b in service_account_set.list_service_agent_set(MCP, A)] == [("oli-acct", True)]

@@ -61,6 +61,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import safe_fs
 import shared
 from ooxml import render_copy
 
@@ -126,6 +127,9 @@ SEND_MAX_BYTES = 32 * 1024 * 1024
 SEND_MAX_UNCOMPRESSED = 256 * 1024 * 1024
 SEND_MAX_ENTRIES = 20_000
 ANSWER_MAX_BYTES = 512 * 1024 * 1024
+# A person's file reaches an engine as a private copy, capped at the most the
+# engine takes back from a conversion.
+COPY_MAX_BYTES = ANSWER_MAX_BYTES
 LANG = "en-US"
 OOXML_EXTENSIONS = frozenset({".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm", ".xltx", ".xltm",
                               ".pptx", ".pptm", ".potx", ".potm"})
@@ -905,21 +909,46 @@ async def _libreoffice(path: str, output_format: str, out_dir: str, *, kind: str
         raise RuntimeError(f"the conversion timed out ({left:.0f}s)") from None
 
 
+def _persons_file(path: str) -> bool:
+    """Whether ``path`` is beneath the write root (a person's file), judged
+    on its text; a path the strict open refuses counts as one, so the open
+    answers it."""
+    try:
+        return shared._read_place(path) is not None
+    except safe_fs.SafeFsError:
+        return True
+
+
 async def _render(path: str, fmt: str, out_dir: str, *, share_s: float, kind: str, lo_format: str,
                   extension: str | None, slot_wait_s: float, timeout_s: float, deadline: float | None,
                   drop_cached: bool = False, a4: bool = False, collabora: bool = True) -> str:
+    """A person's file is never handed to an engine by name: a private copy
+    read beneath the mount with no link followed (``shared.private_copy``,
+    capped at COPY_MAX_BYTES) in a folder of this call's own, under the
+    same name (LibreOffice picks some filters by the suffix and names its
+    output after the stem), is what the link scan, the Collabora upload and
+    LibreOffice read; the folder is removed afterwards."""
     end = deadline if deadline is not None else time.monotonic() + slot_wait_s + timeout_s
-    links = await asyncio.to_thread(_links, path)
+    name = path
+    private = await asyncio.to_thread(tempfile.mkdtemp, prefix="private-", dir=out_dir) \
+        if _persons_file(path) else None
     folder = None
-    source = path
     try:
+        if private is not None:
+            try:
+                path = await asyncio.to_thread(shared.private_copy, path, private, COPY_MAX_BYTES)
+            except safe_fs.FileTooLarge:
+                raise RuntimeError(f"{os.path.basename(name)} is past the {COPY_MAX_BYTES // (1024 * 1024)} MB "
+                                   "a conversion reads: save a smaller copy and convert that") from None
+        links = await asyncio.to_thread(_links, path)
+        source = path
         if links.outside:
             folder = await asyncio.to_thread(tempfile.mkdtemp, prefix="unlinked-", dir=out_dir)
             source = await _unlinked(path, folder, end)
             deadline = end
         if collabora and _base_url():
             attempt = await _via_collabora(source, fmt, out_dir, end, share_s, drop_cached=drop_cached, a4=a4,
-                                           name=path, alt_chunk=links.alt_chunk)
+                                           name=name, alt_chunk=links.alt_chunk)
             if attempt.path is not None:
                 return attempt.path
             if attempt.timed_out and end - time.monotonic() < MIN_FALLBACK_S:
@@ -928,8 +957,9 @@ async def _render(path: str, fmt: str, out_dir: str, *, share_s: float, kind: st
         return await _libreoffice(source, lo_format, out_dir, kind=kind, extension=extension,
                                   slot_wait_s=slot_wait_s, timeout_s=timeout_s, deadline=deadline)
     finally:
-        if folder is not None:
-            await asyncio.to_thread(shutil.rmtree, folder, True)
+        for made in (folder, private):
+            if made is not None:
+                await asyncio.to_thread(shutil.rmtree, made, True)
 
 
 async def to_pdf(path: str, *, out_dir: str, timeout_s: float = CONVERT_RUN_S,

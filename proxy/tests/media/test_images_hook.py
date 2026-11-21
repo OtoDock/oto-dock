@@ -359,3 +359,24 @@ def test_temp_url_caps(tmp_agent_image, monkeypatch):
     monkeypatch.setattr(config, "TEMP_IMAGE_MAX_TOTAL_BYTES", 8)
     images._temp_image_tokens.clear()
     assert _post_temp_url(abs_path).status_code == 503
+
+
+def test_temp_url_opens_the_gates_answer_never_a_second_resolution(tmp_agent_image, monkeypatch):
+    """The mint reads the place the gate authorized. A link put at that place
+    after the judgement (here: before the mint's read) is refused, never
+    resolved again to wherever it now leads."""
+    from api.media import images
+    abs_path, agent = tmp_agent_image
+    bob = Path(abs_path).parents[2] / "bob" / "workspace"
+    bob.mkdir(parents=True)
+    (bob / "theirs.png").write_bytes(b"\x89PNG bob")
+    answer = Path(abs_path).parent / "pic.png"
+    answer.symlink_to(bob / "theirs.png")
+
+    async def _judged(session_id, raw):
+        return answer, None
+    monkeypatch.setattr(images, "_classify_and_pull", _judged)
+    resp = _post_temp_url(str(answer))
+    assert resp.status_code == 404
+    assert not images._temp_image_tokens or all(
+        e.data != b"\x89PNG bob" for e in images._temp_image_tokens.values())

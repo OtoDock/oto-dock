@@ -1,0 +1,42 @@
+{
+ "defaults": {
+  "plan": "",
+  "reached": "",
+  "scoped": [],
+  "source": "",
+  "windows": {}
+ },
+ "observed_at_is_aware_utc": true,
+ "quota_key_first_declared": "seven_day",
+ "quota_key_no_specs": "",
+ "quota_key_none_declared": "",
+ "scoped_for_empty": null,
+ "scoped_for_hit": {
+  "active": true,
+  "key": "opus",
+  "label": "Opus",
+  "pct": 90.0,
+  "resets_at": null
+ },
+ "scoped_for_is_the_first": true,
+ "scoped_for_miss": null,
+ "usage_to_dict": {
+  "in_band": [],
+  "windows": [
+   {
+    "key": "five_hour",
+    "label": "5-hour limit",
+    "length_s": 18000,
+    "role": "session",
+    "scope": "account"
+   },
+   {
+    "key": "seven_day",
+    "label": "weekly limit reached",
+    "length_s": 604800,
+    "role": "quota",
+    "scope": "account"
+   }
+  ]
+ }
+}

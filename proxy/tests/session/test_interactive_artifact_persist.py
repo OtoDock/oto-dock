@@ -8,7 +8,6 @@ blocking prompts never persist (parity with the pump's ``_save_turn_blocks``).
 """
 import asyncio
 import json
-import os
 
 import pytest
 import pytest_asyncio
@@ -21,10 +20,8 @@ from core.events.artifact_events import (
 )
 from core.session import interactive_session as isess
 from core.session.session_state import get_permission_queue
+from tests._terminal import register
 from ws import wire_events as wire
-
-_ENV = {"TERM": "xterm-256color", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
-
 
 # ─────────────────────────── persist function (unit) ─────────────────────────
 
@@ -159,9 +156,9 @@ class TestDrainerPersistence:
         self, temp_db, _clean_registry,
     ):
         temp_db.create_chat("chat-drain", "user-admin", "agent-x")
-        s = await isess.register(
+        s = await register(
             session_id="sid-art-drain", chat_id="chat-drain",
-            agent_name="agent-x", argv=["cat"], env=dict(_ENV),
+            agent_name="agent-x",
         )
         try:
             got: asyncio.Queue = asyncio.Queue()
@@ -191,9 +188,9 @@ class TestDrainerPersistence:
         self, temp_db, _clean_registry,
     ):
         temp_db.create_chat("chat-drain-card", "user-admin", "agent-x")
-        s = await isess.register(
+        s = await register(
             session_id="sid-art-card", chat_id="chat-drain-card",
-            agent_name="agent-x", argv=["cat"], env=dict(_ENV),
+            agent_name="agent-x",
         )
         try:
             got: asyncio.Queue = asyncio.Queue()
@@ -216,9 +213,9 @@ class TestDrainerPersistence:
         # drawn in a terminal chat has its history row, so the chat view
         # behind the terminal shows it.
         temp_db.create_chat("chat-drain-acard", "user-admin", "agent-x")
-        s = await isess.register(
+        s = await register(
             session_id="sid-art-acard", chat_id="chat-drain-acard",
-            agent_name="agent-x", argv=["cat"], env=dict(_ENV),
+            agent_name="agent-x",
         )
         try:
             got: asyncio.Queue = asyncio.Queue()
@@ -242,9 +239,9 @@ class TestDrainerPersistence:
         # The third card kind rides the same gate: no row of the list, the
         # kind, the filters, the title and the person alone.
         temp_db.create_chat("chat-drain-lcard", "user-admin", "agent-x")
-        s = await isess.register(
+        s = await register(
             session_id="sid-art-lcard", chat_id="chat-drain-lcard",
-            agent_name="agent-x", argv=["cat"], env=dict(_ENV),
+            agent_name="agent-x",
         )
         try:
             got: asyncio.Queue = asyncio.Queue()
@@ -269,9 +266,9 @@ class TestDrainerPersistence:
         # The whole point of the seam: the artifact row exists even when
         # nobody is watching, so a later open can replay the popup.
         temp_db.create_chat("chat-noview", "user-admin", "agent-x")
-        s = await isess.register(
+        s = await register(
             session_id="sid-art-noview", chat_id="chat-noview",
-            agent_name="agent-x", argv=["cat"], env=dict(_ENV),
+            agent_name="agent-x",
         )
         try:
             assert s.on_perm_event is None

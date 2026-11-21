@@ -43,14 +43,16 @@ const RULES = {
   lowercase: 'a sentence starts with a capital',
 } as const
 
-/** The changelog lint's words for how the platform works inside: a person
- *  cannot act on them. The two lists stay the same. */
-const MECHANISM_WORDS = [
-  'carve', 'floor', 'hook', 'broker', 'probe', 'egress', 'daemon', 'endpoint',
-  'handler', 'payload', 'regex', 'mutex', 'socket', 'stdout', 'stderr', 'cgroup',
-  'namespace', 'userns', 'asyncio', 'coroutine', 'mixin', 'adapter', 'tombstone',
-  'manifest', 'runtime', 'sentinel', 'heuristic', 'idempotent', 'pool',
-]
+/** The writing rules every repository shares (scripts/prose/rules.json),
+ *  read as a file: the dashboard's image build copies dashboard/ alone. */
+const WRITING = JSON.parse(readFileSync(path.join(dashboard, '..', 'scripts', 'prose', 'rules.json'), 'utf8')) as {
+  sentence: { screen: number }
+  words: { plain: string[], inside: string[] }
+}
+
+/** The long list of words for how the platform works inside: a person
+ *  cannot act on them. The changelog lint reads the same list. */
+const MECHANISM_WORDS = [...new Set([...WRITING.words.plain, ...WRITING.words.inside])]
 const MECHANISM = new RegExp(`\\b(${MECHANISM_WORDS.join('|')})s?\\b`, 'i')
 
 /** Words a screen keeps although a rule refuses them, each with its reason.
@@ -60,7 +62,7 @@ const KEPT: Record<string, string> = {
 }
 
 /** The longest sentence, in words. */
-const MAX_WORDS = 20
+const MAX_WORDS = WRITING.sentence.screen
 
 const NOT_PROSE_ATTRIBUTES = new Set([
   'className', 'style', 'd', 'points', 'viewBox', 'allow', 'sandbox', 'rel', 'target', 'type',
@@ -90,10 +92,10 @@ const QUIET_CALLS = /^(console\.\w+|debugWarn|debugLog|logError|noteFold|logger\
 /** Code a sentence may quote, which keeps its own spelling: a backticked
  *  span, an address, a path, a dotted name, a key, a flag, a key
  *  combination, a name with a digit, an assignment with no space around its
- *  `=` (`KEY=value`). */
+ *  `=` (`KEY=value`, its sentence's own full stop left outside). */
 const CODE = new RegExp([
   '`[^`]*`',
-  '[^\\s=]+=[^\\s=]+',
+  '[^\\s=]+=[^\\s=]*[^\\s=.,!?…]',
   '\\b[a-z][a-z0-9+.-]*:\\/\\/[^\\s)\\]]+',
   '[\\w.~*-]*\\/[\\w.~*{}/-]+',
   '\\b\\w+(?:\\.\\w+)+\\b(?:\\([^)]*\\))?',
@@ -374,6 +376,8 @@ describe('plain sentences in the dashboard', () => {
       "const r = { title: 'Send (Shift+Enter)' }",
       "const s = 'Set DASHBOARD_PUBLIC_URL=https://a.example in config.env, then restart.'",
       "const u = 'a[href], button, input, select, textarea, [tabindex]:not([tabindex=\"-1\"])'",
+      // A `KEY=value` that ends a sentence keeps its full stop: two sentences.
+      "const v = 'This install keeps the chats on the server, because its settings say A_KEY=local. To use this machine, remove that line and start OtoDock again.'",
     ].join('\n')
     const found = faults('sample.tsx', sample)
     expect(found.map(ruleOf)).toEqual([

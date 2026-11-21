@@ -1,0 +1,88 @@
+{
+ "absent": {
+  "parsed": []
+ },
+ "absolute file": {
+  "parsed": [],
+  "warnings": [
+   "char-mcp: skill 'a' file '/abs/skill.md' is absolute; skill dropped"
+  ]
+ },
+ "bad audience": {
+  "parsed": [],
+  "warnings": [
+   "char-mcp: skill 'a' has an invalid audience 'team' (expected one of ['owner', 'editor', 'workspace']); skill dropped"
+  ]
+ },
+ "bad id": {
+  "parsed": [],
+  "warnings": [
+   "char-mcp: skill id 'Not_Valid' is not a valid skill name (lowercase alnum + single hyphens, max 64 chars) — skill dropped"
+  ]
+ },
+ "bad loading": {
+  "parsed": [
+   {
+    "file": "a.md",
+    "id": "a"
+   }
+  ],
+  "warnings": [
+   "char-mcp: skill 'a' has invalid loading 'sometimes' (expected one of ['always', 'on_demand']) — using 'on_demand'"
+  ]
+ },
+ "climbing file": {
+  "parsed": [],
+  "warnings": [
+   "char-mcp: skill 'a' file '../a.md' is not a plain relative path; skill dropped"
+  ]
+ },
+ "entry not an object": {
+  "parsed": [],
+  "warnings": [
+   "char-mcp: skill entry 'x' needs a string id and file; skill dropped"
+  ]
+ },
+ "file not text": {
+  "parsed": [],
+  "warnings": [
+   "char-mcp: skill entry {'id': 'a', 'file': 1} needs a string id and file; skill dropped"
+  ]
+ },
+ "good": {
+  "parsed": [
+   {
+    "file": "a.md",
+    "id": "a"
+   },
+   {
+    "audience": "workspace",
+    "default_exclude_from": [
+     "task"
+    ],
+    "description": "d",
+    "file": "skills/b.md",
+    "id": "b-c",
+    "loading": "always"
+   }
+  ]
+ },
+ "id not text": {
+  "parsed": [],
+  "warnings": [
+   "char-mcp: skill entry {'id': 1, 'file': 'a.md'} needs a string id and file; skill dropped"
+  ]
+ },
+ "long id": {
+  "parsed": [],
+  "warnings": [
+   "char-mcp: skill id 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' is not a valid skill name (lowercase alnum + single hyphens, max 64 chars) — skill dropped"
+  ]
+ },
+ "not a list": {
+  "parsed": [],
+  "warnings": [
+   "char-mcp: skills is not a list; skills dropped"
+  ]
+ }
+}

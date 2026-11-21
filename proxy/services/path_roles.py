@@ -32,6 +32,7 @@ from pathlib import Path
 
 from auth.roles import OWNER_TIER, WORKSPACE_TIER
 from core import layout
+from core.layers.codex import session_text
 
 # Literal token left in path values for session-scoped roles. Expanded at
 # subprocess-spawn time by the bwrap launcher (local) and the satellite
@@ -44,17 +45,12 @@ SESSION_ID_TOKEN = "{session_id}"
 # ---------------------------------------------------------------------------
 
 def is_protected_credentials_path(path: Path | str) -> bool:
-    """Return True if any segment of ``path`` is a registered
-    ``credentials_dir`` subpath.
+    """Return True if any segment of ``path`` is one of the folder names
+    earlier releases gave a session's OAuth token copies
+    (``mcp_registry.get_protected_credentials_subpaths``).
 
     Used by both the dashboard file API and the agent permission hook to
-    refuse access to OAuth token files (``users/{u}/google-tokens/x.json``,
-    ``workspace/google-tokens/x.json``, future ``<provider>-tokens/...``).
-
-    Protection is manifest-driven via
-    ``mcp_registry.get_protected_credentials_subpaths()`` — a future MCP
-    that declares ``path_env.X.role: "credentials_dir"`` automatically
-    inherits the gate, no code change required.
+    refuse what those releases may have left on a disk.
 
     Robust against:
       * Relative paths (split on '/' OS-independently via ``pathlib``)
@@ -65,8 +61,7 @@ def is_protected_credentials_path(path: Path | str) -> bool:
       * Empty / falsy input (returns False)
       * Lookalike folder names — only EXACT subpath matches count, so
         ``my-design-tokens/`` is safe while ``google-tokens/`` is
-        protected. The set is the manifest-declared subpaths, not a
-        glob pattern.
+        protected. The set is a frozen list of names, not a glob pattern.
     """
     if not path:
         return False
@@ -84,7 +79,7 @@ def is_protected_credentials_path(path: Path | str) -> bool:
 
 
 def command_references_protected_path(command: str) -> bool:
-    """Substring-match a bash command for known credentials_dir subpaths.
+    """Substring-match a bash command for the protected folder names.
 
     Catches the common ``cat /workspace/google-tokens/x.json`` /
     ``cp .../google-tokens/...`` shapes used in prompt-injection
@@ -129,7 +124,7 @@ def command_references_protected_path(command: str) -> bool:
 # for the rest of the session (no bwrap behind it on a satellite).
 _HOOK_SCRIPTS = frozenset({
     "permission_gate.py", "tool_result_forwarder.py", "subagent_tracker.py",
-    "stop_tracker.py", "stdio_path_interceptor.py",
+    "stop_tracker.py", "stdio_path_interceptor.py", "usage_report.py",
 })
 _CODEX_SECRET_FILES = frozenset({"config.toml", "auth.json"})
 
@@ -181,6 +176,8 @@ def is_protected_agent_config_path(path: Path | str, *, writing: bool = False) -
     dotdir, name = parts[-2], parts[-1].lower()
     if dotdir == "tmp" and name == ".claude.json":
         return len(parts) == 3 and parts[0] == "/"
+    if _in_session_home(parts, writing=writing):
+        return True
     if writing:
         if parts[-1] in _STATE_DIRS:
             return _at_scope_root(parts[:-1])
@@ -196,7 +193,9 @@ def is_protected_agent_config_path(path: Path | str, *, writing: bool = False) -
         if not name.endswith(".json"):
             return False
     elif dotdir == ".codex":
-        if name not in _CODEX_SECRET_FILES:
+        # A session's own files and a thread's record: its text and tool
+        # tokens, guarded as config.toml is.
+        if name not in _CODEX_SECRET_FILES and not session_text.is_session_file(name):
             return False
     else:
         return False
@@ -204,6 +203,29 @@ def is_protected_agent_config_path(path: Path | str, *, writing: bool = False) -
 
 
 _STATE_DIRS = (".claude", ".codex")
+
+
+def _in_session_home(parts: tuple[str, ...], *, writing: bool) -> bool:
+    """A session's home in a scope's state dir (``core/sandbox/session_home``:
+    ``<scope root>/.claude/own/<id>/``) holds that session's sign-in, its
+    account record and its settings: every direct file of a home is guarded
+    for reads and writes, and a home itself for a write (``own`` is a direct
+    child of the state dir, guarded below). The engine reads its mods from
+    the home's ``dev-mods``, so everything under it is a write, as under the
+    store's. The home's links reach the store's folders (the conversations,
+    the skills), under their own rules."""
+    from core.sandbox import session_home
+    for i in range(len(parts) - 2):
+        if parts[i] in _STATE_DIRS and parts[i + 1] == session_home.OWN and _at_scope_root(parts[:i]):
+            rest = parts[i + 2:]
+            if not session_home.valid_id(rest[0]):
+                return False
+            if len(rest) == 2 or (writing and len(rest) == 1):
+                return True
+            return writing and rest[1] == _DEV_MODS_DIR
+    return False
+
+
 # Where Claude Code 2.1.287+ keeps the mods Claude writes during a session
 # (judged under either state dir: the rule needs no engine branch).
 _DEV_MODS_DIR = "dev-mods"
@@ -290,8 +312,7 @@ def is_session_runtime_path(
     The tree is ``<root>/<cwd-slug>/<session_id>/…`` — scratchpad and
     background-task outputs. ``root`` is the CLI's per-user runtime root
     (``<tempdir>/claude-<uid>``: reported by a satellite's capabilities
-    probe, or ``core.sandbox.sandbox.claude_runtime_root()`` for a local
-    sandbox) and ``session_id`` must appear as a path segment below it —
+    probe) and ``session_id`` must appear as a path segment below it —
     the root itself is not the tree. The session-id equality is the
     capability: another session (another platform user on a shared-admin
     satellite, another sandbox on the proxy) can never name this session's
@@ -317,13 +338,15 @@ def is_session_runtime_path(
 # as ``is_protected_agent_config_path`` (a repo's nested ``.claude``/``.codex``
 # config is NOT matched), so the two never diverge. The raw text cannot tell
 # a read from a write, so it carries the WRITE set: a Bash reference to a
-# hook script is refused in both directions.
+# hook script is refused in both directions. Anything under a state dir's
+# ``own`` (the sessions' homes, each with its sign-in) is refused whole.
 _HOOK_SCRIPTS_ALT = "|".join(re.escape(s) for s in sorted(_HOOK_SCRIPTS))
 _AGENT_CONFIG_CMD_RE = re.compile(
     r'(?:^|[\s/\\"\'=])'                                   # boundary before
     r'(?:(?:users/[^/\s"\']+|workspace|knowledge|tmp)/'    # session scope root
-    r'\.(?:claude/(?:[^/\s"\']*\.json|dev-mods(?:/[^\s"\';|&)<>]*)?|' + _HOOK_SCRIPTS_ALT + r')'
-    r'|codex/(?:config\.toml|auth\.json|hooks\.json|dev-mods(?:/[^\s"\';|&)<>]*)?|' + _HOOK_SCRIPTS_ALT + r'))'
+    r'\.(?:claude/(?:[^/\s"\']*\.json|(?:dev-mods|own)(?:/[^\s"\';|&)<>]*)?|' + _HOOK_SCRIPTS_ALT + r')'
+    r'|codex/(?:config\.toml|auth\.json|hooks\.json|(?:dev-mods|own)(?:/[^\s"\';|&)<>]*)?|'
+    + _HOOK_SCRIPTS_ALT + r'))'
     r'|tmp/\.claude\.json)'                                # the sandbox HOME's own
     r'(?:$|[\s"\';|&)<>])'                                 # boundary after
 )
@@ -360,7 +383,6 @@ ROLES = (
     "shared_workspace",
     "config",
     "knowledge_dir",
-    "credentials_dir",
 )
 
 
@@ -418,7 +440,7 @@ def resolve_role(
             ``"admin"``, or ``""`` for agent-scoped / unknown). Only the
             ``shared_workspace`` and ``config`` roles consult this — the
             other roles ignore it.
-        subpath: required for ``credentials_dir``. Optional for
+        subpath: optional for
             ``workspace``, ``user_root``, ``shared_workspace`` — appended
             under the role's directory when set. Ignored for ``config``.
 
@@ -426,12 +448,10 @@ def resolve_role(
         Sandbox-style virtual path (always absolute, leading ``/``) or ``""``.
 
     Raises:
-        ValueError if ``role`` is unknown or ``credentials_dir`` is given
-        without a subpath.
+        ValueError if ``role`` is unknown.
     """
     # Subpath is optional for workspace/user_root/shared_workspace (subdir
-    # within the role's directory). Required for credentials_dir.
-    # Ignored for config.
+    # within the role's directory). Ignored for config.
     sp = subpath.lstrip("/") if subpath else ""
 
     if role == "workspace":
@@ -496,21 +516,6 @@ def resolve_role(
         # sessions). Universally available — unlike workspace, knowledge
         # reads from the SAME dir regardless of session scope.
         return f"{layout.V_KNOWLEDGE}/{sp}" if sp else layout.V_KNOWLEDGE
-
-    if role == "credentials_dir":
-        if not sp:
-            raise ValueError("credentials_dir role requires a non-empty subpath")
-        # Per-session OAuth token copy destination. Lives under
-        # ``.credentials/`` so the file API + workspace tree can hide the
-        # whole subtree cleanly + so adding any future privacy-sensitive
-        # per-session asset has an obvious home.
-        # - User-scope sessions: under the user's own dir.
-        # - Agent-scope sessions (phone/task/trigger): under the agent's
-        #   knowledge dir (universally visible to agent-scope sessions of
-        #   this agent; never visible to user-scope sessions).
-        if username:
-            return f"{layout.virtual_user_root(username)}/{layout.CREDENTIALS_DIR}/{sp}"
-        return f"{layout.V_KNOWLEDGE}/{layout.CREDENTIALS_DIR}/{sp}"
 
     raise ValueError(f"Unknown path role: {role!r}; valid roles: {ROLES}")
 

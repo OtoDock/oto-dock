@@ -311,12 +311,12 @@ def _manifest(name, *, exclude_from=("task",), audience="", remote_policy="",
 
 
 def _session(*, client_type="task", role="manager", kind="admin_remote",
-             permission_mode="default", external=False):
+             permission_mode="default", external=False, os="", version=""):
     from types import SimpleNamespace
 
     from core.placement import PlacementCapabilities
-    sc = SimpleNamespace(placement=PlacementCapabilities(kind=kind), role=role,
-                         principal="external" if external else "user")
+    sc = SimpleNamespace(placement=PlacementCapabilities(kind=kind, os=os, satellite_version=version),
+                         role=role, principal="external" if external else "user")
     return SimpleNamespace(agent_name="agent-1", client_type=client_type,
                            permission_mode=permission_mode, security_context=sc)
 
@@ -353,12 +353,28 @@ async def test_an_mcp_another_gate_left_out_is_not_lifted():
 
 
 @pytest.mark.asyncio
-async def test_an_admin_paired_only_mcp_is_not_wanted_on_a_user_paired_machine():
+async def test_an_admin_paired_only_tool_handed_no_secret_is_wanted_on_every_machine():
+    """The proxy signs and no key leaves it: the admin-paired-only policy
+    does not keep the tool off a person's own machine."""
     ssh = _manifest("ssh-hosts", remote_policy="admin_paired_only")
-    got, _ = await _lifted([ssh], _session(kind="user_remote"))
-    assert got == set()
-    got, _ = await _lifted([ssh], _session(kind="admin_remote"))
+    got, _ = await _lifted([ssh], _session(kind="user_remote", version="0.5.173"))
     assert got == {"ssh-hosts"}
+    got, _ = await _lifted([ssh], _session(kind="admin_remote", version="0.5.196", os="windows"))
+    assert got == {"ssh-hosts"}
+    # A compute machine is no person's place.
+    got, _ = await _lifted([ssh], _session(kind="compute", version="0.5.173"))
+    assert got == {"ssh-hosts"}
+
+
+@pytest.mark.asyncio
+async def test_a_tool_handed_a_secret_is_not_wanted_on_a_users_own_machine():
+    """The lift is for a tool handed no secret of its own: one the platform
+    hands a key keeps the policy, as the build does."""
+    keyed = _manifest("vendor-tool", remote_policy="admin_paired_only", cred="infra")
+    got, _ = await _lifted([keyed], _session(kind="user_remote", version="0.5.194"))
+    assert got == set()
+    got, _ = await _lifted([keyed], _session(kind="admin_remote", version="0.5.194"))
+    assert got == {"vendor-tool"}
 
 
 @pytest.mark.asyncio
@@ -407,3 +423,45 @@ async def test_an_external_callers_session_lifts_what_the_external_context_left_
     m = _manifest("crm-mcp", exclude_from=("external",))
     assert (await _lifted([m], _session(client_type="phone", external=True)))[0] == {"crm-mcp"}
     assert (await _lifted([m], _session(client_type="phone")))[0] == set()
+
+
+@pytest.mark.asyncio
+async def test_pending_for_names_what_a_sync_would_install_now(monkeypatch):
+    """Install ahead plans with it: a missing tool always, an outdated one
+    unless the run installs only what is missing (a sign-in)."""
+    from services.mcp import mcp_sync
+
+    async def _state(cm, machine_id):
+        return {"current": {"version_hash": "h1", "healthy": True},
+                "outdated": {"version_hash": "old", "healthy": True}}
+
+    async def _hashes(names, *, force=False):
+        return {"current": "h1", "outdated": "h2", "missing": "h3"}
+    monkeypatch.setattr(mcp_sync, "_fetch_satellite_state", _state)
+    monkeypatch.setattr(mcp_sync, "version_hashes_for", _hashes)
+    monkeypatch.setattr("services.mcp.mcp_registry.get_manifest", _fake_manifest)
+    names = {"current", "outdated", "missing"}
+    assert await mcp_sync.pending_for("m1", names) == {"outdated", "missing"}
+    assert await mcp_sync.pending_for("m1", names, install_only=True) == {"missing"}
+
+
+@pytest.mark.asyncio
+async def test_a_verify_that_fails_plans_the_missing_tools_alone(monkeypatch):
+    """The fallback (the list reported at sign-in) knows no hash: reading
+    it as every tool outdated would make a sign-in run rebuild them all."""
+    from types import SimpleNamespace
+
+    from services.mcp import mcp_sync
+
+    async def _fails(machine_id, msg, **kw):
+        raise RuntimeError("timed out")
+    cm = SimpleNamespace(send_command=_fails, builds_own_tools=lambda mid: False,
+                         get_connection=lambda mid: SimpleNamespace(
+                             capabilities={"installed_mcps": ["current", "outdated"]}))
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
+
+    async def _hashes(names, *, force=False):
+        return {"current": "h1", "outdated": "h2", "missing": "h3"}
+    monkeypatch.setattr(mcp_sync, "version_hashes_for", _hashes)
+    monkeypatch.setattr("services.mcp.mcp_registry.get_manifest", _fake_manifest)
+    assert await mcp_sync.pending_for("m1", {"current", "outdated", "missing"}) == {"missing"}

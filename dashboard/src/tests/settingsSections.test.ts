@@ -53,10 +53,17 @@ describe('agentSections', () => {
     ])
   })
 
+  it('shows an editor the Conversations row and no manager row', () => {
+    expect(shown(agentSections('ops', false, true))).toEqual([
+      'Overview', 'Checks', 'Conversations', 'Scheduled Tasks', 'Triggers', 'Notifications', 'Meetings',
+    ])
+  })
+
   it('builds the paths under the agent, Overview on its own route', () => {
     const list = agentSections('ops', true)
     expect(list[0].path).toBe('/agents/ops/overview')
     expect(list.find((s) => s.label === 'Configuration')?.path).toBe('/agents/ops/config')
+    expect(list.find((s) => s.label === 'Outside people')).toBeUndefined()
     expect(list.find((s) => s.label === 'Conversations')?.group).toBe('Monitoring')
   })
 })

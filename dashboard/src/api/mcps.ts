@@ -111,6 +111,13 @@ export interface McpServer {
   // false = operator-owned compose sibling (core file-tools on containerized
   // installs) — no status pill, no start/stop/restart controls.
   docker_managed?: boolean
+  // A Docker tool's container that never sleeps: its manifest says so, or
+  // an admin keeps it running; and why its last start at a use failed.
+  docker_always_on?: boolean
+  docker_keep_running?: boolean
+  docker_wake_error?: string
+  /** It says it is working, so it stays awake this many more minutes at most (0: not held). */
+  docker_working_minutes?: number
   agents: string[]
   credential_fields?: { key: string; label: string; input_type: string }[]
   server_config_fields?: { key: string; label: string; input_type: string }[]
@@ -145,6 +152,8 @@ export interface McpServer {
   // Internal-network access (homelab MCPs declaring network_targets). When on,
   // the agent sandbox carves egress to the MCP's configured target host.
   has_network_targets?: boolean
+  // The platform browser: its container's own local network, closed by default.
+  has_network_exit?: boolean
   network_access?: boolean
   // Generic tool filter. Dashboard renders the
   // regex field when `tool_filter_supported` is true; greys out with a
@@ -260,6 +269,20 @@ export function useSetNetworkAccess() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled }),
       }).catch(withMessage('Failed to save network access'))
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
+  })
+}
+
+export function useSetKeepRunning() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ name, keep }: { name: string; keep: boolean }) => {
+      await apiOk(`/v1/admin/mcps/${name}/docker/keep-running`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keep }),
+      }).catch(withMessage('Failed to save keep running'))
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -778,8 +801,8 @@ export interface AgentMcp {
   icon?: boolean
   assignment_mode: 'auto' | 'explicit' | 'platform'
   credential_type: string
-  /** Manifest declares a service account — the binding dropdown only
-   *  renders (and queries its options) where this is true. */
+  /** Manifest declares a service account: the agent's accounts on Agent
+   *  Settings, MCPs render (and query their options) only where this is true. */
   has_service_account: boolean
   enabled: boolean
   authorized_by: 'auto' | 'admin'

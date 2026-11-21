@@ -8,6 +8,7 @@ on-disk layout — including the OS-aware bits (Windows uses
 `~/.oto-dock/...venv/bin/<bin>`).
 """
 
+import re
 from unittest.mock import patch
 
 SAT_PORT = 49152  # arbitrary tunnel port for tests
@@ -95,6 +96,26 @@ class TestRewriteMcpJson:
         cfg = {"mcpServers": {"linear": {"url": "https://mcp.linear.app/mcp"}}}
         result = _rewrite_mcp_json_for_remote(cfg, SAT_PORT, session_id="sess-xyz")
         assert "session_id" not in result["mcpServers"]["linear"]["url"]
+
+    def test_a_tools_call_limit_reaches_the_machine(self):
+        """Claude Code's per-server ``timeout`` rides to the machine on every
+        kind of entry: a Docker tool's tunneled one, a credential gateway's,
+        a vendor's and a program's (the satellite writes the config as given)."""
+        from core.remote.remote_execution import _rewrite_mcp_json_for_remote
+
+        cfg = {"mcpServers": {
+            "file-tools": {"type": "http", "url": "http://localhost:8932/mcp/", "timeout": 660_000},
+            "vendor": {"type": "http", "url": "http://127.0.0.1:8400/v1/mcp-gateway/vendor/mcp/",
+                       "headers": {"Authorization": "Bearer x"}, "timeout": 900_000},
+            "linear": {"type": "http", "url": "https://mcp.linear.app/mcp", "timeout": 600_000},
+            "media": {"type": "stdio", "command": "/opt/mcps/media/venv/bin/python",
+                      "args": ["server.py"], "timeout": 3_660_000},
+        }}
+        gateway = {"vendor": {"path": "/mcp/"}}
+        result = _rewrite_mcp_json_for_remote(cfg, SAT_PORT, session_id="sess-xyz", gateway=gateway)
+        assert {k: v["timeout"] for k, v in result["mcpServers"].items()} == {
+            "file-tools": 660_000, "vendor": 900_000, "linear": 600_000, "media": 3_660_000}
+        assert result["mcpServers"]["vendor"]["url"].startswith(f"http://127.0.0.1:{SAT_PORT}/")
 
 
 class TestStripExcludedTomlSections:
@@ -276,28 +297,29 @@ class TestRewriteMcpToml:
         assert ".oto-dock" not in result
         assert "mcps/custom/schedules-mcp" not in result
 
-    def test_toml_rewrite_name_differs_from_dir(self):
-        """workspace-mcp dir / google-workspace manifest name → the satellite
-        path must use the manifest NAME (google-workspace)."""
+    def test_toml_rewrite_name_differs_from_dir(self, monkeypatch):
+        """workspace-mcp folder / google-workspace manifest name: the satellite
+        path uses the FOLDER, the key the machine installs the tool under
+        (``machine_tools.key_of``). The resolver runs for real."""
+        from types import SimpleNamespace
+
         import config as app_config
         from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
+        from services.mcp import mcp_manifest_store
 
         plat = str(app_config.MCPS_DIR.resolve())
+        manifest = SimpleNamespace(name="google-workspace", server_name="", category="community",
+                                   mcp_dir=app_config.MCPS_DIR / "community" / "workspace-mcp")
+        monkeypatch.setattr(mcp_manifest_store, "_manifests", {"google-workspace": manifest})
         toml = (
             '[mcp_servers.google-workspace]\n'
             f'command = "{plat}/community/workspace-mcp/venv/bin/python"\n'
             f'args = ["{plat}/community/workspace-mcp/main.py"]\n'
         )
-        with patch(
-            "core.remote.remote_mcp_rewrite._resolve_satellite_mcp_path_info",
-            return_value=(
-                "community", "google-workspace",
-                f"{plat}/community/workspace-mcp", None,
-            ),
-        ):
-            result = _rewrite_mcp_toml_for_remote(toml, SAT_PORT)
-        assert "~/.oto-dock/mcps/community/google-workspace/venv/bin/python" in result
-        assert "mcps/community/workspace-mcp" not in result
+        result = _rewrite_mcp_toml_for_remote(toml, SAT_PORT)
+        assert "~/.oto-dock/mcps/community/workspace-mcp/venv/bin/python" in result
+        assert "~/.oto-dock/mcps/community/workspace-mcp/main.py" in result
+        assert "google-workspace/" not in result
 
     def test_toml_rewrite_preserves_http_headers_block(self):
         """A bearer MCP's ``http_headers`` sub-table must survive the rewrite
@@ -425,30 +447,29 @@ class TestRewriteStdioPaths:
         # Non-path args pass through untouched.
         assert args == ["--single-user", "--transport", "stdio"]
 
-    def test_manifest_name_differs_from_platform_dir_name(self):
-        """Real-world bug: workspace-mcp dir / google-workspace manifest name.
+    def test_manifest_name_differs_from_platform_dir_name(self, monkeypatch):
+        """workspace-mcp folder / google-workspace manifest name, on a Windows
+        satellite: the folder comes from the resolver (never a name passed in),
+        the exact-prefix swap keeps it, and the venv turns into Scripts/.exe."""
+        from types import SimpleNamespace
 
-        Caught in prod on a Windows satellite — the regex-based variant of
-        the rewriter (which assumed the dir segment was the manifest name)
-        silently left the Linux platform path in the shipped MCP config,
-        causing the CLI to fail to spawn the MCP. The exact-prefix substitution
-        with ``platform_dir`` fixes this.
-        """
         import config as app_config
         from core.remote.remote_execution import _rewrite_stdio_paths
+        from core.remote.remote_mcp_rewrite import _resolve_satellite_mcp_path_info
+        from services.mcp import mcp_manifest_store
 
         plat = str(app_config.MCPS_DIR.resolve())
+        manifest = SimpleNamespace(name="google-workspace", server_name="", category="community",
+                                   mcp_dir=app_config.MCPS_DIR / "community" / "workspace-mcp")
+        monkeypatch.setattr(mcp_manifest_store, "_manifests", {"google-workspace": manifest})
+        cat, sat_name, platform_dir, _ = _resolve_satellite_mcp_path_info("google-workspace")
         cmd, args = _rewrite_stdio_paths(
             f"{plat}/community/workspace-mcp/venv/bin/workspace-mcp",
             ["--single-user", "--transport", "stdio"],
-            mcp_name="google-workspace",  # manifest name
-            satellite_category="community",
-            platform_dir=f"{plat}/community/workspace-mcp",  # dir name
-            target_os="windows",
+            mcp_name=sat_name, satellite_category=cat, platform_dir=platform_dir, target_os="windows",
         )
-        # Both segments swapped correctly: dir → name; bin → Scripts/.exe.
         assert cmd == (
-            "~/OtoDock/mcps/community/google-workspace/venv/Scripts/workspace-mcp.exe"
+            "~/OtoDock/mcps/community/workspace-mcp/venv/Scripts/workspace-mcp.exe"
         )
         assert args == ["--single-user", "--transport", "stdio"]
 
@@ -508,3 +529,143 @@ class TestRewriteEnv:
         assert result["PROXY_URL"] == f"http://127.0.0.1:{SAT_PORT}"
         assert result["API_KEY"] == "secret"
         assert result["HOME"] == "/home/user"
+
+
+def test_a_server_name_alias_is_found_in_the_store_after_a_scan(monkeypatch, tmp_path):
+    """The fallback reads the store at call time: a scan rebinds ``_manifests``,
+    so a copy on the registry facade would keep the first (empty) table."""
+    from types import SimpleNamespace
+
+    from core.remote.remote_mcp_rewrite import _resolve_satellite_mcp_path_info
+    from services.mcp import mcp_manifest_store
+
+    manifest = SimpleNamespace(name="camoufox", server_name="playwright", category="browsers",
+                               mcp_dir=tmp_path / "camoufox")
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {"camoufox": manifest})
+    category, sat_name, platform_dir, _ = _resolve_satellite_mcp_path_info("playwright")
+    assert (category, sat_name, platform_dir) == ("browsers", "camoufox", str((tmp_path / "camoufox").resolve()))
+
+
+# ---------------------------------------------------------------------------
+# A machine's tool folder: the start command and the install agree
+# ---------------------------------------------------------------------------
+
+_MCPS_PATH_RE = re.compile(r'mcps/(core|custom|community|skills)/([^/"]+)/')
+
+
+def _shipped_machine_tools():
+    """Every shipped manifest whose server a machine installs and starts
+    (``installs_on_host``, stdio): the program a paired computer runs."""
+    from services.mcp import mcp_manifest_types as mt, mcp_registry
+    from tests._paths import REPO_ROOT
+
+    out = []
+    for group in ("core", "custom", "community"):
+        for path in sorted((REPO_ROOT / "mcps" / group).glob("*/manifest.json")):
+            manifest = mcp_registry._parse_manifest(path)
+            if manifest is not None and mt.installs_on_host(manifest.server) and manifest.server.transport == "stdio":
+                out.append(manifest)
+    return out
+
+
+def _folders(text: str) -> set[tuple[str, str]]:
+    return {(m.group(1), m.group(2)) for m in _MCPS_PATH_RE.finditer(text)}
+
+
+def _platform_entry(manifest):
+    """The platform's start command of ``manifest`` as a session's config
+    carries it (``resolve_server_config``)."""
+    from services.mcp import mcp_server_resolve
+    return mcp_server_resolve.resolve_server_config(manifest, "agent", mcp_config_format="json", session_ctx={})
+
+
+def test_every_machine_tool_starts_from_the_folder_it_is_installed_under(monkeypatch):
+    """The guard of the fault 61cec048d brought: the satellite installs a tool
+    under ``mcp_sync._install_spec(...)["name"]`` and the session's start
+    command, rewritten for the machine, must name that same folder, in the
+    JSON rewrite (Claude Code) and its TOML twin (Codex), on Linux and Windows."""
+    import json
+    from types import SimpleNamespace
+
+    import config as app_config
+    from core.remote.remote_execution import (
+        _rewrite_mcp_json_for_remote,
+        _rewrite_mcp_toml_for_remote,
+    )
+    from services.mcp import mcp_manifest_store, mcp_server_resolve, mcp_sync
+
+    shipped = _shipped_machine_tools()
+    assert len(shipped) >= 5
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {m.name: m for m in shipped})
+    monkeypatch.setattr(mcp_server_resolve.mcp_store, "get_mcp_config_values", lambda name: {})
+    monkeypatch.setattr(app_config, "MCPS_DIR", shipped[0].mcp_dir.parent.parent)
+    tb = SimpleNamespace(tarball_b64="", version_hash="")
+    checked = 0
+    for manifest in shipped:
+        key = mcp_sync._install_spec(manifest.name, manifest, tb)["name"]
+        want = {(manifest.category, key)}
+        slug = manifest.server_name or manifest.name
+        entry = _platform_entry(manifest)
+        for target in ("linux", "windows"):
+            out = _rewrite_mcp_json_for_remote({"mcpServers": {slug: dict(entry)}}, SAT_PORT, target_os=target)
+            got = _folders(json.dumps(out["mcpServers"][slug].get("command", "")) + json.dumps(
+                out["mcpServers"][slug].get("args", [])))
+            if got:
+                assert got == want, (manifest.name, target, got, want)
+                checked += 1
+            toml = (f'[mcp_servers.{slug}]\ncommand = {json.dumps(entry.get("command", ""))}\n'
+                    f'args = {json.dumps(entry.get("args", []))}\n')
+            got = _folders(_rewrite_mcp_toml_for_remote(toml, SAT_PORT, target_os=target))
+            if got:
+                assert got == want, (manifest.name, target, "toml", got, want)
+    assert checked >= len(shipped)  # every tool's command or args named its folder
+
+
+def test_computer_control_starts_from_its_folder_not_its_name(monkeypatch):
+    """The tool whose folder (computer-mcp) is not its name (computer-control)
+    and whose server name is a third word (computer)."""
+    import json
+
+    import config as app_config
+    from core.remote.remote_execution import (
+        _rewrite_mcp_json_for_remote,
+        _rewrite_mcp_toml_for_remote,
+    )
+    from services.mcp import mcp_manifest_store, mcp_server_resolve
+
+    manifest = next(m for m in _shipped_machine_tools() if m.mcp_dir.name == "computer-mcp")
+    assert (manifest.name, manifest.server_name) == ("computer-control", "computer")
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {manifest.name: manifest})
+    monkeypatch.setattr(mcp_server_resolve.mcp_store, "get_mcp_config_values", lambda name: {})
+    monkeypatch.setattr(app_config, "MCPS_DIR", manifest.mcp_dir.parent.parent)
+    entry = _platform_entry(manifest)
+    out = _rewrite_mcp_json_for_remote({"mcpServers": {"computer": dict(entry)}}, SAT_PORT)
+    assert out["mcpServers"]["computer"]["command"] == "~/.oto-dock/mcps/custom/computer-mcp/venv/bin/python"
+    assert out["mcpServers"]["computer"]["args"] == ["~/.oto-dock/mcps/custom/computer-mcp/server.py"]
+    toml = (f'[mcp_servers.computer]\ncommand = {json.dumps(entry["command"])}\n'
+            f'args = {json.dumps(entry["args"])}\n')
+    rewritten = _rewrite_mcp_toml_for_remote(toml, SAT_PORT, target_os="windows")
+    assert "~/OtoDock/mcps/custom/computer-mcp/venv/Scripts/python.exe" in rewritten
+    assert "computer-control" not in rewritten
+
+
+def test_a_machine_holding_the_old_name_keyed_folder_gets_the_tool_under_its_folder(monkeypatch):
+    """A machine paired before tools were keyed by folder still holds
+    ``custom/computer-control``. That folder is not the tool's own: the
+    sync installs the tool under ``computer-mcp``, where its start command
+    points, and the old folder is never named for removal (removing by the
+    tool's name would take its new folder)."""
+    from types import SimpleNamespace
+
+    from services.mcp import mcp_registry, mcp_sync
+
+    manifest = next(m for m in _shipped_machine_tools() if m.mcp_dir.name == "computer-mcp")
+    other = SimpleNamespace(name="memory-mcp", category="core", mcp_dir=manifest.mcp_dir.parent / "memory-mcp")
+    monkeypatch.setattr(mcp_registry, "get_all_manifests", lambda: {manifest.name: manifest, "memory-mcp": other})
+    monkeypatch.setattr(mcp_registry, "get_manifest", {manifest.name: manifest, "memory-mcp": other}.get)
+    held = {"version_hash": "h", "healthy": True, "category": "custom"}
+    only_old = mcp_sync._named({"computer-control": dict(held), "memory-mcp": dict(held)})
+    assert "computer-control" not in only_old and "memory-mcp" in only_old
+    both = mcp_sync._named({"computer-control": {**held, "version_hash": "old"}, "computer-mcp": dict(held)})
+    assert both == {"computer-control": held}
+    assert "computer-control" not in mcp_sync._gone(only_old)

@@ -8,7 +8,9 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -17,6 +19,7 @@ from cryptography.fernet import InvalidToken
 # The placement vocabulary (the stored target value, the resolved kind, the
 # pairing scope) and the descriptor this store builds from a machine row.
 from core import placement
+from services.scheduler import task_kinds
 from storage.pg import get_conn
 from ws import wire_events as wire
 
@@ -57,8 +60,13 @@ _SECRET_COLUMNS = (
 
 
 def _strip_secret_columns(row: dict) -> dict:
+    """A row as callers may hold it: no credential column, and ``""`` for a
+    machine nobody owns (a compute machine's NULL ``registered_by``), so no
+    reader ever slices a None. Every row reader passes through here."""
     for col in _SECRET_COLUMNS:
         row.pop(col, None)
+    if "registered_by" in row and row["registered_by"] is None:
+        row["registered_by"] = ""
     return row
 
 
@@ -66,14 +74,37 @@ def _strip_secret_columns(row: dict) -> dict:
 # Machine CRUD
 # ---------------------------------------------------------------------------
 
+#: The words a person reads when a compute machine is refused something.
+COMPUTE_SETTING_REFUSED = "This setting is not used on compute machines."
+COMPUTE_PLACE_REFUSED = "Compute machines cannot run chats yet."
+
+
+class ComputeMachineRefused(ValueError):
+    """A write a compute machine does not take: a machine's own setting, an
+    update, an agent's default place or a person's own. The message is the
+    sentence the person reads; ``app.py`` answers it 400."""
+
+
+def _refuse_compute(conn, machine_id: str, sentence: str = COMPUTE_SETTING_REFUSED) -> None:
+    """Raise ``ComputeMachineRefused`` when ``machine_id`` is a compute
+    machine. Every settings writer asks first, so no route reaches a compute
+    row's settings, the ``users/me`` ones an admin passes included."""
+    row = conn.execute(
+        "SELECT pairing_scope FROM remote_machines WHERE id = %s", (machine_id,)
+    ).fetchone()
+    if row and placement.machine_is_compute(dict(row)):
+        raise ComputeMachineRefused(sentence)
+
+
 def create_remote_machine(
     machine_id: str,
     name: str,
-    registered_by: str,
+    registered_by: str | None,
     pairing_scope: str = "admin",
     allow_full_fs: bool = False,
+    paired: bool | None = None,
 ) -> dict:
-    """Create a machine record and generate a one-time pairing token.
+    """Create a machine record with a one-time pairing token.
 
     ``pairing_scope`` distinguishes how the row was created:
       * ``"admin"`` (default) — paired via ``/v1/admin/remote-machines/pair``.
@@ -82,19 +113,33 @@ def create_remote_machine(
       * ``"user"`` — paired via ``/v1/users/me/remote-machines/pair``.
         Personal machine: only the owner's user-scope chats/tasks run
         there; only the owner can delete it.
+      * ``"compute"`` — the platform's own machine. Nobody owns it
+        (``registered_by`` is NULL whatever is passed) and it never takes the
+        satellite's code from the platform (``auto_update_enabled`` off).
+        Added by an admin for another server (``/v1/admin/remote-machines/
+        compute``), it gets a pairing token like a paired machine; the
+        install's own (``compute_bootstrap``) gets none, its credential is
+        minted by the install. Refused everywhere until the platform serves
+        compute machines.
+
+    ``paired``: whether the row gets a pairing token; every paired machine
+    does, a compute machine only when asked.
 
     ``allow_full_fs`` (per-machine FS policy): caller-decided
     default. Both admin- and user-pairing flows default to False;
-    the flag is enabled only by an explicit opt-in.
+    the flag is enabled only by an explicit opt-in. Never on a compute row.
 
-    Returns the machine dict with ``pairing_token`` (plaintext, not stored).
+    Returns the machine dict with ``pairing_token`` (plaintext, not stored)
+    when one was minted.
     """
-    if pairing_scope not in placement.PAIRING_SCOPES:
+    compute = pairing_scope == placement.PAIRING_COMPUTE
+    if pairing_scope not in placement.MACHINE_SCOPES:
         raise ValueError(f"invalid pairing_scope: {pairing_scope!r}")
-
+    if not compute and not registered_by:
+        raise ValueError("a paired machine needs the person who paired it")
+    paired = (not compute) if paired is None else paired
     now = _now()
-    token = secrets.token_urlsafe(32)
-    token_hash = _sha256(token)
+    token, token_hash, token_at = _new_pairing_token() if paired else (None, None, None)
 
     with get_conn() as conn:
         # Check name uniqueness
@@ -103,15 +148,14 @@ def create_remote_machine(
         ).fetchone()
         if existing:
             raise ValueError(f"Machine name already in use: {name}")
-
         conn.execute(
             """INSERT INTO remote_machines
                (id, name, status, registered_by, pairing_scope,
                 pairing_token_hash, pairing_token_created_at, capabilities,
-                allow_full_fs, created_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, '{}', %s, %s)""",
-            (machine_id, name, STATUS_OFFLINE, registered_by, pairing_scope,
-             token_hash, now, bool(allow_full_fs), now),
+                allow_full_fs, auto_update_enabled, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, '{}', %s, %s, %s)""",
+            (machine_id, name, STATUS_OFFLINE, None if compute else registered_by, pairing_scope,
+             token_hash, token_at, bool(allow_full_fs) and not compute, not compute, now),
         )
         conn.commit()
         row = conn.execute(
@@ -119,8 +163,94 @@ def create_remote_machine(
         ).fetchone()
         result = _strip_secret_columns(dict(row))
 
-    result["pairing_token"] = token
+    if token:
+        result["pairing_token"] = token
     return result
+
+
+def _new_pairing_token() -> tuple[str, str, str]:
+    """A one-time pairing token, its stored hash and its time: the one maker."""
+    token = secrets.token_urlsafe(32)
+    return token, _sha256(token), _now()
+
+
+def mint_pairing_token(machine_id: str) -> str:
+    """A new one-time pairing token for an existing compute machine on
+    another server (its "Pair again"), the old one replaced: the machine's
+    current secret keeps working until the token is exchanged. Refused for
+    any other row: a paired machine is paired again by a new pairing."""
+    token, token_hash, token_at = _new_pairing_token()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE remote_machines SET pairing_token_hash = %s, pairing_token_created_at = %s "
+            "WHERE id = %s AND pairing_scope = %s",
+            (token_hash, token_at, machine_id, placement.PAIRING_COMPUTE),
+        )
+        conn.commit()
+    if cur.rowcount != 1:
+        raise ValueError("Machine not found")
+    return token
+
+
+def pairing_row(pairing_token: str) -> dict | None:
+    """The row a pairing token names (``id``, ``pairing_scope``, whether the
+    token ``expired``), None for no row: read, never consumed."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, pairing_scope, pairing_token_created_at FROM remote_machines "
+            "WHERE pairing_token_hash = %s",
+            (_sha256(pairing_token),),
+        ).fetchone()
+    if not row:
+        return None
+    created = datetime.fromisoformat(row["pairing_token_created_at"])
+    return {"id": row["id"], "pairing_scope": row["pairing_scope"],
+            "expired": datetime.now(timezone.utc) - created > timedelta(hours=PAIRING_TOKEN_EXPIRY_HOURS)}
+
+
+def compute_addresses() -> list[str]:
+    """The addresses the compute machines on other servers last signed in from."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT compute_address FROM remote_machines WHERE compute_address <> ''"
+        ).fetchall()
+    return [r["compute_address"] for r in rows]
+
+
+def set_chat_compute_machine(chat_id: str, machine_id: str) -> None:
+    """Record the compute machine on another host a chat's engine session
+    started on (``placement.compute_own_copy``), or ``""`` for a session
+    that started anywhere else: the chat stays where the engine's record
+    lives (``remote_status.chat_place``). A no-op when it is already
+    recorded."""
+    if not chat_id:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE chats SET compute_machine = %s WHERE id = %s AND compute_machine <> %s",
+            (machine_id, chat_id, machine_id),
+        )
+        conn.commit()
+
+
+def mint_compute_secret(machine_id: str) -> str:
+    """Mint the credential a compute machine signs in with, the one writer
+    of its secret hash: a new 48-byte secret, hashed as a paired machine's
+    is, replacing any earlier one (the old process cannot sign in again).
+    Refused for a row that is not a compute machine's, and for no row."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, pairing_scope FROM remote_machines WHERE id = %s", (machine_id,),
+        ).fetchone()
+        if not row or not placement.machine_is_compute(dict(row)):
+            raise ValueError("Only a compute machine takes a minted credential.")
+        secret = secrets.token_urlsafe(48)
+        conn.execute(
+            "UPDATE remote_machines SET machine_secret_hash = %s WHERE id = %s",
+            (_sha256(secret), machine_id),
+        )
+        conn.commit()
+    return secret
 
 
 def get_remote_machine(machine_id: str) -> dict | None:
@@ -146,7 +276,7 @@ def get_remote_machine(machine_id: str) -> dict | None:
 
 
 def placement_of(
-    target: str, user_sub: str | None, agent_slug: str,
+    target: str, user_sub: str | None, agent_slug: str, *, compute: dict | None = None,
 ) -> placement.PlacementCapabilities:
     """The resolved placement of one session — the ONE builder the session
     builders call, once, from what ``resolve_execution_target`` (or a
@@ -157,15 +287,27 @@ def placement_of(
     registration; see ``core.placement``); the user-paired kind for a
     person's own machine, and for an admin machine the person's
     ``user_remote_targets`` row names for this agent (the dual-scope flow),
-    else the agent-level default (admin-paired); the machine row read once
-    and its facts parsed by ``placement.from_machine`` (a missing row: the
-    kind with every fact empty — the path gate fail-closes).
+    else the agent-level default (admin-paired); a compute machine's row its
+    own kind; the machine row read once and its facts parsed by
+    ``placement.from_machine`` (a missing row: the kind with every fact
+    empty — the path gate fail-closes). ``compute`` is the compute machine
+    that serves the platform's place now (``remote_status.serving_compute_machine``,
+    which the builders read once): a ``local`` target then answers that
+    machine's compute placement, and a sentinel still answers local.
     """
-    if placement.is_local(target) or placement.is_offline_sentinel(target):
+    if placement.is_offline_sentinel(target):
+        return placement.LOCAL_PLACEMENT
+    if placement.is_local(target):
+        if compute and placement.machine_is_compute(compute):
+            return placement.from_machine(placement.KIND_COMPUTE, compute)
         return placement.LOCAL_PLACEMENT
     machine = get_remote_machine(target)
     kind = placement.KIND_ADMIN_REMOTE
-    if machine and not placement.machine_is_admin_paired(machine):
+    if placement.machine_is_compute(machine):
+        # Never reached while a compute machine is refused everywhere: its
+        # kind is ready for when one is served.
+        kind = placement.KIND_COMPUTE
+    elif machine and not placement.machine_is_admin_paired(machine):
         # A person's own machine is user-remote whatever pinned the chat
         # there (their default, or a move to it).
         kind = placement.KIND_USER_REMOTE
@@ -174,6 +316,16 @@ def placement_of(
         if ut and ut.get("machine_id") == target:
             kind = placement.KIND_USER_REMOTE
     return placement.from_machine(kind, machine)
+
+
+def list_compute_machines() -> list[dict]:
+    """Every compute machine row, oldest first, secret columns stripped."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM remote_machines WHERE pairing_scope = %s ORDER BY created_at",
+            (placement.PAIRING_COMPUTE,),
+        ).fetchall()
+    return [_strip_secret_columns(dict(r)) for r in rows]
 
 
 def get_all_remote_machines() -> list[dict]:
@@ -284,6 +436,7 @@ def set_allow_full_fs(machine_id: str, enabled: bool) -> None:
     Settings → Remote machines for their own paired machines.
     """
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id)
         conn.execute(
             "UPDATE remote_machines SET allow_full_fs = %s WHERE id = %s",
             (bool(enabled), machine_id),
@@ -302,6 +455,7 @@ def set_remote_machine_max_sessions(machine_id: str, value: int | None) -> None:
     ``SatelliteConnectionManager.machine_at_capacity``. No push is needed.
     """
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id)
         conn.execute(
             "UPDATE remote_machines SET max_sessions = %s WHERE id = %s",
             (int(value) if value is not None else None, machine_id),
@@ -323,6 +477,7 @@ def set_device_grants(machine_id: str, grants: list[str]) -> None:
     """
     cleaned = sorted({str(g) for g in (grants or [])})
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id)
         if "browser" in cleaned:
             conn.execute(
                 "UPDATE remote_machines SET device_grants = %s WHERE id = %s",
@@ -382,6 +537,7 @@ def set_browser_mode(machine_id: str, mode: str) -> None:
     if mode not in BROWSER_MODES:
         raise ValueError(f"unknown browser mode {mode!r}")
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id)
         conn.execute(
             "UPDATE remote_machines SET browser_mode = %s WHERE id = %s",
             (mode, machine_id),
@@ -397,6 +553,7 @@ def set_browser_extension_token(machine_id: str, token: str | None) -> None:
     from storage.identity import credential_store
     enc = credential_store.encrypt_secret(token) if token else None
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id)
         if enc is None:
             conn.execute(
                 "UPDATE remote_machines SET browser_extension_token_enc = NULL, "
@@ -416,6 +573,7 @@ def set_browser_profile(machine_id: str, profile: str) -> None:
     """The machine's ``Browser profile`` (the endpoint trims and checks it;
     "" clears it)."""
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id)
         conn.execute(
             "UPDATE remote_machines SET browser_profile = %s WHERE id = %s",
             (profile, machine_id),
@@ -426,6 +584,7 @@ def set_browser_profile(machine_id: str, profile: str) -> None:
 def set_browser_unattended(machine_id: str, enabled: bool) -> None:
     """Whether unattended sessions get the machine's own-browser token."""
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id)
         conn.execute(
             "UPDATE remote_machines SET browser_unattended = %s WHERE id = %s",
             (bool(enabled), machine_id),
@@ -437,6 +596,7 @@ def set_all_roles_run_here(machine_id: str, enabled: bool) -> None:
     """An admin machine's "Every role of its agents runs here"
     (``placement.admits_every_role``)."""
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id)
         conn.execute(
             "UPDATE remote_machines SET all_roles_run_here = %s WHERE id = %s",
             (bool(enabled), machine_id),
@@ -447,13 +607,14 @@ def set_all_roles_run_here(machine_id: str, enabled: bool) -> None:
 def get_target_browser_settings(target: placement.PlacementCapabilities) -> BrowserTargetSettings:
     """Browser-control mode + decrypted extension token for a remote target,
     with the machine's owner and its ``Browser profile``. Dedicated (no
-    token) for a local placement, an unknown machine, or one on the
+    token) for a placement that offers no device tool (the platform's own
+    places), an unknown machine, or one on the
     dedicated profile — the token is decrypted only when the mode is
     ``own``, through this targeted SELECT (the column never rides a machine
     row, and never the placement the session persists; see
     ``_SECRET_COLUMNS``). A decrypt failure (key mismatch) is logged and
     degrades to "no token" — the session then asks in the browser."""
-    if not target.is_remote or not target.machine_id:
+    if not target.offers_device_tools or not target.machine_id:
         return BrowserTargetSettings()
     with get_conn() as conn:
         row = conn.execute(
@@ -495,6 +656,7 @@ def set_auto_update_enabled(machine_id: str, enabled: bool) -> None:
     tarball; an admin must click "Update now" to trigger the push.
     """
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id)
         conn.execute(
             "UPDATE remote_machines SET auto_update_enabled = %s WHERE id = %s",
             (enabled, machine_id),
@@ -579,6 +741,7 @@ def set_pending_update(machine_id: str, pending: bool) -> None:
     when the machine is currently offline; cleared on successful update.
     """
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id)
         conn.execute(
             "UPDATE remote_machines SET pending_update = %s WHERE id = %s",
             (pending, machine_id),
@@ -625,26 +788,38 @@ def clear_user_remote_targets_for_machine(machine_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 PAIRING_TOKEN_EXPIRY_HOURS = 1
+#: The SHA-256 a compute machine on another server sends of the secret it made.
+_SECRET_HASH = re.compile(r"[0-9a-fA-F]{64}")
 
 
 def exchange_pairing_token(
     machine_id: str,
     pairing_token: str,
+    *,
+    secret_hash: str = "",
+    address: str = "",
 ) -> str:
     """Exchange a pairing token for a machine secret.
 
     Validates the token hash and expiry, then:
     - Clears the pairing token (one-time use)
-    - Generates and stores a machine secret hash
-    - Returns the plaintext secret
+    - Stores the machine secret's hash: one generated here and returned in
+      plaintext, or, for a compute machine on another server, the hash of
+      the secret that machine made itself (``secret_hash``; ``""`` returned)
+    - For that compute machine, records the ``address`` it paired from and
+      turns its address lock off (a new pairing is a new proof)
 
-    Raises ValueError on invalid/expired token.
+    Raises ValueError on an invalid or expired token, or a hash or an
+    address given for any other row.
     """
     token_hash = _sha256(pairing_token)
+    if secret_hash and not _SECRET_HASH.fullmatch(secret_hash):
+        raise ValueError("Invalid secret hash")
 
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT pairing_token_hash, pairing_token_created_at FROM remote_machines WHERE id = %s",
+            "SELECT pairing_token_hash, pairing_token_created_at, pairing_scope "
+            "FROM remote_machines WHERE id = %s",
             (machine_id,),
         ).fetchone()
         if not row:
@@ -658,10 +833,12 @@ def exchange_pairing_token(
         created_at = datetime.fromisoformat(row["pairing_token_created_at"])
         if datetime.now(timezone.utc) - created_at > timedelta(hours=PAIRING_TOKEN_EXPIRY_HOURS):
             raise ValueError("Pairing token expired")
+        compute = row["pairing_scope"] == placement.PAIRING_COMPUTE
+        if compute != bool(secret_hash) or compute != bool(address):
+            raise ValueError("This pairing token is for another kind of machine")
 
-        # Generate machine secret
-        machine_secret = secrets.token_urlsafe(48)
-        secret_hash = _sha256(machine_secret)
+        machine_secret = "" if compute else secrets.token_urlsafe(48)
+        stored = secret_hash.lower() if compute else _sha256(machine_secret)
 
         # Conditional on the hash still being present: two racing exchanges
         # (a token thief vs the legitimate installer) must produce ONE winner
@@ -669,9 +846,11 @@ def exchange_pairing_token(
         # would let the loser silently overwrite the winner's secret.
         cur = conn.execute(
             "UPDATE remote_machines SET pairing_token_hash = NULL, "
-            "pairing_token_created_at = NULL, machine_secret_hash = %s "
+            "pairing_token_created_at = NULL, machine_secret_hash = %s, "
+            "compute_address = CASE WHEN pairing_scope = %s THEN %s ELSE compute_address END, "
+            "compute_address_locked = compute_address_locked AND pairing_scope <> %s "
             "WHERE id = %s AND pairing_token_hash = %s",
-            (secret_hash, machine_id, token_hash),
+            (stored, placement.PAIRING_COMPUTE, address, placement.PAIRING_COMPUTE, machine_id, token_hash),
         )
         conn.commit()
         if cur.rowcount != 1:
@@ -772,6 +951,18 @@ def delete_remote_machine(machine_id: str) -> bool:
                 WHERE execution_target = %s""",
             (f"machine_removed:{machine_name}", machine_id),
         )
+        # A compute machine on another host held its chats' engine records in
+        # its own copy (their pin stays 'local'): they continue elsewhere
+        # with the digest, as a pinned chat does.
+        conn.execute(
+            """UPDATE chats
+                  SET compute_machine = '', session_id = NULL,
+                      codex_thread_id = NULL, last_turn_aborted = FALSE,
+                      last_abort_graceful = FALSE, context_used = 0,
+                      pending_history_seed = %s
+                WHERE compute_machine = %s""",
+            (f"machine_removed:{machine_name}", machine_id),
+        )
         # Reset agents that default to this machine
         conn.execute(
             "UPDATE agents SET execution_target = 'local' WHERE execution_target = %s",
@@ -823,8 +1014,9 @@ def rebind_chat_with_files(chat_id: str, target: str, *, expect_target: str,
                            expect_session_id: str | None, expect_thread: str | None) -> bool:
     """The move WITH the session files: the chat's place becomes ``target``
     and it keeps its ids and its context fill (the engine's files are there
-    now, so the next turn resumes the same session); any pending seed goes."""
-    return _rebind(chat_id, "execution_target = %s, pending_history_seed = ''", (target,),
+    now, so the next turn resumes the same session); any pending seed goes,
+    and so does a compute machine named as its record's (it moved)."""
+    return _rebind(chat_id, "execution_target = %s, pending_history_seed = '', compute_machine = ''", (target,),
                    expect_target=expect_target, expect_session_id=expect_session_id,
                    expect_thread=expect_thread)
 
@@ -841,7 +1033,7 @@ def rebind_chat_to_target(chat_id: str, target: str, move_id: str, *, expect_tar
         chat_id,
         """execution_target = %s, session_id = NULL, codex_thread_id = NULL,
            last_turn_aborted = FALSE, last_abort_graceful = FALSE,
-           context_used = 0, pending_history_seed = %s""",
+           context_used = 0, pending_history_seed = %s, compute_machine = ''""",
         (target, f"moved:{move_id}"),
         expect_target=expect_target, expect_session_id=expect_session_id,
         expect_thread=expect_thread,
@@ -921,6 +1113,51 @@ def tool_moves_since_person(chat_id: str) -> int:
         return int((row or {}).get("n") or 0)
 
 
+def newest_person_row(chat_id: str) -> int:
+    """The id of the chat's newest message a person wrote (a ``user`` row with
+    an author), 0 for none."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT COALESCE(max(id), 0) AS id FROM chat_messages
+                WHERE chat_id = %s AND role = 'user' AND COALESCE(author_sub, '') <> ''""",
+            (chat_id,),
+        ).fetchone()
+    return int((row or {}).get("id") or 0)
+
+
+def reloads_since_person(chat_id: str) -> int:
+    """The agent's own reloads of the chat (a ``session_reloaded`` line with
+    no ``reason``: one that happened) since a person last wrote."""
+    return sum(1 for block in _events_since_person(chat_id, wire.SYSTEM)
+               if block.get("subtype") == wire.SUBTYPE_SESSION_RELOADED and not block.get("reason"))
+
+
+def resumes_since_person(chat_id: str) -> int:
+    """The turns the platform started by itself after a reload or a usage limit
+    (the reload's wake row; an undelivered one is taken back) since a person last wrote."""
+    return sum(1 for block in _events_since_person(chat_id, wire.PERSISTED_SCHEDULE_WAKE)
+               if block.get("source") == wire.WAKE_SOURCE_RELOAD)
+
+
+def _events_since_person(chat_id: str, event_type: str) -> list[dict]:
+    """The chat's newest 50 event blocks of ``event_type`` since ``newest_person_row``."""
+    since = newest_person_row(chat_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT event_data FROM chat_messages
+                WHERE chat_id = %s AND role = 'event' AND event_type = %s AND id > %s
+                ORDER BY id DESC LIMIT 50""",
+            (chat_id, event_type, since),
+        ).fetchall()
+    blocks = []
+    for row in rows:
+        try:
+            blocks.append(json.loads(row.get("event_data") or "{}"))
+        except ValueError:
+            continue
+    return [block for block in blocks if isinstance(block, dict)]
+
+
 def add_switch_leftover(row: dict) -> None:
     """Record the session files an engine switch left (``row``: the
     ``engine_switch_leftovers`` columns)."""
@@ -979,36 +1216,49 @@ def chat_moves_in(states: tuple[str, ...]) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def session_refs_shared(chat_id: str, refs: list[str]) -> bool:
+#: A task naming one of the ids (``%s``) as its ``continue_session`` that
+#: can still fire by itself, paused or not: a schedule, an interval, a
+#: trigger task, or a one-time task with a time not yet fired. Never a
+#: delegate's row: it fires once, at its creation, and is meant to go with
+#: its run; its round while it runs is the chat's open turn
+#: (``db_tasks.live_delegate_run_ids_for_chat``). A row that stayed behind
+#: no longer counts.
+_TASK_CAN_CONTINUE = f"""SELECT 1 FROM dynamic_tasks
+     WHERE continue_session = ANY(%s) AND task_type <> '{task_kinds.DELEGATE}'
+       AND (COALESCE(schedule, '') <> '' OR interval_seconds IS NOT NULL
+            OR task_type = '{task_kinds.TRIGGER}'
+            OR (NOT fired AND (COALESCE(run_at, '') <> '' OR delay_seconds IS NOT NULL)))"""
+
+
+def session_refs_shared(chat_id: str, refs: list[str], *,
+                        assume_gone: Sequence[str] = ()) -> bool:
     """Whether anything besides the chat ``chat_id`` still names one of
-    ``refs``: another chat row's session or thread id, or a task that
-    continues the session (a delegation's ``continue_session``). Such a
-    session stays where it is: its next round resumes it there."""
+    ``refs``: another chat row's session or thread id, or a task that can
+    still continue the session (``_TASK_CAN_CONTINUE``). Such a session
+    stays where it is: its next round resumes it there. ``assume_gone`` (a
+    retention dry run) counts those chat rows as deleted already."""
     refs = [r for r in refs if r]
     if not refs:
         return False
     with get_conn() as conn:
         row = conn.execute(
-            """SELECT 1 WHERE EXISTS (
+            f"""SELECT 1 WHERE EXISTS (
                    SELECT 1 FROM chats
-                    WHERE id != %s AND (session_id = ANY(%s) OR codex_thread_id = ANY(%s)))
-                OR EXISTS (
-                   SELECT 1 FROM dynamic_tasks WHERE continue_session = ANY(%s))""",
-            (chat_id, refs, refs, refs),
+                    WHERE id != ALL(%s) AND (session_id = ANY(%s) OR codex_thread_id = ANY(%s)))
+                OR EXISTS ({_TASK_CAN_CONTINUE})""",
+            ([chat_id, *assume_gone], refs, refs, refs),
         ).fetchone()
         return row is not None
 
 
-def chat_continued_by_task(chat: dict) -> bool:
-    """Whether a task continues the chat's session (a delegation's
-    ``continue_session`` names its session or thread id)."""
+def task_can_continue(chat: dict) -> bool:
+    """Whether a task can still continue the chat's session by itself
+    (``_TASK_CAN_CONTINUE`` names its session or thread id)."""
     refs = [r for r in (chat.get("session_id"), chat.get("codex_thread_id")) if r]
     if not refs:
         return False
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM dynamic_tasks WHERE continue_session = ANY(%s) LIMIT 1", (refs,),
-        ).fetchone()
+        row = conn.execute(f"{_TASK_CAN_CONTINUE} LIMIT 1", (refs,)).fetchone()
         return row is not None
 
 
@@ -1053,6 +1303,7 @@ def set_agent_remote_target(
     """
     now = _now()
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id, COMPUTE_PLACE_REFUSED)
         # Remove existing targets (v1: one target per agent)
         conn.execute(
             "DELETE FROM agent_remote_targets WHERE agent_slug = %s",
@@ -1138,6 +1389,18 @@ def get_user_remote_target(user_sub: str, agent_slug: str) -> dict | None:
         return dict(row) if row else None
 
 
+def get_user_targets_on_machine(machine_id: str) -> list[tuple[str, str]]:
+    """``(user_sub, agent_slug)`` of every person who chose this machine for
+    an agent (install ahead reads what their sessions there need)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT user_sub, agent_slug FROM user_remote_targets WHERE machine_id = %s "
+            "ORDER BY agent_slug, user_sub",
+            (machine_id,),
+        ).fetchall()
+        return [(r["user_sub"], r["agent_slug"]) for r in rows]
+
+
 def get_user_remote_targets(user_sub: str) -> list[dict]:
     """All targets for a user (for settings page)."""
     with get_conn() as conn:
@@ -1191,6 +1454,7 @@ def set_user_remote_target(
 ) -> None:
     """Set user's remote target (upsert). Validates machine exists."""
     with get_conn() as conn:
+        _refuse_compute(conn, machine_id, COMPUTE_PLACE_REFUSED)
         # Verify machine exists
         machine = conn.execute(
             "SELECT id FROM remote_machines WHERE id = %s", (machine_id,)

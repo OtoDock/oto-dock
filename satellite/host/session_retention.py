@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 from .._vendored import layout
-from ..config import force_rmtree
 from . import safe_fs
 
 _UUID_RE = re.compile(
@@ -188,8 +187,8 @@ def apply(agents_dir: Path, keep: set[str], live: set[str], min_age_s: float,
     ``deleted_bytes`` what went, or what WOULD go on a dry run (which
     removes nothing), ``candidates`` the first paths that go. A delete goes
     beneath the agents root with no component followed
-    (``safe_fs.unlink_beneath``); a sibling folder that is a link is left
-    where it is."""
+    (``safe_fs.unlink_beneath``, ``safe_fs.rmtree_beneath``); a sibling
+    folder that is a link is left where it is."""
     now = time.time() if now is None else now
     stats: dict = {"files": 0, "bytes": 0, "deleted": 0, "deleted_bytes": 0, "candidates": []}
     emptied: set[Path] = set()
@@ -217,9 +216,9 @@ def apply(agents_dir: Path, keep: set[str], live: set[str], min_age_s: float,
             stats["files"] += 1
             stats["bytes"] += st.st_size
             continue
-        if sibling is not None and not safe_fs.is_link_like(sibling):
-            with contextlib.suppress(OSError):
-                force_rmtree(sibling)
+        if sibling is not None:
+            with contextlib.suppress(OSError, ValueError):
+                safe_fs.rmtree_beneath(agents_dir, _rel(agents_dir, sibling))
         stats["deleted"] += 1
         stats["deleted_bytes"] += st.st_size
         emptied.add(f.parent)

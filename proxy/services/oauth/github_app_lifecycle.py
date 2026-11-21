@@ -123,14 +123,18 @@ def _attach(mcp_names: list[str], body: dict, installation_id: str) -> int:
     return touched
 
 
-def _detach(provider_id: str, mcp_names: list[str], installation_id: str) -> None:
-    """``installation.deleted``: gone from every meta, its bindings and
-    their subscriptions, every subscription targeting it, its token file."""
+def _detach(provider_id: str, mcp_names: list[str], installation_id: str,
+            detached: list[tuple[str, str]] | None) -> None:
+    """``installation.deleted``: gone from every meta, every subscription
+    targeting it, its token file. The rows of agents' own sets that act as
+    it are left to the caller (``detached`` names each ``(mcp, agent)``), who
+    takes them out through ``chat_reload.remove_service_account`` on the
+    loop: a chat that chose one is closed and told, and a set holds other
+    accounts beside it."""
     _update_holders(mcp_names, installation_id, lambda row: None)
-    for binding in credential_store.bindings_naming_installation(mcp_names, installation_id):
-        credential_store.remove_service_agent_binding(
-            binding["mcp_name"], binding["agent_name"], installation_id=installation_id,
-        )
+    if detached is not None:
+        detached.extend(sorted({(b["mcp_name"], b["agent_name"]) for b in
+                                credential_store.bindings_naming_installation(mcp_names, installation_id)}))
     for row in webhook_subscription_store.list_subscriptions(
         provider_id=provider_id, vendor_target=installation_id,
         target_kind=kinds.INSTALLATION_TARGET_KIND,
@@ -239,10 +243,12 @@ def _relist_holders(mcp_names: list[str], installation_id: str, *, sender_id: in
 
 def apply(
     provider_id: str, manifest: Any, event_type: str, body: dict, *,
-    installation_id: str, confirm: bool,
+    installation_id: str, confirm: bool, detached: list[tuple[str, str]] | None = None,
 ) -> str:
     """Apply one delivery's lifecycle meaning; returns what happened
-    (``ignored``, ``unconfirmed``, ``applied``)."""
+    (``ignored``, ``unconfirmed``, ``applied``). An installation deleted at
+    GitHub appends the ``(mcp, agent)`` of each agent's set that acts as it
+    to ``detached``, for the caller to take out on the loop."""
     mcp_names = [m.name for m in (mcp_registry.get_mcps_by_provider(provider_id) or [])]
     if manifest is not None and manifest.name not in mcp_names:
         mcp_names.append(manifest.name)
@@ -268,7 +274,7 @@ def apply(
         ):
             # GitHub signed the removal and no listing made now shows it: a
             # holder whose listing failed keeps no stale copy.
-            _detach(provider_id, mcp_names, installation_id)
+            _detach(provider_id, mcp_names, installation_id, detached)
         return APPLIED
     if event_type == EVENT_INSTALLATION:
         if action in ("created", "deleted", "suspend", "unsuspend") and confirm \
@@ -279,7 +285,7 @@ def apply(
         if action == "created":
             _attach(mcp_names, body, installation_id)
         elif action == "deleted":
-            _detach(provider_id, mcp_names, installation_id)
+            _detach(provider_id, mcp_names, installation_id, detached)
         elif action in ("suspend", "unsuspend"):
             stamp = ""
             if action == "suspend":

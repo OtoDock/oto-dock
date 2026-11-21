@@ -1,17 +1,18 @@
-"""Platform methods and feeds for app servers (APPS.md "Platform methods
-and feeds for servers", "Files").
+"""Platform methods for app servers (APPS.md "Platform methods for
+servers", "Files").
 
 Load-bearing: a server's call runs as the viewer it forwards, else as the
 app identity within the agent-scope slice; a write needs a viewer; the
 files methods reach only the declared prefixes, judged on the resolved
-path; the subscription socket takes the launch token only and delivers
-agent-scope deltas with a sequence.
+path; a server opens no socket to the platform.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -20,8 +21,8 @@ import config
 from api.apps import app_proxy
 from app import app
 from auth.providers import UserContext, get_current_user
-from services.apps import app_supervisor, app_tokens, catalog
-from storage import database as task_store
+from services.apps import app_handlers, app_supervisor, app_tokens, call_rate, catalog
+from storage import database as task_store, db_app_deliveries as deliveries
 from tests.conftest import live_session_token
 
 client = TestClient(app)
@@ -48,16 +49,14 @@ def _clean(monkeypatch):
     _as(ALICE)
     apps_api._fire_rate.clear()
     app_proxy._buckets.clear()
-    catalog._app_subs.clear()
     catalog._seq.clear()
-    # The four-a-second bucket is a production rule, not the subject here.
-    monkeypatch.setattr(app_proxy, "PLATFORM_RATE", 1000.0)
+    # The platform call's pace is a production rule, not the subject here.
+    monkeypatch.setattr(call_rate, "RESERVE", 1000.0)
     yield
     app.dependency_overrides.pop(get_current_user, None)
     app_supervisor._instances.clear()
     app_supervisor._locks.clear()
     app_proxy._buckets.clear()
-    catalog._app_subs.clear()
 
 
 @pytest.fixture
@@ -446,133 +445,9 @@ def test_files_answer_the_agents_members_only_never_a_share_alone(agent_tree):
     assert _call(row["id"], "files.read", inst.token, read["args"]).json()["ok"]
 
 
-def test_the_subscription_socket_takes_the_launch_token_and_the_agent_slice(agent_tree):
-    row = _row("board", [{"id": "t", "label": "Tasks", "type": "data_feed", "feed": "tasks"},
-                         {"id": "n", "label": "Inbox", "type": "data_feed", "feed": "notifications"}])
-    inst = _install(row)
-    from starlette.websockets import WebSocketDisconnect
-    with client.websocket_connect(f"/v1/apps/{row['id']}/platform/ws") as ws:
-        ws.send_text(json.dumps({"type": "auth", "token": _viewer_token(row["id"])}))
-        with pytest.raises(WebSocketDisconnect) as e:
-            ws.receive_text()
-    assert e.value.code == 4401
-    with client.websocket_connect(f"/v1/apps/{row['id']}/platform/ws") as ws:
-        ws.send_text(json.dumps({"type": "auth", "token": inst.token}))
-        ws.send_text(json.dumps({"type": "catalog_subscribe", "feed": "tasks"}))
-        assert ws.receive_json() == {"type": "catalog_ack", "feed": "tasks", "ok": True}
-        ws.send_text(json.dumps({"type": "catalog_subscribe", "feed": "notifications"}))
-        assert ws.receive_json()["ok"] is True
-        ws.send_text(json.dumps({"type": "catalog_snapshot", "feed": "tasks"}))
-        snap = ws.receive_json()
-        assert snap["type"] == "catalog" and snap["feed"] == "tasks" and snap["snapshot"] == []
-        assert snap["seq"] == 0
-        # A user-scope delta never reaches the app; an agent-scope one does,
-        # with the app's own sequence; an inbox delivery never does.
-        catalog.emit(["alice-sub"], AGENT, "tasks", {"id": "t-user"}, shared=False)
-        catalog.emit(["alice-sub"], AGENT, "tasks", {"id": "t-shared"}, shared=True)
-        catalog.emit(["alice-sub"], "", "notifications", {"id": "n-1"}, shared=False)
-        frame = ws.receive_json()
-        assert frame["feed"] == "tasks" and frame["delta"]["id"] == "t-shared" and frame["seq"] == 1
-        catalog.emit(["bob-sub"], AGENT, "tasks", {"id": "t-shared-2"}, shared=True)
-        assert ws.receive_json()["seq"] == 2
-        # Another agent's feed is not this app's.
-        catalog.emit(["alice-sub"], "other-agent", "tasks", {"id": "x"}, shared=True)
-        ws.send_text(json.dumps({"type": "catalog_snapshot", "feed": "tasks"}))
-        assert ws.receive_json()["seq"] == 2
-        assert catalog.app_subscription(row["id"]).feeds == {"tasks", "notifications"}
-    assert catalog.app_subscription(row["id"]) is None
-
-
-def test_a_server_reads_only_the_feeds_its_approved_manifest_declares(agent_tree):
-    # The socket once served any platform feed: an app approved for Tasks
-    # could subscribe to the agent's shared chats and file changes.
-    row = _row("board", [{"id": "t", "label": "Tasks", "type": "data_feed", "feed": "tasks"}])
-    inst = _install(row)
-    url = f"/v1/apps/{row['id']}/platform/ws"
-    with client.websocket_connect(url) as ws:
-        ws.send_text(json.dumps({"type": "auth", "token": inst.token}))
-        for kind in ("catalog_subscribe", "catalog_snapshot"):
-            for feed in ("sessions", "file_changes", "check_verdicts", "no-such-feed"):
-                ws.send_text(json.dumps({"type": kind, "feed": feed}))
-                assert ws.receive_json() == {"type": "catalog_ack", "feed": feed, "ok": False}
-        ws.send_text(json.dumps({"type": "catalog_subscribe", "feed": "tasks"}))
-        assert ws.receive_json()["ok"] is True
-        # Dropping a feed never needs a declaration.
-        ws.send_text(json.dumps({"type": "catalog_unsubscribe", "feed": "sessions"}))
-        assert ws.receive_json()["ok"] is True
-        assert catalog.app_subscription(row["id"]).feeds == {"tasks"}
-        catalog.emit([], AGENT, "sessions", {"id": "chat-1", "created": True}, shared=True)
-        catalog.emit([], AGENT, "tasks", {"id": "t-1"}, shared=True)
-        assert ws.receive_json()["delta"]["id"] == "t-1"
-
-
-def test_a_declared_feed_waits_for_the_approval_the_socket_reads_afresh(agent_tree):
-    # A declared feed on a manifest nobody approved yet is refused, and the
-    # approval counts on the open socket without a reconnect.
-    row = _row("board", [{"id": "t", "label": "Tasks", "type": "data_feed", "feed": "tasks"}],
-               approve=False)
-    inst = _install(row)
-    with client.websocket_connect(f"/v1/apps/{row['id']}/platform/ws") as ws:
-        ws.send_text(json.dumps({"type": "auth", "token": inst.token}))
-        for kind in ("catalog_subscribe", "catalog_snapshot"):
-            ws.send_text(json.dumps({"type": kind, "feed": "tasks"}))
-            assert ws.receive_json() == {"type": "catalog_ack", "feed": "tasks", "ok": False}
-        task_store.approve_app_actions(row["id"], task_store.manifest_sig(row), "alice-sub")
-        ws.send_text(json.dumps({"type": "catalog_subscribe", "feed": "tasks"}))
-        assert ws.receive_json()["ok"] is True
-        ws.send_text(json.dumps({"type": "catalog_snapshot", "feed": "tasks"}))
-        assert ws.receive_json()["type"] == "catalog"
-
-
-def test_a_preview_or_a_reconnect_never_takes_the_live_servers_feeds(agent_tree):
-    # The preview copy's server subscribes beside the live one, and a
-    # socket's close takes down its own subscriptions only: the live
-    # server kept its socket but heard nothing after either.
-    row = _row("board", [{"id": "t", "label": "Tasks", "type": "data_feed", "feed": "tasks"}])
-    live = _install(row)
-    preview = app_supervisor.Instance(row_id=row["id"], name="preview", row=row,
-                                      release_dir=config.get_agent_dir(AGENT),
-                                      data_dir=config.get_agent_dir(AGENT), host_port=2, state="up")
-    preview.token = app_tokens.mint(row["id"], app_tokens.PURPOSE_LAUNCH,
-                                    {"sub": f"app:{row['id']}", "instance": "preview"}, 3600)
-    app_supervisor._instances[(row["id"], "preview")] = preview
-    url = f"/v1/apps/{row['id']}/platform/ws"
-    with client.websocket_connect(url) as ws:
-        ws.send_text(json.dumps({"type": "auth", "token": live.token}))
-        ws.send_text(json.dumps({"type": "catalog_subscribe", "feed": "tasks"}))
-        assert ws.receive_json()["ok"] is True
-        with client.websocket_connect(url) as pws:
-            pws.send_text(json.dumps({"type": "auth", "token": preview.token}))
-            pws.send_text(json.dumps({"type": "catalog_subscribe", "feed": "tasks"}))
-            assert pws.receive_json()["ok"] is True
-            catalog.emit([], AGENT, "tasks", {"id": "both"}, shared=True)
-            assert pws.receive_json()["delta"]["id"] == "both"
-        sub = catalog.app_subscription(row["id"])
-        assert sub is not None and sub.feeds == {"tasks"}
-        assert catalog.app_subscription(row["id"], "preview") is None
-        catalog.emit([], AGENT, "tasks", {"id": "after-preview"}, shared=True)
-        assert ws.receive_json()["delta"]["id"] == "both"
-        assert ws.receive_json()["delta"]["id"] == "after-preview"
-    # A reconnect: the newer socket of the live process keeps its feeds
-    # when the older one closes after it.
-    old = client.websocket_connect(url).__enter__()
-    old.send_text(json.dumps({"type": "auth", "token": live.token}))
-    old.send_text(json.dumps({"type": "catalog_subscribe", "feed": "tasks"}))
-    assert old.receive_json()["ok"] is True
-    with client.websocket_connect(url) as new:
-        new.send_text(json.dumps({"type": "auth", "token": live.token}))
-        new.send_text(json.dumps({"type": "catalog_subscribe", "feed": "tasks"}))
-        assert new.receive_json()["ok"] is True
-        old.__exit__(None, None, None)
-        sub = catalog.app_subscription(row["id"])
-        assert sub is not None and sub.feeds == {"tasks"}
-        catalog.emit([], AGENT, "tasks", {"id": "after-reconnect"}, shared=True)
-        assert new.receive_json()["delta"]["id"] == "after-reconnect"
-
-
 def test_a_preview_burst_never_spends_the_live_servers_platform_bucket(agent_tree, monkeypatch):
     # The preview copy runs code nobody approved: its calls count in a
-    # bucket of their own, so the live server keeps its four a second.
+    # bucket of their own, so the live server keeps its own reserve.
     row = _row("board", ME)
     live = _install(row)
     preview = app_supervisor.Instance(row_id=row["id"], name="preview", row=row,
@@ -581,28 +456,41 @@ def test_a_preview_burst_never_spends_the_live_servers_platform_bucket(agent_tre
     preview.token = app_tokens.mint(row["id"], app_tokens.PURPOSE_LAUNCH,
                                     {"sub": f"app:{row['id']}", "instance": "preview"}, 3600)
     app_supervisor._instances[(row["id"], "preview")] = preview
-    monkeypatch.setattr(app_proxy, "PLATFORM_RATE", 2.0)
+    monkeypatch.setattr(call_rate, "RESERVE", 2.0)
     codes = [_call(row["id"], "viewer.me", preview.token).status_code for _ in range(4)]
     assert codes[:2] == [200, 200] and codes[-1] == 429, codes
     assert _call(row["id"], "viewer.me", live.token).status_code == 200
 
 
-def test_the_agent_slice_of_a_snapshot(agent_tree):
+def test_the_agent_slice_of_a_delta(agent_tree):
     import uuid
 
     from core.session.visibility import SHARED_CHAT_OWNER_PREFIX
-    row = _row("board", [])
     shared_chat = task_store.create_chat(str(uuid.uuid4()), f"{SHARED_CHAT_OWNER_PREFIX}{AGENT}",
                                          AGENT, title="Team chat")
-    task_store.create_chat(str(uuid.uuid4()), "alice-sub", AGENT, title="Alice's chat")
-    rows = catalog.snapshot_for_app("sessions", AGENT, row)
-    assert [r["id"] for r in rows] == [shared_chat["id"]]
-    assert catalog.snapshot_for_app("notifications", AGENT, row) == []
+    own_chat = task_store.create_chat(str(uuid.uuid4()), "alice-sub", AGENT, title="Alice's chat")
     assert catalog.in_agent_slice("sessions", {"id": shared_chat["id"]}, None) is True
+    assert catalog.in_agent_slice("sessions", {"id": own_chat["id"]}, None) is False
     assert catalog.in_agent_slice("file_changes", {"rel_path": "users/alice/workspace/x"}, None) is False
     assert catalog.in_agent_slice("file_changes", {"rel_path": "workspace/x"}, None) is True
     assert catalog.in_agent_slice("notifications", {"id": "n"}, True) is False
     assert os.path.basename(str(config.get_agent_dir(AGENT))) == AGENT
+
+
+def test_an_apps_server_has_no_socket_to_the_platform(agent_tree):
+    """An app's server reaches the platform through its ``platform/``
+    methods and is woken by its handlers. It opens no socket of its own:
+    that route worked only for a server the platform itself ran."""
+    from starlette.websockets import WebSocketDisconnect
+
+    row = _row("board", [{"id": "t", "label": "Tasks", "type": "data_feed", "feed": "tasks"}])
+    inst = _install(row)
+    assert not [r.path for r in app.routes if getattr(r, "path", "").endswith("/platform/ws")]
+    with pytest.raises(WebSocketDisconnect), \
+            client.websocket_connect(f"/v1/apps/{row['id']}/platform/ws") as ws:
+        ws.send_text(json.dumps({"type": "auth", "token": inst.token}))
+        ws.receive_text()
+    assert not hasattr(catalog, "open_app_subscription")
 
 
 def test_an_agent_session_is_judged_at_its_row_not_its_platform_standing(agent_tree):
@@ -682,6 +570,61 @@ def test_the_files_methods_never_follow_a_link_swapped_in_after_the_check(agent_
     assert sorted(p.name for p in outside.iterdir()) == ["secret.md"]
 
 
+def test_files_list_never_follows_a_link_swapped_in_after_the_check(agent_tree, tmp_path, monkeypatch):
+    """``files.list`` lists the authorized folder from a handle opened with
+    no link followed: a folder swapped for a link after the check lists
+    nothing of where the link points."""
+    from api.agents import files as files_api
+    actions = [{"id": "l", "label": "List", "type": "platform", "method": "files.list"}]
+    row = _row("swaplist", actions, files={"read": ["workspace/notes"]})
+    inst = _install(row)
+    ws = agent_tree / "workspace"
+    (ws / "notes").mkdir()
+    (ws / "notes" / "a.md").write_text("hello")
+    outside = tmp_path / "outside-list"
+    outside.mkdir()
+    (outside / "secret-name.md").write_text("x")
+    alice = _viewer_token(row["id"])
+    real = files_api.safe_agent_path
+
+    def swapping(agent_dir, agent, raw, user, writing=False, **kw):
+        answer = real(agent_dir, agent, raw, user, writing=writing, **kw)
+        (ws / "notes").rename(tmp_path / "notes-aside")
+        (ws / "notes").symlink_to(outside)
+        return answer
+
+    monkeypatch.setattr(files_api, "safe_agent_path", swapping)
+    r = _call(row["id"], "files.list", inst.token, {"path": "workspace/notes"}, viewer=alice)
+    assert r.status_code == 200 and "secret-name" not in r.text, r.text
+
+
+def test_files_list_opens_the_folder_it_looked_at(agent_tree, tmp_path, monkeypatch):
+    """The folder ``files.list`` looked at is the folder it lists: one
+    swapped for a link between the look and the open is refused."""
+    from services.infra import safe_fs
+    actions = [{"id": "l", "label": "List", "type": "platform", "method": "files.list"}]
+    row = _row("swaplist2", actions, files={"read": ["workspace/notes2"]})
+    inst = _install(row)
+    ws = agent_tree / "workspace"
+    (ws / "notes2").mkdir()
+    (ws / "notes2" / "a.md").write_text("hello")
+    outside = tmp_path / "outside-list2"
+    outside.mkdir()
+    (outside / "secret-name.md").write_text("x")
+    alice = _viewer_token(row["id"])
+    real = safe_fs.kind_beneath
+
+    def look_then_swap(root, rel):
+        answer = real(root, rel)
+        if str(rel).endswith("notes2") and not (ws / "notes2").is_symlink():
+            (ws / "notes2").rename(tmp_path / "notes2-aside")
+            (ws / "notes2").symlink_to(outside)
+        return answer
+    monkeypatch.setattr(safe_fs, "kind_beneath", look_then_swap)
+    r = _call(row["id"], "files.list", inst.token, {"path": "workspace/notes2"}, viewer=alice)
+    assert r.status_code == 200 and "secret-name" not in r.text, r.text
+
+
 def test_a_files_method_without_the_path_gate_is_refused(agent_tree):
     """The catalog resolves a files method's path only through the files
     API's gate, which its callers pass in: without one it refuses before
@@ -755,6 +698,98 @@ def test_a_placed_agents_session_never_reaches_the_platform_route(agent_tree):
         assert r.status_code == 403 and "member-only" not in r.text
     # The home agent's own no-user session still runs as the app identity.
     assert _call(row["id"], "files.read", live_session_token("s-own", AGENT, ""), read).json()["ok"]
+
+
+# ── the old copies of the database (services/apps/catalog.py) ─────────────
+
+FORGET = [{"id": "forget", "label": "Forget", "type": "platform", "method": "app.forget_copies"}]
+
+
+def _plant_copies(row: dict) -> tuple[list[Path], Path]:
+    from services.apps import releases
+    base = releases.app_release_dir(row)
+    (base / "3").mkdir(parents=True)
+    (base / "3" / "manifest.json").write_text("{}")
+    copies = [base / "3" / releases.DB_BEFORE_NAME, base / "3" / f"{releases.DB_BEFORE_NAME}.tmp",
+              base / "rollback-20260101T000000.sqlite", base / "rollback-20260101T000001.sqlite.tmp",
+              base / "preview" / "data" / "app.db", base / "preview" / "data" / "app.db-wal",
+              base / f"{releases.SCRATCH_DATA_PREFIX}crashed" / "app.db"]
+    for path in copies:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"old rows")
+    return copies, base / "3" / "manifest.json"
+
+
+def test_the_apps_own_server_removes_its_old_copies(agent_tree, monkeypatch):
+    """``app.forget_copies``: the release's and the rollback's copies, the
+    preview's database and a killed proxy's temporary file go, a release's
+    own files stay; a running preview stops first."""
+    row = _row("purger", FORGET)
+    inst = _install(row)
+    copies, keep = _plant_copies(row)
+    stopped: list[tuple] = []
+
+    async def fake_stop(row_id, instance=None):
+        from services.apps import releases
+        # A release may not start while the copies are going.
+        assert releases._deploy_lock(row_id).locked()
+        stopped.append((row_id, instance))
+        return 0
+
+    monkeypatch.setattr(app_supervisor, "stop", fake_stop)
+    r = _call(row["id"], "app.forget_copies", inst.token)
+    assert r.status_code == 200 and r.json()["ok"], r.text
+    assert r.json()["result"]["removed"] == len(copies)
+    assert not any(path.exists() for path in copies) and keep.exists()
+    assert stopped == [(row["id"], app_supervisor.PREVIEW)]
+    # Idempotent: a second call finds nothing.
+    assert _call(row["id"], "app.forget_copies", inst.token).json()["result"]["removed"] == 0
+
+
+def test_nobody_else_removes_an_apps_old_copies(agent_tree, monkeypatch):
+    """A person's page, a forwarded viewer, a no-person session of the home
+    agent (which the row's identity also serves) and the preview copy are
+    all refused, and nothing is touched."""
+    row = _row("purger2", FORGET)
+    inst = _install(row)
+    copies, _keep = _plant_copies(row)
+    async def never(*_a, **_k):
+        raise AssertionError("nothing may run")
+    monkeypatch.setattr(app_supervisor, "stop", never)
+    assert _catalog(row["id"], "app.forget_copies").json()["ok"] is False       # the page's door
+    assert _call(row["id"], "app.forget_copies", inst.token, viewer=_bob_claim(row["id"])).status_code == 403
+    assert _call(row["id"], "app.forget_copies", live_session_token("s-own", AGENT, "")).status_code == 403
+    preview = app_supervisor.Instance(row_id=row["id"], name="preview", row=row,
+                                      release_dir=config.get_agent_dir(AGENT),
+                                      data_dir=config.get_agent_dir(AGENT), host_port=1, state="up")
+    preview.token = app_tokens.mint(row["id"], app_tokens.PURPOSE_LAUNCH,
+                                    {"sub": f"app:{row['id']}", "instance": "preview"}, 3600)
+    app_supervisor._instances[(row["id"], "preview")] = preview
+    assert _call(row["id"], "app.forget_copies", preview.token).status_code == 403
+    # An inbound wake is a stranger's event: its claim opens nothing here.
+    deliveries.enqueue(row["id"], "payment", "inbound:stripe", {"hook": "stripe", "body": "{}"})
+    wake = deliveries.claim_next(row["id"])
+    assert app_handlers.basis_for(wake) == "inbound"
+    claim = app_handlers.claim_for(wake, row["id"])
+    assert _call(row["id"], "app.forget_copies", inst.token, viewer=claim).status_code == 403
+    assert all(path.exists() for path in copies)
+
+
+def test_an_app_waiting_for_approval_cannot_remove_its_copies(agent_tree):
+    row = _row("purger3", FORGET, approve=False)
+    inst = _install(row)
+    assert _call(row["id"], "app.forget_copies", inst.token).status_code == 409
+
+
+def test_a_release_going_live_refuses_the_call_and_never_waits(agent_tree, monkeypatch):
+    from services.apps import releases
+    row = _row("purger4", FORGET)
+    inst = _install(row)
+    copies, _keep = _plant_copies(row)
+    monkeypatch.setattr(releases, "_deploy_lock", lambda _id: SimpleNamespace(locked=lambda: True))
+    body = _call(row["id"], "app.forget_copies", inst.token).json()
+    assert body["ok"] is False and "going live" in body["reason"]
+    assert all(path.exists() for path in copies)
 
 
 # ── the audience and the per-viewer slice (APPS.md "Platform catalog") ──────
@@ -977,7 +1012,8 @@ def test_the_per_viewer_slice_is_each_viewers_own(agent_tree, monkeypatch):
     apps_api._fire_rate.clear()
     r = client.post(f"{url}/catalog/viewer.data.read", json={"args": None},
                     headers={"Authorization": f"Bearer {sess}"})
-    assert r.status_code == 200 and r.json()["ok"] is False and "page" in r.json()["reason"]
+    # A session's token is refused off its route list (a page calls this).
+    assert r.status_code == 403 and r.json()["detail"] == "A session's token does not reach this route"
     _as(ALICE)
     folder_app = _row("board", SLICE)
     r = _catalog(folder_app["id"], "viewer.data.read")
@@ -992,3 +1028,148 @@ def test_the_per_viewer_slice_is_each_viewers_own(agent_tree, monkeypatch):
     assert _call(folder_app["id"], "viewer.data.read", live_session_token("s-a", AGENT, "alice-sub")).status_code == 403
     r = _call(folder_app["id"], "viewer.data.read", inst.token, viewer=_viewer_token(folder_app["id"]))
     assert r.status_code == 200 and r.json()["ok"] is False and "database" in r.json()["reason"]
+
+
+def _linked(agent_tree, tmp_path):
+    """The agent's folder moved by an admin behind a link (the operator's
+    own layout); the real folder."""
+    real = tmp_path / "disk2" / AGENT
+    real.parent.mkdir()
+    agent_tree.rename(real)
+    agent_tree.symlink_to(real)
+    (real / "workspace" / "notes").mkdir()
+    (real / "workspace" / "notes" / "a.md").write_text("hello")
+    return real
+
+
+def test_files_list_on_an_agent_behind_the_operators_link_lists_its_folder(agent_tree, tmp_path):
+    """``files.list`` opens beneath the agent's real folder
+    (``core.agent_folder``): an agent behind the operator's link lists as
+    any other."""
+    _linked(agent_tree, tmp_path)
+    actions = [{"id": "l", "label": "List", "type": "platform", "method": "files.list"}]
+    row = _row("linkedlist", actions, files={"read": ["workspace/notes"]})
+    inst = _install(row)
+    r = _call(row["id"], "files.list", inst.token, {"path": "workspace/notes"}, viewer=_viewer_token(row["id"]))
+    assert r.status_code == 200 and "a.md" in r.text, r.text
+
+
+def test_files_read_on_an_agent_behind_the_operators_link_reads_its_file(agent_tree, tmp_path):
+    """``files.read`` opens beneath the same root, at the place the gates
+    judged. A link inside the agent's folder is still refused."""
+    real = _linked(agent_tree, tmp_path)
+    (real / "workspace" / "secret.md").write_text("no")
+    (real / "workspace" / "notes" / "link.md").symlink_to(real / "workspace" / "secret.md")
+    actions = [{"id": "r", "label": "Read", "type": "platform", "method": "files.read"}]
+    row = _row("linkedread", actions, files={"read": ["workspace/notes"]})
+    inst = _install(row)
+    alice = _viewer_token(row["id"])
+    r = _call(row["id"], "files.read", inst.token, {"path": "workspace/notes/a.md"}, viewer=alice)
+    assert r.status_code == 200 and r.json()["result"]["content"] == "hello", r.text
+    r = _call(row["id"], "files.read", inst.token, {"path": "workspace/notes/link.md"}, viewer=alice)
+    assert not r.json().get("ok") and "no" not in json.dumps(r.json().get("result") or {}), r.text
+
+
+def test_files_write_on_an_agent_behind_the_operators_link_lands_in_its_real_folder(agent_tree, tmp_path):
+    """The twin for ``files.write``: the write lands beneath the agent's
+    real folder at the checked place, makes the folder it needs there, and
+    replaces a link at the file's name instead of writing through it."""
+    real = _linked(agent_tree, tmp_path)
+    actions = [{"id": "w", "label": "Write", "type": "platform", "method": "files.write"}]
+    row = _row("linkedwrite", actions, files={"write": ["workspace/out"]})
+    inst = _install(row)
+    alice = _viewer_token(row["id"])
+    r = _call(row["id"], "files.write", inst.token, {"path": "workspace/out/deep/x.txt", "content": "v"},
+              viewer=alice)
+    assert r.status_code == 200 and r.json()["ok"], r.text
+    assert r.json()["result"]["path"] == "workspace/out/deep/x.txt"
+    assert (real / "workspace" / "out" / "deep" / "x.txt").read_text() == "v"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("kept")
+    (real / "workspace" / "out" / "y.txt").symlink_to(outside)
+    r = _call(row["id"], "files.write", inst.token, {"path": "workspace/out/y.txt", "content": "new"},
+              viewer=alice)
+    assert outside.read_text() == "kept", r.text
+    assert not (real / "workspace" / "out" / "y.txt").is_symlink() or not r.json().get("ok")
+
+
+def test_declared_folders_on_an_agent_behind_the_operators_link_are_made_in_its_real_folder(agent_tree, tmp_path):
+    """The folders an app declares are checked and made beneath the same
+    root: missing before, created once, kept after, never "blocked" by the
+    operator's own link."""
+    from services.apps import app_folders
+    real = _linked(agent_tree, tmp_path)
+    rel = "workspace/videos/projects"
+    actions = [{"id": "l", "label": "List", "type": "platform", "method": "files.list"}]
+    row = _row("linkedfolders", actions, files={"read": ["workspace/videos"], "create": [rel]})
+    assert app_folders.folder_states(row) == [{"path": rel, "state": app_folders.FOLDER_MISSING}]
+    made = app_folders.ensure_created_dirs(row)
+    assert made[app_folders.FOLDERS_CREATED] == [rel] and made[app_folders.FOLDERS_SKIPPED] == []
+    assert (real / rel).is_dir()
+    assert app_folders.folder_states(row) == [{"path": rel, "state": app_folders.FOLDER_PRESENT}]
+    again = app_folders.ensure_created_dirs(row)
+    assert again[app_folders.FOLDERS_KEPT] == [rel] and again[app_folders.FOLDERS_CREATED] == []
+    # A link inside the agent's folder still blocks, and is never followed.
+    (real / rel).rmdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (real / rel).symlink_to(elsewhere)
+    assert app_folders.folder_states(row) == [{"path": rel, "state": app_folders.FOLDER_BLOCKED}]
+    assert app_folders.ensure_created_dirs(row)[app_folders.FOLDERS_SKIPPED][0]["path"] == rel
+
+
+def test_every_file_site_of_an_app_hands_the_opener_the_owners_root(agent_tree, tmp_path, monkeypatch):
+    """One owner follows the operator's link, once
+    (``agent_folder.agent_root``). The read, the listing, the write and the
+    declared folders hand the strict opener that very answer, the object the
+    owner returned: never the folder as it is named, which the opener would
+    resolve by itself, and never a folder the site found by itself, though
+    it be the same place."""
+    from core import agent_folder
+    from services.apps import app_folders
+    from services.infra import safe_fs
+    _linked(agent_tree, tmp_path)
+    ask = agent_folder.agent_root
+    answers: list[Path] = []
+
+    def owner_asked(name: str) -> Path:
+        answers.append(ask(name))
+        return answers[-1]
+    monkeypatch.setattr(agent_folder, "agent_root", owner_asked)
+    owner = ask(AGENT)
+    assert owner != Path(config.get_agent_dir(AGENT))
+    handed: dict[tuple[str, str], list] = {}
+
+    def watch(name: str) -> None:
+        inner = getattr(safe_fs, name)
+
+        def spy(root, rel="", *args, **kwargs):
+            handed.setdefault((name, rel), []).append(root)
+            return inner(root, rel, *args, **kwargs)
+        monkeypatch.setattr(safe_fs, name, spy)
+
+    for name in ("read_bytes_beneath", "kind_beneath", "open_dir_beneath", "atomic_write_beneath",
+                 "lstat_beneath", "mkdirs_beneath"):
+        watch(name)
+    made = "workspace/notes/made"
+    actions = [{"id": method[6:], "label": method, "type": "platform", "method": method}
+               for method in ("files.read", "files.list", "files.write")]
+    row = _row("ownersroot", actions,
+               files={"read": ["workspace/notes"], "write": ["workspace/notes"], "create": [made]})
+    inst = _install(row)
+    alice = _viewer_token(row["id"])
+    for method, args in (("files.read", {"path": "workspace/notes/a.md"}),
+                         ("files.list", {"path": "workspace/notes"}),
+                         ("files.write", {"path": "workspace/notes/new.md", "content": "v"})):
+        r = _call(row["id"], method, inst.token, args, viewer=alice)
+        assert r.status_code == 200 and r.json()["ok"], r.text
+    assert app_folders.ensure_created_dirs(row)[app_folders.FOLDERS_CREATED] == [made]
+    assert app_folders.folder_states(row) == [{"path": made, "state": app_folders.FOLDER_PRESENT}]
+    for site in (("read_bytes_beneath", "workspace/notes/a.md"), ("kind_beneath", "workspace/notes"),
+                 ("open_dir_beneath", "workspace/notes"), ("atomic_write_beneath", "workspace/notes/new.md"),
+                 ("lstat_beneath", made), ("mkdirs_beneath", made)):
+        roots = handed.get(site)
+        assert roots and all(root == owner and any(root is answer for answer in answers)
+                             for root in roots), (site, roots)
+    # The declared folder was looked at twice: by the pass that made it and by the card's state.
+    assert len(handed[("lstat_beneath", made)]) >= 2

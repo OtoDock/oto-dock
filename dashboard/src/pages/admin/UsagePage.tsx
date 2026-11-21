@@ -482,7 +482,7 @@ function AgentBudgetsSection({ limits }: { limits: UsageLimit[] }) {
       <div className="px-4 py-3 border-b border-subtle">
         <h3 className="text-sm font-medium text-primary">Agent Budgets</h3>
         <p className="text-xs text-tertiary mt-0.5">
-          Cap each agent's <strong>agent-scoped</strong> spend on the shared subscriptions. That covers scheduled tasks, triggers, meetings and agent chats. You can set a budget before any usage.
+          Cap each agent's <strong>agent-scoped</strong> spend on the shared subscriptions. That covers the agent's own tasks, triggers and meetings, and every task on a Shared-only agent. A person's chats, and the chats agents start from them, are paid by that person. You can set a budget before any usage.
         </p>
       </div>
       <div className="overflow-x-auto">

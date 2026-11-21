@@ -116,7 +116,7 @@ class TestEnableGate:
         agent_store.update_agent(SLUG, execution_paths=json.dumps(["codex-cli"]))
         r = client.patch(
             f"/v1/agents/{SLUG}",
-            json={"default_model": "gpt-6.1-sol"},
+            json={"default_model": "gpt-6.2-sol"},
             headers=_cookie(MEMBER, "viewer@test.com", "member"),
         )
         assert r.status_code == 403

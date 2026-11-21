@@ -548,3 +548,30 @@ def test_the_two_real_listeners_key_their_buckets_apart(monkeypatch):
         for s in sockets:
             s.close()
     assert started and not thread.is_alive()
+
+
+# ── a hosted install has no local network ─────────────────────────────────
+
+
+def test_a_local_only_account_never_signs_in_on_a_hosted_install(monkeypatch, caplog):
+    """An ingress on a private address must not read as the person's LAN."""
+    email = _local_only_user()
+    c = TestClient(app, client=("192.168.1.60", 40000))
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
+    with caplog.at_level(logging.WARNING, logger="otodock"):
+        assert c.post("/auth/login/local", json={"email": email, "password": _PW}).status_code == 403
+    assert "a hosted install has no local network" in caplog.text
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", False)
+    rate_limiter._attempts.clear()
+    assert c.post("/auth/login/local", json={"email": email, "password": _PW}).status_code == 200
+
+
+def test_the_lan_only_switch_cannot_be_turned_on_on_a_hosted_install(monkeypatch):
+    from auth.providers import create_session_jwt
+    sub = db.create_local_user("someone@t.com", "S", "S", "member", hash_password(_PW))
+    admin = TestClient(app, cookies={"session": create_session_jwt(
+        "user-admin", "admin@test.com", "Admin User", "admin")})
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
+    on = admin.put(f"/v1/admin/users/{sub}/local-only", json={"local_only": True})
+    assert on.status_code == 400 and "no local network" in on.json()["detail"]
+    assert admin.put(f"/v1/admin/users/{sub}/local-only", json={"local_only": False}).status_code == 200

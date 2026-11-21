@@ -1,0 +1,14 @@
+{
+ "missing": {
+  "parsed": null,
+  "warnings": [
+   "Failed to read manifest <tmp>/gone/manifest.json"
+  ]
+ },
+ "not json": {
+  "parsed": null,
+  "warnings": [
+   "Failed to read manifest <tmp>/bad/manifest.json"
+  ]
+ }
+}

@@ -185,6 +185,12 @@ def record_snapshot_async(session_id: str, snapshot: dict) -> None:
         subscription_windows.record_for_session_async(session_id, w)
 
 
+#: The source a terminal's rollout line is stored under (its engine's
+#: ``usage.in_band`` declares it a hint: the rollout is a file in the
+#: engine's folder, which the agent can write).
+ROLLOUT_SOURCE = "codex_rollout"
+
+
 def record_snapshot(session_id: str, snapshot: dict, observed_at: str | None = None) -> bool:
     """A rollout line's ``rate_limits``, dated by the line's own timestamp so a
     replayed line never reads as a fresh observation. Synchronous: the
@@ -192,8 +198,10 @@ def record_snapshot(session_id: str, snapshot: dict, observed_at: str | None = N
     w = from_snapshot(snapshot, _specs())
     if w is None:
         return False
+    w.source = ROLLOUT_SOURCE
     stamped = _iso_dt(observed_at)
     if stamped is not None:
-        w.observed_at = stamped
+        # A line the agent dated in the future would stay the newest hint.
+        w.observed_at = min(stamped, datetime.now(timezone.utc))
     from services.engines import subscription_windows
     return subscription_windows.record_for_session(session_id, w)

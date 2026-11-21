@@ -2,6 +2,8 @@ import { useRef, useCallback, useEffect } from 'react'
 import { Capacitor } from '@capacitor/core'
 import { isDictationActive, isSpeaking } from '../audio/speechActivity'
 import { isNativePlatform } from '../audio/types'
+import { playClip, webAudioAvailable } from '../audio/webaudioPlayer'
+import { isAppleTouch } from '../lib/device/viewport'
 import { NOTIFICATION_SEVERITY, type NotificationSeverity } from '../lib/status/notificationSeverity'
 
 // Each chime stays under five seconds on purpose: for a short file whose
@@ -79,11 +81,23 @@ export function useNotificationSound() {
     warmSounds()
   }, [])
 
-  const playSound = useCallback((key: string) => {
+  // ``followSwitch``: a notification's chime. On an iPhone or an iPad it
+  // plays through Web Audio alone, which WebKit plays in the "ambient"
+  // session: the Ring/Silent switch mutes it, as it mutes the phone's own
+  // alert sounds. A media element plays in "playback", which the switch
+  // leaves on. Everywhere else, and for the danger alarm and the turn's
+  // ping, the media element plays as before.
+  const playSound = useCallback((key: string, followSwitch = false) => {
     const url = SOUND_URLS[key]
     if (!url) return
-    const audio = new Audio(warmed[key] ?? url)
-    audio.volume = key === 'ping' ? 0.3 : 0.7
+    const src = warmed[key] ?? url
+    const volume = key === 'ping' ? 0.3 : 0.7
+    if (followSwitch && isAppleTouch(navigator) && webAudioAvailable()) {
+      void playClip(src, volume)
+      return
+    }
+    const audio = new Audio(src)
+    audio.volume = volume
     audio.play().catch(() => {})
   }, [])
 
@@ -123,10 +137,10 @@ export function useNotificationSound() {
     switch (severity) {
       case NOTIFICATION_SEVERITY.INFO:
       case NOTIFICATION_SEVERITY.SUCCESS:
-        if (!quiet) playSound('success')
+        if (!quiet) playSound('success', true)
         break
       case NOTIFICATION_SEVERITY.WARNING:
-        if (!quiet) playSound('warning')
+        if (!quiet) playSound('warning', true)
         break
       case NOTIFICATION_SEVERITY.DANGER: {
         // Loop alarm + TTS until stopped

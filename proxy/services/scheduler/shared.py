@@ -35,6 +35,13 @@ _active_task_ids: dict[str, str] = {}
 # Set during graceful shutdown so the per-run cancel handler skips delegate
 # result-delivery (the delegating session is being torn down too).
 _shutting_down: bool = False
+# The continuations a planned stop held (``core.drain``): task ids, fired
+# when the drain is called off (a restart finds them by their time instead).
+_held_wakes: list[str] = []
+# Task ids whose fire runs now, from the job's call (APScheduler has removed a
+# one-shot's job by then) until its execution returns (``runner._fire_task``):
+# such a row still fires, whatever its job.
+_fires_under_way: set[str] = set()
 # run_ids cancelled BY A USER via cancel_run (dashboard Stop / cancel API) —
 # distinguishes a deliberate user stop (delegates report "user_interrupted")
 # from a shutdown/system cancel. Discarded in _run_task's finally.
@@ -44,6 +51,14 @@ _user_cancelled_runs: set[str] = set()
 # platform reap (failed + reason) from a user cancel (cancelled). Popped in
 # _run_task's finally (run_ids are never reused — must not accumulate).
 _platform_interrupts: dict[str, str] = {}
+# The runs whose own task left them live for a reopen (the platform's stop,
+# or a machine that came back without the run's session): the run's frame
+# keeps a one-time task's row for them, since the reopen reads it.
+_left_for_reopen: set[str] = set()
+# The runs whose round opened in this process (the run is ``running`` with its
+# chat and session on its row): what a planned stop counts as open work. A run
+# that waits for its slot or at its lane's gate has started nothing.
+_open_rounds: set[str] = set()
 
 
 def now_iso() -> str:
@@ -71,6 +86,9 @@ class TaskDefinition(BaseModel):
     retry: RetryPolicy = RetryPolicy()
     timeout_seconds: int = 600
     enabled: bool = True
+    # A one-time row whose run began (``dynamic_tasks.fired``); its run owns
+    # the row from then on. A continuation's row is never marked.
+    fired: bool = False
     created_by: str | None = None
     # ISO UTC timestamp of row creation. Drives IntervalTrigger.start_date so
     # the cadence is deterministic across proxy restarts.
@@ -124,6 +142,11 @@ class TaskDefinition(BaseModel):
     # run (``task_config_builder.task_target``): a machine the guard refuses
     # or that is offline then gives way to the default, and the run says so.
     target_machine: str = ""
+    # Whose AI accounts a lane or a judge spends, as the platform recorded
+    # it at the spawn (``core/config/spender.py``): "" the subscriptions
+    # shared with agents, None a row written before the column (or any
+    # other task, whose creator answers).
+    spender_sub: str | None = None
     # The run's permission mode, persisted: "" = Don't Ask (the unattended
     # word), the Auto word = the engine's own review.
     permission_mode: str = ""
@@ -159,6 +182,11 @@ class TaskDefinition(BaseModel):
     # "for_chat": the judged chat}``. A run with it is read-only, gets only
     # the listed MCPs, never runs interactive and is never judged itself.
     judge: dict | None = None
+    # A call's wrap-up (task_type='wrapup', in-memory only,
+    # services/phone/wrapup.py): ``{"chat_id": the conversation,
+    # "identity_id": the outside person's row or "", "home": their tree or
+    # ""}``. Its config is the phone builder's, never a task's.
+    wrapup: dict | None = None
     # Where the run goes when the caller already knows (a judge mirrors the
     # judged session's machine; ``judge_on: platform`` pins "local"). Empty
     # = resolve_execution_target as usual.

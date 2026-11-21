@@ -11,6 +11,7 @@ import { useDialogs } from '../../components/ui/dialogs'
 import Button from '../../components/ui/Button'
 import { Input } from '../../components/ui/Field'
 import { BADGE_BASE, BADGE_TONE, CARD, BUTTON_DANGER_QUIET } from '../../components/ui/classes'
+import { copyOrSay } from '../../lib/copyText'
 
 
 // =====================================================================
@@ -46,7 +47,7 @@ export function AgentApiKeysSection({ agent }: { agent: string }) {
 
   const onCopy = async () => {
     if (!createdKey) return
-    try { await navigator.clipboard.writeText(createdKey.key) } catch { /* ignore */ }
+    await copyOrSay(createdKey.key)
   }
 
   const onRevoke = async (id: string, name: string) => {

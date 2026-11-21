@@ -1,0 +1,256 @@
+[
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "remote",
+    "session": "a-prewarm"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a pre-warm goes first, at any age"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "remote",
+    "session": "a-mine"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "then the person's own"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "remote",
+    "session": "a-other"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "then the most idle"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "busy_background",
+   "user_message": "Too many active sessions, and the 1 idle one(s) still have background work running. Try again in a few minutes, or stop that work."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a turn and background work are spared"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "remote",
+    "session": "a-work"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "background work past the ceiling goes"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "busy",
+   "user_message": "Too many active sessions. The platform is busy. Try again shortly, or close an idle chat."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a turn alone is spared without a word"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "remote",
+    "session": "a-turn"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a turn past the ceiling goes, a failed close too"
+ }
+]

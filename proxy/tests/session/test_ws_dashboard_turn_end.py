@@ -476,3 +476,29 @@ async def test_a_queued_batch_on_an_engine_that_takes_photos_inline_gets_their_c
     prompt, _consumed = await conn._prepared_prompt("cc-q", "go on", new_text="go on",
                                                     layer=_layer(False), session_id="s-1")
     assert f"- /{PHOTO}" in prompt
+
+
+def test_a_lost_turn_the_pass_carries_on_writes_no_card(temp_db, monkeypatch):
+    """A machine came back without the chat's session: the pass continues the
+    turn, so its lost ending keeps the turn's rows and writes no card that
+    would tell the person to send again."""
+    from core.events import stream_pump
+    layer, slug = _setup(monkeypatch, [
+        CommonEvent(type=TEXT, data={"content": "half an answer"}),
+        _error_event(turn_ending.LOST, "the machine came back without this chat's session"),
+    ])
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, _sid = await warm_new_chat(ws, layer, slug)
+            stream_pump.the_pass_takes_it(chat_id)
+            ws.client_send({"type": "chat", "text": "start", "chat_id": chat_id})
+            await _until(ws, "text")
+            await _until(ws, "done")
+            await _until(ws, "chat_status")
+            kinds = [(m["role"], m.get("event_type") or "") for m in task_store.get_chat_messages(chat_id)]
+            assert kinds[:2] == [("user", ""), ("assistant", "")]
+            assert _turn_ended_rows(chat_id) == []
+            assert chat_id not in stream_pump._pass_takes
+    run_ws_scenario(scenario)

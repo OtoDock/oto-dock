@@ -204,28 +204,6 @@ def test_a_skipped_push_only_path_is_not_pushed_over():
     assert _act(plan, ".claude/settings.json") is None
 
 
-# --- An old Windows satellite (absence_unknown) ----------------------------
-
-def test_an_old_windows_satellite_never_loses_a_file_to_its_absence():
-    # B == P (a delete_platform before) and B None (the bug cleared the base
-    # of what it deleted, the machine still has it): no action on either.
-    local = [FileEntry("workspace/converged.md", "sha256:v1", 10, 1.0),
-             FileEntry("workspace/rebased.md", "sha256:v2", 10, 1.0),
-             FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)]
-    base = {"workspace/converged.md": ("sha256:v1", 1.0),
-            "workspace/keep.txt": ("sha256:keep", 1.0)}
-    plan = diff_manifests(local, [_ALIVE], base=base, target_role="editor",
-                          absence_unknown=True)
-    assert _act(plan, "workspace/converged.md") is None
-    assert _act(plan, "workspace/rebased.md") is None
-    # What it did list merges as usual.
-    new = _r("workspace/made-there.md", "sha256:n")
-    plan = diff_manifests(local, [_ALIVE, new], base=base, target_role="editor",
-                          absence_unknown=True)
-    a = _act(plan, "workspace/made-there.md")
-    assert a is not None and a.op == "pull"
-
-
 # --- Holds: the Windows hash bug's deletes ----------------------------------
 
 def test_a_held_file_is_restored_only_by_the_windows_machine():
@@ -243,8 +221,8 @@ def test_a_held_file_is_restored_only_by_the_windows_machine():
                            clock_offset=10.0, target_role="editor")
     assert _act(timed, "workspace/report.docx").keep_mtime == 13.0
     assert a.keep_mtime is None             # no clock offset known: nothing to keep
-    # Any other machine (an idle Linux one, or the Windows one before its
-    # update): neither a pull nor a delete, newer or older than the hold.
+    # Any other machine (an idle Linux one): neither a pull nor a delete,
+    # newer or older than the hold.
     for mtime in (1.0, 9.0):
         remote = [_ALIVE, _r("workspace/report.docx", "sha256:old", mtime=mtime)]
         other = diff_manifests(local, remote, holds=holds, target_role="editor")
@@ -271,8 +249,8 @@ def test_a_held_path_the_platform_has_again_merges_and_drops_the_hold():
 
 def test_the_restore_race_keeps_the_windows_edit():
     """The audit's race: an idle Linux machine still holds the old bytes
-    (B == S there). It merges first and does nothing; the updated Windows
-    machine restores its newer edit; the Linux machine then gets the
+    (B == S there). It merges first and does nothing; the Windows machine
+    restores its newer edit; the Linux machine then gets the
     restored copy pushed, its old bytes never reaching the platform."""
     path = "users/alice/workspace/notes.md"
     holds = {path: 2.0}

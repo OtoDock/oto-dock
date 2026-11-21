@@ -30,12 +30,14 @@ import hashlib
 import json
 import logging
 import os
-import shutil
+import secrets
 import stat
+import time
 from pathlib import Path
 
 import config
-from core import layout
+from core import agent_folder, layout
+from services.apps import app_sandbox
 from services.infra import safe_fs
 from services.infra.agent_dirs import agent_dirs
 from services.infra.path_confinement import join_under
@@ -53,12 +55,22 @@ LOG_NAME = "app.log"
 # A scratch copy of the working tree a render job judges (app_render.py):
 # ``check-<nonce>`` beside the releases, removed when the job ends.
 CHECK_DIR_PREFIX = "check-"
+# A check instance's own data (``scratch_data_dir``), beside the releases so
+# whichever machine runs the check can bind it. Not ``check-*``:
+# ``find_release_by_sha`` globs that prefix, and code nobody approved writes
+# this folder.
+SCRATCH_DATA_PREFIX = "scratch-data-"
+STALE_SCRATCH_S = 3600
+# One database copy's private folder (``app_db``), beside the releases.
+DB_SNAPSHOT_PREFIX = ".db-snapshot-"
 
 # What a release may hold (APPS.md "Releases"): per file, per tree, per
 # count. Enforced before any byte is copied.
 MAX_RELEASE_FILE_BYTES = 2 * 1024 * 1024
 MAX_RELEASE_BYTES = 32 * 1024 * 1024
 MAX_RELEASE_FILES = 500
+# A release's manifest (500 entries of a path and a hash) far under this.
+MANIFEST_MAX_BYTES = 1024 * 1024
 # Never copied into a release: dependencies the platform does not install,
 # a stray data directory, dotfiles.
 SKIP_DIR_NAMES = frozenset({"node_modules", "data"})
@@ -96,20 +108,32 @@ def _join(base: str, rel: str) -> str:
 def agents_rel(path: Path) -> tuple[str, str]:
     """``(AGENTS_DIR, "<agent>/…")`` for a path joined from an agent's
     folder; ``EscapeRefused`` for anything else. The agent comes from the
-    text the caller joined, never from where a link resolves."""
+    text the caller joined, never from where a link resolves. What makes a
+    new release, a preview, a check's copy or a bundle opens here, the
+    agent's folder included, as on 1.9.1; what reads and removes the
+    releases already there opens beneath the agent's real folder
+    (``_beneath``)."""
     root = os.fspath(config.AGENTS_DIR)
     return root, safe_fs.rel_under(os.path.abspath(os.fspath(path)), root)
 
 
+def _beneath(path: Path) -> tuple[Path, str]:
+    """The agent's real folder and ``path``'s parts below it
+    (``core/agent_folder.py``: an agent's folder may be the operator's
+    link, followed once, and nothing below it is) for a path joined from an
+    agent's folder; ``EscapeRefused`` for one in no agent's folder."""
+    return agent_folder.beneath_agent(os.path.abspath(os.fspath(path)))
+
+
 def tree_root(path: Path) -> tuple[str, str]:
-    """The root and rel to open ``path`` strictly: beneath ``AGENTS_DIR``
-    with the agent as the first component (an agent's folder is never a
-    root: a session, and every container that mounts the agents tree, can
-    replace it), or, for a directory the platform itself made outside the
-    agents tree (an extracted bundle, a template's copy), that directory.
-    A path that reaches the agents tree only through a link is refused."""
+    """The root and rel to read ``path`` strictly: the agent's real folder
+    and the parts below it (``_beneath``), or, for a directory the platform
+    itself made outside the agents tree (an extracted bundle, a template's
+    copy), that directory. A path that reaches the agents tree only through
+    a link below the agents folder is refused."""
     try:
-        return agents_rel(path)
+        root, rel = _beneath(path)
+        return os.fspath(root), rel
     except safe_fs.EscapeRefused:
         pass
     real = os.path.realpath(os.fspath(path))
@@ -134,6 +158,70 @@ def write_atomic(target: Path, text: str) -> None:
     (``config.get_agent_dir(agent) / rel``), never a resolved path."""
     root, rel = agents_rel(target)
     safe_fs.atomic_write_beneath(root, rel, text.encode("utf-8"), mkdirs=True)
+
+
+def _kind_in_tree(folder: Path, rel: str) -> safe_fs.NameKind:
+    """``safe_fs.kind_beneath`` of ``folder/rel`` in a working tree or a
+    release; ``"other"`` when the folder cannot be placed beneath a root."""
+    try:
+        root, base = tree_root(folder)
+    except OSError:
+        return safe_fs.NameKind("other", None)
+    return safe_fs.kind_beneath(root, _join(base, rel))
+
+
+def is_plain_file(folder: Path, rel: str) -> bool:
+    """Whether ``folder/rel`` is a regular file reached with no link."""
+    return _kind_in_tree(folder, rel).is_file
+
+
+def entries(folder: Path) -> tuple[list[str], list[str]]:
+    """``(folders, files)`` directly in ``folder``, a path joined from an
+    agent's folder: no link is listed, and a folder that is missing, a link
+    or under one lists nothing."""
+    try:
+        root, base = _beneath(folder)
+        walk = safe_fs.walk_beneath(root, base)
+        try:
+            step = next(walk)
+            return list(step.dirs), list(step.files)
+        finally:
+            walk.close()
+    except (OSError, StopIteration):
+        return [], []
+
+
+def remove_tree(path: Path) -> bool:
+    """Remove a folder of an agent's app trees with no link followed (a link
+    at its name or on the way is refused). A refusal is logged and the
+    caller goes on: these removals run after a release is live, at a purge
+    and at boot. False when refused."""
+    try:
+        safe_fs.rmtree_beneath(*_beneath(path), missing_ok=True)
+    except OSError:
+        logger.warning("App folder not removed: %s", path, exc_info=True)
+        return False
+    return True
+
+
+def sweep_stale(base: Path, prefix: str, max_age_s: float) -> None:
+    """Remove the folders named ``prefix…`` in ``base`` older than
+    ``max_age_s``: what a crashed job or a killed copy left beside the
+    releases."""
+    try:
+        root, base_rel = _beneath(base)
+        walk = safe_fs.walk_beneath(root, base_rel)
+        try:
+            step = next(walk)
+            now = time.time()
+            stale = [n for n in step.dirs if n.startswith(prefix)
+                     and now - os.stat(n, dir_fd=step.dirfd, follow_symlinks=False).st_mtime > max_age_s]
+        finally:
+            walk.close()
+    except (OSError, StopIteration):
+        return
+    for name in stale:
+        remove_tree(base / name)
 
 
 def bucket_root(agent_dir: Path, username: str) -> Path:
@@ -167,6 +255,17 @@ def preview_dir(row: dict) -> Path:
     return app_release_dir(row) / PREVIEW_DIRNAME
 
 
+def scratch_data_dir(row: dict) -> Path:
+    """A new data directory for a check instance, removed by its caller;
+    one a crashed job left behind is swept first. Synchronous."""
+    base = app_release_dir(row)
+    safe_fs.mkdirs_beneath(*agents_rel(base))
+    sweep_stale(base, SCRATCH_DATA_PREFIX, STALE_SCRATCH_S)
+    dest = base / f"{SCRATCH_DATA_PREFIX}{secrets.token_hex(4)}"
+    safe_fs.mkdirs_beneath(*agents_rel(dest), exist_ok=False)
+    return dest
+
+
 def log_path(row: dict) -> Path:
     return app_release_dir(row) / LOG_NAME
 
@@ -179,18 +278,60 @@ def rollback_snapshot_path(row: dict, stamp: str) -> Path:
     return app_release_dir(row) / f"rollback-{stamp}.sqlite"
 
 
+def drop_db_copies(row: dict) -> int:
+    """Remove every older copy of the app's database the platform keeps
+    (``<n>/db-before.sqlite``, ``rollback-*.sqlite``, the preview's
+    database, a crashed check's seeded copy, each with a ``.tmp`` a killed
+    proxy left), so a row the app
+    deleted lives on in none of them. Nothing is followed through a link.
+    The next rollback runs the older code on the database as it is
+    (``rollback_folder``'s branch for a release with no copy). The number
+    of files removed; 0 for an app that has none. Runs under the copy's own
+    lock (``app_db.copy_lock``), so a copy that runs meanwhile keeps its
+    private folder."""
+    from services.apps import app_db  # app_db imports this module
+    with app_db.copy_lock(row):
+        return _drop_db_copies(row)
+
+
+def _drop_db_copies(row: dict) -> int:
+    base = app_release_dir(row)
+    root, rel = _beneath(base)
+    names: list[str] = []
+    folders, files = entries(base)
+    for name in sorted(folders + files):
+        if name.isdigit():
+            names += [f"{name}/{DB_BEFORE_NAME}{suffix}" for suffix in ("", ".tmp")]
+        elif name.startswith("rollback-") and name.endswith((".sqlite", ".sqlite.tmp")):
+            names.append(name)
+        elif name.startswith(SCRATCH_DATA_PREFIX):
+            names += [f"{name}/app.db{suffix}" for suffix in ("", "-wal", "-shm")]
+        elif name.startswith(DB_SNAPSHOT_PREFIX):
+            # A killed copy's private folder holds links to the live database.
+            remove_tree(base / name)
+    names += [f"{PREVIEW_DIRNAME}/data/app.db{suffix}" for suffix in ("", "-wal", "-shm")]
+    removed = 0
+    for name in names:
+        try:
+            safe_fs.unlink_beneath(root, f"{rel}/{name}")
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except (OSError, safe_fs.SymlinkRefused):
+            logger.warning("App %s: the old copy %s could not be removed", row.get("slug"), name, exc_info=True)
+    return removed
+
+
 def _is_release(row: dict, child: Path) -> bool:
     if not child.name.isdigit():
         return False
     marker = MANIFEST_NAME if db_apps.app_kind_of(row).serves_tree else "index.html"
-    return (child / marker).is_file()
+    return is_plain_file(child, marker)
 
 
 def _all_numbers(row: dict) -> list[int]:
     d = app_release_dir(row)
-    if not d.is_dir():
-        return []
-    return sorted(int(c.name) for c in d.iterdir() if _is_release(row, c))
+    return sorted(int(n) for n in entries(d)[0] if _is_release(row, d / n))
 
 
 def release_numbers(row: dict) -> list[int]:
@@ -242,7 +383,7 @@ def prune(row: dict, keep: int = KEEP_RELEASES) -> None:
     releases alone until it is approved."""
     numbers = release_numbers(row)
     for old in numbers[:-keep] if len(numbers) > keep else []:
-        shutil.rmtree(app_release_dir(row) / str(old), ignore_errors=True)
+        remove_tree(app_release_dir(row) / str(old))
 
 
 def read_working_file(row: dict) -> bytes:
@@ -439,8 +580,11 @@ def read_manifest(release_dir: Path) -> dict | None:
     size); None when the directory holds none."""
     path = release_dir / MANIFEST_NAME
     try:
-        st = path.stat()
+        root, base = tree_root(release_dir)
     except OSError:
+        return None
+    st = safe_fs.kind_beneath(root, _join(base, MANIFEST_NAME)).st
+    if st is None or not stat.S_ISREG(st.st_mode):
         return None
     key = str(path)
     stamp = (st.st_mtime_ns, st.st_size)
@@ -448,7 +592,7 @@ def read_manifest(release_dir: Path) -> dict | None:
     if hit and hit[0] == stamp:
         return hit[1]
     try:
-        doc = json.loads(path.read_text("utf-8"))
+        doc = json.loads(read_tree_file(release_dir, MANIFEST_NAME, max_size=MANIFEST_MAX_BYTES))
     except (OSError, ValueError):
         return None
     files = doc.get("files") if isinstance(doc, dict) else None
@@ -459,11 +603,22 @@ def read_manifest(release_dir: Path) -> dict | None:
 
 
 def tree_sha(release_dir: Path) -> str:
-    path = release_dir / MANIFEST_NAME
     try:
-        return _sha256(path.read_bytes())
+        return _sha256(read_tree_file(release_dir, MANIFEST_NAME, max_size=MANIFEST_MAX_BYTES))
     except OSError:
         return ""
+
+
+def code_sha(release_dir: Path) -> str:
+    """The hash of a release's files with app.json left out, in the form a
+    template's record keeps for the tree its consent names: the importer
+    rewrites app.json, every other file travels as the template shipped it.
+    "" when the release holds no manifest."""
+    doc = read_manifest(release_dir)
+    if doc is None:
+        return ""
+    entries = {rel: e for rel, e in (doc.get("files") or {}).items() if rel != "app.json"}
+    return _sha256(manifest_text(entries).encode("utf-8"))
 
 
 def find_release_by_sha(row: dict, sha: str) -> Path | None:
@@ -474,13 +629,14 @@ def find_release_by_sha(row: dict, sha: str) -> Path | None:
     if not sha or not db_apps.app_kind_of(row).serves_tree:
         return None
     base = app_release_dir(row)
-    if not base.is_dir():
+    folders = entries(base)[0]
+    if not folders:
         return None
     candidates = [base / str(n) for n in _all_numbers(row)]
     candidates.append(preview_dir(row))
-    candidates.extend(sorted(base.glob(f"{CHECK_DIR_PREFIX}*")))
+    candidates.extend(base / n for n in sorted(folders) if n.startswith(CHECK_DIR_PREFIX))
     for d in candidates:
-        if (d / MANIFEST_NAME).is_file() and tree_sha(d) == sha:
+        if is_plain_file(d, MANIFEST_NAME) and tree_sha(d) == sha:
             return d
     return None
 
@@ -494,9 +650,10 @@ def read_release_file(release_dir: Path, rel: str) -> bytes | None:
     entry = manifest["files"].get(rel)
     if not isinstance(entry, dict):
         return None
-    path = release_dir / rel
     try:
-        data = path.read_bytes()
+        data = read_tree_file(release_dir, rel, max_size=MAX_RELEASE_FILE_BYTES)
+    except safe_fs.FileTooLarge as e:
+        raise ReleaseDamaged(rel) from e
     except OSError:
         return None
     if _sha256(data) != (entry.get("sha256") or ""):
@@ -512,8 +669,8 @@ def point_to(row: dict, n: int) -> tuple[str, str]:
         if not sha:
             raise ReleaseDamaged(str(n))
         return _release_dir_rel(row, n), sha
-    path = app_release_dir(row) / str(n) / "index.html"
-    return _release_rel(row, n), _sha256(path.read_bytes())
+    data = read_tree_file(app_release_dir(row) / str(n), "index.html", max_size=FILE_APP_MAX_BYTES)
+    return _release_rel(row, n), _sha256(data)
 
 
 def live_release_dir(row: dict) -> Path | None:
@@ -524,11 +681,47 @@ def live_release_dir(row: dict) -> Path | None:
     if not rel or not db_apps.app_kind_of(row).serves_tree:
         return None
     d = config.get_agent_dir(row["agent"]) / rel
-    if not (d / MANIFEST_NAME).is_file():
+    if not is_plain_file(d, MANIFEST_NAME):
         return None
     if tree_sha(d) != (row.get("release_sha256") or ""):
         raise ReleaseDamaged(rel)
     return d
+
+
+def live_runs_server(row: dict) -> bool:
+    """Whether the row's live release has a server entry. False for a row
+    with no release live, and for a live copy that is gone or damaged: what
+    cannot be read counts as no server (``adds_server``)."""
+    try:
+        live = live_release_dir(row)
+    except ReleaseDamaged:
+        return False
+    return live is not None and bool(app_sandbox.server_entry(live))
+
+
+def adds_server(row: dict, tree_dir: Path, live_serves: bool | None = None) -> bool:
+    """Whether the code in ``tree_dir`` brings a server where the row's live
+    release has none: such code waits for a person before it goes live, and
+    runs before that on empty data with no outside host. ``live_serves`` is
+    ``live_runs_server(row)`` when the caller read it earlier (a deploy reads
+    it before the cut, which can take a gone live copy's number)."""
+    if not app_sandbox.server_entry(tree_dir):
+        return False
+    return not (live_runs_server(row) if live_serves is None else live_serves)
+
+
+def rollback_adds_server(row: dict) -> bool:
+    """Whether a rollback brings a server back: the previous release has a
+    server entry and the live one has none (``adds_server``). The agent's
+    ``rollback_app`` is refused then."""
+    prev = previous_number(row)
+    return prev is not None and adds_server(row, app_release_dir(row) / str(prev))
+
+
+def pending_adds_server(row: dict) -> bool:
+    """``adds_server`` for the row's waiting release; False when none waits."""
+    pending = int(row.get("pending_release") or 0)
+    return bool(pending) and adds_server(row, app_release_dir(row) / str(pending))
 
 
 def read_release(row: dict) -> bytes | None:
@@ -543,20 +736,23 @@ def read_release(row: dict) -> bytes | None:
     if not rel:
         return None
     path = config.get_agent_dir(row["agent"]) / rel
-    if not path.is_file():
+    try:
+        data = safe_fs.read_bytes_beneath(*_beneath(path), max_size=FILE_APP_MAX_BYTES)
+    except safe_fs.FileTooLarge as e:
+        raise ReleaseDamaged(rel) from e
+    except OSError:
         return None
-    data = path.read_bytes()
     if _sha256(data) != (row.get("release_sha256") or ""):
         raise ReleaseDamaged(rel)
     return data
 
 
 def remove_release_dir(row: dict) -> None:
-    shutil.rmtree(app_release_dir(row), ignore_errors=True)
+    remove_tree(app_release_dir(row))
 
 
 def remove_data_dir(row: dict) -> None:
-    shutil.rmtree(app_data_dir(row), ignore_errors=True)
+    remove_tree(app_data_dir(row))
 
 
 def reconcile() -> dict[str, int]:
@@ -567,9 +763,23 @@ def reconcile() -> dict[str, int]:
     cleared = reaped = 0
     rows = task_store.list_released_apps()
     for row in rows:
+        if safe_fs.kind_beneath(agent_folder.agent_root(row["agent"]), "").kind != "dir":
+            # The agent's own folder not there (a link whose target is away):
+            # nothing about its releases is known, the row keeps its release.
+            logger.warning("App release not looked at, kept: app=%s path=%s",
+                           row.get("slug"), row["release_path"])
+            continue
         target = config.get_agent_dir(row["agent"]) / row["release_path"]
-        present = (target / MANIFEST_NAME).is_file() if db_apps.app_kind_of(row).serves_tree else target.is_file()
-        if not present:
+        folder, name = ((target, MANIFEST_NAME) if db_apps.app_kind_of(row).serves_tree
+                        else (target.parent, target.name))
+        found = _kind_in_tree(folder, name)
+        if found.kind == "other":
+            # Not looked at (a link on the way): never read as missing, the
+            # row keeps its release.
+            logger.warning("App release not looked at, kept: app=%s path=%s",
+                           row.get("slug"), row["release_path"])
+            continue
+        if not found.is_file:
             task_store.clear_app_release(row["id"])
             cleared += 1
             logger.warning(
@@ -581,18 +791,10 @@ def reconcile() -> dict[str, int]:
     if agents_dir.is_dir():
         for agent_dir in agent_dirs(agents_dir):
             base = agent_dir / RELEASES_DIRNAME
-            if not base.is_dir():
-                continue
-            buckets = [base / "shared"]
-            users = base / layout.USERS
-            if users.is_dir():
-                buckets.extend(p for p in users.iterdir() if p.is_dir())
+            buckets = [base / "shared"] + [base / layout.USERS / u for u in entries(base / layout.USERS)[0]]
             for bucket in buckets:
-                if not bucket.is_dir():
-                    continue
-                for app_dir in bucket.iterdir():
-                    if app_dir.is_dir() and app_dir.name not in live_ids:
-                        shutil.rmtree(app_dir, ignore_errors=True)
+                for name in entries(bucket)[0]:
+                    if name not in live_ids and remove_tree(bucket / name):
                         reaped += 1
     if cleared or reaped:
         logger.info("App releases reconciled: %d row(s) fell back, %d orphan dir(s) removed",

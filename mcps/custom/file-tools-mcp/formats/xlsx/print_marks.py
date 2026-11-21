@@ -265,29 +265,25 @@ def _anchor_cell(anchor: etree._Element) -> str:
 # --- The marked copy ----------------------------------------------------------
 
 
-def marked_copy(path: str, folder: str, *, own_copy: bool = False) -> str:
-    """Worker core: the workbook at ``path`` (read beneath the mount unless
-    ``own_copy``) copied into ``folder`` under its own name, with its marks;
+def marked_copy(path: str, folder: str) -> str:
+    """Worker core: the workbook at ``path`` (read through
+    ``CheckContext.open``: beneath the mount, or plainly for a copy the
+    server made) copied into ``folder`` under its own name, with its marks;
     the copy's path."""
     import checks
 
-    fileobj = open(path, "rb") if own_copy else None
-    try:
-        with checks.CheckContext(path, "xlsx", fileobj=fileobj) as ctx:
-            zf = ctx.zip()
-            parts = _marked_parts(zf)
-            if not parts:
-                return path
-            target = os.path.join(folder, os.path.basename(path))
-            with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as out:
-                for info in zf.infolist():
-                    if info.filename not in parts:
-                        out.writestr(info.filename, zf.read(info))
-                for name, data in parts.items():
-                    out.writestr(name, data)
-    finally:
-        if fileobj is not None:
-            fileobj.close()
+    with checks.CheckContext(path, "xlsx") as ctx:
+        zf = ctx.zip()
+        parts = _marked_parts(zf)
+        if not parts:
+            return path
+        target = os.path.join(folder, os.path.basename(path))
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as out:
+            for info in zf.infolist():
+                if info.filename not in parts:
+                    out.writestr(info.filename, zf.read(info))
+            for name, data in parts.items():
+                out.writestr(name, data)
     return target
 
 

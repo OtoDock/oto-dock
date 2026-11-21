@@ -431,7 +431,9 @@ def arm_bg_monitors(layer, session_id: str | None, chat_id: str | None) -> None:
     pending work and no monitor of that kind watches the session (the
     monitors' per-session guards make every caller idempotent). The one
     arming body for every chat turn source: the dashboard's turns, the turns
-    the platform drives into a chat, the reconnect pass."""
+    the platform drives into a chat, the reconnect pass. A turn the engine
+    starts by itself is read by the session's one reader between turns
+    (``remote_bg_commands.wake_reader``), not by these."""
     if not (session_id and chat_id and layer):
         return
     reg = get_subagent_registry(session_id)
@@ -444,6 +446,28 @@ def arm_bg_monitors(layer, session_id: str | None, chat_id: str | None) -> None:
               name="bg_command_monitor", owner="pump_bg_monitors")
 
 
+async def arm_bg_monitors_after(pump, layer, session_id: str | None, chat_id: str | None) -> None:
+    """Await a turn's pump to its end, then arm the monitors for the work it
+    left (``arm_bg_monitors``). The pump task completes only after its
+    producer's finally ran, where Codex registers the sub-agents that outlive
+    the turn, so an earlier check could miss them. ``asyncio.wait``, not the
+    task itself: cancelling this watcher at shutdown must never cancel the
+    pump it watches."""
+    task = getattr(pump, "_task", None)
+    if task is not None:
+        await asyncio.wait({task})
+    arm_bg_monitors(layer, session_id, chat_id)
+
+
+# Sessions whose task-run producer reads them between its own sends: the one
+# reader between turns leaves them alone (``reading_held``).
+_reading_held: set[str] = set()
+
+
+def reading_held(session_id: str) -> bool:
+    return session_id in _reading_held
+
+
 @contextmanager
 def hold_bg_monitors(session_id: str):
     """Suppress BOTH post-turn monitors for a session while the caller owns
@@ -452,13 +476,17 @@ def hold_bg_monitors(session_id: str):
     dashboard viewer detaching mid-run would otherwise arm a chat monitor on
     the task session, race the producer's own drain, and double-nudge. Adds
     to the monitors' idempotency sets so their guards no-op; releases only
-    what it added (a monitor already mid-flight keeps its own guard)."""
+    what it added (a monitor already mid-flight keeps its own guard). The one
+    reader between turns is held off the session the same way."""
     added_agent = session_id not in _bg_monitors_running
     added_cmd = session_id not in _bg_command_monitors_running
+    added_read = session_id not in _reading_held
     if added_agent:
         _bg_monitors_running.add(session_id)
     if added_cmd:
         _bg_command_monitors_running.add(session_id)
+    if added_read:
+        _reading_held.add(session_id)
     try:
         yield
     finally:
@@ -466,6 +494,8 @@ def hold_bg_monitors(session_id: str):
             _bg_monitors_running.discard(session_id)
         if added_cmd:
             _bg_command_monitors_running.discard(session_id)
+        if added_read:
+            _reading_held.discard(session_id)
 
 
 async def _bg_command_monitor(
@@ -511,78 +541,87 @@ async def _bg_command_monitor_impl(
         "chat=%s, count=%s", session_id[:8], chat_id[:8], count
     )
 
-    while (time.monotonic() - start) < MAX_WAIT:
-        if not bgreg.has_pending:
-            break
-        if not await ride_out_grace(layer, session_id):
-            logger.info("BG command monitor: session %s gone, exiting", session_id[:8])
-            return None
-        # No hook — actively read stdout (briefly, under the session lock) to
-        # catch task_updated{completed}. If a user turn holds the lock,
-        # drain_bg_commands backs off and returns False (the turn's own
-        # translator resolves completions meanwhile); we just retry next poll.
-        progressed = await layer.drain_bg_commands(session_id, budget=POLL_INTERVAL)
-        if not progressed and bgreg.has_pending:
-            await asyncio.sleep(0.3)  # nothing ready — back off before re-draining
-
-    if bgreg.has_pending:
-        # Past the fast phase a still-running job is polled slowly, up to
-        # the background-work ceiling: its completion frame lands on this
-        # stdout and nobody else reads it between turns, and the idle
-        # reaper spares the session only while the registry shows it.
-        from core.session import background_leash
-        SLOW_POLL = 15.0
-        ceiling = background_leash.background_work_ceiling()
-        logger.info(
-            "BG command monitor: %s command(s) still "
-            "running after %.0fs — polling every %.0fs "
-            "up to the %.0fs ceiling (session=%s)",
-            bgreg.pending_count, MAX_WAIT, SLOW_POLL, ceiling, session_id[:8]
-        )
-        while bgreg.has_pending and (time.monotonic() - start) < ceiling:
+    while True:
+        while (time.monotonic() - start) < MAX_WAIT:
+            if not bgreg.has_pending:
+                break
             if not await ride_out_grace(layer, session_id):
                 logger.info("BG command monitor: session %s gone, exiting", session_id[:8])
                 return None
+            # No hook — actively read stdout (briefly, under the session lock) to
+            # catch task_updated{completed}. If a user turn holds the lock,
+            # drain_bg_commands backs off and returns False (the turn's own
+            # translator resolves completions meanwhile); we just retry next poll.
             progressed = await layer.drain_bg_commands(session_id, budget=POLL_INTERVAL)
-            if bgreg.has_pending and not progressed:
-                await asyncio.sleep(SLOW_POLL)
+            if not progressed and bgreg.has_pending:
+                await asyncio.sleep(0.3)  # nothing ready — back off before re-draining
 
-    if bgreg.has_pending:
-        logger.warning(
-            "BG command monitor: %s command(s) still pending "
-            "at the background-work ceiling — giving up (no nudge)", bgreg.pending_count
-        )
-        return None
+        if bgreg.has_pending:
+            # Past the fast phase a still-running job is polled slowly, up to
+            # the background-work ceiling: its completion frame lands on this
+            # stdout and nobody else reads it between turns, and the idle
+            # reaper spares the session only while the registry shows it.
+            from core.session import background_leash
+            SLOW_POLL = 15.0
+            ceiling = background_leash.background_work_ceiling()
+            logger.info(
+                "BG command monitor: %s command(s) still "
+                "running after %.0fs — polling every %.0fs "
+                "up to the %.0fs ceiling (session=%s)",
+                bgreg.pending_count, MAX_WAIT, SLOW_POLL, ceiling, session_id[:8]
+            )
+            while bgreg.has_pending and (time.monotonic() - start) < ceiling:
+                if not await ride_out_grace(layer, session_id):
+                    logger.info("BG command monitor: session %s gone, exiting", session_id[:8])
+                    return None
+                progressed = await layer.drain_bg_commands(session_id, budget=POLL_INTERVAL)
+                if bgreg.has_pending and not progressed:
+                    await asyncio.sleep(SLOW_POLL)
 
-    if not await ride_out_grace(layer, session_id):
-        return None
+        if bgreg.has_pending:
+            logger.warning(
+                "BG command monitor: %s command(s) still pending "
+                "at the background-work ceiling — giving up (no nudge)", bgreg.pending_count
+            )
+            return None
 
-    # A run on this chat or session owes its report: its producer reviews the
-    # commands it inherits (pending plus unseen); the checks below then read
-    # what is left once that window closes.
-    if await _wait_report_window(layer, session_id, chat_id) is None:
-        return None
+        if not await ride_out_grace(layer, session_id):
+            return None
 
-    # The user STOPPED this chat's last turn (graceful abort keeps the CLI —
-    # and its backgrounded commands — alive, so this monitor now survives an
-    # abort): a nudge would auto-run a turn the user just refused. The CLI's
-    # own bg tracking hands the results to the model on the next REAL turn.
-    if chat_id and ((await run_db(task_store.get_chat, chat_id)) or {}).get("last_turn_aborted"):
-        logger.info(
-            "BG command monitor: last turn aborted by the user — skipping "
-            "nudge for chat=%s", chat_id[:8]
-        )
-        return None
+        # A run on this chat or session owes its report: its producer reviews the
+        # commands it inherits (pending plus unseen); the checks below then read
+        # what is left once that window closes.
+        if await _wait_report_window(layer, session_id, chat_id) is None:
+            return None
 
-    # Self-wake supersession — mirror of the subagent monitor: the CLI's own
-    # review turn (captured by the drain above or during this grace) makes
-    # our nudge redundant. Per-command badges are already cleared.
-    if await _wake_grace_covers(layer, session_id):
-        logger.info(
-            "BG command monitor: self-wake turn covered the cohort — nudge "
-            "stands down (session=%s)", session_id[:8]
-        )
-        return None
+        # The user STOPPED this chat's last turn (graceful abort keeps the CLI —
+        # and its backgrounded commands — alive, so this monitor now survives an
+        # abort): a nudge would auto-run a turn the user just refused. The CLI's
+        # own bg tracking hands the results to the model on the next REAL turn.
+        if chat_id and ((await run_db(task_store.get_chat, chat_id)) or {}).get("last_turn_aborted"):
+            logger.info(
+                "BG command monitor: last turn aborted by the user — skipping "
+                "nudge for chat=%s", chat_id[:8]
+            )
+            return None
+
+        # Self-wake supersession — mirror of the subagent monitor: the CLI's own
+        # review turn (captured by the drain above or during this grace) makes
+        # our nudge redundant. Per-command badges are already cleared.
+        if await _wake_grace_covers(layer, session_id):
+            if bgreg.has_pending:
+                # The review the engine ran started more work: it is watched
+                # the same way, inside the same ceiling.
+                logger.info("BG command monitor: the self-wake turn started %s "
+                            "command(s) — watching them (session=%s)",
+                            bgreg.pending_count, session_id[:8])
+                continue
+            logger.info(
+                "BG command monitor: self-wake turn covered the cohort — nudge "
+                "stands down (session=%s)", session_id[:8]
+            )
+            return None
+        break
 
     # Every completion landed inside a later turn (the turn-start reset keeps
     # a still-running command pending, so this monitor outlives that turn),

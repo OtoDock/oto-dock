@@ -1,0 +1,438 @@
+{
+ "caps_default": {
+  "auth": {
+   "auth_types": [],
+   "credential_file": null,
+   "oauth_flow": "",
+   "resume_refusal_codes": [],
+   "session_home": null,
+   "sign_in_in_place": false
+  },
+  "behaviour": {
+   "attach_images_inline": false,
+   "builtin_file_tools": false,
+   "has_shell_on_external_route": true,
+   "hides_denied_tools": false,
+   "nonblocking_question_tools": [],
+   "prompt_cache_s": 0,
+   "provider_pinned_per_session": false,
+   "rebuilds_history_from_db": false,
+   "repository_instruction_files": [],
+   "skills_delivery": "materialized_dir",
+   "start_context_door": "turn",
+   "supports_background_commands": false,
+   "supports_bash": false,
+   "supports_compact": false,
+   "supports_interrupt_for_queued": false,
+   "supports_plans_dir": false,
+   "supports_steer": false,
+   "supports_step_descriptions": false,
+   "tools": {}
+  },
+  "compression_threshold_pct": null,
+  "control_commands": [],
+  "display_name": "D",
+  "effort_changeable_mid_session": false,
+  "effort_levels": [],
+  "identity": {
+   "account_label": "",
+   "role": "supporting",
+   "short_name": "",
+   "sort_order": 100,
+   "vendor_id": "",
+   "vendor_label": ""
+  },
+  "mcp_config_format": "json",
+  "mcp_delivery": "external_config",
+  "model_policy": {
+   "default_model": "",
+   "model_filter_policy": "none",
+   "pricing_editable": false
+  },
+  "models": [],
+  "name": "d",
+  "permission_modes": [],
+  "providers": null,
+  "runtime": {
+   "binary": "",
+   "config_dir_name": "",
+   "event_queue_depth": 0,
+   "hard_abort_kills_process": false,
+   "has_os_process": false,
+   "installed_name": "",
+   "interactive_first_prompt_via_argv": false,
+   "interactive_reports_model": false,
+   "interactive_submit_backstop": false,
+   "pin_key": "",
+   "readopts_idle_session": false,
+   "self_wakes": false,
+   "supports_interactive_pty": false,
+   "supports_reattach_after_restart": false,
+   "supports_remote_execution": false
+  },
+  "supports_context_compression": false,
+  "supports_control_commands": false,
+  "supports_mcps": true,
+  "supports_permissions": false,
+  "supports_plan_mode": false,
+  "supports_resume": false,
+  "supports_subagents": false,
+  "supports_todos": false,
+  "usage": {
+   "in_band": [],
+   "windows": []
+  }
+ },
+ "caps_filled": {
+  "auth": {
+   "auth_types": [
+    "oauth",
+    "api_key"
+   ],
+   "credential_file": {
+    "dirname": ".x",
+    "filename": "creds.json",
+    "wire_kind": "x-kind"
+   },
+   "oauth_flow": "device_code",
+   "resume_refusal_codes": [],
+   "session_home": null,
+   "sign_in_in_place": false
+  },
+  "behaviour": {
+   "attach_images_inline": true,
+   "builtin_file_tools": true,
+   "has_shell_on_external_route": false,
+   "hides_denied_tools": false,
+   "nonblocking_question_tools": [
+    "AskLater"
+   ],
+   "prompt_cache_s": 0,
+   "provider_pinned_per_session": true,
+   "rebuilds_history_from_db": true,
+   "repository_instruction_files": [
+    "instructions.txt",
+    "AGENTS.md"
+   ],
+   "skills_delivery": "prompt_catalog",
+   "start_context_door": "turn",
+   "supports_background_commands": false,
+   "supports_bash": true,
+   "supports_compact": true,
+   "supports_interrupt_for_queued": true,
+   "supports_plans_dir": true,
+   "supports_steer": true,
+   "supports_step_descriptions": false,
+   "tools": {
+    "question": [
+     "Ask"
+    ],
+    "shell": [
+     "Bash",
+     "Run"
+    ]
+   }
+  },
+  "compression_threshold_pct": 80,
+  "control_commands": [
+   "set_model"
+  ],
+  "display_name": "Engine X",
+  "effort_changeable_mid_session": true,
+  "effort_levels": [
+   "low",
+   "high"
+  ],
+  "identity": {
+   "account_label": "Acme Plan",
+   "role": "coding",
+   "short_name": "x",
+   "sort_order": 7,
+   "vendor_id": "acme",
+   "vendor_label": "Acme"
+  },
+  "mcp_config_format": "toml",
+  "mcp_delivery": "proxy_managed",
+  "model_policy": {
+   "default_model": "m1",
+   "model_filter_policy": "all",
+   "pricing_editable": true
+  },
+  "models": [
+   {
+    "id": "m1",
+    "tier": 2
+   }
+  ],
+  "name": "engine-x",
+  "permission_modes": [
+   "ask",
+   "plan"
+  ],
+  "providers": [
+   {
+    "id": "acme",
+    "label": "Acme",
+    "requires_key": true
+   }
+  ],
+  "runtime": {
+   "binary": "xcli",
+   "config_dir_name": ".x",
+   "event_queue_depth": 64,
+   "hard_abort_kills_process": true,
+   "has_os_process": true,
+   "installed_name": "x-cli",
+   "interactive_first_prompt_via_argv": true,
+   "interactive_reports_model": false,
+   "interactive_submit_backstop": true,
+   "pin_key": "x_cli",
+   "readopts_idle_session": true,
+   "self_wakes": true,
+   "supports_interactive_pty": true,
+   "supports_reattach_after_restart": true,
+   "supports_remote_execution": true
+  },
+  "supports_context_compression": true,
+  "supports_control_commands": true,
+  "supports_mcps": false,
+  "supports_permissions": true,
+  "supports_plan_mode": true,
+  "supports_resume": true,
+  "supports_subagents": true,
+  "supports_todos": true,
+  "usage": {
+   "in_band": [],
+   "windows": [
+    {
+     "key": "five_hour",
+     "label": "5-hour limit",
+     "length_s": 18000,
+     "role": "session",
+     "scope": "account"
+    },
+    {
+     "key": "seven_day",
+     "label": "weekly limit reached",
+     "length_s": 604800,
+     "role": "quota",
+     "scope": "account"
+    }
+   ]
+  }
+ },
+ "credential_file": {
+  "dirname": "d",
+  "filename": "f",
+  "wire_kind": "k"
+ },
+ "groups_default": {
+  "auth": {
+   "auth_types": [],
+   "credential_file": null,
+   "oauth_flow": "",
+   "resume_refusal_codes": [],
+   "session_home": null,
+   "sign_in_in_place": false
+  },
+  "behaviour": {
+   "attach_images_inline": false,
+   "builtin_file_tools": false,
+   "has_shell_on_external_route": true,
+   "hides_denied_tools": false,
+   "nonblocking_question_tools": [],
+   "prompt_cache_s": 0,
+   "provider_pinned_per_session": false,
+   "rebuilds_history_from_db": false,
+   "repository_instruction_files": [],
+   "skills_delivery": "materialized_dir",
+   "start_context_door": "turn",
+   "supports_background_commands": false,
+   "supports_bash": false,
+   "supports_compact": false,
+   "supports_interrupt_for_queued": false,
+   "supports_plans_dir": false,
+   "supports_steer": false,
+   "supports_step_descriptions": false,
+   "tools": {}
+  },
+  "identity": {
+   "account_label": "",
+   "role": "supporting",
+   "short_name": "",
+   "sort_order": 100,
+   "vendor_id": "",
+   "vendor_label": ""
+  },
+  "model_policy": {
+   "default_model": "",
+   "model_filter_policy": "none",
+   "pricing_editable": false
+  },
+  "runtime": {
+   "binary": "",
+   "config_dir_name": "",
+   "event_queue_depth": 0,
+   "hard_abort_kills_process": false,
+   "has_os_process": false,
+   "installed_name": "",
+   "interactive_first_prompt_via_argv": false,
+   "interactive_reports_model": false,
+   "interactive_submit_backstop": false,
+   "pin_key": "",
+   "readopts_idle_session": false,
+   "self_wakes": false,
+   "supports_interactive_pty": false,
+   "supports_reattach_after_restart": false,
+   "supports_remote_execution": false
+  },
+  "usage": {
+   "in_band": [],
+   "windows": []
+  }
+ },
+ "groups_filled": {
+  "auth": {
+   "auth_types": [
+    "oauth",
+    "api_key"
+   ],
+   "credential_file": {
+    "dirname": ".x",
+    "filename": "creds.json",
+    "wire_kind": "x-kind"
+   },
+   "oauth_flow": "device_code",
+   "resume_refusal_codes": [],
+   "session_home": null,
+   "sign_in_in_place": false
+  },
+  "behaviour": {
+   "attach_images_inline": true,
+   "builtin_file_tools": true,
+   "has_shell_on_external_route": false,
+   "hides_denied_tools": false,
+   "nonblocking_question_tools": [
+    "AskLater"
+   ],
+   "prompt_cache_s": 0,
+   "provider_pinned_per_session": true,
+   "rebuilds_history_from_db": true,
+   "repository_instruction_files": [
+    "instructions.txt",
+    "AGENTS.md"
+   ],
+   "skills_delivery": "prompt_catalog",
+   "start_context_door": "turn",
+   "supports_background_commands": false,
+   "supports_bash": true,
+   "supports_compact": true,
+   "supports_interrupt_for_queued": true,
+   "supports_plans_dir": true,
+   "supports_steer": true,
+   "supports_step_descriptions": false,
+   "tools": {
+    "question": [
+     "Ask"
+    ],
+    "shell": [
+     "Bash",
+     "Run"
+    ]
+   }
+  },
+  "identity": {
+   "account_label": "Acme Plan",
+   "role": "coding",
+   "short_name": "x",
+   "sort_order": 7,
+   "vendor_id": "acme",
+   "vendor_label": "Acme"
+  },
+  "model_policy": {
+   "default_model": "m1",
+   "model_filter_policy": "all",
+   "pricing_editable": true
+  },
+  "runtime": {
+   "binary": "xcli",
+   "config_dir_name": ".x",
+   "event_queue_depth": 64,
+   "hard_abort_kills_process": true,
+   "has_os_process": true,
+   "installed_name": "x-cli",
+   "interactive_first_prompt_via_argv": true,
+   "interactive_reports_model": false,
+   "interactive_submit_backstop": true,
+   "pin_key": "x_cli",
+   "readopts_idle_session": true,
+   "self_wakes": true,
+   "supports_interactive_pty": true,
+   "supports_reattach_after_restart": true,
+   "supports_remote_execution": true
+  },
+  "usage": {
+   "in_band": [],
+   "windows": [
+    {
+     "key": "five_hour",
+     "label": "5-hour limit",
+     "length_s": 18000,
+     "role": "session",
+     "scope": "account"
+    },
+    {
+     "key": "seven_day",
+     "label": "weekly limit reached",
+     "length_s": 604800,
+     "role": "quota",
+     "scope": "account"
+    }
+   ]
+  }
+ },
+ "key_order": [
+  "name",
+  "display_name",
+  "supports_resume",
+  "supports_permissions",
+  "supports_plan_mode",
+  "supports_todos",
+  "supports_subagents",
+  "supports_context_compression",
+  "supports_control_commands",
+  "supports_mcps",
+  "permission_modes",
+  "control_commands",
+  "models",
+  "effort_levels",
+  "effort_changeable_mid_session",
+  "compression_threshold_pct",
+  "mcp_delivery",
+  "mcp_config_format",
+  "providers",
+  "identity",
+  "runtime",
+  "behaviour",
+  "model_policy",
+  "auth",
+  "usage"
+ ],
+ "runtime_key_order": [
+  "has_os_process",
+  "hard_abort_kills_process",
+  "supports_remote_execution",
+  "supports_interactive_pty",
+  "interactive_first_prompt_via_argv",
+  "supports_reattach_after_restart",
+  "readopts_idle_session",
+  "binary",
+  "pin_key",
+  "config_dir_name",
+  "installed_name",
+  "self_wakes",
+  "event_queue_depth",
+  "interactive_submit_backstop",
+  "interactive_reports_model"
+ ]
+}

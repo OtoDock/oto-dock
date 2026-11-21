@@ -47,16 +47,14 @@ class PlatformSettingsRequest(BaseModel):
     # Session retention (services/infra/retention.py)
     session_retention_enabled: bool | None = None
     session_retention_days: str | None = None
+    # The working-files window (services/infra/working_files.py)
+    working_files_retention_enabled: bool | None = None
+    working_files_retention_days: str | None = None
     # The archive of removed people (services/infra/retention.py)
     offboarded_retention_enabled: bool | None = None
     offboarded_retention_days: str | None = None
     # Automatic MCP updates (services/mcp/mcp_autoupdate.py)
     mcp_auto_update_enabled: bool | None = None
-    # The apps' store review ask (api/auth/_common.py): on or off, and the
-    # days before the second ask. Parsed in the handler, so a word or a
-    # fraction is the handler's sentence and not a validation error.
-    store_review_enabled: bool | None = None
-    store_review_days: str | int | float | None = None
     # Read each OAuth account's 5-hour / weekly usage from the vendor
     # (services/engines/subscription_windows.py). Default ON (unset = on).
     subscription_windows_enabled: bool | None = None
@@ -140,8 +138,9 @@ async def _enforce_user_paired_disabled() -> None:
             live: list[str] = []
             for machine_id in connected:
                 machine = _rs.get_remote_machine(machine_id)
-                if not machine or placement.machine_is_admin_paired(machine):
-                    continue  # admin-paired stays connected
+                if (not machine or placement.machine_is_admin_paired(machine)
+                        or placement.machine_is_compute(machine)):
+                    continue  # an admin's machine stays connected; a compute one is no person's
                 try:
                     _rs.clear_user_remote_targets_for_machine(machine_id)
                 except Exception:
@@ -230,6 +229,11 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         # only — junk/orphan cleanup always runs.
         "session_retention_enabled": settings.get("session_retention_enabled", "") != "0",
         "session_retention_days": settings.get("session_retention_days", "") or "180",
+        # The working-files window (unset = ON at 180 days).
+        "working_files_retention_enabled": settings.get("working_files_retention_enabled", "") != "0",
+        "working_files_retention_days": settings.get("working_files_retention_days", "") or "180",
+        # Off and absent from the card unless an operator set it.
+        "chat_rows_retention_days": _chat_rows_days_shown(settings.get("chat_rows_retention_days", "")),
         # The archive of removed people: its own toggle (unset = ON) and days
         # (default 180; 0 keeps the archives for ever).
         "offboarded_retention_enabled": settings.get("offboarded_retention_enabled", "") != "0",
@@ -244,7 +248,8 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         # updates in a low-traffic window, deferring docker MCPs that are in use.
         # Failure-only admin notification + an inline run-history log.
         "mcp_auto_update_enabled": settings.get("mcp_auto_update_enabled", "") != "0",
-        # The apps' store review ask (api/auth/_common.py). Default ON, 90 days.
+        # The apps' store review ask (api/auth/_common.py): default ON, 90 days,
+        # no field of the PUT (an operator sets them in OTODOCK_FORCED_SETTINGS).
         "store_review_enabled": settings.get("store_review_enabled", "") != "0",
         "store_review_days": _common.store_review_days_from(settings.get("store_review_days", "")),
         # Storage quotas (services/infra/storage_quota.py). MB; the value shown is the
@@ -359,32 +364,15 @@ async def _refuse_require_2fa_that_would_hold(u: UserContext) -> None:
         )
 
 
+def _chat_rows_days_shown(raw: str) -> str:
+    """What the sweep makes of the chat-rows window: nothing when it deletes nothing."""
+    from services.infra import history_retention
+    return str(history_retention.days_from(raw) or "")
+
+
 def _retention_days_shown(raw: str) -> int:
     from services.infra import retention as _retention
     return _retention.offboarded_days_from(raw)
-
-
-def _validated_store_review_days(value: str | int | float | None) -> int | None:
-    """The days before the second store review ask a PUT carries, refused
-    before anything is written when not a whole number in range."""
-    if value is None:
-        return None
-    raw = str(value).strip()
-    if (not raw.isdecimal()
-            or not _common.STORE_REVIEW_DAYS_MIN <= int(raw) <= _common.STORE_REVIEW_DAYS_MAX):
-        raise HTTPException(
-            400, "The days before the second ask are a whole number from "
-                 f"{_common.STORE_REVIEW_DAYS_MIN} to {_common.STORE_REVIEW_DAYS_MAX}.")
-    return int(raw)
-
-
-async def _save_store_review(enabled: bool | None, days: int | None) -> None:
-    """The apps' store review ask: the switch, and the days already judged."""
-    if enabled is not None:
-        await asyncio.to_thread(
-            task_store.set_platform_setting, "store_review_enabled", "1" if enabled else "0")
-    if days is not None:
-        await asyncio.to_thread(task_store.set_platform_setting, "store_review_days", str(days))
 
 
 def _validated_notebook_bytes(value: str | None) -> int | None:
@@ -398,6 +386,34 @@ def _validated_notebook_bytes(value: str | None) -> int | None:
             400, "The Notebook's share of the prompt is a whole number of bytes "
                  f"from 0 to {notebook_entries.INLINE_BYTES_MAX:,}.")
     return int(raw)
+
+
+def _validated_working_days(value: str | None) -> int | None:
+    """The working-files window a PUT carries, refused before anything is
+    written when outside the pass's range: a typed 0 means keep on the card
+    below it, and must never become the shortest window."""
+    if value is None:
+        return None
+    from services.infra import working_files as _working_files
+    try:
+        days = int(str(value).strip())
+    except (TypeError, ValueError):
+        days = -1
+    if not _working_files.MIN_DAYS <= days <= _working_files.MAX_DAYS:
+        raise HTTPException(400, f"Enter a number of days from {_working_files.MIN_DAYS} to "
+                                 f"{_working_files.MAX_DAYS}. To keep everything, turn this cleanup off.")
+    return days
+
+
+async def _save_working_files(enabled: bool | None, days: int | None) -> None:
+    """The working-files toggle and window, already judged."""
+    from services.infra import working_files as _working_files
+    if enabled is not None:
+        await asyncio.to_thread(
+            task_store.set_platform_setting, _working_files.ENABLED_KEY, "1" if enabled else "0")
+    if days is not None:
+        await asyncio.to_thread(
+            task_store.set_platform_setting, _working_files.DAYS_KEY, str(days))
 
 
 @router.put("/v1/admin/platform-settings")
@@ -421,8 +437,8 @@ async def set_platform_settings(
             raise HTTPException(
                 400, f"offboarded_retention_days must be a whole number from 0 (keep for ever) "
                      f"to {_retention.OFFBOARDED_MAX_DAYS}")
+    working_days = _validated_working_days(req.working_files_retention_days)
     notebook_bytes = _validated_notebook_bytes(req.notebook_inline_bytes)
-    store_review_days = _validated_store_review_days(req.store_review_days)
     if req.require_2fa:
         await _refuse_require_2fa_that_would_hold(u)
     if req.company_name is not None:
@@ -504,6 +520,7 @@ async def set_platform_settings(
             "session_retention_enabled",
             "1" if req.session_retention_enabled else "0",
         )
+    await _save_working_files(req.working_files_retention_enabled, working_days)
     if archive_days is not None:
         await asyncio.to_thread(
             task_store.set_platform_setting, "offboarded_retention_days", str(archive_days))
@@ -521,7 +538,6 @@ async def set_platform_settings(
             "mcp_auto_update_enabled",
             "1" if req.mcp_auto_update_enabled else "0",
         )
-    await _save_store_review(req.store_review_enabled, store_review_days)
     if req.session_retention_days is not None:
         # Clamp to the sweep's floor; garbage falls back to the default.
         from services.infra import retention as _retention

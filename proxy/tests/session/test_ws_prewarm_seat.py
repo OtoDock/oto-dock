@@ -14,9 +14,10 @@ The detached pre-warm and the model-foreign check live in ws/dashboard_prewarm.p
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
+
+from tests._pool_store import pool_store
 
 
 def _controller():
@@ -78,7 +79,7 @@ def _cfg(**over):
     base = dict(
         subscription_id="sub-S", execution_target="local",
         sandbox_host_claude_dir="/agents/a/.codex", execution_path="codex-cli",
-        model="some-model", interactive=False,
+        model="some-model", interactive=False, mcp_config_path="",
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -86,10 +87,9 @@ def _cfg(**over):
 
 @pytest.mark.asyncio
 async def test_remote_target_skip_returns_the_seat(monkeypatch):
-    from services.engines import subscription_pool as sp
     conn = _controller()
     calls = _stub_seams(monkeypatch, built_cfg=_cfg(execution_target="mach-790546a4"))
-    with patch.object(sp, "subscription_store") as store:
+    with pool_store() as store:
         await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
                                        "execution_path": "codex-cli"})
     assert len(calls) == 1
@@ -100,11 +100,10 @@ async def test_remote_target_skip_returns_the_seat(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_interactive_skip_returns_the_seat(monkeypatch):
-    from services.engines import subscription_pool as sp
     conn = _controller()
     _stub_seams(monkeypatch, built_cfg=_cfg())
     monkeypatch.setattr("ws.dashboard._resolve_session_interactive", lambda cfg, *a: True)
-    with patch.object(sp, "subscription_store") as store:
+    with pool_store() as store:
         await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
                                        "execution_path": "codex-cli"})
     store.decrement_active_sessions.assert_called_once_with("sub-S")
@@ -116,11 +115,10 @@ async def test_foreign_model_skips_before_building(monkeypatch):
     # The frame pairs the page's Claude model with a Codex pre-warm: building
     # would filter the Codex candidates by provider anthropic and refuse
     # (the T1 "no borrowable platform credentials" of 2026-09-10 05:07:59).
-    from services.engines import subscription_pool as sp
     conn = _controller()
     calls = _stub_seams(monkeypatch, built_cfg=_cfg(),
                         model_layers=["claude-code-cli", "direct-llm"])
-    with patch.object(sp, "subscription_store") as store:
+    with pool_store() as store:
         await conn._handle_pre_warmup({"agent": "alpha", "model": "claude-sonnet-5",
                                        "execution_path": "codex-cli"})
     assert calls == []
@@ -142,7 +140,6 @@ def test_model_foreign_to_engine_trusts_unknown_models(monkeypatch):
 @pytest.mark.asyncio
 async def test_detached_prewarm_skips_return_the_seat(monkeypatch):
     import ws.dashboard  # noqa: F401  (the pre-warm module needs it loaded first)
-    from services.engines import subscription_pool as sp
     from ws import dashboard_prewarm as dp
 
     async def _run_db(fn, *a, **k):
@@ -160,7 +157,7 @@ async def test_detached_prewarm_skips_return_the_seat(monkeypatch):
         return _cfg(execution_target="mach-1")
 
     monkeypatch.setattr(dp, "build_agent_config", _build)
-    with patch.object(sp, "subscription_store") as store:
+    with pool_store() as store:
         sid = await dp.spawn_detached_prewarm(
             agent="alpha", user={"username": "pw", "role": "manager"},
             user_sub="user-pw", requested_model="some-model",
@@ -176,7 +173,6 @@ async def test_cancelled_prewarm_returns_the_seat_and_the_slot(monkeypatch):
     # skipped and the seat the build took stayed taken until a restart.
     conn = _controller()
     from core import concurrency
-    from services.engines import subscription_pool as sp
     from ws import dashboard_prewarm as dp, dashboard_warmup as dw
     _stub_seams(monkeypatch, built_cfg=_cfg())
     monkeypatch.setattr("ws.dashboard._resolve_session_interactive", lambda cfg, *a: False)
@@ -197,7 +193,7 @@ async def test_cancelled_prewarm_returns_the_seat_and_the_slot(monkeypatch):
     monkeypatch.setattr(dw, "get_execution_layer", lambda *a, **k: _Layer())
     monkeypatch.setattr(concurrency, "acquire_chat_slot", _acquire)
     monkeypatch.setattr(concurrency, "release_chat_slot", released.append)
-    with patch.object(sp, "subscription_store") as store:
+    with pool_store() as store:
         task = asyncio.create_task(conn._handle_pre_warmup(
             {"agent": "alpha", "model": "some-model", "execution_path": "codex-cli"}))
         await spawning.wait()
@@ -217,7 +213,6 @@ async def test_prewarm_cancelled_inside_the_build_still_returns_the_seat(monkeyp
     # it must wait for the config and give the seat back.
     conn = _controller()
     from core import concurrency
-    from services.engines import subscription_pool as sp
     from ws import dashboard_prewarm as dp, dashboard_warmup as dw
     _stub_seams(monkeypatch, built_cfg=_cfg())
     building = asyncio.Event()
@@ -230,7 +225,7 @@ async def test_prewarm_cancelled_inside_the_build_still_returns_the_seat(monkeyp
 
     monkeypatch.setattr(dw, "build_agent_config", _build)
     monkeypatch.setattr(concurrency, "release_chat_slot", lambda sid: None)
-    with patch.object(sp, "subscription_store") as store:
+    with pool_store() as store:
         task = asyncio.create_task(conn._handle_pre_warmup(
             {"agent": "alpha", "model": "some-model", "execution_path": "codex-cli"}))
         await building.wait()
@@ -256,7 +251,9 @@ async def test_no_room_for_two_skips_before_the_build(monkeypatch):
                         lambda path=None, **kw: asked.append((path, kw)) or False)
     await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
                                    "execution_path": "codex-cli"})
-    assert asked == [("codex-cli", {"user_sub": "user-pw"})]
+    # ``shared_folder``: the rule of a tool's local address, read in the
+    # pre-warm's own thread job (no machine on another host here).
+    assert asked == [("codex-cli", {"user_sub": "user-pw", "shared_folder": False})]
     assert calls == []
     assert conn.errors == [] and conn.sent == []
     assert conn._pre_warmed_sid is None
@@ -267,7 +264,6 @@ async def test_a_speculative_refusal_returns_the_seat_quietly(monkeypatch):
     """A pre-warm's admit is speculative: refused for lack of room, it gives
     the seat back and shows nothing (nothing was asked for yet)."""
     from core import concurrency
-    from services.engines import subscription_pool as sp
     conn = _controller()
     _stub_seams(monkeypatch, built_cfg=_cfg())
     monkeypatch.setattr("ws.dashboard._resolve_session_interactive", lambda cfg, *a: False)
@@ -278,7 +274,7 @@ async def test_a_speculative_refusal_returns_the_seat_quietly(monkeypatch):
         seen.update(kw)
         return concurrency.Admission(False, "speculative", None)
     monkeypatch.setattr(concurrency, "acquire_chat_slot", _acquire)
-    with patch.object(sp, "subscription_store") as store:
+    with pool_store() as store:
         await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
                                        "execution_path": "codex-cli"})
     assert seen["speculative"] is True and seen["user_sub"] == "user-pw"
@@ -307,6 +303,38 @@ async def test_detached_prewarm_asks_the_ledger_before_building(monkeypatch):
     sid = await dp.spawn_detached_prewarm(
         agent="alpha", user={"username": "pw"}, user_sub="user-pw")
     assert sid is None and calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_prewarm_tells_the_page_its_reason(monkeypatch):
+    """A person with no engine: the pre-warm's build refuses, and the page
+    hears the same sentence a send would meet, by reason, for this agent
+    and engine (not a bare error frame)."""
+    from services.engines.subscription_pool import NoSubscriptionError
+    from ws import dashboard_warmup as dw
+    conn = _controller()
+    _stub_seams(monkeypatch, built_cfg=_cfg())
+
+    async def _refused(**kwargs):
+        raise NoSubscriptionError("auth_off")
+    monkeypatch.setattr(dw, "build_agent_config", _refused)
+    await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model", "execution_path": "codex-cli"})
+    assert conn.errors == []
+    assert conn.sent == [{"type": "pre_warmup_refused", "agent": "alpha", "execution_path": "codex-cli",
+                          "reason": "auth_off", "error": "This runs on an AI engine you have not connected yet."}]
+
+
+@pytest.mark.asyncio
+async def test_a_crash_in_the_prewarm_keeps_the_error_frame(monkeypatch):
+    from ws import dashboard_warmup as dw
+    conn = _controller()
+    _stub_seams(monkeypatch, built_cfg=_cfg())
+
+    async def _broken(**kwargs):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(dw, "build_agent_config", _broken)
+    await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model", "execution_path": "codex-cli"})
+    assert conn.sent == [] and conn.errors and "boom" in conn.errors[0]
 
 
 @pytest.mark.asyncio
@@ -405,18 +433,33 @@ async def test_a_prewarm_another_tab_claimed_is_left_running(monkeypatch):
     assert "taken-sid" not in released and conn._pre_warmed_sid is None
 
 
-def test_the_layer_for_a_prewarm_falls_back_to_its_engine(monkeypatch):
-    """A pool drops a dead entry on any lookup, so "nobody holds it" still
-    closes on the pre-warm's own engine (the close frees the seat and the
-    slot); a holder wins; an unknown engine gives nothing to close on."""
+def test_the_layer_for_a_prewarm_is_the_one_that_holds_it(monkeypatch):
+    """A pool drops a dead entry on any lookup, so "nobody holds it" has no
+    layer to close on, whatever its engine (the caller gives back the seat
+    and the slot, ``release_unheld``); a holder is the answer."""
     from core.session import session_manager as sm
-    engine, holder = object(), object()
-    monkeypatch.setitem(sm._LAYERS, "codex-cli", engine)
+    holder = object()
     monkeypatch.setattr(sm, "find_layer_for_session", lambda sid: None)
-    assert sm.layer_for_prewarm("s1", "codex-cli") is engine
+    assert sm.layer_for_prewarm("s1", "codex-cli") is None
     assert sm.layer_for_prewarm("s1", "no-such-engine") is None
     monkeypatch.setattr(sm, "find_layer_for_session", lambda sid: holder)
     assert sm.layer_for_prewarm("s1", "codex-cli") is holder
+
+
+def test_what_a_session_nobody_holds_still_owns_is_given_back(monkeypatch):
+    """The permission state, the broker's secrets, the seat and the slot:
+    what a layer's close gives back after its own pool's."""
+    from core import concurrency
+    from core.credentials import mcp_broker
+    from core.session import session_manager as sm, session_state
+    from services.engines import subscription_pool
+    given = []
+    monkeypatch.setattr(session_state, "cleanup_session_permission_state", lambda sid: given.append(("state", sid)))
+    monkeypatch.setattr(mcp_broker, "purge_session", lambda sid: given.append(("secrets", sid)))
+    monkeypatch.setattr(subscription_pool, "release_subscription", lambda sid: given.append(("seat", sid)))
+    monkeypatch.setattr(concurrency, "release_chat_slot", lambda sid: given.append(("slot", sid)))
+    sm.release_unheld("s1")
+    assert given == [("state", "s1"), ("secrets", "s1"), ("seat", "s1"), ("slot", "s1")]
 
 
 def test_the_prewarm_registry_takes_no_unknown_role():
@@ -441,21 +484,22 @@ def test_the_prewarm_registry_takes_no_unknown_role():
     asyncio.run(run())
 
 
-def test_the_reaper_closes_a_dead_prewarm_on_its_engine(monkeypatch):
+def test_the_reaper_closes_a_prewarm_on_its_holder_and_gives_back_one_nobody_holds(monkeypatch):
     from core.session import prewarm_session_registry as reg, session_manager as sm
-    closed = []
+    closed, given = [], []
 
     class _Layer:
         async def close_session(self, sid):
             closed.append(sid)
-    monkeypatch.setattr(sm, "find_layer_for_session", lambda sid: None)
-    monkeypatch.setitem(sm._LAYERS, "codex-cli", _Layer())
+    monkeypatch.setattr(sm, "find_layer_for_session", lambda sid: _Layer() if sid == "sid-held" else None)
+    monkeypatch.setattr(sm, "release_unheld", given.append)
 
     async def run():
-        await reg.register("sid-dead", agent="alpha", user_sub="u1", role="editor",
-                           exec_path="codex-cli", model="m")
+        for sid, model in (("sid-held", "m1"), ("sid-dead", "m2")):
+            await reg.register(sid, agent="alpha", user_sub="u1", role="editor",
+                               exec_path="codex-cli", model=model)
         return await reg.reap_stale(ttl=0)
-    assert asyncio.run(run()) == 1 and closed == ["sid-dead"]
+    assert asyncio.run(run()) == 2 and closed == ["sid-held"] and given == ["sid-dead"]
 
 
 def test_no_prewarm_close_reads_a_role_default():
@@ -463,7 +507,7 @@ def test_no_prewarm_close_reads_a_role_default():
     without a role: none is left (the socket-close block sits inside the
     connection loop, so its fence is this pin beside the helper's tests)."""
     from tests._paths import PROXY_DIR
-    for rel in ("core/session/prewarm_session_registry.py", "ws/dashboard_warmup.py",
+    for rel in ("core/session/prewarm_session_registry.py", "ws/dashboard_warmup.py", "ws/dashboard_warmup_spawn.py",
                 "ws/dashboard_warmup_tail.py", "ws/dashboard.py"):
         text = (PROXY_DIR / rel).read_text()
         assert 'or "manager"' not in text, rel
@@ -513,7 +557,6 @@ async def test_a_prewarm_for_the_platform_pins_its_build_there(monkeypatch):
     machine: the pre-warm builds pinned to the platform (the resolver would
     have named the machine and skipped)."""
     from core import concurrency
-    from services.engines import subscription_pool as sp
     conn = _controller()
     calls = _stub_seams(monkeypatch, built_cfg=_cfg())
     _stub_place(monkeypatch, ("local", "OtoDock platform", "m-def", ""))
@@ -522,7 +565,7 @@ async def test_a_prewarm_for_the_platform_pins_its_build_there(monkeypatch):
     async def _acquire(sid, **kw):
         return concurrency.Admission(False, "speculative", None)
     monkeypatch.setattr(concurrency, "acquire_chat_slot", _acquire)
-    with patch.object(sp, "subscription_store"):
+    with pool_store():
         await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
                                        "execution_path": "codex-cli", "target": "local"})
     assert calls and calls[0]["pinned_target"] == "local"
@@ -551,6 +594,30 @@ async def test_a_pick_elsewhere_closes_the_prewarm_made_for_another_place(monkey
     await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
                                    "execution_path": "codex-cli", "target": "m-1"})
     assert closed == ["pw-local"] and conn._pre_warmed_sid is None
+
+
+@pytest.mark.asyncio
+async def test_a_prewarm_nobody_holds_any_more_gives_back_what_it_owns(monkeypatch):
+    """A pool dropped the dead pre-warm, so no layer is left to close it on:
+    its seat and its slot are given back without one."""
+    from core.session import prewarm_session_registry as reg, session_manager
+    conn = _controller()
+    _stub_seams(monkeypatch, built_cfg=_cfg())
+    _stub_place(monkeypatch, ("m-1", "drill-sat", "local", ""))
+    conn._pre_warmed_sid = "pw-gone"
+    conn._pre_warmed_agent = "alpha"
+    conn._pre_warmed_exec_path = "codex-cli"
+    conn._pre_warmed_model = "some-model"
+    conn._pre_warmed_role = "manager"
+    conn._pre_warmed_place = ""
+    given = []
+    monkeypatch.setattr(session_manager, "layer_for_prewarm", lambda sid, path: None)
+    monkeypatch.setattr(session_manager, "release_unheld", given.append)
+    await reg.register("pw-gone", agent="alpha", user_sub="user-pw", role="manager",
+                       exec_path="codex-cli", model="some-model")
+    await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
+                                   "execution_path": "codex-cli", "target": "m-1"})
+    assert given == ["pw-gone"] and conn._pre_warmed_sid is None
 
 
 def _tail_args(**over):
@@ -619,3 +686,280 @@ def test_a_pre_warm_made_for_a_pick_is_no_other_chats(temp_db):
         await reg.register("sid-plain", **key)
         assert (await reg.claim_by_key(**key))[0] == "sid-plain"
     asyncio.run(run())
+
+
+# -- a pre-warm follows the place its new chat would start ------------------
+
+
+def _held_prewarm(conn, sid: str, *, at: float) -> None:
+    conn._pre_warmed_sid = sid
+    conn._pre_warmed_agent = "alpha"
+    conn._pre_warmed_exec_path = "codex-cli"
+    conn._pre_warmed_model = "some-model"
+    conn._pre_warmed_role = "manager"
+    conn._pre_warmed_place = ""
+    conn._pre_warmed_at = at
+
+
+def _place_seams(monkeypatch, conn, *, resolved, local_only=False):
+    """The resolver's answer now, the layer of every pre-warm, the fresh
+    spawn and the chat lane, recorded."""
+    from core.session import session_manager
+    from services.remote import remote_status
+    from ws import dashboard_warmup as dw, dashboard_warmup_tail as tail
+
+    async def _run_db(fn, *a, **k):
+        return fn(*a, **k)
+    monkeypatch.setattr(dw, "run_db", _run_db)
+    asked = []
+    monkeypatch.setattr(remote_status, "resolve_execution_target",
+                        lambda *a, **k: asked.append(a) or resolved)
+    if local_only:
+        caps = SimpleNamespace(runtime=SimpleNamespace(supports_remote_execution=False), mcp_delivery="external_config")
+        monkeypatch.setattr(session_manager, "get_layer_capabilities", lambda path: caps)
+    rec = SimpleNamespace(closed=[], spawned=[], jobs=[], asked=asked)
+
+    class _Layer:
+        async def close_session(self, sid):
+            rec.closed.append(sid)
+
+        async def is_session_alive(self, sid):
+            return True
+    monkeypatch.setattr(session_manager, "layer_for_prewarm", lambda sid, path: _Layer())
+
+    async def _create(sid, agent, mode, **kw):
+        rec.spawned.append(kw.get("pinned_target"))
+        return SimpleNamespace(session_id=sid, layer=None, execution_target=resolved[0],
+                               fallback_reason=None, interactive=False)
+    conn._create_or_resume_session = _create
+
+    async def _submit(cid, job, label=""):
+        rec.jobs.append(dict(getattr(job, "keywords", {})))
+    monkeypatch.setattr(tail.chat_writer, "submit", _submit)
+
+    async def _mode(*a, **k):
+        return None
+    conn._give_reused_session_the_chats_mode = _mode
+    conn.deferred_mode = None
+    conn.deferred_for = ""
+    return rec
+
+
+def _unpicked_args(**over):
+    return _tail_args(msg={}, w_place="", **over)
+
+
+@pytest.mark.asyncio
+async def test_a_prewarm_made_while_the_machine_was_away_is_dropped_when_it_is_back(monkeypatch):
+    """The agent's machine was away at the pre-warm, so it was built on the
+    platform; it is back at send: the chat starts on the machine, never
+    pinned to the platform."""
+    from core.session import prewarm_session_registry as reg
+    from ws.dashboard_warmup_tail import _TailRun
+    conn = _controller()
+    _held_prewarm(conn, "pw-old", at=50.0)
+    await reg.register("pw-old", agent="alpha", user_sub="user-pw", role="manager",
+                       exec_path="codex-cli", model="some-model")
+    rec = _place_seams(monkeypatch, conn, resolved=("m-1", None))
+    run = _TailRun()
+    await conn._tail_new_chat(_unpicked_args(), run)
+    assert rec.closed == ["pw-old"] and conn._pre_warmed_sid is None
+    assert rec.spawned == [""]
+    assert run.res.session_id != "pw-old"
+    assert all("execution_target" not in job for job in rec.jobs)
+
+
+def _late_prewarm(conn, gate, order, *, sid="pw-late"):
+    """The page's pre-warm, still building at send: as it starts its
+    session it sets the socket's layer to the platform's, then holds."""
+    from core.session import prewarm_session_registry as reg
+
+    async def _building():
+        await gate.wait()
+        conn.layer = "the platform layer"
+        _held_prewarm(conn, sid, at=200.0)          # finished after the mint (at 100)
+        await reg.register(sid, agent="alpha", user_sub="user-pw", role="manager",
+                           exec_path="codex-cli", model="some-model")
+        order.append("pre-warm built")
+    return asyncio.create_task(_building())
+
+
+@pytest.mark.asyncio
+async def test_a_send_to_the_machine_waits_for_the_prewarm_still_building(monkeypatch):
+    """The machine came back while the page's pre-warm was still building:
+    the chat starts on the machine only after it, so the pre-warm cannot set
+    the socket's layer to the platform's under the chat's machine session,
+    and it is closed rather than held to its time-to-live."""
+    from ws.dashboard_warmup_tail import _TailRun
+    conn = _controller()
+    conn.layer = None
+    rec = _place_seams(monkeypatch, conn, resolved=("m-1", None))
+    order: list[str] = []
+    gate = asyncio.Event()
+    pw = _late_prewarm(conn, gate, order)
+    conn._pre_warmup_task = pw
+    create = conn._create_or_resume_session
+
+    async def _create(sid, agent, mode, **kw):
+        order.append("chat spawned")
+        return await create(sid, agent, mode, **kw)
+    conn._create_or_resume_session = _create
+    tail = asyncio.create_task(conn._tail_new_chat(_unpicked_args(pw_task=pw), _TailRun()))
+    await asyncio.sleep(0.05)
+    assert not tail.done(), "the tail spawned on the machine while the pre-warm was building"
+    gate.set()
+    await tail
+    assert order == ["pre-warm built", "chat spawned"]
+    assert rec.closed == ["pw-late"] and conn._pre_warmed_sid is None
+    assert rec.spawned == [""]
+
+
+@pytest.mark.asyncio
+async def test_a_late_prewarm_a_newer_pre_warmup_replaced_is_left_to_it(monkeypatch):
+    """A pre-warm finished after the mint whose task is no longer the
+    page's latest belongs to the next new chat: the tail leaves it."""
+    from core.session import prewarm_session_registry as reg
+    from ws.dashboard_warmup_tail import _TailRun
+    conn = _controller()
+    rec = _place_seams(monkeypatch, conn, resolved=("m-1", None))
+    gate = asyncio.Event()
+    pw = _late_prewarm(conn, gate, [], sid="pw-next")
+    conn._pre_warmup_task = asyncio.create_task(asyncio.sleep(0))   # the page's newer pre_warmup
+    gate.set()
+    try:
+        await conn._tail_new_chat(_unpicked_args(pw_task=pw), _TailRun())
+        assert rec.closed == [] and conn._pre_warmed_sid == "pw-next"
+    finally:
+        await reg.discard("pw-next")
+
+
+@pytest.mark.asyncio
+async def test_a_prewarm_made_while_the_machine_was_away_is_reused_while_it_is_still_away(monkeypatch):
+    from core.session import prewarm_session_registry as reg
+    from ws.dashboard_warmup_tail import _TailRun
+    conn = _controller()
+    _held_prewarm(conn, "pw-old", at=50.0)
+    await reg.register("pw-old", agent="alpha", user_sub="user-pw", role="manager",
+                       exec_path="codex-cli", model="some-model")
+    rec = _place_seams(monkeypatch, conn, resolved=("local", "agent-default-offline"))
+    run = _TailRun()
+    await conn._tail_new_chat(_unpicked_args(), run)
+    assert rec.closed == [] and rec.spawned == []
+    assert run.res.session_id == "pw-old"
+    assert run.res.fallback_reason == "agent-default-offline"
+    assert {"session_id": "pw-old", "execution_target": "local"} in rec.jobs
+    # One read of the place, not a second one for the reason.
+    assert len(rec.asked) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_local_only_engine_keeps_its_prewarm_while_the_agents_machine_is_there(monkeypatch):
+    """The resolver reads the agent's main engine; a chat on an engine that
+    runs only on the platform starts there whatever the machine does."""
+    from core.session import prewarm_session_registry as reg
+    from ws.dashboard_warmup_tail import _TailRun
+    conn = _controller()
+    _held_prewarm(conn, "pw-old", at=50.0)
+    await reg.register("pw-old", agent="alpha", user_sub="user-pw", role="manager",
+                       exec_path="codex-cli", model="some-model")
+    rec = _place_seams(monkeypatch, conn, resolved=("m-1", None), local_only=True)
+    run = _TailRun()
+    await conn._tail_new_chat(_unpicked_args(), run)
+    assert rec.closed == [] and rec.spawned == [] and run.res.session_id == "pw-old"
+    assert rec.asked == []
+
+
+@pytest.mark.asyncio
+async def test_a_detached_prewarm_is_not_claimed_when_the_chat_starts_on_its_machine(monkeypatch):
+    from core.session import prewarm_session_registry as reg
+    from ws.dashboard_warmup_tail import _TailRun
+    conn = _controller()
+    await reg.register("pw-detached", agent="alpha", user_sub="user-pw", role="manager",
+                       exec_path="codex-cli", model="some-model")
+    rec = _place_seams(monkeypatch, conn, resolved=("m-1", None))
+    try:
+        await conn._tail_new_chat(_unpicked_args(w_layer=object()), _TailRun())
+        assert rec.spawned == [""] and rec.closed == []
+        assert "pw-detached" in reg._entries
+    finally:
+        await reg.discard("pw-detached")
+
+
+@pytest.mark.asyncio
+async def test_a_prewarm_finished_after_the_mint_is_left_to_its_time(monkeypatch):
+    """A pre-warm made after the mint is the next new chat's: the tail
+    leaves it, its own send checks its place."""
+    from core.session import prewarm_session_registry as reg
+    from ws.dashboard_warmup_tail import _TailRun
+    conn = _controller()
+    _held_prewarm(conn, "pw-next", at=150.0)
+    await reg.register("pw-next", agent="alpha", user_sub="user-pw", role="manager",
+                       exec_path="codex-cli", model="some-model")
+    rec = _place_seams(monkeypatch, conn, resolved=("m-1", None))
+    try:
+        await conn._tail_new_chat(_unpicked_args(), _TailRun())
+        assert rec.closed == [] and rec.spawned == [""]
+        assert conn._pre_warmed_sid == "pw-next"
+    finally:
+        await reg.discard("pw-next")
+
+
+@pytest.mark.asyncio
+async def test_a_second_pre_warmup_releases_a_prewarm_whose_place_moved(monkeypatch):
+    """The page asks again (another model, the mode) after the agent's
+    machine came back: the platform pre-warm is closed, and nothing is built
+    for the machine."""
+    from core.session import prewarm_session_registry as reg
+    conn = _controller()
+    _stub_seams(monkeypatch, built_cfg=_cfg(execution_target="m-1"))
+    _held_prewarm(conn, "pw-local", at=50.0)
+    await reg.register("pw-local", agent="alpha", user_sub="user-pw", role="manager",
+                       exec_path="codex-cli", model="some-model")
+    rec = _place_seams(monkeypatch, conn, resolved=("m-1", None))
+    from ws import dashboard_warmup as dw
+    monkeypatch.setattr(dw, "release_config_seat", lambda *a, **k: None)
+    await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
+                                   "execution_path": "codex-cli"})
+    assert rec.closed == ["pw-local"] and conn._pre_warmed_sid is None
+    assert not any(f.get("session_id") == "pw-local" for f in conn.sent)
+
+
+@pytest.mark.asyncio
+async def test_a_later_pre_warmup_reads_the_pick_as_checked_now(monkeypatch):
+    """A pre-warm held for a pick that was the default when it was built
+    (the build fell back to the platform): a later pre_warmup with the same
+    pick reads it as a send does, no pick, so the resolver's platform keeps
+    it instead of closing and building it again."""
+    from core.session import prewarm_session_registry as reg
+    conn = _controller()
+    _stub_seams(monkeypatch, built_cfg=_cfg())
+    _held_prewarm(conn, "pw-pick", at=50.0)
+    conn._pre_warmed_place = "m-1"
+    await reg.register("pw-pick", agent="alpha", user_sub="user-pw", role="manager",
+                       exec_path="codex-cli", model="some-model", place="m-1")
+    rec = _place_seams(monkeypatch, conn, resolved=("local", "viewer-on-admin-remote"))
+    asked = _stub_place(monkeypatch, ("", "drill-sat", "m-1", ""))
+    try:
+        await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
+                                       "execution_path": "codex-cli", "target": "m-1"})
+        assert asked == [("alpha", "m-1", "codex-cli")]
+        assert rec.closed == [] and conn._pre_warmed_sid == "pw-pick"
+        assert {"type": "pre_warmup_ready", "session_id": "pw-pick"} in conn.sent
+    finally:
+        await reg.discard("pw-pick")
+
+
+@pytest.mark.asyncio
+async def test_a_later_pre_warmup_for_a_pick_now_refused_closes_the_prewarm(monkeypatch):
+    from core.session import prewarm_session_registry as reg
+    conn = _controller()
+    _stub_seams(monkeypatch, built_cfg=_cfg())
+    _held_prewarm(conn, "pw-pick", at=50.0)
+    conn._pre_warmed_place = "m-1"
+    await reg.register("pw-pick", agent="alpha", user_sub="user-pw", role="manager",
+                       exec_path="codex-cli", model="some-model", place="m-1")
+    rec = _place_seams(monkeypatch, conn, resolved=("local", None))
+    _stub_place(monkeypatch, ("", "", "local", "drill-sat is offline."))
+    await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
+                                   "execution_path": "codex-cli", "target": "m-1"})
+    assert rec.closed == ["pw-pick"] and conn._pre_warmed_sid is None

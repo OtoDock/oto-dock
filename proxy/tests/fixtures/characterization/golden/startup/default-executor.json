@@ -1,0 +1,12 @@
+{
+ "as configured": {
+  "max_workers": 7,
+  "prefix": "asyncio",
+  "set_on_the_loop": true
+ },
+ "never none": {
+  "max_workers": 1,
+  "prefix": "asyncio",
+  "set_on_the_loop": true
+ }
+}

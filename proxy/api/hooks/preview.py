@@ -8,6 +8,7 @@ One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 import asyncio
 import hashlib
 import logging
+import os
 import secrets
 import time
 from collections import OrderedDict
@@ -89,18 +90,25 @@ def mint_generation(file_id: str, row_generation: int) -> int:
 
 
 def file_digest(path: Path) -> str:
-    """sha256 of a file, "" past the hash cap or unreadable. Blocking: a
-    worker-thread call."""
+    """sha256 of a file beneath the agents tree, "" past the hash cap,
+    unreadable, or reached through a link. Blocking: a worker-thread call."""
+    import config as cfg
+    from services.infra import safe_fs
     try:
-        if path.stat().st_size > _HASH_MAX_BYTES:
+        fd, st = safe_fs.open_regular_for_read(cfg.AGENTS_DIR, safe_fs.rel_under(path, cfg.AGENTS_DIR))
+    except OSError:
+        return ""
+    try:
+        if st.st_size > _HASH_MAX_BYTES:
             return ""
         h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
+        for chunk in safe_fs.iter_fd(fd, length=st.st_size):
+            h.update(chunk)
         return h.hexdigest()
     except OSError:
         return ""
+    finally:
+        os.close(fd)
 
 
 def unchanged_since_push(file_id: str, rel_path: str, digest: str) -> bool:
@@ -173,7 +181,7 @@ class HookDocumentPreviewRequest(BaseModel):
 async def hook_document_preview(req: HookDocumentPreviewRequest,
                                  authorization: str | None = Header(None)):
     """Called by file-tools MCP to push a live Collabora preview to the chat."""
-    await verify_session_match_async(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id, accept_callback=True)
 
     import config as cfg
     from api.media.wopi import (
@@ -202,12 +210,15 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
         )
         raise HTTPException(status_code=400, detail=detail)
 
-    filename = req.filename or file_path.name
+    filename = req.filename or paths._asked_name(req.file_path) or file_path.name
 
-    # Compute relative path from AGENTS_DIR
+    # The gate's answer is the authorized place with no link left in it:
+    # its rel beneath AGENTS_DIR is read as text, never resolved again (the
+    # snapshot, the media row and every WOPI open take it strictly).
+    from services.infra import safe_fs
     try:
-        rel_path = str(file_path.resolve().relative_to(cfg.AGENTS_DIR.resolve()))
-    except ValueError as exc:
+        rel_path = safe_fs.rel_under(file_path, cfg.AGENTS_DIR)
+    except safe_fs.SafeFsError as exc:
         raise HTTPException(status_code=400, detail="File must be within agents directory") from exc
 
     file_id = encode_file_id(rel_path)
@@ -227,8 +238,10 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
         document_generation = max(generation, noted + 1) if noted else generation
     note_pushed_generation(file_id, document_generation, digest)
 
-    session_meta = _sessions.get(req.session_id, {})
     sec = get_session_security(req.session_id)
+    # The agent the push decides edit on and its token names, one value: the
+    # editor's judge reads the role on the token's agent.
+    agent = getattr(sec, "agent", "") or _sessions.get(req.session_id, {}).get("agent", "")
     tree_rel = rel_path.partition("/")[2]  # strip "<agent>/" → agent-tree-relative
     # Host-cache doc (a Desktop/Downloads file pulled through THIS session's
     # cache): the agent-tree write matrix doesn't apply — the platform copy is
@@ -237,15 +250,7 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     # real file (wopi.wopi_put_file), where the satellite's own host write
     # policy is the next gate. Session-scoped: only THIS session's cache root
     # qualifies, so another session's cached files stay view-only here.
-    _is_host_cache = False
-    if sec is not None:
-        from core.remote import remote_file_flow
-        try:
-            _is_host_cache = file_path.resolve().is_relative_to(
-                remote_file_flow.host_cache_session_root(req.session_id).resolve()
-            )
-        except OSError:
-            _is_host_cache = False
+    _is_host_cache = sec is not None and paths.in_own_host_cache(req.session_id, rel_path)
 
     # The chat the push lands in: its pane's saves refresh this push's
     # version, so the token names it.
@@ -263,7 +268,7 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     claims: tuple[str, str] | None = None
     if person:
         claims = await run_db(
-            _person_claims, person, tree_rel, _is_host_cache, getattr(sec, "agent", "") or "",
+            _person_claims, person, tree_rel, _is_host_cache, agent,
             getattr(sec, "username", "") or "",
         )
     wopi_token, token_ttl = "", 0
@@ -281,7 +286,7 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
             wopi_token, token_ttl = cached["token"], cached["ttl"]
         else:
             wopi_token, token_ttl = create_wopi_token(
-                rel_path, person, user_name, permissions, session_meta.get("agent", ""),
+                rel_path, person, user_name, permissions, agent,
                 chat_id=chat_id or "", generation=document_generation,
             )
             for key in [k for k, v in _wopi_token_cache.items() if v["expires"] <= now]:
@@ -315,6 +320,7 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     # Download token: durable media_tokens row (media_kind "file" →
     # attachment-forced by /v1/media's inline allowlist), so the preview's
     # download button survives restarts like the rest of the chat history.
+    origin_path, machine_id = paths.machine_origin(req.session_id, resolution)
     download_token = secrets.token_urlsafe(32)
     await run_db(
         task_store.create_media_token,
@@ -323,8 +329,10 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
         media_kind="file",
         chat_id=chat_id,
         session_id=req.session_id,
+        machine_id=machine_id,
         cache_owned=False,
         expires_at="",  # durable until the chat is deleted
+        origin_path=origin_path,
         agent=getattr(sec, "agent", "") or "",
     )
     # No fn= here: the document pane appends it from the file's name

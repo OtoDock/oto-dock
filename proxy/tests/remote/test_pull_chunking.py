@@ -36,9 +36,10 @@ class _PinnedClock:
 
 @pytest.fixture
 def pinned_clock(monkeypatch):
-    from core.remote import satellite_file_transfer
+    from core.remote import satellite_file_transfer, satellite_file_verbs
     clock = _PinnedClock()
     monkeypatch.setattr(satellite_file_transfer, "time", clock)
+    monkeypatch.setattr(satellite_file_verbs, "time", clock)
     return clock
 
 
@@ -48,12 +49,16 @@ def _partials(dest: Path) -> list[Path]:
 
 
 class _FakeConn:
-    """Captures messages the manager enqueues (the file_pull request)."""
+    """Captures messages the manager enqueues (the file_pull request, and a
+    cancel on the control lane without an await)."""
 
     def __init__(self):
         self.sent: list[dict] = []
 
     async def enqueue_send(self, msg: dict) -> None:
+        self.sent.append(msg)
+
+    def enqueue_send_nowait(self, msg, *, bulk=False):
         self.sent.append(msg)
 
 
@@ -68,14 +73,14 @@ def _chunk(rid, idx, total, data, *, last_hash=""):
     }
 
 
-async def _start_pull(mgr, conn, dest, *, stall_s=2.0):
+async def _start_pull(mgr, conn, dest, *, stall_s=2.0, hash_out=None):
     """Kick off a pull and return (task, request_id, stream) once the
     file_pull request has been enqueued."""
     before = sum(1 for m in conn.sent if m.get("type") == "file_pull")
     task = asyncio.create_task(
         mgr.pull_file_to_path(
             "m1", PathRef("agent_tree", "workspace/x.bin"), dest,
-            agent_slug="agent-1", stall_s=stall_s,
+            agent_slug="agent-1", stall_s=stall_s, hash_out=hash_out,
         )
     )
     # Let pull_file_to_path open its root (a worker thread) and run up to
@@ -147,6 +152,39 @@ async def test_the_progress_callback_hears_each_chunk_and_never_stops_the_pull(t
     assert await asyncio.wait_for(task, timeout=5.0) is True
     assert seen == [(1000, 2000), (2000, 2000)]
     assert dest.read_bytes() == data
+
+
+@pytest.mark.asyncio
+async def test_a_committed_pull_hands_back_the_hash_of_the_file_it_wrote(tmp_path):
+    """``hash_out`` takes the sha256 and the length of the bytes renamed into
+    place: the caller records them as the copy the machine holds."""
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    dest = tmp_path / "out.bin"
+    data = b"A" * 1000 + b"B" * 37
+    got: dict = {}
+    task, rid, st = await _start_pull(mgr, conn, dest, hash_out=got)
+    h = hashlib.sha256()
+    for i, part in enumerate((data[:1000], data[1000:])):
+        h.update(part)
+        mgr._on_pull_chunk(st, _chunk(rid, i, 2, part,
+                                      last_hash=f"sha256:{h.hexdigest()}" if i else ""))
+    assert await asyncio.wait_for(task, timeout=5.0) is True
+    assert got == {"hash": "sha256:" + hashlib.sha256(dest.read_bytes()).hexdigest(),
+                   "size": len(data)}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pull_hands_back_no_hash(tmp_path):
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    got: dict = {}
+    task, rid, st = await _start_pull(mgr, conn, tmp_path / "out.bin", hash_out=got)
+    mgr._on_pull_chunk(st, _chunk(rid, 0, 1, b"data", last_hash="sha256:deadbeef"))
+    assert await asyncio.wait_for(task, timeout=5.0) is False
+    assert got == {}
 
 
 @pytest.mark.asyncio
@@ -639,21 +677,8 @@ async def test_a_caller_cancelled_during_the_commit_waits_for_the_job(tmp_path, 
 
 
 # ---------------------------------------------------------------------------
-# A pull the proxy gives up on is cancelled on a 0.5.137 satellite
+# A pull the proxy gives up on is cancelled on the satellite
 # ---------------------------------------------------------------------------
-
-
-class _PacedConn(_FakeConn):
-    """A satellite that paces its pulls (0.5.137): the cancel goes on the
-    control lane without an await."""
-
-    def __init__(self, version="0.5.137", paced=True):
-        super().__init__()
-        self.satellite_version = version
-        self.capabilities = {"paced_transfers": paced}
-
-    def enqueue_send_nowait(self, msg, *, bulk=False):
-        self.sent.append(msg)
 
 
 def _cancels(conn):
@@ -663,7 +688,7 @@ def _cancels(conn):
 @pytest.mark.asyncio
 async def test_a_stalled_pull_is_cancelled_on_the_satellite(tmp_path):
     mgr = SatelliteConnectionManager()
-    conn = _PacedConn()
+    conn = _FakeConn()
     mgr._connections["m1"] = conn
     task, rid, st = await _start_pull(mgr, conn, tmp_path / "out.bin", stall_s=0.1)
     assert await asyncio.wait_for(task, timeout=5.0) is False
@@ -673,7 +698,7 @@ async def test_a_stalled_pull_is_cancelled_on_the_satellite(tmp_path):
 @pytest.mark.asyncio
 async def test_a_pull_its_caller_left_is_cancelled_and_a_proxy_refusal_too(tmp_path, monkeypatch):
     mgr = SatelliteConnectionManager()
-    conn = _PacedConn()
+    conn = _FakeConn()
     mgr._connections["m1"] = conn
     task, rid, st = await _start_pull(mgr, conn, tmp_path / "a.bin")
     task.cancel()
@@ -689,56 +714,34 @@ async def test_a_pull_its_caller_left_is_cancelled_and_a_proxy_refusal_too(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_a_pull_the_satellite_ended_or_an_old_satellite_gets_no_cancel(tmp_path):
+async def test_a_pull_the_satellite_ended_gets_no_cancel(tmp_path):
     mgr = SatelliteConnectionManager()
-    conn = _PacedConn()
+    conn = _FakeConn()
     mgr._connections["m1"] = conn
     task, rid, st = await _start_pull(mgr, conn, tmp_path / "a.bin")
     mgr._on_pull_chunk(st, {"request_id": rid, "error": "File not found"})
     assert await asyncio.wait_for(task, timeout=5.0) is False
-    for old in (_PacedConn(version="0.5.136"), _PacedConn(paced=False)):
-        mgr._connections["m1"] = old
-        task, rid, st = await _start_pull(mgr, old, tmp_path / "b.bin", stall_s=0.1)
-        assert await asyncio.wait_for(task, timeout=5.0) is False
-        assert _cancels(old) == []
     assert _cancels(conn) == []
 
 
 @pytest.mark.asyncio
 async def test_a_pull_whose_connection_was_replaced_sends_no_cancel(tmp_path):
     mgr = SatelliteConnectionManager()
-    conn = _PacedConn()
+    conn = _FakeConn()
     mgr._connections["m1"] = conn
     task, rid, st = await _start_pull(mgr, conn, tmp_path / "a.bin", stall_s=0.2)
-    new = _PacedConn()
+    new = _FakeConn()
     mgr._connections["m1"] = new          # replaced: the old socket answers nothing
     assert await asyncio.wait_for(task, timeout=5.0) is False
     assert _cancels(conn) == [] and _cancels(new) == []
 
 
 @pytest.mark.asyncio
-async def test_a_pull_has_no_ceiling_before_its_first_chunk(tmp_path, pinned_clock):
-    """A pull an older satellite queues behind another one for more than
-    ten minutes waits on the connection's progress alone."""
+async def test_a_pull_that_never_starts_fails_at_its_floor(tmp_path, pinned_clock):
+    """The satellite interleaves its pulls, so one that sends no chunk for
+    ten minutes while the connection moves has failed."""
     mgr = SatelliteConnectionManager()
     conn = _FakeConn()
-    mgr._connections["m1"] = conn
-    task, rid, st = await _start_pull(mgr, conn, tmp_path / "out.bin", stall_s=0.5)
-    st.started -= 700                    # queued for 11+ minutes
-    conn.last_transfer_at = pinned_clock.now      # the connection moves
-    await asyncio.sleep(0.4)
-    assert not task.done()
-    h = hashlib.sha256(b"z")
-    mgr._on_pull_chunk(st, _chunk(rid, 0, 1, b"z", last_hash=f"sha256:{h.hexdigest()}"))
-    assert await asyncio.wait_for(task, 5.0) is True
-
-
-@pytest.mark.asyncio
-async def test_a_pull_a_paced_satellite_never_starts_fails_at_its_floor(tmp_path, pinned_clock):
-    """A 0.5.137 satellite interleaves its pulls, so one that sends no
-    chunk for ten minutes while the connection moves has failed."""
-    mgr = SatelliteConnectionManager()
-    conn = _PacedConn()
     mgr._connections["m1"] = conn
     task, rid, st = await _start_pull(mgr, conn, tmp_path / "out.bin", stall_s=0.5)
     st.started -= 700

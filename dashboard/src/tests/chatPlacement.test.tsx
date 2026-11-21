@@ -7,13 +7,17 @@
 // the chat resumed), and the task dialog (the places of the task's run
 // person, the save of its extra field).
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { useState, type ReactElement, type ReactNode } from 'react'
+import { useState, type ReactElement, type ReactNode, type SetStateAction } from 'react'
 import { act, fireEvent, render, renderHook, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter } from 'react-router-dom'
 
-const h = vi.hoisted(() => ({ apiFetch: vi.fn(), toast: vi.fn() }))
+const h = vi.hoisted(() => ({
+  apiFetch: vi.fn(), toast: vi.fn(),
+  user: { sub: 'u1', role: 'user' } as { sub: string; role: string; feature_flags?: Record<string, boolean> },
+}))
 vi.mock('@/api/auth', () => ({ apiFetch: h.apiFetch }))
-vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: { sub: 'u1', role: 'user' } }) }))
+vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: h.user }) }))
 vi.mock('@/lib/appToasts', () => ({ emitAppToast: h.toast, onAppToast: () => () => {} }))
 
 import RunsOnChip, { ChatLockNotice, MoveRing } from '@/components/chat/RunsOnChip'
@@ -22,9 +26,11 @@ import { CHAT_MOVED_REASON, OUT, SYSTEM_SUBTYPE, WIRE } from '@/api/wireEvents'
 import {
   accountsStayFor, chatTargetsKey, leavesOffline, MOVE_MEMORY, moveMemoryOf, type AgentRunTargets, type ChatTargets, type RunTarget,
 } from '@/api/remoteMachines'
+import { dbMessagesToDisplay } from '@/lib/messageBlocks'
 import type { Task } from '@/api/tasks'
 import { TaskSettingsDialog, TaskSettingsModal } from '@/pages/agent/AgentSchedules.modals'
 import { useAgentChatStream } from '@/pages/agent/chat/useAgentChatStream'
+import type { PreWarmRefusal } from '@/lib/engines/notice'
 import { personClick } from './dialogsHarness'
 import { FakeWebSocket } from './fakeWebSocket'
 
@@ -70,6 +76,7 @@ let targets: ChatTargets
 let moveAnswer: () => Response
 
 beforeEach(() => {
+  h.user = { sub: 'u1', role: 'user' }
   targets = ON_SERVER
   moveAnswer = () => answer(202, { move_id: 'mv-1', to_label: 'Attic PC', memory: 'files' })
   h.toast.mockReset()
@@ -85,7 +92,7 @@ beforeEach(() => {
 
 function withQuery(ui: ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return { qc, ...render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>) }
+  return { qc, ...render(<MemoryRouter><QueryClientProvider client={qc}>{ui}</QueryClientProvider></MemoryRouter>) }
 }
 
 const chip = (over: Partial<Parameters<typeof RunsOnChip>[0]> = {}) => (
@@ -409,7 +416,7 @@ function rowView(row: HTMLElement): Row {
 /** The chat's own place: checked, nothing to pick. */
 const HERE: Row = { label: 'OtoDock platform', checked: true, disabled: true }
 
-const ROLE_CASES: { name: string; answer: ChatTargets; menu?: Row[]; refusal?: string }[] = [
+const ROLE_CASES: { name: string; answer: ChatTargets; menu?: Row[]; refusal?: string; pairing?: boolean }[] = [
   {
     name: 'a viewer, user or editor on a normal agent: the server, their default and their own machines',
     answer: onServer([SERVER_NOT_DEFAULT, { ...ATTIC, is_default: true }, DEN]),
@@ -459,11 +466,13 @@ const ROLE_CASES: { name: string; answer: ChatTargets; menu?: Row[]; refusal?: s
     name: 'personal computers turned off on the platform: the own machine absent',
     answer: onServer([SERVER]),
     menu: [{ ...HERE, default: true }],
+    pairing: false,
   },
 ]
 
 describe("the chip's menu per role", () => {
-  it.each(ROLE_CASES)('$name', async ({ answer, menu, refusal }) => {
+  it.each(ROLE_CASES)('$name', async ({ answer, menu, refusal, pairing }) => {
+    if (pairing === false) h.user = { ...h.user, feature_flags: { allow_user_paired_machines: false } }
     targets = answer
     withQuery(chip())
     const pill = await screen.findByTestId('runs-on-chip')
@@ -486,6 +495,50 @@ async function openMenu(answer: ChatTargets) {
   fireEvent.click(await screen.findByTestId('runs-on-chip'))
   return screen.getByRole('menu', { name: 'Run this chat on' })
 }
+
+// With no computer to pick, the menu says how to add one: a sentence and a
+// button to User Settings, Remote Machines. Not when people may not pair
+// their own computers, and not for a new chat whose engine runs on none.
+describe('the menu with no computer to pick', () => {
+  const PAIR = 'To run chats on your own computer, pair it in User Settings, Remote Machines.'
+
+  it('says how to pair one, the button reachable by the arrows', async () => {
+    const menu = await openMenu(onServer([SERVER]))
+    expect(within(menu).getByText(PAIR)).toBeTruthy()
+    const link = within(menu).getByRole('menuitem', { name: 'Pair your computer' })
+    expect(link).toHaveAttribute('href', '/user-settings/remote-machines')
+  })
+
+  it('says nothing with a computer listed', async () => {
+    const menu = await openMenu(onServer([SERVER, ATTIC]))
+    expect(within(menu).queryByText(PAIR)).toBeNull()
+  })
+
+  it('says nothing when the install runs no remote machines', async () => {
+    h.user = { ...h.user, feature_flags: { remote_machines_available: false } }
+    const menu = await openMenu(onServer([SERVER]))
+    expect(within(menu).queryByText(PAIR)).toBeNull()
+  })
+
+  it('a new chat says it too, unless its engine runs on no computer', async () => {
+    const platformOnly: AgentRunTargets = { default_target: 'local', targets: [SERVER] }
+    h.apiFetch.mockImplementation(async (path: string) => {
+      if (path.startsWith('/v1/agents/dev/run-targets')) return answer(200, platformOnly)
+      if (path === '/v1/execution-layers') {
+        return answer(200, { 'direct-llm': { runtime: { supports_remote_execution: false } } })
+      }
+      return answer(404, { detail: 'Not found' })
+    })
+    const { unmount } = withQuery(chip({ chatId: null, engine: 'codex-cli', onPickPlace: () => {} }))
+    fireEvent.click(await screen.findByTestId('runs-on-chip'))
+    expect(screen.getByText(PAIR)).toBeTruthy()
+    unmount()
+    withQuery(chip({ chatId: null, engine: 'direct-llm', onPickPlace: () => {} }))
+    await waitFor(() => expect(h.apiFetch.mock.calls.some(([p]) => p === '/v1/execution-layers')).toBe(true))
+    fireEvent.click(await screen.findByTestId('runs-on-chip'))
+    await waitFor(() => expect(screen.queryByText(PAIR)).toBeNull())
+  })
+})
 
 const LONG: RunTarget = {
   target: 'm-long', label: 'Homelab Trusted Services VM on the second rack', pairing: 'admin', state: 'online',
@@ -624,7 +677,7 @@ describe("the page's answer to chat_moved", () => {
       sessionInteractiveRef: { current: false }, duplexActiveRef: { current: false },
       setChatActiveLayer: vi.fn(), setProcessAlive: vi.fn(), setPendingEngineSwitch: vi.fn(),
       setEngineSwitchBusy: vi.fn(), setEngineSwitchError: vi.fn(), pendingFindQueryRef: { current: null },
-      setFindInput: vi.fn(), setFindQuery: vi.fn(), setFindBarOpen: vi.fn(), setDriveRefusal: vi.fn(),
+      setFindInput: vi.fn(), setFindQuery: vi.fn(), setFindBarOpen: vi.fn(), setDriveRefusal: vi.fn(), setPreWarmRefusal: vi.fn(),
     }), { wrapper })
     hook.result.current.latestRef.current = {
       interactive: { resetSession } as never, draftKey: 'c1', refetchChats: vi.fn() as never,
@@ -690,6 +743,24 @@ describe("the page's answer to chat_moved", () => {
     }))
     expect(invalidate).toHaveBeenCalledWith({ queryKey: chatTargetsKey('c1') })
     expect(resumes(ws).length).toBe(before + 1)
+  })
+
+  it("locks the chat with the call's sentence while a call holds it, and opens it at the hang-up", () => {
+    const sentence = 'A phone call is writing in this chat. You can write here when it ends.'
+    const { ws, hook } = mountStream('c1')
+    const send = (msg: Record<string, unknown>) => act(() => { ws.onmessage?.({ data: JSON.stringify(msg) }) })
+    act(() => { hook.result.current.ws.resumeChat('c1') })
+    send({ type: WIRE.CHAT_VIEW_ONLY, chat_id: 'c1', kind: 'phone', lock: sentence })
+    send({ type: WIRE.CHAT_HISTORY, chat_id: 'c1', messages: [], agent: 'dev' })
+    expect(hook.result.current.callLock).toBe(sentence)
+    // The call's ready status at the hang-up: the page asks for the chat again, open.
+    send({ type: WIRE.CHAT_STATUS, chat_id: 'c1', status: 'ready' })
+    send({ type: WIRE.CHAT_HISTORY, chat_id: 'c1', messages: [], agent: 'dev' })
+    expect(hook.result.current.callLock).toBe('')
+    // A call that runs inside the chat carries no lock: its typed messages wait.
+    send({ type: WIRE.CHAT_VIEW_ONLY, chat_id: 'c1', kind: 'phone' })
+    expect(hook.result.current.callLock).toBe('')
+    expect(hook.result.current.phoneCallActive).toBe(true)
   })
 
   it("ignores a move of a chat this page does not show", () => {
@@ -848,3 +919,183 @@ describe("the task dialog's mode", () => {
   })
 })
 
+// The agent's reload of its chat's session: the note in the history (a
+// title by how the reload ended, the server's words below it), the same
+// block live, and a terminal chat's new terminal, whose live frame draws no
+// card and makes a chat still in terminal mode attach to it as a reopen does.
+const RELOAD_NOTE = 'The session of this chat was rebuilt from its history.'
+
+describe('the reload note', () => {
+  it('titles the note by how the reload ended, with the server\'s words below', () => {
+    const cases: Array<[string | undefined, string]> = [
+      [undefined, 'Session reloaded'],
+      [CHAT_MOVED_REASON.RESUME_SKIPPED, 'Session reloaded'],
+      [CHAT_MOVED_REASON.FAILED, 'Session was not reloaded'],
+      [CHAT_MOVED_REASON.RESUME_STOPPED, 'Session reloads stopped'],
+      [CHAT_MOVED_REASON.ACCOUNT_CHANGED, 'Account changed'],
+      [CHAT_MOVED_REASON.ACCOUNT_CHANGE_WAITS, 'Account change waiting'],
+    ]
+    for (const [reason, title] of cases) {
+      const { unmount } = render(<SystemEvent subtype={SYSTEM_SUBTYPE.SESSION_RELOADED} reason={reason} message={RELOAD_NOTE} />)
+      const card = screen.getByTestId('session-reloaded')
+      expect(card.firstElementChild).toHaveTextContent(new RegExp(`^${title}$`))
+      expect(card).toHaveTextContent(RELOAD_NOTE)
+      unmount()
+    }
+  })
+
+  it('reads the stored row as the same note', () => {
+    const [msg] = dbMessagesToDisplay([{
+      id: 1, role: 'event', content: '', event_type: 'system', created_at: '2026-11-06T09:00:00+00:00',
+      event_data: JSON.stringify({ type: 'system', subtype: 'session_reloaded', message: RELOAD_NOTE, reason: 'failed' }),
+    }], [])
+    expect(msg.blocks).toEqual([expect.objectContaining({
+      type: 'system', subtype: SYSTEM_SUBTYPE.SESSION_RELOADED, message: RELOAD_NOTE, reason: CHAT_MOVED_REASON.FAILED,
+    })])
+  })
+})
+
+describe("the page's answer to a reloaded terminal", () => {
+  beforeEach(() => {
+    FakeWebSocket.instances.length = 0
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
+    h.toast.mockReset()
+  })
+  afterEach(() => vi.unstubAllGlobals())
+
+  function mountStream(interactiveMode: boolean, page: { sessionInteractive?: boolean; restarting?: boolean } = {}) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    )
+    const resetSession = vi.fn()
+    const restarting = vi.fn(() => !!page.restarting)
+    const hook = renderHook(() => useAgentChatStream({
+      agents: [], urlChatId: 'c1', agentDefaultModel: '', agentExecutionPath: '', agentName: 'dev',
+      navigate: vi.fn(), isFavoriteAgent: false, preWarmPath: '', warmingUp: false, setWarmingUp: vi.fn(),
+      chatNotif: { playPing: vi.fn(), onShareInbox: vi.fn() } as never,
+      sessionInteractiveRef: { current: false }, duplexActiveRef: { current: false },
+      setChatActiveLayer: vi.fn(), setProcessAlive: vi.fn(), setPendingEngineSwitch: vi.fn(),
+      setEngineSwitchBusy: vi.fn(), setEngineSwitchError: vi.fn(), pendingFindQueryRef: { current: null },
+      setFindInput: vi.fn(), setFindQuery: vi.fn(), setFindBarOpen: vi.fn(), setDriveRefusal: vi.fn(), setPreWarmRefusal: vi.fn(),
+    }), { wrapper })
+    hook.result.current.latestRef.current = {
+      interactive: { resetSession, interactiveMode, sessionInteractive: !!page.sessionInteractive, restarting } as never,
+      draftKey: 'c1', refetchChats: vi.fn() as never,
+    }
+    const ws = FakeWebSocket.instances[0]
+    act(() => { ws.onopen?.() })
+    const send = (frame: Record<string, unknown>) => act(() => { ws.onmessage?.({ data: JSON.stringify(frame) }) })
+    const resumes = () => ws.sent.map((s) => JSON.parse(s)).filter((m) => m.type === OUT.RESUME_CHAT)
+    const notes = () => hook.result.current.messages.flatMap((m) => m.blocks)
+      .filter((b) => b.type === 'system' && b.subtype === SYSTEM_SUBTYPE.SESSION_RELOADED)
+    return { send, resumes, notes, resetSession }
+  }
+
+  const terminalFrame = { type: WIRE.SYSTEM, subtype: SYSTEM_SUBTYPE.SESSION_RELOADED, terminal: true, chat_id: 'c1' }
+
+  it('attaches a chat in terminal mode to its new terminal, as a reopen does, and draws no card', () => {
+    const { send, resumes, notes, resetSession } = mountStream(true)
+    const before = resumes().length
+    send(terminalFrame)
+    expect(resetSession).toHaveBeenCalledTimes(1)
+    expect(resumes()).toHaveLength(before + 1)
+    expect(resumes()[before]).toEqual(expect.objectContaining({ chat_id: 'c1' }))
+    expect(notes()).toEqual([])
+  })
+
+  // The picking page's own warmup_ready attaches it: a resume here would
+  // load the history twice and lose a pick made from the history.
+  it.each([
+    ['a page on the new terminal', { sessionInteractive: true }],
+    ['a page whose own pick or switch starts it', { restarting: true }],
+  ])('leaves alone %s', (_name, page) => {
+    const { send, resumes, resetSession } = mountStream(true, page)
+    const before = resumes().length
+    send(terminalFrame)
+    expect(resetSession).not.toHaveBeenCalled()
+    expect(resumes()).toHaveLength(before)
+  })
+
+  it('leaves a chat no longer in terminal mode on its history', () => {
+    const { send, resumes, notes, resetSession } = mountStream(false)
+    const before = resumes().length
+    send(terminalFrame)
+    expect(resetSession).not.toHaveBeenCalled()
+    expect(resumes()).toHaveLength(before)
+    expect(notes()).toEqual([])
+  })
+
+  it('ignores the new terminal of a chat this page does not show', () => {
+    const { send, resumes, resetSession } = mountStream(true)
+    const before = resumes().length
+    send({ ...terminalFrame, chat_id: 'c2' })
+    expect(resetSession).not.toHaveBeenCalled()
+    expect(resumes()).toHaveLength(before)
+  })
+
+  it('draws the note that comes live with its words, and resumes nothing', () => {
+    const { send, resumes, notes, resetSession } = mountStream(true)
+    const before = resumes().length
+    send({ type: WIRE.SYSTEM, subtype: SYSTEM_SUBTYPE.SESSION_RELOADED, chat_id: 'c1', message: RELOAD_NOTE, reason: '' })
+    expect(notes()).toEqual([expect.objectContaining({ message: RELOAD_NOTE })])
+    expect(resetSession).not.toHaveBeenCalled()
+    expect(resumes()).toHaveLength(before)
+  })
+})
+
+describe("a new chat's engine notice", () => {
+  beforeEach(() => {
+    FakeWebSocket.instances.length = 0
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
+  })
+  afterEach(() => vi.unstubAllGlobals())
+
+  function mountStream() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    )
+    let refusal: PreWarmRefusal | null = null
+    const setPreWarmRefusal = (next: SetStateAction<PreWarmRefusal | null>) => {
+      refusal = typeof next === 'function' ? next(refusal) : next
+    }
+    const hook = renderHook(() => useAgentChatStream({
+      agents: [], urlChatId: undefined, agentDefaultModel: '', agentExecutionPath: 'claude-code-cli', agentName: 'dev',
+      navigate: vi.fn(), isFavoriteAgent: false, preWarmPath: '', warmingUp: false, setWarmingUp: vi.fn(),
+      chatNotif: { playPing: vi.fn(), onShareInbox: vi.fn() } as never,
+      sessionInteractiveRef: { current: false }, duplexActiveRef: { current: false },
+      setChatActiveLayer: vi.fn(), setProcessAlive: vi.fn(), setPendingEngineSwitch: vi.fn(),
+      setEngineSwitchBusy: vi.fn(), setEngineSwitchError: vi.fn(), pendingFindQueryRef: { current: null },
+      setFindInput: vi.fn(), setFindQuery: vi.fn(), setFindBarOpen: vi.fn(), setDriveRefusal: vi.fn(), setPreWarmRefusal,
+    }), { wrapper })
+    hook.result.current.latestRef.current = {
+      interactive: { resetSession: vi.fn(), interactiveMode: false } as never, draftKey: 'new', refetchChats: vi.fn() as never,
+    }
+    const ws = FakeWebSocket.instances[0]
+    act(() => { ws.onopen?.() })
+    const send = (frame: Record<string, unknown>) => act(() => { ws.onmessage?.({ data: JSON.stringify(frame) }) })
+    return { send, refusal: () => refusal }
+  }
+
+  const refused = {
+    type: WIRE.PRE_WARMUP_REFUSED, agent: 'dev', execution_path: 'claude-code-cli', reason: 'auth_off', error: 'Connect one.',
+  }
+
+  it('holds the refusal, and lets it go when a later pre-warm is up', () => {
+    const { send, refusal } = mountStream()
+    send(refused)
+    expect(refusal()).toEqual({ agent: 'dev', executionPath: 'claude-code-cli', reason: 'auth_off', error: 'Connect one.' })
+    send({ type: WIRE.PRE_WARMUP_READY, session_id: 's1' })
+    expect(refusal()).toBeNull()
+  })
+
+  it('lets it go when a session is up on the refused engine, and keeps it for another engine', () => {
+    const { send, refusal } = mountStream()
+    send(refused)
+    send({ type: WIRE.WARMUP_READY, session_id: 's1', execution_path: 'codex-cli' })
+    expect(refusal()).not.toBeNull()
+    send({ type: WIRE.WARMUP_READY, session_id: 's2', execution_path: 'claude-code-cli' })
+    expect(refusal()).toBeNull()
+  })
+})

@@ -1,15 +1,18 @@
 """Unit tests for the satellite auto-update mechanism.
 
 Covers the tarball+hash builder, the auto-update toggle column, the
-version-bookkeeping helpers, and the broadcast helpers' recipient
-resolution. The auth-time WS handler in proxy/ws/satellite.py is
+version-bookkeeping helpers, the broadcast helpers' recipient
+resolution, and the frame a machine's connect and leave sends the pages
+(``machine_link``). The auth-time WS handler in proxy/ws/satellite.py is
 exercised indirectly via the broadcast helpers (full WS auth flow
 testing lives in the existing test_satellite_security.py).
 """
 
+import asyncio
 import hashlib
 import io
 import tarfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -239,6 +242,104 @@ async def test_push_machine_event_enqueues_to_all_user_connections(monkeypatch):
     finally:
         notification_manager.unregister_user_connection("owner-sub-1", "conn-A")
         notification_manager.unregister_user_connection("owner-sub-1", "conn-B")
+
+
+@pytest.fixture
+def link_rig(monkeypatch):
+    """Two tabs of an owner, one of an admin, one of a member of the agent
+    that runs on m-1 by default, one of a stranger, one of a user of the
+    platform who is none of these; the window at zero."""
+    import asyncio as _asyncio
+
+    from services.notifications import notification_manager
+    from storage import remote_store
+    from storage.sharing import share_store
+    from ws import satellite as sat_ws
+
+    monkeypatch.setattr(sat_ws, "_LINK_FRAME_WINDOW_S", 0.0)
+    monkeypatch.setattr("storage.database.list_users",
+                        lambda: [{"sub": "admin-1", "role": "admin"},
+                                 {"sub": "creator-2", "role": "creator"}])
+    rows = {"m-1": {"id": "m-1", "name": "attic", "registered_by": "owner-1",
+                    "pairing_scope": "user", "machine_secret_hash": "never-sent"}}
+    monkeypatch.setattr(remote_store, "get_remote_machine", rows.get)
+    monkeypatch.setattr(remote_store, "get_agents_for_machine",
+                        lambda mid: ["alpha"] if mid == "m-1" else [])
+    monkeypatch.setattr(share_store, "members_of_agents",
+                        lambda agents: {"member-3"} if agents == ["alpha"] else set())
+    queues = {}
+    notification_manager._user_connections.clear()
+    for sub, conn in (("owner-1", "A"), ("owner-1", "B"), ("admin-1", "C"),
+                      ("member-3", "D"), ("stranger-4", "E"), ("creator-2", "F")):
+        queues[conn] = _asyncio.Queue(maxsize=8)
+        notification_manager.register_user_connection(sub, conn, queues[conn])
+    sat_ws._link_pushes.clear()
+    yield SimpleNamespace(sat_ws=sat_ws, queues=queues, rows=rows)
+    sat_ws._link_pushes.clear()
+    notification_manager._user_connections.clear()
+
+
+async def _link_frames_settled(sat_ws) -> None:
+    for task in list(sat_ws._link_pushes.values()):
+        await task
+    for _ in range(5):
+        await asyncio.sleep(0.01)
+
+
+def _drained(q) -> list[dict]:
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out
+
+
+@pytest.mark.asyncio
+async def test_a_machines_connect_reaches_its_owner_the_admins_and_the_agents_members(link_rig):
+    """One frame per tab of the owner, the admins and the members of the
+    agents that run on the machine by default; the id alone, nothing of the
+    machine's row; nobody else."""
+    sat_ws = link_rig.sat_ws
+    sat_ws._on_machine_link("m-1")
+    await _link_frames_settled(sat_ws)
+    for conn in ("A", "B", "C", "D"):
+        assert _drained(link_rig.queues[conn]) == [{"type": "machine_link", "machine_id": "m-1"}], conn
+    assert _drained(link_rig.queues["E"]) == []
+    assert _drained(link_rig.queues["F"]) == []
+
+
+@pytest.mark.asyncio
+async def test_connects_and_leaves_inside_the_window_are_one_frame(link_rig, monkeypatch):
+    sat_ws = link_rig.sat_ws
+    monkeypatch.setattr(sat_ws, "_LINK_FRAME_WINDOW_S", 0.05)
+    for _ in range(4):
+        sat_ws._on_machine_link("m-1")
+    await _link_frames_settled(sat_ws)
+    assert len(_drained(link_rig.queues["A"])) == 1
+    # The window closed: the next change is a frame of its own.
+    sat_ws._on_machine_link("m-1")
+    await _link_frames_settled(sat_ws)
+    assert len(_drained(link_rig.queues["A"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_removed_machine_sends_no_frame(link_rig):
+    sat_ws = link_rig.sat_ws
+    link_rig.rows.clear()
+    sat_ws._on_machine_link("m-1")
+    await _link_frames_settled(sat_ws)
+    assert all(_drained(q) == [] for q in link_rig.queues.values())
+
+
+def test_the_satellite_module_registers_the_link_callback(monkeypatch):
+    from core.remote import satellite_connection as sc, satellite_link
+    from ws import satellite as sat_ws
+    manager = sc.SatelliteConnectionManager()
+    monkeypatch.setattr(sc, "_connection_manager", manager)
+    try:
+        sat_ws.register()
+        assert manager._link_callback is sat_ws._on_machine_link
+    finally:
+        satellite_link.reset_hooks()
 
 
 def test_rewrite_stdio_paths_swaps_category_segment():
@@ -495,6 +596,7 @@ async def test_update_now_online_push_registers_the_target(monkeypatch):
     error, no count)."""
     import core.remote.satellite_connection as sc
     from api.remote import remote_machines as rm
+    from core.remote import satellite_link
     from ws import satellite as sat_ws
 
     sent: list[dict] = []
@@ -504,6 +606,9 @@ async def test_update_now_online_push_registers_the_target(monkeypatch):
             sent.append(msg)
 
     class _CM:
+        def __init__(self):
+            self.links = satellite_link.MachineLinks(self)
+
         def is_connected(self, mid):
             return True
 
@@ -540,6 +645,7 @@ async def test_update_now_counts_an_acknowledging_satellite_once_it_read_the_pus
 
     import core.remote.satellite_connection as sc
     from api.remote import remote_machines as rm
+    from core.remote import satellite_link
     from ws import satellite as sat_ws
 
     class _Conn:
@@ -554,6 +660,7 @@ async def test_update_now_counts_an_acknowledging_satellite_once_it_read_the_pus
     class _CM:
         def __init__(self):
             self.fut = None
+            self.links = satellite_link.MachineLinks(self)
 
         def is_connected(self, mid):
             return True
@@ -612,6 +719,7 @@ def _plaintext_update_now_stubs(monkeypatch, *, connected: bool, conn_caps: dict
     broadcast and queued, for the two branches of _do_trigger_update_now."""
     import core.remote.satellite_connection as sc
     from api.remote import remote_machines as rm
+    from core.remote import satellite_link
     from ws import satellite as sat_ws
 
     seen = {"sent": [], "broadcast": [], "pending": []}
@@ -623,6 +731,9 @@ def _plaintext_update_now_stubs(monkeypatch, *, connected: bool, conn_caps: dict
             seen["sent"].append(msg)
 
     class _CM:
+        def __init__(self):
+            self.links = satellite_link.MachineLinks(self)
+
         def is_connected(self, mid):
             return connected
 
@@ -691,3 +802,295 @@ async def test_update_now_still_queues_an_offline_satellite_on_a_secure_link(mon
         "m-tls-off", {"satellite_version": "0.9.0", "capabilities": '{"os": "linux"}'})
     assert out == {"ok": True, "queued": True, "pushed_now": False}
     assert seen["pending"] == [("m-tls-off", True)]
+
+
+@pytest.mark.asyncio
+async def test_the_push_over_the_socket_sends_nothing_to_a_machine_that_is_away(monkeypatch):
+    import core.remote.satellite_connection as sc
+    from api.remote import remote_machines as rm
+
+    class _CM:
+        def is_connected(self, mid):
+            return False
+
+        def get_connection(self, mid):
+            raise AssertionError("not read for a machine that is away")
+
+    monkeypatch.setattr(sc, "get_connection_manager", _CM)
+    assert await rm.push_update_online("m-away", {"satellite_version": "0.9.0"}) is False
+
+
+# ---------------------------------------------------------------------------
+# One update at a time, none to a machine on the newest version: the state
+# both update-now routes, the idle hook's push and the machine rows read.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def press(monkeypatch):
+    """'Update now' against one machine: a connection manager with real link
+    state, a live connection whose version and frames the test sets, and what
+    was sent, broadcast and queued. The platform's version is 9.9.9."""
+    import core.remote.satellite_connection as sc
+    from api.remote import remote_machines as rm
+    from core.remote import satellite_link
+    from ws import satellite as sat_ws
+
+    seen = {"sent": [], "broadcast": [], "pending": []}
+
+    class _Conn:
+        satellite_version = "0.9.0"
+        capabilities: dict = {}
+        last_frame_at = 0.0
+
+        async def enqueue_send(self, msg, *, bulk=False):
+            if state.get("send_fails"):
+                raise ConnectionError("socket closed")
+            seen["sent"].append(msg)
+
+    state = {"connected": True, "conn": _Conn()}
+
+    class _CM:
+        def __init__(self):
+            self.links = satellite_link.MachineLinks(self)
+
+        def is_connected(self, mid):
+            return state["connected"]
+
+        def get_connection(self, mid):
+            return state["conn"] if state["connected"] else None
+
+    cm = _CM()
+
+    async def _broadcast(*a, **k):
+        seen["broadcast"].append(a)
+
+    async def _run_db(fn, *args, **kwargs):
+        if fn is rm.remote_store.set_pending_update:
+            seen["pending"].append(args)
+            return None
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(sc, "get_connection_manager", lambda: cm)
+    monkeypatch.setattr(rm, "_require_satellite_source", lambda: None)
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "sha"))
+    monkeypatch.setattr(rm, "run_db", _run_db)
+    monkeypatch.setattr(sat_ws, "_broadcast_satellite_updating", _broadcast)
+    monkeypatch.setattr(sat_ws, "SATELLITE_VERSION_LATEST", "9.9.9")
+    monkeypatch.setattr(sat_ws, "UPDATE_ACK_SATELLITE_VERSION", "99.0.0")   # no ack wait
+    sat_ws._pending_pushed_updates.pop("m-u", None)
+    yield SimpleNamespace(rm=rm, cm=cm, state=state, seen=seen, link=satellite_link)
+    sat_ws._pending_pushed_updates.pop("m-u", None)
+
+
+async def _refused(press, machine: dict) -> str:
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        await press.rm._do_trigger_update_now("m-u", machine)
+    assert exc.value.status_code == 409
+    return exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_update_now_sends_nothing_to_a_connected_machine_on_the_newest_version(press):
+    """A machine on the version the platform would send is sent nothing. Its
+    live version decides."""
+    press.state["conn"].satellite_version = "9.9.9"
+    detail = await _refused(press, {"satellite_version": "0.9.0"})
+    assert detail == "This machine already runs the newest version, 9.9.9."
+    assert press.seen == {"sent": [], "broadcast": [], "pending": []}
+    assert press.cm.links.update_running("m-u") == ""
+
+
+@pytest.mark.asyncio
+async def test_update_now_queues_nothing_for_a_machine_away_on_the_newest_version(press):
+    press.state["connected"] = False
+    detail = await _refused(press, {"satellite_version": "10.0.1"})
+    assert "already runs the newest version" in detail
+    assert press.seen["pending"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_second_press_while_the_update_runs_sends_nothing(press):
+    out = await press.rm._do_trigger_update_now("m-u", {"satellite_version": "0.9.0"})
+    assert out == {"ok": True, "queued": False, "pushed_now": True}
+    assert press.cm.links.update_running("m-u") == "9.9.9"
+    assert await _refused(press, {"satellite_version": "0.9.0"}) == "This machine is already updating."
+    # Away while it restarts: still running, nothing queued.
+    press.state["connected"] = False
+    assert await _refused(press, {"satellite_version": "0.9.0"}) == "This machine is already updating."
+    assert len(press.seen["sent"]) == 1 and press.seen["pending"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_mark_ends_at_its_bound_and_at_the_next_sign_in(press, monkeypatch):
+    await press.rm._do_trigger_update_now("m-u", {"satellite_version": "0.9.0"})
+    monkeypatch.setattr(press.link, "UPDATE_RUN_S", 0.0)
+    assert press.cm.links.update_running("m-u") == ""
+    out = await press.rm._do_trigger_update_now("m-u", {"satellite_version": "0.9.0"})
+    assert out["pushed_now"] is True and len(press.seen["sent"]) == 2
+    monkeypatch.setattr(press.link, "UPDATE_RUN_S", 300.0)
+    assert press.cm.links.update_running("m-u") == "9.9.9"
+    press.cm.links.update_sent("m-u", "")
+    assert press.cm.links.update_running("m-u") == ""
+
+
+@pytest.mark.asyncio
+async def test_a_connection_that_still_talks_after_the_push_ends_the_mark(press):
+    """The apply blocks the satellite's loop and ends in its exit: the
+    connection the push went out on talking again past the quiet time means
+    the apply failed there and the machine runs its old version."""
+    await press.rm._do_trigger_update_now("m-u", {"satellite_version": "0.9.0"})
+    sent_at = press.cm.links._links["m-u"].update_sent_at
+    press.state["conn"].last_frame_at = sent_at + press.link.UPDATE_QUIET_S - 1
+    assert press.cm.links.update_running("m-u") == "9.9.9"
+    press.state["conn"].last_frame_at = sent_at + press.link.UPDATE_QUIET_S + 1
+    assert press.cm.links.update_running("m-u") == ""
+    # The sign-in's push went out on no registered connection: only the
+    # sign-in or the bound ends it.
+    press.cm.links.update_sent("m-u", "9.9.9")
+    assert press.cm.links.update_running("m-u") == "9.9.9"
+
+
+@pytest.mark.asyncio
+async def test_a_press_while_an_update_is_queued_writes_nothing(press):
+    press.state["connected"] = False
+    machine = {"satellite_version": "0.9.0", "pending_update": True}
+    detail = await _refused(press, machine)
+    assert detail == "An update is already queued for this machine. It runs when the machine connects."
+    assert press.seen["pending"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_push_the_door_refuses_is_never_queued(press, monkeypatch):
+    """``push_update_online`` answers False for a machine that is away, which
+    the route reads as "queue it": a refusal must never take that path."""
+    async def _refuse(mid, machine):
+        raise press.rm.UpdateRefused("This machine is already updating.")
+    monkeypatch.setattr(press.rm, "push_update_online", _refuse)
+    assert await _refused(press, {"satellite_version": "0.9.0"}) == "This machine is already updating."
+    assert press.seen["pending"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_push_door_refuses_a_second_push_and_a_current_machine(press):
+    machine = {"satellite_version": "0.9.0"}
+    assert await press.rm.push_update_online("m-u", machine) is True
+    with pytest.raises(press.rm.UpdateRefused):
+        await press.rm.push_update_online("m-u", machine)
+    press.cm.links.update_sent("m-u", "")
+    press.state["conn"].satellite_version = "9.9.9"
+    with pytest.raises(press.rm.UpdateRefused):
+        await press.rm.push_update_online("m-u", machine)
+    assert len(press.seen["sent"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_mark_stays_when_the_push_never_left(press, monkeypatch):
+    from fastapi import HTTPException
+
+    def _boom():
+        raise OSError("satellite tree unreadable")
+    monkeypatch.setattr(press.rm, "get_satellite_tarball_with_hash", _boom)
+    with pytest.raises(HTTPException):
+        await press.rm._do_trigger_update_now("m-u", {"satellite_version": "0.9.0"})
+    assert press.cm.links.update_running("m-u") == ""
+    monkeypatch.setattr(press.rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "sha"))
+    press.state["send_fails"] = True
+    with pytest.raises(HTTPException):
+        await press.rm._do_trigger_update_now("m-u", {"satellite_version": "0.9.0"})
+    assert press.cm.links.update_running("m-u") == ""
+    assert press.seen["pending"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_press_ends_the_wait_for_an_idle_moment(press):
+    press.cm.links.update_waits("m-u", "9.9.9")
+    assert press.rm.machine_update_state("m-u", {"satellite_version": "0.9.0"}, press.state["conn"]) == "waiting"
+    await press.rm._do_trigger_update_now("m-u", {"satellite_version": "0.9.0"})
+    assert press.cm.links.update_waiting("m-u") == ""
+
+
+@pytest.mark.asyncio
+async def test_the_idle_hook_drops_a_push_the_door_refuses(press, monkeypatch):
+    from ws import satellite as sat_ws
+
+    async def _row(fn, *a, **k):
+        return {"id": "m-u", "satellite_version": "9.9.9"}
+    monkeypatch.setattr(sat_ws, "run_db", _row)
+    press.state["conn"].satellite_version = "9.9.9"
+    await sat_ws._push_waiting_update("m-u")
+    assert press.seen["sent"] == []
+
+
+@pytest.mark.parametrize("case, expected", [
+    ({"conn": "9.9.9"}, "current"),
+    ({"conn": "10.0.0", "running": True}, "current"),
+    ({"conn": "0.9.0", "running": True}, "running"),
+    ({"away": True, "row": "0.9.0", "running": True}, "running"),
+    ({"away": True, "row": "9.9.9", "pending": True}, "current"),
+    ({"away": True, "row": "0.9.0", "caps": '{"insecure_transport": true}'}, "manual"),
+    ({"conn": "0.9.0", "conn_caps": {"insecure_transport": True}}, "manual"),
+    ({"away": True, "row": "0.9.0", "pending": True}, "queued"),
+    ({"conn": "0.9.0", "pending": True}, "available"),
+    ({"conn": "0.9.0", "waits": True}, "waiting"),
+    ({"conn": "0.9.0"}, "available"),
+    ({"away": True, "row": ""}, "available"),
+    ({"conn": "0.9.0", "compute": True}, ""),
+    ({"conn": "0.9.0", "no_source": True}, ""),
+])
+def test_the_machines_update_state(press, monkeypatch, case, expected):
+    from ws import satellite as sat_ws
+    if case.get("no_source"):
+        monkeypatch.setattr(sat_ws, "SATELLITE_VERSION_LATEST", None)
+    machine = {"satellite_version": case.get("row", "0.9.0"),
+               "pending_update": case.get("pending", False),
+               "capabilities": case.get("caps", "{}")}
+    if case.get("compute"):
+        machine["pairing_scope"] = "compute"
+    conn = None
+    if not case.get("away"):
+        conn = press.state["conn"]
+        conn.satellite_version = case["conn"]
+        conn.capabilities = case.get("conn_caps", {})
+    if case.get("running"):
+        press.cm.links.update_sent("m-u", "9.9.9", conn)
+    if case.get("waits"):
+        press.cm.links.update_waits("m-u", "9.9.9")
+    assert press.rm.machine_update_state("m-u", machine, conn) == expected
+
+
+def test_a_machine_row_carries_its_update_state(press, monkeypatch):
+    """The card reads the row's state: a connected machine on the platform's
+    version is current, whatever its row and its queued mark still say."""
+    monkeypatch.setattr(press.rm, "get_live_machine_status", lambda mid, machine=None: {
+        "state": "online", "last_heartbeat_age_s": 1, "reachable": True, "link_ok": True,
+        "link_down_s": None, "link_error": "", "last_seen_iso": ""})
+    monkeypatch.setattr(press.rm.tools_ahead, "card", lambda mid: None)
+    press.state["conn"].satellite_version = "9.9.9"
+    row = {"id": "m-u", "satellite_version": "0.9.0", "pending_update": True, "capabilities": {}}
+    assert press.rm._merge_live_status(row)["update_state"] == "current"
+
+
+@pytest.mark.asyncio
+async def test_two_presses_at_the_same_moment_send_one_update(press):
+    """Two admins in the same second: nothing awaits between the state's read
+    and the mark, so one press pushes and the other is refused."""
+    from fastapi import HTTPException
+
+    machine = {"satellite_version": "0.9.0"}
+    answers = await asyncio.gather(press.rm._do_trigger_update_now("m-u", machine),
+                                   press.rm._do_trigger_update_now("m-u", machine),
+                                   return_exceptions=True)
+    pushed = [a for a in answers if isinstance(a, dict)]
+    refused = [a for a in answers if isinstance(a, HTTPException)]
+    assert len(pushed) == 1 and pushed[0]["pushed_now"] is True
+    assert len(refused) == 1 and refused[0].status_code == 409
+    assert len(press.seen["sent"]) == 1
+
+
+def test_reading_a_machines_state_keeps_no_link_alive(press):
+    """The machine lists poll every 15 s: a read must not create or refresh
+    a link, or no away machine's link state would ever be dropped."""
+    press.rm.machine_update_state("m-unknown", {"satellite_version": "0.9.0"}, None)
+    assert "m-unknown" not in press.cm.links._links

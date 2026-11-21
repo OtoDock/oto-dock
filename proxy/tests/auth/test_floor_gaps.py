@@ -261,3 +261,73 @@ def test_a_command_holding_a_nul_is_refused_in_every_context(cmd):
 def test_a_nul_never_raises_in_the_resolver_or_the_undeclared_tool_scan():
     assert "\x00" in str(path_policy._resolve_path("/tmp/a\x00b"))
     assert not path_policy._unknown_tool_dangerous_scan({"note": "a\x00b"}).allowed
+
+
+@pytest.mark.parametrize("cmd", [
+    "otodock chat send --agent b hi", "otodock login", "otodock files get --agent b x",
+    "~/.local/bin/otodock tasks run --agent b go", "A=1 otodock notify hello",
+    "cd /tmp && otodock agents", "bash -c 'otodock chat send hi'",
+    "/opt/x/otodock.py logout",
+    # Behind a wrapper: the first clears what the command's own check reads.
+    "env -u OTO_SESSION_ID -u PROXY_API_KEY otodock chat send hi",
+    "timeout 5 otodock chat send hi", "nohup otodock tasks run --agent b go",
+    "nice -n 5 otodock notify hello", "command otodock agents",
+    # Run by an interpreter, as a file or as a module.
+    "python3 otodock.py chat send hi",
+    "python3 /home/u/.oto-dock/satellite/terminal/otodock_api.py files list --agent b",
+    "python3 -m otodock_api chat send hi",
+    # Any letter case, and the words as the shell reads them.
+    "OTODOCK chat send hi", "Otodock.CMD login", "otodock $'chat' send hi",
+    "otodock {chat,send} hi",
+    # Bare words after a printer read the same: the gate cannot tell them apart.
+    "echo otodock chat send hi",
+    # The name spelled so the raw text never holds it: the shell still runs it.
+    "oto''dock chat send hi", 'oto""dock login', "o\\todock chat send hi",
+    "$'oto\\x64ock' chat send hi", "env {A=1,oto}dock chat send hi",
+    # The file as a module, by its dotted name.
+    "python3 -m terminal.otodock_api chat send hi",
+    "python3 -m satellite.terminal.otodock_api files list --agent b",
+])
+def test_the_otodock_commands_key_verbs_are_refused_in_every_context(cmd):
+    for name, ctx in _matrix().items():
+        d = path_shell._check_bash(cmd, ctx)
+        assert not d.allowed and "API key verbs" in d.reason, (cmd, name, d)
+
+
+@pytest.mark.parametrize("cmd", [
+    "otodock claude my-agent", "otodock codex", "grep -n 'otodock chat' notes.txt",
+    "echo 'otodock chat send hi'", "cat otodock.py",
+    "git diff satellite/terminal/otodock_api.py satellite/tests/test_otodock_api.py",
+    "python3 -m pytest satellite/tests/test_otodock_api.py -k chat",
+    "git commit -m 'otodock chat send waits for the turn'",
+    "python3 -m satellite.terminal.otodock_cli claude my-agent", "ls docs.otodock.io files",
+])
+def test_the_rest_of_the_otodock_command_and_its_mentions_stay_open(cmd):
+    assert path_shell._key_command_refusal(cmd) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "otodock chat send hi", "otodock.cmd login", "OTODOCK agents",
+    "& 'C:\\Users\\u\\OtoDock\\satellite\\bin\\otodock.cmd' chat send hi",
+    ".\\otodock.cmd tasks run --agent b go",
+    "python otodock.py files list --agent b", "py -3 C:\\tools\\otodock_api.py notify hello",
+    "Write-Output x; otodock notify hello", "$env:OTO_SESSION_ID=''; otodock chat send hi",
+    "cmd /c otodock agents", "powershell -Command \"otodock chat send hi\"",
+    # Quotes and a backtick inside the name: PowerShell runs it all the same.
+    "oto''dock chat send hi", 'oto""dock login', "oto`dock agents", "otodock c`hat send hi",
+    "& C:\\\"Program Files\"\\OtoDock\\otodock.cmd chat send hi",
+    "python -m terminal.otodock_api chat send hi",
+])
+def test_the_powershell_gate_refuses_the_key_verbs_in_every_context(cmd):
+    for name, ctx in _matrix().items():
+        d = path_shell._check_powershell(cmd, ctx)
+        assert not d.allowed and "API key verbs" in d.reason, (cmd, name, d)
+
+
+@pytest.mark.parametrize("cmd", [
+    "otodock claude my-agent", "Get-Content otodock.py", "Select-String 'otodock chat' notes.txt",
+    "Write-Output 'otodock chat send hi'", 'Write-Output "otodock chat send hi"',
+    "o`todock chat send hi",
+])
+def test_the_powershell_gate_leaves_the_rest_of_the_otodock_command_open(cmd):
+    assert path_shell._key_command_refusal_ps(cmd) is None, cmd

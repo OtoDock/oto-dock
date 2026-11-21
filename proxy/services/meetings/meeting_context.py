@@ -13,6 +13,7 @@ tests (``meeting_orchestrator.build_meeting_agent_config`` /
 """
 
 import asyncio
+import functools
 import json
 import logging
 from typing import cast
@@ -70,10 +71,11 @@ async def build_meeting_agent_config(
     # (core/config/task_config_builder.py). This is what forces a Shared-only
     # participant to AGENT scope even inside a user-scope meeting:
     # ``resolve_task_identity`` returns ``creds_user_sub=None`` / ``scope='agent'``
-    # for a Shared-only agent (so the session draws on the platform pool, never
-    # the meeting creator's subscription), and ``resolve_visibility`` clamps the
-    # mount + owns session_scope / config_visible / available_scopes for the
-    # prompt + sandbox decouple.
+    # for a Shared-only agent (its files and tool accounts are the agent's;
+    # who pays is ``core/config/spender.py``'s: the creator of a person's
+    # meeting, every participant included), and ``resolve_visibility`` clamps
+    # the mount + owns session_scope / config_visible / available_scopes for
+    # the prompt + sandbox decouple.
     from core.config.task_config_builder import resolve_task_identity
     from core.session.visibility import SCOPE_AGENT, is_shared_only, resolve_visibility
 
@@ -142,8 +144,18 @@ async def build_meeting_agent_config(
         remote_status.resolve_execution_target,
         agent_name, user_sub_for_creds, task_role,
     ))[0]
+    # The compute machine that serves the platform's place takes the
+    # participant: its session on Claude Code and Codex, its tool processes
+    # on an engine whose tools the proxy manages. One that shares the
+    # platform's folders: every participant of a meeting works on one copy.
+    compute_row = await asyncio.to_thread(functools.partial(
+        remote_status.compute_row_for, resolved_target,
+        (agent_info or {}).get("execution_path") or DEFAULT_EXECUTION_PATH,
+        shared_folder=True,
+    ))
     target = await asyncio.to_thread(
         _remote_store.placement_of, resolved_target, user_sub_for_creds, agent_name,
+        **({"compute": compute_row} if compute_row else {}),
     )
     target_browser = await asyncio.to_thread(
         _remote_store.get_target_browser_settings, target,
@@ -156,8 +168,11 @@ async def build_meeting_agent_config(
     # revocation check, and a Codex participant's sandbox mode ignores the
     # machine's flag. Carrying the full object would open all five (the
     # task builder does); that is the operator's decision, not this
-    # refactor's (core-seams phase 7, D17).
-    context_placement = _placement.PlacementCapabilities(kind=target.kind, label=target.label)
+    # refactor's (core-seams phase 7, D17). A compute placement stays whole:
+    # the layer and admission read the machine off it, the relayed tools
+    # open by its id and their callbacks are admitted by it.
+    context_placement = (target if target.kind == _placement.KIND_COMPUTE
+                         else _placement.PlacementCapabilities(kind=target.kind, label=target.label))
 
     # Codex needs the MCP config in TOML (config.toml [mcp_servers.*]), not the
     # Claude JSON format — a JSON blob written into config.toml makes Codex's
@@ -167,6 +182,11 @@ async def build_meeting_agent_config(
     from core.session.session_manager import capabilities_for_path
     mcp_format = capabilities_for_path(execution_path).mcp_config_format
 
+    # The agent's tool limits for a participant: the chats column behind a
+    # person (a user-scope meeting), the runs column behind none.
+    from services.mcp import tool_limits
+    limits = await asyncio.to_thread(
+        tool_limits.load, agent_name, tool_limits.governs_of(external=False, person=identity.person))
     mcp_config, credential_env, excluded_mcps, secret_bundles, bash_env_keys = (
         await asyncio.to_thread(
             mcp_registry.build_session_mcp_config,
@@ -174,6 +194,7 @@ async def build_meeting_agent_config(
             user_sub_for_creds,
             session_id=session_id,
             task_mode=True,
+            limits=limits or None,
             # ALSO match "meeting" in exclude_from (union with "task") — keeps
             # the tool config in step with the prompt catalog, which filters by
             # client_type "meeting".
@@ -186,6 +207,10 @@ async def build_meeting_agent_config(
             task_username=session_task_username,
             placement=target,
             target_browser=target_browser,
+            # The audience gate of a participant's role: a Direct LLM
+            # participant's tool manager reads this build alone.
+            user_role=task_role,
+            username=task_username,
         )
     )
 
@@ -198,6 +223,7 @@ async def build_meeting_agent_config(
     credential_env = credential_env if credential_env is not None else {}
     token_minted_at = mint_session_env(
         credential_env, session_id, agent_name, user_sub_for_creds or "", external="",
+        role=task_role or "",
     )
 
     # A Codex config gets the credential environment written in; the
@@ -207,12 +233,17 @@ async def build_meeting_agent_config(
         mcp_format=mcp_format, exclude_keys=bash_env_keys,
     )
 
+    _attached = [m for m in (await asyncio.to_thread(
+        mcp_registry.get_agent_mcps, agent_name, placement=target) or [])
+        if m.name not in (excluded_mcps or {})]
+    limit_pairs = tool_limits.grants(limits, _attached, forced=("meetings-mcp",))
     task_security = SecurityContext(
         role=task_role,
         username=task_username,
         agent=agent_name,
         is_admin_agent=is_admin_only,
         placement=context_placement,
+        tool_limits=limit_pairs,
         # Visibility-modes: a Shared-only participant mounts agent scope even in a
         # user-scope meeting (no user dirs; shared workspace) — drives the prompt's
         # scope/folder variants + the sandbox mount decouple.
@@ -272,6 +303,8 @@ async def build_meeting_agent_config(
         placement=target,
         mount_shared=vis.mount_shared,
         execution_path=execution_path or "",
+        tool_limits=limit_pairs or None,
+        session_id=session_id,
     )
     agent_prompt = (agent_prompt or "") + build_permission_context(
         task_security,
@@ -290,29 +323,12 @@ async def build_meeting_agent_config(
     # notifications-mcp, schedules-mcp, delegation-mcp manifest.json.
     extra_env: dict[str, str] = {}
 
-    # Acquire execution layer subscription
-    subscription_id = ""
-    sub_user = created_by if scope == "user" else None
-
-    try:
-        subscription_id, sub_env = await asyncio.to_thread(
-            subscription_pool.resolve_subscription_env,
-            execution_path, sub_user,
-            model=resolved_model, agent_info=agent_info,
-        )
-        extra_env.update(sub_env)
-    except subscription_pool.NoSubscriptionError:
-        # The pool refused the spawn (its subscription cap, or a user-scope
-        # block): the orchestrator fails the meeting with the reason.
-        raise
-    except Exception as e:  # noqa: BLE001  # a pool error leaves the meeting agent on its own engine login
-        logger.warning("Subscription pool error for meeting agent %s: %s", agent_name, e)
-
     # Prepare the persistent config dir — .codex/ for Codex, .claude/ otherwise.
     # Single source of truth so the builders can't drift (a Codex meeting agent
     # whose config landed in .claude/ would crash at init). See
     # core.sandbox.sandbox.ensure_persistent_agent_dir.
     from core.sandbox.sandbox import ensure_persistent_agent_dir
+    from core.sandbox.session_config_dir import session_home_for
     host_claude_dir = await asyncio.to_thread(
         ensure_persistent_agent_dir,
         agent_name,
@@ -320,6 +336,23 @@ async def build_meeting_agent_config(
         username=task_username,
         scope=scope,
     )
+    home = session_home_for(host_claude_dir, session_id, execution_path=execution_path, ctx=task_security)
+
+    # The account, through the one owner (``core/config/spender.py``): a
+    # meeting a person starts is theirs, every participant included; an
+    # agent-scope meeting the agent's. A refusal (the pool's cap, a person
+    # with no account or who lost the agent) fails the meeting with the
+    # reason, rather than a participant starting with an empty key.
+    from core.config import spender
+    payer = await asyncio.to_thread(spender.meeting_spender, meeting, agent_name)
+    spent = await asyncio.to_thread(functools.partial(
+        spender.spend_env, payer, execution_path, model=resolved_model, agent_info=agent_info,
+        # The same key the layer binds with: a participant shares the
+        # agent's sign-in folder with the agent's live chats.
+        sticky_scope=subscription_pool.scope_key_for(resolved_target, str(host_claude_dir), home),
+        agent=agent_name))
+    subscription_id = spent.subscription_id
+    extra_env.update(spent.env)
 
     return AgentConfig(
         agent_name=agent_name,
@@ -340,8 +373,9 @@ async def build_meeting_agent_config(
         extra_env=extra_env,
         security_context=task_security,
         subscription_id=subscription_id,
-        subscription_user_sub=sub_user or "",
+        subscription_user_sub=spent.bound_sub,
         sandbox_host_claude_dir=str(host_claude_dir),
+        session_home=home,
         execution_target=resolved_target,
         execution_path=execution_path,
     )

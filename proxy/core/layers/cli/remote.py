@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import config as app_config
+from core.background import spawn
 from core.events import turn_ending, turn_life
 from core.events.common_events import DONE, ERROR, CommonEvent
 from core.execution_layer import (
@@ -39,15 +40,16 @@ from core.execution_layer import (
     ResumeVerdict,
 )
 from core.layers.cli import usage as claude_usage
+from core.layers.cli.helpers import _STEER_INIT_GRACE_S, _THINKING_SIG_RE
 from core.layers.cli.layer import CLIExecutionLayer, cli_chunk_to_events
 from core.layers.cli.oauth import REMOTE_401_WAIT_MS
-from core.layers.cli.session import _STEER_INIT_GRACE_S
 from core.layers.cli.settle import (
     FOREIGN_SKIP_SILENCE_S,
     ForeignSkipGate,
     SettleController,
     chunk_is_content,
     is_foreign_result,
+    result_chunks,
 )
 from core.layers.cli.translator import ClaudeCLIEventTranslator
 from core.permission_modes import ASK_MODE, AUTO_REVIEW_MODE, cli_mode
@@ -61,13 +63,16 @@ logger = logging.getLogger("remote-layer")
 # engine's wire vocabulary, frozen with the satellites in the field.
 CREDENTIALS_PAYLOAD_KEY = "credentials_json"
 CONFIG_DIR_PAYLOAD_KEY = "claude_dir_relative"
+# The session's home in that dir (``SessionHomeSpec.to_dict``): present only
+# for a satellite that reports ``session_homes``.
+SESSION_HOME_PAYLOAD_KEY = "session_home"
 MCP_CONFIG_PAYLOAD_KEY = "mcp_config"
 
 # The satellite frames this engine's session answers to.
 SOFT_INTERRUPT_FRAME = "interrupt_turn"     # control_request {interrupt} into the CLI's stdin
 STOP_TURN_FRAME = "stop_turn"               # exit the satellite's stdout read loop
 CONTROL_REQUEST_FRAME = "control_request"   # set_model / set_permission_mode → CLI stdin
-STEER_FRAME = "steer_turn"                  # a user frame into the live turn's stdin (satellite ≥ 0.5.128)
+STEER_FRAME = "steer_turn"                  # a user frame into the live turn's stdin
 RESUME_PROBE_FRAME = "check_session_resumable"  # read the session JSONL on the machine
 # One call of ``can_resume`` waits this long for the probe's answer; the probe
 # itself stays outstanding across calls (``_probes``).
@@ -89,10 +94,9 @@ _probes: dict[tuple[str, str], _OutstandingProbe] = {}
 
 @dataclass
 class ClaudeRemoteState:
-    """Per-turn state of a remote Claude session: the translator (a pure
-    state machine, fresh every turn like the local ``PersistentSession``),
-    the settle controller that owns the turn-end decision, and the steer
-    bookkeeping ``PersistentSession`` keeps on itself — ``result_seen``
+    """Per-turn state of a Claude session on a machine: the translator (a
+    pure state machine, fresh every turn), the settle controller that owns
+    the turn-end decision, and the steer bookkeeping — ``result_seen``
     (the DRIVEN result was read: a steer would start a turn nobody reads),
     ``steer_written`` (a frame is in the CLI's stdin: the post-result peek
     reads the turn it may start), ``steer_pending`` (RPCs whose ack is in
@@ -116,9 +120,31 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
 
     def start_payload(self, base: dict, ctx: RemoteStartContext) -> RemoteStartPlan:
         config, env, payload = ctx.config, ctx.env, base
+        # A terminal's first message waits for its stand-ins where they say
+        # when the engine has their lists (a compute machine always runs the
+        # platform's own version; a paired one says so).
+        reports = getattr(ctx.cm, "satellite_reports_listed", None)
+        if config.interactive and (ctx.spawn is not None or (
+                callable(reports) and reports(ctx.machine_id))):
+            from core.layers.cli.layer import expect_terminal_tools
+            expect_terminal_tools(ctx.session_id, config)
+        if ctx.spawn is not None:
+            # A compute machine runs the plan's argv (the flags, the prompt
+            # file, the MCP config and the login file are the platform
+            # folder's); it reads the config dir for the transcript tail
+            # and the resume words alone.
+            payload[CONFIG_DIR_PAYLOAD_KEY] = ctx.spawn.config_dir_relative
+            spec = self.layer.capabilities.auth.session_home
+            if config.session_home and spec is not None:
+                # A machine with its own copy makes the home's links itself.
+                payload[SESSION_HOME_PAYLOAD_KEY] = spec.to_dict()
+            payload["resume"] = config.resume
+            payload["session_id_for_resume"] = ctx.session_id if config.resume else ""
+            return RemoteStartPlan(payload=payload,
+                                   credential_file_delivered=ctx.spawn.credential_file)
         # CLI effort: xhigh→max for models that don't support xhigh — the
         # satellite has no model registry, so the proxy is the single source
-        # of truth (mirrors core/layers/cli/session.py). "ultra" is Codex-only
+        # of truth (as core/layers/cli/spawn.py does for the argv). "ultra" is Codex-only
         # (gpt-5.6 multi-agent orchestration) — the `claude` CLI rejects it,
         # clamp to the ceiling.
         effort = config.effort
@@ -130,6 +156,12 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         payload[CONFIG_DIR_PAYLOAD_KEY] = (
             f"{ctx.scope_root}/{self.layer.capabilities.runtime.config_dir_name}"
         )
+        # A home of its own in that dir (``session_config_dir.session_home_for``
+        # decided it for a satellite that makes homes): the satellite makes it
+        # by the engine's declaration and points the engine there.
+        spec = self.layer.capabilities.auth.session_home
+        if config.session_home and spec is not None:
+            payload[SESSION_HOME_PAYLOAD_KEY] = spec.to_dict()
         payload["resume"] = config.resume
         payload["session_id_for_resume"] = ctx.session_id if config.resume else ""
         # OAuth file delivery (mirrors the local layer): the satellite writes
@@ -170,7 +202,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                         target_os=ctx.target_os, session_id=ctx.session_id,
                         secret_bundle_keys=ctx.secret_bundle_keys,
                         proxy_api_key=ctx.proxy_api_key,
-                        gateway=ctx.gateway, gateway_mode=ctx.gateway_mode,
+                        gateway=ctx.gateway,
                     )
             except Exception:
                 logger.exception("Claude MCP JSON build failed")
@@ -205,7 +237,10 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
     def adopt_state(self, info: RemoteSessionInfo, cm=None) -> None:
         """Mode C: the replayed turn streams through a fresh translator and an
         interactive settle (the buffered turn's sentinel / turn_ended closes
-        it)."""
+        it). The MCP server keys the satellite reported become manifest
+        names, as a start's are."""
+        server_to_name = _server_to_manifest_name()
+        info.used_mcps = {server_to_name.get(key, key) for key in info.used_mcps}
         translator = ClaudeCLIEventTranslator(info.session_id)
         info.engine_state = ClaudeRemoteState(
             translator=translator,
@@ -254,7 +289,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         # Foreign-result skip regime (see settle.ForeignSkipGate): resume
         # handshake / settlement results must not close the driven turn —
         # the valve, not a count, ends the regime.
-        gate = ForeignSkipGate(info.session_id, translator)
+        gate = ForeignSkipGate(info.session_id, translator, own_message=info.own_message_turn)
         while True:
             timeout = gate.clamp_timeout(settle.effective_timeout())
             try:
@@ -285,8 +320,10 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                     )
                     yield CommonEvent(type=DONE)
                     return
-                if not settle.settling:
-                    # Pre-settle silence: the turn keeps its life (an open
+                if not settle.settling or settle.wake_open:
+                    # Pre-settle silence, or silence inside the CLI's own wake
+                    # turn open in the settle (a turn before its result
+                    # too): the turn keeps its life (an open
                     # tool, a prompt on a person, background work, a recent
                     # hook) or ends typed past the ceiling, the twin of the
                     # local drive loop. The satellite's reader is stopped
@@ -348,9 +385,9 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             # the send_message command it was streamed under. A result/error
             # from a PREVIOUS turn (the replaced process's dying flush racing
             # past the send-start drain) must not terminate THIS turn.
-            # Untagged events (older satellite) pass through; content-type
-            # events pass regardless (a late bg task_updated frame from the
-            # prior turn must still reach the registries).
+            # An untagged event passes through, and a content-type event
+            # passes regardless (a late bg task_updated frame from the prior
+            # turn must still reach the registries).
             ev_cmd = raw.get("_command_id", "")
             if (ev_cmd and expected_cmd_id and ev_cmd != expected_cmd_id
                     and rtype in ("result", "error")):
@@ -383,14 +420,8 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                     )
                     continue
                 turn["closed"] = True
-                if not state.result_seen and not settle.settling and not info.proxy_killed:
-                    # The satellite closed the turn before the CLI's result:
-                    # its process went, and what it ran may not be on disk.
-                    info.cli_dead = True
-                    for event in _lost_events("the machine ended the turn before its result"):
-                        yield event
-                    return
-                yield CommonEvent(type=DONE)
+                for event in _turn_end_events(info, state, settle, raw):
+                    yield event
                 return
 
             # Feed the translator and forward all chunks. Content counts
@@ -401,13 +432,17 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             # "real" and close the turn on it.
             info.last_activity = info.last_event_at = time.monotonic()
             # An init DURING settle = the CLI's self-wake review turn running
-            # INLINE through this stream (its content joins the task output)
-            # — note it so the producer/monitors skip the redundant nudge.
-            # Twin of the local session loop's marker.
+            # INLINE through this stream (its content joins the task output).
+            # The settle holds until its result, where the producer and the
+            # monitors learn the review ran. Twin of the local session loop's
+            # marker.
             if (settle.settling and rtype == "system"
                     and raw.get("subtype") == "init"):
-                wake_capture.note_captured(info.session_id)
+                settle.note_wake_open()
             engine_prompts.note_frame(info.session_id, raw, in_turn=True)
+            # A result's chunks wait for the foreign check below: a skipped
+            # result's metadata (its own time and cost) is not the turn's.
+            held: list = []
             for chunk in translator.feed(raw):
                 if chunk.event_type == "rate_limit":
                     # The account's window state: for the pool, never the chat.
@@ -416,6 +451,9 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                 if (chunk_is_content(chunk)
                         and (not ev_cmd or ev_cmd == expected_cmd_id)):
                     gate.note_content()
+                if rtype == "result":
+                    held.append(chunk)
+                    continue
                 for event in cli_chunk_to_events(chunk):
                     yield event
 
@@ -425,23 +463,41 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             # it, and task mode must not enter settle on it (the job-done
             # 5s fast-grace would close the turn just the same).
             if rtype == "result":
-                if not settle.settling and is_foreign_result(
+                skipped = not settle.settling and is_foreign_result(
                     raw, gate.content_since_skip,
-                ):
+                )
+                if skipped:
                     gate.record_skip(raw)
+                for event in [e for c in result_chunks(held, skipped) for e in cli_chunk_to_events(c)]:
+                    yield event
+                if skipped:
                     continue
+                if info.post_interrupt_watch:
+                    if raw.get("is_error") and _THINKING_SIG_RE.search(str(raw.get("result", ""))):
+                        info.post_interrupt_watch = False
+                        logger.warning(
+                            "Remote session %s: thinking-signature error after an "
+                            "interrupt; ending the process for a resume", info.session_id[:8],
+                        )
+                        spawn(self._repair_wedge(info), name="repair_wedge", owner="remote-layer")
+                    elif not raw.get("is_error"):
+                        info.post_interrupt_watch = False
+                if settle.note_wake_result():
+                    # The wake turn ran to its result: it is the review of
+                    # the finished background work.
+                    wake_capture.note_captured(info.session_id)
                 state.result_seen = True
                 if settle.is_interactive_done():
                     if state.steer_written or state.steer_pending:
                         # A steer the turn did not consume becomes the
                         # CLI's next turn by itself: its init follows the
                         # result at once, and this stream reads that turn
-                        # through (twin of the local _drive_turn peek). The
+                        # through. The
                         # satellite's loop is still reading — no stop_turn
                         # was sent — so the frames keep coming.
                         nxt = await _peek_after_result(info, expected_cmd_id)
                         state.steer_written = False
-                        if nxt is not None and wake_capture.is_wake_init(nxt):
+                        if nxt is not None and wake_capture.opens_turn(nxt):
                             state.result_seen = False
                             translator.reset_for_foreign_skip()
                             # Its result is the driven one even when empty.
@@ -482,55 +538,24 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                 settle.enter_settle()
 
     async def drain_bg_commands(self, info: RemoteSessionInfo, cm, *, budget: float) -> bool:
-        """Read the background work's lines between turns. The satellite
-        forwards claude's stdout CONTINUOUSLY into the per-session
-        ``event_queue`` (a persistent WS pipe), so post-turn frames (a
-        command's ``task_updated{patch.status:completed}``, a sub-agent's own
-        lines and its completion) accumulate there. This pulls them with a
-        short budget, resolving each via ``resolve_background_frame`` (badge
-        clear + registry). Returns True if any work ended. Both post-turn
-        monitors poll this: bg bash has no completion hook, and a sub-agent's
-        stdout completion heals a stop hook the proxy never received.
-        Acquires the session lock with a short timeout so it never races an
-        in-flight turn (the lock blocks the next turn's send_message, so we only
-        ever see idle post-turn frames)."""
+        """The monitors' poll of the session between turns: the one reader
+        between turns (``remote_bg_commands.read_between_turns``) for up to
+        ``budget``, resolving background lines (badge clear + registry) and
+        recording a turn the engine starts by itself. Returns True if any
+        work ended. Takes the session lock with a short timeout so it never
+        races an in-flight turn (the lock blocks the next turn's
+        send_message, so only idle post-turn frames are seen)."""
         try:
             await asyncio.wait_for(info.lock.acquire(), timeout=0.1)
         except asyncio.TimeoutError:
             return False  # a turn is in flight — retry next poll
-        progressed = False
         try:
-            from core.events import wake_capture
-            from core.remote.remote_bg_commands import queue_frame_reader
-            from core.session import engine_prompts
-            from core.session.background_frames import resolve_background_work
-            deadline = time.monotonic() + budget
-            while time.monotonic() < deadline:
-                try:
-                    raw = await asyncio.wait_for(info.event_queue.get(), timeout=0.4)
-                except asyncio.TimeoutError:
-                    break  # no more buffered frames right now
-                if not isinstance(raw, dict):
-                    continue  # synthetic marker (_turn_ended, None) — ignore
-                info.last_activity = time.monotonic()
-                if wake_capture.is_wake_init(raw):
-                    # A self-wake turn (2.1.243) forwarded by the satellite's
-                    # post-turn drain — record it as a real chat turn (twin
-                    # of the local drain). Ignores the drain budget: the
-                    # bracket has its own ceiling; abandoning it mid-turn
-                    # would orphan the remaining frames.
-                    await wake_capture.capture_wake_turn(
-                        info.session_id, raw, queue_frame_reader(info),
-                        source="remote_idle_drain",
-                    )
-                    progressed = True
-                    continue
-                if resolve_background_work(info.session_id, raw):
-                    progressed = True
-                engine_prompts.note_frame(info.session_id, raw)
+            from core.remote.remote_bg_commands import read_between_turns
+            progressed, _ = await read_between_turns(
+                info, cm, quiet_s=0.4, budget_s=budget, source="remote_idle_drain")
+            return progressed
         finally:
             info.lock.release()
-        return progressed
 
     # --- control -------------------------------------------------------------
 
@@ -538,9 +563,22 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         return SOFT_INTERRUPT_FRAME
 
     def note_interrupt(self, info: RemoteSessionInfo) -> None:
+        from core.events import wake_capture
         state = cast("ClaudeRemoteState | None", info.engine_state)
         if state is not None:
             state.translator.interrupted = True
+        wake_capture.note_interrupt(info.session_id)
+        info.post_interrupt_watch = True
+
+    async def _repair_wedge(self, info: RemoteSessionInfo) -> None:
+        """The thinking-signature error after an interrupt: the CLI's
+        process is ended through the layer's hard abort (the next send
+        resumes it by its handle, which drops the unsigned block) and the
+        chat's cancelled context is armed again, as the local session's
+        kill does."""
+        from core.session.session_manager import _get_remote_layer
+        await _get_remote_layer()._hard_abort(info.session_id)
+        await _arm_cancelled_context(info.session_id)
 
     def turn_settled(self, info: RemoteSessionInfo) -> bool:
         state = cast("ClaudeRemoteState | None", info.engine_state)
@@ -572,33 +610,40 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         return True
 
     async def steer(self, info: RemoteSessionInfo, cm, text: str) -> bool:
-        """Mid-turn steering — the tunnel twin of ``PersistentSession.steer``:
-        the satellite writes the user frame into the live turn's stdin
-        (``steer_turn``, satellite ≥ 0.5.128; an older one would drop the
-        frame silently, so refuse before sending and let the caller queue).
-        The result-seen guard is this side's — a foreign result (the resume
-        handshake) never sets it, exactly as the local loop — and the accept
-        is strict: True only when the satellite reached the pipe. A steer
-        that races the result is not lost: the frame becomes the CLI's next
-        turn, which ``stream_turn`` reads through while an RPC is pending or
-        a frame is written."""
-        state = cast("ClaudeRemoteState | None", info.engine_state)
+        """Mid-turn steering: the satellite writes the user frame into the
+        live turn's stdin (``steer_turn``). The result-seen guard is this
+        side's: a foreign result (the resume handshake) never sets it. The
+        accept is strict: True only when the satellite reached
+        the pipe. A steer that races the result is not lost: the frame
+        becomes the CLI's next turn, which ``stream_turn`` reads through
+        while an RPC is pending or a frame is written. A turn the engine
+        started by itself (``info.engine_turn``) takes a steer the same way on
+        a satellite that streams between turns, and its record reads a late
+        one through; an older satellite refuses it there, so the message
+        takes the stop-and-send path."""
+        engine = info.engine_turn
+        if engine is not None and not cm.satellite_streams_between_turns(info.machine_id):
+            return False
+        state = engine if engine is not None else cast("ClaudeRemoteState | None", info.engine_state)
         if not text or state is None or state.result_seen:
             return False
-        if _silence_ends(info, state.translator):
+        # A turn parked on a permission card: the card is the question, and
+        # a typed message keeps the auto-deny plus queue path.
+        from core.events.stream_pump import _pending_permissions
+        if _pending_permissions.get(info.session_id):
+            return False
+        if engine is None and _silence_ends(info, state.translator):
             # The turn is about to end silent: the frame would be lost with
             # the process, so the caller queues it for the next turn.
-            return False
-        if not cm.satellite_supports_steer_turn(info.machine_id):
-            logger.info(
-                "remote steer unsupported by satellite %s (< 0.5.128) — "
-                "falling back to queue", info.machine_id[:8],
-            )
             return False
         # A photo attached to the steer must be on the machine before the
         # CLI reads its path — the same barrier the turn dispatch runs.
         from core.remote import upload_inflight
-        await upload_inflight.wait_settled(info.agent_name, machine_id=info.machine_id)
+        if info.files_synced and not await upload_inflight.wait_settled(
+                info.agent_name, machine_id=info.machine_id,
+                ceiling=upload_inflight.BARRIER_TIMEOUT_S):
+            text = await upload_inflight.turn_goes_on_without_files(
+                info.session_id, info.machine_id, info.agent_name, text)
         state.steer_pending += 1
         try:
             ack = await cm.send_command(info.machine_id, {
@@ -648,10 +693,9 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         chat memory evaporates.
 
         Only a definite answer decides: ``resumable: true`` is RESUMABLE,
-        ``false`` is FRESH (a 0.5.149 satellite answers it for a read error
-        too). A machine away, a probe unanswered within ``_PROBE_WAIT_S``,
-        a failed send or a 0.5.150 satellite's ``status: error`` (a read the
-        machine could not finish) is UNKNOWN: the fresh branch is
+        ``false`` is FRESH. A machine away, a probe unanswered within
+        ``_PROBE_WAIT_S``, a failed send or the satellite's ``status: error``
+        (a read the machine could not finish) is UNKNOWN: the fresh branch is
         irreversible, and a chat with an intact transcript was once lost to
         a 5 s timeout read as "no". ``settle_resume`` calls again while it
         waits; the probe sent stays outstanding across those calls
@@ -770,21 +814,23 @@ async def send_stop_turn(cm, info: RemoteSessionInfo) -> None:
     on stdout, which the proxy-side drain captures, and their own lines
     and stdout completions reach the agent monitor's drain; the satellite's
     drain loop forwards every frame unfiltered (verified 0.5.110
-    ``_bg_drain_loop``). ``drain_bg_s`` bounds it: before 0.5.167 the
-    satellite stopped after ten minutes whatever ran."""
-    from core.events.bg_command_state import get_bg_command_registry
+    ``_bg_drain_loop``). ``drain_bg_s`` bounds it. Work that ended during
+    the turn asks for it too: the CLI's review of that end can follow the
+    result at once (``background_frames.read_after_turn``). A satellite that
+    streams between turns (``satellite_streams_between_turns``) is asked to
+    forward everything until the next turn, so a turn the engine starts by
+    itself is read whatever the registries know."""
     from core.session import background_leash
-    from core.session.session_state import get_subagent_registry
-    drain_bg = (get_bg_command_registry(info.session_id).has_pending
-                or get_subagent_registry(info.session_id).has_pending)
+    from core.session.background_frames import read_after_turn
+    stream = cm.satellite_streams_between_turns(info.machine_id)
     await cm.send_fire_and_forget(info.machine_id, {
         "type": STOP_TURN_FRAME,
         "session_id": info.session_id,
-        "drain_bg": drain_bg,
-        # How long the satellite keeps forwarding (0.5.167; an older one
-        # stops at ten minutes): the background-work ceiling, as long as
-        # the proxy waits for the work itself.
+        "drain_bg": stream or read_after_turn(info.session_id),
+        # How long the satellite keeps forwarding: the background-work
+        # ceiling, as long as the proxy waits for the work itself.
         "drain_bg_s": background_leash.background_work_ceiling(),
+        **({"stream_between_turns": True} if stream else {}),
     })
 
 
@@ -795,6 +841,67 @@ def _silence_ends(info: RemoteSessionInfo, translator) -> bool:
         info.session_id, tools_open=bool(translator.open_tools),
         silent_for=time.monotonic() - info.last_event_at, task=info.task_turn,
     )
+
+
+async def _arm_cancelled_context(session_id: str) -> None:
+    """The chat's flags for the cancelled-context line the graceful
+    interrupt suppressed: the next turn tells the agent its last turn was
+    cut (``last_abort_graceful`` off)."""
+    from storage import database as task_store
+    from storage.pg import run_db
+    try:
+        chat = await run_db(task_store.get_chat_by_session, session_id)
+        if chat:
+            await run_db(task_store.update_chat, chat["id"],
+                         last_turn_aborted=True, last_abort_graceful=False)
+    except Exception:
+        logger.exception("Remote session %s: the chat's abort flags were not written",
+                         session_id[:8])
+
+
+def _memory_events() -> list[CommonEvent]:
+    """The ending of a turn whose engine the machine's memory guard ended,
+    and the turn's end; the next message resumes the session."""
+    ending = turn_ending.TurnEnding(reason=turn_ending.EXITED, detail=turn_ending.MEMORY)
+    return [CommonEvent(type=ERROR, data={"message": ending.line(), "ending": ending.as_dict()}),
+            CommonEvent(type=DONE)]
+
+
+def _turn_end_events(info: RemoteSessionInfo, state: ClaudeRemoteState, settle: SettleController,
+                     raw: dict) -> list[CommonEvent]:
+    """A machine's turn end as the turn's reader ends on it. After the
+    proxy's own kill it is that kill: a plain end, whatever the machine says."""
+    reason = "" if info.proxy_killed else raw.get("reason")
+    if reason == "memory":
+        # The machine's memory guard ended the engine.
+        info.cli_dead = True
+        return _memory_events()
+    if reason == "exited":
+        # The machine says the engine's process exited in the turn. Before
+        # its result, or inside its own wake turn open in the settle, a turn
+        # was cut: the exited ending. After the result the answer is whole.
+        # Either way the process is gone, and the next send resumes the session.
+        info.cli_dead = True
+        if not state.result_seen or settle.wake_open:
+            return _exited_events(raw)
+        return [CommonEvent(type=DONE)]
+    if not state.result_seen and not settle.settling and not info.proxy_killed:
+        # The satellite closed the turn before the CLI's result: its
+        # process went, and what it ran may not be on disk.
+        info.cli_dead = True
+        return _lost_events("the machine ended the turn before its result")
+    return [CommonEvent(type=DONE)]
+
+
+def _exited_events(raw: dict) -> list[CommonEvent]:
+    """The ``exited`` ending of a turn whose engine the machine says exited
+    in it (``satellite_connection.turn_end_of``): the exit code and the last
+    line the engine said, then the turn's end."""
+    code, line = raw.get("exit_code"), raw.get("last_line") or ""
+    detail = f"exit {code if code is not None else 'unknown'}" + (f": {line}" if line else "")
+    ending = turn_ending.TurnEnding(reason=turn_ending.EXITED, detail=detail, exit_code=code)
+    return [CommonEvent(type=ERROR, data={"message": ending.line(), "ending": ending.as_dict()}),
+            CommonEvent(type=DONE)]
 
 
 def _lost_events(detail: str) -> list[CommonEvent]:
@@ -811,7 +918,7 @@ def _satellite_error_events(raw: dict) -> list[CommonEvent]:
     refused send is ``error`` with the satellite's words."""
     message = str(raw.get("message") or "the machine reported an error")
     if raw.get("durable_marker"):
-        return _lost_events(message)
+        return _lost_events(str(raw.get("detail") or message))
     ending = turn_ending.TurnEnding(reason=turn_ending.ERROR, detail=message)
     data = {k: v for k, v in raw.items() if k != "type"}
     data.update({"message": ending.line(), "ending": ending.as_dict()})
@@ -852,9 +959,13 @@ async def drain_until_turn_ended(
             # The turn is over: what arrives here is mostly background work (a
             # sub-agent's lines, a command's or an agent's end, a sub-agent's
             # ask for the engine prompts). It can also be the CLI's own next
-            # turn (a steer it took late, a wake), whose lines are read here
-            # and lost, its init included: the stale drain before the next
-            # turn captures a wake only when its init reaches it.
+            # turn (a steer it took late, a wake): from its opening line on,
+            # its lines are kept whole for the reader between turns, which
+            # records it.
+            from core.events import wake_capture
+            if info.carried or wake_capture.opens_turn(raw):
+                info.carried.append(raw)
+                continue
             from core.session import engine_prompts
             from core.session.background_frames import resolve_background_frame
             resolve_background_frame(info.session_id, raw)

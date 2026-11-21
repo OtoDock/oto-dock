@@ -8,14 +8,18 @@ Covers:
   clobber capture + base/author advance + delete tombstone (versioned LWW).
 """
 
+import asyncio
 import base64
 import hashlib
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from core import placement
+from core.remote import remote_workspace_apply
+from core.session import interactive_registry
 
 
 def _h(b: bytes) -> str:
@@ -47,6 +51,47 @@ def _no_save_fan_out_left():
     wf._queued_save_fan_outs.clear()
     remote_file_flow._global_path_locks.clear()
     remote_file_flow._fanout_locks.clear()
+
+
+@pytest.fixture(autouse=True)
+def _lanes(monkeypatch, tmp_path_factory):
+    # A fan-out hands each target a file name and returns: the machine's
+    # lane (``core/remote/machine_push_lane``) pushes the platform copy.
+    # Every test starts with no lane and an agents root of its own.
+    import config
+    from core.remote import machine_push_lane
+    machine_push_lane.reset()
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path_factory.mktemp("agents"), raising=False)
+    yield
+    machine_push_lane.reset()
+
+
+def _cm() -> AsyncMock:
+    """A connection manager stand-in a lane can drive: every machine reads
+    as connected."""
+    cm = AsyncMock()
+    cm.is_connected = MagicMock(return_value=True)
+    cm.get_connection = MagicMock(return_value=object())
+    cm.get_connected_machines = MagicMock(return_value=[])
+    cm.stat_file = AsyncMock(return_value=None)
+    cm.push_file.return_value = True
+    return cm
+
+
+async def _fan(agent, rel, source, **kw):
+    """``fan_out_write`` and the lanes' pushes to their end. Bytes are what
+    the caller wrote to the platform copy first: written here when the test
+    did not."""
+    import config
+    from services.remote import workspace_fanout
+    if isinstance(source, (bytes, bytearray)):
+        copy = config.AGENTS_DIR / agent / rel
+        if not copy.exists():
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            copy.write_bytes(source)
+    write = workspace_fanout.fan_out_write
+    await write(agent, rel, source, **kw)
+    assert await workspace_fanout.drain_fan_outs()
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +211,7 @@ def _setup_interactive(monkeypatch, sessions):
     """sessions: {sid: SimpleNamespace(agent_name, alive, target, username, role)}"""
     from core.session import interactive_session as isess
     monkeypatch.setattr(isess, "_sessions", sessions)
+    monkeypatch.setattr(interactive_registry, "_sessions", sessions)
 
 
 def test_fanout_includes_remote_interactive_sessions(temp_db, monkeypatch):
@@ -226,19 +272,25 @@ async def test_fan_out_write_pushes_to_targets(temp_db, monkeypatch):
         workspace_fanout, "fanout_targets",
         lambda a, r, *, exclude_machine_id=None: ["m1", "m2"],
     )
-    fake_cm = AsyncMock()
+    fake_cm = _cm()
+    pushed: dict[str, bytes] = {}
+
+    async def push(mid, ref, source, **kw):
+        with open(source, "rb") as fh:  # noqa: ASYNC230  # a fake push reads the descriptor it was handed
+            pushed[mid] = fh.read()
+        return True
+    fake_cm.push_file.side_effect = push
     from core.remote import satellite_connection as sc
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
 
-    await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"data")
+    await _fan("agent-1", "workspace/x.md", b"data")
 
-    assert fake_cm.push_file.await_count == 2
+    assert pushed == {"m1": b"data", "m2": b"data"}
     for call in fake_cm.push_file.await_args_list:
-        mid, ref, content = call.args[:3]
-        assert mid in ("m1", "m2")
+        mid, ref = call.args[:2]
         assert ref.kind == "agent_tree" and ref.value == "workspace/x.md"
-        assert content == b"data"
         assert call.kwargs.get("agent_slug") == "agent-1"
+        assert call.kwargs.get("content_hash") == _h(b"data")
 
 
 @pytest.mark.asyncio
@@ -254,8 +306,7 @@ async def test_a_target_the_fan_out_missed_keeps_the_platform_ahead(temp_db, tmp
         workspace_fanout, "fanout_targets",
         lambda a, r, *, exclude_machine_id=None: ["m1", "m2", "m3"],
     )
-    fake_cm = AsyncMock()
-    fake_cm.satellite_supports_file_stat = MagicMock(return_value=True)
+    fake_cm = _cm()
     fake_cm.stat_file = AsyncMock(return_value={"exists": True, "size": 1, "mtime_ns": 5})
     seen_during: dict[str, dict] = {}
 
@@ -271,7 +322,7 @@ async def test_a_target_the_fan_out_missed_keeps_the_platform_ahead(temp_db, tmp
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
     remote_file_flow._pull_stat_records.clear()
     try:
-        await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"data")
+        await _fan("agent-1", "workspace/x.md", b"data")
         st = target.stat()
         assert all(m["in_flight_until"] > 0 for m in seen_during.values()) and len(seen_during) == 3
         assert set(remote_file_flow._platform_ahead) == {
@@ -305,12 +356,12 @@ async def test_the_in_flight_mark_is_set_again_at_the_transfer_slot(temp_db, tmp
             marks.append(mid)
         return real(mid, *a, **kw)
     monkeypatch.setattr(remote_file_flow, "note_platform_ahead", note)
-    fake_cm = AsyncMock()
+    fake_cm = _cm()
     fake_cm.push_file = AsyncMock(return_value=True)
     from core.remote import satellite_connection as sc
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
-    await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"data")
-    assert marks == ["m1", "m1"]  # before the gather, then at the slot
+    await _fan("agent-1", "workspace/x.md", b"data")
+    assert marks == ["m1"]  # at the transfer slot, for as long as the push may run
     assert ("m1", "agent-1", "workspace/x.md") not in remote_file_flow._platform_ahead
 
 
@@ -331,8 +382,7 @@ async def test_a_fan_out_of_older_bytes_leaves_a_newer_writes_mark(temp_db, tmp_
         workspace_fanout, "fanout_targets",
         lambda a, r, *, exclude_machine_id=None: ["m1", "m2"],
     )
-    fake_cm = AsyncMock()
-    fake_cm.satellite_supports_file_stat = MagicMock(return_value=True)
+    fake_cm = _cm()
     fake_cm.stat_file = AsyncMock(return_value={"exists": True, "size": 2, "mtime_ns": 5})
     newer: dict[str, tuple[int, int]] = {}
 
@@ -349,7 +399,7 @@ async def test_a_fan_out_of_older_bytes_leaves_a_newer_writes_mark(temp_db, tmp_
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
     remote_file_flow._pull_stat_records.clear()
     try:
-        await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"B1")
+        await _fan("agent-1", "workspace/x.md", b"B1")
         for mid in ("m1", "m2"):
             marker = remote_file_flow._platform_ahead[(mid, "agent-1", "workspace/x.md")]
             assert (marker["size"], marker["mtime_ns"]) == newer[mid]
@@ -365,11 +415,12 @@ async def test_fan_out_delete_broadcasts(temp_db, monkeypatch):
         workspace_fanout, "fanout_targets",
         lambda a, r, *, exclude_machine_id=None: ["m1"],
     )
-    fake_cm = AsyncMock()
+    fake_cm = _cm()
     from core.remote import satellite_connection as sc
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
 
     await workspace_fanout.fan_out_delete("agent-1", "workspace/x.md")
+    assert await workspace_fanout.drain_fan_outs()
 
     assert fake_cm.send_fire_and_forget.await_count == 1
     msg = fake_cm.send_fire_and_forget.await_args.args[1]
@@ -386,11 +437,11 @@ async def test_fan_out_write_no_targets_is_noop(temp_db, monkeypatch):
         workspace_fanout, "fanout_targets",
         lambda a, r, *, exclude_machine_id=None: [],
     )
-    fake_cm = AsyncMock()
+    fake_cm = _cm()
     from core.remote import satellite_connection as sc
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
 
-    await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"d")
+    await _fan("agent-1", "workspace/x.md", b"d")
     assert fake_cm.push_file.await_count == 0
 
 
@@ -580,7 +631,6 @@ async def test_pre_overwrite_capture_never_reads_through_a_link(tmp_path, monkey
 
 
 def test_the_merge_loser_read_never_reads_through_a_link(tmp_path):
-    from core.remote import remote_workspace_sync as rws
 
     agents = tmp_path / "agents"
     agent_dir = agents / "agent-1"
@@ -589,9 +639,9 @@ def test_the_merge_loser_read_never_reads_through_a_link(tmp_path):
     victim.write_bytes(b"secret")
     (agent_dir / "workspace" / "shared.md").symlink_to(victim)
     (agent_dir / "workspace" / "plain.md").write_bytes(b"mine")
-    assert rws._platform_bytes(agent_dir, "workspace/shared.md") is None
-    assert rws._platform_bytes(agent_dir, "workspace/plain.md") == b"mine"
-    assert rws._platform_bytes(agent_dir, "workspace/../../victim.txt") is None
+    assert remote_workspace_apply._platform_bytes(agent_dir, "workspace/shared.md") is None
+    assert remote_workspace_apply._platform_bytes(agent_dir, "workspace/plain.md") == b"mine"
+    assert remote_workspace_apply._platform_bytes(agent_dir, "workspace/../../victim.txt") is None
 
 
 @pytest.mark.asyncio
@@ -736,6 +786,496 @@ async def test_apply_delete_writes_tombstone_and_captures(temp_db, tmp_path, mon
     assert any(e["rel_path"] == rel and e["reason"] == "deleted" for e in entries)
 
 
+# --- A delete reported again: its record stays and nothing is sent on ---
+
+_AGENT = "agent-1"
+
+
+def _editor_on(machine_id, username):
+    return SimpleNamespace(
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id=machine_id),
+        role="editor", username=username, agent=_AGENT, display_name=username.title())
+
+
+def _repeat_rig(monkeypatch, *, real_fan_out=False):
+    """The live applier with ``sess-bob`` and ``sess-bob-2`` on ``mBob`` and
+    ``sess-carol`` on ``mCarol``, all editors, and no fan-out target. Returns
+    the delete's fan-out and the dashboard refresh, both recorded (the real
+    fan-out with ``real_fan_out``)."""
+    import core.session.session_state as ss
+    import services.notifications.notification_manager as nm
+    from services.remote import workspace_fanout as wf
+    secs = {"sess-bob": _editor_on("mBob", "bob"), "sess-bob-2": _editor_on("mBob", "bob"),
+            "sess-carol": _editor_on("mCarol", "carol")}
+    _patch_apply_deps(monkeypatch, sec=None, loser_sub_for=lambda u: None, notifs=[])
+    monkeypatch.setattr(ss, "get_session_security", secs.get)
+    fan_out = AsyncMock(wraps=wf.fan_out_delete) if real_fan_out else AsyncMock()
+    monkeypatch.setattr(wf, "fan_out_delete", fan_out)
+    refreshed = AsyncMock()
+    monkeypatch.setattr(nm, "broadcast_file_updated", refreshed)
+    return fan_out, refreshed
+
+
+def _agent_path(rel):
+    import config
+    return config.AGENTS_DIR / _AGENT / rel
+
+
+def _platform_file(rel, data=b"bye"):
+    path = _agent_path(rel)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+def _delete_frame(rel, session_id="sess-bob"):
+    # The delete frame of every satellite in the field, the same keys in
+    # 0.5.168 (release 1.9.1) and on master: detect_changes emits the path and
+    # the action (satellite/transport/file_sync.py), the per-turn scan wraps it
+    # with the type, the session and the agent (satellite/sessions/session_manager.py).
+    return {"type": "file_changed", "session_id": session_id, "agent_slug": _AGENT,
+            "path": rel, "action": "delete"}
+
+
+async def _applied(cm, machine_id):
+    """Wait until every frame the receive loop handed ``machine_id``'s lane
+    has been applied."""
+    from core.remote import satellite_file_transfer as sft
+    for _ in range(500):
+        if sft.file_changed_in_flight(machine_id, _AGENT) == 0:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the applier did not finish")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["live-delete", "dashboard", "retention"])
+@pytest.mark.parametrize("rel", ["workspace/gone.md", "workspace/notes/gone.md"])
+async def test_a_delete_reported_again_leaves_its_record_and_sends_nothing(
+        temp_db, monkeypatch, caplog, rel, origin):
+    """A second report of a delete the platform recorded, for a file it no
+    longer holds, from a machine with no base for it: the record keeps its
+    time, its origin and its age, nothing is sent on and no dashboard is
+    told. A report whose folder went with the first delete is no error."""
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from storage.files import file_tombstones_store, sync_state_store
+
+    fan_out, refreshed = _repeat_rig(monkeypatch)
+    _agent_path("workspace").mkdir(parents=True)
+    file_tombstones_store.record(_AGENT, rel, 1000.0, origin=origin)
+    before = file_tombstones_store.get(_AGENT, rel)
+
+    with caplog.at_level(logging.INFO):
+        await SatelliteConnectionManager()._apply_file_changed("mBob", _delete_frame(rel))
+
+    assert file_tombstones_store.get(_AGENT, rel) == before
+    fan_out.assert_not_awaited()
+    refreshed.assert_not_awaited()
+    assert sync_state_store.get_one("mBob", _AGENT, rel) is None
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_a_file_that_came_back_and_goes_again_is_a_new_deletion(temp_db, monkeypatch):
+    """Delete, the same delete from a second session on the machine, the file
+    written again by another machine, delete again: the second report
+    changes nothing, the third is a deletion of its own with a new time and
+    age, sent on."""
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from storage.files import file_tombstones_store, sync_state_store
+
+    rel = "workspace/doc.md"
+    fan_out, _ = _repeat_rig(monkeypatch)
+    path = _platform_file(rel, b"v1")
+    sync_state_store.record_one("mBob", _AGENT, rel, _h(b"v1"), 1.0)
+    cm = SatelliteConnectionManager()
+
+    await cm._apply_file_changed("mBob", _delete_frame(rel))
+    first = file_tombstones_store.get(_AGENT, rel)
+    await cm._apply_file_changed("mBob", _delete_frame(rel, "sess-bob-2"))
+    assert file_tombstones_store.get(_AGENT, rel) == first
+    assert fan_out.await_count == 1
+
+    await cm._apply_file_changed("mCarol", _write_msg(_AGENT, rel, b"v2", "sess-carol"))
+    assert path.read_bytes() == b"v2"
+    sync_state_store.record_one("mBob", _AGENT, rel, _h(b"v2"), 2.0)  # the push to Bob
+    await cm._apply_file_changed("mBob", _delete_frame(rel))
+
+    second = file_tombstones_store.get(_AGENT, rel)
+    assert not path.exists()
+    assert second["deleted_at_mtime"] > first["deleted_at_mtime"]
+    assert second["expires_at"] > first["expires_at"]
+    assert fan_out.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "held, no base", "held, a base", "held above the capture size", "a link at the name",
+    "the reporter's base", "a hold", "no record", "an expired record",
+])
+async def test_a_delete_that_is_not_a_repeat_is_recorded_and_sent_on(temp_db, monkeypatch, case):
+    """A delete runs as it always has unless all three hold: nothing at the
+    path, a live record that is not a hold, and no base of the reporting
+    machine. A file held (a link at the name, a file too large to capture),
+    a machine that still has a base for the path (it held a copy the
+    platform knew), a hold, no record and an expired one are each a
+    deletion of their own: recorded with a new time, sent on, the name
+    gone."""
+    from core.remote import satellite_file_transfer as sft
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from storage.files import file_tombstones_store, sync_state_store
+
+    rel = "workspace/doc.md"
+    fan_out, _ = _repeat_rig(monkeypatch)
+    _agent_path("workspace").mkdir(parents=True)
+    origin, ttl_days = "retention", 30
+    if case.startswith("held"):
+        _platform_file(rel, b"twelve bytes")
+    if case == "held, a base" or case == "the reporter's base":
+        sync_state_store.record_one("mBob", _AGENT, rel, _h(b"twelve bytes"), 1.0)
+    if case == "held above the capture size":
+        monkeypatch.setattr(sft, "CONFLICT_BACKUP_MAX_BYTES", 4)
+    if case == "a link at the name":
+        _platform_file("workspace/other.md")
+        _agent_path(rel).symlink_to("other.md")
+    if case == "a hold":
+        origin = file_tombstones_store.HOLD_ORIGIN
+    if case == "an expired record":
+        ttl_days = -1
+    if case != "no record":
+        file_tombstones_store.record(_AGENT, rel, 1000.0, origin=origin, ttl_days=ttl_days)
+
+    await SatelliteConnectionManager()._apply_file_changed("mBob", _delete_frame(rel))
+
+    row = file_tombstones_store.get(_AGENT, rel)
+    assert row["deleted_at_mtime"] > 1000.0 and row["origin"] == "live-delete"
+    fan_out.assert_awaited_once()
+    assert not _agent_path(rel).is_symlink() and not _agent_path(rel).exists()
+    assert sync_state_store.get_one("mBob", _AGENT, rel) is None
+
+
+@pytest.mark.asyncio
+async def test_after_a_repeat_the_record_still_orders_copies_and_ends_on_time(temp_db, monkeypatch):
+    """What the record decides after a repeat is what the first delete set:
+    an old copy on a machine that was away is deleted at its merge and never
+    pulled by a read, a copy made after the first delete is adopted, and
+    the record ends 30 days after the first delete."""
+    import datetime
+    import time
+
+    import config
+    from core.remote import remote_file_cache
+    from core.remote.file_sync import diff_manifests
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from storage.files import file_tombstones_store
+
+    rel = "workspace/report.md"
+    _repeat_rig(monkeypatch)
+    _agent_path("workspace").mkdir(parents=True)
+    deleted_at = time.time() - 20 * 86400
+    at_delete = datetime.datetime.fromtimestamp(deleted_at, datetime.timezone.utc)
+    with monkeypatch.context() as m:
+        m.setattr(file_tombstones_store, "_now", lambda: at_delete)
+        file_tombstones_store.record(_AGENT, rel, deleted_at, origin="live-delete")
+
+    await SatelliteConnectionManager()._apply_file_changed("mBob", _delete_frame(rel))
+
+    tombstones = file_tombstones_store.load_for_agent(_AGENT)
+    cm = MagicMock()
+    cm.get_clock_offset = MagicMock(return_value=0.0)
+    for made_at, op, stands in ((deleted_at - 3600, "delete_satellite", True),
+                                (deleted_at + 3600, "pull", False)):
+        remote = [{"path": rel, "hash": "sha256:c", "size": 1, "mtime": made_at}]
+        plan = diff_manifests([], remote, tombstones=tombstones, clock_offset=0.0,
+                              target_role="editor", target_username="carol")
+        assert [a.op for a in plan.actions if a.rel_path == rel] == [op]
+        fresh = {"exists": True, "size": 1, "mtime_ns": int(made_at * 1e9)}
+        assert await remote_file_cache.delete_stands(
+            cm, ("mCarol", _AGENT, rel), _agent_path(rel), fresh) is stands
+
+    past_its_age = at_delete + datetime.timedelta(days=config.FILE_TOMBSTONE_TTL_DAYS, seconds=1)
+    monkeypatch.setattr(file_tombstones_store, "_now", lambda: past_its_age)
+    assert file_tombstones_store.get(_AGENT, rel) is None
+    assert file_tombstones_store.delete_expired() == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second", ["in one batch", "after a reconnect"])
+async def test_one_delete_reported_twice_is_recorded_and_sent_once(temp_db, monkeypatch, second):
+    """Two reports of one delete through the receive loop, from a second
+    session in the same batch or the same frame again after a reconnect:
+    the path lock orders them, the second finds the deletion recorded. The
+    frame is the one 0.5.168 and today's satellite both send."""
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from storage.files import file_tombstones_store
+
+    rel = "workspace/doc.md"
+    fan_out, refreshed = _repeat_rig(monkeypatch)
+    _platform_file(rel)
+    cm = SatelliteConnectionManager()
+
+    if second == "in one batch":
+        assert cm._dispatch_file_changed("mBob", _delete_frame(rel))
+        assert cm._dispatch_file_changed("mBob", _delete_frame(rel, "sess-bob-2"))
+        await _applied(cm, "mBob")
+        first = file_tombstones_store.get(_AGENT, rel)
+    else:
+        assert cm._dispatch_file_changed("mBob", _delete_frame(rel))
+        await _applied(cm, "mBob")
+        first = file_tombstones_store.get(_AGENT, rel)
+        cm._reset_file_changed_lane("mBob")
+        assert cm._dispatch_file_changed("mBob", _delete_frame(rel))
+        await _applied(cm, "mBob")
+
+    assert first is not None and file_tombstones_store.get(_AGENT, rel) == first
+    assert fan_out.await_count == 1 and refreshed.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_while_the_first_delete_is_on_its_way_sends_it_once(temp_db, monkeypatch):
+    """The first delete is still in Carol's lane when Bob's second session
+    reports it: Carol gets it once."""
+    from core.remote import satellite_connection as sc
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from services.remote import workspace_fanout as wf
+
+    rel = "workspace/doc.md"
+    _repeat_rig(monkeypatch, real_fan_out=True)
+    monkeypatch.setattr(wf, "fanout_targets",
+                        lambda a, r, *, exclude_machine_id=None, shared_only=None:
+                        [m for m in ("mBob", "mCarol") if m != exclude_machine_id])
+    sent, gate = [], asyncio.Event()
+
+    async def _send(machine_id, msg):
+        sent.append((machine_id, msg["action"], msg["path"]))
+        await gate.wait()
+
+    fake = _cm()
+    fake.shares_folders = MagicMock(return_value=False)
+    fake.send_fire_and_forget = AsyncMock(side_effect=_send)
+    monkeypatch.setattr(sc, "get_connection_manager", lambda: fake)
+    _platform_file(rel)
+    cm = SatelliteConnectionManager()
+
+    await cm._apply_file_changed("mBob", _delete_frame(rel))
+    for _ in range(500):
+        if sent:
+            break
+        await asyncio.sleep(0.01)
+    await cm._apply_file_changed("mBob", _delete_frame(rel, "sess-bob-2"))
+    gate.set()
+    assert await wf.drain_fan_outs()
+
+    assert sent == [("mCarol", "delete", rel)]
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_removes_nothing_so_a_file_written_meanwhile_stays(temp_db, monkeypatch):
+    """A person's upload takes no path lock: one that lands just after a
+    repeat looked at the name keeps its file, since a repeat removes
+    nothing."""
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from services.infra import safe_fs
+    from storage.files import file_tombstones_store
+
+    rel = "workspace/doc.md"
+    fan_out, _ = _repeat_rig(monkeypatch)
+    _agent_path("workspace").mkdir(parents=True)
+    file_tombstones_store.record(_AGENT, rel, 1000.0, origin="live-delete")
+    before = file_tombstones_store.get(_AGENT, rel)
+    looked = safe_fs.kind_beneath
+
+    def _look_then_upload(root, name):
+        kind = looked(root, name)
+        _platform_file(rel, b"uploaded")
+        return kind
+
+    monkeypatch.setattr(safe_fs, "kind_beneath", _look_then_upload)
+
+    await SatelliteConnectionManager()._apply_file_changed("mBob", _delete_frame(rel))
+
+    assert _agent_path(rel).read_bytes() == b"uploaded"
+    assert file_tombstones_store.get(_AGENT, rel) == before
+    fan_out.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_only_the_reporting_machines_own_base_counts(temp_db, monkeypatch):
+    """Carol was away with an old copy and still has its base. Bob's second
+    report of the recorded delete is a repeat all the same: another
+    machine's base never makes it new."""
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from storage.files import file_tombstones_store, sync_state_store
+
+    rel = "workspace/gone.md"
+    fan_out, _ = _repeat_rig(monkeypatch)
+    _agent_path("workspace").mkdir(parents=True)
+    file_tombstones_store.record(_AGENT, rel, 1000.0, origin="live-delete")
+    sync_state_store.record_one("mCarol", _AGENT, rel, _h(b"old"), 1.0)
+    before = file_tombstones_store.get(_AGENT, rel)
+
+    await SatelliteConnectionManager()._apply_file_changed("mBob", _delete_frame(rel))
+
+    assert file_tombstones_store.get(_AGENT, rel) == before
+    fan_out.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_link_to_nothing_at_the_name_is_a_delete_of_its_own(temp_db, monkeypatch):
+    """A link whose target is gone is still a name on the platform: the
+    delete removes it, records anew and is sent on."""
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from storage.files import file_tombstones_store
+
+    rel = "workspace/doc.md"
+    fan_out, _ = _repeat_rig(monkeypatch)
+    _agent_path("workspace").mkdir(parents=True)
+    _agent_path(rel).symlink_to("nowhere.md")
+    file_tombstones_store.record(_AGENT, rel, 1000.0, origin="live-delete")
+
+    await SatelliteConnectionManager()._apply_file_changed("mBob", _delete_frame(rel))
+
+    assert not _agent_path(rel).is_symlink()
+    assert file_tombstones_store.get(_AGENT, rel)["deleted_at_mtime"] > 1000.0
+    fan_out.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_of_a_knowledge_delete_projects_nothing(temp_db, monkeypatch):
+    """The first delete of a knowledge file is projected to the libraries,
+    the repeat is not."""
+    import core.session.session_state as ss
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from services.knowledge import library_projector
+
+    rel = "knowledge/notes.md"
+    fan_out, _ = _repeat_rig(monkeypatch)
+    manager = _editor_on("mBob", "bob")
+    manager.role = "manager"
+    monkeypatch.setattr(ss, "get_session_security",
+                        {"sess-bob": manager, "sess-bob-2": manager}.get)
+    projected = AsyncMock()
+    monkeypatch.setattr(library_projector, "propagate_source_write", projected)
+    _platform_file(rel)
+    cm = SatelliteConnectionManager()
+
+    await cm._apply_file_changed("mBob", _delete_frame(rel))
+    assert projected.call_count == 1
+    await cm._apply_file_changed("mBob", _delete_frame(rel, "sess-bob-2"))
+
+    assert projected.call_count == 1
+    assert fan_out.await_count == 1
+
+
+# --- A write that did not land: nothing is recorded or sent on ---
+
+_LARGE = 5 * 1024 * 1024
+
+
+async def _large_write_frame(machine_id, session_id, rel, new_hash, monkeypatch):
+    """A machine's write above the inline size, whose pull by the platform
+    fails (a link that dropped, a stall, a refused read)."""
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    pull = AsyncMock(return_value=False)
+    monkeypatch.setattr(SatelliteConnectionManager, "pull_file_to_path", pull)
+    await SatelliteConnectionManager()._apply_file_changed(machine_id, {
+        "type": "file_changed", "session_id": session_id, "agent_slug": _AGENT,
+        "path": rel, "action": "write", "size": _LARGE, "hash": new_hash})
+    return pull
+
+
+@pytest.mark.asyncio
+async def test_an_edit_whose_pull_failed_keeps_the_base_and_sends_nothing(temp_db, monkeypatch):
+    """Carol edits a large file both sides hold, and the pull fails. The
+    platform keeps its bytes, so her base keeps the old hash, the author
+    stays, nothing is sent on, and her next merge pulls her edit instead of
+    pushing the older copy over it."""
+    import time
+
+    from core.remote.file_sync import FileEntry, diff_manifests
+    from services.remote import workspace_fanout as wf
+    from storage.files import file_author_store, sync_state_store
+
+    rel = "workspace/render.bin"
+    _repeat_rig(monkeypatch)
+    old = b"the old bytes"
+    _platform_file(rel, old)
+    sync_state_store.record_one("mCarol", _AGENT, rel, _h(old), 1.0)
+    file_author_store.record(_AGENT, rel, "alice")
+    monkeypatch.setattr(wf, "fanout_targets", lambda *a, **k: ["mDan"])
+    marked, pushed = AsyncMock(return_value={}), AsyncMock()
+    monkeypatch.setattr(wf, "mark_fan_out_targets", marked)
+    monkeypatch.setattr(wf, "fan_out_write", pushed)
+    new_hash = "sha256:" + "c" * 64
+    made_at = time.time() - 5
+
+    pull = await _large_write_frame("mCarol", "sess-carol", rel, new_hash, monkeypatch)
+
+    pull.assert_awaited_once()
+    assert _agent_path(rel).read_bytes() == old
+    assert sync_state_store.get_one("mCarol", _AGENT, rel)[0] == _h(old)
+    assert file_author_store.get(_AGENT, rel) == "alice"
+    marked.assert_not_awaited()
+    pushed.assert_not_awaited()
+    plan = diff_manifests(
+        [FileEntry(rel, _h(old), len(old), time.time() - 3600)],
+        [{"path": rel, "hash": new_hash, "size": _LARGE, "mtime": made_at}],
+        base=sync_state_store.load_for_machine_agent("mCarol", _AGENT), clock_offset=0.0,
+        target_role="editor", target_username="carol")
+    assert [a.op for a in plan.actions if a.rel_path == rel] == ["pull"]
+
+
+@pytest.mark.asyncio
+async def test_a_write_whose_pull_failed_captures_nothing_and_tells_nobody(temp_db, monkeypatch):
+    """Alice edited the file on the platform after Carol last saw it, then
+    Carol's large write fails to arrive. Alice's bytes were never replaced:
+    nothing goes to the Recover bin and Alice is not told her version lost."""
+    from storage.files import file_author_store, recover_bin_store, sync_state_store
+
+    rel = "workspace/plan.md"
+    notifs = []
+    _patch_apply_deps(monkeypatch, sec=_editor_on("mCarol", "carol"),
+                      loser_sub_for=lambda u: "user-alice", notifs=notifs)
+    _platform_file(rel, b"alice's edit")
+    file_author_store.record(_AGENT, rel, "alice")
+    sync_state_store.record_one("mCarol", _AGENT, rel, _h(b"what carol saw"), 1.0)
+
+    await _large_write_frame("mCarol", "sess-carol", rel, "sha256:" + "c" * 64, monkeypatch)
+
+    assert _agent_path(rel).read_bytes() == b"alice's edit"
+    assert notifs == []
+    assert [e for e in recover_bin_store.list_for(_AGENT, "admin", True, True, True)
+            if e["reason"] == "conflict"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_write_frame_with_no_body_and_no_size_lands_nothing(temp_db, monkeypatch, caplog):
+    """A write frame that carries neither the bytes nor a size names nothing
+    the platform can fetch: no base, no author, nothing sent on, one warning."""
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from services.remote import workspace_fanout as wf
+    from storage.files import file_author_store, sync_state_store
+
+    rel = "workspace/mystery.md"
+    _repeat_rig(monkeypatch)
+    _agent_path("workspace").mkdir(parents=True)
+    monkeypatch.setattr(wf, "fanout_targets", lambda *a, **k: ["mDan"])
+    marked = AsyncMock(return_value={})
+    monkeypatch.setattr(wf, "mark_fan_out_targets", marked)
+
+    with caplog.at_level(logging.WARNING):
+        await SatelliteConnectionManager()._apply_file_changed("mBob", {
+            "type": "file_changed", "session_id": "sess-bob", "agent_slug": _AGENT,
+            "path": rel, "action": "write", "hash": "sha256:" + "d" * 64})
+
+    assert not _agent_path(rel).exists()
+    assert sync_state_store.get_one("mBob", _AGENT, rel) is None
+    assert file_author_store.get(_AGENT, rel) is None
+    marked.assert_not_awaited()
+    assert [r for r in caplog.records
+            if r.levelno == logging.WARNING and "carries no body" in r.getMessage()]
+
+
 @pytest.mark.asyncio
 async def test_apply_agent_mismatch_rejected(temp_db, tmp_path, monkeypatch):
     """A file_changed whose payload agent_slug != the session's authenticated
@@ -772,7 +1312,7 @@ def _tracked_setup(monkeypatch, machines=("m1", "m2")):
         workspace_fanout, "fanout_targets",
         lambda a, r, *, exclude_machine_id=None: list(machines),
     )
-    fake_cm = AsyncMock()
+    fake_cm = _cm()
     fake_cm.push_file.return_value = True
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
     tr._items.clear()
@@ -786,7 +1326,7 @@ def _tracked_setup(monkeypatch, machines=("m1", "m2")):
 async def test_fan_out_big_payload_creates_item_and_done_rows(temp_db, monkeypatch):
     workspace_fanout, fake_cm, tr = _tracked_setup(monkeypatch)
     big = b"x" * (600 * 1024)  # > MAX_CHUNK_SIZE → tracked without explicit id
-    await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big)
+    await _fan("agent-1", "workspace/big.bin", big)
     items = tr.snapshot_inflight()
     assert len(items) == 1
     assert {r.state for r in items[0].machines.values()} == {"done"}
@@ -799,17 +1339,15 @@ async def test_fan_out_big_payload_creates_item_and_done_rows(temp_db, monkeypat
 @pytest.mark.asyncio
 async def test_fan_out_small_sync_payload_untracked(temp_db, monkeypatch):
     workspace_fanout, fake_cm, tr = _tracked_setup(monkeypatch)
-    await workspace_fanout.fan_out_write("agent-1", "workspace/small.md", b"tiny")
+    await _fan("agent-1", "workspace/small.md", b"tiny")
     assert tr.snapshot_inflight() == []
-    # untracked pushes carry no progress callback
-    for call in fake_cm.push_file.await_args_list:
-        assert call.kwargs.get("progress_cb") is None
+    assert fake_cm.push_file.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_fan_out_explicit_transfer_id_tracks_any_size(temp_db, monkeypatch):
     workspace_fanout, fake_cm, tr = _tracked_setup(monkeypatch, machines=("m1",))
-    await workspace_fanout.fan_out_write(
+    await _fan(
         "agent-1", "workspace/small.md", b"tiny",
         transfer_kind="upload", transfer_id="upl-1",
     )
@@ -827,11 +1365,11 @@ async def test_fan_out_failed_push_marks_row_failed(temp_db, monkeypatch):
 
     fake_cm.push_file.side_effect = _push
     big = b"x" * (600 * 1024)
-    await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big)
+    await _fan("agent-1", "workspace/big.bin", big)
     item = tr.snapshot_inflight()[0]
     assert item.machines["m1"].state == "done"
     assert item.machines["m2"].state == "failed"
-    assert "retries at next sync" in item.machines["m2"].error
+    assert "The next sync brings it" in item.machines["m2"].error
     assert item.done_at is not None
 
 
@@ -863,7 +1401,7 @@ async def test_fan_out_gate_is_per_machine(temp_db, monkeypatch):
 
     fake_cm.push_file.side_effect = _push
     big = b"x" * (600 * 1024)
-    await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big)
+    await _fan("agent-1", "workspace/big.bin", big)
     transfer_gate.reset_for_tests()
     # One slot per machine: three machines push at once, none waits on another.
     assert state["max_active"] == 3
@@ -910,7 +1448,7 @@ async def test_gate_queued_state_reaches_registry(temp_db, monkeypatch):
     holder = asyncio.create_task(_hold())
     await held.wait()
     fan_out = asyncio.create_task(
-        workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big))
+        _fan("agent-1", "workspace/big.bin", big))
     while ("m2", "done") not in seen_states:  # noqa: ASYNC110  # the recorded states list: the gate's callback has no event
         await asyncio.sleep(0.01)
     release.set()
@@ -1003,18 +1541,22 @@ async def test_fan_out_write_pushes_the_checked_descriptor_and_records_its_hash(
         seen["content_hash"] = kw.get("content_hash")
         return True
 
-    cm = SimpleNamespace(push_file=_push)
+    cm = _cm()
+    cm.push_file.side_effect = _push
     monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
     recorded = []
     monkeypatch.setattr(sync_state_store, "record_one",
                         lambda mid, a, r, h, m: recorded.append((mid, a, r, h, m)))
-    await wf.fan_out_write("agent-1", "workspace/x.md", f)
+    await _fan("agent-1", "workspace/x.md", f)
     assert str(seen["source"]).startswith(("/proc/self/fd/", "/dev/fd/"))
     assert seen["bytes"] == b"hello"
     assert seen["content_hash"] == _h(b"hello")
     assert recorded and recorded[0][:4] == ("m1", "agent-1", "workspace/x.md", _h(b"hello"))
-    await wf.fan_out_write("agent-1", "workspace/x.md", b"inline")
-    assert seen["content_hash"] == _h(b"inline")
+    # Bytes say what the caller wrote to the platform copy: the lane pushes
+    # that copy from its own descriptor, hashed there.
+    f.write_bytes(b"inline")
+    await _fan("agent-1", "workspace/x.md", b"inline")
+    assert seen["content_hash"] == _h(b"inline") and seen["bytes"] == b"inline"
 
 
 @pytest.mark.asyncio
@@ -1028,8 +1570,8 @@ async def test_fan_out_write_refuses_a_source_that_is_not_the_platform_copy(temp
     (tmp_path / "x.md").write_bytes(b"outside")
     monkeypatch.setattr(config, "AGENTS_DIR", agents, raising=False)
     monkeypatch.setattr(wf, "fanout_targets", lambda a, r, *, exclude_machine_id=None: ["m1"])
-    pushed = AsyncMock(return_value=True)
-    cm = SimpleNamespace(push_file=pushed)
+    cm = _cm()
+    pushed = cm.push_file
     monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
     begun = []
 
@@ -1040,12 +1582,12 @@ async def test_fan_out_write_refuses_a_source_that_is_not_the_platform_copy(temp
     monkeypatch.setattr(transfer_registry, "begin", _begin)
     # A link component: the strict open refuses, nothing is pushed, and a
     # tracked transfer still gets its terminal (no rows).
-    await wf.fan_out_write("agent-1", "workspace/sub/x.md",
+    await _fan("agent-1", "workspace/sub/x.md",
                            agents / "agent-1" / "workspace" / "sub" / "x.md", transfer_id="t1")
     pushed.assert_not_awaited()
     assert begun == [[]]
     # A Path that is not the platform copy of ``rel_path`` at all.
-    await wf.fan_out_write("agent-1", "workspace/y.md", tmp_path / "x.md")
+    await _fan("agent-1", "workspace/y.md", tmp_path / "x.md")
     pushed.assert_not_awaited()
 
 
@@ -1093,7 +1635,7 @@ async def test_a_save_answers_while_a_target_never_answers(temp_db, tmp_path, mo
 
     cm = MagicMock()
     cm.push_file = AsyncMock(side_effect=_push)
-    cm.satellite_supports_file_stat = MagicMock(return_value=False)
+    cm.stat_file = AsyncMock(return_value=None)
     monkeypatch.setattr(sc, "get_connection_manager", lambda: cm)
 
     # The waits are guards against a hang (the target never answers, so a
@@ -1105,10 +1647,13 @@ async def test_a_save_answers_while_a_target_never_answers(temp_db, tmp_path, mo
     # one more fan-out queues behind the running one.
     await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v2"), timeout=20)
     await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v3"), timeout=20)
-    assert len(wf._save_fan_out_tasks) == 2
+    # Each save's fan-out only names the file for the machine's lane and
+    # ends: nothing queues behind the push that is stuck.
+    await asyncio.wait_for(wf.drain_save_fan_outs(), timeout=20)
+    assert pushed == [b"v1"]
     release.set()
-    await wf.drain_save_fan_outs()
-    # The queued fan-out pushed the newest copy, once.
+    assert await wf.drain_fan_outs()
+    # The lane then pushed the newest copy, once.
     assert pushed == [b"v1", b"v3"]
 
 
@@ -1228,7 +1773,6 @@ async def test_a_marked_machine_the_fan_out_does_not_push_gets_the_failure_rules
     for ten minutes: its mark ends its window and keeps its baseline."""
     import config
     from core.remote import remote_file_flow
-    from services.remote import workspace_fanout as wf
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
     target = tmp_path / "agent-1" / "workspace" / "x.md"
     target.parent.mkdir(parents=True)
@@ -1240,7 +1784,7 @@ async def test_a_marked_machine_the_fan_out_does_not_push_gets_the_failure_rules
     # Another copy's mark on a second machine is a later write's: untouched.
     remote_file_flow.note_platform_ahead("mOther", "agent-1", "workspace/x.md", *stat, in_flight_s=600)
     _setup_layer(monkeypatch, {}, {})
-    await wf.fan_out_write("agent-1", "workspace/x.md", target,
+    await _fan("agent-1", "workspace/x.md", target,
                            marked={"mGone": stat, "mOther": (999, 999)})
     gone = remote_file_flow._platform_ahead[("mGone", "agent-1", "workspace/x.md")]
     assert gone["in_flight_until"] == 0.0
@@ -1289,7 +1833,7 @@ async def test_a_tracked_push_moves_its_row_at_most_twice_a_second(temp_db, monk
         return True
 
     fake_cm.push_file.side_effect = _push
-    await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", b"x" * (600 * 1024))
+    await _fan("agent-1", "workspace/big.bin", b"x" * (600 * 1024))
     assert len(calls) <= 4
     assert calls[-1][0] == calls[-1][1]
 
@@ -1323,15 +1867,14 @@ async def test_a_fan_out_target_changing_the_file_is_marked_ahead_with_its_own_s
             stale_out.update(reason="live", size=3, mtime_ns=9)
             return False
         return mid == "m2"
-    fake_cm = AsyncMock()
+    fake_cm = _cm()
     fake_cm.push_file.side_effect = push
-    fake_cm.satellite_supports_file_stat = MagicMock(return_value=True)
     fake_cm.stat_file = AsyncMock(return_value={"exists": True, "size": 1, "mtime_ns": 6})
     from core.remote import satellite_connection as sc
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
     try:
         with caplog.at_level("INFO", logger="otodock"):
-            await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"data")
+            await _fan("agent-1", "workspace/x.md", b"data")
         assert seen == {"m1": {"size": 1, "mtime_ns": 5}, "m2": "live", "m3": "live"}
         assert ("m1", "agent-1", "workspace/x.md") not in remote_file_flow._pull_stat_records
         st = target.stat()

@@ -1,24 +1,24 @@
-"""Proxy-side handle for an interactive PTY running on a remote satellite.
+"""Proxy-side handle for an interactive PTY running on a machine.
 
-This mirrors :class:`core.sandbox.pty_relay.PtyProcess`'s interface (``write`` /
-``resize`` / ``close`` / ``terminate`` / ``scrollback`` / ``closed`` / ``pid``)
-so :class:`core.session.interactive_session.InteractiveSession` drives a REMOTE PTY
-exactly like a local one. Everything above the PtyProcess seam — the readiness
-gate, cold-submit, the scrollback replay, the dashboard viewer (``_attach_pty_
-viewer``), the permission drainer — is unchanged; only the transport differs.
+Its interface (``write`` / ``resize`` / ``close`` / ``terminate`` /
+``scrollback`` / ``closed`` / ``pid``) is the seam
+:class:`core.session.interactive_session.InteractiveSession` drives a PTY
+through. Everything above it — the readiness gate, cold-submit, the
+scrollback replay, the dashboard viewer (``_attach_pty_viewer``), the
+permission drainer — knows only this seam.
 
 Instead of an OS master fd, a ``RemotePtyProcess`` talks to the satellite over
 the EXISTING satellite WebSocket (no new connection):
 
     proxy → satellite
-      pty_open    {session_id, agent_slug, execution_path, config, rows, cols}
-                  (sent via send_command → ack carries the satellite pid)
+      pty_open    {session_id, agent_slug, execution_path, config, rows, cols, open_token}
+                  (sent via send_command → ack carries the satellite pid and the token)
       pty_input   {session_id, data_b64}
       pty_resize  {session_id, rows, cols}
-      pty_close   {session_id}
+      pty_close   {session_id, open_token}
     satellite → proxy
-      pty_output  {session_id, data_b64}   → feed_output(...)
-      pty_exit    {session_id, code}        → feed_exit(...)
+      pty_output  {session_id, data_b64}              → feed_output(...)
+      pty_exit    {session_id, code, open_token}       → feed_exit(...)
 
 Incoming ``pty_output`` / ``pty_exit`` frames are routed by
 ``core.remote.satellite_connection.SatelliteConnectionManager.handle_message`` to the
@@ -28,10 +28,18 @@ Incoming ``pty_output`` / ``pty_exit`` frames are routed by
 This is the dumb-pipe design: the satellite owns only the raw
 PTY; ALL the interactive intelligence stays on the proxy.
 
+Every open carries a token of its own (``open_token``): the ack and the exit
+name it, so the exit of a PTY closed under an id never reaches the PTY started
+again under that id (the satellite keeps its terminals by session id and
+reports an exit after its own teardown). A handle taken back for a PTY the
+machine already ran keeps the open its machine's ``pty_alive`` named
+(``adopt_remote_pty``). A frame or a handle with no token takes the id's exit.
+
 Scope notes:
   * Scrollback is buffered HERE on the proxy (fed by ``pty_output``). It survives
-    a dashboard reconnect but NOT a satellite reconnect — a satellite-side replay
-    is a future enhancement.
+    a dashboard reconnect and a satellite reconnect (the handle is held), not a
+    platform restart: a terminal taken back starts empty, and the viewer's size
+    on attach makes the TUI repaint.
   * Output is lossless only as far as the satellite's send queue + WS/TCP
     backpressure allow; a dedicated lossless lane is a future enhancement.
 """
@@ -40,10 +48,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import secrets
+import time
 from collections import deque
 from collections.abc import Iterable
 
-from core.sandbox.pty_relay import DEFAULT_SCROLLBACK_BYTES, ExitCb, OutputCb
+from core.session.interactive_common import DEFAULT_SCROLLBACK_BYTES, ExitCb, OutputCb
 
 logger = logging.getLogger("otodock.remote_pty")
 
@@ -70,6 +80,42 @@ from core.terminal_queries import (
 # removed when the handle's exit fires (satellite-reported or local close).
 _remote_ptys: dict[tuple[str, str], RemotePtyProcess] = {}
 
+# machine_id -> when its reconnect window ran out with terminals held. The
+# window ends only the waiting: the handles stay, the viewers keep their
+# "reconnecting", and the machine's report decides each terminal at its
+# return (re-adopted or ended). A machine away past ``TERMINAL_AWAY_MAX_S``
+# has its terminals ended by the reaper's sweep, as the window did at 90 s
+# before 2.0.
+_away_since: dict[str, float] = {}
+TERMINAL_AWAY_MAX_S = 24 * 3600.0
+
+
+def machine_away(machine_id: str) -> None:
+    """The machine's reconnect window ran out: its terminals wait for it."""
+    _away_since.setdefault(machine_id, time.monotonic())
+
+
+def machine_back(machine_id: str) -> None:
+    _away_since.pop(machine_id, None)
+
+
+def is_machine_away(machine_id: str) -> bool:
+    return machine_id in _away_since
+
+
+def sweep_away(now: float | None = None) -> int:
+    """End the terminals of every machine away longer than
+    ``TERMINAL_AWAY_MAX_S``. Returns how many machines were swept."""
+    now = time.monotonic() if now is None else now
+    swept = 0
+    for machine_id, since in list(_away_since.items()):
+        if now - since >= TERMINAL_AWAY_MAX_S:
+            _away_since.pop(machine_id, None)
+            cancel_machine_ptys(machine_id)
+            swept += 1
+            logger.info("Satellite %s: away for a day, its held terminals are ended", machine_id[:8])
+    return swept
+
 
 def feed_output(machine_id: str, session_id: str, data: bytes) -> None:
     """Route a satellite ``pty_output`` frame to its RemotePtyProcess."""
@@ -78,21 +124,28 @@ def feed_output(machine_id: str, session_id: str, data: bytes) -> None:
         rp._feed_output(data)
 
 
-def feed_exit(machine_id: str, session_id: str, code: int | None) -> None:
-    """Route a satellite ``pty_exit`` frame to its RemotePtyProcess."""
+def feed_exit(machine_id: str, session_id: str, code: int | None, open_token: str = "", *,
+              reason: str = "") -> None:
+    """Route a satellite ``pty_exit`` frame to its RemotePtyProcess: the one
+    whose open the frame names. An exit of an earlier open under the id (a
+    PTY this side closed, reported after its teardown) reaches nothing. A
+    handle with no token (a PTY taken back) takes the id's exit. ``reason``
+    is the machine's (``memory``: its guard ended the engine), kept on the
+    handle as ``exit_reason`` for the exit callback to read."""
     rp = _remote_ptys.get((machine_id, session_id))
-    if rp is not None:
-        rp._feed_exit(code)
+    if rp is None:
+        return
+    if open_token and rp.open_token and open_token != rp.open_token:
+        logger.info("remote pty %s: an exit of an earlier open under this id, dropped", session_id[:8])
+        return
+    rp.exit_reason = reason
+    rp._feed_exit(code)
 
 
 def cancel_machine_ptys(machine_id: str) -> None:
-    """Fire-exit every remote PTY on a machine (WS deregister / reconnect).
-
-    Mirrors ``SatelliteHttpTunnelDispatcher.cancel_machine_streams`` — when a
-    satellite drops, its in-flight remote PTYs are dead; surface that as an exit
-    so the InteractiveSession tears down (dashboard shows "session ended") rather
-    than hanging on a stream that will never resume. (A future grace-window
-    re-adopt is a planned enhancement.)
+    """Fire-exit every remote PTY on a machine away for
+    ``TERMINAL_AWAY_MAX_S`` (``sweep_away``). Each InteractiveSession tears
+    down, and its chat resumes at the next send.
     """
     for (mid, _sid), rp in list(_remote_ptys.items()):
         if mid == machine_id:
@@ -150,7 +203,7 @@ def reconcile_machine_ptys(
 
 
 class RemotePtyProcess:
-    """A satellite-hosted PTY, driven over the WS with the PtyProcess interface.
+    """A satellite-hosted PTY, driven over the WS.
 
     Construct via :func:`spawn_remote_pty` (which sends ``pty_open`` and waits for
     the ack). The handle is registered in ``_remote_ptys`` for inbound routing
@@ -167,11 +220,16 @@ class RemotePtyProcess:
         on_output: OutputCb,
         on_exit: ExitCb | None,
         scrollback_limit: int,
+        open_token: str = "",
     ) -> None:
         self.machine_id = machine_id
         self.session_id = session_id
-        # Satellite-reported pid (filled from the pty_open ack) — for log parity
-        # with PtyProcess.pid; the proxy never signals it directly.
+        # The token of this open (``spawn_remote_pty`` mints it): the exit
+        # that names another open never reaches this handle. Empty for a
+        # handle taken back for a PTY the machine already ran.
+        self.open_token = open_token
+        # Satellite-reported pid (filled from the pty_open ack) — for the
+        # logs; the proxy never signals it directly.
         self.pid: int | None = None
         self.rows = rows
         self.cols = cols
@@ -184,6 +242,9 @@ class RemotePtyProcess:
         self._loop = asyncio.get_running_loop()
         self._closed = False
         self._exit_fired = False
+        # The machine's reason for the exit (``feed_exit``): "memory" when its
+        # guard ended the engine.
+        self.exit_reason = ""
         _remote_ptys[(machine_id, session_id)] = self
 
     # -- output: satellite -> proxy (fed by handle_message) -------------------
@@ -265,13 +326,18 @@ class RemotePtyProcess:
             return
         self._closed = True
         if signal_child:
-            self._send_ff({"type": "pty_close", "session_id": self.session_id})
-        # Mirror PtyProcess.close → on_exit. The satellite's pty_exit (if it
+            frame = {"type": "pty_close", "session_id": self.session_id}
+            if self.open_token:
+                frame["open_token"] = self.open_token
+            self._send_ff(frame)
+        # A close fires on_exit. The satellite's pty_exit (if it
         # still arrives) is deduped by the _exit_fired guard in _fire_exit.
         self._fire_exit(None)
 
     def _fire_exit(self, code: int | None) -> None:
-        _remote_ptys.pop((self.machine_id, self.session_id), None)
+        # Its own entry only: a PTY started again under the id keeps its own.
+        if _remote_ptys.get((self.machine_id, self.session_id)) is self:
+            del _remote_ptys[(self.machine_id, self.session_id)]
         self._closed = True
         if self._exit_fired:
             return
@@ -288,7 +354,7 @@ class RemotePtyProcess:
     def _send_ff(self, msg: dict) -> None:
         """Fire-and-forget a frame to the satellite (off the caller's stack).
 
-        ``write``/``resize``/``close`` are SYNC (the PtyProcess contract), but
+        ``write``/``resize``/``close`` are SYNC (the seam the session drives), but
         the manager's send is async — schedule it on the loop. Frames are tiny
         and ordered within the writer's control lane.
         """
@@ -296,6 +362,38 @@ class RemotePtyProcess:
         mgr = get_connection_manager()
         spawn(mgr.send_fire_and_forget(self.machine_id, msg),
               name="send_fire_and_forget", owner="remote_pty")
+
+
+# The open each terminal of a machine had at its last report
+# (``note_reported_opens``), read by the adoption of one.
+_reported_opens: dict[str, dict[str, str]] = {}
+
+
+def note_reported_opens(machine_id: str, tokens: dict[str, str]) -> None:
+    """The machine's report named these opens for its terminals."""
+    _reported_opens[machine_id] = dict(tokens)
+
+
+def adopt_remote_pty(
+    *,
+    machine_id: str,
+    session_id: str,
+    rows: int,
+    cols: int,
+    on_output: OutputCb,
+    on_exit: ExitCb | None = None,
+    scrollback_limit: int = DEFAULT_SCROLLBACK_BYTES,
+) -> RemotePtyProcess:
+    """The handle of a PTY the machine already runs (a terminal taken back
+    after a restart or a window that ran out): registered for its frames,
+    no ``pty_open`` sent, no pid known, its open the one the machine's
+    report named. Its scrollback starts empty: the viewer's size on attach
+    makes the TUI repaint."""
+    return RemotePtyProcess(
+        machine_id=machine_id, session_id=session_id, rows=rows, cols=cols,
+        on_output=on_output, on_exit=on_exit, scrollback_limit=scrollback_limit,
+        open_token=_reported_opens.get(machine_id, {}).get(session_id, ""),
+    )
 
 
 async def spawn_remote_pty(
@@ -329,6 +427,7 @@ async def spawn_remote_pty(
         on_output=on_output,
         on_exit=on_exit,
         scrollback_limit=scrollback_limit,
+        open_token=secrets.token_hex(8),
     )
     from core.remote.satellite_connection import get_connection_manager
     mgr = get_connection_manager()
@@ -341,9 +440,12 @@ async def spawn_remote_pty(
             "config": config_payload,
             "rows": rows,
             "cols": cols,
+            "open_token": rp.open_token,
         }, timeout=timeout)
     except Exception:
-        _remote_ptys.pop((machine_id, session_id), None)
+        # Its own entry only, as ``_fire_exit``.
+        if _remote_ptys.get((machine_id, session_id)) is rp:
+            del _remote_ptys[(machine_id, session_id)]
         raise
     rp.pid = ack.get("pid")
     logger.info(

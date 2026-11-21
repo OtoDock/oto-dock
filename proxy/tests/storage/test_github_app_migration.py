@@ -83,7 +83,7 @@ def test_rows_written_before_the_columns_come_through_the_boot():
                 "WHERE mcp_name=%s AND agent_name='mig-agent'", (mcp,),
             ).fetchone()
         assert (row["installation_id"], row["repositories"], row["read_only"]) == ("", "[]", False)
-        assert credential_store.get_account_agent_binding(OWNER, mcp, "mig-agent") == ("gh", (), False)
+        assert credential_store.get_account_agent_binding(OWNER, mcp, "mig-agent")[:3] == ("gh", (), False)
         with get_conn() as conn:
             assert pg_schema.check_schema_drift(conn) == []
     finally:

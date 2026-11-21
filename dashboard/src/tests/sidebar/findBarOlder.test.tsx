@@ -29,13 +29,20 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = function (this: Element) {
     scrolled(this.getAttribute('data-search-index'))
   }
-  vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => setTimeout(() => cb(0), 0))
-  vi.stubGlobal('cancelAnimationFrame', (id: number) => clearTimeout(id))
+  // The bar's frames and its retry run on a clock only the test moves: a
+  // loaded box cannot reorder them, and a frame a test leaves pending is
+  // dropped with that test's clock instead of running in the next one.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'requestAnimationFrame', 'cancelAnimationFrame'] })
 })
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => vi.useRealTimers())
 
+async function advance(ms: number) {
+  await act(async () => { await vi.advanceTimersByTimeAsync(ms) })
+}
+
+// The two frames the bar waits for before it reads the match count.
 async function frames() {
-  await act(async () => { await new Promise((r) => setTimeout(r, 5)) })
+  await advance(32)
 }
 
 function bar(props: Partial<Parameters<typeof FindBar>[0]> = {}) {
@@ -97,7 +104,7 @@ describe('FindBar and older messages', () => {
     fireEvent.click(screen.getByText('Search them'))
     await frames()
     expect(onLoadOlder).toHaveBeenCalledTimes(1)
-    await act(async () => { await new Promise((r) => setTimeout(r, 350)) })
+    await advance(350)
     expect(onLoadOlder).toHaveBeenCalledTimes(2)
   })
 
@@ -119,6 +126,26 @@ describe('FindBar and older messages', () => {
     )
     await frames()
     expect(setCurrent).toHaveBeenLastCalledWith(2)
+  })
+
+  it('moves nothing when it closes between a landing\'s two frames', async () => {
+    const view = render(
+      <Context>
+        <FindBar value="needle" onChange={() => {}} onClose={() => {}} anchorPending />
+        <div data-msg-id="db-41"><span data-search-index="2" /></div>
+      </Context>,
+    )
+    view.rerender(
+      <Context>
+        <FindBar value="needle" onChange={() => {}} onClose={() => {}} anchorLanded={{ bubbleId: 'db-41' }} />
+        <div data-msg-id="db-41"><span data-search-index="2" /></div>
+      </Context>,
+    )
+    await advance(16)
+    view.unmount()
+    render(<div data-msg-id="db-41"><span data-search-index="2" /></div>)
+    await frames()
+    expect(setCurrent).toHaveBeenLastCalledWith(-1)
   })
 
   it('ignores a landing it did not wait for', async () => {

@@ -72,8 +72,8 @@ _LIST_TOOL = Tool(
     name="list_ssh_hosts",
     description=(
         "List the SSH hosts this agent is authorized to reach, with the key "
-        "file each one uses and a ready-to-run ssh command (keys are already "
-        "provisioned at $OTO_SSH_KEY_DIR). Call this whenever you are unsure "
+        "each one uses and a ready-to-run ssh command (the key file it names "
+        "sits in $OTO_SSH_KEY_DIR). Call this whenever you are unsure "
         "which hosts or keys are available — the list in the system prompt "
         "and this tool return the same data, but this is always fresh."
     ),
@@ -96,10 +96,14 @@ async def _handle_list_ssh_hosts(_args: dict) -> str:
     hosts = (data or {}).get("hosts", [])
     if not hosts:
         return "No SSH hosts are configured for this agent."
+    # The platform's own words when this machine's lines need them (a Windows
+    # machine, whose session runs Windows' own SSH client).
+    note = (data or {}).get("note") or ""
     lines = [
-        f"{len(hosts)} SSH host(s) configured for this agent. Keys are "
-        "provisioned at `$OTO_SSH_KEY_DIR`; use plain `ssh`/`scp`/`rsync` "
-        "from your shell.\n",
+        f"{len(hosts)} SSH host(s) configured for this agent. Each command "
+        + (f"names its key file in `$OTO_SSH_KEY_DIR`. Run it as given. {note}\n" if note else
+           "names its key file in `$OTO_SSH_KEY_DIR`; use it as given with plain "
+           "`ssh`/`scp`/`rsync` from your shell.\n"),
     ]
     for h in hosts:
         target = f"{h['username']}@{h['host']}" if h.get("username") else h["host"]

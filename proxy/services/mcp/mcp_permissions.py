@@ -20,8 +20,9 @@ non-destructive AND closed-world, both sent → ``standard``; anything else →
 way. A tool that sent no hints, or whose
 list the platform never read, takes the manifest's ``default_tier``. The
 hints are the server's own word; the platform keeps what it read from the
-tool lists it fetches (a Direct LLM session's, a local Codex session's) in a
-cache persisted under the data dir (``record_tool_hints``).
+tool lists it fetches (a Direct LLM session's, a local Codex session's, the
+listing job's) in the ``mcp_tool_labels`` table, where the Outside people
+picks read them too (``record_tool_hints``).
 
 Consulted from the ``mcp__`` branch of ``decide_tool_permission`` (all CLI
 layers + the Codex approval bridge) and from the Direct-LLM inline gate. The
@@ -41,8 +42,6 @@ self-declared ``category`` field.
 
 import json
 import logging
-import os
-import tempfile
 import threading
 from collections.abc import Iterable
 from fnmatch import fnmatchcase
@@ -53,7 +52,6 @@ from core.permission_modes import (
     DONT_ASK_MODE,
     PLAN_MODE,
     UNATTENDED_MODE,
-    current_mode,
 )
 from services.mcp.mcp_manifest_parse import ships_with_platform
 from services.mcp.mcp_manifest_types import PERMISSION_TIERS, McpManifest
@@ -85,7 +83,7 @@ def _is_bundled(manifest: McpManifest) -> bool:
     return ships_with_platform(manifest.mcp_dir)
 
 
-def _manifest_for(server_name: str) -> McpManifest | None:
+def manifest_for_server(server_name: str) -> McpManifest | None:
     from services.mcp import mcp_registry
     for m in mcp_registry.get_all_manifests().values():
         if (m.server_name or m.name) == server_name:
@@ -104,7 +102,7 @@ def resolve_tool_tier(server_name: str, tool_name: str) -> str:
     """
     if not server_name or not tool_name:
         return DEFAULT_TIER
-    manifest = _manifest_for(server_name)
+    manifest = manifest_for_server(server_name)
     block = manifest.permissions if manifest is not None else None
     if block is None:
         return hint_tier(tool_hints(server_name, tool_name)) or DEFAULT_TIER
@@ -145,10 +143,27 @@ def resolve_tool_tier(server_name: str, tool_name: str) -> str:
 HINT_KEYS: tuple[str, ...] = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 # A tier's strictness, to log a tier a server's new hints loosen.
 _STRICTNESS = {"open": 0, "standard": 1, "sensitive": 2, "critical": 3}
+# The file the labels lived in before 2.0, under the data dir: read once
+# into the table when the table is empty, then left alone.
 _HINTS_FILE = "mcp-tool-hints.json"
 _hints: dict[str, dict[str, dict]] = {}
 _hints_loaded = False
 _hints_lock = threading.Lock()
+
+
+def reads_only(hints: dict | None) -> bool:
+    """Whether a function's labels say it only reads (``readOnlyHint``
+    true). A function with no label, or an unlisted one, does not."""
+    return hints is not None and hints.get("readOnlyHint") is True
+
+
+def reset_cache() -> None:
+    """Forget the loaded labels (a test's fixture): the next read loads
+    the table again."""
+    global _hints_loaded
+    with _hints_lock:
+        _hints.clear()
+        _hints_loaded = False
 
 
 def hint_tier(hints: dict | None) -> str | None:
@@ -178,35 +193,55 @@ def _hints_path() -> Path:
     return Path(config.PLATFORM_DATA_DIR) / _HINTS_FILE
 
 
-def _load_hints_locked() -> None:
-    global _hints_loaded
-    if _hints_loaded:
-        return
-    _hints_loaded = True
+def _legacy_file_labels() -> dict[str, dict[str, dict]]:
+    """The labels of the file a 1.9.x install kept, by server; empty when
+    there is none or it cannot be read."""
     try:
         data = json.loads(_hints_path().read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return
+        return {}
     except (OSError, ValueError):
-        logger.warning("MCP permissions: the tool hints file is unreadable; starting empty")
-        return
+        logger.warning("MCP permissions: the tool hints file is unreadable; not imported")
+        return {}
+    out: dict[str, dict[str, dict]] = {}
     if isinstance(data, dict):
         for server, tools in data.items():
             if isinstance(server, str) and isinstance(tools, dict):
-                _hints[server] = {t: h for t, h in tools.items()
-                                  if isinstance(t, str) and isinstance(h, dict)}
+                out[server] = {t: h for t, h in tools.items()
+                               if isinstance(t, str) and isinstance(h, dict)}
+    return out
 
 
-def _save_hints_locked() -> None:
-    path = _hints_path()
+def _load_hints_locked() -> None:
+    """The table into memory, once. An empty table takes the 1.9.x file's
+    labels first, so an upgraded install keeps what its sessions listed. A
+    store that cannot be read leaves the cache empty for this process and
+    logs it; the next process loads again."""
+    global _hints_loaded
+    if _hints_loaded:
+        return
+    from storage.mcp import mcp_store
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".mcp-tool-hints-")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(_hints, fh, sort_keys=True)
-        os.replace(tmp, path)
-    except OSError:
-        logger.warning("MCP permissions: the tool hints file could not be written", exc_info=True)
+        stored = mcp_store.get_all_tool_labels()
+        if not stored:
+            for server, tools in _legacy_file_labels().items():
+                mcp_store.replace_tool_labels(server, tools)
+                stored[server] = tools
+    except Exception:  # noqa: BLE001  # the store is unreachable: the tiers fall back to the manifests' word
+        logger.warning("MCP permissions: the tool labels could not be read; starting empty", exc_info=True)
+        stored = {}
+    _hints.clear()
+    _hints.update(stored)
+    _hints_loaded = True
+
+
+def _save_hints_locked(server_name: str) -> None:
+    from storage.mcp import mcp_store
+    try:
+        mcp_store.replace_tool_labels(server_name, _hints.get(server_name, {}))
+    except Exception:  # noqa: BLE001  # the store is unreachable: the labels stay in memory for this process
+        logger.warning("MCP permissions: the tool labels of %s could not be written", server_name,
+                       exc_info=True)
 
 
 def tool_hints(server_name: str, tool_name: str) -> dict | None:
@@ -226,15 +261,24 @@ def known_tools(server_name: str) -> list[str]:
 def record_tool_hints(server_name: str, tools: Iterable[tuple[str, dict | None]]) -> None:
     """Keep the annotations a server's tool list carried (a Direct LLM
     session's ``list_tools``, a Codex session's server status), written
-    through to the data dir when they change. A tier a new hint loosens is
+    through to the data dir when they change. A list adds to and updates
+    what is known and never shrinks it: a server lists by the session's
+    role (agent-config-mcp hands a viewer three tools, a run two), so a
+    shorter list is that session's view, not the maker's word, and a Read
+    only pick or limit built on the labels must not lose its functions to
+    it (an empty list is a start that failed). A function the maker removed
+    stays known, harmless: nothing can call it. A tier a new hint loosens is
     logged: a server can change its own word between versions."""
     if not server_name:
         return
-    fresh = {name: {k: hints[k] for k in HINT_KEYS if isinstance(hints.get(k), bool)}
-             for name, hints in ((n, h or {}) for n, h in tools) if name}
+    listed = {name: {k: hints[k] for k in HINT_KEYS if isinstance(hints.get(k), bool)}
+              for name, hints in ((n, h or {}) for n, h in tools) if name}
+    if not listed:
+        return
     with _hints_lock:
         _load_hints_locked()
         old = _hints.get(server_name, {})
+        fresh = {**old, **listed}
         if old == fresh:
             return
         for name, hints in fresh.items():
@@ -243,7 +287,10 @@ def record_tool_hints(server_name: str, tools: Iterable[tuple[str, dict | None]]
                 logger.info("MCP permissions: %s/%s now labels itself %s (was %s)",
                             server_name, name, after, before)
         _hints[server_name] = fresh
-        _save_hints_locked()
+        _save_hints_locked(server_name)
+    # The Outside people picks compare what Read only gave before and after.
+    from services.mcp import outside_picks
+    outside_picks.labels_changed(server_name, old, fresh)
 
 
 def codex_server_default(server_name: str) -> str | None:
@@ -254,7 +301,7 @@ def codex_server_default(server_name: str) -> str | None:
     tool's own label could have Codex run it unasked); None otherwise."""
     if known_tools(server_name):
         return None
-    manifest = _manifest_for(server_name)
+    manifest = manifest_for_server(server_name)
     if manifest is None or manifest.permissions is None:
         return None
     if any(_is_glob(r.tool) and r.tier in ("sensitive", "critical")
@@ -271,7 +318,7 @@ def codex_tool_approvals(server_name: str) -> dict[str, str]:
     ``prompt`` for a sensitive tool it would not (a manifest rule beats a
     hint on Codex too). Over the tools whose list was read and the
     manifest's exact rule names."""
-    manifest = _manifest_for(server_name)
+    manifest = manifest_for_server(server_name)
     names = set(known_tools(server_name))
     if manifest is not None and manifest.permissions is not None:
         names |= {r.tool for r in manifest.permissions.rules if not _is_glob(r.tool)}
@@ -308,7 +355,6 @@ def tier_decision(tier: str, mode: str) -> str:
     """
     if tier not in PERMISSION_TIERS:  # unknown → safest prompt-capable tier
         tier = DEFAULT_TIER
-    mode = current_mode(mode)
     if tier == "open":
         return "allow"
     if mode == PLAN_MODE:

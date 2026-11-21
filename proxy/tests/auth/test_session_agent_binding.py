@@ -59,9 +59,6 @@ _BOUND = [
     ("DELETE", "/v1/agents/{a}/checks/c1", None),
     ("PUT", "/v1/agents/{a}/user-checks/c1", _CHECK),
     ("DELETE", "/v1/agents/{a}/user-checks/c1", None),
-    ("GET", "/v1/agents/{a}/check-verdicts", None),
-    ("GET", "/v1/agents/{a}/check-settings", None),
-    ("PATCH", "/v1/agents/{a}/check-settings", {"daily_cap_usd": 1}),
     ("PATCH", "/v1/agents/{a}", {"display_name": "Renamed"}),
     ("GET", "/v1/agents/{a}/knowledge-attachments", None),
     ("PUT", "/v1/agents/{a}/knowledge-library", {"subdirs": []}),
@@ -72,9 +69,45 @@ _BOUND = [
 
 @pytest.mark.parametrize("method, path, body", _BOUND, ids=[f"{m} {p}" for m, p, _ in _BOUND])
 def test_a_token_for_one_agent_is_refused_on_anothers_route(method, path, body):
+    """The session token's route list binds every per-agent row to the
+    token's own agent first (``auth/external_endpoints.SESSION_ROUTES``);
+    the route's own ``session_bound_to`` stands behind it."""
+    from auth.external_endpoints import SESSION_ROUTE_DETAIL
     r = client.request(method, path.format(a=B), json=body, headers=_token(A))
     assert r.status_code == 403
-    assert "started for" in r.json()["detail"]
+    assert r.json()["detail"] == SESSION_ROUTE_DETAIL
+
+
+@pytest.mark.parametrize("method, path, body", [
+    ("GET", "/v1/agents/{a}/check-verdicts", None),
+    ("GET", "/v1/agents/{a}/check-settings", None),
+    ("PATCH", "/v1/agents/{a}/check-settings", {"daily_cap_usd": 1}),
+])
+def test_a_per_agent_route_no_tool_calls_is_off_the_list_for_the_tokens_own_agent_too(method, path, body):
+    """These rows are a person's: the list refuses a session token on them
+    before any binding, for the token's own agent as for another's."""
+    from auth.external_endpoints import SESSION_ROUTE_DETAIL
+    for agent in (A, B):
+        r = client.request(method, path.format(a=agent), json=body, headers=_token(A))
+        assert r.status_code == 403 and r.json()["detail"] == SESSION_ROUTE_DETAIL, agent
+
+
+def test_the_routes_own_binding_still_refuses_another_agent():
+    """Behind the list: the dependency itself, as a route carries it, with
+    no middleware in front."""
+    from fastapi import Depends, FastAPI
+
+    from auth.providers import session_bound_to
+    mini = FastAPI()
+
+    @mini.get("/t/{a}", dependencies=[Depends(session_bound_to("a"))])
+    async def _route(a: str) -> dict:
+        return {"ok": a}
+
+    bare = TestClient(mini)
+    r = bare.get(f"/t/{B}", headers=_token(A))
+    assert r.status_code == 403 and "started for" in r.json()["detail"]
+    assert bare.get(f"/t/{A}", headers=_token(A)).json() == {"ok": A}
 
 
 @pytest.mark.parametrize("method, path, body", _BOUND, ids=[f"{m} {p}" for m, p, _ in _BOUND])
@@ -124,32 +157,28 @@ def test_a_creators_session_cannot_create_an_agent(sub):
     assert not agent_store.agent_exists("from-a-prompt")
 
 
-def test_a_persons_session_token_acts_at_their_role_on_the_files_routes(monkeypatch):
-    """A session token that names a person moves, copies, zips and lists at
-    that person's tier, never the admin tier: a contributor's session cannot
-    zip the config folder or move the persona out of it. The agent's own
-    session (no person) is judged by its grant: the config folder only where
-    its context shows it."""
+def test_a_session_token_reaches_the_files_api_for_the_tree_and_the_persona_alone(monkeypatch):
+    """The files API's moves, copies, zips and reads are no tool's: a session
+    token is refused them with the list's sentence at every role, the files
+    stay where they are, and the two routes a tool calls (the tree, the
+    persona file) answer the token's own agent."""
     import config
+    from auth.external_endpoints import SESSION_ROUTE_DETAIL
     contrib = "user-contrib"
     task_store.upsert_user(contrib, "contrib@t.com", "Contrib", "member")
     task_store.set_user_agents(contrib, [A], ADMIN, agent_roles={A: "contributor"})
     (config.AGENTS_DIR / A / "config" / "agent.md").write_text("persona")
-    h = _token(A, contrib)
-    r = client.post(f"/v1/agents/{A}/move", json={"src_paths": ["config/agent.md"], "dest_dir": "workspace"}, headers=h)
-    assert r.status_code == 403, r.text
-    r = client.post(f"/v1/agents/{A}/copy", json={"src_paths": ["config/agent.md"], "dest_dir": "workspace"}, headers=h)
-    assert r.status_code == 403, r.text
-    assert client.post(f"/v1/agents/{A}/zip", json={"paths": ["config"]}, headers=h).status_code == 403
+    for h in (_token(A, contrib), _token(A, ""), _token(A)):
+        for method, path, body in (
+            ("POST", f"/v1/agents/{A}/move", {"src_paths": ["config/agent.md"], "dest_dir": "workspace"}),
+            ("POST", f"/v1/agents/{A}/copy", {"src_paths": ["config/agent.md"], "dest_dir": "workspace"}),
+            ("POST", f"/v1/agents/{A}/zip", {"paths": ["config"]}),
+            ("GET", f"/v1/agents/{A}/files/workspace/x.txt", None),
+        ):
+            r = client.request(method, path, json=body, headers=h)
+            assert (r.status_code, r.json()["detail"]) == (403, SESSION_ROUTE_DETAIL), (method, path, r.text)
     assert (config.AGENTS_DIR / A / "config" / "agent.md").read_text() == "persona"
-    from auth.path_policy import SecurityContext
-    from core.session import session_state
-    sid = str(uuid.uuid4())
-    own = {"Authorization": f"Bearer {live_session_token(sid, A, '')}"}
-    assert client.post(f"/v1/agents/{A}/zip", json={"paths": ["config"]}, headers=own).status_code == 403
-    for visible, status in ((False, 403), (True, 200)):
-        monkeypatch.setitem(session_state._session_security, sid, SecurityContext(
-            role="manager", username="", agent=A, is_admin_agent=False,
-            session_scope="agent", config_visible=visible))
-        r = client.post(f"/v1/agents/{A}/zip", json={"paths": ["config"]}, headers=own)
-        assert r.status_code == status, (visible, r.text)
+    h = _token(A)
+    assert client.get(f"/v1/agents/{A}/files", headers=h).status_code != 403
+    r = client.put(f"/v1/agents/{A}/files/config/agent.md", json={"content": "persona"}, headers=h)
+    assert not (r.status_code == 403 and r.json().get("detail") == SESSION_ROUTE_DETAIL), r.text

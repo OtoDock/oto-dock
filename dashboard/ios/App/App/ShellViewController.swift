@@ -213,6 +213,7 @@ final class ShellViewController: CAPBridgeViewController {
         center.addObserver(self, selector: #selector(keyboardWillChange(_:)), name: UIResponder.keyboardWillHideNotification, object: nil)
         center.addObserver(self, selector: #selector(deviceOrientationChanged), name: UIDevice.orientationDidChangeNotification, object: nil)
         installSwipes(on: webView)
+        installBackSwipe()
         UIDevice.current.beginGeneratingDeviceOrientationNotifications()
 
         // The first load is the server's root (or the bare setup page); a
@@ -970,6 +971,30 @@ final class ShellViewController: CAPBridgeViewController {
 
     @objc private func swipedLeft() { cycleInstall(1) }
     @objc private func swipedRight() { cycleInstall(-1) }
+
+    // MARK: - The edge swipe back
+
+    /// iOS has no system back: a pan from the screen's left edge goes back
+    /// one page of the dashboard (`BackSwipe` holds the rules). On the
+    /// container, so a touch beside a web view inset for the sensor housing
+    /// counts too. WebKit's own back-forward gesture stays off.
+    private func installBackSwipe() {
+        let pan = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(edgePanned(_:)))
+        pan.edges = .left
+        pan.cancelsTouchesInView = false
+        pan.delegate = self
+        container.addGestureRecognizer(pan)
+    }
+
+    @objc private func edgePanned(_ pan: UIScreenEdgePanGestureRecognizer) {
+        guard pan.state == .ended, let webView, !retiring, !videoFullscreen, showsDashboard(webView.url) else { return }
+        let end = pan.location(in: webView)
+        let moved = pan.translation(in: webView)
+        guard BackSwipe.counts(startX: Double(end.x - moved.x), dx: Double(moved.x), dy: Double(moved.y)) else { return }
+        webView.evaluateJavaScript(BackSwipe.script) { answer, _ in
+            Self.log.debug("edge swipe: \((answer as? String) ?? "no answer", privacy: .public)")
+        }
+    }
 
     // MARK: - Dialogs
 

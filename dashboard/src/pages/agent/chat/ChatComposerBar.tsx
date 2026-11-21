@@ -5,7 +5,7 @@
  * Presentational: every value is computed by the page. `ChatBottomPanel`
  * holds it with the banners above it and draws the fade over the chat.
  */
-import type { Dispatch, JSX, ReactNode, SetStateAction } from 'react'
+import { useContext, useState, type JSX, type ReactNode } from 'react'
 import type { useChatStream } from '../../../hooks/useChatStream'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import { utf8ToB64 } from '../../../hooks/useInteractiveChat'
@@ -14,6 +14,7 @@ import type { LayerCapabilities } from '../../../api/agents'
 import type { computeModelGroups } from '../../../lib/modelGroups'
 import { useChatStore } from '../../../store/chatStore'
 import ChatStatusBar from '../../../components/chat/ChatStatusBar'
+import { BADGE_FLOAT_SLOT, BadgeFloatSlot, badgePlacement } from '../../../lib/chat/badgeFloat'
 import ChatInput, { PendingImage, PendingFile } from '../../../components/chat/ChatInput'
 import type { QueuedMessage } from '../../../store/types'
 import type { ChatInputVoice } from '../../../components/chat/ChatInput'
@@ -22,8 +23,8 @@ import { describeLimitReached, describeLimitWarning } from '../../../components/
 import { usePrimaryPointerCoarse } from '../../../hooks/usePrimaryPointerCoarse'
 import { withSendHint } from '../../../lib/composerKeys'
 import type { CollectedItems } from '../../../lib/droppedItems'
-import { DONT_ASK_MODE, currentMode, runsWithoutAsking } from '../../../lib/engines/modes'
-import { TOAST } from '../../../components/ui/classes'
+import { DONT_ASK_MODE, modeBusyReason, runsWithoutAsking } from '../../../lib/engines/modes'
+import { COMPOSER_COLUMN, COMPOSER_INSET, TOAST } from '../../../components/ui/classes'
 
 type Stream = ReturnType<typeof useChatStream>
 
@@ -94,16 +95,16 @@ interface Props {
   pendingFiles: PendingFile[]
   handleAddFiles: (files: PendingFile[]) => void
   handleAddFolder: (name: string, items: CollectedItems | Promise<CollectedItems>) => void
+  handleAddFetched: (name: string, load: (signal: AbortSignal) => Promise<File>) => void
   handleRemoveFile: (id: string) => void
   handleRetryFile: (id: string) => void
   workspace: ReturnType<typeof useWorkspaceState>
   appsActive: boolean
   toggleApps: () => void
-  setAppsOpen: Dispatch<SetStateAction<boolean>>
   projectsActive: boolean
   isProjectChat: boolean
   dockAvailable: boolean
-  setProjectsOpen: Dispatch<SetStateAction<boolean>>
+  toggleDock: () => void
   // ChatInput's duplex voice controls — built by pages/agent/chat/useChatDuplexVoice.ts
   voice: ChatInputVoice
   /** Animate the composer's shrink and regrow (ChatInput `animateHeight`). */
@@ -126,15 +127,21 @@ export default function ChatComposerBar({
   limitReached, limitReachedInfo, limitWarning, setLimitWarning, engineLabels,
   draftInput, setDraftInput, handleSend, handleAbort, handleEditQueued, handleEngage,
   permissionPending, warmingUp, aborting, queuedMessages, editText, setEditText,
-  pendingImages, draftKey, pendingFiles, handleAddFiles, handleAddFolder, handleRemoveFile, handleRetryFile,
-  workspace, appsActive, toggleApps, setAppsOpen,
-  projectsActive, isProjectChat, dockAvailable, setProjectsOpen,
+  pendingImages, draftKey, pendingFiles, handleAddFiles, handleAddFolder, handleAddFetched, handleRemoveFile, handleRetryFile,
+  workspace, appsActive, toggleApps,
+  projectsActive, isProjectChat, dockAvailable, toggleDock,
   voice, composerAnimates, targetSlot, composerLockReason = '',
 }: Props) {
   const touchPrimary = usePrimaryPointerCoarse()
+  // A phone's badges float over the chat or the terminal; over the
+  // workspace, an app or the projects they keep their row.
+  const badges = badgePlacement(useContext(BadgeFloatSlot), {
+    workspaceOpen: workspace.state.open, appsActive, projectsActive,
+    sessionInteractive: interactive.sessionInteractive, showRichView: interactive.showRichView,
+  })
   return (
     <div data-composer-bar className="shrink-0 relative bg-surface-page">
-      <div className="max-w-4xl mx-auto">
+      <div className={COMPOSER_COLUMN}>
         <ChatStatusBar
           streaming={viewedStreaming}
           warming={warming}
@@ -142,7 +149,7 @@ export default function ChatComposerBar({
           thinkingActive={thinkingActive}
           compressingActive={compressingActive}
           activeAgents={activeAgents}
-          mode={runsWithoutAsking(mode) ? DONT_ASK_MODE : currentMode(mode)}
+          mode={runsWithoutAsking(mode) ? DONT_ASK_MODE : mode}
           // While a cross-engine pick is pending these are DISPLAY-ONLY
           // overrides — the real `model` state stays on the chat's
           // engine (it feeds handleSend/pre-warm; mutating it would warm
@@ -169,7 +176,10 @@ export default function ChatComposerBar({
           richViewAvailable={interactive.sessionInteractive}
           richViewActive={interactive.showRichView}
           onToggleRichView={handleToggleRichView}
-          hidePermissions={interactive.interactiveMode || interactive.sessionInteractive}
+          modeBusyReason={modeBusyReason({
+            terminalLive: interactive.sessionInteractive, terminalChat: interactive.interactiveMode,
+            switching: interactive.switching, starting: warming || warmingUp, turnRuns: viewedStreaming,
+          })}
           interactiveActive={interactive.interactiveMode || interactive.sessionInteractive}
           // A task run's PERMISSIONS are the run's fact ('auto'
           // posture) — display-only. Its MODEL (1.5) follows the same
@@ -180,13 +190,15 @@ export default function ChatComposerBar({
           // model/engine from the chat row, so the pick governs
           // exactly those. Interactive PTY sessions stay locked (the
           // terminal owns its process).
-          modelLocked={interactive.sessionInteractive || !!pickersLockReason}
+          modelLocked={interactive.sessionInteractive || interactive.switching || !!pickersLockReason}
           modeLocked={isTaskChat || !!pickersLockReason}
           lockReason={pickersLockReason || undefined}
           leftSlot={interactive.sessionInteractive && chatId
             ? <TerminalControlBar className="flex-1 min-w-0" send={(seq) => ws.sendPtyInput(chatId, utf8ToB64(seq))} />
             : undefined}
           targetSlot={targetSlot}
+          badgeFloat={badges.float}
+          terminalShown={badges.compact}
           onModeChange={handleModeChange}
           onModelChange={handleModelChange}
           // Lazy liveness re-probe on dropdown open (committed chats
@@ -212,9 +224,11 @@ export default function ChatComposerBar({
       {/* Usage limit banner — names the budget that blocked (platform
           budget, own API-key budget, or the subscription pool cap). */}
       {limitReached && (
-        <div data-testid="limit-banner" className="mx-4 mb-2 p-3 rounded-card bg-status-danger-bg border border-status-danger-border text-sm text-status-danger-fg">
-          <strong>{describeLimitReached(limitReachedInfo, engineLabels).title}</strong>{' '}
-          {describeLimitReached(limitReachedInfo, engineLabels).body}
+        <div className={COMPOSER_INSET}>
+          <div data-testid="limit-banner" className={`${COMPOSER_COLUMN} mb-2 p-3 rounded-card bg-status-danger-bg border border-status-danger-border text-sm text-status-danger-fg`}>
+            <strong>{describeLimitReached(limitReachedInfo, engineLabels).title}</strong>{' '}
+            {describeLimitReached(limitReachedInfo, engineLabels).body}
+          </div>
         </div>
       )}
       {/* Usage limit warning toast */}
@@ -244,10 +258,10 @@ export default function ChatComposerBar({
         streaming={(viewedStreaming && !permissionPending) || warmingUp}
         queueable={viewedStreaming && !permissionPending && !warmingUp}
         aborting={aborting}
-        placeholder={composerLockReason || (pendingEngineSwitch
+        // A notice above says why the box is locked: said once, there.
+        placeholder={composerLockReason || limitReached ? '' : (pendingEngineSwitch
           ? 'Confirm or cancel the engine switch first…'
-          : limitReached ? 'Usage limit reached'
-            : withSendHint(viewedStreaming ? 'Type to queue a message' : 'Type a message', touchPrimary))}
+          : withSendHint(viewedStreaming ? 'Type to queue a message' : 'Type a message', touchPrimary))}
         queuedCount={queuedMessages.length}
         editText={editText}
         onClearEditText={() => setEditText(null)}
@@ -257,6 +271,7 @@ export default function ChatComposerBar({
         pendingFiles={pendingFiles}
         onAddFiles={handleAddFiles}
         onAddFolder={handleAddFolder}
+        onAddFetched={handleAddFetched}
         onRemoveFile={handleRemoveFile}
         onRetryFile={handleRetryFile}
         workspaceOpen={workspace.state.open}
@@ -266,13 +281,7 @@ export default function ChatComposerBar({
         onToggleApps={toggleApps}
         projectsOpen={projectsActive}
         dockKind={isProjectChat ? 'project' : 'chat'}
-        onToggleProjects={dockAvailable ? () => {
-          // Same reveal-intent shape as toggleApps (visibility, not flag).
-          if (projectsActive) { setProjectsOpen(false); return }
-          if (workspace.state.open) workspace.closeWorkspace()
-          setAppsOpen(false)
-          setProjectsOpen(true)
-        } : undefined}
+        onToggleProjects={dockAvailable ? toggleDock : undefined}
         voice={voice}
         animateHeight={composerAnimates}
       />
@@ -282,8 +291,11 @@ export default function ChatComposerBar({
 
 /** The chat page's bottom panel: the banners, the lock line and the
  *  composer, on the page colour. The fade over the chat's last lines sits
- *  above the whole panel, so it never covers a banner. */
+ *  above the whole panel, so it never covers a banner, and so does the slot
+ *  a phone's status badges float in. */
 export function ChatBottomPanel({ children }: { children: ReactNode }) {
+  // Set in the commit's layout phase, so the first paint already has it.
+  const [badgeSlot, setBadgeSlot] = useState<HTMLDivElement | null>(null)
   return (
     <div data-chat-bottom className="shrink-0 relative bg-surface-page">
       <div
@@ -291,7 +303,8 @@ export function ChatBottomPanel({ children }: { children: ReactNode }) {
         aria-hidden="true"
         className="absolute left-0 right-0 bottom-full h-4 bg-linear-to-t from-surface-page to-transparent pointer-events-none"
       />
-      {children}
+      <div ref={setBadgeSlot} data-badge-float className={BADGE_FLOAT_SLOT} />
+      <BadgeFloatSlot.Provider value={badgeSlot}>{children}</BadgeFloatSlot.Provider>
     </div>
   )
 }

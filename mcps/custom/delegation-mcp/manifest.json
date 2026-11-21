@@ -2,7 +2,7 @@
   "name": "delegation-mcp",
   "label": "Delegation",
   "description": "Delegate work to parallel agent sessions, monitor them, hand files back with a result, and share a Notebook with the agents around you",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "category": "core",
 
   "server": {

@@ -11,9 +11,14 @@
     "delegation_targets": [
      "char-agent"
     ],
+    "limits": null,
     "mcp_config_format": "json",
     "only_mcps": null,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "session_id": "s-task",
     "shared_chat": false,
     "target_browser": {},
@@ -102,7 +107,11 @@
      }
     ],
     "nouser_reads": false,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "trigger_payload": null,
     "user_role": "editor",
     "user_sub": "user-viewer"
@@ -119,11 +128,17 @@
     "excluded_mcps": null,
     "execution_path": "claude-code-cli",
     "mount_shared": true,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "read_only": false,
     "role": "editor",
     "sandboxed": true,
+    "session_id": "s-task",
     "shared_chat": false,
+    "tool_limits": [],
     "username": "vic"
    }
   },
@@ -133,7 +148,21 @@
      "agent": "char-agent",
      "config_visible": false,
      "is_admin_agent": false,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
      "role": "editor",
+     "tool_limits": [
+      [
+       "agent-config-mcp",
+       [
+        "reload_session",
+        "switch_account"
+       ]
+      ]
+     ],
      "username": "vic"
     }
    ],
@@ -186,9 +215,12 @@
      "execution_path": "claude-code-cli",
      "execution_paths": "",
      "execution_target": "local",
+     "history_retention_days": 0,
      "local_only_engines": "",
      "setup_completed_at": null,
      "slug": "char-agent",
+     "team_account": false,
+     "team_account_floor": "editor",
      "updated_at": "<stamp>"
     },
     "model": "claude-char-1",
@@ -221,7 +253,21 @@
    "agent": "char-agent",
    "config_visible": false,
    "is_admin_agent": false,
+   "placement": {
+    "kind": "compute",
+    "label": "Compute",
+    "machine_id": "compute-0123456789ab"
+   },
    "role": "editor",
+   "tool_limits": [
+    [
+     "agent-config-mcp",
+     [
+      "reload_session",
+      "switch_account"
+     ]
+    ]
+   ],
    "username": "vic"
   },
   "subscription_id": "sub-char",

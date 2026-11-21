@@ -453,6 +453,46 @@ def test_audience_shared_personal_hides_and_the_dock_chat_gate(people):
     assert audience.app_audience(task_store.get_app(dock["id"])) == []
 
 
+def test_a_pin_in_an_agent_runs_chat_reaches_whoever_may_open_that_chat(people, monkeypatch):
+    """A Dock pin in an agent-scope run's chat follows the one rule
+    (``visibility.may_open_chat``): the editor tier and the admins get its
+    frames, never a viewer of the agent nor a person it was shared with."""
+    from storage.sharing import share_store
+    task_store.upsert_user("root-sub", "root@test.com", "Root", "admin")
+    task_store.create_chat("task-run-1", f"task::{AGENT}", AGENT)
+    task_store.create_run("run-1", "task-x", AGENT, "manual", None, "go")
+    task_store.update_run("run-1", chat_id="task-run-1")
+    dock = _row("run-dock")
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("UPDATE pinned_apps SET scope_chat_id=%s WHERE id=%s", ("task-run-1", dock["id"]))
+        conn.commit()
+    monkeypatch.setattr(share_store, "internal_grantees", lambda app_id: ["carol-sub"])
+    who = [s for s in audience.app_audience(task_store.get_app(dock["id"]))
+           if s in {"alice-sub", "bob-sub", "carol-sub", "root-sub"}]
+    assert who == ["alice-sub", "root-sub"]
+
+
+@pytest.mark.asyncio
+async def test_the_live_fan_out_never_pushes_to_a_viewer_who_may_not_open_the_pins_chat(people, monkeypatch):
+    """``app_push`` of a pin in an agent-scope run's chat reaches the manager's
+    socket, never the viewer's (ONE-DOOR #13)."""
+    from api.hooks import pins
+    task_store.create_chat("task-run-2", f"task::{AGENT}", AGENT)
+    task_store.create_run("run-2", "task-x", AGENT, "manual", None, "go")
+    task_store.update_run("run-2", chat_id="task-run-2")
+    dock = _row("run-dock-2")
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("UPDATE pinned_apps SET scope_chat_id=%s WHERE id=%s", ("task-run-2", dock["id"]))
+        conn.commit()
+    pushed: list[str] = []
+    monkeypatch.setattr(nm, "push_live", lambda sub, frame: pushed.append(sub) or 1)
+    await pins._live_fan_out(task_store.get_app(dock["id"]), {"type": "app_push"})
+    assert "alice-sub" in pushed
+    assert "bob-sub" not in pushed
+
+
 # ───────────────────────────── the hooks ──────────────────────────────────
 
 

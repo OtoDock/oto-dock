@@ -1,0 +1,126 @@
+{
+ "always_load text": {
+  "refused": "char-mcp: always_load must be true or false, got 'yes'"
+ },
+ "bad audience": {
+  "refused": "char-mcp: audience must be one of ['owner', 'editor', 'workspace'] when declared, got 'team'"
+ },
+ "bad device capability": {
+  "refused": "char-mcp: device_capability must be one of ['app', 'browser', 'computer'] or null, got 'printer'"
+ },
+ "bad placement": {
+  "refused": "char-mcp: placement must be one of ['any', 'satellite_only'], got 'moon'"
+ },
+ "bad remote policy": {
+  "refused": "char-mcp: remote_policy must be one of ['admin_paired_only', 'any'], got 'never'"
+ },
+ "companion auth": {
+  "refused": "char-mcp: invalid companion_app block — companion_app.auth must be \"none\" or \"per_connection_token\", got 'password'"
+ },
+ "companion connect": {
+  "refused": "char-mcp: invalid companion_app block — companion_app.connect must be an object"
+ },
+ "companion defaults": {
+  "parsed": {
+   "agent_env": {},
+   "category": "community",
+   "companion_app": {},
+   "config": [],
+   "credentials": {},
+   "description": "Char tools.",
+   "env": {},
+   "exclude_from": [],
+   "label": "Char",
+   "manifest_path": "<tmp>/cases/companion-defaults/manifest.json",
+   "mcp_dir": "<tmp>/cases/companion-defaults",
+   "name": "char-mcp",
+   "server": {
+    "args": [
+     "server.py"
+    ],
+    "command": "python3",
+    "runtime": "python",
+    "transport": "stdio"
+   },
+   "server_name": "char-mcp",
+   "skills": [],
+   "version": "1.0.0"
+  }
+ },
+ "companion not an object": {
+  "refused": "char-mcp: invalid companion_app block — companion_app must be an object, got list"
+ },
+ "companion plugin": {
+  "refused": "char-mcp: invalid companion_app block — companion_app.plugin must be an object"
+ },
+ "config without key": {
+  "raised": "KeyError",
+  "text": "'key'"
+ },
+ "instance field without key": {
+  "raised": "KeyError",
+  "text": "'key'"
+ },
+ "null name": {
+  "parsed": {
+   "agent_env": {},
+   "category": "community",
+   "config": [],
+   "credentials": {},
+   "description": "Char tools.",
+   "env": {},
+   "exclude_from": [],
+   "label": "Char",
+   "manifest_path": "<tmp>/cases/null-name/manifest.json",
+   "mcp_dir": "<tmp>/cases/null-name",
+   "name": null,
+   "server": {
+    "args": [
+     "server.py"
+    ],
+    "command": "python3",
+    "runtime": "python",
+    "transport": "stdio"
+   },
+   "server_name": null,
+   "skills": [],
+   "version": "1.0.0"
+  }
+ },
+ "outputs defaults": {
+  "parsed": {
+   "agent_env": {},
+   "category": "community",
+   "config": [],
+   "credentials": {},
+   "description": "Char tools.",
+   "env": {},
+   "exclude_from": [],
+   "label": "Char",
+   "manifest_path": "<tmp>/cases/outputs-defaults/manifest.json",
+   "mcp_dir": "<tmp>/cases/outputs-defaults",
+   "name": "char-mcp",
+   "outputs": [
+    {
+     "destination_template": "d",
+     "source": "s"
+    }
+   ],
+   "server": {
+    "args": [
+     "server.py"
+    ],
+    "command": "python3",
+    "runtime": "python",
+    "transport": "stdio"
+   },
+   "server_name": "char-mcp",
+   "skills": [],
+   "version": "1.0.0"
+  }
+ },
+ "server not an object": {
+  "raised": "AttributeError",
+  "text": "'str' object has no attribute 'get'"
+ }
+}

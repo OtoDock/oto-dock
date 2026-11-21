@@ -1,0 +1,196 @@
+[
+ {
+  "hold": 0.0,
+  "step": "no agents tracked",
+  "trace": [],
+  "walks_left": []
+ },
+ {
+  "hold": 30.0,
+  "step": "an admin-paired machine",
+  "trace": [
+   [
+    "sleep",
+    3.5
+   ],
+   [
+    "merge",
+    "m-admin",
+    "agent-1",
+    {
+     "background": true,
+     "target_role": "admin",
+     "target_username": null
+    }
+   ],
+   [
+    "merge",
+    "m-admin",
+    "agent-2",
+    {
+     "background": true,
+     "target_role": "admin",
+     "target_username": null
+    }
+   ]
+  ],
+  "walks_left": []
+ },
+ {
+  "hold": 30.0,
+  "step": "the next walk waits out the window",
+  "trace": [
+   [
+    "sleep",
+    20.0
+   ],
+   [
+    "merge",
+    "m-admin",
+    "agent-1",
+    {
+     "background": true,
+     "target_role": "admin",
+     "target_username": null
+    }
+   ],
+   [
+    "merge",
+    "m-admin",
+    "agent-2",
+    {
+     "background": true,
+     "target_role": "admin",
+     "target_username": null
+    }
+   ]
+  ],
+  "walks_left": []
+ },
+ {
+  "hold": 30.0,
+  "step": "a user-paired machine as its owner",
+  "trace": [
+   [
+    "sleep",
+    3.5
+   ],
+   [
+    "merge",
+    "m-user",
+    "agent-1",
+    {
+     "background": true,
+     "target_role": "editor",
+     "target_username": "vic"
+    }
+   ],
+   [
+    "merge",
+    "m-user",
+    "agent-3",
+    {
+     "background": true,
+     "target_role": "",
+     "target_username": "vic"
+    }
+   ]
+  ],
+  "walks_left": []
+ },
+ {
+  "hold": 30.0,
+  "step": "a machine gone from the store merges nothing, and completes",
+  "trace": [
+   [
+    "sleep",
+    3.5
+   ]
+  ],
+  "walks_left": []
+ },
+ {
+  "hold": 0.0,
+  "step": "a drop cuts the pass short: no window restarts",
+  "trace": [
+   [
+    "sleep",
+    3.5
+   ]
+  ],
+  "walks_left": []
+ },
+ {
+  "hold": 30.0,
+  "step": "a kick during a pass earns one more",
+  "trace": [
+   [
+    "sleep",
+    3.5
+   ],
+   [
+    "merge",
+    "m-user",
+    "agent-1",
+    {
+     "background": true,
+     "target_role": "editor",
+     "target_username": "vic"
+    }
+   ],
+   [
+    "kick",
+    "m-user"
+   ],
+   [
+    "merge",
+    "m-user",
+    "agent-3",
+    {
+     "background": true,
+     "target_role": "",
+     "target_username": "vic"
+    }
+   ],
+   [
+    "sleep",
+    30.0
+   ],
+   [
+    "merge",
+    "m-user",
+    "agent-1",
+    {
+     "background": true,
+     "target_role": "editor",
+     "target_username": "vic"
+    }
+   ],
+   [
+    "merge",
+    "m-user",
+    "agent-3",
+    {
+     "background": true,
+     "target_role": "",
+     "target_username": "vic"
+    }
+   ]
+  ],
+  "walks_left": []
+ },
+ {
+  "step": "presync at the enable click",
+  "trace": [
+   [
+    "merge",
+    "m-user",
+    "agent-1",
+    {
+     "target_role": "editor",
+     "target_username": "vic"
+    }
+   ]
+  ]
+ }
+]

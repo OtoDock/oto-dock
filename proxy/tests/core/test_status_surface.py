@@ -81,7 +81,7 @@ MACHINES: tuple[Machine, ...] = (
             frozenset({"streaming", "warming", "finished", "generating", "awaiting_user"}),
             frozenset({"ready", "idle"}),
             ("proxy/ws/chat_phase.py", "proxy/services/delegation/lane_status.py"),
-            ("proxy/ws/", "proxy/core/events/stream_pump.py", "proxy/core/session/interactive_session.py",
+            ("proxy/ws/", "proxy/core/events/stream_pump.py", "proxy/core/session/interactive_",
              "proxy/api/agents/chats.py", "proxy/services/notifications/", "proxy/services/apps/catalog.py",
              "proxy/core/session/sibling_awareness.py"),
             ("dashboard/src/lib/status/chat.ts",),

@@ -7,10 +7,25 @@ import { appKind, type AppKindName } from '../lib/kinds/app'
 import type { DeployState } from '../lib/status/appDeploy'
 import type { AppServerState } from '../lib/status/appServer'
 import { isRecord } from '../lib/json/guards'
+import { pacedWaitMs, sendPaced } from '../lib/sendPaced'
 import { withMessage, apiJson, apiOk, apiResponse, raiseApiError } from '../lib/http/apiJson'
 
+/** One page-filled property: a plain value, a file the page names (`file`),
+ *  or the one list of named operations a tool button may send. */
+export interface AppArgProp {
+  type?: string
+  description?: string
+  enum?: unknown[]
+  file?: 'read' | 'write'
+  /** An operation's name in a list (its `op`). */
+  const?: string
+  maxItems?: number
+  /** A list's operations: each names its `op` and its other fields, one of which may name a file. */
+  items?: { oneOf?: { properties?: Record<string, AppArgProp> }[] }
+}
+
 export interface AppArgsSchema {
-  properties?: Record<string, { type?: string; description?: string; enum?: unknown[] }>
+  properties?: Record<string, AppArgProp>
   required?: string[]
 }
 
@@ -36,6 +51,16 @@ export interface AppAction {
   min_role?: ActionFloor
   /** fire_task only: the checks (by name) the press attaches to the run (CHECKS.md). */
   checks?: string[]
+  /** send_prompt only: the button always starts a new chat with the agent. */
+  new_chat?: boolean
+}
+
+/** A prompt button's press, as the frame hands it to the page that delivers it. */
+export interface AppPromptAction {
+  id: string
+  label: string
+  prompt: string
+  new_chat?: boolean
 }
 
 /** The manifest's other blocks (APPS.md "Handlers", "Bindings") as the
@@ -160,6 +185,8 @@ export interface PinnedApp {
   /** idle | pending (a release waiting for approval) — lib/status/appDeploy.ts. */
   deploy_state?: DeployState
   pending_release?: number
+  /** The release that waits has a server entry (the approval card judges it, not the live one). */
+  pending_has_server?: boolean
   /** A deploy is running right now (the row lock is held). */
   deploying?: boolean
   /** The server's state (lib/status/appServer.ts; the supervisor's words). */
@@ -172,6 +199,10 @@ export interface PinnedApp {
   handlers?: AppHandlers
   exports?: AppExports
   bindings?: AppBinding[]
+  /** The names of the bindings read inside the app's own department (the
+   * member of its department installed from the template the binding
+   * names), beside the declaration, never inside it. */
+  bindings_follow?: string[]
   requires?: AppRequires
   requires_status?: AppRequiresStatus
   /** The server's "nothing to approve": no actions and no block. Absent on
@@ -257,6 +288,12 @@ export interface DeployStatus {
    * off: a deploy never lowers it, the person's approval of that release
    * does. Absent on an older proxy. */
   lowers_approval?: boolean
+  /** The pending release has a server and the live one has none, so it
+   * waits for a person whatever else changed. Absent on an older proxy. */
+  adds_server?: boolean
+  /** The waiting copy's tree hash: the card's click sends it back, so a copy
+   * that took the same number since is refused. Absent on an older proxy. */
+  pending_sha?: string
 }
 
 export const useDeployStatus = (appId: string | undefined, enabled = true) =>
@@ -275,15 +312,17 @@ export interface DeployDecision {
   appId: string
   release?: number
   sig?: string
+  /** The waiting copy's tree hash the card showed (`pending_sha`). */
+  sha?: string
 }
 
 const useDeployDecision = (agent: string, verb: 'approve' | 'reject') => {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async ({ appId, release, sig }: DeployDecision) => {
+    mutationFn: async ({ appId, release, sig, sha }: DeployDecision) => {
       await apiOk(`/v1/apps/${appId}/deploy/${verb}`, {
         method: 'POST',
-        ...(verb === 'approve' ? { body: JSON.stringify({ release, sig }) } : {}),
+        ...(verb === 'approve' ? { body: JSON.stringify({ release, sig, sha }) } : {}),
       }, `${verb} failed`)
     },
     onSettled: () => {
@@ -394,7 +433,7 @@ export const useChatPins = (chatId: string | undefined) =>
 
 /** One app row for the full-screen page — the list shape plus its agent and
  * (chat-scoped pins) its chat. Denied is the same 404 as missing. */
-export const useApp = (appId: string | undefined) =>
+export const useApp = (appId: string | undefined, { enabled = true }: { enabled?: boolean } = {}) =>
   useQuery({
     queryKey: ['app', appId],
     queryFn: async (): Promise<(PinnedApp & { agent: string; chat_id: string }) | null> => {
@@ -403,7 +442,7 @@ export const useApp = (appId: string | undefined) =>
       if (!res.ok) await raiseApiError(res, 'Could not load the app')
       return res.json()
     },
-    enabled: !!appId,
+    enabled: !!appId && enabled,
     staleTime: 30_000,
   })
 
@@ -518,14 +557,20 @@ export async function fetchCatalogFeed(appId: string, feed: string): Promise<Cat
   return apiJson<CatalogSnapshot>(`/v1/apps/${appId}/catalog/${encodeURIComponent(feed)}`, {}, `feed ${feed} unavailable`)
 }
 
-/** One platform method call as the viewer; the server judges the declared
- * entry, its floor and the args. */
+/** One platform method as the viewer; the server judges the declared
+ * entry, its floor and the args. A paced call is sent once more
+ * (`sendPaced`); a second refusal goes back with the wait in it. */
 export async function callPlatformMethod(
   appId: string, method: string, args: unknown,
-): Promise<{ ok: boolean; result?: unknown; reason?: string }> {
-  const res = await apiFetch(`/v1/apps/${appId}/catalog/${encodeURIComponent(method)}`, {
+): Promise<{ ok: boolean; result?: unknown; reason?: string; retry_after_ms?: number }> {
+  const send = () => apiFetch(`/v1/apps/${appId}/catalog/${encodeURIComponent(method)}`, {
     method: 'POST', body: JSON.stringify({ args: args ?? null }),
   })
+  const res = await sendPaced(send, async (r) => (r.status === 429 ? (await pacedWaitMs(r.clone())).wait : 0))
+  if (res.status === 429) {
+    const { wait, detail } = await pacedWaitMs(res)
+    return { ok: false, reason: detail, retry_after_ms: wait }
+  }
   if (!res.ok) {
     return { ok: false, reason: (await res.json().catch(() => null))?.detail || 'unavailable' }
   }
@@ -549,7 +594,7 @@ export function rollbackNoticeText(app: PinnedApp, left: number, r: RollbackResu
   const head = `Release ${r.release} serves again.`
   if (!appKind(app).keepsData || r.db_restored === undefined) return head
   if (r.db_restored) {
-    return `${head} The database was restored from before release ${left} went live. The newer writes are kept in a snapshot beside the releases.`
+    return `${head} Its data went back to before release ${left}. The newer data is kept as a backup.`
   }
   return `${head} No copy from before release ${left} exists, so the app keeps its current data.`
 }
@@ -636,6 +681,11 @@ export interface AppActionResult {
   reason?: string
   result?: string
   run_id?: string
+  /** A refusal's HTTP status. */
+  code?: number
+  /** A call the platform paced and a host may send again: how long until
+   *  it would pass (a task pressed twice inside its own gap names none). */
+  retry_after_ms?: number
 }
 
 /** A streamed batch line: one call's result, keyed by its id. */
@@ -656,19 +706,20 @@ export interface AppActionCall {
  * `error`), refusals `denied` with a reason. Every call gets exactly one
  * result: a whole-batch refusal or a transport failure resolves the
  * remaining calls `denied` here. Args pass the server's user-approved
- * schema gate — never trusted client-side. */
+ * schema gate — never trusted client-side. Answers the wait the platform
+ * named when it refused the batch whole for its pace, else 0. */
 export async function fireAppActions(
   appId: string,
   calls: AppActionCall[],
   onResult: (callId: string, r: AppActionResult) => void,
-): Promise<void> {
+): Promise<number> {
   const pending = new Set(calls.map((c) => c.call_id))
   const settle = (callId: string, r: AppActionResult) => {
     if (!pending.delete(callId)) return
     onResult(callId, r.status === 'ok' ? { ...r, status: 'sent' } : r)
   }
-  const failRest = (reason: string) => {
-    for (const id of [...pending]) settle(id, { status: 'denied', reason })
+  const failRest = (reason: string, paced?: Partial<AppActionResult>) => {
+    for (const id of [...pending]) settle(id, { status: 'denied', reason, ...paced })
   }
   const takeLine = (line: string) => {
     if (!line.trim()) return
@@ -681,9 +732,18 @@ export async function fireAppActions(
       method: 'POST',
       body: JSON.stringify({ calls }),
     })
+    if (res.status === 429) {
+      // One batch a second for a person on an app, whatever its buttons: the
+      // host spaces its batches by that second when it sends them, and the
+      // network can bring two closer by the time they arrive.
+      const { wait, detail } = await pacedWaitMs(res)
+      failRest(detail, { code: 429, retry_after_ms: wait })
+      return wait
+    }
     if (!res.ok) {
       const detail = (await res.json().catch(() => null))?.detail || `HTTP ${res.status}`
-      return failRest(String(detail))
+      failRest(String(detail))
+      return 0
     }
     if (res.body && typeof res.body.getReader === 'function') {
       const reader = res.body.getReader()
@@ -708,6 +768,7 @@ export async function fireAppActions(
   } catch {
     failRest('Network error. The call may not have reached the server.')
   }
+  return 0
 }
 
 /** Ask the platform to keep this app's tool manager warm (fire and forget;

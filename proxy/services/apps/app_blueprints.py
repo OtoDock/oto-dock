@@ -28,9 +28,11 @@ from pathlib import Path
 
 import config
 from core import layout
+from core.permission_modes import AUTO_REVIEW_MODE, stored_mode
 from core.session.session_state import get_user_tz
 from services.apps import app_deploy, releases
-from services.infra import path_confinement, safe_fs
+from services.infra import archive_read, path_confinement, safe_fs
+from services.scheduler import task_fields
 from storage import database as task_store
 
 logger = logging.getLogger("otodock.apps")
@@ -62,8 +64,16 @@ def _task_items(actions: list[dict]) -> tuple[list[dict], list[dict]]:
             dyn = task_store.get_dynamic_task(str(a.get("task_id") or ""))
             if not dyn:
                 raise BlueprintError(f"button {a.get('id')!r}: its task is gone — fix the app first")
-            items.append({"slug": a["id"], "description": dyn.get("name") or a["id"],
-                          "prompt": dyn.get("prompt") or ""})
+            item = {"slug": a["id"], "description": dyn.get("name") or a["id"],
+                    "prompt": dyn.get("prompt") or ""}
+            # A person's task may sit past the bounds a bundle's import
+            # holds: such a value stays home, the task keeps its own.
+            if dyn.get("permission_mode") == AUTO_REVIEW_MODE:
+                item["permission_mode"] = AUTO_REVIEW_MODE
+            timeout = dyn.get("timeout_seconds")
+            if timeout != task_fields.DEFAULT_TIMEOUT_S and task_fields.clean_timeout(timeout) == timeout:
+                item["timeout_seconds"] = timeout
+            items.append(item)
             a.pop("task_id", None)
             a["task"] = a["id"]
         a.pop("task_name", None)
@@ -240,11 +250,9 @@ def read_bundle(data: bytes) -> tuple[Path, dict]:
     count = 0
     entries = 0
     try:
-        try:
-            tar = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
-        except (tarfile.TarError, OSError, EOFError) as e:
-            raise BlueprintError(f"not a .otoapp archive: {e}") from e
-        with tar:
+        # At most the release's bytes and 4 MB of tar headers is ever
+        # unpacked: no member or header is larger than that.
+        with archive_read.open_tar_gz(data, max_unpacked=releases.MAX_RELEASE_BYTES + 4 * 1024 * 1024) as tar:
             # Member by member, every entry counted (folders too): the whole
             # index up front was gigabytes for a small archive of empty
             # entries before any cap applied.
@@ -284,6 +292,14 @@ def read_bundle(data: bytes) -> tuple[Path, dict]:
                     safe_fs.atomic_write_beneath(str(tmp), rel, content, mkdirs=True, fsync=False)
                 except OSError as exc:
                     raise BlueprintError(f"{rel} could not be unpacked from the bundle") from exc
+    except archive_read.ArchiveTooLarge as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise BlueprintError("the bundle exceeds 32 MB or 500 files") from exc
+    except tarfile.TarError as exc:
+        # Also while the members are read: a cut member is the bundle's
+        # refusal, never a 500.
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise BlueprintError(f"not a .otoapp archive: {exc}") from exc
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -310,20 +326,31 @@ def _seed_task(item: dict, agent: str, created_by: str, scope: str, app_slug: st
     prompt = str(item.get("prompt") or "").strip()
     if not prompt or len(prompt) > 8000:
         raise BlueprintError(f"bundle task {slug!r}: a prompt of 1 to 8000 characters is required")
+    mode = stored_mode(item.get("permission_mode"))
+    if mode is None:
+        raise BlueprintError(f"bundle task {slug!r}: permission_mode must be dontAsk or autoReview")
+    timeout = task_fields.clean_timeout(item.get("timeout_seconds"))
+    if timeout is None:
+        raise BlueprintError(f"bundle task {slug!r}: timeout_seconds must be a whole number from "
+                             f"{task_fields.MIN_TIMEOUT_S} to {task_fields.MAX_TIMEOUT_S}")
     item_slug = f"{app_slug}__{slug}"
     task_id = f"task-app-{app_slug}-{slug}-{agent}-{created_by or 'agent'}"[:120]
     # A shared app's task follows the platform clock (NULL; its created_by
     # is the agent slug, never a person); a personal one takes the owner's
     # zone when their dashboard reported it.
     user_tz = get_user_tz(created_by) if scope == "user" else None
+    if task_fields.mode_problem(agent, None, mode):
+        logger.info("Bundle task %s of %s seeded on Don't Ask: the engine has no Auto", slug, app_slug)
+        mode = ""
     from services.scheduler import task_kinds
     try:
         task_store.create_dynamic_task(
             task_id=task_id, agent=agent, name=str(item.get("description") or slug)[:200],
             prompt=prompt, llm_mode="cli", task_type=task_kinds.TRIGGER, schedule=None, run_at=None,
-            delay_seconds=None, timeout_seconds=600, created_by=created_by, scope=scope,
+            delay_seconds=None, timeout_seconds=timeout, created_by=created_by, scope=scope,
             notification_mode="manual", notify_severity="info", user_tz=user_tz,
             community_template=template_slug, community_template_item_slug=item_slug,
+            permission_mode=mode,
         )
         return task_id
     except psycopg.errors.UniqueViolation as exc:
@@ -420,7 +447,8 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
                         origin: tuple[str, str] | None = None,
                         follows: dict | None = None,
                         voids_approval: bool = True, replace: bool = True,
-                        hold: bool = False, keep_tasks: dict[str, str] | None = None) -> dict:
+                        hold: bool = False, keep_tasks: dict[str, str] | None = None,
+                        consent_tree: str = "", consent_server: bool = False) -> dict:
     """Write ``source_dir`` as the scope's ``apps/<slug>/`` with its buttons
     pointing at freshly seeded tasks, void any approval the slug had, and
     run the deploy pipeline — release 1 lands pending unless the manifest
@@ -439,7 +467,11 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
     id: a button the folder already binds keeps its task and the bundle's
     item for it is not seeded). ``follows`` (``clean_source``) is written on
     the row after the deploy when the row is another than the source and
-    the source row exists on this install."""
+    the source row exists on this install. ``consent_tree`` and
+    ``consent_server`` (``template_app_seeder.consent_reach``) go to the
+    deploy with ``approve_as``: the consent covers a server only on a cut of
+    that tree, and on a copy that runs a release only when its dialog showed
+    the server."""
     from services.infra import file_bookkeeping
     shared = not username
     keep = dict(keep_tasks or {})
@@ -542,7 +574,8 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
         await asyncio_to_thread(task_store.clear_app_approval, existing["id"])
     out = await app_deploy.deploy_folder(agent, username, owner_sub, slug, root, rel_dir,
                                          cold=cold, approve_as=approve_as,
-                                         template_ref=template_ref, origin=origin, hold=hold)
+                                         template_ref=template_ref, origin=origin, hold=hold,
+                                         consent_tree=consent_tree, consent_server=consent_server)
     out["tasks"] = task_ids
     if follows and out.get("app_id") and str(out.get("status") or "") not in (
             app_deploy.RESULT_REFUSED, app_deploy.RESULT_REJECTED):
@@ -553,7 +586,8 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
     if trigger_items and out.get("app_id") and str(out.get("status") or "") not in (
             app_deploy.RESULT_REFUSED, app_deploy.RESULT_REJECTED):
         # After the row exists (the trigger aims at it); a pending copy's
-        # trigger waits with it — the drain holds its wakes as "unapproved".
+        # trigger waits with it: the drain holds its wakes while its manifest
+        # or the server it brings waits for a person.
         out["triggers"] = await asyncio_to_thread(
             _seed_triggers, trigger_items, agent, created_by, scope, slug, template_slug,
             str(out["app_id"]), doc)

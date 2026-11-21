@@ -105,9 +105,9 @@ if [ -f "$_root/docker-compose.phone.yml" ] && [ "${OTODOCK_PHONE:-1}" != "0" ];
 fi
 
 # --- Ubuntu 24.04+ unprivileged-userns restriction --------------------------
-# When kernel.apparmor_restrict_unprivileged_userns=1 the proxy container
+# When kernel.apparmor_restrict_unprivileged_userns=1 the compute container
 # (unprivileged + apparmor=unconfined) cannot create the user namespaces the
-# agent sandbox is built on — the proxy hard-fails its boot preflight. The fix
+# agent sandbox is built on, so it runs no session and says why. The fix
 # is the SCOPED `otodock_userns` AppArmor profile (grants userns to this
 # workload only; the system-wide restriction stays on). Select it when the
 # host has it; install it (one-time, sudo — same trust level dev-setup.sh
@@ -123,7 +123,7 @@ if [ -z "${OTODOCK_APPARMOR_PROFILE:-}" ] \
     else
         echo "compose.sh: this host restricts unprivileged user namespaces"
         echo "  (kernel.apparmor_restrict_unprivileged_userns=1 — the Ubuntu 24.04+ default),"
-        echo "  which blocks the agent sandbox inside the proxy container."
+        echo "  which blocks the agent sandbox inside the compute container."
         echo "  Installing the scoped AppArmor profile 'otodock_userns' (one-time; the"
         echo "  system-wide hardening stays ON — this may prompt for your sudo password):"
         _sudo=(sudo)

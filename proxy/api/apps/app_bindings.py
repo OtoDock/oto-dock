@@ -55,7 +55,13 @@ from api.apps.app_proxy import (
 )
 from auth import roles
 from auth.providers import effective_role_of
-from services.apps import app_supervisor, app_tokens, manifest as _mf, releases
+from services.apps import (
+    app_supervisor,
+    app_tokens,
+    binding_target,
+    manifest as _mf,
+    releases,
+)
 from services.apps.app_supervisor import forward
 from storage import database as task_store, db_app_deliveries as deliveries
 from storage.pg import run_db
@@ -86,17 +92,6 @@ def _binding_of(row: dict, name: str) -> dict | None:
         if b.get("name") == name:
             return b
     return None
-
-
-def _target_of(binding: dict) -> dict | None:
-    """The shared folder row a binding names (personal apps are never
-    targets)."""
-    row = task_store.get_app_by_slug(binding.get("agent") or "", "", binding.get("app") or "")
-    if not row or row.get("hidden") or not task_store.app_kind_of(row).may_serve:
-        return None
-    if row.get("scope_chat_id") or row.get("scope_project_id"):
-        return None
-    return row
 
 
 def edge_ok(caller: dict, target: dict) -> bool:
@@ -158,6 +153,9 @@ async def _caller_context(request: Request, row: dict) -> tuple[dict, dict | Non
         viewer = app_tokens.verify(forwarded, row["id"], app_tokens.PURPOSE_VIEWER)
         if viewer is None:
             platform = app_tokens.verify(forwarded, row["id"], app_tokens.PURPOSE_CALLER)
+            if (platform or {}).get("external"):
+                # An outside person's call is never brokered on.
+                raise _refuse(403, "not available to outside people")
             if (platform or {}).get("placement"):
                 # A placed agent's session reaches the app's exports alone;
                 # its claim is never brokered on (APPS.md "Agents call apps").
@@ -205,6 +203,12 @@ def _claim_for_target(caller: dict, target: dict, viewer: dict, parent: dict | N
         # rule ``_agent_caller`` and ``edge_ok`` apply on their side).
         rows = task_store.get_user_agent_roles(sub) if sub else {}
         role = roles.row_role(rows, target.get("agent") or "") or CLAIM_ROLE_NONE
+        if (viewer.get("principal") == app_tokens.PRINCIPAL_AGENT and role != CLAIM_ROLE_NONE
+                and viewer.get("role") and target.get("agent") == viewer.get("agent")):
+            # On its own agent a session acts at most at its principal's role
+            # there, which its claim carries (``_agent_caller``,
+            # ``session_principal``).
+            role = roles.capped(role, str(viewer["role"]))
     else:
         role = role_on(sub, target.get("agent") or "")
     claims = {
@@ -291,7 +295,7 @@ async def read_snapshot(app_id: str, name: str, snap: str, request: Request):
     binding = _binding_of(row, name)
     if binding is None or not _NAME_RE.match(snap):
         raise _refuse(404, "not available")
-    target = await run_db(lambda: gate(row, _target_of(binding)))
+    target = await run_db(lambda: gate(row, binding_target.target_of(row, binding)))
     entry = (_mf.parse_exports(target).get("snapshots") or {}).get(snap)
     if entry is None:
         raise _refuse(404, "not available")
@@ -299,7 +303,7 @@ async def read_snapshot(app_id: str, name: str, snap: str, request: Request):
         raise _refuse(429, "too many calls to this app")
     _claim, role = await asyncio.to_thread(_claim_for_target, row, target, viewer, parent)
     if not floor_ok(entry, role):
-        raise _refuse(403, f"this snapshot needs the {entry.get('min_role')} role on {target.get('agent')}")
+        raise _refuse(403, f"this snapshot needs the {entry.get('min_role')} role on the agent of the binding {name}")
     got = await asyncio.to_thread(_read_snapshot, target, snap)
     if got is None:
         raise _refuse(404, "no snapshot yet")
@@ -325,7 +329,7 @@ async def broker(app_id: str, name: str, path: str, request: Request):
     binding = _binding_of(row, name)
     if binding is None:
         raise _refuse(404, "not available")
-    target = await run_db(lambda: gate(row, _target_of(binding)))
+    target = await run_db(lambda: gate(row, binding_target.target_of(row, binding)))
     raw = request.scope.get("raw_path") or b""
     raw_s = raw.decode("latin-1") if isinstance(raw, bytes) else str(raw)
     check_app_path(path, raw_s)
@@ -337,7 +341,7 @@ async def broker(app_id: str, name: str, path: str, request: Request):
     check_rate(target["id"], f"bind:{row['id']}")
     claim, role = await asyncio.to_thread(_claim_for_target, row, target, viewer, parent)
     if not floor_ok(entry, role):
-        raise _refuse(403, f"this call needs the {entry.get('min_role')} role on {target.get('agent')}")
+        raise _refuse(403, f"this call needs the {entry.get('min_role')} role on the agent of the binding {name}")
     if _inflight.get(row["id"], 0) >= BIND_INFLIGHT_MAX:
         raise _refuse(429, "too many calls in flight")
     try:
@@ -425,10 +429,10 @@ async def emit_event(app_id: str, request: Request):
         raise _refuse(403, "the preview copy cannot emit events")
     if not task_store.app_actions_approved(row):
         raise _refuse(409, "the app is waiting for approval")
-    # Subscribers find an emitter by (agent, slug) and a binding names only
-    # the shared row there (``_target_of``): a personal or Dock row of the
-    # same slug would speak in that app's name.
-    named = await run_db(_target_of, {"agent": row.get("agent") or "", "app": row.get("slug") or ""})
+    # Subscribers find an emitter by (agent, slug) and a binding reaches only
+    # the shared row there (``binding_target.shared_app_row``): a personal or Dock
+    # row of the same slug would speak in that app's name.
+    named = await run_db(binding_target.shared_app_row, row.get("agent") or "", row.get("slug") or "")
     if named is None or named["id"] != row["id"]:
         raise _refuse(403, "only a shared app emits events")
     body = await _read_body(request)
@@ -458,7 +462,9 @@ async def emit_event(app_id: str, request: Request):
         if not sub_row or sub_row.get("hidden"):
             continue
         try:
-            await run_db(lambda sub_row=sub_row: gate(sub_row, row))
+            # The subscriber's binding read again now: the index may predate
+            # a change of its department's members.
+            await run_db(lambda sub_row=sub_row, bname=bname: gate(sub_row, _reached_by(sub_row, bname, row)))
         except (HTTPException, psycopg.Error, ValueError):
             continue
         d = await app_handlers.enqueue(
@@ -471,6 +477,13 @@ async def emit_event(app_id: str, request: Request):
             delivered += 1
     return JSONResponse({"ok": True, "delivered": delivered, "event_id": event_id},
                         headers=dict(_CORS))
+
+
+def _reached_by(sub_row: dict, bname: str, emitter: dict) -> dict | None:
+    """The emitter, when the subscriber's binding ``bname`` reaches it now."""
+    binding = _binding_of(sub_row, bname)
+    reached = binding_target.target_of(sub_row, binding) if binding else None
+    return emitter if reached is not None and reached["id"] == emitter["id"] else None
 
 
 # ── describe ────────────────────────────────────────────────────────────────

@@ -49,6 +49,15 @@ class FakeManager:
         return self.conn
 
 
+@pytest.fixture(autouse=True)
+def _every_session_is_on_the_asking_machine(request, monkeypatch):
+    """The cases in this module are about other rules of the dispatcher: the
+    session a bearer names reads as held on the machine the frame came from.
+    The place rule itself has its own cases (``test_tunnel_session_place.py``)."""
+    from core.remote import satellite_http_tunnel as tun
+    monkeypatch.setattr(tun, "session_place", lambda manager, machine_id, sid: tun.HERE)
+
+
 # ===== Allowlist =====
 
 def test_allowlist_accepts_known_hook_paths():
@@ -76,6 +85,11 @@ def test_allowlist_accepts_known_hook_paths():
     assert _is_allowed_path("/v1/hooks/cli-credential") and _sat_allowed("/v1/hooks/cli-credential")
     assert not _is_allowed_path("/v1/hooks/cli-credentials")
     assert not _sat_allowed("/v1/hooks/cli-credential/x")
+    # The session's SSH agent socket a satellite forwards (0.5.173): the
+    # exact path on both lists, nothing beside it.
+    assert _is_allowed_path("/v1/hooks/ssh-agent") and _sat_allowed("/v1/hooks/ssh-agent")
+    assert not _is_allowed_path("/v1/hooks/ssh-agents")
+    assert not _sat_allowed("/v1/hooks/ssh-agent/x")
 
 
 def test_allowlist_accepts_the_checks_routes():
@@ -569,7 +583,7 @@ def test_resolve_mcp_path_falls_back_to_server_name():
     fake_manifest = MagicMock(server=fake_server, server_name="platform")
     with patch("services.mcp.mcp_registry.get_manifest", return_value=None), \
          patch.object(
-             __import__("services.mcp.mcp_registry", fromlist=["_manifests"]),
+             __import__("services.mcp.mcp_manifest_store", fromlist=["_manifests"]),
              "_manifests",
              {"camoufox": fake_manifest},
          ):
@@ -704,6 +718,13 @@ def test_allowlist_accepts_delegation_and_continuations():
     assert not _is_allowed_path("/v1/delegation/../admin")
 
 
+def test_allowlist_accepts_the_agents_reload_of_its_own_chat():
+    # agent-config-mcp's reload_session and switch_account post it from a
+    # machine: it sits under the agents prefix both lists already carry.
+    assert _is_allowed_path("/v1/agents/personal-assistant/reload-session")
+    assert not _is_allowed_path("/v1/agents/../admin/reload-session")
+
+
 def test_allowlist_accepts_the_agents_move_and_not_the_persons():
     # Twin of the satellite-side test (0.5.157): delegation-mcp's move_chat
     # posts the session-token route; the person's move stays the dashboard's.
@@ -753,7 +774,7 @@ async def test_mcp_and_hook_requests_go_to_their_own_clients(monkeypatch):
     disp._mcp_client, disp._hook_client = _fake("mcp"), _fake("hook")
     monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: f"http://u{p}")
     conn = FakeConnection()
-    for path in ("/mcp/file-tools/mcp?session_id=1", "/v1/hooks/permission"):
+    for path in ("/mcp/plain-tool/mcp?session_id=1", "/v1/hooks/permission"):
         await disp.handle_request_frame(FakeManager(conn), "m1", {
             "stream_id": str(uuid.uuid4()), "method": "POST", "path": path,
             "headers": {}, "body_b64": "", "body_eof": True, "timeout_s": 30,
@@ -762,7 +783,7 @@ async def test_mcp_and_hook_requests_go_to_their_own_clients(monkeypatch):
         if len(conn.sent) >= 2:
             break
         await asyncio.sleep(0.01)
-    assert sent == {"mcp": ["http://u/mcp/file-tools/mcp?session_id=1"],
+    assert sent == {"mcp": ["http://u/mcp/plain-tool/mcp?session_id=1"],
                     "hook": ["http://u/v1/hooks/permission"]}
 
 
@@ -844,7 +865,7 @@ async def test_hooks_do_not_wait_behind_held_mcp_streams(monkeypatch):
     try:
         for i in range(2):
             await disp.handle_request_frame(mgr, "m1", {
-                "stream_id": f"get-{i}", "method": "GET", "path": "/mcp/file-tools/mcp/",
+                "stream_id": f"get-{i}", "method": "GET", "path": "/mcp/plain-tool/mcp/",
                 "headers": {"Accept": "text/event-stream"}, "body_b64": "",
                 "body_eof": True, "timeout_s": 604800,
             })
@@ -1041,8 +1062,7 @@ async def _first_frame(conn, stream_id: str) -> dict:
 async def test_a_credentialed_sidecar_request_is_forwarded_through_the_gateway(monkeypatch):
     """A tunneled ``/mcp/<name>/`` request of a session that holds a gateway
     credential for that sidecar reaches it with the credential added and the
-    session token kept on the platform; one without a credential takes the
-    direct hop as before."""
+    session token kept on the platform."""
     import base64
     import uuid
 
@@ -1082,20 +1102,174 @@ async def test_a_credentialed_sidecar_request_is_forwarded_through_the_gateway(m
         assert "Authorization: Bearer ghp_real" in head
         assert token not in head and "forged" not in head and f"session_id={sid}" in head
         assert head.startswith("POST /mcp?")
-        # the direct hop for a sidecar the session holds no credential for
-        await disp.handle_request_frame(mgr, "m1", {
-            "stream_id": "ft", "method": "POST", "path": "/mcp/file-tools/mcp/?session_id=x",
-            "headers": {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            "body_b64": body, "body_eof": True, "timeout_s": 30,
-        })
-        first = await _first_frame(conn, "ft")
-        assert first["status"] == 200
-        assert f"Authorization: Bearer {token}" in up.heads[-1].decode()
     finally:
         mcp_broker.purge_session(sid)
         mcp_gateway.forget_memos()
         await disp.shutdown()
         await up.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_docker_tool_is_reached_through_its_door_alone(monkeypatch):
+    """A paired computer's ``/mcp/<tool>/`` for a Docker tool never takes the
+    direct hop: a request with no session token is refused (``session-required``),
+    one whose session holds no entry for the tool is refused by the gateway,
+    and neither dials the tool."""
+    import base64
+    import uuid
+    from types import SimpleNamespace
+
+    from core.remote import satellite_http_tunnel as tun
+    from services.mcp import mcp_registry
+    from tests.conftest import live_session_token
+
+    up = _RecordingUpstream()
+    await up.start()
+    docker = SimpleNamespace(server=SimpleNamespace(runtime="docker"), credentials=None)
+    monkeypatch.setattr(mcp_registry, "get_manifest_by_config_key",
+                        lambda name: docker if name == "video-tools" else None)
+    monkeypatch.setattr(tun, "_resolve_upstream_url",
+                        lambda p: f"http://127.0.0.1:{up.port}{p.split('?', 1)[0]}")
+    monkeypatch.setattr("auth.token_holder.holder_ok", _ok)
+    sid = str(uuid.uuid4())
+    token = live_session_token(sid, "agent", "user-1")
+    disp = SatelliteHttpTunnelDispatcher()
+    conn = FakeConnection()
+    mgr = FakeManager(conn)
+    body = base64.b64encode(b'{"jsonrpc":"2.0","id":4,"method":"tools/list"}').decode()
+    try:
+        await disp.handle_request_frame(mgr, "m1", {
+            "stream_id": "bare", "method": "POST", "path": "/mcp/video-tools/mcp/",
+            "headers": {"Content-Type": "application/json"},
+            "body_b64": body, "body_eof": True, "timeout_s": 30,
+        })
+        first = await _first_frame(conn, "bare")
+        assert first["status"] == 401 and first["error"] == "session-required"
+        await disp.handle_request_frame(mgr, "m1", {
+            "stream_id": "none", "method": "POST", "path": "/mcp/video-tools/mcp/",
+            "headers": {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            "body_b64": body, "body_eof": True, "timeout_s": 30,
+        })
+        doc = json.loads(base64.b64decode((await _first_frame(conn, "none"))["body_b64"]))
+        assert doc["id"] == 4 and "error" in doc
+        assert up.heads == []
+    finally:
+        await disp.shutdown()
+        await up.stop()
+
+
+async def _whole_body(conn, stream_id: str) -> bytes:
+    """The decoded body of a stream's response frames, once its last came."""
+    for _ in range(500):
+        frames = [f for f in conn.sent if f.get("stream_id") == stream_id]
+        if any(f.get("body_eof") for f in frames):
+            return b"".join(base64.b64decode(f["body_b64"]) for f in frames if f.get("body_b64"))
+        await asyncio.sleep(0.01)
+    raise AssertionError("the stream did not end")
+
+
+@pytest.mark.asyncio
+async def test_a_docker_tools_answer_from_its_door_streams_through_the_tunnel(monkeypatch):
+    """A paired computer's call to a Docker tool is answered by the tool's door
+    through the tunnel: 200 and the event stream, the token's session alone at
+    the tool (never the query's), no credential at the tool, the use count
+    given back at the end and when the machine drops the call."""
+    import uuid
+    from types import SimpleNamespace
+
+    import httpx
+
+    from core.credentials import mcp_broker, mcp_gateway
+    from core.credentials.mcp_gateway import CONTAINER, GatewayCredential
+    from core.remote import satellite_http_tunnel as tun
+    from services.containers import door, state
+    from services.mcp import mcp_registry, tool_listing
+    from tests.conftest import live_session_token
+
+    sid = str(uuid.uuid4())
+    mcp_broker.provision(sid, {"dock-tools": mcp_broker.SecretBundle(gateway=GatewayCredential(
+        upstream="http://localhost:8936", path="/mcp/", allowlist_key="", header="", prefix="",
+        proxy_local=True, manifest="dock-tools", kind=CONTAINER))})
+    manifest = SimpleNamespace(name="dock-tools", label="Dock Tools", server_name="", mcp_dir=None,
+                               server=SimpleNamespace(runtime="docker", port=8936), credentials=None)
+    monkeypatch.setattr(mcp_registry, "get_manifest", lambda n: manifest if n == "dock-tools" else None)
+    monkeypatch.setattr(mcp_registry, "get_manifest_by_config_key",
+                        lambda n: manifest if n == "dock-tools" else None)
+    record = {"initialize": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}},
+              "lists": {"tools/list": [{"name": "render", "inputSchema": {}}]}}
+    monkeypatch.setattr(tool_listing, "container_fingerprint", lambda m, account="": "fp")
+    monkeypatch.setattr(tool_listing, "saved_platform", lambda key, fp: record)
+    monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: "http://127.0.0.1:1/never-dialled")
+    monkeypatch.setattr("auth.token_holder.holder_ok", _ok)
+    release = asyncio.Event()
+    seen: list[httpx.Request] = []
+
+    class _Hold(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b": progress\n\n"
+            await release.wait()
+
+    class _Once(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'event: message\ndata: {"jsonrpc":"2.0","id":9,"result":{"content":[]}}\n\n'
+
+    async def tool(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        msg = json.loads(request.content)
+        if msg.get("method") == "initialize":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+        if "id" not in msg:
+            return httpx.Response(202)
+        if msg["id"] == 10:
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_Hold())
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_Once())
+    plain = httpx.AsyncClient(transport=httpx.MockTransport(tool))
+    monkeypatch.setattr(mcp_gateway, "client", lambda *a, **k: plain)
+    token = live_session_token(sid, "agent", "user-1")
+    disp = SatelliteHttpTunnelDispatcher()
+    conn = FakeConnection()
+    mgr = FakeManager(conn)
+    door.reset_for_tests()
+
+    def call(stream: str, rid: int) -> dict:
+        body = json.dumps({"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {"name": "render"}})
+        return {"stream_id": stream, "method": "POST", "path": "/mcp/dock-tools/mcp/?session_id=forged",
+                "headers": {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                "body_b64": base64.b64encode(body.encode()).decode(), "body_eof": True, "timeout_s": 30}
+    try:
+        await disp.handle_request_frame(mgr, "m1", call("c1", 9))
+        first = await _first_frame(conn, "c1")
+        assert first["status"] == 200 and first.get("error") is None
+        assert first["headers"].get("content-type", first["headers"].get("Content-Type", "")).startswith(
+            "text/event-stream")
+        assert b'"id":9' in await _whole_body(conn, "c1")
+        assert seen and all(dict(q.url.params) == {"session_id": sid} for q in seen)
+        assert all("authorization" not in q.headers for q in seen)
+        for _ in range(100):
+            if state.of("dock-tools").in_flight == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert state.of("dock-tools").in_flight == 0
+        # The machine drops a call the tool still works on: the count comes back.
+        await disp.handle_request_frame(mgr, "m1", call("c2", 10))
+        await _first_frame(conn, "c2")
+        for _ in range(100):
+            if state.of("dock-tools").in_flight == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert state.of("dock-tools").in_flight == 1
+        assert disp.abort_stream("m1", "c2") is True
+        for _ in range(200):
+            if state.of("dock-tools").in_flight == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert state.of("dock-tools").in_flight == 0
+    finally:
+        release.set()
+        mcp_broker.purge_session(sid)
+        mcp_gateway.forget_memos()
+        await disp.shutdown()
+        door.reset_for_tests()
 
 
 @pytest.mark.asyncio
@@ -1291,8 +1465,29 @@ def test_the_two_tunnel_allowlists_are_the_same_list():
     proxy_patterns = [r.pattern for r in tun._ALLOWLIST_REGEXES]
     satellite_patterns = [r.pattern for r in sat._ALLOWLIST_REGEXES]
     assert proxy_patterns == satellite_patterns
-    assert "/v1/mcp-gateway" not in "".join(proxy_patterns)
+    # The credential gateway's path is on the list for a compute machine
+    # alone: ``handle_request_frame`` refuses it on every other link, where
+    # the machine serves the gateway itself (test_compute_tunnel_rows).
+    gateway = [p for p in proxy_patterns if "/v1/mcp-gateway" in p]
+    assert gateway == [r"^/v1/mcp-gateway/[A-Za-z0-9_-]+(/.*)?$"]
     assert r"^/v1/chats/agent-move$" in proxy_patterns
+
+
+def test_both_tunnels_pass_a_tool_stand_ins_two_routes():
+    """A tool's stand-in on a machine reads its saved answers and asks to
+    start through the machine's tunnel (0.5.176); a near name passes neither."""
+    import sys
+
+    from tests._paths import REPO_ROOT
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from core.remote import satellite_http_tunnel as tun
+    from satellite.transport import http_tunnel as sat
+    for allowed in (tun._is_allowed_path, sat._is_allowed_path):
+        assert allowed("/v1/hooks/tool-listing?fp=" + "a" * 64)
+        assert allowed("/v1/hooks/tool-start")
+        assert not allowed("/v1/hooks/tool-starts")
+        assert not allowed("/v1/hooks/tool-listing/x")
 
 
 @pytest.mark.asyncio
@@ -1322,7 +1517,7 @@ async def test_a_tunneled_mcp_request_of_a_closed_or_earlier_life_is_refused(mon
     async def _ask(token: str) -> dict:
         n = len(conn.sent)
         await disp.handle_request_frame(mgr, "m1", {
-            "stream_id": str(uuid.uuid4()), "method": "POST", "path": "/mcp/file-tools/mcp/",
+            "stream_id": str(uuid.uuid4()), "method": "POST", "path": "/mcp/plain-tool/mcp/",
             "headers": {"Authorization": f"Bearer {token}"}, "body_b64": "",
             "body_eof": True, "timeout_s": 30,
         })

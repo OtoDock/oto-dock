@@ -1,0 +1,101 @@
+{
+ "parse_replaces": {
+  "absent": {
+   "parsed": [],
+   "warnings": []
+  },
+  "empty": {
+   "parsed": [],
+   "warnings": []
+  },
+  "mixed": {
+   "parsed": [
+    {
+     "source": "npm:a"
+    },
+    {
+     "source": "npm:a"
+    },
+    {
+     "credentials": {
+      "O2": "N2",
+      "OLD": "NEW"
+     },
+     "source": "npm:a"
+    }
+   ],
+   "warnings": [
+    "char-mcp: replaces entry None must be an object; dropped",
+    "char-mcp: replaces entry 'x' must be an object; dropped",
+    "char-mcp: replaces entry [] must be an object; dropped",
+    "char-mcp: replaces entry {} needs a non-empty string source; dropped",
+    "char-mcp: replaces entry {'source': ' '} needs a non-empty string source; dropped",
+    "char-mcp: replaces entry {'source': 3} needs a non-empty string source; dropped",
+    "char-mcp: replaces entry {'source': 'npm:a', 'credentials': []} credentials must be an object of old key to new key; dropped",
+    "char-mcp: replaces entry {'source': 'npm:a', 'credentials': {'_OLD': 'NEW'}} credential key '_OLD' is not a plain identifier; dropped",
+    "char-mcp: replaces entry {'source': 'npm:a', 'credentials': {'OLD': '_NEW'}} credential key '_NEW' is not a plain identifier; dropped",
+    "char-mcp: replaces entry {'source': 'npm:a', 'credentials': {'OLD': 3}} credential key 3 is not a plain identifier; dropped"
+   ]
+  },
+  "not a list": {
+   "parsed": [],
+   "warnings": [
+    "char-mcp: replaces is not a list; dropped"
+   ]
+  }
+ },
+ "replaces_entry_error": [
+  [
+   "None",
+   "must be an object"
+  ],
+  [
+   "'x'",
+   "must be an object"
+  ],
+  [
+   "[]",
+   "must be an object"
+  ],
+  [
+   "{}",
+   "needs a non-empty string source"
+  ],
+  [
+   "{'source': ' '}",
+   "needs a non-empty string source"
+  ],
+  [
+   "{'source': 3}",
+   "needs a non-empty string source"
+  ],
+  [
+   "{'source': 'npm:a'}",
+   null
+  ],
+  [
+   "{'source': ' npm:a ', 'credentials': None}",
+   null
+  ],
+  [
+   "{'source': 'npm:a', 'credentials': []}",
+   "credentials must be an object of old key to new key"
+  ],
+  [
+   "{'source': 'npm:a', 'credentials': {'_OLD': 'NEW'}}",
+   "credential key '_OLD' is not a plain identifier"
+  ],
+  [
+   "{'source': 'npm:a', 'credentials': {'OLD': '_NEW'}}",
+   "credential key '_NEW' is not a plain identifier"
+  ],
+  [
+   "{'source': 'npm:a', 'credentials': {'OLD': 3}}",
+   "credential key 3 is not a plain identifier"
+  ],
+  [
+   "{'source': 'npm:a', 'credentials': {'OLD': 'NEW', 'O2': 'N2'}}",
+   null
+  ]
+ ]
+}

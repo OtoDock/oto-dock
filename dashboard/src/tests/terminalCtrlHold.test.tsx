@@ -64,4 +64,14 @@ describe('TerminalControlBar — Ctrl in the ⋯ popover', () => {
     expect(isCtrlHeld()).toBe(false)
     expect(screen.queryByText('Ctrl')).toBeNull()
   })
+
+  it('the popover spans its host, not the keys: the bar sets no position of its own', () => {
+    const { container } = render(<div className="relative"><TerminalControlBar send={() => {}} className="min-w-0" /></div>)
+    const bar = container.firstElementChild!.firstElementChild!
+    expect(bar.className).toBe('min-w-0')
+    fireEvent.click(screen.getByTitle('More keys'))
+    const panel = screen.getByText('More keys').closest('.absolute')!
+    expect(bar.contains(panel)).toBe(true)
+    expect(panel.className.split(' ')).toEqual(expect.arrayContaining(['bottom-full', 'left-0', 'right-0']))
+  })
 })

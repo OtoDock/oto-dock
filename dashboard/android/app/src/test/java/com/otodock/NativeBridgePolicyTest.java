@@ -313,6 +313,8 @@ public class NativeBridgePolicyTest {
     public void onlyAPlainHttpsAddressOpensTheBrowser() {
         assertEquals("https://auth.example.com/authorize?x=1",
                 NativeBridgePolicy.authBrowserUrl("https://auth.example.com/authorize?x=1"));
+        String signIn = "https://auth.example.com/application/o/authorize/?redirect_uri=otodock%3A%2F%2Fauth%2Fcallback&state=a%2Bb";
+        assertEquals("an escape the server wrote is kept, never escaped again", signIn, NativeBridgePolicy.authBrowserUrl(signIn));
         assertNull(NativeBridgePolicy.authBrowserUrl("http://auth.example.com/"));
         assertNull(NativeBridgePolicy.authBrowserUrl("https://user@auth.example.com/"));
         assertNull(NativeBridgePolicy.authBrowserUrl("https://auth.example.com\\@x.example/"));

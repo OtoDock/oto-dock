@@ -26,6 +26,8 @@ tokens of this module.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -65,18 +67,28 @@ TRUSTED_DEVICE = Kind("trusted_device", ("purpose", "trusted_device"))
 SHARE_UNLOCK = Kind("share_unlock", ("purpose", "share_unlock"))
 SHARE_APP_SESSION = Kind("share_app_session", ("purpose", "app_session"))
 ZIP_DOWNLOAD = Kind("zip_download", ("purpose", "zip_download"))
+PERSON_EXPORT = Kind("person_export", ("purpose", "person_export"))
 WOPI = Kind("wopi", ("purpose", "wopi"), secret="WOPI_SECRET")
 AUDIO_STT = Kind("audio_stt", ("purpose", "audio_stt"))
 AUDIO_TTS = Kind("audio_tts", ("purpose", "audio_tts"))
 DUPLEX = Kind("duplex", ("purpose", "duplex_session"))
 MCP_CREDENTIALS = Kind("mcp_credentials", ("type", "mcp_cred"))
-SESSION_FILES = Kind("session_files", ("type", "session_files"))
 RENDER = Kind("render", ("purpose", "app_render"))
+# The Docker tools' file callbacks (``server.proxy_callbacks``): good for the
+# five callback routes alone, on either listener.
+TOOL_CALLBACK = Kind("tool_callback", None)
+# A stdio tool's renewal of its account's access token (``mcp_broker.mint_renewal``):
+# good for that token's names alone, on the route that hands a tool its bundle.
+MCP_TOKEN = Kind("mcp_token", None)
+# The secret a machine's credential exit admits one session by
+# (``credential_exit._door_secret``): derived (``derive``), never minted, so a
+# session taken back after a restart is admitted again and nothing is stored.
+EXIT_DOOR = Kind("exit_door", None)
 
 KINDS: tuple[Kind, ...] = (
     SESSION, CLI, SIGN_IN, TWO_FACTOR, PASSWORD_RESET, INVITE, TRUSTED_DEVICE,
-    SHARE_UNLOCK, SHARE_APP_SESSION, ZIP_DOWNLOAD, WOPI, AUDIO_STT, AUDIO_TTS,
-    DUPLEX, MCP_CREDENTIALS, SESSION_FILES, RENDER,
+    SHARE_UNLOCK, SHARE_APP_SESSION, ZIP_DOWNLOAD, PERSON_EXPORT, WOPI, AUDIO_STT, AUDIO_TTS,
+    DUPLEX, MCP_CREDENTIALS, RENDER, TOOL_CALLBACK, MCP_TOKEN, EXIT_DOOR,
 )
 
 
@@ -106,6 +118,14 @@ def _key(kind: Kind) -> bytes:
         ).derive(secret.encode("utf-8"))
         _keys[cache_key] = key
     return key
+
+
+def derive(kind: Kind, subject: str) -> str:
+    """A value bound to ``subject`` under the kind's own key (HMAC-SHA256,
+    hex): the same in every process of this install, another for another
+    subject, kind or secret. For a secret a party presents again after a
+    restart, where a minted token would have to be stored."""
+    return hmac.new(_key(kind), subject.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def mint(kind: Kind, claims: dict[str, Any], *, ttl_s: int | None = None,

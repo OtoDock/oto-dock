@@ -28,7 +28,13 @@ export const SETTINGS_KINDS: ReadonlySet<string> = new Set(['agent_settings', 'u
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/
 const SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
-export type OpenTargetRoute = { kind: OpenTargetKind; path: string; label: string }
+export type OpenTargetRoute = {
+  kind: OpenTargetKind
+  path: string
+  label: string
+  /** A file target, checked: the host shows it over the app it came from. */
+  file?: { agent: string; path: string }
+}
 
 function str(v: unknown): string {
   return typeof v === 'string' ? v : ''
@@ -101,7 +107,10 @@ export function buildOpenTarget(
         return { error: 'invalid file path' }
       }
       const params = new URLSearchParams({ ws: '1', ws_preview: rel })
-      return { kind, path: `/chat/${targetAgent}?${params.toString()}`, label: 'a workspace file' }
+      return {
+        kind, path: `/chat/${targetAgent}?${params.toString()}`, label: 'a workspace file',
+        file: { agent: targetAgent, path: rel },
+      }
     }
   }
   return { error: 'unknown target kind' }

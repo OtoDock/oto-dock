@@ -1,11 +1,17 @@
-"""Unit tests for core/sandbox/sandbox.py — SandboxBuilder and helpers."""
+"""Unit tests for core/sandbox/sandbox.py — SandboxBuilder and helpers.
+
+The platform writes a session's sandbox description and starts no sandbox
+itself. Where a test reads the launcher and bwrap argv, it is that
+description rendered as a machine holding the same folders renders it
+(``_rendered``)."""
 
 import os
-import time
+from pathlib import Path
 
 import pytest
 
 from core.layers.cli.config_dir import ensure_persistent_claude_dir
+from core.sandbox import sandbox_render
 from core.sandbox.sandbox import (
     SandboxBuilder,
     SandboxConfig,
@@ -13,6 +19,10 @@ from core.sandbox.sandbox import (
     empty_mount_dir,
     resolve_sandbox_config,
 )
+from tests._paths import PROXY_DIR
+
+#: The launcher a machine runs ahead of bwrap (the satellite vendors this file).
+_LAUNCHER = PROXY_DIR / "scripts" / "oto-sandbox-net"
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -58,11 +68,40 @@ def _make_config(agents_dir, mcps_dir, role="manager", username="alice",
         host_claude_dir=claude_dir.resolve(),
         mcp_sandbox_mounts=mcp_mounts or [],
         mcp_dir_binds=mcp_dir_binds or [],
-        # Isolation is always on: a resolved session carries at least the proxy
-        # hook port, so build_command_prefix wraps + does not fail closed. The
-        # value is cosmetic for these mount-only tests.
+        # A resolved session carries at least the proxy hook port: the render
+        # refuses a description with no forward. The value is cosmetic for
+        # these mount-only tests.
         net_forwards=["8400"],
     )
+
+
+def _host(builder: SandboxBuilder, **overrides) -> sandbox_render.RenderHost:
+    """A machine that holds the same folders as the builder's configuration:
+    its agents and tools roots, the platform's empty mask folder, the
+    launcher, this process's uid and gid, the port the proxy port is spliced
+    onto (the internal listener when this process has one), the engine's
+    install binds, and absolute sources allowed (an app server's table). No
+    resolver swap and no ``/tmp`` cap unless the test names one."""
+    import config as app_config
+    values: dict = {
+        "agents_root": str(builder.cfg.host_agents_dir),
+        "mcps_root": str(builder.cfg.host_mcps_dir),
+        "empty_dir": str(empty_mount_dir()),
+        "launcher": str(_LAUNCHER),
+        "uid": os.getuid(),
+        "gid": os.getgid(),
+        "proxy_target_port": int(getattr(app_config, "INTERNAL_LISTENER_PORT", 0) or 0),
+        "extra_ro_binds": tuple(builder.cfg.extra_ro_binds),
+        "allow_abs": True,
+    }
+    values.update(overrides)
+    return sandbox_render.RenderHost(**values)
+
+
+def _rendered(builder: SandboxBuilder, inner: list[str], **host) -> list[str]:
+    """The launcher and bwrap command that machine runs ``inner`` in: the
+    session's description rendered with its values (``_host``)."""
+    return sandbox_render.render(builder.describe(), _host(builder, **host), inner)
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +126,7 @@ class TestSandboxBuilderViewer:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="viewer")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude", "-p"])
+        cmd = _rendered(sb, ["claude", "-p"])
         # Isolation is always on: the launcher wraps bwrap (argv[0] is the
         # launcher), bwrap appears after it, and the inner cmd is last.
         assert cmd[0].endswith("oto-sandbox-net")
@@ -100,7 +139,7 @@ class TestSandboxBuilderViewer:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="viewer")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         cmd_str = " ".join(cmd)
         # Viewer gets their user dir mounted (RW)
         assert "/users/alice" in cmd_str
@@ -121,7 +160,7 @@ class TestSandboxBuilderViewer:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="viewer")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         agent_dir = str(agents_dir / "personal-assistant")
         bind_pairs = list(zip(cmd, cmd[1:], strict=False))
         knowledge_ro = any(
@@ -139,7 +178,7 @@ class TestSandboxBuilderEditor:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="editor")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         agent_dir = str(agents_dir / "personal-assistant")
         bind_pairs = list(zip(cmd, cmd[1:], strict=False))
         ws_rw = any(
@@ -154,7 +193,7 @@ class TestSandboxBuilderEditor:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="editor")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         agent_dir = str(agents_dir / "personal-assistant")
         bind_pairs = list(zip(cmd, cmd[1:], strict=False))
         config_mounted = any(
@@ -168,7 +207,7 @@ class TestSandboxBuilderEditor:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="editor")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         agent_dir = str(agents_dir / "personal-assistant")
         bind_pairs = list(zip(cmd, cmd[1:], strict=False))
         knowledge_ro = any(
@@ -188,7 +227,7 @@ class TestSandboxBuilderEditor:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="editor")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         agent_dir = str(agents_dir / "personal-assistant")
         bind_pairs = list(zip(cmd, cmd[1:], strict=False))
         assert any(
@@ -213,7 +252,7 @@ class TestSandboxBuilderEditor:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="manager")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         agent_dir = str(agents_dir / "personal-assistant")
         root_idx = cmd.index(f"{agent_dir}/users/alice")
         ws_idx = cmd.index(f"{agent_dir}/users/alice/workspace")
@@ -231,7 +270,7 @@ class TestSandboxBuilderEditor:
         import subprocess
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="manager")
-        cmd = SandboxBuilder(cfg).build_command_prefix(["codex"])
+        cmd = _rendered(SandboxBuilder(cfg), ["codex"])
         user_dir = agents_dir / "personal-assistant" / "users" / "alice"
         for sub in (".git", ".agents", ".aws"):
             assert (user_dir / sub).is_dir(), f"{sub} mountpoint missing"
@@ -260,7 +299,7 @@ class TestSandboxBuilderManager:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="manager")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         cmd_str = " ".join(cmd)
         assert "/config" in cmd_str
         assert "/knowledge" in cmd_str
@@ -279,7 +318,7 @@ class TestSandboxBuilderManager:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="manager", username="alice")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         cmd_str = " ".join(cmd)
         assert "/users/bob" not in cmd_str
 
@@ -296,7 +335,7 @@ class TestSandboxBuilderAgentTask:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         cmd_str = " ".join(cmd)
         assert "/workspace" in cmd_str
         assert "/knowledge" in cmd_str
@@ -331,7 +370,7 @@ class TestSandboxBuilderAgentTask:
             ("manager", "alice", "/knowledge/.credentials"),
         ):
             cfg = _make_config(agents_dir, mcps_dir, role=role, username=username)
-            cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+            cmd = _rendered(SandboxBuilder(cfg), ["claude"])
             assert f"{agent_dir}/knowledge/.credentials" not in cmd, (role, username)
             bind_pairs = list(zip(cmd, cmd[1:], cmd[2:], strict=False))
             masks = [i for i, (a, b, c) in enumerate(bind_pairs)
@@ -348,11 +387,59 @@ class TestSandboxBuilderAgentTask:
         (user_dir / ".credentials" / "google-tokens").mkdir(parents=True)
         (user_dir / ".credentials" / "google-tokens" / "a@b.json").write_text("{}")
         cfg = _make_config(agents_dir, mcps_dir, role="editor", username="alice")
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        cmd = _rendered(SandboxBuilder(cfg), ["claude"])
         assert f"{user_dir}/.credentials" not in cmd
         joined = " ".join(cmd)
         assert f"--ro-bind {empty_mount_dir()} /users/alice/.credentials" in joined
         assert joined.index(f"{user_dir} /users/alice") < joined.index("/users/alice/.credentials")
+
+    def test_a_credentials_link_is_never_removed_through_a_swapped_parent(self, tmp_agents, tmp_path,
+                                                                         monkeypatch):
+        """The link at a credentials name is removed beneath the agent's
+        real folder: a parent swapped for a link after its check refuses
+        the build and removes nothing through the link."""
+        from core.sandbox import sandbox as sandbox_mod
+        agents_dir, mcps_dir = tmp_agents
+        user_dir = agents_dir / "personal-assistant" / "users" / "alice"
+        out = tmp_path / "outside"
+        out.mkdir()
+        (out / ".credentials").symlink_to(tmp_path / "anything")
+        real = sandbox_mod._verified_literal_path
+
+        def checked(root, *parts):
+            found = real(root, *parts)
+            if parts == ("users", "alice") and not user_dir.is_symlink():
+                user_dir.rename(user_dir.with_name("alice-moved"))
+                user_dir.symlink_to(out, target_is_directory=True)
+            return found
+        monkeypatch.setattr(sandbox_mod, "_verified_literal_path", checked)
+        cfg = _make_config(agents_dir, mcps_dir, role="editor", username="alice")
+        with pytest.raises(RuntimeError):
+            _rendered(SandboxBuilder(cfg), ["claude"])
+        assert (out / ".credentials").is_symlink()
+
+    def test_a_credentials_link_is_never_removed_through_a_parent_swapped_after_its_look(
+            self, tmp_agents, tmp_path, monkeypatch):
+        from services.infra import safe_fs
+        agents_dir, mcps_dir = tmp_agents
+        user_dir = agents_dir / "personal-assistant" / "users" / "alice"
+        (user_dir / ".credentials").symlink_to(tmp_path / "anything")
+        out = tmp_path / "outside"
+        out.mkdir()
+        (out / ".credentials").symlink_to(tmp_path / "anything")
+        real = safe_fs.lstat_beneath
+
+        def looked_then_swapped(root, rel):
+            st = real(root, rel)
+            if rel == "users/alice/.credentials" and not user_dir.is_symlink():
+                user_dir.rename(user_dir.with_name("alice-moved"))
+                user_dir.symlink_to(out, target_is_directory=True)
+            return st
+        monkeypatch.setattr(safe_fs, "lstat_beneath", looked_then_swapped)
+        cfg = _make_config(agents_dir, mcps_dir, role="editor", username="alice")
+        with pytest.raises(RuntimeError):
+            _rendered(SandboxBuilder(cfg), ["claude"])
+        assert (out / ".credentials").is_symlink()
 
     def test_no_credentials_bind_when_dir_absent(self, tmp_agents):
         """No .credentials dir on disk (no bound account) → no bind emitted;
@@ -360,7 +447,7 @@ class TestSandboxBuilderAgentTask:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         agent_dir = str(agents_dir / "personal-assistant")
         assert f"{agent_dir}/knowledge/.credentials" not in " ".join(cmd)
 
@@ -378,18 +465,30 @@ class TestSandboxBuilderAgentTask:
         (outside / "token.json").write_text("{}")
         os.symlink(outside, knowledge / ".credentials")
         cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        cmd = _rendered(SandboxBuilder(cfg), ["claude"])
         assert not (knowledge / ".credentials").is_symlink()
         assert not (knowledge / ".credentials").exists()
         assert str(outside) not in " ".join(cmd)
         assert (outside / "token.json").read_text() == "{}"
+
+    def test_a_plain_file_at_a_credentials_name_is_left(self, tmp_agents):
+        """Only a link at the name is removed: a plain file there stays,
+        and nothing is bound over it."""
+        agents_dir, mcps_dir = tmp_agents
+        knowledge = agents_dir / "personal-assistant" / "knowledge"
+        knowledge.mkdir(parents=True, exist_ok=True)
+        (knowledge / ".credentials").write_text("a plain file")
+        cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
+        cmd = _rendered(SandboxBuilder(cfg), ["claude"])
+        assert (knowledge / ".credentials").read_text() == "a plain file"
+        assert f"{knowledge}/.credentials" not in " ".join(cmd)
 
     def test_namespace_flags_isolate_ipc_and_uts(self, tmp_agents):
         """Every sandbox unshares IPC (else same-uid agents share a SysV/POSIX
         shm channel) and UTS."""
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        cmd = _rendered(SandboxBuilder(cfg), ["claude"])
         assert "--unshare-ipc" in cmd
         assert "--unshare-uts" in cmd
         assert "--unshare-pid" in cmd
@@ -401,7 +500,7 @@ class TestSandboxBuilderMCPs:
         agents_dir, mcps_dir = tmp_agents
         task_dir = str((mcps_dir / "custom" / "schedules-mcp").resolve())
         cfg = _make_config(agents_dir, mcps_dir, mcp_dir_binds=[task_dir])
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        cmd = _rendered(SandboxBuilder(cfg), ["claude"])
         assert task_dir in cmd  # exact arg → identity bind present
         # The OTHER (unassigned) MCP dir must not be bound.
         camoufox = str((mcps_dir / "community" / "camoufox").resolve())
@@ -414,7 +513,7 @@ class TestSandboxBuilderMCPs:
         task_dir = str((mcps_dir / "custom" / "schedules-mcp").resolve())
         for binds in ([], [task_dir]):
             cfg = _make_config(agents_dir, mcps_dir, mcp_dir_binds=binds)
-            cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+            cmd = _rendered(SandboxBuilder(cfg), ["claude"])
             # Exact-arg check: subdir binds contain the root as a PREFIX, so a
             # substring assert would false-positive.
             assert str(mcps_dir.resolve()) not in cmd
@@ -460,7 +559,7 @@ class TestSandboxBuilderMCPs:
         mounts = [SandboxMount(host=screenshots_dir, sandbox="/screenshots", mode="rw")]
         cfg = _make_config(agents_dir, mcps_dir, mcp_mounts=mounts)
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         cmd_str = " ".join(cmd)
         assert "/screenshots" in cmd_str
         assert screenshots_dir in cmd_str
@@ -481,7 +580,7 @@ class TestSandboxBuilderMCPs:
         ):
             mounts = [SandboxMount(host=str(evil), sandbox=dest, mode="ro")]
             cfg = _make_config(agents_dir, mcps_dir, mcp_mounts=mounts)
-            cmd_str = " ".join(SandboxBuilder(cfg).build_command_prefix(["claude"]))
+            cmd_str = " ".join(_rendered(SandboxBuilder(cfg), ["claude"]))
             # The malicious bind must be absent — assert via the unique evil host
             # path (the dest strings like /workspace also appear in legit mounts).
             assert str(evil) not in cmd_str, f"protected dest mounted: {dest}"
@@ -499,7 +598,7 @@ class TestSandboxBuilderMCPs:
         for host in (str(secret), str(other)):
             mounts = [SandboxMount(host=host, sandbox="/workspace/leak", mode="ro")]
             cfg = _make_config(agents_dir, mcps_dir, mcp_mounts=mounts)
-            cmd_str = " ".join(SandboxBuilder(cfg).build_command_prefix(["claude"]))
+            cmd_str = " ".join(_rendered(SandboxBuilder(cfg), ["claude"]))
             assert host not in cmd_str, f"out-of-tree host mounted: {host}"
 
 
@@ -508,7 +607,7 @@ class TestSandboxBuilderNamespaceFlags:
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir)
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
         assert "--unshare-pid" in cmd
         assert "--die-with-parent" in cmd
         assert "--share-net" in cmd
@@ -720,10 +819,13 @@ class TestDisallowedBuiltinsConstant:
         # switched off by name; 2.1.281 ignores the ids it does not know.
         assert settings["enabledPlugins"] == {p: False for p in DISABLED_BUILTIN_PLUGINS}
         # 2.1.312 adds the chart mod and the platform docs mod (an HTTP MCP
-        # server and a skill); 2.1.296 ignores ids it does not know.
+        # server and a skill); 2.1.296 ignores ids it does not know. 2.1.322
+        # loads the account-email check, which refuses shell commands on its
+        # own beside the platform's gate.
         for off in ("cc-plugin-plugin-authoring@builtin", "cc-plugin-you-should-know@builtin",
                     "cc-plugin-claude-test@builtin", "cc-plugin-mods-guide@builtin",
-                    "cc-plugin-easel@builtin", "cc-plugin-claude-platform@builtin"):
+                    "cc-plugin-easel@builtin", "cc-plugin-claude-platform@builtin",
+                    "cc-plugin-privacy@builtin"):
             assert off in DISABLED_BUILTIN_PLUGINS
         # The four the platform keeps on are never in the disable map.
         for keep in ("cc-plugin-agents-md", "cc-plugin-diff", "cc-plugin-telemetry", "cc-plugin-sec-default"):
@@ -779,24 +881,23 @@ class TestSystemROOptionalBinds:
     without snap (Docker, most servers)."""
 
     def test_snap_bin_in_optional_list(self):
-        from core.sandbox.sandbox import _SYSTEM_RO_OPTIONAL
+        from core.sandbox.sandbox_render import _SYSTEM_RO_OPTIONAL
         assert "/snap/bin" in _SYSTEM_RO_OPTIONAL
 
     def test_optional_bind_mounted_when_path_exists(self, tmp_agents, monkeypatch):
         """When a path in _SYSTEM_RO_OPTIONAL exists on the host, it
         appears in the bwrap argv as a --ro-bind."""
-        from core.sandbox import sandbox as sandbox_mod
         # Pretend /snap/bin exists on this host.
         real_exists = os.path.exists
         monkeypatch.setattr(
-            sandbox_mod.os.path, "exists",
+            sandbox_render.os.path, "exists",
             lambda p: True if p == "/snap/bin" else real_exists(p),
         )
 
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir)
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
 
         # --ro-bind /snap/bin /snap/bin should appear as a pair.
         joined = " ".join(cmd)
@@ -805,17 +906,16 @@ class TestSystemROOptionalBinds:
     def test_optional_bind_skipped_when_path_missing(self, tmp_agents, monkeypatch):
         """When the optional path does NOT exist on the host, it is
         absent from the bwrap argv — no error."""
-        from core.sandbox import sandbox as sandbox_mod
         real_exists = os.path.exists
         monkeypatch.setattr(
-            sandbox_mod.os.path, "exists",
+            sandbox_render.os.path, "exists",
             lambda p: False if p == "/snap/bin" else real_exists(p),
         )
 
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir)
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
 
         joined = " ".join(cmd)
         assert "/snap/bin" not in joined
@@ -833,49 +933,47 @@ class TestSystemROEtcGitconfig:
     when GH_TOKEN is set."""
 
     def test_etc_gitconfig_in_ro_files_list(self):
-        from core.sandbox.sandbox import _SYSTEM_RO_FILES
+        from core.sandbox.sandbox_render import _SYSTEM_RO_FILES
         assert "/etc/gitconfig" in _SYSTEM_RO_FILES
 
     def test_etc_gitconfig_mounted_when_present(self, tmp_agents, monkeypatch):
-        from core.sandbox import sandbox as sandbox_mod
         real_exists = os.path.exists
         real_isdir = os.path.isdir
         monkeypatch.setattr(
-            sandbox_mod.os.path, "exists",
+            sandbox_render.os.path, "exists",
             lambda p: True if p == "/etc/gitconfig" else real_exists(p),
         )
         monkeypatch.setattr(
-            sandbox_mod.os.path, "isdir",
+            sandbox_render.os.path, "isdir",
             lambda p: False if p == "/etc/gitconfig" else real_isdir(p),
         )
 
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir)
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
 
         joined = " ".join(cmd)
         assert "--ro-bind /etc/gitconfig /etc/gitconfig" in joined
 
     def test_etc_gitconfig_skipped_when_missing(self, tmp_agents, monkeypatch):
-        from core.sandbox import sandbox as sandbox_mod
         real_exists = os.path.exists
         monkeypatch.setattr(
-            sandbox_mod.os.path, "exists",
+            sandbox_render.os.path, "exists",
             lambda p: False if p == "/etc/gitconfig" else real_exists(p),
         )
 
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir)
         sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
+        cmd = _rendered(sb, ["claude"])
 
         joined = " ".join(cmd)
         assert "/etc/gitconfig" not in joined
 
 
 # ---------------------------------------------------------------------------
-# Network namespace isolation (OTODOCK_SANDBOX_NETNS)
+# Network namespace isolation
 # ---------------------------------------------------------------------------
 
 import shutil as _shutil
@@ -900,144 +998,26 @@ def _netns_cfg(agents_dir, mcps_dir, *, forwards, allow_hosts=None,
     )
 
 
-class TestNetnsAlwaysOn:
-    """Isolation is always on: every resolved session is launcher-wrapped."""
-
-    def test_launcher_prefix_shape(self, tmp_agents, monkeypatch):
-        import config as app_config
-        monkeypatch.setattr(app_config, "INTERNAL_LISTENER_PORT", 0, raising=False)
-        agents_dir, mcps_dir = tmp_agents
-        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=["8400", "8931", "8932"])
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude", "-p"])
-
-        # argv[0] is the launcher, not bwrap.
-        assert cmd[0].endswith("oto-sandbox-net")
-        assert "--block-private" in cmd
-
-        # One --forward per port, in the order given.
-        fwd_idx = [i for i, a in enumerate(cmd) if a == "--forward"]
-        assert [cmd[i + 1] for i in fwd_idx] == ["8400", "8931", "8932"]
-
-        # Structure: launcher … -- bwrap … -- claude -p
-        sep = cmd.index("--")
-        assert cmd[sep + 1] == "bwrap"
-        assert cmd[-2:] == ["claude", "-p"]
-        # Postgres is never forwarded.
-        assert "5432" not in [cmd[i + 1] for i in fwd_idx]
-
-    def test_proxy_port_forward_lands_on_the_internal_listener(self, tmp_agents, monkeypatch):
-        """With an internal listener bound (``config.INTERNAL_LISTENER_PORT``),
-        the proxy-port forward alone becomes pasta's ``<namespace>:<host>``
-        splice; the other forwards and the sandbox side are unchanged, and
-        with no listener the argv is byte-identical to before."""
-        import config as app_config
-        agents_dir, mcps_dir = tmp_agents
-        proxy_port = str(app_config.PORT)
-        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=[proxy_port, "8931"])
-        monkeypatch.setattr(app_config, "INTERNAL_LISTENER_PORT", 0, raising=False)
-        plain = SandboxBuilder(cfg).build_command_prefix(["claude"])
-        monkeypatch.setattr(app_config, "INTERNAL_LISTENER_PORT", 8123, raising=False)
-        spliced = SandboxBuilder(cfg).build_command_prefix(["claude"])
-        fwd = lambda cmd: [cmd[i + 1] for i, a in enumerate(cmd) if a == "--forward"]
-        assert fwd(plain) == [proxy_port, "8931"]
-        assert fwd(spliced) == [f"{proxy_port}:8123", "8931"]
-        assert [a for a in plain if a != proxy_port] == [a for a in spliced if a != f"{proxy_port}:8123"]
-
-    def test_allow_hosts_emitted(self, tmp_agents):
-        """Routable carve-outs become one --allow-host per entry."""
-        agents_dir, mcps_dir = tmp_agents
-        cfg = _netns_cfg(
-            agents_dir, mcps_dir, forwards=["8400"],
-            allow_hosts=["192.168.1.10", "10.200.0.5", "fd00::5"],
-        )
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
-        ah_idx = [i for i, a in enumerate(cmd) if a == "--allow-host"]
-        assert [cmd[i + 1] for i in ah_idx] == ["192.168.1.10", "10.200.0.5", "fd00::5"]
-
-    def test_empty_forwards_fails_closed(self, tmp_agents):
-        """An empty egress set is a build error — refuse to launch rather than
-        run the agent un-isolated OR netns-wrapped without the hook port."""
-        agents_dir, mcps_dir = tmp_agents
-        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=[])
-        with pytest.raises(RuntimeError, match="net_forwards"):
-            SandboxBuilder(cfg).build_command_prefix(["claude"])
-
-    def test_uid_mapback_present_on_rootless(self, tmp_agents, monkeypatch):
-        """Non-root proxy (rootless pasta) → bwrap maps the agent back to the
-        proxy uid/gid so the in-sandbox identity is byte-identical to root."""
-        monkeypatch.setattr(_sandbox_mod.os, "getuid", lambda: 1000)
-        monkeypatch.setattr(_sandbox_mod.os, "getgid", lambda: 1000)
-        agents_dir, mcps_dir = tmp_agents
-        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=["8400"])
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
-        assert "--unshare-user" in cmd
-        assert cmd[cmd.index("--uid") + 1] == "1000"
-        assert cmd[cmd.index("--gid") + 1] == "1000"
-
-    def test_no_uid_mapback_on_rootful_docker(self, tmp_agents, monkeypatch):
-        """Root proxy (rootful pasta) → no userns nesting, so no map-back is
-        emitted (bwrap already runs the agent as 0)."""
-        monkeypatch.setattr(_sandbox_mod.os, "getuid", lambda: 0)
-        monkeypatch.setattr(_sandbox_mod.os, "getgid", lambda: 0)
-        agents_dir, mcps_dir = tmp_agents
-        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=["8400"])
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
-        # Still launcher-wrapped, just without the uid flags.
-        assert cmd[0].endswith("oto-sandbox-net")
-        assert "--unshare-user" not in cmd
-
-    def test_dns_forward_emitted_when_resolv_swap_exists(
-        self, tmp_agents, monkeypatch, tmp_path,
-    ):
-        """When the stub-resolver swap file exists, the launcher gets
-        --dns-forward and bwrap mounts the generated resolv.conf."""
-        fake_resolv = tmp_path / "netns-resolv.conf"
-        fake_resolv.write_text("nameserver 169.254.1.1\n")
-        monkeypatch.setattr(_sandbox_mod, "netns_resolv_path", lambda: fake_resolv)
-
-        agents_dir, mcps_dir = tmp_agents
-        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=["8400"])
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
-        joined = " ".join(cmd)
-        assert "--dns-forward" in cmd
-        assert cmd[cmd.index("--dns-forward") + 1] == _sandbox_mod._NETNS_DNS_FORWARD_ADDR
-        # The generated resolv.conf shadows the host's at /etc/resolv.conf.
-        assert f"--ro-bind {fake_resolv} /etc/resolv.conf" in joined
-
-    def test_no_dns_forward_without_resolv_swap(self, tmp_agents, monkeypatch):
-        # Point the swap path at a definitely-missing file.
-        monkeypatch.setattr(
-            _sandbox_mod, "netns_resolv_path",
-            lambda: _app_config.SESSIONS_DIR / "does-not-exist-netns-resolv.conf",
-        )
-        agents_dir, mcps_dir = tmp_agents
-        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=["8400"])
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
-        assert "--dns-forward" not in cmd
-
-
 class TestRootfulCapDropAndEnv:
     """Sandbox hardening: the agent always holds zero Linux capabilities
     (--cap-drop ALL, unconditional). IS_SANDBOX (the CLI's run-as-root guard
     bypass) stays gated on uid 0 so every non-root path keeps a byte-identical
     env — the norm, since no default topology runs the proxy as root."""
 
-    def test_cap_drop_all_emitted_when_root(self, tmp_agents, monkeypatch):
-        monkeypatch.setattr(_sandbox_mod.os, "getuid", lambda: 0)
+    def test_cap_drop_all_emitted_when_root(self, tmp_agents):
         agents_dir, mcps_dir = tmp_agents
-        cmd = SandboxBuilder(_make_config(agents_dir, mcps_dir)).build_command_prefix(["claude"])
+        cmd = _rendered(SandboxBuilder(_make_config(agents_dir, mcps_dir)), ["claude"], uid=0, gid=0)
         assert "--cap-drop" in cmd
         assert cmd[cmd.index("--cap-drop") + 1] == "ALL"
         # Caps dropped for the payload, before the inner command (the last `--`
-        # separator — the first `--` now belongs to the netns launcher prefix).
+        # separator: the first `--` belongs to the launcher prefix).
         assert cmd.index("--cap-drop") < (len(cmd) - 1 - cmd[::-1].index("--"))
 
-    def test_cap_drop_all_emitted_when_non_root(self, tmp_agents, monkeypatch):
+    def test_cap_drop_all_emitted_when_non_root(self, tmp_agents):
         # Unconditional: the agent is capability-less on every path (rootless
         # bwrap included), so --cap-drop ALL is emitted at uid 1000 too.
-        monkeypatch.setattr(_sandbox_mod.os, "getuid", lambda: 1000)
         agents_dir, mcps_dir = tmp_agents
-        cmd = SandboxBuilder(_make_config(agents_dir, mcps_dir)).build_command_prefix(["claude"])
+        cmd = _rendered(SandboxBuilder(_make_config(agents_dir, mcps_dir)), ["claude"], uid=1000, gid=1000)
         assert "--cap-drop" in cmd
         assert cmd[cmd.index("--cap-drop") + 1] == "ALL"
 
@@ -1063,74 +1043,9 @@ class TestRootfulCapDropAndEnv:
         assert agent_env["PNPM_CONFIG_CACHE_DIR"] == f"{_sandbox_mod.layout.V_WORKSPACE}/.cache/pnpm"
 
 
-class TestTmpfsCap:
-    """Per-sandbox /tmp cap (bwrap --size): feature-gated on the bubblewrap,
-    bounded by half the host's RAM, off with SANDBOX_TMP_SIZE_MB=0."""
-
-    def _args(self, tmp_agents):
-        agents_dir, mcps_dir = tmp_agents
-        return SandboxBuilder(_make_config(agents_dir, mcps_dir))._system_mounts()
-
-    def test_size_directly_precedes_tmpfs_when_supported(self, tmp_agents, monkeypatch):
-        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", True)
-        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 4096)
-        monkeypatch.setattr(_sandbox_mod, "_mem_total_mb", lambda: 16000)
-        args = self._args(tmp_agents)
-        i = args.index("--tmpfs")
-        assert args[i + 1] == "/tmp"
-        assert args[i - 2:i] == ["--size", str(4096 * 1024 * 1024)]
-
-    def test_cap_never_looser_than_half_ram(self, monkeypatch):
-        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", True)
-        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 4096)
-        monkeypatch.setattr(_sandbox_mod, "_mem_total_mb", lambda: 4000)
-        assert _sandbox_mod.tmpfs_cap_mb() == 2000
-        monkeypatch.setattr(_sandbox_mod, "_mem_total_mb", lambda: 0)  # unreadable
-        assert _sandbox_mod.tmpfs_cap_mb() == 4096
-
-    def test_no_size_when_bwrap_lacks_it(self, tmp_agents, monkeypatch):
-        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", False)
-        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 4096)
-        args = self._args(tmp_agents)
-        assert "--size" not in args and "/tmp" in args
-
-    def test_zero_disables(self, tmp_agents, monkeypatch):
-        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", True)
-        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 0)
-        assert "--size" not in self._args(tmp_agents)
-
-    def test_lazy_probe_when_preflight_never_ran(self, monkeypatch):
-        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", None)
-        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 4096)
-        monkeypatch.setattr(_sandbox_mod, "_probe_bwrap_size", lambda: True)
-        monkeypatch.setattr(_sandbox_mod, "_mem_total_mb", lambda: 16000)
-        assert _sandbox_mod.tmpfs_cap_mb() == 4096
-        assert _sandbox_mod._bwrap_has_size is True
-
-    def test_preflight_logs_and_caches(self, monkeypatch, caplog):
-        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", None)
-        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 4096)
-        monkeypatch.setattr(_sandbox_mod, "_probe_bwrap_size", lambda: False)
-        with caplog.at_level("INFO", logger=_sandbox_mod.logger.name):
-            _sandbox_mod.tmpfs_cap_preflight()
-        assert _sandbox_mod._bwrap_has_size is False
-        assert "uncapped" in caplog.text
-
-    def test_claude_runtime_root_follows_uid(self, monkeypatch):
-        monkeypatch.setattr(_sandbox_mod.os, "getuid", lambda: 1234)
-        assert _sandbox_mod.claude_runtime_root() == "/tmp/claude-1234"
-
-
-class TestNetnsPreflight:
-    def test_hard_fails_when_pasta_missing(self, monkeypatch):
-        # Isolation is mandatory — a missing tool hard-fails boot.
-        real_which = _shutil.which
-        monkeypatch.setattr(
-            _sandbox_mod.shutil, "which",
-            lambda tool: None if tool == "pasta" else real_which(tool),
-        )
-        with pytest.raises(RuntimeError, match="pasta"):
-            _sandbox_mod.netns_preflight()
+class TestNetnsLauncher:
+    """The launcher's hand-off to pasta, and what makes a machine swap its
+    resolver file for the launcher's forwarder."""
 
     def test_the_shim_starts_through_sh_so_a_confined_pasta_may_exec_it(self, tmp_path):
         """Ubuntu 26.04 confines pasta with an AppArmor profile that lets it
@@ -1144,7 +1059,7 @@ class TestNetnsPreflight:
         fake.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
         fake.chmod(0o755)
         env = {**os.environ, "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"}
-        out = subprocess.run([sys.executable, str(_sandbox_mod._NETNS_LAUNCHER), "--", "/bin/true"],
+        out = subprocess.run([sys.executable, str(_LAUNCHER), "--", "/bin/true"],
                              capture_output=True, text=True, env=env, timeout=30)
         assert out.returncode == 0, out.stderr
         argv = out.stdout.splitlines()
@@ -1153,311 +1068,13 @@ class TestNetnsPreflight:
         assert argv[-1] == "/bin/true"
         assert argv[:argv.index("-t")] == ["--quiet", "--config-net", "--no-map-gw"]
 
-    def test_loopback_resolver_detection(self, monkeypatch, tmp_path):
+    def test_loopback_resolver_detection(self, tmp_path):
         resolv = tmp_path / "resolv.conf"
         resolv.write_text("nameserver 127.0.0.53\noptions edns0\n")
-        assert _sandbox_mod._host_resolv_has_loopback_ns(str(resolv)) is True
+        assert sandbox_render.host_resolv_has_loopback_ns(str(resolv)) is True
 
         resolv.write_text("nameserver 8.8.8.8\n")
-        assert _sandbox_mod._host_resolv_has_loopback_ns(str(resolv)) is False
-
-    def _failing_probe(self, monkeypatch, tmp_path=None):
-        # All tools present; the `unshare -Urn true` capability probe fails.
-        real_which = _shutil.which
-        monkeypatch.setattr(_sandbox_mod.shutil, "which",
-                            lambda tool: real_which(tool) or f"/usr/bin/{tool}")
-        monkeypatch.setattr(_sandbox_mod.os, "access", lambda *a, **k: True)
-        if tmp_path is not None:
-            # Hermetic: don't let the HOST's Debian sysctl steer the message.
-            monkeypatch.setattr(_sandbox_mod, "_DEBIAN_USERNS_SYSCTL",
-                                tmp_path / "missing-debian-sysctl")
-
-        class _Probe:
-            returncode = 1
-            stderr = b"unshare: unshare failed: Operation not permitted"
-        monkeypatch.setattr(_sandbox_mod, "_run_probe", lambda *a, **k: _Probe())
-
-    def _happy_gates(self, monkeypatch, tmp_path):
-        # Tools present + one-level probe passes; keep the resolv side effects
-        # inside tmp so the success path is exercisable from tests.
-        real_which = _shutil.which
-        monkeypatch.setattr(_sandbox_mod.shutil, "which",
-                            lambda tool: real_which(tool) or f"/usr/bin/{tool}")
-        monkeypatch.setattr(_sandbox_mod.os, "access", lambda *a, **k: True)
-        monkeypatch.setattr(_sandbox_mod, "_host_resolv_has_loopback_ns",
-                            lambda *a, **k: False)
-        monkeypatch.setattr(_sandbox_mod, "netns_resolv_path",
-                            lambda: tmp_path / "netns-resolv.conf")
-        # Hermetic: a character device stands in for the host's tun.
-        monkeypatch.setattr(_sandbox_mod, "_TUN_DEVICE", "/dev/null")
-
-    def _shape_answers(self, monkeypatch, shape):
-        """Every probe passes but the one-level shape (the launcher with one
-        bwrap level), which ``shape(argv)`` answers; the nested probe stays out."""
-        launcher = str(_sandbox_mod._NETNS_LAUNCHER)
-
-        class _OK:
-            returncode = 0
-            stderr = b""
-        seen = []
-
-        def fake_run(argv, **kwargs):
-            if argv[0] == launcher:
-                seen.append(argv)
-                return shape(argv)
-            return _OK()
-        monkeypatch.setattr(_sandbox_mod, "_run_probe", fake_run)
-        monkeypatch.setattr(_sandbox_mod, "_nested_sandbox_probe", lambda: None)
-        return seen
-
-    def test_a_host_without_the_tun_device_refuses_the_boot(self, monkeypatch, tmp_path, caplog):
-        # Before 1.9.0 such a host booted with an ERROR and every session
-        # failed at spawn; the refusal says the same sentence the ERROR did.
-        self._happy_gates(monkeypatch, tmp_path)
-        seen = self._shape_answers(monkeypatch, lambda argv: pytest.fail("the shape ran"))
-        monkeypatch.setattr(_sandbox_mod, "_TUN_DEVICE", str(tmp_path / "tun"))
-        with pytest.raises(RuntimeError) as exc:
-            _sandbox_mod.netns_preflight()
-        assert str(exc.value) == _sandbox_mod._tun_sentence(f"{tmp_path / 'tun'} is missing")
-        assert "devices: /dev/net/tun" in str(exc.value) and "modprobe tun" in str(exc.value)
-        assert seen == []
-        (tmp_path / "tun").write_text("")
-        with pytest.raises(RuntimeError, match="is not a character device"):
-            _sandbox_mod.netns_preflight()
-        with caplog.at_level("ERROR"):
-            _sandbox_mod._warn_nested_probe("x")
-        assert _sandbox_mod._tun_sentence(f"{tmp_path / 'tun'} is not a character device") in caplog.text
-
-    def test_a_shape_whose_launcher_cannot_open_its_tap_refuses_the_boot(self, monkeypatch, tmp_path):
-        self._happy_gates(monkeypatch, tmp_path)
-
-        class _Tun:
-            returncode = 1
-            stderr = b"Failed to open tun socket in namespace: No such device"
-        seen = self._shape_answers(monkeypatch, lambda argv: _Tun())
-        with pytest.raises(RuntimeError) as exc:
-            _sandbox_mod.netns_preflight()
-        assert str(exc.value) == _sandbox_mod._tun_sentence(_Tun.stderr.decode())
-        # The shape is one bwrap level with a fresh /proc running true.
-        assert seen[0][1:3] == ["--block-private", "--"] and seen[0][-2:] == ["--", "true"]
-        assert {"--unshare-pid", "--unshare-ipc", "--unshare-uts"} <= set(seen[0])
-        assert seen[0].count("bwrap") == 1 and "--proc" in seen[0]
-
-    def test_any_other_failure_of_the_shape_refuses_the_boot(self, monkeypatch, tmp_path):
-        self._happy_gates(monkeypatch, tmp_path)
-
-        class _Proc:
-            returncode = 1
-            stderr = b"bwrap: Can't mount proc on /newroot/proc: Operation not permitted"
-        self._shape_answers(monkeypatch, lambda argv: _Proc())
-        with pytest.raises(RuntimeError) as exc:
-            _sandbox_mod.netns_preflight()
-        assert "Can't mount proc" in str(exc.value) and "sandbox-doctor.sh" in str(exc.value)
-        assert "Refusing to start" in str(exc.value) and "tap device" not in str(exc.value)
-
-        def unrunnable(argv):
-            raise OSError(8, "Exec format error")
-        self._shape_answers(monkeypatch, unrunnable)
-        with pytest.raises(RuntimeError, match="failed to run: .*Exec format error"):
-            _sandbox_mod.netns_preflight()
-
-    def test_a_shape_probe_that_never_answers_boots_with_an_error(self, monkeypatch, tmp_path, caplog):
-        self._happy_gates(monkeypatch, tmp_path)
-
-        def silent(argv):
-            raise _sandbox_mod.subprocess.TimeoutExpired(argv, _sandbox_mod._SHAPE_PROBE_S)
-        self._shape_answers(monkeypatch, silent)
-        with caplog.at_level("ERROR"):
-            _sandbox_mod.netns_preflight()  # must not raise
-        assert "did not answer within 20s" in caplog.text
-
-    def test_probe_failure_names_apparmor_restriction(self, monkeypatch, tmp_path):
-        # Ubuntu 24.04+ (sysctl = 1): the error must name the sysctl and the
-        # scoped-profile remedy, never suggest flipping the sysctl off.
-        self._failing_probe(monkeypatch)
-        sysctl = tmp_path / "apparmor_restrict_unprivileged_userns"
-        sysctl.write_text("1\n")
-        monkeypatch.setattr(_sandbox_mod, "_APPARMOR_USERNS_SYSCTL", sysctl)
-        with pytest.raises(RuntimeError) as exc:
-            _sandbox_mod.netns_preflight()
-        msg = str(exc.value)
-        assert "apparmor_restrict_unprivileged_userns" in msg
-        assert "setup-apparmor-userns.sh" in msg
-        assert "OTODOCK_APPARMOR_PROFILE" in msg
-        assert "NOT set the sysctl to 0" in msg
-
-    def test_probe_failure_generic_without_restriction(self, monkeypatch, tmp_path):
-        # Sysctl absent (non-Ubuntu kernel): the generic message, no AppArmor blame.
-        self._failing_probe(monkeypatch, tmp_path)
-        monkeypatch.setattr(_sandbox_mod, "_APPARMOR_USERNS_SYSCTL",
-                            tmp_path / "missing-sysctl")
-        with pytest.raises(RuntimeError) as exc:
-            _sandbox_mod.netns_preflight()
-        msg = str(exc.value)
-        assert "apparmor_restrict_unprivileged_userns" not in msg
-        assert "cannot create" in msg
-
-    def test_probe_failure_names_debian_knob(self, monkeypatch, tmp_path):
-        # kernel.unprivileged_userns_clone=0 (Debian hardening): name the knob
-        # and its remedy instead of the generic message.
-        self._failing_probe(monkeypatch)
-        monkeypatch.setattr(_sandbox_mod, "_APPARMOR_USERNS_SYSCTL",
-                            tmp_path / "missing-sysctl")
-        debian = tmp_path / "unprivileged_userns_clone"
-        debian.write_text("0\n")
-        monkeypatch.setattr(_sandbox_mod, "_DEBIAN_USERNS_SYSCTL", debian)
-        with pytest.raises(RuntimeError) as exc:
-            _sandbox_mod.netns_preflight()
-        assert "unprivileged_userns_clone" in str(exc.value)
-
-    def test_unshare_missing_probes_with_bwrap_instead(self, monkeypatch, tmp_path):
-        # `unshare` absent used to SKIP the capability probe (host boots, every
-        # spawn fails). Now it must fall back to probing with bwrap itself.
-        self._happy_gates(monkeypatch, tmp_path)
-        calls = []
-
-        class _OK:
-            returncode = 0
-            stderr = b""
-
-        def fake_run(argv, **kwargs):
-            calls.append(argv[0])
-            if argv[0] == "unshare":
-                raise FileNotFoundError("unshare")
-            return _OK()
-
-        monkeypatch.setattr(_sandbox_mod, "_run_probe", fake_run)
-        monkeypatch.setattr(_sandbox_mod, "_nested_sandbox_probe", lambda: None)
-        _sandbox_mod.netns_preflight()  # must not raise
-        assert calls[0] == "unshare" and "bwrap" in calls
-
-    def test_pasta_build_date_reads_every_version_form(self):
-        date = _sandbox_mod.pasta_build_date
-        assert date("pasta 2026_10_02.cba3570") == "2026_10_02"
-        assert date("pasta 2026_06_11.a9c61ff-31-gbf21038") == "2026_06_11"
-        assert date("pasta 0.0~git20230309.7c7625d-1") == "2023_03_09"
-        assert date("pasta unknown version") == ""
-        assert date("") == ""
-
-    def _floor(self, monkeypatch, floor="2023_12_30", line="", docker=False):
-        real_read = _sandbox_mod.app_config._read_pinned_version
-        monkeypatch.setattr(_sandbox_mod.app_config, "_read_pinned_version",
-                            lambda key: floor if key == "PASST_MIN_VERSION" else real_read(key))
-        monkeypatch.setattr(_sandbox_mod.app_config, "RUNNING_IN_DOCKER", docker)
-        monkeypatch.setattr(_sandbox_mod, "_pasta_version",
-                            lambda: (line, _sandbox_mod.pasta_build_date(line)))
-
-    def test_a_pasta_below_the_floor_boots_with_a_warning(self, monkeypatch, tmp_path, caplog):
-        # bookworm's package, as every 1.8.x image shipped it: the sandbox runs
-        # on it, so the boot goes on and the warning names the gap and the fix.
-        self._happy_gates(monkeypatch, tmp_path)
-
-        class _OK:
-            returncode = 0
-            stderr = b""
-        monkeypatch.setattr(_sandbox_mod, "_run_probe", lambda *a, **k: _OK())
-        monkeypatch.setattr(_sandbox_mod, "_nested_sandbox_probe", lambda: None)
-        self._floor(monkeypatch, line="pasta 0.0~git20230309.7c7625d-1")
-        with caplog.at_level("WARNING"):
-            _sandbox_mod.netns_preflight()  # must not raise
-        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert any("0.0~git20230309" in m and "2023_12_30" in m
-                   and "install-baseline-tools.sh" in m for m in warned), warned
-
-    def test_the_fix_follows_the_install(self, monkeypatch, caplog):
-        self._floor(monkeypatch, line="pasta 2023_03_09.7c7625d", docker=True)
-        with caplog.at_level("WARNING"):
-            _sandbox_mod._warn_pasta_below_floor()
-        assert "proxy image" in caplog.text and "install-baseline-tools" not in caplog.text
-
-    @pytest.mark.parametrize("line,floor", [
-        ("pasta 2023_12_30.f091893", "2023_12_30"),   # at the floor
-        ("pasta 2026_10_02.cba3570", "2023_12_30"),   # the pin
-        ("pasta unknown version", "2023_12_30"),      # nothing to compare
-        ("", "2023_12_30"),                           # pasta did not answer
-        ("pasta 0.0~git20230309.7c7625d-1", ""),      # no floor in VERSIONS.md
-    ])
-    def test_no_warning_at_or_above_the_floor_or_without_a_comparison(
-            self, monkeypatch, caplog, line, floor):
-        self._floor(monkeypatch, floor=floor, line=line)
-        with caplog.at_level("WARNING"):
-            _sandbox_mod._warn_pasta_below_floor()
-        assert not [r for r in caplog.records if r.levelname == "WARNING"]
-
-    def test_the_version_survives_a_pasta_that_cannot_run(self, monkeypatch):
-        monkeypatch.setattr(_sandbox_mod.shutil, "which", lambda tool: None)
-        assert _sandbox_mod._pasta_version() == ("", "")
-        monkeypatch.setattr(_sandbox_mod.shutil, "which", lambda tool: "/usr/local/bin/pasta")
-        for exc in (FileNotFoundError("pasta"),
-                    _sandbox_mod.subprocess.TimeoutExpired(["pasta"], 5)):
-            def boom(*a, _exc=exc, **k):
-                raise _exc
-            monkeypatch.setattr(_sandbox_mod.subprocess, "run", boom)
-            assert _sandbox_mod._pasta_version() == ("", "")
-
-    def test_debians_undated_pasta_reads_its_package_version(self, monkeypatch):
-        # bookworm's package prints "pasta unknown version"; the package
-        # database knows it is 0.0~git20230309. A copy outside /usr/bin (the
-        # pinned build, an upstream static one) is never asked about a package.
-        answers = {"--version": "pasta unknown version\nCopyright Red Hat\n",
-                   "-W": "0.0~git20230309.7c7625d-1"}
-
-        class _Done:
-            def __init__(self, out):
-                self.stdout = out
-
-        def fake_run(argv, **kwargs):
-            return _Done(answers["-W" if argv[0] == "dpkg-query" else argv[1]])
-        monkeypatch.setattr(_sandbox_mod.subprocess, "run", fake_run)
-        monkeypatch.setattr(_sandbox_mod.shutil, "which", lambda tool: "/usr/bin/pasta")
-        monkeypatch.setattr(_sandbox_mod.os.path, "realpath", lambda p: p)
-        assert _sandbox_mod._pasta_version() == (
-            "pasta (package passt 0.0~git20230309.7c7625d-1)", "2023_03_09")
-        # trixie's package prints nothing at all; a native Debian 13 host
-        # takes it, since it is above the floor.
-        answers.update({"--version": "", "-W": "0.0~git20250503.587980c-2+deb13u1"})
-        assert _sandbox_mod._pasta_version() == (
-            "pasta (package passt 0.0~git20250503.587980c-2+deb13u1)", "2025_05_03")
-        monkeypatch.setattr(_sandbox_mod.shutil, "which", lambda tool: "/usr/local/bin/pasta")
-        assert _sandbox_mod._pasta_version() == ("", "")
-        answers["--version"] = "pasta unknown version\nCopyright Red Hat\n"
-        assert _sandbox_mod._pasta_version() == ("pasta unknown version", "")
-
-    def test_run_probe_reports_the_exit_and_bounds_the_wait(self):
-        done = _sandbox_mod._run_probe(["sh", "-c", "echo denied >&2; exit 3"], timeout=5)
-        assert done.returncode == 3 and done.stderr == b"denied\n"
-        # A probe that never answers ends at the timeout, its whole process
-        # group with it (the grandchild here would outlive a plain kill), and
-        # the boot never waits past the reap bound.
-        started = time.monotonic()
-        with pytest.raises(_sandbox_mod.subprocess.TimeoutExpired):
-            _sandbox_mod._run_probe(["sh", "-c", "sleep 30 & wait"], timeout=0.5)
-        assert time.monotonic() - started < _sandbox_mod._PROBE_REAP_S + 1
-
-    def test_nested_probe_failure_warns_never_fatal(self, monkeypatch, tmp_path, caplog):
-        # A host can pass the one-level gate yet deny the NESTED level (what
-        # the Codex engine's inner bwrap needs — the 2026-08-12 incident).
-        # Boot must proceed; the flag flips False and the warning names the
-        # doctor script.
-        self._happy_gates(monkeypatch, tmp_path)
-
-        class _OK:
-            returncode = 0
-            stderr = b""
-        monkeypatch.setattr(_sandbox_mod, "_run_probe", lambda *a, **k: _OK())
-        monkeypatch.setattr(
-            _sandbox_mod, "_nested_sandbox_probe",
-            lambda: "bwrap: setting up uid map: Permission denied",
-        )
-        with caplog.at_level("WARNING"):
-            _sandbox_mod.netns_preflight()  # must not raise
-        assert _sandbox_mod.nested_sandbox_ok() is False
-        assert any("sandbox-doctor" in r.message for r in caplog.records)
-
-        # And a healthy nested probe flips it back True.
-        monkeypatch.setattr(_sandbox_mod, "_nested_sandbox_probe", lambda: None)
-        _sandbox_mod.netns_preflight()
-        assert _sandbox_mod.nested_sandbox_ok() is True
+        assert sandbox_render.host_resolv_has_loopback_ns(str(resolv)) is False
 
 
 class TestResolveSandboxEgress:
@@ -1479,36 +1096,62 @@ class TestResolveSandboxEgress:
         return m
 
     def test_proxy_port_always_present_and_first(self, monkeypatch):
-        from services.mcp import mcp_registry
-        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [])
+        from services.mcp import mcp_egress, mcp_registry
+        monkeypatch.setattr(mcp_egress, "get_agent_mcps", lambda *a, **k: [])
         forwards, allow = mcp_registry.resolve_sandbox_egress("any-agent")
         assert forwards == [str(_app_config.PORT)]
         assert allow == []
 
-    def test_docker_mcp_ports_included_loopback_t1(self, monkeypatch):
+    def test_a_docker_mcp_is_never_forwarded(self, monkeypatch):
+        """A session reaches a Docker tool through the credential gateway on the
+        proxy port: its loopback port is never spliced."""
         from core.config import deployment
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_egress, mcp_registry
         monkeypatch.setattr(deployment, "in_docker_compose", lambda: False)  # T1
 
         mcps = [
             self._mk("camoufox", "docker", 8931, "http://localhost:${port}"),
             self._mk("file-tools", "docker", 8932, "http://localhost:${port}"),
-            self._mk("slack", "node", 0, ""),          # external stdio → no fwd
-            self._mk("espo", "docker", 0, ""),         # docker but no port → skip
+            self._mk("slack", "node", 0, ""),
         ]
-        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: mcps)
+        monkeypatch.setattr(mcp_egress, "get_agent_mcps", lambda *a, **k: mcps)
         forwards, allow = mcp_registry.resolve_sandbox_egress("pa")
-        assert forwards[0] == str(_app_config.PORT)    # proxy port first
-        assert "8931" in forwards and "8932" in forwards
-        assert "5432" not in forwards                  # never Postgres
-        # External (non-docker) + portless docker contribute nothing.
-        assert len([f for f in forwards if f != str(_app_config.PORT)]) == 2
+        assert forwards == [str(_app_config.PORT)]
+        assert allow == []
+
+    def test_the_attached_names_keep_the_carve_to_those_mcps(self, monkeypatch):
+        """The layers hand the egress the names the session's build attached:
+        a tool the session was refused gets no route; None carves for all."""
+        from core.config import deployment
+        from services.mcp import mcp_egress, mcp_registry
+        monkeypatch.setattr(deployment, "in_docker_compose", lambda: False)
+        mcps = [
+            self._mk("camoufox", "docker", 8931, "http://localhost:${port}"),
+            self._mk("file-tools", "docker", 8932, "http://localhost:${port}"),
+        ]
+        monkeypatch.setattr(mcp_egress, "get_agent_mcps", lambda *a, **k: mcps)
+        for attached in (["file-tools"], [], None):
+            forwards, _allow = mcp_registry.resolve_sandbox_egress("pa", attached=attached)
+            assert forwards == [str(_app_config.PORT)]
+        # resolve_sandbox_config passes them through.
+        from core.sandbox import sandbox as sb
+        seen = {}
+
+        def _egress(agent, **kw):
+            seen.update(kw)
+            return [str(_app_config.PORT)], []
+        monkeypatch.setattr(mcp_registry, "resolve_sandbox_egress", _egress)
+        cfg = sb.resolve_sandbox_config("viewer", "", "pa", False, Path("/tmp/x"),
+                                        attached_mcps=["file-tools"], outside_files_write=True,
+                                        outside_knowledge=["faq"])
+        assert seen["attached"] == ["file-tools"]
+        assert cfg.outside_files_write is True and cfg.outside_knowledge == ("faq",)
 
     def test_extra_targets_carved_as_allow_hosts(self, monkeypatch):
         """A layer-supplied target URL (e.g. a Codex local-LLM endpoint) on a
         private IP is carved as an allow-host; a public one is skipped."""
-        from services.mcp import mcp_registry
-        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [])
+        from services.mcp import mcp_egress, mcp_registry
+        monkeypatch.setattr(mcp_egress, "get_agent_mcps", lambda *a, **k: [])
         forwards, allow = mcp_registry.resolve_sandbox_egress(
             "pa", extra_targets=["http://192.168.1.50:11434/v1", "https://api.openai.com"],
         )
@@ -1576,8 +1219,8 @@ class TestNetnsIntegration:
         _accept_once(ok_port, b"REACHED")
         _accept_once(blocked_port, b"LEAK")
 
-        # Build the real launcher+bwrap argv via the production code path,
-        # forwarding ONLY ok_port.
+        # The real launcher and bwrap argv, as the render makes it, forwarding
+        # ONLY ok_port.
         cfg = _netns_cfg(agents_dir, mcps_dir, forwards=[str(ok_port)])
 
         probe = (
@@ -1594,9 +1237,7 @@ class TestNetnsIntegration:
             "capture_output=True,text=True)\n"
             "sys.stdout.write('meta_rc='+str(r.returncode)+'\\n')\n"
         )
-        cmd = SandboxBuilder(cfg).build_command_prefix(
-            ["python3", "-c", probe]
-        )
+        cmd = _rendered(SandboxBuilder(cfg), ["python3", "-c", probe])
         assert cmd[0].endswith("oto-sandbox-net")
 
         out = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -1608,6 +1249,48 @@ class TestNetnsIntegration:
         assert "blocked=ERR:" in stdout, (stdout, out.stderr)
         # Metadata IP is unrouteable (ip route get returns non-zero).
         assert "meta_rc=0" not in stdout, (stdout, out.stderr)
+
+    def test_a_compute_machines_render_reaches_its_link_and_nothing_else(self, tmp_agents):
+        """The same description rendered with a machine's values (the
+        vendored module, this host standing in for the machine): the proxy
+        port inside is spliced onto the machine's link port, and nothing
+        else on loopback answers."""
+        from core.sandbox import sandbox_render as _render
+        from core.sandbox.sandbox import empty_mount_dir
+        agents_dir, mcps_dir = tmp_agents
+        link_port = _free_port()
+        other_port = _free_port()
+        _accept_once(link_port, b"LINK")
+        _accept_once(other_port, b"LEAK")
+        proxy_port = int(_app_config.PORT)
+        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=[str(proxy_port)])
+        desc = SandboxBuilder(cfg).describe()
+        assert desc.forwards == (_render.PROXY_FORWARD,)
+        host = _render.RenderHost(
+            agents_root=str(agents_dir), mcps_root=str(mcps_dir), empty_dir=str(empty_mount_dir()),
+            launcher=str(_LAUNCHER), uid=os.getuid(), gid=os.getgid(),
+            proxy_target_port=link_port,
+        )
+        probe = (
+            "import socket,sys\n"
+            "def chk(p):\n"
+            "  s=socket.socket(); s.settimeout(2)\n"
+            "  try:\n"
+            "    s.connect(('127.0.0.1',p)); d=s.recv(16); s.close(); return d\n"
+            "  except Exception as e: return b'ERR:'+str(e).encode()\n"
+            f"sys.stdout.write('link='+chk({proxy_port}).decode(errors='replace')+'\\n')\n"
+            f"sys.stdout.write('other='+chk({other_port}).decode(errors='replace')+'\\n')\n"
+            f"sys.stdout.write('raw='+chk({link_port}).decode(errors='replace')+'\\n')\n"
+        )
+        cmd = _render.render(desc, host, ["python3", "-c", probe])
+        assert ["--forward", f"{proxy_port}:{link_port}"] == cmd[cmd.index("--forward"):cmd.index("--forward") + 2]
+        out = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        stdout = out.stdout
+        # The proxy port inside reaches the machine's link.
+        assert "link=LINK" in stdout, (stdout, out.stderr)
+        # Nothing else on loopback does: not another port, not the link's own number.
+        assert "other=ERR:" in stdout, (stdout, out.stderr)
+        assert "raw=ERR:" in stdout, (stdout, out.stderr)
 
     def test_ipv6_loopback_fails_at_once_so_localhost_falls_back(self, tmp_agents):
         """A forward reaches a host service on IPv4 loopback only (every
@@ -1631,7 +1314,7 @@ class TestNetnsIntegration:
             "s=socket.socket(); s.settimeout(5)\n"
             f"s.connect(('127.0.0.1',{port})); sys.stdout.write('v4='+s.recv(16).decode()+'\\n')\n"
         )
-        cmd = SandboxBuilder(cfg).build_command_prefix(["python3", "-c", probe])
+        cmd = _rendered(SandboxBuilder(cfg), ["python3", "-c", probe])
         out = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         assert "v4=REACHED" in out.stdout, (out.stdout, out.stderr)
         v6 = next(ln for ln in out.stdout.splitlines() if ln.startswith("v6="))
@@ -1649,13 +1332,13 @@ class TestCliInstallRoBinds:
     Shared by the CLI and Codex layers."""
 
     def test_bare_name_needs_no_mount(self):
-        from core.sandbox.sandbox import cli_install_ro_binds
+        from core.sandbox.sandbox_render import cli_install_ro_binds
         # PATH-resolved inside the sandbox (system dirs are always bound).
         assert cli_install_ro_binds("claude") == []
         assert cli_install_ro_binds("") == []
 
     def test_npm_shim_mounts_bin_and_package_root(self, tmp_path):
-        from core.sandbox.sandbox import cli_install_ro_binds
+        from core.sandbox.sandbox_render import cli_install_ro_binds
         pkg = tmp_path / "lib" / "node_modules" / "some-cli"
         (pkg / "bin").mkdir(parents=True)
         real = pkg / "bin" / "cli.js"
@@ -1668,7 +1351,7 @@ class TestCliInstallRoBinds:
         assert out == [str(bindir), str(pkg)]
 
     def test_native_binary_mounts_only_its_dir(self, tmp_path):
-        from core.sandbox.sandbox import cli_install_ro_binds
+        from core.sandbox.sandbox_render import cli_install_ro_binds
         bindir = tmp_path / "bin"
         bindir.mkdir()
         elf = bindir / "native-cli"
@@ -1686,7 +1369,7 @@ class TestSandboxBuilderContributor:
     def _pairs(self, tmp_agents, **kw):
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, **kw)
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        cmd = _rendered(SandboxBuilder(cfg), ["claude"])
         return str(agents_dir / "personal-assistant"), list(zip(cmd, cmd[1:], strict=False))
 
     def test_workspace_rw_knowledge_ro_no_config(self, tmp_agents):
@@ -1711,51 +1394,34 @@ class TestSandboxBuilderContributor:
         import dataclasses
         agents_dir, mcps_dir = tmp_agents
         cfg = dataclasses.replace(_make_config(agents_dir, mcps_dir, **kw), external=True)
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        cmd = _rendered(SandboxBuilder(cfg), ["claude"])
         return str(agents_dir / "personal-assistant"), list(zip(cmd, cmd[1:], strict=False))
 
-    def test_an_external_caller_keeps_the_cli_state_dirs_writable(self, tmp_agents):
-        """An external caller with no tree of its own runs from the agent's
-        CLI state under the read-only workspace (CLAUDE_CONFIG_DIR /
-        CODEX_HOME = /workspace/.claude or .codex): the two stack RW on the
-        RO root, or the CLI cannot even start (Codex's sqlite state runtime
-        refused a read-only home, T1 2026-09-24)."""
-        agents_dir, _ = tmp_agents
-        workspace = agents_dir / "personal-assistant" / "workspace"
-        for sub in (".claude", ".codex"):
-            (workspace / sub).mkdir(parents=True, exist_ok=True)
+    def test_an_external_caller_with_no_home_binds_nothing_of_the_agent(self, tmp_agents):
+        """An outside session runs from its own home (a scratch one when the
+        identity keeps none): a context with no home at all binds no
+        /workspace and no knowledge, only the agent scope's state masked."""
         agent_dir, pairs = self._ext_pairs(tmp_agents, role="viewer", username="")
-        assert ("--ro-bind", f"{agent_dir}/workspace") in pairs
-        assert ("--bind", f"{agent_dir}/workspace/.claude") in pairs
-        assert ("--bind", f"{agent_dir}/workspace/.codex") in pairs
-
-    def test_a_person_below_the_editor_tier_never_sees_the_agents_state(self, tmp_agents):
-        """A Shared-only viewer or contributor (whose CLI session the engines
-        refuse) sees the agent's CLI state masked in any sandbox run as them,
-        a script or an app button; an editor runs from it."""
         empty = str(empty_mount_dir())
-        for role in ("viewer", "contributor"):
-            agent_dir, pairs = self._pairs(tmp_agents, role=role, username="")
-            for sub in (".claude", ".codex"):
-                assert ("--ro-bind", empty) in pairs and (empty, f"/workspace/{sub}") in pairs, role
-                assert ("--bind", f"{agent_dir}/workspace/{sub}") not in pairs, role
-        agent_dir, pairs = self._pairs(tmp_agents, role="editor", username="")
-        assert ("--bind", f"{agent_dir}/workspace") in pairs
-        assert not any(b == "/workspace/.claude" for _a, b in pairs)
+        # The only /workspace entries are the two masks, bound from the empty dir.
+        binds = [(a, b) for a, b in pairs if b.startswith("/workspace") and a != "--chdir"]
+        assert [b for _a, b in binds] == ["/workspace/.claude", "/workspace/.codex"]
+        assert all(a == empty for a, _b in binds)
+        assert not any(b == f"{agent_dir}/workspace" or b == f"{agent_dir}/knowledge" for _a, b in pairs)
+        assert not any(b == "/knowledge" for _a, b in pairs)
 
     def test_an_external_callers_state_dir_symlink_is_refused(self, tmp_agents, tmp_path):
-        """The workspace is RW for the tiers above: a planted link must not
-        become an RW bind of its target in a caller's sandbox, and a person's
-        sandbox refuses to build over one."""
+        """A planted link at the agent scope's CLI state refuses the build of
+        an outside session as it refuses every other."""
         agents_dir, mcps_dir = tmp_agents
         workspace = agents_dir / "personal-assistant" / "workspace"
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / ".claude").mkdir(exist_ok=True)
         (workspace / ".codex").symlink_to(tmp_path)
-        agent_dir, pairs = self._ext_pairs(tmp_agents, role="viewer", username="")
-        assert ("--bind", f"{agent_dir}/workspace/.claude") in pairs
-        assert not any(b.endswith("/workspace/.codex") for _a, b in pairs)
-        assert not any(b == str(tmp_path) for _a, b in pairs)
+        import dataclasses
+        outside = dataclasses.replace(_make_config(agents_dir, mcps_dir, role="viewer", username=""), external=True)
+        with pytest.raises(RuntimeError, match="symlinked"):
+            SandboxBuilder(outside).workspace_mount_table()
         with pytest.raises(RuntimeError, match="symlinked"):
             SandboxBuilder(_make_config(agents_dir, mcps_dir, role="viewer", username="")
                            ).workspace_mount_table()
@@ -1770,7 +1436,7 @@ class TestAgentStateMasked:
     def _pairs(self, tmp_agents, **kw):
         agents_dir, mcps_dir = tmp_agents
         cfg = _make_config(agents_dir, mcps_dir, **kw)
-        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        cmd = _rendered(SandboxBuilder(cfg), ["claude"])
         return str(agents_dir / "personal-assistant"), cmd
 
     @pytest.mark.parametrize("role", ["viewer", "contributor", "editor", "manager", "admin"])
@@ -1813,7 +1479,7 @@ class TestAgentStateMasked:
             "sys.stdout.write('plant='+t(lambda: open(base+'json.py','w').write('X'))+'\\n')\n"
             "sys.stdout.write('shared='+t(lambda: open('/workspace/notes.txt','w').write('X'))+'\\n')\n"
         )
-        out = _subprocess.run(SandboxBuilder(cfg).build_command_prefix(["python3", "-c", probe]),
+        out = _subprocess.run(_rendered(SandboxBuilder(cfg), ["python3", "-c", probe]),
                               capture_output=True, text=True, timeout=30)
         assert "read=FileNotFoundError" in out.stdout, (out.stdout, out.stderr)
         assert "hook=ok" not in out.stdout and "plant=ok" not in out.stdout, out.stdout
@@ -1852,7 +1518,8 @@ class TestRefusalWording:
 class TestEnginesRefuseTheAgentStateBelowEditor:
     """The start-time floor: no engine runs a CLI from the agent's own state
     for a person below the editor tier (its sandbox masks that dir, so the
-    CLI would start with no hooks), locally or on a machine."""
+    CLI would start with no hooks): the engine refuses when it readies the
+    spawn, and the start on a machine refuses before any frame."""
 
     def _ctx(self, role, username="", scope="agent", **kw):
         from auth.path_policy import SecurityContext
@@ -1879,14 +1546,14 @@ class TestEnginesRefuseTheAgentStateBelowEditor:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["claude-code-cli", "codex-cli"])
-    async def test_a_local_engine_refuses_before_it_spawns(self, path, tmp_path):
+    async def test_an_engine_refuses_before_it_readies_a_spawn(self, path, tmp_path):
         from core.execution_layer import AgentConfig
         from core.sandbox.session_config_dir import AgentStateRefused
         from core.session.session_manager import get_layer_by_path
         cfg = AgentConfig(agent_name="personal-assistant", sandbox_host_claude_dir=str(tmp_path),
                           security_context=self._ctx("contributor"), execution_path=path)
         with pytest.raises(AgentStateRefused):
-            await get_layer_by_path(path)._start_session_impl("sess-x", cfg)
+            await get_layer_by_path(path)._prepare("sess-x", cfg)
 
     def test_the_start_time_refusal_names_what_the_session_runs_as(self, temp_db):
         from core.sandbox.session_config_dir import (
@@ -1931,7 +1598,7 @@ from core.sandbox.sandbox import Mount as _Mount
 def _launcher_module():
     import importlib.util
     from importlib.machinery import SourceFileLoader
-    loader = SourceFileLoader("oto_sandbox_net_held", str(_sandbox_mod._NETNS_LAUNCHER))
+    loader = SourceFileLoader("oto_sandbox_net_held", str(_LAUNCHER))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
@@ -1961,7 +1628,7 @@ class TestHeldBindSources:
         agents_dir, mcps_dir = tmp_agents
         for username in ("alice", ""):
             cfg = _make_config(agents_dir, mcps_dir, username=username)
-            cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+            cmd = _rendered(SandboxBuilder(cfg), ["claude"])
             launcher = cmd[:cmd.index("--")]
             root = str((agents_dir / "personal-assistant").resolve())
             assert launcher[launcher.index("--beneath") + 1] == root
@@ -1978,7 +1645,7 @@ class TestHeldBindSources:
         (agents_dir / "moved-agent").symlink_to(moved)
         for username in ("alice", ""):
             cfg = _make_config(agents_dir, mcps_dir, username=username, agent="moved-agent")
-            cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+            cmd = _rendered(SandboxBuilder(cfg), ["claude"])
             launcher = cmd[:cmd.index("--")]
             real = str(moved.resolve())
             assert launcher[launcher.index("--beneath") + 1] == real
@@ -1990,10 +1657,12 @@ class TestHeldBindSources:
             finally:
                 _close_fds(out[:out.index("--")])
 
-    def test_every_option_the_builder_emits_is_known_to_the_shim(self, tmp_agents, tmp_path):
+    def test_every_option_the_render_emits_is_known_to_the_shim(self, tmp_agents, tmp_path):
         """The shim steps over each bwrap option with its values; one it
-        does not know refuses the launch, so every shape the builder emits
-        must walk cleanly and every agent-tree source must be held."""
+        does not know refuses the launch, so every shape the render emits
+        (with the uid map, the capped ``/tmp`` and the resolver swap of a
+        host that has them) must walk cleanly and every agent-tree source
+        must be held."""
         from core.sandbox.session_config_dir import HOOK_SCRIPTS
         agents_dir, mcps_dir = tmp_agents
         pa = agents_dir / "personal-assistant"
@@ -2013,8 +1682,12 @@ class TestHeldBindSources:
                                  external=True, external_home=str(home.resolve())),
         ]
         root = str(pa.resolve())
+        resolv = tmp_path / "netns-resolv.conf"
+        resolv.write_text("nameserver 169.254.1.1\n")
         for cfg in shapes:
-            bwrap = _bwrap_argv(SandboxBuilder(cfg).build_command_prefix(["claude", "--", "x"]))
+            bwrap = _bwrap_argv(_rendered(SandboxBuilder(cfg), ["claude", "--", "x"], uid=1000, gid=1000,
+                                          tmp_cap_mb=512, resolv_conf=str(resolv)))
+            assert {"--unshare-user", "--uid", "--size"} <= set(bwrap) and str(resolv) in bwrap
             out = _shim_held_binds([root])(bwrap)
             try:
                 head = out[:out.index("--")]
@@ -2028,7 +1701,7 @@ class TestHeldBindSources:
         cfg = _dataclasses.replace(
             _make_config(agents_dir, mcps_dir, username=""),
             app_mounts=[_Mount(str(tmp_path), "/app", False)], app_cwd="/app")
-        cmd = SandboxBuilder(cfg).build_command_prefix(["bun"])
+        cmd = _rendered(SandboxBuilder(cfg), ["bun"])
         assert "--beneath" not in cmd[:cmd.index("--")]
 
     def test_the_launcher_takes_the_root_before_its_own_flags(self):
@@ -2040,6 +1713,31 @@ class TestHeldBindSources:
         assert "_BENEATH = ['/srv/agents']" in mod._build_pyshim(
             ["8400"], [], "", True, False, beneath=["/srv/agents"])
         assert "_BENEATH = []" in mod._build_pyshim(["8400"], [], "", True, False)
+
+    def test_a_hosted_install_blackholes_the_shared_and_unique_local_ranges(
+            self, tmp_agents, monkeypatch):
+        """On a hosted install no address beside the public internet is the
+        customer's: the shim takes 100.64/10, 198.18/15 and fc00::/7 too,
+        and only there."""
+        import config as app_config
+        mod = _launcher_module()
+        hosted, rest = mod._take_flag(["--hosted", "--block-private", "--", "bwrap", "--hosted"],
+                                      "--hosted")
+        assert hosted and rest == ["--block-private", "--", "bwrap", "--hosted"]
+        assert mod._take_flag(["--block-private", "--", "x", "--hosted"], "--hosted")[0] is False
+        plain = mod._build_pyshim(["8400"], [], "", True, False)
+        shim = mod._build_pyshim(["8400"], [], "", True, False, hosted=True)
+        compile(shim, "shim", "exec")
+        for net in ("100.64.0.0/10", "198.18.0.0/15", "fc00::/7"):
+            assert repr(net) in shim and repr(net) not in plain, net
+        assert "_HOSTED = True" in shim and "_HOSTED = False" in plain
+        agents_dir, mcps_dir = tmp_agents
+        cfg = _make_config(agents_dir, mcps_dir)
+        cmd = _rendered(SandboxBuilder(cfg), ["claude"])
+        assert "--hosted" not in cmd[:cmd.index("--")]
+        monkeypatch.setattr(app_config, "OTODOCK_CLOUD", True)
+        cmd = _rendered(SandboxBuilder(cfg), ["claude"])
+        assert "--hosted" in cmd[:cmd.index("--")]
 
     def test_the_shim_hands_bwrap_a_held_handle_for_each_source_below_the_root(self, tmp_path):
         root = tmp_path / "agent"
@@ -2186,7 +1884,7 @@ class TestHeldBindSources:
         cfg = _dataclasses.replace(
             _make_config(agents_dir, mcps_dir, role="manager"),
             mount_shared=False, knowledge_libraries=[("src", "sub", False)])
-        cmd = SandboxBuilder(cfg).build_command_prefix(["ls", "/knowledge/shared/src/sub"])
+        cmd = _rendered(SandboxBuilder(cfg), ["ls", "/knowledge/shared/src/sub"])
         outside = tmp_path / "outside"
         (outside / "sub").mkdir(parents=True)
         (outside / "sub" / "host-only.txt").write_text("x")
@@ -2205,16 +1903,17 @@ class TestHeldBindSources:
                  "print('extra=' + ','.join(str(f) for f in fds if f > 3))\n"
                  "print('w=' + open('/users/alice/workspace/w.txt').read())\n")
         cfg = _make_config(agents_dir, mcps_dir, role="editor")
-        cmd = SandboxBuilder(cfg).build_command_prefix(["python3", "-c", probe])
+        cmd = _rendered(SandboxBuilder(cfg), ["python3", "-c", probe])
         out = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         assert "w=SEEN" in out.stdout, (out.stdout, out.stderr)
         assert "extra=\n" in out.stdout, (out.stdout, out.stderr)
 
 
 class TestEnginesResolveTheMcpMounts:
-    """A local engine hands the sandbox an MCP's declared mounts with the
-    ``${mcp_dir}`` template of the host resolved (the builder skips a host
-    path that does not exist, so an unresolved one was never mounted)."""
+    """An engine that readies a spawn hands the sandbox an MCP's declared
+    mounts with the ``${mcp_dir}`` template of the host resolved (the builder
+    skips a host path that does not exist, so an unresolved one is never
+    mounted)."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["claude-code-cli", "codex-cli"])
@@ -2228,7 +1927,7 @@ class TestEnginesResolveTheMcpMounts:
         from services.mcp.mcp_registry import SandboxMountDef
 
         mcp_dir = tmp_path / "mcps" / "demo"
-        manifest = SimpleNamespace(mcp_dir=mcp_dir, sandbox_mounts=[
+        manifest = SimpleNamespace(name="char-mounts", mcp_dir=mcp_dir, sandbox_mounts=[
             SandboxMountDef(host="${mcp_dir}/data", sandbox="/opt/demo", mode="ro")])
         monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [manifest])
         seen: dict = {}
@@ -2245,9 +1944,41 @@ class TestEnginesResolveTheMcpMounts:
         cfg = AgentConfig(agent_name="personal-assistant", sandbox_host_claude_dir=str(tmp_path),
                           security_context=ctx, execution_path=path)
         with pytest.raises(_Stop):
-            await get_layer_by_path(path)._start_session_impl("sess-x", cfg)
+            await get_layer_by_path(path)._prepare("sess-x", cfg)
         assert [(m.host, m.sandbox, m.mode) for m in seen["mcp_sandbox_mounts"]] == [
             (f"{mcp_dir}/data", "/opt/demo", "ro")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["claude-code-cli", "codex-cli"])
+    @pytest.mark.parametrize("own", [True, False])
+    async def test_a_machine_with_its_own_copy_opens_no_tool_address(self, path, own, tmp_path, monkeypatch):
+        """The placement the build made reaches the carve: a session on a
+        compute machine on another server opens no tool's local address."""
+        from auth.path_policy import SecurityContext
+        from core import placement
+        from core.execution_layer import AgentConfig
+        from core.session.session_manager import get_layer_by_path
+        from services.mcp import mcp_registry
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [])
+        seen: dict = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _capture(**kw):
+            seen.update(kw)
+            raise _Stop
+        monkeypatch.setattr(_sandbox_mod, "resolve_sandbox_config", _capture)
+        machine = {"id": "c-2", "name": "Rack", "pairing_scope": "compute",
+                   "compute_address": "203.0.113.7" if own else ""}
+        ctx = SecurityContext(role="editor", username="", agent="personal-assistant",
+                              is_admin_agent=False, session_scope="agent",
+                              placement=placement.from_machine(placement.KIND_COMPUTE, machine))
+        cfg = AgentConfig(agent_name="personal-assistant", sandbox_host_claude_dir=str(tmp_path),
+                          security_context=ctx, execution_path=path)
+        with pytest.raises(_Stop):
+            await get_layer_by_path(path)._prepare("sess-x", cfg)
+        assert seen["own_copy"] is own
 
 
 def test_the_session_env_turns_the_advisor_tool_off():
@@ -2257,3 +1988,139 @@ def test_the_session_env_turns_the_advisor_tool_off():
     from core.sandbox.env_builder import build_session_env
     env = build_session_env("sess-advisor", "personal-assistant")
     assert env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+
+
+def test_tools_that_really_start_connect_together(monkeypatch):
+    """Claude Code connects stdio tools three at a time and holds the first
+    turn for them all: twice the cores, 3 to 16, start together. A stand-in's
+    fingerprint leaves the name out, so no saved answer moves with it."""
+    import os
+
+    from core import stdio_path_interceptor as itc
+    from core.sandbox.env_builder import build_session_env
+    for cores, window in ((1, "3"), (6, "12"), (64, "16"), (None, "3")):
+        monkeypatch.setattr(os, "cpu_count", lambda c=cores: c)
+        assert build_session_env("sess-window", "personal-assistant")[
+            "MCP_SERVER_CONNECTION_BATCH_SIZE"] == window
+    assert itc._volatile("MCP_SERVER_CONNECTION_BATCH_SIZE")
+
+
+class TestAgentScopePersonalOnly:
+    def test_no_shared_space_binds_no_shared_folder(self, tmp_path, monkeypatch):
+        """An agent-scope session of an agent whose mode has no shared space
+        (Personal-only) binds no /workspace and no /knowledge; an attached
+        library mirrors read-only on its own."""
+        from core.sandbox.sandbox import SandboxBuilder, SandboxConfig
+        agents = tmp_path / "agents"
+        monkeypatch.setattr(_app_config, "AGENTS_DIR", agents)
+        agent_dir = agents / "solo"
+        for sub in ("workspace", "knowledge", "knowledge/shared/lib-a"):
+            (agent_dir / sub).mkdir(parents=True)
+        cfg = SandboxConfig(
+            role="manager", username="", agent_name="solo", is_admin_agent=False,
+            host_agents_dir=agents, host_mcps_dir=agents, host_claude_dir=agent_dir / "workspace" / ".claude",
+            config_visible=False, mount_shared=False, net_forwards=["8400"],
+            knowledge_libraries=[("lib-a", "", False)],
+        )
+        mounts = {m.sandbox: m for m in SandboxBuilder(cfg).workspace_mount_table()}
+        assert "/workspace" not in mounts and "/knowledge" not in mounts
+        assert mounts["/knowledge/shared/lib-a"].rw is False
+        shared = SandboxConfig(
+            role="manager", username="", agent_name="solo", is_admin_agent=False,
+            host_agents_dir=agents, host_mcps_dir=agents, host_claude_dir=agent_dir / "workspace" / ".claude",
+            config_visible=False, mount_shared=True, net_forwards=["8400"],
+        )
+        assert "/workspace" in {m.sandbox for m in SandboxBuilder(shared).workspace_mount_table()}
+
+
+# ---------------------------------------------------------------------------
+# The histories of memory and settings are out of every session's reach
+# ---------------------------------------------------------------------------
+
+_TABLE_SHAPES = [
+    # role, username, the fields a builder sets for the shape
+    ("viewer", "alice", {}), ("editor", "alice", {}), ("contributor", "alice", {}),
+    ("manager", "alice", {}), ("admin", "alice", {}),
+    ("manager", "alice", {"mount_shared": False}),
+    ("viewer", "", {"config_visible": False}), ("editor", "", {"config_visible": False}),
+    ("manager", "", {"config_visible": True}), ("manager", "", {"config_visible": False, "knowledge_rw": True}),
+    ("manager", "", {"config_visible": False, "mount_shared": False}),
+    ("manager", "", {"config_visible": False, "read_only": True}),
+    ("manager", "alice", {"read_only": True}),
+    ("external", "", {"config_visible": False, "external": True, "outside_files_write": True, "home": "external_home"}),
+    ("manager", "", {"config_visible": False, "home": "wrapup_home"}),
+    ("manager", "", {"config_visible": False, "home": "engine_home"}),
+]
+
+
+@pytest.mark.parametrize("role, username, shape", _TABLE_SHAPES,
+                         ids=lambda v: v if isinstance(v, str) else "+".join(sorted(v)) or "plain")
+def test_no_table_reaches_the_histories_of_memory_and_settings(tmp_agents, tmp_path, monkeypatch,
+                                                                role, username, shape):
+    """Each history is a repository in the proxy's own data
+    (services/infra/git_writer.py), and the proxy's git obeys what it finds
+    in one. No session's table may bind that folder, anything in it, or a
+    folder above it, read-only or not; and the description a compute machine
+    renders names no path there."""
+    import dataclasses
+    import json
+
+    import config as app_config
+    from services.infra import git_writer
+    agents_dir, mcps_dir = tmp_agents
+    monkeypatch.setattr(app_config, "SESSIONS_DIR", tmp_path / "sessions")
+    store = git_writer.history_root()
+    store.mkdir(parents=True)
+    fields = dict(shape)
+    home = fields.pop("home", "")
+    if home:
+        caller = agents_dir / "personal-assistant" / "externals" / "phone" / "caller-1"
+        (caller / ".claude").mkdir(parents=True)
+        fields[home] = str(caller)
+    cfg = dataclasses.replace(_make_config(agents_dir, mcps_dir, role=role, username=username), **fields)
+    builder = SandboxBuilder(cfg)
+    table = builder.workspace_mount_table()
+    assert table or not cfg.mount_shared, "only an agent scope with nothing shared binds nothing"
+    real_store = os.path.realpath(store)
+    for mount in table:
+        host = os.path.realpath(mount.host)
+        assert host != real_store and not host.startswith(real_store + os.sep), mount
+        assert not real_store.startswith(host.rstrip(os.sep) + os.sep), f"{mount} is above the histories"
+    described = json.dumps(dataclasses.asdict(builder.describe()), default=str)
+    assert str(store) not in described and git_writer.HISTORY_DIRNAME + "/" not in described
+
+
+@pytest.mark.parametrize("named", ["../sessions/history", "./../sessions", "../sessions", "..", "./x"])
+def test_a_tool_folder_bind_never_leaves_the_tools_folder(tmp_agents, tmp_path, monkeypatch, named):
+    """The tool folders a session binds are read from its MCP config's text:
+    only a folder named by two plain parts under the tools folder is bound,
+    so no text there can bind the histories of memory and settings, the
+    sessions folder or anything above them."""
+    import dataclasses
+    import json
+
+    import config as app_config
+    from services.infra import git_writer
+    agents_dir, mcps_dir = tmp_agents
+    monkeypatch.setattr(app_config, "MCPS_DIR", mcps_dir)
+    monkeypatch.setattr(app_config, "SESSIONS_DIR", tmp_path / "sessions")
+    store = git_writer.history_root() / "agents" / "personal-assistant" / "config.git"
+    store.mkdir(parents=True)
+    (mcps_dir / "custom" / "tool").mkdir(parents=True, exist_ok=True)
+    (mcps_dir / "x").mkdir(exist_ok=True)
+    mcps = str(mcps_dir.resolve())
+    config_file = tmp_path / "mcp.json"
+    config_file.write_text(json.dumps({"mcpServers": {
+        "tool": {"command": f"{mcps}/custom/tool/run", "args": [f"{mcps}/{named}/x"]}}}))
+    binds = _sandbox_mod.mcp_dir_binds_from_config(config_file)
+    from services.mcp import mcp_installer
+    interpreters = {str(d) for d in mcp_installer.interpreter_dirs(mcps_dir.resolve())}
+    assert [b for b in binds if b not in interpreters] == [f"{mcps}/custom/tool"]
+    cfg = dataclasses.replace(_make_config(agents_dir, mcps_dir), mcp_dir_binds=binds)
+    rels = SandboxBuilder(cfg).describe().mcp_binds
+    real_store = os.path.realpath(store)
+    for rel in rels:
+        assert ".." not in rel.split("/"), rel
+        host = os.path.realpath(os.path.join(mcps, rel))
+        assert host.startswith(mcps + os.sep), rel
+        assert not real_store.startswith(host + os.sep) and not host.startswith(real_store), rel

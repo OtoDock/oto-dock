@@ -394,9 +394,10 @@ async def task_produce(
                     break
                 # The CLI's own self-wake review turn (≥2.1.243) may already
                 # have covered this cohort — inline during the settle read
-                # (the session loop notes an in-settle init) or via a drain
-                # capture in the wait above. A second review would double the
-                # cost and re-tell the model what it just reviewed.
+                # (the session loop notes the wake turn's result, which the
+                # settle read waits for) or via a drain capture in the wait
+                # above. A second review would double the cost and re-tell
+                # the model what it just reviewed.
                 from core.events import wake_capture
                 if wake_capture.recently_captured(session_id, within_s=120.0):
                     logger.info(

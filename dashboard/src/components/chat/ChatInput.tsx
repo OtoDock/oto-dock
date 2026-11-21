@@ -36,12 +36,13 @@ import {
   FOLDER_PICKER_ATTRS, type CollectedItems,
 } from '../../lib/droppedItems'
 import { FILE_ICON_PATH, FOLDER_ICON_PATH } from './attachmentIcons'
+import { composerTakesDrag, fetchDroppedFile, readFileDrag, REFUSED_SHAPE } from '../../lib/chat/fileDrag'
 import { enterAction, insertNewline, isComposingKey, pasteAttachesFiles } from '../../lib/composerKeys'
 import { useFlag } from '../../hooks/useFlag'
 import { useTransferStore } from '../../store/transferStore'
 import { saveDocumentPane, useDocumentPushStore } from '../../store/documentPaneStore'
 import { Bar } from '../common/TransferBar'
-import { POPOVER } from '../ui/classes'
+import { COMPOSER_COLUMN, COMPOSER_INSET, POPOVER } from '../ui/classes'
 import { GLASS } from '../ui/glass'
 import { SEND_SAVE_TIMEOUT_MS } from './media/DocumentFrame'
 import ImageLightbox from './media/ImageLightbox'
@@ -59,6 +60,11 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/** What a file over the upload cap says, on its chip. */
+function uploadCapSentence(cap: number): string {
+  return `Over the ${formatFileSize(cap)} upload limit`
 }
 
 // Inline images ride the dashboard WS as base64 data-URLs in ONE frame with
@@ -155,6 +161,7 @@ interface Props {
    * single slot instead. */
   queueable?: boolean
   aborting?: boolean
+  /** The box's hint; "" shows none (a notice above says why it is locked). */
   placeholder?: string
   queuedCount?: number
   editText?: string | null
@@ -168,6 +175,8 @@ interface Props {
    * promise of it while a dropped folder is read (the chip shows at once);
    * a host without it turns a dropped folder away with an error chip. */
   onAddFolder?: (name: string, items: CollectedItems | Promise<CollectedItems>) => void
+  /** Attach a file fetched first (a file card dragged from a chat). */
+  onAddFetched?: (name: string, load: (signal: AbortSignal) => Promise<File>) => void
   onRemoveFile: (id: string) => void
   /** Re-queue a failed upload from its error chip. The affordance renders
    * only for retryable failures (a file over the upload cap stays
@@ -255,6 +264,7 @@ export default function ChatInput({
   pendingFiles,
   onAddFiles,
   onAddFolder,
+  onAddFetched,
   onRemoveFile,
   onRetryFile,
   workspaceOpen,
@@ -364,7 +374,7 @@ export default function ChatInput({
   const pasteGuard = usePasteGuard()
   // The pending-photo lightbox is portaled out of the composer: while it is
   // open, using it never shrinks the composer.
-  const height = useComposerHeight(textareaRef, rootRef, { animate: animateHeight, holdOpen: lightbox !== null })
+  const height = useComposerHeight(textareaRef, rootRef, { animate: animateHeight, holdOpen: lightbox !== null, touchPrimary })
 
   // The chat's document pane holds unsaved edits: the agent reads the
   // stored file, so a send saves them first (FEATURES.md "Document pane").
@@ -547,7 +557,7 @@ export default function ChatInput({
       onAddFiles(docFiles.map(file => ({
         id: generateId(), name: file.name, size: file.size, file,
         ...(file.size > uploadCap
-          ? { error: `Over the ${formatFileSize(uploadCap)} upload limit` }
+          ? { error: uploadCapSentence(uploadCap) }
           : {}),
       })))
     }
@@ -631,8 +641,8 @@ export default function ChatInput({
   )
 
   return (
-    <div ref={rootRef} className="px-3 pb-composer-safe">
-      <div className="max-w-4xl mx-auto">
+    <div ref={rootRef} className={`${COMPOSER_INSET} pb-composer-safe`}>
+      <div className={COMPOSER_COLUMN}>
         {(docNotice || docDirty) && (
           <p role="status" className="mb-1 truncate px-1 text-xs text-status-warning-fg">
             {docNotice || (docSaving
@@ -665,23 +675,24 @@ export default function ChatInput({
         )}
         <div
           className={`relative z-40 ${GLASS} rounded-composer p-2`}
-          // Drop zone for EXTERNAL files only (dataTransfer carries 'Files').
-          // Internal agent-path drags never do, so their native text insert
-          // into the textarea keeps working untouched. preventDefault on the
+          // Drop zone for EXTERNAL files (dataTransfer carries 'Files') and
+          // for a file card dragged from a chat (lib/chat/fileDrag). Internal
+          // agent-path drags carry neither, so their native text insert into
+          // the textarea keeps working untouched. preventDefault on the
           // external path is load-bearing: an unhandled file drop navigates
           // the page away.
           onDragEnter={(e) => {
-            if (disabled || !Array.from(e.dataTransfer?.types ?? []).includes('Files')) return
+            if (disabled || !composerTakesDrag(e.dataTransfer)) return
             e.preventDefault()
             setDragDepth(d => d + 1)
           }}
           onDragOver={(e) => {
-            if (disabled || !Array.from(e.dataTransfer?.types ?? []).includes('Files')) return
+            if (disabled || !composerTakesDrag(e.dataTransfer)) return
             e.preventDefault()
             e.dataTransfer.dropEffect = 'copy'
           }}
           onDragLeave={(e) => {
-            if (disabled || !Array.from(e.dataTransfer?.types ?? []).includes('Files')) return
+            if (disabled || !composerTakesDrag(e.dataTransfer)) return
             setDragDepth(d => Math.max(0, d - 1))
           }}
           onDrop={(e) => {
@@ -690,7 +701,20 @@ export default function ChatInput({
             // read: it is walked through its entry and attached as one chip.
             const { files, folders } = splitDropForAttach(e.dataTransfer)
             setDragDepth(0)
-            if (!files.length && !folders.length) return // internal path drag → textarea handles it
+            if (!files.length && !folders.length) {
+              // A file card: fetched by its checked reference, never by an
+              // address the drop carries. Real files win over a card.
+              const card = readFileDrag(e.dataTransfer)
+              if (!card) return // internal path drag → textarea handles it
+              e.preventDefault()
+              if ('refused' in card || !onAddFetched) {
+                onAddFiles([{ id: generateId(), name: 'Dropped file', size: 0,
+                              error: 'refused' in card ? card.refused : REFUSED_SHAPE }])
+              } else {
+                onAddFetched(card.name, (signal) => fetchDroppedFile(card, uploadCap, signal, uploadCapSentence))
+              }
+              return
+            }
             e.preventDefault()
             for (const folder of folders) {
               if (!onAddFolder) {
@@ -799,7 +823,7 @@ export default function ChatInput({
                       <span className="text-xs text-tertiary shrink-0">
                         {f.folder
                           ? f.fileCount == null ? 'Folder' : `${f.fileCount} file${f.fileCount === 1 ? '' : 's'}`
-                          : formatFileSize(f.size)}
+                          : f.size || f.file ? formatFileSize(f.size) : ''}
                       </span>
                       {f.error && onRetryFile && ((f.file && f.size <= uploadCap) || f.folderFiles) && (
                         <button
@@ -1032,7 +1056,7 @@ export default function ChatInput({
                   void ingestFiles(files)
                 }
               }}
-              placeholder={placeholder || 'Type a message...'}
+              placeholder={placeholder ?? 'Type a message...'}
               disabled={disabled}
               rows={1}
               className="flex-1 resize-none rounded-control px-3 py-2 text-sm bg-transparent

@@ -28,6 +28,7 @@ from core.execution_layer import ResumeVerdict
 from services.scheduler import interactive, runner, scheduler, shared
 from storage import database as task_store
 from storage.automation import run_status
+from tests._compute import serve
 
 pytestmark = pytest.mark.asyncio
 
@@ -353,6 +354,9 @@ def _drive(monkeypatch, layer: _Layer, task: shared.TaskDefinition, run_id: str,
                         lambda *a, **k: task_config_builder.TaskIdentity("", "manager", "agent", None))
     monkeypatch.setattr(session_manager, "get_execution_layer", lambda *a, **k: layer)
     monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
+    # A run of the platform's place takes its slot on the compute machine
+    # that serves (with none it would wait for one before its slot).
+    serve(monkeypatch)
     monkeypatch.setattr(concurrency, "task_slot", _instant_slot)
     monkeypatch.setattr("configuration.models.get_cli_model", lambda agent, layer=None: "test-model")
     monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
@@ -668,7 +672,9 @@ async def test_a_checks_judge_run_gets_no_prelude(temp_db, monkeypatch):
 
 
 @pytest.mark.parametrize("engine,via_argv", [("codex-cli", True), ("claude-code-cli", False)])
-async def test_an_interactive_runs_first_prompt_carries_both_lines(temp_db, monkeypatch, engine, via_argv):
+async def test_an_interactive_runs_first_prompt_carries_the_time_once(temp_db, monkeypatch, engine, via_argv):
+    """The time line on the prompt's own line; the parallel sessions come
+    with the start's data (the terminal's start hook), never on the prompt."""
     from core.config import task_config_builder
     from core.session import sibling_awareness
     run_id = f"run-tz3-{via_argv}"
@@ -703,7 +709,8 @@ async def test_an_interactive_runs_first_prompt_carries_both_lines(temp_db, monk
         shared._run_subscribers.pop(run_id, None)
     [prompt] = driven
     # One line: the Claude TUI would journal a multi-line prompt as a paste.
-    assert prompt.startswith("[Current time: ") and prompt.endswith(f"] {parallel} count")
+    assert prompt.startswith("[Current time: ") and prompt.endswith("] count")
+    assert parallel not in prompt
     assert "\n" not in prompt
     assert cfg.interactive_first_prompt == (prompt if via_argv else "")
     assert layer.sends == []      # no pump for a terminal

@@ -394,6 +394,10 @@ async def test_a_deletion_archives_the_folders_outside_the_agent_trees(world):
     home_a = root / A / "users" / w.pat_name
     (home_a / "workspace").mkdir(parents=True, exist_ok=True)
     (home_a / "workspace" / "notes.md").write_text("mine")
+    from services.infra import git_writer
+    (home_a / "context").mkdir(exist_ok=True)
+    (home_a / "context" / "note.md").write_text("mine too")
+    assert git_writer.commit_file(home_a / "context", home_a / "context" / "note.md", "pat's own")
     # The membership made B's tree; a link stands in its place here.
     shutil.rmtree(root / B / "users" / w.pat_name)
     (root / B / "users" / w.pat_name).symlink_to(root / A)
@@ -411,6 +415,12 @@ async def test_a_deletion_archives_the_folders_outside_the_agent_trees(world):
     assert (root / A / "users" / "someone-else").is_dir()
     [retired] = db.list_retired_usernames()
     assert retired["archived_at"]
+    # The folder's history left its place with it: the name given out again
+    # starts with none.
+    assert not git_writer.store_path(f"{A}/users/{w.pat_name}/context").exists()
+    assert (git_writer.history_root() / "offboarded" / w.pat_name / A / "context.git" / "HEAD").is_file()
+    (home_a / "context").mkdir(parents=True)
+    assert git_writer.log(home_a / "context") == []
 
 
 @pytest.mark.asyncio

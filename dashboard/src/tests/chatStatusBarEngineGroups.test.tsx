@@ -2,6 +2,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 
 import ChatStatusBar from '@/components/chat/ChatStatusBar'
+import { modeBusyReason } from '@/lib/engines/modes'
 
 // ─── Model dropdown: multi-engine groups + the display-only overrides ───────
 // On a dead chat the page passes expanded groups (chat engine first) and,
@@ -116,16 +117,52 @@ describe('ChatStatusBar — the right-hand controls', () => {
     expect(rightControls()).toEqual(['pill', 'mode', 'model'])
   })
 
-  it.each([1280, 390])('on a live terminal at %i px: the pill, the view toggle, the model', (px) => {
+  it.each([1280, 390])('on a live terminal at %i px: the view toggle, the pill, the mode, the model', (px) => {
     Object.defineProperty(window, 'innerWidth', { value: px, configurable: true })
-    renderBar({ targetSlot: PILL, richViewAvailable: true, hidePermissions: true, interactiveActive: true })
-    expect(rightControls()).toEqual(['pill', 'view', 'model'])
+    renderBar({ targetSlot: PILL, richViewAvailable: true, interactiveActive: true })
+    expect(rightControls()).toEqual(['view', 'pill', 'mode', 'model'])
   })
 
   it('the terminal order holds while the history view is shown', () => {
+    renderBar({ targetSlot: PILL, richViewAvailable: true, richViewActive: true, interactiveActive: true })
+    expect(rightControls()).toEqual(['view', 'pill', 'mode', 'model'])
+  })
+
+  it('a live terminal with the toggle on and no terminal yet: no view toggle, the mode shown', () => {
+    renderBar({ targetSlot: PILL, interactiveActive: true })
+    expect(rightControls()).toEqual(['pill', 'mode', 'model'])
+  })
+
+  it('a turn on a live terminal and a restart make the mode button busy; a headless turn never', () => {
+    const idle = { terminalLive: false, terminalChat: false, switching: false, starting: false, turnRuns: false }
+    const live = { ...idle, terminalLive: true, terminalChat: true }
+    expect(modeBusyReason({ ...live, turnRuns: true })).toBe('Finish or stop the current turn before changing the mode.')
+    expect(modeBusyReason(live)).toBe('')
+    expect(modeBusyReason({ ...idle, turnRuns: true })).toBe('')
+    expect(modeBusyReason({ ...idle, switching: true })).toBe('The chat is starting again.')
+    // A terminal chat whose terminal is starting: its start has read the mode.
+    expect(modeBusyReason({ ...idle, terminalChat: true, starting: true }))
+      .toBe('The terminal is starting. Pick the mode again when it is up.')
+    // A terminal chat with nothing starting: the pick goes to the row.
+    expect(modeBusyReason({ ...idle, terminalChat: true })).toBe('')
+    // A headless chat starting: its pick reaches the start.
+    expect(modeBusyReason({ ...idle, starting: true })).toBe('')
+  })
+
+  it('a busy mode button takes no pick, keeps its place and says why on a click', () => {
+    const onModeChange = vi.fn()
+    const reason = 'Finish or stop the current turn before changing the mode.'
     renderBar({
-      targetSlot: PILL, richViewAvailable: true, richViewActive: true, hidePermissions: true, interactiveActive: true,
+      targetSlot: PILL, richViewAvailable: true, interactiveActive: true, mode: 'dontAsk',
+      modeBusyReason: reason, onModeChange,
     })
-    expect(rightControls()).toEqual(['pill', 'view', 'model'])
+    expect(rightControls()).toEqual(['view', 'pill', 'mode', 'model'])
+    const button = screen.getByTestId('mode-busy')
+    expect(button.getAttribute('aria-disabled')).toBe('true')
+    expect(button.getAttribute('title')).toBe(`Mode: Don't Ask. ${reason}`)
+    fireEvent.click(button)
+    expect(screen.getByTestId('runs-on-note').textContent).toContain(reason)
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(onModeChange).not.toHaveBeenCalled()
   })
 })

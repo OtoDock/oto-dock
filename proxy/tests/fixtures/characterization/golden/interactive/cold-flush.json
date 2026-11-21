@@ -1,0 +1,626 @@
+[
+ {
+  "pty": [
+   "\u001b[200~earlier\nhistory\n\n\u001b[201~",
+   "please redeploy the internal install and verify the card"
+  ],
+  "slot_acquired": [
+   [
+    "sid-cold-retry",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-cold-retry": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": "please redeploy the internal install and verify the card\r"
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_submit",
+     "_fire_submit"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the flush pastes the seed, then the body",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "\r"
+  ],
+  "state": {
+   "sid-cold-retry": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": "please redeploy the internal install and verify the card\r"
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_check_cold_flush",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the Enter arms the watcher",
+  "timers": [
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ],
+   [
+    "_check_cold_flush",
+    5.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "\u001b[200~earlier\nhistory\n\n\u001b[201~",
+   "please redeploy the internal install and verify the card"
+  ],
+  "state": {
+   "sid-cold-retry": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 1,
+     "pending": "please redeploy the internal install and verify the card\r"
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_submit",
+     "_fire_submit",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "unconfirmed: replay 1",
+  "timers": [
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "\r",
+   "\u001b[200~earlier\nhistory\n\n\u001b[201~",
+   "please redeploy the internal install and verify the card"
+  ],
+  "state": {
+   "sid-cold-retry": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 2,
+     "pending": "please redeploy the internal install and verify the card\r"
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_submit",
+     "_fire_submit",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "unconfirmed: replay 2",
+  "timers": [
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ],
+   [
+    "_check_cold_flush",
+    5.0
+   ],
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "\r"
+  ],
+  "rows": [
+   [
+    "event",
+    "",
+    "system",
+    "{\"type\": \"system\", \"subtype\": \"undelivered_input\", \"message\": \"please redeploy the internal install and verify the card\"}"
+   ]
+  ],
+  "state": {
+   "sid-cold-retry": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 2,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "exhausted: the breadcrumb",
+  "timers": [
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ],
+   [
+    "_check_cold_flush",
+    5.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-cold-turn",
+    "streaming",
+    {
+     "agent": "term-cold"
+    }
+   ]
+  ],
+  "pty": [
+   "please redeploy the internal install and verify the card",
+   "\r"
+  ],
+  "slot_acquired": [
+   [
+    "sid-cold-turn",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-cold-turn": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_title_timer",
+     "_run_midturn_tail",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "the transcript confirms: the watcher stands down",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ],
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ],
+   [
+    "_check_cold_flush",
+    5.0
+   ],
+   [
+    "_fire_title_timer",
+    30.0
+   ],
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "please redeploy the internal install and verify the card",
+   "\r"
+  ],
+  "slot_acquired": [
+   [
+    "sid-cold-hook",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-cold-hook": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "a hook after the Enter confirms it",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ],
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ],
+   [
+    "_check_cold_flush",
+    5.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "please redeploy the internal install and verify the card",
+   "x"
+  ],
+  "rows": [
+   [
+    "event",
+    "",
+    "system",
+    "{\"type\": \"system\", \"subtype\": \"undelivered_input\", \"message\": \"please redeploy the internal install and verify the card\"}"
+   ]
+  ],
+  "slot_acquired": [
+   [
+    "sid-cold-typed",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-cold-typed": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": true,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the person types over the pending Enter: the breadcrumb",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "ok",
+   "x"
+  ],
+  "rows": [],
+  "slot_acquired": [
+   [
+    "sid-cold-short",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-cold-short": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": true,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "short residue leaves no row",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ]
+  ]
+ },
+ {
+  "slot_acquired": [
+   [
+    "sid-cold-argv",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-cold-argv": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "a prompt in the launch argument starts ready"
+ }
+]

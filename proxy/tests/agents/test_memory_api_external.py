@@ -1,4 +1,4 @@
-"""The memory API for external sessions: only the caller's own scope."""
+"""The memory API for an outside session: refused at the door and behind it."""
 
 from __future__ import annotations
 
@@ -14,15 +14,10 @@ def client(temp_db):
     return TestClient(app)
 
 
-def _seed_agent(slug: str, *, collaborative: bool = True, default_scope: str = "user") -> None:
+def _seed_agent(slug: str) -> None:
     from storage.agents import agent_store
     if not agent_store.agent_exists(slug):
-        agent_store.create_agent(slug, slug.title(), default_scope=default_scope)
-    if not collaborative:
-        from storage.pg import get_conn
-        with get_conn() as c:
-            c.execute("UPDATE agents SET collaborative = FALSE WHERE slug = %s", (slug,))
-            c.commit()
+        agent_store.create_agent(slug, slug.title(), default_scope="user")
 
 
 def _headers(agent: str, claim: str) -> dict:
@@ -35,47 +30,36 @@ def _op(client, agent, claim, **body):
     return client.post("/v1/internal/memory/op", json=body, headers=_headers(agent, claim))
 
 
-def test_caller_scope_only(client):
+@pytest.mark.parametrize("claim", ["phone:+302101234567", "phone:", "phone:ephemeral:4f1d2c3b-0000-4000-8000-0000000000e1"])
+def test_an_outside_session_is_refused_the_memory_route(client, claim):
+    """Whatever the person's home: the middleware keeps the memory route off an
+    outside token, and nothing lands on disk."""
     import config
     _seed_agent("ext-mem")
-    claim = "phone:+302101234567"
-    r = _op(client, "ext-mem", claim, command="view", path="/memories")
-    assert r.status_code == 200 and not r.json()["is_error"]
-    listing = r.json()["output"]
-    assert "user/" in listing and "agent/" not in listing
-
     r = _op(client, "ext-mem", claim, command="create", path="/memories/user/name.md",
             file_text="# Name\nThe caller is Maria.\n")
-    assert r.status_code == 200 and not r.json()["is_error"], r.json()
-    saved = (config.AGENTS_DIR / "ext-mem" / "externals" / "phone" / "302101234567"
-             / "context" / "memory" / "name.md")
-    assert saved.is_file()
-
-    r = _op(client, "ext-mem", claim, command="create", path="/memories/agent/x.md",
-            file_text="# x\n")
-    assert r.json()["is_error"] and "external routes" in r.json()["output"]
-    r = _op(client, "ext-mem", claim, command="view", path="/memories/agent/")
-    assert r.json()["is_error"]
+    assert r.status_code == 403
+    externals = config.AGENTS_DIR / "ext-mem" / "externals"
+    assert not list(externals.rglob("name.md")) if externals.exists() else True
 
 
-def test_shared_mode_has_no_memory(client):
-    _seed_agent("ext-mem")
-    r = _op(client, "ext-mem", "phone:", command="view", path="/memories")
-    assert r.json()["is_error"] and "not available on this line" in r.json()["output"]
+@pytest.mark.asyncio
+async def test_the_handler_refuses_an_outside_session_behind_the_middleware(temp_db):
+    """Defence in depth: the handler itself answers an outside session with
+    the tool's own refusal, never a scope."""
+    from unittest.mock import AsyncMock
 
+    from api.agent_data import memory as memory_api
+    from auth import roles
+    from auth.providers import UserContext
 
-def test_shared_only_agent_has_no_caller_memory(client):
-    _seed_agent("ext-shared-only", collaborative=False, default_scope="agent")
-    r = _op(client, "ext-shared-only", "phone:+3021", command="view", path="/memories")
-    assert r.json()["is_error"] and "not available on this line" in r.json()["output"]
-
-
-def test_ephemeral_caller_writes_under_the_ephemeral_tree(client):
-    import config
     _seed_agent("ext-mem")
     sid = str(uuid.uuid4())
-    r = _op(client, "ext-mem", f"phone:ephemeral:{sid}", command="create",
-            path="/memories/user/t.md", file_text="# t\n")
-    assert not r.json()["is_error"], r.json()
-    assert (config.AGENTS_DIR / "ext-mem" / "externals" / "phone" / "_ephemeral" / sid
-            / "context" / "memory" / "t.md").is_file()
+    user = UserContext(sub=f"session:{sid}", email="", name="", role=roles.SERVICE,
+                       is_api_key=True, session_id=sid, agent="ext-mem",
+                       external_claim="phone:+3021", external_channel="phone")
+    assert user.is_external
+    request = AsyncMock()
+    out = await memory_api.memory_op(request, user=user, x_agent_name="ext-mem")
+    assert out["is_error"] and "not written during an outside conversation" in out["output"]
+    request.json.assert_not_called()

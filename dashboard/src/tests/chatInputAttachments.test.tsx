@@ -246,4 +246,66 @@ describe('ChatInput attachments', () => {
     expect(box).toBeTruthy()
     expect(box.getAttribute('data-count')).toBe('1')
   })
+
+  describe('a file card dragged from a chat', () => {
+    const TOKEN = 'k'.repeat(43)
+    function card(ref: Record<string, unknown>) {
+      const data: Record<string, string> = { 'application/x-otodock-file': JSON.stringify(ref) }
+      return { files: [] as File[], items: [], types: Object.keys(data), getData: (t: string) => data[t] ?? '' }
+    }
+    const ref = () => ({ v: 1, origin: window.location.origin, token: TOKEN, name: 'q3.pdf' })
+
+    it('shows the drop overlay', () => {
+      const props = baseProps()
+      const { container } = render(<ChatInput {...props} />)
+      fireEvent.dragEnter(composerPill(container), { dataTransfer: card(ref()) })
+      expect(container.textContent).toContain('Drop to attach')
+    })
+
+    it('hands the checked reference to the intake, and the textarea inserts nothing', async () => {
+      const props = { ...baseProps(), onAddFetched: vi.fn() }
+      const { container } = render(<ChatInput {...props} />)
+      const notCancelled = fireEvent.drop(composerPill(container), { dataTransfer: card(ref()) })
+      expect(notCancelled).toBe(false)
+      expect(props.onAddFetched).toHaveBeenCalledTimes(1)
+      expect(props.onAddFetched.mock.calls[0][0]).toBe('q3.pdf')
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(new Uint8Array(3)))
+      await props.onAddFetched.mock.calls[0][1](new AbortController().signal)
+      expect(fetchSpy.mock.calls[0][0]).toBe(`/v1/media/${TOKEN}?download=1`)
+      fetchSpy.mockRestore()
+      expect(props.onAddFiles).not.toHaveBeenCalled()
+    })
+
+    it('turns a card from another install away with its sentence and fetches nothing', () => {
+      const props = { ...baseProps(), onAddFetched: vi.fn() }
+      const { container } = render(<ChatInput {...props} />)
+      fireEvent.drop(composerPill(container), { dataTransfer: card({ ...ref(), origin: 'https://other.example' }) })
+      expect(props.onAddFetched).not.toHaveBeenCalled()
+      expect(props.onAddFiles.mock.calls[0][0][0]).toMatchObject({
+        name: 'Dropped file', error: 'This file is from another OtoDock.',
+      })
+    })
+
+    it('shows no size on a chip that has no file yet, or was refused', () => {
+      const props = baseProps()
+      props.pendingFiles = [
+        { id: 'w', name: 'q3.pdf', size: 0, uploading: true, queued: true },
+        { id: 'r', name: 'Dropped file', size: 0, error: 'This file is from another OtoDock.' },
+        { id: 'z', name: 'empty.txt', size: 0, file: makeFile('empty.txt', 0) },
+      ]
+      const { container } = render(<ChatInput {...props} />)
+      expect(container.textContent).toContain('This file is from another OtoDock.')
+      expect(container.textContent?.match(/0 B/g) ?? []).toHaveLength(1)   // the picked empty file keeps its size
+    })
+
+    it('lets real files win over a card', async () => {
+      const props = { ...baseProps(), onAddFetched: vi.fn() }
+      const { container } = render(<ChatInput {...props} />)
+      const both = { ...card(ref()), files: [makeFile('real.zip', 300)], types: ['Files', 'application/x-otodock-file'] }
+      fireEvent.drop(composerPill(container), { dataTransfer: both })
+      await waitFor(() => expect(props.onAddFiles).toHaveBeenCalledTimes(1))
+      expect(props.onAddFiles.mock.calls[0][0][0].name).toBe('real.zip')
+      expect(props.onAddFetched).not.toHaveBeenCalled()
+    })
+  })
 })

@@ -1,0 +1,76 @@
+[
+ {
+  "projector": [
+   [
+    "propagate_mirror_delete",
+    "flow-agent",
+    "src-agent",
+    "sub/x.md"
+   ]
+  ],
+  "step": "a mirror delete reaches the source",
+  "tree": {}
+ },
+ {
+  "projector": [
+   [
+    "propagate_mirror_delete",
+    "flow-agent",
+    "src-agent",
+    "sub/y.md"
+   ]
+  ],
+  "step": "a mirror delete the source ignores",
+  "tree": {}
+ },
+ {
+  "projector": [
+   [
+    "propagate_mirror_write",
+    "flow-agent",
+    "src-agent",
+    "sub/x.md"
+   ]
+  ],
+  "step": "a mirror write flows back",
+  "tree": {
+   "knowledge/shared/src-agent/sub/x.md": "k"
+  }
+ },
+ {
+  "projector": [],
+  "step": "a read-only mirror takes no write",
+  "tree": {
+   "knowledge/shared/src-agent/sub/x.md": "k"
+  }
+ },
+ {
+  "projector": [
+   [
+    "propagate_source_write",
+    "flow-agent",
+    "own.md",
+    false
+   ]
+  ],
+  "step": "a write of the agent's own knowledge",
+  "tree": {
+   "knowledge/own.md": "k",
+   "knowledge/shared/src-agent/sub/x.md": "k"
+  }
+ },
+ {
+  "projector": [
+   [
+    "propagate_source_write",
+    "flow-agent",
+    "own.md",
+    true
+   ]
+  ],
+  "step": "a delete of it",
+  "tree": {
+   "knowledge/shared/src-agent/sub/x.md": "k"
+  }
+ }
+]

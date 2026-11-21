@@ -1,0 +1,213 @@
+[
+ {
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "the budget is full"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "interactive",
+    "reason": "evicted_for_capacity",
+    "session": "e-term"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "evicts the most idle: a terminal"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "remote",
+    "session": "e-codex"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "then the compute machine's Codex session"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "direct-llm",
+    "session": "e-direct"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "then direct"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "closed": [
+   {
+    "close": "remote",
+    "session": "e-claude"
+   }
+  ],
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "then its Claude Code session"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "busy",
+   "user_message": "Too many active sessions. The platform is busy. Try again shortly, or close an idle chat."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "only a fresh one left"
+ }
+]

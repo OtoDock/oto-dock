@@ -131,6 +131,177 @@ describe('the chime hook', () => {
   })
 })
 
+// A notification's chime on an iPhone or an iPad plays through Web Audio
+// alone, which Apple's WebKit plays in the "ambient" session: the Ring/Silent
+// switch mutes it. A media element plays in "playback", which the switch
+// leaves on. The chime asks for no session type (a spoken answer's hold and a
+// live microphone stay as they are), and every other device, the danger alarm
+// and the turn's ping keep the media element.
+const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'
+const IPHONE_APP = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148'
+const MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15'
+const ANDROID = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36'
+const DESKTOP_CHROME = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+const DEVICE = ['userAgent', 'platform', 'maxTouchPoints', 'audioSession']
+
+class ClipSource {
+  buffer: unknown = null
+  onended: (() => void) | null = null
+  started = 0
+  connect() {}
+  start() { this.started++; setTimeout(() => this.onended?.(), 0) }
+}
+
+class ClipContext {
+  static made: ClipContext[] = []
+  static decodes = true
+  closed = false
+  resumed = 0
+  destination = {}
+  gains: { gain: { value: number } }[] = []
+  sources: ClipSource[] = []
+  constructor() { ClipContext.made.push(this) }
+  resume() { this.resumed++; return Promise.resolve() }
+  close() { this.closed = true; return Promise.resolve() }
+  decodeAudioData() {
+    return ClipContext.decodes ? Promise.resolve({ duration: 0.4 }) : Promise.reject(new Error('not audio'))
+  }
+  createGain() {
+    const node = { gain: { value: 1 }, connect() {} }
+    this.gains.push(node)
+    return node
+  }
+  createBufferSource() {
+    const s = new ClipSource()
+    this.sources.push(s)
+    return s
+  }
+}
+
+function device(userAgent: string, opts: { platform?: string; touch?: number } = {}): string[] {
+  const writes: string[] = []
+  let type = 'auto'
+  const audioSession = {
+    get type() { return type },
+    set type(v: string) { writes.push(v); type = v },
+  }
+  const values: Record<string, unknown> = {
+    userAgent, platform: opts.platform ?? '', maxTouchPoints: opts.touch ?? 0, audioSession,
+  }
+  for (const [k, v] of Object.entries(values)) {
+    Object.defineProperty(navigator, k, { value: v, configurable: true })
+  }
+  return writes
+}
+
+describe('a notification chime on an iPhone or an iPad', () => {
+  beforeEach(() => {
+    FakeAudio.made = []
+    ClipContext.made = []
+    ClipContext.decodes = true
+    vi.stubGlobal('Audio', FakeAudio)
+    vi.stubGlobal('AudioContext', ClipContext)
+    vi.stubGlobal('speechSynthesis', { speak: vi.fn(), cancel: vi.fn(), getVoices: () => [] })
+    vi.stubGlobal('SpeechSynthesisUtterance', FakeUtterance)
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(8),
+    }) as unknown as Response))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    for (const k of DEVICE) delete (navigator as unknown as Record<string, unknown>)[k]
+  })
+
+  async function chime(severity: 'info' | 'success' | 'warning') {
+    const { useNotificationSound } = await freshHook()
+    const { result } = renderHook(() => useNotificationSound())
+    result.current.playForSeverity(severity, 't', 'b')
+    return result
+  }
+
+  it('plays through Web Audio alone, at its volume, and closes its context at the end', async () => {
+    for (const [ua, severity, file] of [
+      [IPHONE, 'info', '/sounds/success.wav'],
+      [IPHONE_APP, 'success', '/sounds/success.wav'],
+      [IPHONE, 'warning', '/sounds/warning.wav'],
+    ] as const) {
+      ClipContext.made = []
+      vi.mocked(fetch).mockClear()
+      const writes = device(ua)
+      await chime(severity)
+      await vi.waitFor(() => expect(ClipContext.made[0]?.closed).toBe(true))
+      expect(FakeAudio.made).toHaveLength(0)
+      expect(ClipContext.made).toHaveLength(1)
+      const ctx = ClipContext.made[0]
+      expect(ctx.sources.map(s => s.started)).toEqual([1])
+      expect(ctx.gains.map(g => g.gain.value)).toEqual([0.7])
+      expect(vi.mocked(fetch).mock.calls.map(c => c[0])).toContain(file)
+      // No session type asked: WebKit picks "ambient", which the switch mutes.
+      expect(writes).toEqual([])
+    }
+  })
+
+  it('plays through Web Audio on an iPad in desktop mode too', async () => {
+    const writes = device(MAC, { platform: 'MacIntel', touch: 5 })
+    await chime('info')
+    await vi.waitFor(() => expect(ClipContext.made[0]?.closed).toBe(true))
+    expect(FakeAudio.made).toHaveLength(0)
+    expect(writes).toEqual([])
+  })
+
+  it('leaves an open wake microphone alone', async () => {
+    const writes = device(IPHONE)
+    const { useNotificationSound } = await freshHook()
+    const mic = await import('@/audio/micCoordinator')
+    mic.noteCapture('wake', true)
+    const { result } = renderHook(() => useNotificationSound())
+    result.current.playForSeverity('info', 't', 'b')
+    await vi.waitFor(() => expect(ClipContext.made[0]?.closed).toBe(true))
+    expect(mic.captureLive()).toBe(true)
+    expect(mic.micBusy()).toBe(false)
+    expect(writes).toEqual([])
+    mic.noteCapture('wake', false)
+  })
+
+  it('keeps the media element on Android, a Mac and a desktop browser', async () => {
+    for (const ua of [ANDROID, MAC, DESKTOP_CHROME]) {
+      FakeAudio.made = []
+      device(ua)
+      await chime('info')
+      expect(FakeAudio.made.map(a => [a.src, a.volume])).toEqual([['/sounds/success.wav', 0.7]])
+    }
+    expect(ClipContext.made).toHaveLength(0)
+  })
+
+  it('keeps the media element for the danger alarm and the turn ping on an iPhone', async () => {
+    device(IPHONE)
+    const { useNotificationSound } = await freshHook()
+    const { result } = renderHook(() => useNotificationSound())
+    result.current.playPing()
+    result.current.playForSeverity('danger', 't', 'b')
+    await result.current.stopDangerAlarm()
+    expect(FakeAudio.made.map(a => a.src)).toEqual(['/sounds/ping.wav', '/sounds/danger.wav'])
+    expect(ClipContext.made).toHaveLength(0)
+  })
+
+  it('plays the media element as before on an iPhone with no Web Audio', async () => {
+    device(IPHONE)
+    vi.stubGlobal('AudioContext', undefined)
+    await chime('info')
+    expect(FakeAudio.made.map(a => a.src)).toEqual(['/sounds/success.wav'])
+  })
+
+  it('closes its context and throws nothing when the file cannot be played', async () => {
+    device(IPHONE)
+    ClipContext.decodes = false
+    await chime('info')
+    await vi.waitFor(() => expect(ClipContext.made[0]?.closed).toBe(true))
+    expect(ClipContext.made[0].sources).toHaveLength(0)
+    expect(FakeAudio.made).toHaveLength(0)
+  })
+})
+
 /** The WAV header's duration: the fmt chunk's rate, channels and bits, the
  *  data chunk's size. */
 function wavSeconds(bytes: Buffer): number {

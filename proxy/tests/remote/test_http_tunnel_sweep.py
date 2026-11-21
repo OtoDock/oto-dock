@@ -194,15 +194,15 @@ async def test_mcp_streams_and_hook_streams_are_capped_separately(monkeypatch):
     client = _ParkedClient()
     monkeypatch.setattr(disp, "_get_client", lambda is_mcp=False: client)
     try:
-        assert await _admitted(disp, mgr, "m1", "mcp-1", "/mcp/file-tools/mcp/")
+        assert await _admitted(disp, mgr, "m1", "mcp-1", "/mcp/plain-tool/mcp/")
         # A queried MCP path is still an MCP stream.
-        assert await _admitted(disp, mgr, "m1", "mcp-2", "/mcp/file-tools/mcp/?session_id=1")
+        assert await _admitted(disp, mgr, "m1", "mcp-2", "/mcp/plain-tool/mcp/?session_id=1")
         assert disp._open[("m1", "mcp")] == 2 and disp._open_mcp_total == 2
         # The machine's MCP streams are at their cap: a hook is still admitted.
         assert await _admitted(disp, mgr, "m1", "hook-1", "/v1/hooks/permission", "POST")
         assert disp._open[("m1", "hook")] == 1
         # A third MCP stream is refused with the protocol frame, at once.
-        assert not await _admitted(disp, mgr, "m1", "mcp-3", "/mcp/file-tools/mcp/")
+        assert not await _admitted(disp, mgr, "m1", "mcp-3", "/mcp/plain-tool/mcp/")
         assert _refused(conn)
         assert disp._open[("m1", "mcp")] == 2 and disp._open_mcp_total == 2
         # The mirror on another machine: hooks at their cap refuse a hook,
@@ -211,7 +211,7 @@ async def test_mcp_streams_and_hook_streams_are_capped_separately(monkeypatch):
         assert await _admitted(disp, mgr, "m2", "hook-b", "/v1/hooks/stop", "POST")
         assert not await _admitted(disp, mgr, "m2", "hook-c", "/v1/hooks/permission", "POST")
         assert _refused(conn)
-        assert await _admitted(disp, mgr, "m2", "mcp-a", "/mcp/file-tools/mcp/")
+        assert await _admitted(disp, mgr, "m2", "mcp-a", "/mcp/plain-tool/mcp/")
         assert disp._open[("m2", "hook")] == 2 and disp._open[("m2", "mcp")] == 1
         assert disp._open_mcp_total == 3
     finally:
@@ -228,10 +228,10 @@ async def test_the_fleet_mcp_cap_refuses_mcp_streams_and_never_a_hook(monkeypatc
     client = _ParkedClient()
     monkeypatch.setattr(disp, "_get_client", lambda is_mcp=False: client)
     try:
-        assert await _admitted(disp, mgr, "m1", "s1", "/mcp/file-tools/mcp/")
-        assert await _admitted(disp, mgr, "m2", "s2", "/mcp/file-tools/mcp/")
+        assert await _admitted(disp, mgr, "m1", "s1", "/mcp/plain-tool/mcp/")
+        assert await _admitted(disp, mgr, "m2", "s2", "/mcp/plain-tool/mcp/")
         before = (dict(disp._open), disp._open_mcp_total)
-        assert not await _admitted(disp, mgr, "m3", "s3", "/mcp/file-tools/mcp/")
+        assert not await _admitted(disp, mgr, "m3", "s3", "/mcp/plain-tool/mcp/")
         assert _refused(conn)
         # A refusal changes no counter.
         assert (dict(disp._open), disp._open_mcp_total) == before
@@ -248,7 +248,7 @@ async def test_a_forgotten_stream_frees_its_slot_exactly_once(monkeypatch):
     mgr = FakeManager(conn)
     client = _ParkedClient()
     monkeypatch.setattr(disp, "_get_client", lambda is_mcp=False: client)
-    assert await _admitted(disp, mgr, "m1", "s1", "/mcp/file-tools/mcp/")
+    assert await _admitted(disp, mgr, "m1", "s1", "/mcp/plain-tool/mcp/")
     assert await _admitted(disp, mgr, "m1", "h1", "/v1/hooks/permission", "POST")
     # Reaped: the slot is freed now, and the cancelled dispatch's finally
     # does not free it again.
@@ -271,7 +271,7 @@ async def test_a_forgotten_stream_frees_its_slot_exactly_once(monkeypatch):
     assert disp._open == {} and disp._open_mcp_total == 0
     # A machine's counters are gone with its streams.
     client.release.clear()
-    assert await _admitted(disp, mgr, "m1", "s2", "/mcp/file-tools/mcp/")
+    assert await _admitted(disp, mgr, "m1", "s2", "/mcp/plain-tool/mcp/")
     assert await _admitted(disp, mgr, "m1", "h2", "/v1/hooks/stop", "POST")
     await disp.cancel_machine_streams(mgr, "m1")
     await asyncio.sleep(0)

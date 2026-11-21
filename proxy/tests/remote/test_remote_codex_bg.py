@@ -3,16 +3,15 @@
 The satellite is a dumb pipe: its persistent forwarder streams EVERY app-server
 notification to the proxy as a session_event (including a background sub-agent's
 events AFTER the main turn ends). All the demux + supervision lives on the proxy,
-mirroring the LOCAL session (core/layers/codex/session.py) but consuming the
-WS-forwarded ``info.event_queue`` instead of the daemon's notif_queue.
+which consumes the WS-forwarded ``info.event_queue``.
 
 Covered:
 1. Router demuxes main-thread events (+ synthetic turn-control markers) to the
    active turn's default_consumer, and each sub-agent thread to its own buffer.
 2. A background sub-agent active at main-turn end is registered + supervised, and
    the supervisor resolves it (registry mark_done) when its thread terminates —
-   reusing the shared resolve_bg_subagent + SubagentRegistry, so the cohort nudge
-   + the delegation wait fire identically to local.
+   through the shared resolve_bg_subagent + SubagentRegistry, which the cohort
+   nudge + the delegation wait read.
 3. Supervision is always on: every satellite that can connect forwards
    bg-thread events past the main turn (that landed in 0.5.18, far below
    MIN_SATELLITE_VERSION), so the Codex remote adapter's router is the sole
@@ -27,9 +26,9 @@ import contextlib
 
 import pytest
 
+from core.layers.codex.events import CodexEvent
 from core.layers.codex.layer import CodexEventTranslator
 from core.layers.codex.remote import CodexRemoteState
-from core.layers.codex.session import CodexEvent
 from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
 from core.remote.satellite_connection import (
     SatelliteConnection,
@@ -140,6 +139,60 @@ def test_router_fans_out_session_ended_sentinel():
     asyncio.run(run())
 
 
+def test_a_sub_agents_end_or_error_never_ends_the_main_turn():
+    """A sub-agent runs on its own thread and emits its own ``turn/completed``
+    (and possibly a final ``error``) before the main agent's synthesis: the
+    turn goes on to the main thread's own end, and nothing of the sub-agent's
+    thread reaches the chat."""
+    from core.events.common_events import ERROR, TEXT
+
+    def _said(tid, text):
+        return _ev("item/completed", tid, id=f"m-{text[:4]}", type="agentMessage", text=text)
+
+    sequence = [
+        _ev("turn/started", MAIN),
+        _said(MAIN, "Spawning a sub-agent; waiting for its result."),
+        _ev("item/completed", MAIN, id="c1", type="collabAgentToolCall",
+            receiverThreadIds=[SUB], agentsStates={SUB: {"status": "pendingInit"}}),
+        _ev("turn/started", SUB),
+        _said(SUB, "pineapple"),
+        {"method": "error", "params": {"threadId": SUB, "willRetry": False,
+                                       "error": {"message": "sub boom"}}},
+        {"method": "turn/completed", "params": {"threadId": SUB, "turn": {"status": "completed"}}},
+        _ev("item/completed", MAIN, id="c1", type="collabAgentToolCall",
+            agentsStates={SUB: {"status": "completed"}}),
+        _said(MAIN, "The sub-agent returned: pineapple."),
+        {"method": "turn/completed", "params": {"threadId": MAIN, "turn": {"status": "completed"}}},
+        _said(MAIN, "LATE"),
+        {"type": "_turn_ended", "command_id": ""},
+    ]
+
+    async def run():
+        layer, info = _make_layer_info()
+        router = asyncio.create_task(_adapter()._route_notifications(info))
+        try:
+            await _adapter().begin_turn(info, 0)
+            for raw in sequence:
+                info.event_queue.put_nowait(raw)
+            return [ev async for ev in _adapter().stream_turn(info, layer._cm)]
+        finally:
+            router.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await router
+            await _adapter().close_state(info)
+
+    try:
+        events = asyncio.run(run())
+    finally:
+        _subagent_registries.pop("s1", None)
+        _bg_command_registries.pop("s1", None)
+    text = "".join(e.data["content"] for e in events if e.type == TEXT)
+    assert "The sub-agent returned: pineapple." in text
+    assert "sub boom" not in text and "LATE" not in text
+    assert text.count("pineapple") == 1
+    assert not [e for e in events if e.type == ERROR] and events[-1].type == DONE
+
+
 # ---------------------------------------------------------------------------
 # 2. Handoff + supervisor + resolve
 # ---------------------------------------------------------------------------
@@ -219,28 +272,38 @@ def test_remote_supervisor_resolves_on_session_ended():
     asyncio.run(run())
 
 
-# ---------------------------------------------------------------------------
-# 3. Version gate
-# ---------------------------------------------------------------------------
+def test_a_long_background_subagent_is_supervised_until_its_terminal():
+    # A supervisor waits as long as the thread lives (no fixed bound may clear
+    # a research agent's badge or run its review while it works); each event
+    # stamps the agent alive for the chat monitor's silence rule.
+    async def run():
+        layer, info = _make_layer_info()
+        reg = get_subagent_registry("s1")
+        reg.reset()
+        reg.register_spawn(SUB, SUB, label="bg task")
+        reg.last_seen[SUB] = 0.0
+        q: asyncio.Queue = asyncio.Queue()
+        info.engine_state.thread_consumers[SUB] = q
+        try:
+            sup = asyncio.create_task(_adapter()._supervise_bg_subagent(info, SUB))
+            for _ in range(3):
+                q.put_nowait(_ev("item/completed", SUB))
+            await asyncio.sleep(0.05)
+            assert not sup.done() and reg.has_pending
+            assert reg.last_seen[SUB] > 0.0
+            q.put_nowait({"method": "turn/completed", "params": {"threadId": SUB}})
+            await asyncio.wait_for(sup, timeout=5)
+            assert SUB in reg.completed
+        finally:
+            await _adapter().close_state(info)
+            _subagent_registries.pop("s1", None)
 
-def test_satellite_supports_pty_inject_version_gate():
-    cm = SatelliteConnectionManager()
-    for mid, ver in [("new", "0.5.83"), ("old", "0.5.82"),
-                     ("future", "0.6.0"), ("garbage", "abc")]:
-        cm._connections[mid] = SatelliteConnection(
-            machine_id=mid, ws=None, satellite_version=ver,
-        )
-    assert cm.satellite_supports_pty_inject("new") is True
-    assert cm.satellite_supports_pty_inject("future") is True
-    assert cm.satellite_supports_pty_inject("old") is False
-    assert cm.satellite_supports_pty_inject("garbage") is False
-    assert cm.satellite_supports_pty_inject("absent") is False
+    asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------
-# Plan mode: the remote path queues the SAME plan review as the local codex
-# layer: a completed plan-mode turn's `plan` item (else its last agentMessage)
-# becomes the plan, with no plan file on the machine.
+# Plan mode: a completed plan-mode turn's `plan` item becomes a plan review,
+# with no plan file on the machine.
 # ---------------------------------------------------------------------------
 
 from core.events.common_events import DONE, PLAN_MODE
@@ -262,8 +325,8 @@ def queued_reviews(monkeypatch):
     from core.layers.codex import remote as codex_remote
     queued: list = []
 
-    async def _queue(session_id, plan, plans_dir):
-        queued.append((session_id, plan, plans_dir))
+    async def _queue(session_id, plan):
+        queued.append((session_id, plan))
     monkeypatch.setattr(codex_remote, "queue_plan_review", _queue)
     return queued
 
@@ -284,69 +347,8 @@ def test_a_remote_plan_turn_queues_a_plan_review_only_for_a_plan_item(queued_rev
          "params": {"threadId": MAIN, "turn": {"status": "completed"}}},
         {"type": "_turn_ended", "command_id": ""},
     ])
-    assert queued_reviews == ([(info.session_id, plan, None)] if plan else [])
+    assert queued_reviews == ([(info.session_id, plan)] if plan else [])
     assert not [e for e in events if e.type == PLAN_MODE]
-
-
-@pytest.mark.parametrize("items,plan", [
-    ([("agentMessage", "Here is the plan."), ("plan", "1. Add --version")], "1. Add --version"),
-    ([("agentMessage", "- Add --version\n- Add a CLI test")], None),
-])
-def test_a_local_plan_turn_queues_a_plan_review_only_for_a_plan_item(monkeypatch, items, plan):
-    """The local layer's twin of the remote rule."""
-    from core.layers.codex import layer as codex_layer
-    queued: list = []
-
-    async def _queue(session_id, text, plans_dir):
-        queued.append((session_id, text))
-
-    class _Session:
-        plan_mode = True
-        thread_id = MAIN
-        translator = None
-        model = "gpt-5.5"
-        config_dir = ""
-
-        async def send_message(self, prompt, *, inject_time=False, task=False):
-            for kind, text in items:
-                yield CodexEvent(type="item/completed",
-                                 data={"threadId": MAIN, "item": {"type": kind, "text": text, "id": kind}})
-            yield CodexEvent(type="turn/completed",
-                             data={"threadId": MAIN, "turn": {"status": "completed"}})
-
-    async def _get(session_id):
-        return _Session()
-    monkeypatch.setattr(codex_layer, "queue_plan_review", _queue)
-    monkeypatch.setattr(codex_layer, "get_codex_session", _get)
-
-    async def run():
-        return [ev async for ev in codex_layer.CodexCLIExecutionLayer()._send_turn("s-local", "plan it")]
-    asyncio.run(run())
-    assert queued == ([("s-local", plan)] if plan else [])
-
-
-@pytest.mark.parametrize("version,warns", [("0.5.165", True), ("", True), ("0.5.166", False)])
-def test_a_plan_turn_on_a_satellite_below_0_5_166_says_it_runs_plain(
-        queued_reviews, caplog, version, warns):
-    """An older satellite sends the plan mode in a key Codex drops: the turn
-    is a plain one there, which the log says at the turn's start."""
-    import logging
-
-    from core.remote.satellite_connection import SatelliteConnection
-    tr = CodexEventTranslator(model="gpt-5.5")
-    layer, info = _make_layer_info(tr)
-    if version:
-        layer._cm._connections["m1"] = SatelliteConnection(
-            machine_id="m1", ws=None, satellite_version=version)
-    info.mode = "plan"
-    with caplog.at_level(logging.WARNING, logger="remote-layer"):
-        _drain_codex_turn(info, layer, [
-            {"method": "turn/completed",
-             "params": {"threadId": MAIN, "turn": {"status": "completed"}}},
-            {"type": "_turn_ended", "command_id": ""},
-        ])
-    said = [r.getMessage() for r in caplog.records if "older than 0.5.166" in r.getMessage()]
-    assert len(said) == (1 if warns else 0)
 
 
 def test_remote_default_mode_queues_no_plan_review(queued_reviews):
@@ -360,29 +362,28 @@ def test_remote_default_mode_queues_no_plan_review(queued_reviews):
     assert queued_reviews == []
 
 
-def test_a_plan_review_is_queued_with_its_file_and_answered_between_turns(tmp_path, monkeypatch):
-    """The local layer's half: the plan file (the same one across revisions)
-    under the session's plans folder, the review on the session's queue as
-    Claude's ExitPlanMode puts it, marked as answered between turns; a
-    satellite's session writes no file (its rows hold the plans)."""
-    from core.layers.codex import layer as codex_layer
+def test_a_plan_review_is_queued_under_the_chats_plan_name_and_answered_between_turns(monkeypatch):
+    """The review goes on the session's queue as Claude's ExitPlanMode puts
+    it, named after the chat's plan file (the same name across revisions) and
+    marked as answered between turns."""
+    from core.layers.codex.plan_review import queue_plan_review
     from core.session.session_state import get_permission_queue
     from storage import database as task_store
     monkeypatch.setattr(task_store, "get_chat_by_session", lambda sid: {"id": "abcdef12-0000"})
 
     async def run():
-        await codex_layer.queue_plan_review("s-plan", "1. Add --version", tmp_path / "plans")
-        await codex_layer.queue_plan_review("s-plan-remote", "1. Remote", None)
+        await queue_plan_review("s-plan", "1. Add --version")
+        await queue_plan_review("s-plan", "1. Add --version\n2. Add a test")
     asyncio.run(run())
-    item = get_permission_queue("s-plan").get_nowait()
+    queue = get_permission_queue("s-plan")
+    item = queue.get_nowait()
     assert item["event_type"] == "plan_review" and item["request_id"]
     assert item["plan"] == "1. Add --version"
     assert item["tool_input"] == {"plan": "1. Add --version", "planFilePath": "plan-abcdef12.md",
                                   "between_turns": True}
-    assert (tmp_path / "plans" / "plan-abcdef12.md").read_text() == "1. Add --version"
-    remote = get_permission_queue("s-plan-remote").get_nowait()
-    assert remote["tool_input"]["planFilePath"] == "plan-abcdef12.md"
-    assert sorted(p.name for p in (tmp_path / "plans").iterdir()) == ["plan-abcdef12.md"]
+    revised = queue.get_nowait()
+    assert revised["tool_input"]["planFilePath"] == "plan-abcdef12.md"
+    assert revised["request_id"] != item["request_id"]
 
 
 def test_a_turn_the_satellite_closed_before_completion_is_lost_and_resumes():
@@ -399,6 +400,56 @@ def test_a_turn_the_satellite_closed_before_completion_is_lost_and_resumes():
     err = next(e for e in events if e.type == ERROR)
     assert turn_ending.from_dict(err.data["ending"]).reason == turn_ending.LOST
     assert info.cli_dead
+
+
+def test_a_turn_the_machine_ended_for_an_unanswered_interrupt_is_a_plain_done():
+    """The daemon did not take the interrupt this side asked for (a person's
+    Stop), so the machine dropped it and ended the turn. The turn was
+    stopped: no ``lost`` card, and the session is not read dead, since the
+    machine re-warms the daemon on the same thread at the next turn."""
+    from core.events.common_events import ERROR
+    layer, info = _make_layer_info()
+    events = _drain_codex_turn(info, layer, [
+        _ev("item/completed", MAIN, type="agentMessage", text="half an answer"),
+        {"type": "_turn_ended", "command_id": "", "reason": "interrupted"},
+    ])
+    assert not [e for e in events if e.type == ERROR] and events[-1].type == DONE
+    assert not info.cli_dead
+
+
+def test_a_daemon_that_exits_in_a_turn_is_one_exited_ending():
+    """The machine says the daemon exited inside the turn: one ending, typed
+    ``exited`` with the exit code, where the stream used to carry the
+    machine's own error and then a ``lost`` one."""
+    from core.events import turn_ending
+    from core.events.common_events import ERROR
+    layer, info = _make_layer_info()
+    events = _drain_codex_turn(info, layer, [
+        _ev("item/completed", MAIN, type="agentMessage", text="half an answer"),
+        {"type": "_turn_ended", "command_id": "", "reason": "exited", "exit_code": 101,
+         "last_line": "thread 'main' panicked"},
+    ])
+    errors = [e for e in events if e.type == ERROR]
+    assert len(errors) == 1 and events[-1].type == DONE
+    ending = turn_ending.from_dict(errors[0].data["ending"])
+    assert (ending.reason, ending.exit_code, ending.detail) == (
+        turn_ending.EXITED, 101, "exit 101: thread 'main' panicked")
+    assert info.cli_dead
+
+
+def test_a_daemon_exit_after_the_platforms_own_kill_is_no_exit_ending():
+    """The platform's own hard abort ended the daemon (a Stop, its
+    watchdog): the machine's word that it exited is that kill, never an
+    exit for the chat to read."""
+    from core.events.common_events import ERROR
+    layer, info = _make_layer_info()
+    info.proxy_killed = True
+    events = _drain_codex_turn(info, layer, [
+        _ev("item/completed", MAIN, type="agentMessage", text="half an answer"),
+        {"type": "_turn_ended", "command_id": "", "reason": "exited", "exit_code": -15},
+    ])
+    assert not [e for e in events if e.type == ERROR] and events[-1].type == DONE
+    assert not info.cli_dead
 
 
 def test_a_silent_remote_codex_turn_ends_typed_and_a_tool_item_keeps_it(monkeypatch):
@@ -455,6 +506,95 @@ def test_a_silent_remote_codex_turn_ends_typed_and_a_tool_item_keeps_it(monkeypa
 async def _collect(stream, into: list) -> None:
     async for ev in stream:
         into.append(ev)
+
+
+def _short_silence(monkeypatch, layer) -> list[dict]:
+    """The silence ceiling at 0.2 s, read every 0.1 s, on a machine that is
+    not reconnecting. Returns the frames sent to the machine."""
+    import config
+    from core.layers.codex import remote as codex_remote
+    monkeypatch.setattr(config, "TURN_SILENCE_S", 0.2)
+    monkeypatch.setattr(config, "CLAUDE_TIMEOUT", 7200)
+    monkeypatch.setattr(codex_remote, "_SILENCE_SLICE_S", 0.1)
+    monkeypatch.setattr(layer._cm, "is_session_in_grace", lambda mid, sid: False)
+    sent: list[dict] = []
+
+    async def _send(mid, msg):
+        sent.append(msg)
+    monkeypatch.setattr(layer._cm, "send_fire_and_forget", _send)
+    return sent
+
+
+def test_an_open_message_item_does_not_keep_a_silent_remote_codex_turn(monkeypatch):
+    """A stream that stalls in the middle of an answer is silence, not work:
+    only a tool-like item takes the turn ceiling."""
+    from core.events import turn_ending
+    from core.events.common_events import ERROR
+    layer, info = _make_layer_info()
+    sent = _short_silence(monkeypatch, layer)
+    events = _drain_codex_turn(info, layer, [
+        _ev("item/started", MAIN, id="msg-1", type="agentMessage")])
+    assert [e.type for e in events][-2:] == [ERROR, DONE]
+    assert turn_ending.from_dict(events[-2].data["ending"]).reason == turn_ending.SILENT
+    assert sent == [{"type": "abort", "session_id": "s1"}]
+
+
+def test_a_task_runs_remote_codex_turn_keeps_its_silence_to_the_turn_ceiling(monkeypatch):
+    """A task run's turn takes the turn ceiling with no tool open (a tool
+    that never returns is the task watchdog's case)."""
+    from core.events.common_events import ERROR
+    layer, info = _make_layer_info()
+    sent = _short_silence(monkeypatch, layer)
+    info.task_turn = True
+
+    async def run():
+        info.engine_state.default_consumer = asyncio.Queue()
+        seen: list = []
+        collect = asyncio.create_task(_collect(_adapter().stream_turn(info, layer._cm), seen))
+        await asyncio.sleep(0.6)             # past the silence ceiling, nothing open
+        assert not collect.done()
+        info.engine_state.default_consumer.put_nowait(
+            {"method": "turn/completed",
+             "params": {"threadId": MAIN, "turn": {"status": "completed"}}})
+        info.engine_state.default_consumer.put_nowait({"type": "_turn_ended", "command_id": ""})
+        await asyncio.wait_for(collect, 5.0)
+        return seen
+    seen = asyncio.run(run())
+    assert not [e for e in seen if e.type == ERROR] and seen[-1].type == DONE
+    assert sent == []
+
+
+def test_a_codex_session_on_a_machine_counts_its_idle_seconds_from_its_last_event(monkeypatch):
+    """The seconds since a session's last event, which the wedge check of a
+    re-opened chat and the task watchdog read: every notification the router
+    reads counts (a background sub-agent's included). A session in the
+    reconnect grace is reconnecting, not idle, and has none; neither has a
+    session the layer does not hold."""
+    import time
+
+    async def run():
+        layer, info = _make_layer_info()
+        info.last_activity = time.monotonic() - 42.0
+        assert 41.0 < layer.session_idle_seconds("s1") < 50.0
+        assert layer.session_idle_seconds("no-such") is None
+        router = asyncio.create_task(_adapter()._route_notifications(info))
+        try:
+            info.event_queue.put_nowait(_ev("item/started", SUB, type="agentMessage"))
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if SUB in info.engine_state.thread_consumers:
+                    break
+            assert layer.session_idle_seconds("s1") < 5.0
+        finally:
+            router.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await router
+        info.last_activity = time.monotonic() - 42.0
+        monkeypatch.setattr(layer._cm, "is_session_in_grace",
+                            lambda mid, sid: (mid, sid) == ("m1", "s1"))
+        assert layer.session_idle_seconds("s1") is None
+
+    asyncio.run(run())
 
 
 def test_remote_interrupted_plan_turn_emits_no_card():
@@ -545,8 +685,8 @@ def test_router_oob_resolves_tracked_bg_command_completion():
 
 
 def test_router_oob_completion_clears_the_terminal_s_badge(monkeypatch):
-    # The remote twin of the local router: a terminal's exit between turns
-    # clears its own badge through the chat's viewers (no pump is attached).
+    # A terminal's exit between turns clears its own badge through the
+    # chat's viewers (no pump is attached).
     from core.session import session_state
     monkeypatch.setattr(session_state, "_push_pump_event_fn", lambda cid, ev: False)
     viewer: asyncio.Queue = asyncio.Queue()
@@ -622,9 +762,9 @@ def test_remote_teardown_sweeps_pending_terminals_as_killed():
 
 
 def test_codex_send_message_prunes_registry_preserving_pending():
-    # The per-turn prune (reset_bg_command_registry) must run for remote codex
-    # too: reset() PRESERVES still-pending terminals but clears resolved +
-    # unsurfaced state, so the cohort math can't fire spurious review turns.
+    # The per-turn prune (reset_bg_command_registry): reset() PRESERVES
+    # still-pending terminals but clears resolved + unsurfaced state, so the
+    # cohort math can't fire spurious review turns.
     async def run():
         layer = RemoteExecutionLayer.__new__(RemoteExecutionLayer)
         layer._cm = MagicMock()
@@ -676,10 +816,10 @@ def test_codex_send_message_prunes_registry_preserving_pending():
 # Drain backstop (codex branch of RemoteExecutionLayer.drain_bg_commands)
 # ---------------------------------------------------------------------------
 
-def _drain_layer(sid, *, version="0.5.105", translator=None):
+def _drain_layer(sid, *, translator=None):
     cm = SatelliteConnectionManager()
     cm._connections["m1"] = SatelliteConnection(
-        machine_id="m1", ws=None, satellite_version=version,
+        machine_id="m1", ws=None, satellite_version="0.5.171",
     )
     layer = RemoteExecutionLayer(cm)
     info = RemoteSessionInfo(
@@ -699,25 +839,6 @@ def _scripted_send(calls, ack):
             raise ack
         return ack
     return _send
-
-
-def test_drain_codex_version_gate_off_is_noop():
-    sid = "s-rbg-gate"
-
-    async def run():
-        tr = _bg_cmd_tr(sid)
-        _swept_bg_candidate(tr)
-        layer, info, cm = _drain_layer(sid, version="0.5.104", translator=tr)
-        calls: list = []
-        cm.send_command = _scripted_send(calls, {"ok": True, "terminals": []})
-        assert await layer.drain_bg_commands(sid) is False
-        assert calls == []      # gated BEFORE sending — no burnt ack timeout
-        assert get_bg_command_registry(sid).pending_count == 1
-
-    try:
-        asyncio.run(run())
-    finally:
-        _bg_command_registries.pop(sid, None)
 
 
 def test_drain_codex_keeps_item_present_in_list():
@@ -790,6 +911,28 @@ def test_drain_codex_resolves_item_missing_from_list():
         _bg_command_registries.pop(sid, None)
 
 
+def test_drain_codex_backs_off_while_a_turn_is_in_flight():
+    # The turn's own translator resolves its completions: the drain asks the
+    # machine for no list while the session's lock is held.
+    sid = "s-rbg-lock"
+
+    async def run():
+        tr = _bg_cmd_tr(sid)
+        _swept_bg_candidate(tr)
+        layer, info, cm = _drain_layer(sid, translator=tr)
+        calls: list = []
+        cm.send_command = _scripted_send(calls, {"ok": True, "terminals": []})
+        async with info.lock:
+            assert await layer.drain_bg_commands(sid) is False
+        assert calls == []
+        assert get_bg_command_registry(sid).pending_count == 1
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop(sid, None)
+
+
 def test_drain_codex_rpc_failure_is_no_progress():
     sid = "s-rbg-fail"
 
@@ -828,20 +971,6 @@ def test_drain_codex_satellite_refusal_is_no_progress():
         _bg_command_registries.pop(sid, None)
 
 
-def test_supports_codex_bg_terminals_version_gate():
-    cm = SatelliteConnectionManager()
-    for mid, ver in [("new", "0.5.105"), ("old", "0.5.104"),
-                     ("future", "0.6.0"), ("blank", "")]:
-        cm._connections[mid] = SatelliteConnection(
-            machine_id=mid, ws=None, satellite_version=ver,
-        )
-    assert cm.supports_codex_bg_terminals("new") is True
-    assert cm.supports_codex_bg_terminals("future") is True
-    assert cm.supports_codex_bg_terminals("old") is False
-    assert cm.supports_codex_bg_terminals("blank") is False
-    assert cm.supports_codex_bg_terminals("absent") is False
-
-
 # ---------------------------------------------------------------------------
 # An idle Codex session a satellite kept across a proxy restart is taken back
 # ---------------------------------------------------------------------------
@@ -854,7 +983,7 @@ def _adopting_layer(monkeypatch):
                                                 satellite_version="0.5.138")
     layer = RemoteExecutionLayer(cm)
     monkeypatch.setattr(RemoteExecutionLayer, "_restore_adopted_credentials",
-                        staticmethod(lambda *a: None))
+                        staticmethod(lambda *a, **k: None))
 
     async def _no_gateway(*a):
         return None

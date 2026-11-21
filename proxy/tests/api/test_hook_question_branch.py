@@ -17,7 +17,7 @@ import uuid
 
 import pytest
 
-from api.hooks import permission
+from api.hooks import permission, questions
 from auth.path_policy import SecurityContext
 from core.session import session_state
 from core.session.session_manager import get_layer_by_path
@@ -38,6 +38,7 @@ def _bind(monkeypatch, path: str | None, *, interactive: bool = False, client_ty
     monkeypatch.setattr("core.session.session_manager.engine_layer_for_session", lambda sid: layer)
     monkeypatch.setattr(permission, "_is_interactive_session", lambda sid: interactive)
     monkeypatch.setattr(permission, "get_session_client_type", lambda sid: client_type)
+    monkeypatch.setattr(questions, "get_session_client_type", lambda sid: client_type)
     parked: list = []
     monkeypatch.setattr(permission, "_park_interactive_on_dialog", lambda sid, name: parked.append(name))
     return parked
@@ -135,3 +136,46 @@ async def test_a_dead_session_is_denied_before_anything_is_enqueued(monkeypatch)
     out = await permission.decide_tool_permission(sid, "ExitPlanMode", {"plan": "p"})
     assert out["decision"] == "deny"
     session_state.cleanup_session_permission_state(sid)
+
+
+# ---------------------------------------------------------------------------
+# Codex's message to the person (the GPT-6.2 rows' send_message_to_user_async)
+# ---------------------------------------------------------------------------
+
+def _mode_session(mode: str, **ctx) -> str:
+    sid = str(uuid.uuid4())
+    session_state.register_session_state(sid, mode, SecurityContext(
+        role="manager", username="alice", agent="pa", is_admin_agent=False, **ctx,
+    ))
+    return sid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["default", "plan", "autoReview", "judge", "dontAsk"])
+@pytest.mark.parametrize("interactive", [False, True])
+async def test_a_codex_message_to_the_person_runs_in_every_mode_without_a_card(monkeypatch, mode, interactive):
+    """It tells the person something and changes nothing: no card in Ask, no
+    refusal in Plan or a judge, no wait for a reviewer in Auto. Codex then
+    shows the message as the chat's text."""
+    import asyncio
+    _bind(monkeypatch, "codex-cli", interactive=interactive)
+    sid = _mode_session(mode)
+    try:
+        out = await asyncio.wait_for(permission.decide_tool_permission(
+            sid, "send_message_to_user_async", {"message": "The build is blocked on a key."}), 5)
+        assert out["decision"] == "allow", out
+        assert session_state.get_permission_queue(sid).empty()
+    finally:
+        session_state.cleanup_session_permission_state(sid)
+
+
+def test_the_message_role_is_open_to_outside_people_and_a_wrap_up():
+    from core.events import tool_roles
+    role = tool_roles.role_of("send_message_to_user_async")
+    assert role == tool_roles.MESSAGE
+    outside = SecurityContext(role="member", username="x", agent="pa", is_admin_agent=False)
+    assert permission.outside_floor(outside, "send_message_to_user_async", role) == ""
+    wrapup = SecurityContext(role="member", username="x", agent="pa", is_admin_agent=False, no_shell=True)
+    assert permission.unattended_floor(wrapup, "send_message_to_user_async", role) == ""
+    # A tool of an MCP server with the same last name is that server's, judged by its tier.
+    assert tool_roles.role_of("mcp__x__send_message_to_user_async") == ""

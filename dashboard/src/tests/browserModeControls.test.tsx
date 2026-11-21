@@ -39,6 +39,11 @@ beforeEach(() => {
 
 // The mode selector lives in the Browser-control row; the token field shows
 // only in own mode, with the short install → paste line and nothing else.
+/** The words of a confirmation's body alone: no title, no button. */
+function bodyOf(dialog: HTMLElement): string | null | undefined {
+  return document.getElementById(dialog.getAttribute('aria-describedby') ?? '')?.textContent
+}
+
 describe('BrowserModeSelect', () => {
   it('defaults to the dedicated profile and hides the token field', () => {
     render(<><BrowserModeSelect machine={machine()} scope="me" /><BrowserTokenField machine={machine()} scope="me" /></>)
@@ -53,10 +58,13 @@ describe('BrowserModeSelect', () => {
     fireEvent.change(screen.getByLabelText('Browser mode'), { target: { value: 'own' } })
     const dialog = await findAlertDialog('Use your own browser on laptop?')
     // The disclosure: unattended use needs its own consent (F47).
-    expect(dialog.textContent).toContain(
-      'can reach your logins, cookies and open tabs. You can also let unattended runs use the '
-      + 'saved token. Then scheduled tasks, triggers, calls and meetings use this browser with '
-      + 'nobody watching. Those runs ask no one before a browser action.\n\n')
+    expect(bodyOf(dialog)).toBe(
+      'Agents on this machine will work inside the browser you are signed into. '
+      + 'They get their own tab group, and can reach your logins, cookies and open tabs. '
+      + 'You can also let unattended runs use the saved token. '
+      + 'Then scheduled tasks, triggers, calls, meetings and API keys use this browser.\n\n'
+      + 'Install the Playwright Extension in that browser first. Sessions already running '
+      + 'switch when they next start.')
     await act(async () => { await answerDialog('Cancel') })
     expect(modeMutate).not.toHaveBeenCalled()
     fireEvent.change(screen.getByLabelText('Browser mode'), { target: { value: 'own' } })
@@ -128,10 +136,14 @@ describe('unattended use of the saved token (F47)', () => {
   it('asks before letting unattended runs use the browser, and turns off at once', async () => {
     const { rerender } = render(<BrowserTokenField
       machine={machine({ browser_mode: 'own', browser_extension_token_set: true })} scope="me" />)
-    const box = screen.getByRole('checkbox')
+    const box = screen.getByRole('checkbox', {
+      name: /^Also let unattended runs like scheduled tasks, triggers, calls, meetings and API keys use this browser\./,
+    })
     expect(box).not.toBeChecked()
     fireEvent.click(box)
     const dialog = await findAlertDialog('Let unattended runs use your browser on laptop?')
+    expect(bodyOf(dialog)).toBe(
+      'Scheduled tasks, triggers, calls, meetings and API keys will drive the browser you are signed into.')
     await act(async () => { await answerDialog('Cancel') })
     expect(unattendedMutate).not.toHaveBeenCalled()
     expect(dialog.isConnected).toBe(false)

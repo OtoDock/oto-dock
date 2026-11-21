@@ -1,43 +1,23 @@
-"""App steps on a machine, the proxy side (APPS.md "Steps", satellite
-0.5.122).
+"""App steps on a machine, the proxy side (APPS.md "Steps").
 
-Load-bearing: the gate needs the version AND the capability; the output
-frames reach the registered callback and nobody else; ``run_remote`` turns
-the ack, an error ack, a timeout and a dropped link into the verdicts the
-runner records, and never sends a frame to a satellite below the gate; both
-tunnel allowlists admit exactly the action route a step's claim may press.
+Load-bearing: the output frames reach the registered callback and nobody
+else. ``run_remote`` turns the ack, an error ack, a timeout and a dropped
+link into the verdicts the runner records, and never sends a frame to a
+machine that is offline. Both tunnel allowlists admit exactly the action
+route a step's claim may press.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
-from unittest.mock import patch
 
 import pytest
 
-from core.remote.satellite_connection import (
-    SatelliteConnection,
-    SatelliteConnectionManager,
-)
+from core.remote.satellite_connection import SatelliteConnectionManager
 from core.remote.satellite_http_tunnel import _is_allowed_path
 from services.apps import app_steps
 from tests._paths import REPO_ROOT
-
-
-def test_the_gate_needs_the_version_and_the_capability():
-    cm = SatelliteConnectionManager()
-    for mid, ver, caps in [("new", "0.5.122", {"steps": True}), ("future", "0.6.0", {"steps": True}),
-                           ("old", "0.5.121", {"steps": True}), ("no-flag", "0.5.122", {}),
-                           ("blank", "", {"steps": True})]:
-        cm._connections[mid] = SatelliteConnection(machine_id=mid, ws=None, satellite_version=ver,
-                                                   capabilities=caps)
-    assert cm.satellite_supports_steps("new") is True
-    assert cm.satellite_supports_steps("future") is True
-    assert cm.satellite_supports_steps("old") is False
-    assert cm.satellite_supports_steps("no-flag") is False
-    assert cm.satellite_supports_steps("blank") is False
-    assert cm.satellite_supports_steps("absent") is False
 
 
 def test_step_output_reaches_the_registered_callback_only():
@@ -65,8 +45,8 @@ def _plan(**over) -> app_steps.StepPlan:
 
 
 class _CM:
-    def __init__(self, *, connected=True, supports=True, ack=None, raise_=None):
-        self.connected, self.supports, self.ack, self.raise_ = connected, supports, ack, raise_
+    def __init__(self, *, connected=True, ack=None, raise_=None):
+        self.connected, self.ack, self.raise_ = connected, ack, raise_
         self.sent: list[dict] = []
         self.registered: list[str] = []
         self.unregistered: list[str] = []
@@ -74,11 +54,14 @@ class _CM:
     def is_connected(self, mid):
         return self.connected
 
-    def satellite_supports_steps(self, mid):
-        return self.supports
+    def is_compute(self, mid):
+        return False
 
-    def satellite_version(self, mid):
-        return "0.5.121"
+    def shares_folders(self, mid):
+        return False
+
+    def owns_copy(self, mid):
+        return False
 
     def register_step_output(self, cid, cb):
         self.registered.append(cid)
@@ -116,16 +99,12 @@ def test_run_remote_sends_the_frame_and_reads_the_ack(monkeypatch):
     assert logged == ["line one\n"]
 
 
-def test_run_remote_refuses_an_old_satellite_and_reports_the_link(monkeypatch):
-    cm = _CM(supports=False)
-    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
-    with pytest.raises(app_steps.StepRefused, match="too old for steps"):
-        asyncio.run(app_steps.run_remote(_plan(), "c", "m-1"))
-    assert cm.sent == []
+def test_run_remote_refuses_an_offline_machine_and_reports_the_link(monkeypatch):
     cm = _CM(connected=False)
     monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
     with pytest.raises(app_steps.StepUnavailable, match="offline"):
         asyncio.run(app_steps.run_remote(_plan(), "c", "m-1"))
+    assert cm.sent == []
     for exc, kind, fragment in [
         (RuntimeError("Satellite m-1 not connected"), app_steps.StepUnavailable, "offline"),
         (RuntimeError("Satellite m-1 command timeout (65.0s)"), app_steps.StepRefused, "did not answer"),
@@ -166,5 +145,3 @@ def test_the_step_env_carries_the_claim_and_the_tokens_never_in_argv():
     assert env["OTODOCK_DELIVERY_ID"] == "d-1" and env["OTODOCK_STEP_HANDLER"] == "sync"
     argv = app_steps.argv_for(plan.script, "/app/scripts/sync.sh")
     assert "claim-1" not in " ".join(argv) and "ghp_secret_value" not in " ".join(argv)
-    with patch.object(app_steps, "OUTPUT_KEEP_BYTES", 8):
-        assert app_steps._output_text(b"12345678", 20) == "12345678\n… [12 more bytes not kept]"

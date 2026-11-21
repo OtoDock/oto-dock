@@ -105,35 +105,6 @@ async def test_writer_failure_triggers_deregister():
 
 
 @pytest.mark.asyncio
-async def test_enqueue_drops_oldest_on_overflow():
-    """When the send queue is full (10K cap), the oldest message gets
-    dropped to make room. Prevents OOM during sustained disconnect with
-    high send volume."""
-    # Use a small queue cap for the test by injecting a fresh Queue
-    ws = FakeWS()
-    conn = SatelliteConnection(machine_id="m1", ws=ws)  # type: ignore[arg-type]
-    conn.send_queue = asyncio.Queue(maxsize=3)
-
-    # Don't start the writer — let the queue fill
-    await conn.enqueue_send({"type": "a", "n": 1})
-    await conn.enqueue_send({"type": "a", "n": 2})
-    await conn.enqueue_send({"type": "a", "n": 3})
-    # 4th and 5th cause overflow → drop oldest
-    await conn.enqueue_send({"type": "a", "n": 4})
-    await conn.enqueue_send({"type": "a", "n": 5})
-
-    # Queue should still have exactly 3 items, but with the oldest dropped
-    items = []
-    while not conn.send_queue.empty():
-        items.append(conn.send_queue.get_nowait())
-    ns = [it["n"] for it in items]
-    assert len(ns) == 3, f"queue had {len(ns)} items, expected 3"
-    # The newest 3 should be retained: 3, 4, 5 (1 and 2 dropped)
-    assert max(ns) == 5
-    assert 1 not in ns and 2 not in ns
-
-
-@pytest.mark.asyncio
 async def test_writer_cancelled_on_deregister():
     """Calling deregister() cancels the writer task cleanly."""
     cm = SatelliteConnectionManager()
@@ -270,23 +241,3 @@ async def test_control_preempts_bulk_midstream():
     conn.writer_task.cancel()
 
 
-@pytest.mark.asyncio
-async def test_bulk_drops_oldest_on_overflow():
-    """The bulk lane drops oldest on overflow independently of control —
-    parity with test_enqueue_drops_oldest_on_overflow."""
-    ws = FakeWS()
-    conn = SatelliteConnection(machine_id="m1", ws=ws)  # type: ignore[arg-type]
-    conn.bulk_queue = asyncio.Queue(maxsize=3)
-
-    for n in range(1, 6):  # 1..5 → oldest (1,2) dropped
-        await conn.enqueue_send({"type": "chunk", "n": n}, bulk=True)
-
-    items = []
-    while not conn.bulk_queue.empty():
-        items.append(conn.bulk_queue.get_nowait())
-    ns = [it["n"] for it in items]
-    assert len(ns) == 3
-    assert max(ns) == 5
-    assert 1 not in ns and 2 not in ns
-    # Control lane untouched by bulk overflow.
-    assert conn.send_queue.empty()

@@ -71,8 +71,9 @@ _URL_SECRET = re.compile(
 _BEARER = re.compile(r"((?:Bearer|bearer)(?:\s|\+|%20|%2520)+)[A-Za-z0-9._~/+=-]{8,}")
 # A share link's token is a path segment (``/s/<token>``, its socket too).
 _SHARE_PATH = re.compile(r"(/s/)[A-Za-z0-9_-]{8,}")
-# The HTTP clients log every request's full URL at INFO.
-_QUIET_LOGGERS = ("httpx", "httpcore")
+# The HTTP clients log every request's full URL at INFO, under either
+# generation's name (a dependency can bring ``httpx2`` into the process).
+_QUIET_LOGGERS = ("httpx", "httpcore", "httpx2", "httpcore2")
 
 _active: LogQueue | None = None
 

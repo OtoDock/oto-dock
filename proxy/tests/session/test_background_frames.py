@@ -39,6 +39,8 @@ from core.session.background_frames import (
     log_between_turns_census,
     resolve_background_frame,
     running_background,
+    running_fields,
+    running_work,
 )
 from core.session.session_state import get_permission_queue, get_subagent_registry
 from tests._paths import PROXY_DIR
@@ -195,6 +197,35 @@ def test_running_background_names_background_spawns_only(sid, monkeypatch):
     assert running_background(["chat-bgf"])["agents"] == []
 
 
+def test_running_work_adds_the_delegations_of_the_chats(sid, monkeypatch):
+    # The task store names a delegation whatever runs the caller: a terminal's
+    # registries are skipped, never its delegations; empty chat ids ask nothing.
+    from core.session import interactive_session
+    from storage import database as task_store
+    asked: list[list[str]] = []
+
+    def live(chat_ids):
+        asked.append(chat_ids)
+        return [{"id": "dyn-1", "description": "lane", "agent": "worker"}]
+    monkeypatch.setattr(task_store, "live_delegations_reporting_to", live)
+    _agent(sid)
+    assert asyncio.run(running_work(["chat-bgf", "", "chat-bgf"])) == {
+        "agents": [{"id": "tuA1", "description": "long reader"}],
+        "commands": [],
+        "delegates": [{"id": "dyn-1", "description": "lane", "agent": "worker"}],
+    }
+    assert asked == [["chat-bgf"]]
+    monkeypatch.setattr(interactive_session, "get", lambda s: object() if s == sid else None)
+    assert asyncio.run(running_work(["chat-bgf"]))["agents"] == []
+    assert asyncio.run(running_work(["chat-bgf"]))["delegates"] == [
+        {"id": "dyn-1", "description": "lane", "agent": "worker"}]
+    assert asyncio.run(running_work(["", ""])) == {"agents": [], "commands": [], "delegates": []}
+    assert len(asked) == 3
+    # A history frame's field: present only when something runs.
+    assert asyncio.run(running_fields(["chat-bgf"]))["running"]["delegates"][0]["id"] == "dyn-1"
+    assert asyncio.run(running_fields(["", ""])) == {}
+
+
 def test_the_census_warns_only_for_the_main_agents_lines(caplog):
     caplog.set_level(logging.INFO, logger="otodock")
     log_between_turns_census("Remote session s1", {"background": 675})
@@ -226,9 +257,10 @@ def test_a_stale_line_is_named_for_the_census_and_seen_by_the_engine_prompts(sid
 
 def test_a_drain_counts_the_work_it_ended(sid, chat_frames):
     _agent(sid)
-    assert background_frames.resolve_background_work(sid, _sys("task_progress", task_id="a1")) is False
-    assert background_frames.resolve_background_work(sid, _sys(
-        "task_notification", task_id="a1", status="completed")) is True
+    assert background_frames.read_line_between_turns(
+        sid, _sys("task_progress", task_id="a1")) == ("background", False)
+    assert background_frames.read_line_between_turns(sid, _sys(
+        "task_notification", task_id="a1", status="completed")) == ("background", True)
 
 
 # ---------------------------------------------------------------------------

@@ -80,6 +80,10 @@ WAITING_MACHINE = "machine"
 #: author may not drive that terminal): cleared, and the queue armed, when the
 #: terminal closes.
 WAITING_TERMINAL = "terminal"
+#: A message waits for the platform, which holds new work for an update
+#: (``core.drain``): it goes out when the platform is back, or at the
+#: drain's resume.
+WAITING_UPDATING = "updating"
 
 #: Chats the registry holds before it evicts idle ones, and how long an entry
 #: stays untouched before it counts as idle (its ``accepted`` memory answers a
@@ -304,6 +308,10 @@ class ChatInputQueue:
             return ACCEPTED, None, -1
         if len(self.items) >= CAP:
             return FULL, None, -1
+        if not waiting:
+            from core import drain
+            if drain.holding():
+                waiting = WAITING_UPDATING
         qi = QueuedInput(queue_id=queue_id, chat_id=self.chat_id, author_sub=author_sub,
                          item=item, origin_conn=origin_conn, seq=self._next_seq(),
                          view_chat_id=view_chat_id, conn=conn, waiting=waiting)
@@ -481,12 +489,14 @@ def getting_ready(chat_id: str) -> bool:
     return True
 
 
-def _frozen() -> bool:
+def frozen() -> bool:
     """The proxy is shutting down (the scheduler's flag, raised before any
-    session closes): no return and no delivery, what waits stays in the
-    table for the next process."""
+    session closes), or holds new work for a planned stop (``core.drain``):
+    no return and no delivery, what waits stays in the table for the next
+    process, or for the drain's resume."""
+    from core import drain
     from services.scheduler import shared
-    return bool(shared._shutting_down)
+    return bool(shared._shutting_down) or drain.holding()
 
 
 def _spawn(coro) -> None:
@@ -658,6 +668,13 @@ def clear_waiting(chat_id: str, reason: str = WAITING_RECONNECT) -> None:
         fan_out_snapshot(chat_id)
 
 
+def clear_updating() -> None:
+    """The platform takes new work again (a drain's resume): no chip of a
+    loaded queue keeps saying it is updating."""
+    for chat_id in list(_registry):
+        clear_waiting(chat_id, WAITING_UPDATING)
+
+
 def announce_queued(qi: QueuedInput, index: int) -> None:
     """The ``queued`` chip to the chat's audience and its author."""
     fan_out(qi.chat_id, {"type": wire.QUEUED, "index": index, **qi.chip()},
@@ -784,7 +801,7 @@ def on_pump_end(chat_id: str, *, return_upto: int | None, viewers: bool) -> None
     (a message sent after the error or the Stop) is delivered as the next
     turn: after an attached viewer's own drain (``VIEWER_GRACE_S``), or at
     once with no viewer."""
-    if _frozen():
+    if frozen():
         return
     _spawn(_after_pump_end(chat_id, return_upto=return_upto, viewers=viewers))
 
@@ -810,7 +827,7 @@ def arm(chat_id: str, *, delay: float = VIEWER_GRACE_S) -> None:
     with no pump left to drain it, rows restored after a restart). The
     grace lets a viewer's socket re-register first; a card's answer, pressed
     on a live socket, passes none."""
-    if _frozen():
+    if frozen():
         return
 
     async def _later() -> None:
@@ -825,6 +842,26 @@ def arm(chat_id: str, *, delay: float = VIEWER_GRACE_S) -> None:
 
 # The open connections per person, for a re-check on demand.
 _connections_by_user: dict[str, set[DashboardConnection]] = {}
+
+
+def arm_for_author(author_sub: str) -> None:
+    """A person's socket registered: the chats holding messages they queued
+    are loaded and armed. A queue is otherwise armed at its chat's first
+    touch, so a message that waited through a restart would wait until its
+    author opened that chat."""
+    if not author_sub:
+        return
+
+    async def _arm() -> None:
+        from storage import database as task_store
+        from storage.pg import run_db
+        try:
+            for row in await run_db(task_store.queued_chats_of, author_sub):
+                await loaded(row["id"])
+                arm(row["id"])
+        except Exception:
+            logger.exception("the queued chats of %s were not armed", author_sub[:8])
+    _spawn(_arm())
 
 
 def _driver_for(author_sub: str, items: list[QueuedInput]):
@@ -858,7 +895,7 @@ async def deliver(chat_id: str) -> bool:
     connection object waits for their next touch. True when a turn went
     out."""
     from core.events.stream_pump import _active_pumps
-    if _frozen() or deleting(chat_id):
+    if frozen() or deleting(chat_id):
         return False
     q = await loaded(chat_id)
     if getting_ready(chat_id):

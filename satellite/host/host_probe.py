@@ -257,7 +257,9 @@ def _machine_resources() -> tuple[int, int]:
 
 def _recommended_max_sessions() -> int:
     """Conservative ceiling on concurrent local agent sessions this satellite can
-    run, from its CPU + RAM."""
+    run, from its CPU + RAM. It caps a machine only where the memory guard does
+    not run (a Mac, Windows) and feeds an older platform's count; a Linux
+    machine starts sessions by its memory (``sessions/memory_guard.py``)."""
     cpus, mem_bytes = _machine_resources()
     cpu_bound = int(cpus * _SAT_SESSIONS_PER_CORE)
     if mem_bytes <= 0:

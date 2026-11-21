@@ -1863,7 +1863,7 @@
    ],
    "frames": [
     {
-     "mode": "default",
+     "mode": "ask",
      "pump_type": "perm_mode_restored"
     }
    ],

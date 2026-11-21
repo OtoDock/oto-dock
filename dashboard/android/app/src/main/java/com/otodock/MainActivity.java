@@ -27,6 +27,7 @@ import android.util.Base64;
 import android.graphics.Color;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.Window;
 import android.animation.ArgbEvaluator;
 import android.animation.ValueAnimator;
@@ -35,6 +36,7 @@ import android.util.Log;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.URLUtil;
+import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
@@ -525,6 +527,8 @@ public class MainActivity extends BridgeActivity {
             @Override
             public void onPageCommitVisible(WebView view, String url) {
                 pageCommitted = true;
+                // A page replaced while it held the bars never sent its exit.
+                applyVideoFullscreen(videoFs.newDocument());
                 // A page that commits after the deadline releases at once: the
                 // keep condition is read on a draw pass, and the hold has none.
                 if (bootHeld && SystemClock.uptimeMillis() - bootStart >= BOOT_HOLD_MAX_MS) releaseBoot("deadline");
@@ -633,6 +637,23 @@ public class MainActivity extends BridgeActivity {
             }
         });
 
+        // Full screen for a video, the dashboard's player or a frame's own
+        // (YouTube's): the WebView's view goes above the WebView. Set here,
+        // after Capacitor set its own and before the activity starts, which
+        // is the last moment the client's constructor may register its
+        // activity-result launchers.
+        wv.setWebChromeClient(new FullscreenWebChromeClient(getBridge(), new FullscreenWebChromeClient.Host() {
+            @Override
+            public void showCustomView(View view, WebChromeClient.CustomViewCallback callback) {
+                MainActivity.this.showCustomView(view, callback);
+            }
+
+            @Override
+            public void hideCustomView() {
+                MainActivity.this.hideCustomView();
+            }
+        }));
+
         // Cold-start deep link: app was killed while browser was open for OAuth.
         // BridgeActivity.load() already replays the launch intent through
         // onNewIntent, which consumes an otodock:// link; this routes one it left.
@@ -660,6 +681,9 @@ public class MainActivity extends BridgeActivity {
 
         // Handle file downloads — WebView doesn't download files natively
         getBridge().getWebView().setDownloadListener((url, userAgent, contentDisposition, mimeType, contentLength) -> {
+            // The download's own facts, never its address (a media link carries its token).
+            Log.i("OtoDock", "download handed over: mime=" + mimeType + " length=" + contentLength
+                    + " disposition=" + (contentDisposition == null || contentDisposition.isEmpty() ? "none" : "set"));
             // Guard: DownloadManager only supports http/https. blob:/data: URLs would
             // throw IllegalArgumentException and crash the app. For those, the JS side
             // is expected to bridge the data via Android.saveImageFromBase64() instead.
@@ -690,10 +714,10 @@ public class MainActivity extends BridgeActivity {
         paintBarIcons(false);
 
         ViewCompat.setOnApplyWindowInsetsListener(container, (view, insets) -> {
-            // Video fullscreen: no system-bar padding, so the web <video>
-            // fullscreen fills the screen (enterVideoFullscreen hides the bars
-            // too); a camera cutout keeps its band, so the player's controls
-            // stay clear of it.
+            // Video fullscreen: no system-bar padding, so the full screen view
+            // (or an older page's own full screen) fills the screen, and
+            // applyVideoFullscreen hides the bars; a camera cutout keeps its
+            // band, so the player's controls stay clear of it.
             if (videoFullscreen) {
                 Insets cut = insets.getInsets(WindowInsetsCompat.Type.displayCutout());
                 view.setPadding(cut.left, cut.top, cut.right, cut.bottom);
@@ -1386,7 +1410,8 @@ public class MainActivity extends BridgeActivity {
 
         DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
         if (dm != null) {
-            dm.enqueue(request);
+            long id = dm.enqueue(request);
+            Log.i("OtoDock", "download " + id + " queued: " + filename);
             Toast.makeText(this, "Downloading " + filename, Toast.LENGTH_SHORT).show();
         }
     }
@@ -1421,9 +1446,14 @@ public class MainActivity extends BridgeActivity {
     private PowerManager.WakeLock wakeLock;
     private volatile boolean isStreaming = false;
     private boolean isPaused = false;
-    // True while a web <video> is in fullscreen (set via the JS bridge) — the
-    // inset listener then pads the display cutout only.
+    // True while a video holds the screen (videoFs.on(), written on the UI
+    // thread): the inset listener then pads the display cutout only.
     private volatile boolean videoFullscreen = false;
+    // Who holds it, and the WebView's own full screen view with the callback
+    // that ends it. UI thread only.
+    private final VideoFullscreen videoFs = new VideoFullscreen();
+    private View customView;
+    private WebChromeClient.CustomViewCallback customViewCallback;
 
     // --- The dashboard channel ---
 
@@ -1615,50 +1645,103 @@ public class MainActivity extends BridgeActivity {
     }
 
     /**
-     * Enter edge-to-edge video fullscreen: drop the WebView's system-bar
-     * padding (so a web &lt;video&gt; fullscreen fills the screen) and hide
-     * the status/nav bars (immersive). Called by VideoPlayer.tsx on
-     * fullscreen enter. The screen turns with the phone: the app requests no
-     * orientation (Android 16 ignores one on a large screen, and Play counts
-     * it against large-screen support), so the page's wide-video hint
-     * {@code landscape} is accepted and unused.
+     * The page asks for the bars to go: a dashboard calls this on every
+     * full screen, beside the WebView's own view (where it changes nothing),
+     * and alone where it fills the page itself. The screen turns with the
+     * phone: the app requests no orientation (Android 16 ignores one on a
+     * large screen, and Play counts it against large-screen support), so the
+     * page's wide-video hint {@code landscape} is accepted and unused.
      */
     private void enterVideoFullscreen(boolean landscape) {
-        runOnUiThread(() -> {
-            videoFullscreen = true;
-            try {
-                View container = (View) getBridge().getWebView().getParent();
+        runOnUiThread(() -> applyVideoFullscreen(videoFs.pageEntered()));
+    }
+
+    /** The page gives the bars back. */
+    private void exitVideoFullscreen() {
+        runOnUiThread(() -> applyVideoFullscreen(videoFs.pageLeft()));
+    }
+
+    /**
+     * The bars and the container follow {@link VideoFullscreen} (UI thread):
+     * on, the WebView's system-bar padding drops to the cutout's band over a
+     * black container and the status and navigation bars hide (immersive);
+     * off, the padding, the container and the bars return. The one place
+     * that does either, for the page's calls and for the WebView's view.
+     */
+    private void applyVideoFullscreen(boolean changed) {
+        if (!changed || isDestroyed()) return;
+        boolean on = videoFs.on();
+        videoFullscreen = on;
+        try {
+            View container = (View) getBridge().getWebView().getParent();
+            WindowInsetsControllerCompat ctl = WindowCompat.getInsetsController(
+                getWindow(), getWindow().getDecorView());
+            if (on) {
                 // The cutout's band beside the player is black, as a player's.
                 if (containerFade != null) containerFade.end();
                 container.setBackgroundColor(Color.BLACK);
                 ViewCompat.requestApplyInsets(container);
-                WindowInsetsControllerCompat ctl = WindowCompat.getInsetsController(
-                    getWindow(), getWindow().getDecorView());
                 if (ctl != null) {
                     ctl.setSystemBarsBehavior(
                         WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
                     ctl.hide(WindowInsetsCompat.Type.systemBars());
                 }
-            } catch (Exception ignored) {}
-        });
-    }
-
-    /** Exit video fullscreen: restore the padding, the container and the bars. */
-    private void exitVideoFullscreen() {
-        runOnUiThread(() -> {
-            videoFullscreen = false;
-            try {
-                View container = (View) getBridge().getWebView().getParent();
+            } else {
                 container.setBackground(new GradientDrawable(
                         GradientDrawable.Orientation.TOP_BOTTOM, containerColors.clone()));
                 ViewCompat.requestApplyInsets(container);
-                WindowInsetsControllerCompat ctl = WindowCompat.getInsetsController(
-                    getWindow(), getWindow().getDecorView());
                 if (ctl != null) {
                     ctl.show(WindowInsetsCompat.Type.systemBars());
                 }
-            } catch (Exception ignored) {}
-        });
+            }
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * The WebView hands over its full screen view (FullscreenWebChromeClient):
+     * it goes above the WebView, inside the container's padding, so the
+     * cutout's band is the one the insets listener already keeps. The
+     * WebView stays visible under it: the WebView takes the focus back
+     * before it asks for the view to go. Nothing thrown here may reach it.
+     * A refused view answers the callback at once, as Capacitor's client
+     * does: the page then fills the WebView and the bars follow its calls.
+     */
+    private void showCustomView(View view, WebChromeClient.CustomViewCallback callback) {
+        if (customView != null || isFinishing() || isDestroyed()) {
+            callback.onCustomViewHidden();
+            return;
+        }
+        try {
+            ViewGroup container = (ViewGroup) getBridge().getWebView().getParent();
+            view.setBackgroundColor(Color.BLACK);
+            container.addView(view, new ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        } catch (RuntimeException e) {
+            Log.w(TAG, "The full screen view was not shown", e);
+            callback.onCustomViewHidden();
+            return;
+        }
+        customView = view;
+        customViewCallback = callback;
+        view.requestFocus();
+        applyVideoFullscreen(videoFs.viewShown());
+    }
+
+    /** The WebView left full screen: the view goes, the bars return. With no
+     *  view kept this does nothing (the WebView may call it with none). */
+    private void hideCustomView() {
+        View view = customView;
+        if (view == null) return;
+        customView = null;
+        customViewCallback = null;
+        try {
+            if (view.getParent() instanceof ViewGroup) ((ViewGroup) view.getParent()).removeView(view);
+            WebView wv = getBridge().getWebView();
+            if (!wv.hasFocus()) wv.requestFocus();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "The full screen view was not removed", e);
+        }
+        applyVideoFullscreen(videoFs.viewHidden());
     }
 
     /** The SPA signals it has mounted; deliver any deep link held for it. */
@@ -2387,6 +2470,9 @@ public class MainActivity extends BridgeActivity {
             foldDiag.detach(isChangingConfigurations(), getChangingConfigurations(), sSwitchInProgress);
             foldDiag = null;
         }
+        // The WebView goes with the activity: nothing to tell, nothing to remove.
+        customView = null;
+        customViewCallback = null;
         super.onDestroy();
     }
 
@@ -2433,6 +2519,15 @@ public class MainActivity extends BridgeActivity {
      * agents / admin pages).
      */
     private void handleBackAction() {
+        // A full screen view is what the person sees, so Back leaves it
+        // first, a frame's own player included. On Android 13 and later the
+        // WebView's view usually takes Back itself before this runs. Read
+        // into a local: the callback calls hideCustomView before it returns.
+        WebChromeClient.CustomViewCallback leave = customViewCallback;
+        if (customView != null && leave != null) {
+            leave.onCustomViewHidden();
+            return;
+        }
         WebView webView = getBridge().getWebView();
         if (webView == null) {
             moveTaskToBack(true);
@@ -2454,8 +2549,8 @@ public class MainActivity extends BridgeActivity {
             "    }" +
             "    return 'handled';" +
             "  }" +
-            // Video fullscreen outside a dialog — Back exits fullscreen (which
-            // restores padding/orientation via exitVideoFullscreen) instead of
+            // A page's own full screen outside a dialog (an older page, or
+            // one that fills the page itself): Back leaves it instead of
             // minimizing. VideoPlayer.tsx wires these globals on FS enter.
             "  if (window.__otodockVideoFullscreenActive === true) {" +
             "    if (typeof window.__otodockVideoFullscreenClose === 'function') {" +

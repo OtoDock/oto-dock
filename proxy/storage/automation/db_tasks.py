@@ -17,14 +17,17 @@ from storage.pg import get_conn
 def create_run(run_id: str, task_id: str, agent: str, trigger_type: str,
                trigger_source: str | None, prompt: str,
                task_type: str | None = None,
-               scope: str = "agent", created_by: str | None = None) -> None:
+               scope: str = "agent", created_by: str | None = None,
+               spender_sub: str | None = None) -> None:
+    """Write a run row. ``spender_sub`` is its task's recorded spender
+    (``core/config/spender.py``), copied as it is."""
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO task_runs (id, task_id, agent, trigger_type, trigger_source,
-               status, prompt_preview, prompt_text, task_type, scope, created_by)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+               status, prompt_preview, prompt_text, task_type, scope, created_by, spender_sub)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (run_id, task_id, agent, trigger_type, trigger_source,
-             run_status.PENDING, prompt[:200], prompt, task_type, scope, created_by),
+             run_status.PENDING, prompt[:200], prompt, task_type, scope, created_by, spender_sub),
         )
         conn.commit()
 
@@ -70,17 +73,21 @@ def update_run(run_id: str, *, status: str | None = None, output_text: str | Non
     with get_conn() as conn:
         conn.execute(sql, values)
         conn.commit()
-    if run_status.is_terminal(status):
-        for hook in list(_run_finished_hooks):
-            with contextlib.suppress(Exception):
-                hook(run_id, status)
+    if status is not None and run_status.is_terminal(status):
+        _tell_finished(run_id, status)
 
 
 # The listeners told after a terminal write commits (the platform catalog's
-# ``tasks`` feed, APPS.md). Every writer of a terminal status goes through
-# ``update_run``, so this is the one site; the vocabulary is
-# ``storage/automation/run_status.py``.
+# ``tasks`` feed, APPS.md). Every writer of a terminal status while the
+# platform runs goes through ``update_run`` or ``fail_live_run``, and both come
+# here; the vocabulary is ``storage/automation/run_status.py``.
 _run_finished_hooks: list = []
+
+
+def _tell_finished(run_id: str, status: str) -> None:
+    for hook in list(_run_finished_hooks):
+        with contextlib.suppress(Exception):
+            hook(run_id, status)
 
 
 def on_run_finished(hook) -> None:
@@ -99,8 +106,42 @@ def list_orphaned_runs() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def fail_live_run(run_id: str, reason: str) -> bool:
+    """Fail a run still live, in one statement: of two that race to end a
+    run, one is told it did, and that one reports it."""
+    return _end_live_run(run_id, run_status.FAILED, reason)
+
+
+def cancel_live_run(run_id: str, reason: str) -> bool:
+    """A person stopped a run still live that no task of this process
+    drives (it waits for its reopen or its replay): cancelled, in the one
+    statement ``fail_live_run`` uses, so one of two that end it is told."""
+    return _end_live_run(run_id, run_status.CANCELLED, reason)
+
+
+def _end_live_run(run_id: str, status: str, reason: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE task_runs SET status=%s, error_message=%s, completed_at=%s "
+            "WHERE id=%s AND status = ANY(%s)",
+            (status, reason, datetime.now(timezone.utc).isoformat(), run_id,
+             sorted(run_status.LIVE)),
+        )
+        conn.commit()
+        ended = cur.rowcount > 0
+    if ended:
+        _tell_finished(run_id, status)
+    return ended
+
+
+#: Why a run nothing takes up again ends at a restart, as its row and the
+#: task history say it (``services/scheduler/run_recovery.RUN_CUT`` is the
+#: same sentence).
+RUN_CUT_REASON = "Cut short when the platform restarted"
+
+
 def mark_orphaned_runs_failed(
-    reason: str = "Proxy restarted", exclude_ids: list[str] | None = None,
+    reason: str = RUN_CUT_REASON, exclude_ids: list[str] | None = None,
 ) -> int:
     """Mark task_runs stuck in running/pending as failed (proxy restart recovery).
 
@@ -135,6 +176,15 @@ def mark_orphaned_runs_failed(
             )
         conn.commit()
         return cur.rowcount
+
+
+def delete_run(run_id: str) -> bool:
+    """One run row and what hangs on it (its cascade). For a run whose
+    prompt holds a forgotten person's words: a call's wrap-up."""
+    with get_conn() as conn:
+        n = conn.execute("DELETE FROM task_runs WHERE id = %s", (run_id,)).rowcount
+        conn.commit()
+        return n > 0
 
 
 def get_run(run_id: str) -> dict | None:
@@ -420,6 +470,49 @@ def live_delegate_run_ids_for_chat(chat_id: str) -> list[str]:
     return [row["id"] for row in rows]
 
 
+def live_delegate_rounds(chat_id: str) -> list[dict]:
+    """The live delegated-worker runs tied to one chat
+    (``live_delegate_run_ids_for_chat``), in the order they were delegated
+    (the task row's own time, then the run's id): ``{"id", "session_id",
+    "status"}`` each. A run with no session on its row has not opened its
+    round: it waits at the lane gate."""
+    from services.scheduler import task_kinds
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT tr.id, tr.session_id, tr.status FROM task_runs tr "
+            "LEFT JOIN dynamic_tasks dt ON dt.id = tr.task_id "
+            "WHERE tr.task_type=%s AND tr.status = ANY(%s) "
+            "AND (tr.chat_id=%s OR dt.target_chat_id=%s) "
+            "ORDER BY COALESCE(dt.created_at, ''), tr.id",
+            (task_kinds.RUN_DELEGATE, sorted(run_status.LIVE), chat_id, chat_id),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def live_delegations_reporting_to(chat_ids: list[str]) -> list[dict]:
+    """The delegations still running that report to one of these chats:
+    the delegate tasks whose callback anchor (``on_complete_chat_id``) is
+    one of them and that have a live (pending/running) run, oldest first,
+    one per task, as ``{"id", "description", "agent"}`` (the task's id,
+    name and agent: what the caller's spawn row carries). The callers' side
+    of ``live_delegate_run_ids_for_chat``. A delegate's task row goes with
+    its run's end, so an ended delegation is never named."""
+    from services.scheduler import task_kinds
+    ids = [c for c in dict.fromkeys(chat_ids) if c]
+    if not ids:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT dt.id, dt.name, dt.agent FROM dynamic_tasks dt "
+            "WHERE dt.task_type=%s AND dt.on_complete_chat_id = ANY(%s) "
+            "AND EXISTS (SELECT 1 FROM task_runs tr WHERE tr.task_id = dt.id "
+            "AND tr.status = ANY(%s)) "
+            "ORDER BY dt.created_at, dt.id",
+            (task_kinds.DELEGATE, ids, sorted(run_status.LIVE)),
+        ).fetchall()
+    return [{"id": row["id"], "description": row["name"], "agent": row["agent"]} for row in rows]
+
+
 def count_runs_by_task(task_ids: list[str]) -> dict[str, int]:
     """Runs recorded in ``task_runs`` per task id — what a task view shows as
     its run count. The ``dynamic_tasks.run_count`` column is a continuation's
@@ -510,7 +603,8 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
                         app_handler: str | None = None,
                         checks: str = "",
                         target_machine: str = "",
-                        notify_audience: str = roles.EDITOR) -> None:
+                        notify_audience: str = roles.EDITOR,
+                        spender_sub: str | None = None) -> None:
     """Insert a dynamic_tasks row.
 
     ``app_id`` + ``app_handler`` mark an app handler's schedule row
@@ -538,6 +632,10 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
 
     ``notify_audience`` is who is told: the lowest per-agent role an
     agent-scope task's notifications reach (``editor`` for a new task).
+
+    ``spender_sub`` is the person whose accounts a lane or a judge spends,
+    as the platform recorded it (``core/config/spender.py``); None for any
+    other row.
     """
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
@@ -551,8 +649,8 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
                 community_template, community_template_item_slug,
                 target_chat_id, max_runs, until_at,
                 override_model, override_execution_path, permission_mode, app_id, app_handler,
-                checks, target_machine, notify_audience)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                checks, target_machine, notify_audience, spender_sub)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (task_id, agent, name, prompt, llm_mode, task_type, schedule, run_at,
              delay_seconds, interval_seconds, timeout_seconds, now, created_by,
              on_complete_agent, on_complete_prompt, on_complete_session_id,
@@ -561,7 +659,8 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
              community_template, community_template_item_slug,
              target_chat_id, max_runs, until_at,
              override_model or "", override_execution_path or "", permission_mode or "",
-             app_id, app_handler, checks or "", target_machine or "", notify_audience or roles.EDITOR),
+             app_id, app_handler, checks or "", target_machine or "", notify_audience or roles.EDITOR,
+             spender_sub),
         )
         conn.commit()
 

@@ -1,0 +1,444 @@
+[
+ {
+  "author": [],
+  "noted": {
+   "fan_out_delete": [],
+   "fan_out_write": [],
+   "file_updated": [],
+   "notifications": []
+  },
+  "recover_bin": [],
+  "stamp": 0.0,
+  "step": "a refused frame touches nothing",
+  "sync_state": [],
+  "tombstones": [],
+  "tree": {},
+  "wire": []
+ },
+ {
+  "author": [],
+  "noted": {
+   "fan_out_delete": [],
+   "fan_out_write": [],
+   "file_updated": [],
+   "notifications": []
+  },
+  "recover_bin": [],
+  "stamp": 1000.0,
+  "step": "a role that may not write",
+  "sync_state": [],
+  "tombstones": [],
+  "tree": {},
+  "wire": []
+ },
+ {
+  "author": [
+   {
+    "last_writer": "alice",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "noted": {
+   "fan_out_delete": [],
+   "fan_out_write": [
+    {
+     "agent": "flow-agent",
+     "bytes": "first",
+     "exclude": "sat-one-0",
+     "marked": {
+      "sat-two-0": [
+       1,
+       2
+      ]
+     },
+     "rel": "workspace/live.txt"
+    }
+   ],
+   "file_updated": [
+    "flow-agent/workspace/live.txt disk"
+   ],
+   "notifications": []
+  },
+  "recover_bin": [],
+  "stamp": 1000.0,
+  "step": "a new file",
+  "sync_state": [
+   {
+    "base_hash": "sha256:a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "tombstones": [],
+  "tree": {
+   "workspace/live.txt": "first"
+  },
+  "wire": []
+ },
+ {
+  "author": [
+   {
+    "last_writer": "alice",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "noted": {
+   "fan_out_delete": [],
+   "fan_out_write": [
+    {
+     "agent": "flow-agent",
+     "bytes": "second",
+     "exclude": "sat-one-0",
+     "marked": {
+      "sat-two-0": [
+       1,
+       2
+      ]
+     },
+     "rel": "workspace/live.txt"
+    }
+   ],
+   "file_updated": [
+    "flow-agent/workspace/live.txt disk"
+   ],
+   "notifications": []
+  },
+  "recover_bin": [],
+  "stamp": 1000.0,
+  "step": "the same machine's next write",
+  "sync_state": [
+   {
+    "base_hash": "sha256:16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "tombstones": [],
+  "tree": {
+   "workspace/live.txt": "second"
+  },
+  "wire": []
+ },
+ {
+  "author": [
+   {
+    "last_writer": "alice",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "noted": {
+   "fan_out_delete": [],
+   "fan_out_write": [
+    {
+     "agent": "flow-agent",
+     "bytes": "third",
+     "exclude": "sat-one-0",
+     "marked": {
+      "sat-two-0": [
+       1,
+       2
+      ]
+     },
+     "rel": "workspace/live.txt"
+    }
+   ],
+   "file_updated": [
+    "flow-agent/workspace/live.txt disk"
+   ],
+   "notifications": [
+    {
+     "agent_slug": "flow-agent",
+     "body": "Your version of “live.txt” was replaced by a newer version. It is in the Recover bin.",
+     "scope": "user",
+     "severity": "info",
+     "source": "file_conflict",
+     "target": "user-viewer",
+     "title": "Recover your file"
+    }
+   ]
+  },
+  "recover_bin": [
+   {
+    "reason": "conflict",
+    "rel_path": "workspace/live.txt",
+    "size": 13
+   }
+  ],
+  "stamp": 1000.0,
+  "step": "over a colleague's edit the merge base never saw",
+  "sync_state": [
+   {
+    "base_hash": "sha256:b1e99324505bd32da0e1f85dcf5e19a09db0481e8a15f62c41eb320304a8e927",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "tombstones": [],
+  "tree": {
+   "workspace/live.txt": "third"
+  },
+  "wire": []
+ },
+ {
+  "author": [
+   {
+    "last_writer": "alice",
+    "rel_path": "workspace/large.bin"
+   },
+   {
+    "last_writer": "alice",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "noted": {
+   "fan_out_delete": [],
+   "fan_out_write": [
+    {
+     "agent": "flow-agent",
+     "exclude": "sat-one-0",
+     "marked": {
+      "sat-two-0": [
+       1,
+       2
+      ]
+     },
+     "path": "<agents>/flow-agent/workspace/large.bin",
+     "rel": "workspace/large.bin"
+    }
+   ],
+   "file_updated": [
+    "flow-agent/workspace/large.bin disk"
+   ],
+   "notifications": []
+  },
+  "recover_bin": [
+   {
+    "reason": "conflict",
+    "rel_path": "workspace/live.txt",
+    "size": 13
+   }
+  ],
+  "stamp": 1000.0,
+  "step": "a large file is pulled",
+  "sync_state": [
+   {
+    "base_hash": "sha256:a63899ab1f7741f5528fc502862d09e8d04f2f169144091babc28503fb8aa8a2",
+    "rel_path": "workspace/large.bin"
+   },
+   {
+    "base_hash": "sha256:b1e99324505bd32da0e1f85dcf5e19a09db0481e8a15f62c41eb320304a8e927",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "tombstones": [],
+  "tree": {
+   "workspace/large.bin": "large file body",
+   "workspace/live.txt": "third"
+  },
+  "wire": [
+   {
+    "agent_slug": "flow-agent",
+    "path": "workspace/large.bin",
+    "path_kind": "agent_tree",
+    "request_id": "<id>",
+    "type": "file_pull"
+   }
+  ]
+ },
+ {
+  "author": [
+   {
+    "last_writer": "alice",
+    "rel_path": "workspace/large.bin"
+   },
+   {
+    "last_writer": "alice",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "noted": {
+   "fan_out_delete": [],
+   "fan_out_write": [
+    {
+     "agent": "flow-agent",
+     "bytes": "",
+     "exclude": "sat-one-0",
+     "marked": {
+      "sat-two-0": [
+       1,
+       2
+      ]
+     },
+     "rel": "workspace/live.txt"
+    }
+   ],
+   "file_updated": [
+    "flow-agent/workspace/live.txt disk"
+   ],
+   "notifications": []
+  },
+  "recover_bin": [
+   {
+    "reason": "conflict",
+    "rel_path": "workspace/live.txt",
+    "size": 13
+   }
+  ],
+  "stamp": 1000.0,
+  "step": "an empty inline write",
+  "sync_state": [
+   {
+    "base_hash": "sha256:a63899ab1f7741f5528fc502862d09e8d04f2f169144091babc28503fb8aa8a2",
+    "rel_path": "workspace/large.bin"
+   },
+   {
+    "base_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "tombstones": [],
+  "tree": {
+   "workspace/large.bin": "large file body",
+   "workspace/live.txt": ""
+  },
+  "wire": []
+ },
+ {
+  "author": [
+   {
+    "last_writer": "alice",
+    "rel_path": "workspace/large.bin"
+   }
+  ],
+  "noted": {
+   "fan_out_delete": [
+    {
+     "agent": "flow-agent",
+     "exclude": "sat-one-0",
+     "rel": "workspace/live.txt"
+    }
+   ],
+   "fan_out_write": [],
+   "file_updated": [
+    "flow-agent/workspace/live.txt disk"
+   ],
+   "notifications": []
+  },
+  "recover_bin": [
+   {
+    "reason": "conflict",
+    "rel_path": "workspace/live.txt",
+    "size": 13
+   }
+  ],
+  "stamp": 1000.0,
+  "step": "a delete",
+  "sync_state": [
+   {
+    "base_hash": "sha256:a63899ab1f7741f5528fc502862d09e8d04f2f169144091babc28503fb8aa8a2",
+    "rel_path": "workspace/large.bin"
+   }
+  ],
+  "tombstones": [
+   {
+    "origin": "live-delete",
+    "rel_path": "workspace/live.txt"
+   }
+  ],
+  "tree": {
+   "workspace/large.bin": "large file body"
+  },
+  "wire": []
+ },
+ {
+  "author": [
+   {
+    "last_writer": "alice",
+    "rel_path": "workspace/large.bin"
+   }
+  ],
+  "noted": {
+   "fan_out_delete": [
+    {
+     "agent": "flow-agent",
+     "exclude": "sat-one-0",
+     "rel": "workspace/none"
+    }
+   ],
+   "fan_out_write": [],
+   "file_updated": [
+    "flow-agent/workspace/none disk"
+   ],
+   "notifications": []
+  },
+  "recover_bin": [
+   {
+    "reason": "conflict",
+    "rel_path": "workspace/live.txt",
+    "size": 13
+   }
+  ],
+  "stamp": 1000.0,
+  "step": "a delete of nothing",
+  "sync_state": [
+   {
+    "base_hash": "sha256:a63899ab1f7741f5528fc502862d09e8d04f2f169144091babc28503fb8aa8a2",
+    "rel_path": "workspace/large.bin"
+   }
+  ],
+  "tombstones": [
+   {
+    "origin": "live-delete",
+    "rel_path": "workspace/live.txt"
+   },
+   {
+    "origin": "live-delete",
+    "rel_path": "workspace/none"
+   }
+  ],
+  "tree": {
+   "workspace/large.bin": "large file body"
+  },
+  "wire": []
+ },
+ {
+  "author": [
+   {
+    "last_writer": "alice",
+    "rel_path": "workspace/large.bin"
+   }
+  ],
+  "noted": {
+   "fan_out_delete": [],
+   "fan_out_write": [],
+   "file_updated": [],
+   "notifications": []
+  },
+  "recover_bin": [
+   {
+    "reason": "conflict",
+    "rel_path": "workspace/live.txt",
+    "size": 13
+   }
+  ],
+  "stamp": 1000.0,
+  "step": "a path outside the tree's scopes",
+  "sync_state": [
+   {
+    "base_hash": "sha256:a63899ab1f7741f5528fc502862d09e8d04f2f169144091babc28503fb8aa8a2",
+    "rel_path": "workspace/large.bin"
+   }
+  ],
+  "tombstones": [
+   {
+    "origin": "live-delete",
+    "rel_path": "workspace/live.txt"
+   },
+   {
+    "origin": "live-delete",
+    "rel_path": "workspace/none"
+   }
+  ],
+  "tree": {
+   "workspace/large.bin": "large file body"
+  },
+  "wire": []
+ }
+]

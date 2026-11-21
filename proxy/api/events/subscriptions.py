@@ -22,7 +22,7 @@ import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from psycopg import errors as pg_errors
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import config
 from auth.providers import UserContext, get_current_user, require_auth, require_user
@@ -46,7 +46,7 @@ router = APIRouter(dependencies=[Depends(require_user)])
 class CreateSubscriptionRequest(BaseModel):
     scope: str  # 'user' | 'service'
     mcp_name: str
-    account_label: str
+    account_label: str = Field(min_length=1)
     vendor_target: str
     selected_events: list[str]
     selected_subevents: dict[str, list[str]] | None = None
@@ -96,26 +96,11 @@ def _can_view_subscription(row: dict, user: UserContext) -> bool:
     return False
 
 
-def _ensure_bound_label(*, mcp_name: str, agent: str, account_label: str) -> None:
-    """A service-scope request may only name the account the agent's service
-    binding points at (same rule as the manager's create path)."""
-    from services.oauth import credential_resolver
-    ref = credential_resolver.pick_account(mcp_name, agent)
-    if ref is None:
-        raise HTTPException(
-            400, f"no account bound to agent {agent!r} for {mcp_name}",
-        )
-    if ref.label != account_label:
-        raise HTTPException(
-            400,
-            detail={
-                "message": (
-                    f"account {account_label!r} is not the service account "
-                    f"bound to agent {agent!r} for {mcp_name}"
-                ),
-                "bound_account_label": ref.label,
-            },
-        )
+def _ensure_set_label(*, mcp_name: str, agent: str, account_label: str) -> None:
+    """A service-scope request may only name one of the agent's own accounts
+    whose lender still manages it (the create path's rule)."""
+    if subscription_manager.service_account(mcp_name, agent, account_label) is None:
+        raise HTTPException(400, subscription_manager.not_in_the_set(mcp_name, account_label))
 
 
 def _enforce_create_permission(
@@ -171,8 +156,8 @@ async def create_subscription(
     """Create + auto-register a vendor webhook subscription."""
     u = require_auth(user)
     _reject_on_behalf(x_on_behalf_of)
-    creator_sub = _enforce_create_permission(
-        scope=body.scope, agent=body.agent, user=u,
+    creator_sub = await run_db(
+        _enforce_create_permission, scope=body.scope, agent=body.agent, user=u,
     )
     try:
         row = await subscription_manager.create_subscription(
@@ -232,22 +217,11 @@ def _decorate_creators(rows: list[dict]) -> list[dict]:
     return rows
 
 
-@router.get("/v1/subscriptions")
-async def list_subscriptions(
-    scope: str | None = Query(default=None),
-    agent: str | None = Query(default=None),
-    mcp_name: str | None = Query(default=None),
-    provider_id: str | None = Query(default=None),
-    account_label: str | None = Query(default=None),
-    user: UserContext | None = Depends(get_current_user),
-):
-    """List subscriptions visible to the caller.
-
-    Filters: scope (user|service), agent, mcp_name, provider_id, account_label.
-    Admin sees everything; non-admin sees own user-scope + service-scope on
-    accessible agents.
-    """
-    u = require_auth(user)
+def _list_view(
+    u: UserContext, *, scope: str | None, agent: str | None, mcp_name: str | None,
+    provider_id: str | None, account_label: str | None,
+) -> list[dict]:
+    """The list route's reads, one ``run_db`` job."""
     # Keyed on is_service like /v1/tasks (H1/H2): a session JWT is
     # api-key-shaped but must get the user-view (own user-scope +
     # accessible-agent service-scope), never the full table.
@@ -271,7 +245,30 @@ async def list_subscriptions(
         # Filter service-scope rows by manageable agents (view ≠ manage; we
         # still SHOW agent-scope rows for any agent the user can access).
         rows = [r for r in rows if _can_view_subscription(r, u)]
-    return {"subscriptions": _decorate_mcp_state(_decorate_creators(rows))}
+    return _decorate_mcp_state(_decorate_creators(rows))
+
+
+@router.get("/v1/subscriptions")
+async def list_subscriptions(
+    scope: str | None = Query(default=None),
+    agent: str | None = Query(default=None),
+    mcp_name: str | None = Query(default=None),
+    provider_id: str | None = Query(default=None),
+    account_label: str | None = Query(default=None),
+    user: UserContext | None = Depends(get_current_user),
+):
+    """List subscriptions visible to the caller.
+
+    Filters: scope (user|service), agent, mcp_name, provider_id, account_label.
+    Admin sees everything; non-admin sees own user-scope + service-scope on
+    accessible agents.
+    """
+    u = require_auth(user)
+    rows = await run_db(
+        _list_view, u, scope=scope, agent=agent, mcp_name=mcp_name, provider_id=provider_id,
+        account_label=account_label,
+    )
+    return {"subscriptions": rows}
 
 
 def _decorate_mcp_state(rows: list[dict]) -> list[dict]:
@@ -301,7 +298,7 @@ async def get_subscription(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    row = webhook_subscription_store.get_subscription(subscription_id)
+    row = await run_db(webhook_subscription_store.get_subscription, subscription_id)
     if not row:
         raise HTTPException(404, "Subscription not found")
     if not _can_view_subscription(row, u):
@@ -309,18 +306,8 @@ async def get_subscription(
     return row
 
 
-@router.delete("/v1/subscriptions/{subscription_id}")
-async def delete_subscription(
-    subscription_id: str,
-    force: bool = Query(default=False),
-    user: UserContext | None = Depends(get_current_user),
-    x_on_behalf_of: str | None = Header(default=None),
-):
-    """Delete a subscription. Triggers still linked to it make this a 409
-    (the FK would detach them silently) unless ``force=true``; the cascades
-    (account disconnect, agent delete, binding clear) keep the FK behaviour."""
-    u = require_auth(user)
-    _reject_on_behalf(x_on_behalf_of)
+def _check_deletable(subscription_id: str, u: UserContext, force: bool) -> None:
+    """The delete route's reads and refusals, one ``run_db`` job."""
     row = webhook_subscription_store.get_subscription(subscription_id)
     if not row:
         raise HTTPException(404, "Subscription not found")
@@ -344,6 +331,21 @@ async def delete_subscription(
                     ],
                 },
             )
+
+
+@router.delete("/v1/subscriptions/{subscription_id}")
+async def delete_subscription(
+    subscription_id: str,
+    force: bool = Query(default=False),
+    user: UserContext | None = Depends(get_current_user),
+    x_on_behalf_of: str | None = Header(default=None),
+):
+    """Delete a subscription. Triggers still linked to it make this a 409
+    (the FK would detach them silently) unless ``force=true``; the cascades
+    (account disconnect, agent delete, binding clear) keep the FK behaviour."""
+    u = require_auth(user)
+    _reject_on_behalf(x_on_behalf_of)
+    await run_db(_check_deletable, subscription_id, u, force)
     deleted, vendor_detached = await subscription_manager.delete_subscription(
         subscription_id=subscription_id,
     )
@@ -358,7 +360,7 @@ async def renew_subscription(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    row = webhook_subscription_store.get_subscription(subscription_id)
+    row = await run_db(webhook_subscription_store.get_subscription, subscription_id)
     if not row:
         raise HTTPException(404, "Subscription not found")
     if not _can_manage_subscription(row, u):
@@ -370,20 +372,22 @@ async def renew_subscription(
     return updated or {"error": "not_renewable"}
 
 
-def _installation_target_spec(meta: dict, *, scope: str, agent: str | None, mcp_name: str) -> dict:
-    from services.oauth import credential_resolver, github_apps
+def _installation_target_spec(
+    meta: dict, *, scope: str, agent: str | None, mcp_name: str, account_label: str,
+) -> dict:
+    from services.oauth import github_apps
     owned = [i for i in oauth_app_kinds.installations_of(meta) if i.get("admin") and not i.get("suspended_at")]
     help_text = "One subscription covers every repository the installation reaches, now and later."
     not_owned = "Install the app on GitHub first. You can subscribe only to an installation you own."
     if scope == "service":
-        # The ones the agent's binding covers: its pinned installation, or
-        # on a hosted account (no installation identity) every owned one.
-        bound = credential_resolver.pick_account(mcp_name, agent or "")
+        # The ones this account of the agent covers: the installation it acts
+        # as, or on a hosted account (no installation identity) every owned one.
         owned = [i for i in owned
-                 if bound is not None and oauth_app_kinds.binding_covers(bound.installation_id, meta, str(i.get("id")))]
+                 if subscription_manager.service_row_covers(mcp_name, agent or "", account_label, str(i.get("id")))]
         if not owned:
             help_text = (not_owned if oauth_app_kinds.is_hosted_app_meta(meta) else
-                         "First pick an installation as this agent's GitHub account in Agent Settings, MCPs.")
+                         "First add an installation as one of this agent's GitHub accounts in "
+                         "Agent Settings, MCPs.")
     elif not owned:
         help_text = not_owned
     return {
@@ -393,6 +397,65 @@ def _installation_target_spec(meta: dict, *, scope: str, agent: str | None, mcp_
             for i in owned
         ],
     }
+
+
+def _catalog_account_view(
+    *, mcp_name: str, webhooks: dict, account_label: str | None, scope: str | None,
+    agent: str | None, u: UserContext,
+) -> tuple[str, dict, str, list[str] | None, str]:
+    """The catalog's reads for the asked account, one ``run_db`` job: the
+    effective mode, the target spec, the prefill, the granted scopes and the
+    target kind (an ``HTTPException`` crosses it)."""
+    effective_mode = (webhooks.get("registration", {}) or {}).get("mode", "manual")
+    vendor_target_spec = webhooks.get("vendor_target_spec", {})
+    vendor_target_prefill = ""
+    granted_scopes: list[str] | None = None
+    target_kind = ""
+    if not account_label or scope not in ("user", "service"):
+        return effective_mode, vendor_target_spec, vendor_target_prefill, granted_scopes, target_kind
+    if scope == "service":
+        _ensure_set_label(mcp_name=mcp_name, agent=agent or "", account_label=account_label)
+    owner = (u.sub or "") if scope == "user" else ""
+    # A GitHub-App account subscribes to one of its installations: the
+    # app's own webhook delivers, so the target is a pick among the
+    # owned ones (an agent's: the ones its binding covers).
+    if webhooks.get("app_webhook"):
+        meta = subscription_manager._account_meta(
+            scope=scope, owner=owner, agent=agent, mcp_name=mcp_name, account_label=account_label,
+        )
+        if oauth_app_kinds.is_github_app_meta(meta):
+            target_kind = oauth_app_kinds.INSTALLATION_TARGET_KIND
+            vendor_target_spec = _installation_target_spec(
+                meta, scope=scope, agent=agent, mcp_name=mcp_name, account_label=account_label)
+    with contextlib.suppress(Exception):
+        effective_mode = subscription_manager.resolve_effective_registration_mode(
+            mcp_name=mcp_name, scope=scope, owner=owner, agent=agent,
+            account_label=account_label, target_kind=target_kind,
+        )
+    # What the create-time check reads, so the modal's line and the
+    # refusal agree; unknown for a token and for an installation. A
+    # person's own (``owner`` is set on the user scope alone), or an
+    # agent's, the bound owner's, for the agent's managers (only they
+    # subscribe there).
+    if not target_kind and (owner or u.can_manage_agent(agent or "")):
+        granted = subscription_manager._read_granted_scopes(
+            scope=scope, owner=owner, agent=agent, provider_id=webhooks.get("provider_id", ""),
+            mcp_name=mcp_name, account_label=account_label,
+        )
+        granted_scopes = sorted(granted) if granted is not None else None
+    extra_key = (webhooks.get("vendor_target_spec") or {}).get(
+        "account_extra_key", "")
+    if extra_key:
+        try:
+            extra = subscription_manager._resolve_account_extra(
+                provider_id=webhooks.get("provider_id", ""), scope=scope,
+                owner=owner, agent=agent, mcp_name=mcp_name,
+                account_label=account_label,
+            )
+            vendor_target_prefill = str(extra.get(extra_key, "") or "")
+        except (OSError, ValueError):
+            vendor_target_prefill = ""
+    return effective_mode, vendor_target_spec, vendor_target_prefill, granted_scopes, target_kind
 
 
 @router.get("/v1/mcps/{mcp_name}/webhook-event-catalog")
@@ -421,66 +484,24 @@ async def get_event_catalog(
     if not webhooks.get("available", False):
         raise HTTPException(404, f"MCP {mcp_name!r} does not support webhooks")
     if scope == "service":
-        # The effective mode and the prefill below read the BOUND OWNER's
-        # token file: only someone with access to the agent may ask, and
-        # only for the account the binding names.
+        # The account view below reads the lender's token file of one of the
+        # agent's own accounts: only a manager of the agent, who alone
+        # subscribes it, asks for one, and only for an account of its set.
         if not agent:
             raise HTTPException(400, "scope=service requires an `agent`")
         if not u.can_access_agent(agent):
             raise HTTPException(403, "Access denied")
-        if account_label:
-            _ensure_bound_label(mcp_name=mcp_name, agent=agent, account_label=account_label)
+        if account_label and not u.can_manage_agent(agent):
+            raise HTTPException(403, "Only a manager of this agent can subscribe it to events.")
     catalog = webhooks.get("event_catalog", [])
     if not (u.is_admin or u.is_api_key):
         catalog = [e for e in catalog if not e.get("admin_only")]
 
     reg_block = webhooks.get("registration", {}) or {}
-    effective_mode = reg_block.get("mode", "manual")
-    vendor_target_prefill = ""
-    vendor_target_spec = webhooks.get("vendor_target_spec", {})
-    granted_scopes: list[str] | None = None
-    target_kind = ""
-    if account_label and scope in ("user", "service"):
-        owner = (u.sub or "") if scope == "user" else ""
-        # A GitHub-App account subscribes to one of its installations: the
-        # app's own webhook delivers, so the target is a pick among the
-        # owned ones (an agent's: the ones its binding covers).
-        if webhooks.get("app_webhook"):
-            meta = subscription_manager._account_meta(
-                scope=scope, owner=owner, agent=agent, mcp_name=mcp_name, account_label=account_label,
-            )
-            if oauth_app_kinds.is_github_app_meta(meta):
-                target_kind = oauth_app_kinds.INSTALLATION_TARGET_KIND
-                vendor_target_spec = _installation_target_spec(meta, scope=scope, agent=agent, mcp_name=mcp_name)
-        with contextlib.suppress(Exception):
-            effective_mode = subscription_manager.resolve_effective_registration_mode(
-                mcp_name=mcp_name, scope=scope, owner=owner, agent=agent,
-                account_label=account_label, target_kind=target_kind,
-            )
-        # What the create-time check reads, so the modal's line and the
-        # refusal agree; unknown for a token and for an installation. A
-        # person's own (``owner`` is set on the user scope alone), or an
-        # agent's, the bound owner's, for the agent's managers (only they
-        # subscribe there).
-        if not target_kind and (owner or u.can_manage_agent(agent or "")):
-            granted = await run_db(
-                subscription_manager._read_granted_scopes,
-                scope=scope, owner=owner, agent=agent, provider_id=webhooks.get("provider_id", ""),
-                mcp_name=mcp_name, account_label=account_label,
-            )
-            granted_scopes = sorted(granted) if granted is not None else None
-        extra_key = (webhooks.get("vendor_target_spec") or {}).get(
-            "account_extra_key", "")
-        if extra_key:
-            try:
-                extra = subscription_manager._resolve_account_extra(
-                    provider_id=webhooks.get("provider_id", ""), scope=scope,
-                    owner=owner, agent=agent, mcp_name=mcp_name,
-                    account_label=account_label,
-                )
-                vendor_target_prefill = str(extra.get(extra_key, "") or "")
-            except (OSError, ValueError):
-                vendor_target_prefill = ""
+    effective_mode, vendor_target_spec, vendor_target_prefill, granted_scopes, target_kind = await run_db(
+        _catalog_account_view,
+        mcp_name=mcp_name, webhooks=webhooks, account_label=account_label, scope=scope, agent=agent, u=u,
+    )
 
     return {
         "provider_id": webhooks.get("provider_id", ""),
@@ -516,15 +537,8 @@ def _scope_services(manifest) -> dict[str, str]:
     return named
 
 
-@router.get("/v1/subscriptions/{subscription_id}/signing-secret")
-async def get_subscription_signing_secret(
-    subscription_id: str,
-    user: UserContext | None = Depends(get_current_user),
-):
-    """Reveal the PER-SUBSCRIPTION signing secret (manual-mode vendors need
-    it pasted into the vendor console next to the webhook URL). Manage-gated;
-    404 for manifests using a platform-wide secret (nothing to reveal)."""
-    u = require_auth(user)
+def _signing_secret_view(subscription_id: str, u: UserContext) -> dict:
+    """The signing-secret route's reads and refusals, one ``run_db`` job."""
     row = webhook_subscription_store.get_subscription(subscription_id)
     if not row:
         raise HTTPException(404, "Subscription not found")
@@ -539,3 +553,15 @@ async def get_subscription_signing_secret(
         raise HTTPException(404, "This vendor uses a platform-wide secret")
     secret = webhook_subscription_store.get_signing_secret(subscription_id)
     return {"signing_secret": secret or ""}
+
+
+@router.get("/v1/subscriptions/{subscription_id}/signing-secret")
+async def get_subscription_signing_secret(
+    subscription_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Reveal the PER-SUBSCRIPTION signing secret (manual-mode vendors need
+    it pasted into the vendor console next to the webhook URL). Manage-gated;
+    404 for manifests using a platform-wide secret (nothing to reveal)."""
+    u = require_auth(user)
+    return await run_db(_signing_secret_view, subscription_id, u)

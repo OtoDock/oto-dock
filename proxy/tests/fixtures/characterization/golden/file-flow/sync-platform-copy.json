@@ -1,0 +1,13 @@
+{
+ "keep_mtime": {
+  "beyond_a_link": 1700000000.0,
+  "kept": 12345.5
+ },
+ "platform_bytes": {
+  "workspace": null,
+  "workspace/alias/k.txt": null,
+  "workspace/k.txt": "kept",
+  "workspace/link.txt": null,
+  "workspace/none.txt": null
+ }
+}

@@ -29,6 +29,7 @@ _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
+from core import placement
 from core.credentials import mcp_broker
 
 # ---------------------------------------------------------------------------
@@ -41,6 +42,9 @@ class _FakeManifest:
                  proxy_callbacks=False, runtime="python", oauth=None):
         self.name = name
         self.label = name
+        # A bundled tool: it comes with a compute machine's image, so no
+        # machine has to have built it before a session there gets it.
+        self.category = "custom"
         self.server_name = server_name
         self.exclude_from = []
         self.instances = instances
@@ -81,11 +85,10 @@ def _stub_assembly(monkeypatch, manifests, *, env_by_mcp, tmp_path,
     then gets a gateway entry). ``secret_keys`` defaults to EVERY resolver
     cred (the infra/per-user case); pass it + ``bash_env_keys`` to model
     OAuth paths / env_injection."""
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_registry, mcp_server_resolve, mcp_session_config
     from services.oauth import credential_resolver
 
-    monkeypatch.setattr(
-        mcp_registry, "_get_agent_mcps_with_device_exclusions",
+    monkeypatch.setattr(mcp_session_config, "_get_agent_mcps_with_device_exclusions",
         lambda *a, **k: (list(manifests), {}),
     )
     _secret = (
@@ -104,6 +107,9 @@ def _stub_assembly(monkeypatch, manifests, *, env_by_mcp, tmp_path,
             secret_keys=_secret,
             bash_env_keys=_bash,
             cli_credentials={},
+            token_credentials={},
+            accounts={},
+            agent_accounts={},
         ),
     )
     entries = server_entries or {}
@@ -113,7 +119,7 @@ def _stub_assembly(monkeypatch, manifests, *, env_by_mcp, tmp_path,
         # builder writes into the entry's env.
         return copy.deepcopy(entries.get(manifest.name, {"type": "stdio", "command": "x", "args": []}))
 
-    monkeypatch.setattr(mcp_registry, "resolve_server_config", _fake_server_config)
+    monkeypatch.setattr(mcp_session_config, "resolve_server_config", _fake_server_config)
 
     bearers = bearer_by_mcp or {}
 
@@ -124,7 +130,7 @@ def _stub_assembly(monkeypatch, manifests, *, env_by_mcp, tmp_path,
             return TokenRef(str(tmp_path), label, ""), None
         return None, f"{manifest.label}: no account is connected for this session"
 
-    monkeypatch.setattr(mcp_registry, "_gateway_bearer_source", _fake_source)
+    monkeypatch.setattr(mcp_server_resolve, "_gateway_bearer_source", _fake_source)
     monkeypatch.setattr(mcp_registry.config, "SESSIONS_DIR", tmp_path)
     # Keep the assembly DB-free: server_name "local" (browser-mcp) would
     # otherwise hit get_browser_allowed_origins, opening an app DB connection
@@ -297,8 +303,8 @@ def test_flat_env_keeps_nonsecret_and_excludes_from_bundle(monkeypatch, tmp_path
     _p, env_vars, _x, bundles, _ = mcp_registry.build_session_mcp_config("agent", None)
     # both stay in the flat env (the MCP needs the path; bash needs GH_TOKEN)
     assert env_vars == {"WS_DIR": "/virt/p", "GH_TOKEN": "tok"}
-    # nothing secret → no bundle for ws at all
-    assert "ws" not in bundles
+    # nothing secret → ws's bundle is the stand-in's empty one
+    assert not bundles["ws"].env and bundles["ws"].token is None
 
 
 def test_oto_strip_keys_on_credentialed_stdio_only(monkeypatch, tmp_path):
@@ -329,7 +335,7 @@ def test_oto_strip_keys_on_credentialed_stdio_only(monkeypatch, tmp_path):
     assert "ALPHA_KEY" not in _p.read_text()
 
 
-def test_no_bundle_for_credless_mcp(monkeypatch, tmp_path):
+def test_a_credless_stdio_mcp_gets_an_empty_bundle_and_none_on_a_call(monkeypatch, tmp_path):
     from services.mcp import mcp_registry
     _stub_assembly(
         monkeypatch,
@@ -340,6 +346,12 @@ def test_no_bundle_for_credless_mcp(monkeypatch, tmp_path):
 
     _p, _e, _x, bundles, _ = mcp_registry.build_session_mcp_config("agent", None)
 
+    # A stdio tool with no secret gets an empty bundle: its fetch token (the
+    # stand-in's, which starts the program at the agent's first call) reaches
+    # nothing; a call's tools start with it and get none.
+    assert set(bundles) == {"plain"}
+    assert not bundles["plain"].env and bundles["plain"].token is None
+    _p, _e, _x, bundles, _ = mcp_registry.build_session_mcp_config("agent", None, phone_mode=True)
     assert bundles == {}
 
 
@@ -347,7 +359,7 @@ def test_inject_toml_credentials_is_the_builders_one_step(tmp_path, monkeypatch)
     """The step every session builder runs: a JSON config, no config or no
     environment comes back as given; a TOML config goes through the writer
     (reached as the module attribute, so a test's patch of it holds)."""
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_registry, mcp_session_config
     toml = tmp_path / "a.toml"
     toml.write_text("")
     seen: list = []
@@ -355,7 +367,7 @@ def test_inject_toml_credentials_is_the_builders_one_step(tmp_path, monkeypatch)
     def _fake(path, env, *, exclude_keys=None):
         seen.append((path, dict(env), set(exclude_keys or ())))
         return tmp_path / "b.toml"
-    monkeypatch.setattr(mcp_registry, "inject_credential_env_into_toml", _fake)
+    monkeypatch.setattr(mcp_session_config, "inject_credential_env_into_toml", _fake)
     assert mcp_registry.inject_toml_credentials(toml, {"K": "v"}, mcp_format="json") is toml
     assert mcp_registry.inject_toml_credentials(None, {"K": "v"}, mcp_format="toml") is None
     assert mcp_registry.inject_toml_credentials(toml, {}, mcp_format="toml") is toml
@@ -372,13 +384,13 @@ def test_inject_toml_excludes_bash_env_keys(tmp_path):
     the non-secret OTO_* still ships into the Codex MCP env block."""
     import json as _json
 
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_session_config
     toml_path = tmp_path / "agent-x.toml"
     toml_path.write_text("")  # regenerated by the injector
     (tmp_path / "agent-x.servers.json").write_text(_json.dumps({
         "alpha": {"type": "stdio", "command": "x", "args": [], "env": {}},
     }))
-    out = mcp_registry.inject_credential_env_into_toml(
+    out = mcp_session_config.inject_credential_env_into_toml(
         toml_path, {"OTO_USERNAME": "alice", "GH_TOKEN": "ghp_secret"},
         exclude_keys={"GH_TOKEN"},
     )
@@ -409,7 +421,7 @@ def _isolate_remote_paths(monkeypatch):
     )
     monkeypatch.setattr(
         remote_mcp_rewrite, "_rewrite_env_for_remote",
-        lambda env, port: env,
+        lambda env, port, **k: env,
     )
     return remote_execution
 
@@ -485,7 +497,7 @@ def test_two_sessions_of_one_identity_get_their_own_build(monkeypatch, tmp_path)
     the other's injected token. The file name stays the identity's, so the
     per-session sandbox copy keeps its name and its host-local pattern."""
     from core.remote import file_sync
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_registry, mcp_session_config
     _stub_assembly(monkeypatch, [_FakeManifest("alpha")], env_by_mcp={"alpha": {}},
                    tmp_path=tmp_path)
     paths = []
@@ -495,7 +507,7 @@ def test_two_sessions_of_one_identity_get_their_own_build(monkeypatch, tmp_path)
         paths.append(path)
     assert paths[0] != paths[1] and paths[0].name == paths[1].name
     assert all(p.with_suffix(".servers.json").exists() for p in paths)
-    mcp_registry.inject_credential_env_into_toml(paths[0], {"PROXY_API_KEY": "tok-a"})
+    mcp_session_config.inject_credential_env_into_toml(paths[0], {"PROXY_API_KEY": "tok-a"})
     assert "tok-a" not in paths[1].read_text()
     assert paths[1].with_suffix(".servers.json").exists()
     json_path, *_ = mcp_registry.build_session_mcp_config(
@@ -509,8 +521,8 @@ def test_session_builds_older_than_a_day_are_swept(monkeypatch, tmp_path):
     import time
 
     import config
-    from services.mcp import mcp_registry
-    monkeypatch.setattr(mcp_registry, "_build_sweep_at", None)
+    from services.mcp import mcp_registry, mcp_session_config
+    monkeypatch.setattr(mcp_session_config, "_build_sweep_at", None)
     _stub_assembly(monkeypatch, [_FakeManifest("alpha")], env_by_mcp={"alpha": {}},
                    tmp_path=tmp_path)
     old, *_ = mcp_registry.build_session_mcp_config("agent", None, session_id="old-session")
@@ -519,7 +531,7 @@ def test_session_builds_older_than_a_day_are_swept(monkeypatch, tmp_path):
     day_ago = time.time() - 25 * 3600
     os.utime(old.parent, (day_ago, day_ago))
     os.utime(instance_file, (day_ago, day_ago))
-    monkeypatch.setattr(mcp_registry, "_build_sweep_at", None)
+    monkeypatch.setattr(mcp_session_config, "_build_sweep_at", None)
     new, *_ = mcp_registry.build_session_mcp_config("agent", None, session_id="new-session")
     assert not old.parent.exists() and new.exists()
     assert instance_file.exists()
@@ -532,8 +544,8 @@ def test_a_rebuild_into_its_directory_keeps_it_from_the_sweep(monkeypatch, tmp_p
     import os
     import time
 
-    from services.mcp import mcp_registry
-    monkeypatch.setattr(mcp_registry, "_build_sweep_at", None)
+    from services.mcp import mcp_registry, mcp_session_config
+    monkeypatch.setattr(mcp_session_config, "_build_sweep_at", None)
     _stub_assembly(monkeypatch, [_FakeManifest("alpha")], env_by_mcp={"alpha": {}},
                    tmp_path=tmp_path)
     first, *_ = mcp_registry.build_session_mcp_config("agent", None, session_id="resumed")
@@ -590,12 +602,163 @@ def test_the_agents_accounts_stay_off_a_personal_machine(monkeypatch, tmp_path):
     personal = placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m")
     admin = placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, machine_id="m")
 
-    def excluded(where, scope):
+    def excluded(where, scope, person=None):
         return mcp_registry.build_session_mcp_config(
-            "agent", None, placement=where, task_scope=scope)[2]
+            "agent", person, placement=where, task_scope=scope)[2]
 
     gone = excluded(personal, SCOPE_AGENT)
     assert "github" in gone and "agent's own account" in gone["github"]
     assert "plain" not in gone
     assert "github" not in excluded(admin, SCOPE_AGENT)
-    assert "github" not in excluded(personal, SCOPE_USER)
+    # A person's own session there runs on their own accounts.
+    assert "github" not in excluded(personal, SCOPE_USER, "u-owner")
+    # No person at all resolves the agent's accounts, whatever the scope word:
+    # they stay on the platform too.
+    assert "github" in excluded(personal, SCOPE_USER)
+
+
+# ---------------------------------------------------------------------------
+# The credential exit: placeholders in the bundle, the values held behind
+# ---------------------------------------------------------------------------
+
+
+def _exit_manifest(name, exits):
+    fm = _FakeManifest(name)
+    fm.credentials.exit = exits
+    return fm
+
+
+def test_a_declared_secret_leaves_the_bundle_as_a_placeholder(monkeypatch, tmp_path):
+    import config
+    from core.credentials import credential_exit
+    from services.mcp import mcp_registry
+    monkeypatch.setattr(config, "OTODOCK_RELAY_BASE", "https://relay.example.test/v1")
+    _stub_assembly(
+        monkeypatch,
+        [_exit_manifest("music", [{"key": "ELEVENLABS_API_KEY", "header": "xi-api-key",
+                                   "hosts": ["api.elevenlabs.io"]}]),
+         _exit_manifest("images", [{"key": "OPENAI_IMAGE_API_KEY", "header": "Authorization",
+                                    "prefix": "Bearer ", "hosts": ["api.openai.com"], "streams": True},
+                                   {"key": "OTODOCK_RELAY_TOKEN", "header": "Authorization",
+                                    "prefix": "Bearer ", "hosts": ["api.otodock.io"], "streams": "yes"},
+                                   {"key": "GOOGLE_AI_API_KEY", "header": "x-goog-api-key",
+                                    "hosts": ["generativelanguage.googleapis.com"]}]),
+         _FakeManifest("plain")],
+        env_by_mcp={"music": {"ELEVENLABS_API_KEY": "sk-eleven"},
+                    "images": {"OPENAI_IMAGE_API_KEY": "sk-openai", "OTODOCK_RELAY_TOKEN": "rt-1"},
+                    "plain": {"PLAIN_KEY": "p"}},
+        tmp_path=tmp_path,
+    )
+    _p, _e, _x, bundles, _ = mcp_registry.build_session_mcp_config(
+        "agent", None, placement=placement.LOCAL_PLACEMENT)
+    music = bundles["music"]
+    assert music.env["ELEVENLABS_API_KEY"].startswith(credential_exit.PLACEHOLDER_PREFIX)
+    (cred,) = music.exit
+    assert cred.placeholder == music.env["ELEVENLABS_API_KEY"]
+    assert (cred.header, cred.hosts, cred.value, cred.env_name, cred.prefix) == (
+        "xi-api-key", ("api.elevenlabs.io",), "sk-eleven", "ELEVENLABS_API_KEY", "")
+    assert cred.allowlist_key == cred.manifest == "music"
+    images = bundles["images"]
+    by_key = {c.env_name: c for c in images.exit}
+    # A declared key the session does not hold is no credential.
+    assert set(by_key) == {"OPENAI_IMAGE_API_KEY", "OTODOCK_RELAY_TOKEN"}
+    assert images.env["OPENAI_IMAGE_API_KEY"] == by_key["OPENAI_IMAGE_API_KEY"].placeholder
+    assert by_key["OPENAI_IMAGE_API_KEY"].prefix == "Bearer " and by_key["OPENAI_IMAGE_API_KEY"].value == "sk-openai"
+    # The relay's token goes to this install's relay, whatever the manifest named.
+    assert by_key["OTODOCK_RELAY_TOKEN"].hosts == ("relay.example.test",)
+    assert by_key["OTODOCK_RELAY_TOKEN"].value == "rt-1"
+    assert len({c.placeholder for c in images.exit} | {cred.placeholder}) == 3
+    # An entry that asks for the larger path gets it, by a plain true alone.
+    assert by_key["OPENAI_IMAGE_API_KEY"].streams is True and by_key["OPENAI_IMAGE_API_KEY"].judged is False
+    assert by_key["OTODOCK_RELAY_TOKEN"].streams is False and cred.streams is False
+    # A secret no entry declares, and a tool without entries, are delivered as before.
+    assert bundles["plain"].env == {"PLAIN_KEY": "p"} and bundles["plain"].exit == ()
+    assert "sk-eleven" not in _p.read_text() and "sk-openai" not in _p.read_text()
+
+
+@pytest.mark.parametrize("where", [
+    placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, machine_id="m"),
+    placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
+    placement.PlacementCapabilities(kind=placement.KIND_COMPUTE, machine_id="c"),
+])
+def test_a_machine_that_runs_no_exit_gets_no_tool_that_holds_a_declared_key(monkeypatch, tmp_path, where):
+    """A machine that reports no exit: the tool is left out with the rule's
+    sentence, never handed its value."""
+    from services.mcp import mcp_registry
+    _stub_assembly(
+        monkeypatch,
+        [_exit_manifest("music", [{"key": "ELEVENLABS_API_KEY", "header": "xi-api-key",
+                                   "hosts": ["api.elevenlabs.io"]}])],
+        env_by_mcp={"music": {"ELEVENLABS_API_KEY": "sk-eleven"}}, tmp_path=tmp_path,
+    )
+    _p, flat, excluded, bundles, _ = mcp_registry.build_session_mcp_config("agent", "u-1", placement=where)
+    from services.mcp.mcp_session_config import exit_machine_refusal
+    assert "music" not in bundles and "sk-eleven" not in str(flat)
+    assert excluded["music"] == exit_machine_refusal(where) != ""
+
+
+def test_a_command_line_credential_gets_a_placeholder_for_its_host(monkeypatch, tmp_path):
+    from core.credentials.mcp_gateway import CliCredential, TokenRef
+    from services.mcp import mcp_registry
+    from services.oauth import credential_resolver
+    _stub_assembly(monkeypatch, [_FakeManifest("github-mcp")], env_by_mcp={}, tmp_path=tmp_path)
+    cli = CliCredential(host="GitHub.com", token_ref=TokenRef(str(tmp_path), "acct"),
+                        env_names=("GH_TOKEN",), manifest="github-mcp")
+    resolved = credential_resolver.resolve_credentials()
+    resolved.cli_credentials = {"github-mcp": cli}
+    monkeypatch.setattr(credential_resolver, "resolve_credentials", lambda *a, **k: resolved)
+    _p, _e, _x, bundles, _ = mcp_registry.build_session_mcp_config(
+        "agent", None, placement=placement.LOCAL_PLACEMENT)
+    bundle = bundles["github-mcp"]
+    assert bundle.cli is cli
+    (cred,) = bundle.exit
+    assert cred.cli is cli and cred.header == "Authorization" and cred.env_name == ""
+    assert cred.hosts == ("github.com", "*.github.com")
+    assert cred.placeholder.startswith("oto-exit-")
+
+
+
+# --- the stand-in's marker (tool_listing.starts_late) -------------------------
+
+
+def test_a_stdio_entry_gets_the_stand_ins_marker_and_a_call_or_a_live_tool_none(monkeypatch, tmp_path):
+    import json
+
+    from services.mcp import mcp_registry
+    live = _FakeManifest("live")
+    live.server.starts = "with_chat"
+    _stub_assembly(monkeypatch, [_FakeManifest("plain"), live, _FakeManifest("keyed")],
+                   env_by_mcp={"keyed": {"KEY": "v"}}, tmp_path=tmp_path)
+    path, _e, _x, bundles, _ = mcp_registry.build_session_mcp_config("agent", None)
+    servers = json.loads(path.read_text())["mcpServers"]
+    plain = json.loads(servers["plain"]["env"]["OTO_TOOL_STANDIN"])
+    keyed = json.loads(servers["keyed"]["env"]["OTO_TOOL_STANDIN"])
+    assert plain["fetch"] is False and plain["label"] == "plain"
+    # A tool with a secret: its start needs its fetch to answer.
+    assert keyed["fetch"] is True and bundles["keyed"].env == {"KEY": "v"}
+    # A tool whose list reads live data starts with the chat: no marker, no bundle.
+    assert "OTO_TOOL_STANDIN" not in (servers["live"].get("env") or {})
+    assert "live" not in bundles
+    assert "warm" not in plain
+    # The listing job (the call's context, no call) reads each program itself.
+    path, _e, _x, bundles, _ = mcp_registry.build_session_mcp_config("agent", None, phone_mode=True)
+    servers = json.loads(path.read_text())["mcpServers"]
+    assert not any("OTO_TOOL_STANDIN" in (s.get("env") or {}) for s in servers.values())
+    # A call's tools start beside its engine: a warm stand-in, on a route tied
+    # to a person (the call's context) and for an outside caller on any route.
+    for kw in ({"phone_mode": True}, {}):
+        path, _e, _x, bundles, _ = mcp_registry.build_session_mcp_config("agent", None, call=True, **kw)
+        servers = json.loads(path.read_text())["mcpServers"]
+        warm = json.loads(servers["plain"]["env"]["OTO_TOOL_STANDIN"])
+        assert warm["warm"] is True and "plain" in bundles
+        assert "OTO_TOOL_STANDIN" not in (servers["live"].get("env") or {})
+
+
+def test_codex_gives_a_stand_in_tool_its_start_on_top_of_its_call_limit():
+    from services.mcp.mcp_session_config import _servers_to_toml
+    marked = {"env": {"OTO_TOOL_STANDIN": "{}"}, "command": "x"}
+    toml = _servers_to_toml({"a": dict(marked), "b": {**marked, "tool_timeout_sec": 600},
+                             "c": {"command": "x"}})
+    assert "[mcp_servers.a]\nstartup_timeout_sec = 10\ntool_timeout_sec = 120\n" in toml
+    assert "tool_timeout_sec = 660" in toml
+    assert "tool_timeout_sec" not in toml.split("[mcp_servers.c]")[1]

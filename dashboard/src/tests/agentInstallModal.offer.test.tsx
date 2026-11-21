@@ -64,7 +64,7 @@ describe('AgentInstallModal: the department offer', () => {
     await screen.findByText('The department Lady G holds Yacht Manager and Yacht Crew.')
     expect(screen.getByTestId('install-department')).toHaveTextContent('The department Lady G holds Yacht Manager and Yacht Crew.')
     expect(screen.queryByTestId('install-pins-dropped')).toBeNull()
-    expect(screen.queryByText('Model choices left out')).toBeNull()
+    expect(screen.queryByText('Task choices left out')).toBeNull()
   })
 
   it('says all N agents for several members, and carries nothing when unticked', async () => {

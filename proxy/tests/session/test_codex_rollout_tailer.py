@@ -234,9 +234,11 @@ def test_resume_prefix_merge_no_duplicates(tmp_path, monkeypatch, _capture):
 
 
 def test_resolve_discovers_codex_tui_rollout(tmp_path, monkeypatch, _capture):
+    import config
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)   # a rollout's first record is read beneath its agent's folder
     # CODEX_HOME with three rollouts: an app-server one, a subagent one, and the
     # interactive (codex-tui) one — resolve must pick only the codex-tui rollout.
-    home = tmp_path / ".codex"
+    home = tmp_path / "ag" / "workspace" / ".codex"
     day = home / "sessions" / "2026" / "06" / "15"
     day.mkdir(parents=True)
     (day / "rollout-app-server.jsonl").write_text(
@@ -257,7 +259,9 @@ def test_resolve_discovers_codex_tui_rollout(tmp_path, monkeypatch, _capture):
 
 
 def test_resume_resolves_by_thread_id(tmp_path, monkeypatch, _capture):
-    home = tmp_path / ".codex"
+    import config
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)   # a rollout's first record is read beneath its agent's folder
+    home = tmp_path / "ag" / "workspace" / ".codex"
     day = home / "sessions" / "2026" / "06" / "15"
     day.mkdir(parents=True)
     # An unrelated newer codex-tui rollout + the resumed thread's own (older) rollout.
@@ -804,6 +808,23 @@ def test_usage_duplicate_event_claims_once(_capture, _usage_env):
     assert len(_usage_env) == 1
 
 
+def test_a_message_line_sent_again_is_one_row(_capture):
+    """A machine sends a terminal's lines again at a sign-in when the ack for
+    them was lost (and the forwarded path has no prefix merge): the same line,
+    by its time, role and words, writes one row. The same words at another
+    time are another row."""
+    def stamped(role, text, at):
+        obj = json.loads(_msg(role, text))
+        obj["timestamp"] = at
+        return _line(obj)
+    turn = [stamped("user", "Hi", "2026-01-01T00:00:01.100Z"),
+            stamped("assistant", "Hello.", "2026-01-01T00:00:21.200Z")]
+    C.tail_lines("s-again", "c-again", turn)
+    C.tail_lines("s-again", "c-again", turn)
+    C.tail_lines("s-again", "c-again", [stamped("assistant", "Hello.", "2026-01-01T00:01:00.000Z")])
+    assert list(_capture) == [("user", "Hi"), ("assistant", "Hello."), ("assistant", "Hello.")]
+
+
 def test_usage_first_tail_reread_calibrates_without_recording(tmp_path, _capture,
                                                               _usage_env):
     # Post-restart: no offset for the session → the first tail re-reads from
@@ -1049,30 +1070,59 @@ def test_manual_compact_closes_turn_via_task_complete(tmp_path, _capture):
 # ---------------------------------------------------------------------------
 
 
-def test_error_event_triggers_limit_hook(tmp_path, _capture, monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        "services.engines.subscription_pool.throttle_from_cli_error",
-        lambda sid, text: calls.append((sid, text)))
+def test_a_limit_ends_the_turn_through_its_task_complete(tmp_path, _capture, monkeypatch):
+    """Codex 0.166 writes no ``error`` line to the rollout: the turn's failure rides its ``task_complete``
+    (``error.codex_error_info`` in snake case). The batch ends the turn with the typed limit, and no
+    completion; the reset is the pool's to read (none rides the event)."""
+    nudged = []
+    monkeypatch.setattr("services.engines.subscription_pool.nudge_from_cli_error",
+                        lambda sid, text: nudged.append(text))
     path = _write(
-        tmp_path, _meta("t-lim"),
-        _evt("error", message="You've hit your usage limit."),
+        tmp_path, _meta("t-lim"), _msg("user", "go on"),
+        _evt("task_complete", last_agent_message=None,
+             error={"message": "You've hit your usage limit. Try again at 3:05 PM.",
+                    "codex_error_info": "usage_limit_exceeded"}),
     )
-    C.tail_rollout("s-lim-cx", "c-lim-cx", path)
-    assert calls == [("s-lim-cx", "You've hit your usage limit.")]
+    r = C.tail_rollout("s-lim-cx", "c-lim-cx", path)
+    assert r["ending"] == {"reason": "limit", "resets_at": "", "window": "",
+                           "detail": "You've hit your usage limit. Try again at 3:05 PM."}
+    assert r["last_signal"] == "end_turn" and r["turn_complete"] is False and nudged == []
 
 
-def test_assistant_prose_never_triggers_hook_codex(tmp_path, _capture, monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        "services.engines.subscription_pool.throttle_from_cli_error",
-        lambda sid, text: calls.append((sid, text)))
+def test_a_failed_turn_that_is_no_limit_ends_with_an_error_and_a_clean_one_with_none(tmp_path, _capture):
     path = _write(
-        tmp_path, _meta("t-prose"),
-        _msg("assistant", "your usage limit handling code has a bug"),
+        tmp_path, _meta("t-err"), _msg("user", "go on"),
+        _evt("task_complete", last_agent_message=None,
+             error={"message": "stream disconnected", "codex_error_info": {"response_stream_disconnected": {}}}),
     )
-    C.tail_rollout("s-prose-cx", "c-prose-cx", path)
-    assert calls == []
+    assert C.tail_rollout("s-err-cx", "c-err-cx", path)["ending"]["reason"] == "error"
+    path = _write(tmp_path, _meta("t-ok"), _msg("user", "go on"),
+                  _evt("task_complete", last_agent_message="done"))
+    r = C.tail_rollout("s-ok-cx", "c-ok-cx", path)
+    assert "ending" not in r and r["turn_complete"] is True
+
+
+def test_a_clean_turn_after_a_limit_in_the_same_batch_folds_clean(tmp_path, _capture):
+    """One batch holds a limit's ``task_complete`` and then a new turn's clean one: the last turn's end
+    decides, so the batch carries no ending and the turn completes."""
+    path = _write(
+        tmp_path, _meta("t-two"), _msg("user", "go on"),
+        _evt("task_complete", last_agent_message=None,
+             error={"message": "You've hit your usage limit.", "codex_error_info": "usage_limit_exceeded"}),
+        _msg("user", "try again"), _evt("task_complete", last_agent_message="done"),
+    )
+    r = C.tail_rollout("s-two-cx", "c-two-cx", path)
+    assert "ending" not in r and r["turn_complete"] is True
+
+
+def test_an_error_event_only_nudges_and_prose_never_ends_a_turn(tmp_path, _capture, monkeypatch):
+    nudged = []
+    monkeypatch.setattr("services.engines.subscription_pool.nudge_from_cli_error",
+                        lambda sid, text: nudged.append(text))
+    path = _write(tmp_path, _meta("t-e"), _evt("stream_error", message="Reconnecting... 1/5 (429)"),
+                  _msg("assistant", "your usage limit handling code has a bug"))
+    r = C.tail_rollout("s-e-cx", "c-e-cx", path)
+    assert "ending" not in r and nudged == ["Reconnecting... 1/5 (429)"]
 
 
 def test_token_count_rate_limits_recorded_with_the_line_timestamp(tmp_path, _capture):
@@ -1318,3 +1368,45 @@ def test_a_first_tail_skips_a_persisted_note_row(tmp_path, monkeypatch, _capture
     assert _capture == [("user", "one more"), ("assistant", "Checking again.")]
     assert _capture.data == ["", _NOTE]
     assert stats["persisted"] == 2
+
+
+# ---------------------------------------------------------------------------
+# A model a person picks inside the terminal (``model_chosen``)
+# ---------------------------------------------------------------------------
+
+def _main_turn(model: str, mode: str = "default", turn: str = "t", root: str | None = None) -> str:
+    return _line({"type": "turn_context", "payload": {
+        "turn_id": turn, "root_turn_id": turn if root is None else root, "model": model, "cwd": "/x",
+        "collaboration_mode": {"mode": mode, "settings": {"model": model}}}})
+
+
+def test_a_main_turn_on_another_model_in_the_same_mode_is_a_pick(_capture):
+    C.forget("cx1")
+    # The session's first turn is the model it started on.
+    assert "model_chosen" not in C.tail_lines("cx1", "ccx1", [_main_turn("gpt-6.1-sol", turn="a")])
+    assert "model_chosen" not in C.tail_lines("cx1", "ccx1", [_main_turn("gpt-6.1-sol", turn="b")])
+    got = C.tail_lines("cx1", "ccx1", [_main_turn("gpt-6-astra", turn="c")])
+    assert got["model_chosen"] == "gpt-6-astra"
+
+
+def test_a_mode_toggle_and_a_sub_turn_are_no_pick(_capture):
+    C.forget("cx2")
+    C.tail_lines("cx2", "ccx2", [_main_turn("gpt-6.1-sol", turn="a")])
+    # Plan mode carries its own model.
+    assert "model_chosen" not in C.tail_lines("cx2", "ccx2", [_main_turn("gpt-6-astra", mode="plan", turn="b")])
+    # A turn inside another turn (a review, a sub-turn) is not the person's.
+    assert "model_chosen" not in C.tail_lines("cx2", "ccx2", [
+        _main_turn("gpt-6-luna", mode="plan", turn="c", root="b")])
+    assert C.tail_lines("cx2", "ccx2", [_main_turn("gpt-6.1-terra", mode="plan", turn="d")])[
+        "model_chosen"] == "gpt-6.1-terra"
+
+
+def test_a_re_read_from_the_start_names_no_pick_and_forget_drops_the_last_turn(_capture):
+    C.forget("cx3")
+    replay = C._process_rollout_lines("cx3", "ccx3", [_main_turn("gpt-6.1-sol", turn="a"),
+                                                      _main_turn("gpt-6-astra", turn="b")],
+                                      calibrate_usage=True)
+    assert "model_chosen" not in replay
+    assert "model_chosen" not in C.tail_lines("cx3", "ccx3", [_main_turn("gpt-6-astra", turn="c")])
+    C.forget("cx3")
+    assert "model_chosen" not in C.tail_lines("cx3", "ccx3", [_main_turn("gpt-6.1-sol", turn="d")])

@@ -13,6 +13,11 @@ from services.mcp import docker_manager, mcp_registry
 from tests._timing import bound
 
 
+@pytest.fixture(autouse=True)
+def _no_mcp_installs_at_boot():
+    """This module tests the bring-up itself, with its compose runs faked."""
+
+
 @pytest.fixture
 def file_tools_manifest():
     mcp_registry.scan_manifests()
@@ -147,13 +152,11 @@ def test_inject_mcp_env_idempotent(file_tools_manifest, tmp_path, monkeypatch):
 
 
 def test_startup_docker_mcps_skips_in_t2(monkeypatch):
-    """Non-T1 (T2 docker-compose / T3 cloud): startup must NOT drive per-MCP
-    `docker compose`.
+    """T2 docker-compose: startup must NOT drive per-MCP `docker compose`.
 
     In T2 the core file-tools is an operator-managed compose sibling and
     community Docker MCPs are pull-managed — never started from their
-    build-context compose files here (the socket-proxy blocks build). In T3
-    (external-pool) there is no local daemon at all. Only bare-metal T1
+    build-context compose files here (the socket-proxy blocks build). Only bare-metal T1
     (managed-local) drives lifecycle here, so the gate keys off
     ``current_mode() == MANAGED_LOCAL`` and must return BEFORE reading
     mcp_state / manifests or shelling out — a raise from either proves it failed.
@@ -304,6 +307,31 @@ def test_compose_up_overlap_retry_preserved(file_tools_manifest, tmp_path, monke
         file_tools_manifest, ["up", "-d"], timeout=10, t1_retry=True,
     ) is True
     assert realloc["called"] is True
+
+
+def test_a_start_the_platform_tried_that_failed_reads_did_not_start_with_one_cause(
+    file_tools_manifest, monkeypatch,
+):
+    """A boot's, Start's or an update's start that failed is the row's Did
+    not start, with compose's last line of error once (its progress lines
+    dropped), the missing image's own sentence; a start that works clears it."""
+    from services.containers import state
+    state.reset_for_tests()
+    out = ("Container otodock-mcp-file-tools  Creating\n"
+           "Error response from daemon: driver failed programming external connectivity\n"
+           " \u2718 Container otodock-mcp-file-tools  Error\n")
+    monkeypatch.setattr(docker_manager, "_run_compose_streaming", lambda *a, **k: (1, out))
+    assert docker_manager._compose_up(file_tools_manifest, ["up", "-d"], timeout=10) is False
+    name = file_tools_manifest.name
+    assert state.of(name).failed == state.FAILED
+    assert state.plain_cause(name) == "Error response from daemon: driver failed programming external connectivity"
+    monkeypatch.setattr(docker_manager, "_run_compose_streaming", lambda *a, **k: (
+        1, "Container x  Creating\nError response from daemon: No such image: ghcr.io/otodock/file-tools:9\n"))
+    assert docker_manager._compose_up(file_tools_manifest, ["up", "-d"], timeout=10) is False
+    assert state.plain_cause(name) == "Its image is not on this server: press Start to fetch it."
+    monkeypatch.setattr(docker_manager, "_run_compose_streaming", lambda *a, **k: (0, ""))
+    assert docker_manager._compose_up(file_tools_manifest, ["up", "-d"], timeout=10) is True
+    assert state.of(name).failed == "" and state.plain_cause(name) == ""
 
 
 def test_compose_up_perm_denied_logs_hint_once(
@@ -1262,6 +1290,10 @@ def test_a_timeout_mid_recreate_is_not_called_unchanged(fake_docker_manifest, mo
     message = caplog.records[-1].getMessage()
     assert "while it recreated the containers (x renamed back to y)" in message
     assert "unchanged" not in message
+    # The row's cause says it once, as a sentence.
+    from services.containers import state
+    assert state.plain_cause(fake_docker_manifest.name) == (
+        "Compose up ran past 900 s while it recreated the containers (x renamed back to y).")
 
 
 def test_a_stall_then_a_timeout_names_both(fake_docker_manifest, monkeypatch, caplog):
@@ -1318,3 +1350,50 @@ def test_the_collabora_bind_reaches_the_native_compose(file_tools_manifest, tmp_
 def test_the_collabora_bind_is_an_address_or_loopback(value, bound):
     import config
     assert config.collabora_bind_ip_for(value) == bound
+
+
+@pytest.mark.parametrize("warm, recorded, started", [
+    (False, True, False),   # asleep until its first use
+    (True, True, True),     # it stays warm
+    (False, False, True),   # no record of its tools yet: the start reads it
+])
+def test_a_boot_starts_a_stopped_tool_only_when_it_stays_warm_or_has_no_record(
+    fake_docker_manifest, monkeypatch, warm, recorded, started,
+):
+    from services.containers import lifecycle
+    from services.mcp import tool_listing
+    monkeypatch.setattr(docker_manager, "_inject_mcp_env", lambda m: False)
+    monkeypatch.setattr(docker_manager, "get_container_status", lambda m: docker_manager.STOPPED)
+    monkeypatch.setattr(lifecycle, "stays_warm", lambda m, keep=None: warm)
+    monkeypatch.setattr(tool_listing, "container_fingerprint", lambda m: "fp")
+    monkeypatch.setattr(tool_listing, "saved_platform", lambda key, fp: {"initialize": {}} if recorded else None)
+    calls = []
+    monkeypatch.setattr(docker_manager, "start_container", lambda m, **k: calls.append(k) or True)
+    docker_manager._bring_up("fake", fake_docker_manifest)
+    assert bool(calls) is started
+
+
+def test_a_compose_run_and_a_wake_never_run_on_one_tool_at_once(fake_docker_manifest, monkeypatch):
+    import threading
+    import time as _time
+
+    from services.containers import state
+    inside: list[int] = []
+    peak: list[int] = []
+
+    def run(*a, **k):
+        inside.append(1)
+        peak.append(len(inside))
+        _time.sleep(0.05)
+        inside.pop()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_manager.subprocess, "run", run)
+    threads = [threading.Thread(target=docker_manager.stop_container, args=(fake_docker_manifest,))
+               for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert max(peak) == 1
+    assert not state.of(fake_docker_manifest.name).lock._is_owned()

@@ -1,0 +1,35 @@
+{
+  "name": "outside-apps-mcp",
+  "server_name": "outside-apps",
+  "label": "Apps for external identities",
+  "description": "The apps a manager opened to external identities, used in a conversation with one of them: what the app offers them and nothing more. The platform attaches it to such a conversation while an app is picked, and no agent is assigned it.",
+  "version": "1.0.0",
+  "category": "core",
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": [
+      "server.py"
+    ]
+  },
+  "credentials": {
+    "type": "none"
+  },
+  "config": [],
+  "env": {},
+  "agent_env": {},
+  "assignment_mode": "platform",
+  "exclude_from": [],
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "use_app",
+        "tier": "open"
+      }
+    ]
+  },
+  "patched": false,
+  "patch_note": null
+}

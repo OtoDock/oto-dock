@@ -51,10 +51,29 @@ describe('AppApprovalCard — role floors', () => {
     expect(screen.getAllByText(/editors and up|managers only/)).toHaveLength(2)
     // A button that acts for the agent with no floor says who may press it;
     // platform data never does.
-    const everyone = screen.getAllByText('everyone who opens the app')
+    const everyone = screen.getAllByText('members who open the app')
     expect(everyone).toHaveLength(1)
     expect(everyone[0].closest('li')?.textContent).toContain('Stats')
-    expect(everyone[0].getAttribute('title')).toBe('Anyone who opens the app can press it')
+    expect(everyone[0].getAttribute('title')).toBe('Members who open the app can press it')
+  })
+
+  it('says in the summary which calls external identities may use', () => {
+    renderCard(mkApp({ exports: { methods: {
+      book: { description: 'Book a time', min_role: 'external' },
+      list: { description: 'Every booking', min_role: 'editor' },
+    } } }))
+    const line = screen.getByTestId('summary-outside-calls')
+    expect(line.textContent).toBe('External identities may use the book call once a manager adds the app')
+  })
+
+  it('names the floor that opens a button to external identities', () => {
+    renderCard(mkApp({ actions: [
+      { id: 'book', label: 'Book', type: 'fire_task', task_id: 't1', min_role: 'external' },
+    ] }))
+    openDetails()
+    expect(screen.queryByTestId('summary-outside-calls')).toBeNull()
+    const chip = screen.getByText('external identities too')
+    expect(chip.getAttribute('title')).toBe('Members and external identities can use it.')
   })
 
   it('names the contributor floor: the workspace tier, below editors', () => {
@@ -70,6 +89,47 @@ describe('AppApprovalCard — role floors', () => {
 // stacked left nothing readable): one short line per kind of thing the
 // app may do, always open; the sentences behind "Details"; the JSON
 // behind "Exact manifest"; both toggles in the pinned footer.
+describe('AppApprovalCard — a list and a file field', () => {
+  it('says how many changes a button may send and of which kinds, and names a file field', () => {
+    renderCard(mkApp({ actions: [{
+      id: 'edit', label: 'Edit', type: 'mcp_tool', mcp: 'video-tools', tool: 'edit_composition',
+      min_role: 'contributor',
+      args_schema: { properties: {
+        operations: { type: 'array', maxItems: 8, items: { oneOf: [
+          { properties: { op: { const: 'update_clip' } } },
+          { properties: { op: { const: 'set_transition' } } }] } },
+        path: { type: 'string', file: 'write' },
+        source: { type: 'string', file: 'read' },
+        note: { type: 'string' },
+      } },
+    }] }))
+    openDetails()
+    const line = screen.getAllByText('Edit').map((e) => e.closest('li')?.textContent || '').find((t) => t.includes('Calls')) || ''
+    expect(line).toContain('Sends up to 8 changes of these kinds: update_clip, set_transition.')
+    expect(line).toContain('path: a file the page names, to write')
+    expect(line).toContain('source: a file the page names')
+    expect(line).toContain('note: filled by the page')
+    expect(line).not.toContain('operations: filled by the page')
+  })
+
+  it('names a file an operation of a list may name', () => {
+    renderCard(mkApp({ actions: [{
+      id: 'edit', label: 'Edit', type: 'mcp_tool', mcp: 'video-tools', tool: 'edit_composition',
+      min_role: 'contributor',
+      args_schema: { properties: {
+        operations: { type: 'array', maxItems: 4, items: { oneOf: [
+          { properties: { op: { const: 'update_clip' }, src: { type: 'string', file: 'write' } } },
+          { properties: { op: { const: 'add_caption' }, font: { type: 'string', file: 'read' } } },
+          { properties: { op: { const: 'set_transition' }, kind: { type: 'string' } } }] } },
+      } },
+    }] }))
+    openDetails()
+    const line = screen.getAllByText('Edit').map((e) => e.closest('li')?.textContent || '').find((t) => t.includes('Calls')) || ''
+    expect(line).toContain('Sends up to 4 changes of these kinds: update_clip, add_caption, set_transition. '
+      + 'update_clip names a file to write. add_caption names a file.')
+  })
+})
+
 describe('AppApprovalCard — the plain list', () => {
   const wide = () => mkApp({
     manifest_empty: false, kind: 'folder',
@@ -107,7 +167,7 @@ describe('AppApprovalCard — the plain list', () => {
       'Uses the platform for sending notifications, the live tasks feed and who you are',
       'Reads files under workspace/team-pulse/',
       'Writes files under workspace/team-pulse/',
-      'Its server may reach api.stripe.com',
+      'Its program may reach api.stripe.com',
       'Its page may open checkout.stripe.com',
       'Bot check before /register',
       'Keeps a visitor’s login for 7 days',
@@ -116,7 +176,7 @@ describe('AppApprovalCard — the plain list', () => {
       'Its scripts receive the github account of the agent, so approval needs a manager',
       'Needs the secrets STRIPE_SECRET_KEY, not set and STRIPE_WEBHOOK_SECRET, setSet',
       'Offers other apps the board snapshot',
-      'Uses the leads app of agent sales',
+      'Uses 1 app of another agent',
       'Needs the MCP github-mcp, assigned',
       'Needs a github account, the agent’s own',
     ])
@@ -135,6 +195,70 @@ describe('AppApprovalCard — the plain list', () => {
     fireEvent.click(screen.getByTestId('exact-manifest-toggle'))
     expect(body.contains(screen.getByTestId('exact-manifest'))).toBe(true)
     expect(screen.getByTestId('exact-manifest-toggle').textContent).toBe('Hide declaration')
+  })
+
+  it('says which buttons start a new chat each time, and that a media page can read what it shows', () => {
+    renderCard(mkApp({
+      manifest_empty: false, kind: 'folder',
+      actions: [
+        { id: 'edit', label: 'Edit a new video', type: 'send_prompt', prompt: 'Start a video edit', new_chat: true },
+        { id: 'ask', label: 'Ask', type: 'send_prompt', prompt: 'Look at this' },
+        { id: 'media', label: 'Show', type: 'platform', method: 'files.media' },
+      ],
+    }))
+    expect(screen.getByTestId('summary-buttons').textContent).toBe('2 buttons: Edit a new video and Ask')
+    expect(screen.getByTestId('summary-new-chat').textContent).toBe('Starts a new chat each time: Edit a new video')
+    // Showing what it reads is no power of its own: the short list says nothing of it.
+    expect(screen.queryByTestId('summary-data')).toBeNull()
+    fireEvent.click(screen.getByTestId('details-toggle'))
+    const body = screen.getByTestId('app-card-body').textContent || ''
+    expect(body).toContain('Starts a new chat with: “Start a video edit”')
+    expect(body).toContain('Sends to the chat: “Look at this”')
+    expect(body.split('Sends to the chat:').length).toBe(2)             // never both for one button
+    expect(body.split('Starts a new chat with:').length).toBe(2)        // only the button that asked for it
+    expect(body).toContain('to show a video, an audio file or a picture from the folders it reads. The page can read what it shows.')
+    // No server: nothing is said about one.
+    expect(screen.queryByTestId('media-server-line')).toBeNull()
+    expect(body).not.toContain('its program can get')
+  })
+
+  it('says what a server can do with the media a page shows, for the release that is judged', () => {
+    const media = { id: 'media', label: 'Show', type: 'platform' as const, method: 'files.media' }
+    const files = { read: ['workspace/videos'], write: [] }
+    const handed = 'While the app is open, its program can get the videos, audio and pictures it shows you.'
+    const sent = 'It can send them to the sites it may reach.'
+    // The short list a person reads first leaves it to Details.
+    const shortList = () => screen.getByTestId('manifest-summary').textContent || ''
+    // A first release that waits: no live server yet, the waiting release has one.
+    const first = renderCard(mkApp({
+      manifest_empty: false, kind: 'folder', actions: [media], files, egress: ['api.example.com'],
+      has_server: false, pending_release: 1, pending_has_server: true,
+    }))
+    expect(shortList()).not.toContain('pictures')
+    fireEvent.click(screen.getByTestId('details-toggle'))
+    expect(screen.getByTestId('media-server-line').textContent).toBe(`${handed} ${sent}`)
+    first.unmount()
+    // A live app with a server and no site it may reach: the first sentence alone.
+    const live = renderCard(mkApp({ manifest_empty: false, kind: 'folder', actions: [media], files, has_server: true }))
+    expect(shortList()).not.toContain('pictures')
+    fireEvent.click(screen.getByTestId('details-toggle'))
+    expect(screen.getByTestId('media-server-line').textContent).toBe(handed)
+    live.unmount()
+    // The waiting release dropped the server: the live one is not what is judged.
+    const dropped = renderCard(mkApp({
+      manifest_empty: false, kind: 'folder', actions: [media], files,
+      has_server: true, pending_release: 3, pending_has_server: false,
+    }))
+    fireEvent.click(screen.getByTestId('details-toggle'))
+    expect(screen.queryByTestId('media-server-line')).toBeNull()
+    dropped.unmount()
+    // A server and no media: nothing to hand over.
+    renderCard(mkApp({
+      manifest_empty: false, kind: 'folder', files, has_server: true,
+      actions: [{ id: 'read', label: 'Read', type: 'platform', method: 'files.read' }],
+    }))
+    fireEvent.click(screen.getByTestId('details-toggle'))
+    expect(screen.queryByTestId('media-server-line')).toBeNull()
   })
 
   it('counts the buttons and names a few, warns in the warning colour, and offers one Set button', () => {
@@ -232,19 +356,54 @@ describe('AppApprovalCard — every block in words', () => {
     openDetails()
     const text = screen.getByTestId('manifest-blocks').textContent || ''
     expect(text).toContain('Reads files under workspace/notes')
-    expect(text).toContain('may reach api.example.com')
+    expect(text).toContain('Its program may reach api.example.com')
     // The carve opens an address: the line says what else answers there.
-    expect(text).toContain('other sites that share their address')
-    expect(text).toContain('never reach your local network or the platform')
+    expect(text).toContain('other sites at the same address')
+    expect(text).toContain('never reach your local network or OtoDock itself')
     expect(text).not.toContain('and nothing else')
     expect(text).toContain('Wakes on the schedule 0 7 * * 1-5 as digest')
     expect(text).toContain('a trigger aimed at github')
     expect(text).toContain('a task finishes or lead-created comes from the app behind crm')
     expect(text).toContain('Publishes the snapshot board: the board as JSON')
-    expect(text).toContain('Calls the app leads of agent sales as crm')
+    expect(text).toContain('leads, of the agent sales')
+    expect(text).not.toContain('Calls the app')
     expect(text).toContain('assigned to this agent')
     expect(text).toContain('not connected for you')
     expect(screen.queryByText(/press the app’s buttons unattended/)).toBeNull()
+  })
+
+  it('folds the apps it uses into one line per kind and names each in Details', () => {
+    const app = mkApp({
+      bindings: [
+        { name: 'finance', agent: 'yacht-finance', app: 'finance-board' },
+        { name: 'technical', agent: 'yacht-technical', app: 'maintenance' },
+        { name: 'crm', agent: 'sales', app: 'leads' },
+      ],
+      bindings_follow: ['finance', 'technical'],
+    })
+    renderCard(app)
+    const lines = Array.from(screen.getByTestId('manifest-summary').querySelectorAll('li')).map((n) => n.textContent || '')
+    expect(lines).toContain('Uses 2 apps of other agents in its department')
+    expect(lines).toContain('Uses 1 app of another agent')
+    expect(summaryText()).not.toContain('finance-board')
+    openDetails()
+    const text = screen.getByTestId('manifest-blocks').textContent || ''
+    expect(text).toContain('finance-board, of the yacht-finance agent in its department')
+    expect(text).toContain('maintenance, of the yacht-technical agent in its department')
+    expect(text).toContain('leads, of the agent sales')
+    // The declaration stays the manifest as declared: no field the server added.
+    fireEvent.click(screen.getByTestId('exact-manifest-toggle'))
+    const exact = screen.getByTestId('exact-manifest').textContent || ''
+    expect(exact).toContain('yacht-finance')
+    expect(exact).not.toContain('bindings_follow')
+  })
+
+  it('says one app in its department in the singular', () => {
+    renderCard(mkApp({ bindings: [{ name: 'finance', agent: 'yacht-finance', app: 'finance-board' }],
+      bindings_follow: ['finance'] }))
+    const lines = Array.from(screen.getByTestId('manifest-summary').querySelectorAll('li')).map((n) => n.textContent || '')
+    expect(lines).toContain('Uses 1 app of another agent in its department')
+    expect(lines.some((l) => l.startsWith('Uses 1 app of another agent') && !l.includes('department'))).toBe(false)
   })
 
   it('names whose account a provider need runs with', () => {
@@ -609,6 +768,16 @@ describe('AppApprovalCard — placed apps and the audience (SHARING.md)', () => 
     expect(body).toContain('Offers to other apps and to the agents it is placed in')
     expect(screen.getByTestId('offers-placed-note').textContent).toContain('also answer chats and tasks in agents a share places this app in')
     expect(screen.getAllByText('editors and up').length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('words the old-copies method on the card', () => {
+    renderCard(mkApp({
+      manifest_empty: false, kind: 'folder',
+      actions: [{ id: 'forget', label: 'Forget', type: 'platform', method: 'app.forget_copies' }],
+    }))
+    openDetails()
+    expect(screen.getByTestId('manifest-blocks').textContent || '')
+      .toContain('Asks the platform for app.forget_copies: to remove the older copies of its database')
   })
 
   it('keeps the plain Offers words for an app that exports no call', () => {

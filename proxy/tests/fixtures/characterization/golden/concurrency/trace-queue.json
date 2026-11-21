@@ -1,0 +1,285 @@
+[
+ {
+  "parked": 0,
+  "result": {
+   "dave": false,
+   "frank": false
+  },
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "two in line"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "first in line, first served"
+ },
+ {
+  "parked": 0,
+  "result": {
+   "frank": false
+  },
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "the second still waits"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "busy",
+   "user_message": "Too many active sessions. The platform is busy. Try again shortly, or close an idle chat."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a walk-in never waits"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "then the second"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "busy",
+   "user_message": "Too many active sessions. The platform is busy. Try again shortly, or close an idle chat."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "past its deadline"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "host_memory",
+   "user_message": "This server is low on memory: 500 MB free, about 1400 MB needed to start. Free some memory on the server, then try again."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 1,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 1,
+    "available_mb": 500,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 1000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "host memory never waits"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 2,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 3,
+    "fit_light": 15,
+    "reserved_mb": 2000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a person's seat"
+ },
+ {
+  "admission": {
+   "admitted": false,
+   "ok": false,
+   "reason": "user_cap",
+   "user_message": "You already have 1 sessions running on this platform. End one, or wait a few minutes for an idle one to end, then try again."
+  },
+  "parked": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 2,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 3,
+    "fit_light": 15,
+    "reserved_mb": 2000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "nor does the person's cap"
+ }
+]

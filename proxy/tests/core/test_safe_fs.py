@@ -567,6 +567,30 @@ def test_unlink_removes_a_link_not_its_target_and_rmtree_refuses_one(tree):
         safe_fs.rmtree_beneath(root, "")
 
 
+def test_rmdir_removes_an_empty_directory_and_never_through_a_link(tree):
+    import errno
+    root, outside = tree
+    (root / "a" / "empty").mkdir()
+    (outside / "dir").mkdir()
+    (root / "a" / "out").symlink_to(outside / "dir")
+    (root / "via").symlink_to(outside)
+    with pytest.raises(safe_fs.SymlinkRefused):
+        safe_fs.rmdir_beneath(root, "a/out")
+    with pytest.raises(safe_fs.SymlinkRefused):
+        safe_fs.rmdir_beneath(root, "via/dir")
+    assert (outside / "dir").is_dir()
+    with pytest.raises(OSError) as ei:
+        safe_fs.rmdir_beneath(root, "a/b")
+    assert ei.value.errno in (errno.ENOTEMPTY, errno.EEXIST)
+    safe_fs.rmdir_beneath(root, "a/empty")
+    assert not (root / "a" / "empty").exists()
+    safe_fs.rmdir_beneath(root, "a/empty", missing_ok=True)
+    with pytest.raises(FileNotFoundError):
+        safe_fs.rmdir_beneath(root, "a/empty")
+    with pytest.raises(safe_fs.UnsafePathError):
+        safe_fs.rmdir_beneath(root, "")
+
+
 def test_rmtree_does_not_follow_a_link_inside_the_tree(tree):
     root, outside = tree
     (root / "a" / "b" / "out").symlink_to(outside)
@@ -628,6 +652,20 @@ def test_a_wide_tree_holds_one_handle_per_level(tree):
     for _step in safe_fs.walk_beneath(root):
         peak = max(peak, len(os.listdir("/proc/self/fd")) - before)
     assert peak < 10
+
+
+def test_a_listing_past_its_cap_raises_and_holds_no_handle(tree):
+    root, outside = tree
+    for i in range(5):
+        (root / "a" / f"n{i}").write_bytes(b"")
+    (root / "a" / "lnk").symlink_to(outside)
+    # "a" lists seven entries: b, five files and the link.
+    assert [s.rel for s in safe_fs.walk_beneath(root, max_entries=7)] == ["", "a", "a/b"]
+    before = len(os.listdir("/proc/self/fd"))
+    for onerror in (None, [].append):
+        with pytest.raises(safe_fs.TooManyEntries):
+            list(safe_fs.walk_beneath(root, onerror=onerror, max_entries=6))
+    assert len(os.listdir("/proc/self/fd")) == before
 
 
 def test_walk_can_be_pruned(tree):
@@ -694,3 +732,23 @@ def test_the_file_tools_copy_is_byte_identical():
     src = repo / "proxy" / "services" / "infra" / "safe_fs.py"
     copy = repo / "mcps" / "custom" / "file-tools-mcp" / "safe_fs.py"
     assert copy.read_bytes() == src.read_bytes(), "refresh with: cp proxy/services/infra/safe_fs.py mcps/custom/file-tools-mcp/safe_fs.py"
+
+
+
+# ── the kind of a name ──────────────────────────────────────────────────
+
+
+def test_kind_beneath_names_each_state_and_never_follows(tree):
+    root, outside = tree
+    os.mkfifo(root / "a" / "fifo")
+    (root / "a" / "link").symlink_to(outside / "secret")
+    (root / "a" / "dirlink").symlink_to(outside)
+    assert safe_fs.kind_beneath(root, "a/b/f.txt").kind == "file"
+    assert safe_fs.kind_beneath(root, "a/b/f.txt").st.st_size == 6
+    assert safe_fs.kind_beneath(root, "a/b").kind == "dir"
+    assert safe_fs.kind_beneath(root, "a/nothing") == safe_fs.NameKind("missing", None)
+    assert safe_fs.kind_beneath(root, "a/link").kind == "other"
+    assert safe_fs.kind_beneath(root, "a/fifo").kind == "other"
+    # On the way: a link, a file.
+    assert safe_fs.kind_beneath(root, "a/dirlink/secret") == safe_fs.NameKind("other", None)
+    assert safe_fs.kind_beneath(root, "a/b/f.txt/x") == safe_fs.NameKind("other", None)

@@ -482,8 +482,12 @@ def _first(cells: list[str], shown_at_most: int = 3) -> str:
 
 
 def _sheet_values(path: str, titles) -> dict[str, dict[str, Value]]:
+    """The stored values of ``titles`` in the original at ``path`` (the
+    person's file: ``shared.safe_open_read``)."""
+    import shared
+
     out: dict[str, dict[str, Value]] = {}
-    with zipfile.ZipFile(path) as zf:
+    with shared.safe_open_read(path) as fh, zipfile.ZipFile(fh) as zf:
         targets = sheet_targets(zf)
         for title in titles:
             part = targets.get(title)
@@ -493,7 +497,9 @@ def _sheet_values(path: str, titles) -> dict[str, dict[str, Value]]:
 
 
 def _original_cm(path: str, titles) -> dict[str, set[str]]:
-    with zipfile.ZipFile(path) as zf:
+    import shared
+
+    with shared.safe_open_read(path) as fh, zipfile.ZipFile(fh) as zf:
         if not any(n.endswith("metadata.xml") for n in zf.namelist()):
             return {}
         targets = sheet_targets(zf)

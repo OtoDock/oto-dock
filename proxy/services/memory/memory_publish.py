@@ -14,6 +14,8 @@ import logging
 import time
 from pathlib import Path
 
+from core import agent_folder
+from services.infra import safe_fs
 from services.memory import memory_file
 from services.memory.memory_file import OpResult
 
@@ -21,11 +23,13 @@ logger = logging.getLogger("otodock.memory-api")
 
 
 def tree_rel(agent_dir: Path, root: Path, rel: str) -> str | None:
-    """Agent-tree-relative posix path for a scope-relative memory path."""
+    """Agent-tree-relative posix path for a scope-relative memory path, from
+    the path as joined, never where a link lands; None outside the agent."""
     try:
-        return (root / rel).resolve().relative_to(agent_dir.resolve()).as_posix()
-    except (OSError, ValueError):
+        _base, inside = agent_folder.beneath_agent(root / rel, agent_dir.name)
+    except OSError:
         return None
+    return inside or None
 
 
 def _is_external_tree(rel: str) -> bool:
@@ -58,11 +62,14 @@ async def publish_changes(
                 await asyncio.to_thread(
                     file_author_store.record, agent_slug, path, writer_slug,
                 )
-            if workspace_fanout.has_fanout_candidates(
-                agent_slug, path, include_idle=True,
-            ):
+            shared_only = await workspace_fanout.shared_only_of(agent_slug, path)
+            if workspace_fanout.has_fanout_candidates(agent_slug, path, include_idle=True,
+                                                      shared_only=shared_only):
                 try:
-                    content = (root / rel).read_bytes()
+                    content = await asyncio.to_thread(
+                        safe_fs.read_bytes_beneath, *agent_folder.beneath_agent(root / rel, agent_slug),
+                        max_size=memory_file.TOPIC_OPEN_CAP_BYTES,
+                    )
                 except OSError:
                     content = None
                 if content is not None:

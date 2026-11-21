@@ -686,11 +686,10 @@ async def prefetch_remote_sources(
                 timeout=remaining,
             )
         except TimeoutError:
-            got = config.get_agent_dir(authz.source_agent) / remote_rel
-            if not got.is_file():
+            if not (await _platform_kind(remote_rel)).is_file:
                 return None
             fallback.append(remote_rel)
-            return got
+            return config.get_agent_dir(authz.source_agent) / remote_rel
         except Exception:  # noqa: BLE001  # a failed prefetch pull leaves the file to the send's own read
             logger.warning(
                 "send_files prefetch: pull failed for %s", remote_rel, exc_info=True,
@@ -702,6 +701,12 @@ async def prefetch_remote_sources(
 
     def _left() -> float:
         return deadline - asyncio.get_running_loop().time()
+
+    async def _platform_kind(remote_rel: str) -> safe_fs.NameKind:
+        """What the platform holds at ``remote_rel``, looked at as the send
+        opens it (beneath the source agent's folder, no link followed)."""
+        return await asyncio.to_thread(
+            safe_fs.kind_beneath, config.AGENTS_DIR, f"{authz.source_agent}/{remote_rel}")
 
     async def _probe(remote_rel: str) -> dict | None:
         try:
@@ -749,7 +754,7 @@ async def prefetch_remote_sources(
         if not await remote_file_flow.write_back_allowed(
                 session_id, authz.source_agent, remote_rel):
             held_rels.append(remote_rel)
-            if not (authz.source_root / rel).exists():
+            if (await _platform_kind(remote_rel)).kind not in ("file", "dir"):
                 unavailable.append(raw)
                 if held is not None:
                     held.append(raw)
@@ -757,13 +762,13 @@ async def prefetch_remote_sources(
         if _left() <= 0:
             # Past the budget nothing more asks the machine: a file the
             # platform holds goes as it is there, the rest is perform's.
-            if (authz.source_root / rel).is_file():
+            if (await _platform_kind(remote_rel)).is_file:
                 fallback.append(remote_rel)
             continue
         # A platform-side directory can't be a satellite file — straight to
         # the manifest. Anything else: probe, then pull when it is (or may
         # be) a file over there.
-        if not (authz.source_root / rel).is_dir():
+        if (await _platform_kind(remote_rel)).kind != "dir":
             probe = await _probe(remote_rel)
             if probe is None or probe.get("exists"):
                 if await _pull(remote_rel) is not None:

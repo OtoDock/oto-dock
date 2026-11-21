@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import time
@@ -472,10 +473,18 @@ async def _dispatch_installation_event(
     event_type = str(headers_lc.get("x-github-event") or "")
     if confirm:
         # A plain thread, not the bulk store lane: the confirmations call GitHub.
-        await asyncio.to_thread(
+        detached: list[tuple[str, str]] = []
+        await asyncio.to_thread(functools.partial(
             github_app_lifecycle.apply, provider_id, manifest, event_type, body,
-            installation_id=installation_id, confirm=True,
-        )
+            installation_id=installation_id, confirm=True, detached=detached,
+        ))
+        if detached:
+            # The rows go within the answer's window; closing the chats on them
+            # can outlast GitHub's wait, and goes on behind the answer.
+            from core import background
+            await asyncio.wait({background.spawn(
+                _take_out_detached(detached, installation_id),
+                name=f"detached-{installation_id}", owner="github-app")}, timeout=_FORWARDED_ANSWER_S)
     else:
         from core import background
         task = background.spawn(
@@ -527,20 +536,35 @@ async def _forwarded_lifecycle(
     from services.oauth import github_app_lifecycle
     lock = _bound.current().forwarded.setdefault(installation_id or "authorization", asyncio.Lock())
     async with lock:
-        await asyncio.to_thread(
+        detached: list[tuple[str, str]] = []
+        await asyncio.to_thread(functools.partial(
             github_app_lifecycle.apply, provider_id, manifest, event_type, body,
-            installation_id=installation_id, confirm=False,
-        )
+            installation_id=installation_id, confirm=False, detached=detached,
+        ))
+        await _take_out_detached(detached, installation_id)
+
+
+async def _take_out_detached(detached: list[tuple[str, str]], installation_id: str) -> None:
+    """The rows of agents' own sets that acted as an installation deleted at
+    GitHub, taken out through the one remover (a chat that chose one is
+    closed and told). Never raises: the lifecycle is applied, and a retry of
+    the delivery would find nothing left to tell."""
+    from services.remote import chat_reload
+    for mcp_name, agent in detached:
+        try:
+            await chat_reload.remove_service_account(mcp_name, agent, installation_id=installation_id)
+        except Exception:  # one agent's set must not stop the others
+            logger.exception("installation %s: the account of %s on %s was not taken out",
+                             installation_id, mcp_name, agent)
 
 
 def _installation_rows_standing(rows: list[dict], installation_id: str) -> list[str]:
     """Why each installation subscription may not receive now, ``""`` when
     it may: its subscriber must still own the installation (the account's
-    meta as the last listing left it), and a service row's agent must still
-    be bound to that account and the binding cover that very installation
-    (``oauth_app_kinds.binding_covers``). The standing was checked once at
-    the create; a Refresh or a rebind since does not touch the row."""
-    from services.oauth import credential_resolver
+    meta as the last listing left it), and a service row's account must
+    still be one of the agent's, standing and covering that very
+    installation (``subscription_manager.service_row_covers``). The standing
+    was checked once at the create; a Refresh since does not touch the row."""
     from services.webhooks import subscription_manager
     from storage.identity import oauth_app_kinds
     out: list[str] = []
@@ -553,12 +577,10 @@ def _installation_rows_standing(rows: list[dict], installation_id: str) -> list[
             scope=scope, owner=str(row.get("owner") or ""), agent=agent, mcp_name=mcp_name,
             account_label=label,
         )
-        if scope == "service":
-            bound = credential_resolver.pick_account(mcp_name, agent or "")
-            if bound is None or bound.label != label or not oauth_app_kinds.binding_covers(
-                    bound.installation_id, meta, installation_id):
-                out.append("not the agent's bound installation")
-                continue
+        if scope == "service" and not subscription_manager.service_row_covers(
+                mcp_name, agent or "", label, installation_id):
+            out.append("not covered by the agent's account")
+            continue
         out.append(oauth_app_kinds.installation_standing(meta, installation_id))
     return out
 

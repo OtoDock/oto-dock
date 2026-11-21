@@ -1,0 +1,346 @@
+{
+ "a viewer keeps it": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": "",
+  "closed": [],
+  "config": {
+   "chat_id": "c-pty",
+   "interactive": true,
+   "mode": "auto",
+   "resume": true,
+   "theme": "dark"
+  },
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "note_left": true,
+  "registered": false,
+  "released": [],
+  "seats": [],
+  "submitted": [
+   [
+    "WAKE",
+    true
+   ]
+  ]
+ },
+ "no terminal registers": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": null,
+  "closed": [],
+  "config": {
+   "chat_id": "c-pty",
+   "interactive": true,
+   "mode": "auto",
+   "resume": true,
+   "theme": "dark"
+  },
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "note_left": false,
+  "registered": false,
+  "released": [
+   "<sid>"
+  ],
+  "seats": [],
+  "submitted": null
+ },
+ "the paste never submits": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": null,
+  "closed": [
+   "delegate_wake_unsubmitted"
+  ],
+  "config": {
+   "chat_id": "c-pty",
+   "interactive": true,
+   "mode": "auto",
+   "resume": true,
+   "theme": "dark"
+  },
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "note_left": true,
+  "registered": false,
+  "released": [],
+  "seats": [],
+  "submitted": [
+   [
+    "WAKE",
+    true
+   ],
+   [
+    "",
+    true
+   ]
+  ]
+ },
+ "the spawn fails": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": null,
+  "closed": [],
+  "config": {
+   "chat_id": "c-pty",
+   "interactive": true,
+   "mode": "auto",
+   "resume": true,
+   "theme": "dark"
+  },
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "note_left": false,
+  "registered": false,
+  "released": [
+   "<sid>"
+  ],
+  "seats": [
+   "<sid>"
+  ],
+  "submitted": null
+ },
+ "the terminal refuses the wake": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": null,
+  "closed": [
+   "delegate_wake_unsubmitted"
+  ],
+  "config": {
+   "chat_id": "c-pty",
+   "interactive": true,
+   "mode": "auto",
+   "resume": true,
+   "theme": "dark"
+  },
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "note_left": false,
+  "registered": false,
+  "released": [],
+  "seats": [],
+  "submitted": [
+   [
+    "WAKE",
+    true
+   ],
+   [
+    "",
+    true
+   ]
+  ]
+ },
+ "the turn opens and completes": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": "",
+  "closed": [],
+  "config": {
+   "chat_id": "c-pty",
+   "interactive": true,
+   "mode": "auto",
+   "resume": true,
+   "theme": "dark"
+  },
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "note_left": true,
+  "registered": false,
+  "released": [],
+  "seats": [],
+  "submitted": [
+   [
+    "WAKE",
+    true
+   ]
+  ]
+ }
+}

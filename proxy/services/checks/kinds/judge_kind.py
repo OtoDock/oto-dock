@@ -18,7 +18,6 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import psycopg
 
@@ -29,10 +28,8 @@ from services.checks import kinds, spend
 from services.checks.kinds.schema_kind import last_json_block
 from services.checks.render import Verdict, parse_verdict_json
 from services.infra.path_confinement import resolve_under
+from services.scheduler.run_wait import wait_run
 from storage.automation import run_status
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 logger = logging.getLogger("checks")
 
@@ -40,7 +37,6 @@ INPUTS_MAX_BYTES = 64 * 1024
 INPUT_FILE_MAX_BYTES = 32 * 1024
 SYNC_QUIET_S = 3.0
 SYNC_WAIT_MAX_S = 30.0
-RUN_POLL_S = 2.0
 # A run is waited its timeout plus this margin; the one re-prompt gets at
 # most RETRY_TIMEOUT_MAX_S.
 WAIT_MARGIN_S = 30
@@ -51,74 +47,6 @@ RETRY_PROMPT = (
     "\"findings\": [{\"location\": \"path:line\", \"severity\": \"error|warning|note\", "
     "\"text\": \"...\"}], \"summary\": \"one or two sentences\"}"
 )
-
-_run_futures: dict[str, asyncio.Future] = {}
-_hooked = False
-
-
-def _install_hook() -> None:
-    global _hooked
-    if _hooked:
-        return
-    from storage.automation import db_tasks
-    db_tasks.on_run_finished(_on_run_finished)
-    _hooked = True
-
-
-def _on_run_finished(run_id: str, status: str) -> None:
-    fut = _run_futures.get(run_id)
-    if fut is None:
-        return
-    loop = fut.get_loop()
-
-    def _set() -> None:
-        if not fut.done():
-            fut.set_result(status)
-    loop.call_soon_threadsafe(_set)
-
-
-# The wait's own two outcomes beside the run's terminal statuses: the
-# judge's wall clock lapsed, or the person spoke. Neither is a run status
-# (the platform cancel that follows stamps the row ``failed``); ``_one_run``
-# folds the word into a row only when the row carries no status.
-WAIT_TIMED_OUT = "timeout"
-WAIT_CANCELLED = "cancelled"
-
-
-async def wait_run(run_id: str, *, timeout: float, cancelled: Callable[[], bool]) -> str:
-    """The run's terminal status, through ``on_run_finished`` (a future the
-    writer's thread completes), with the row re-read in case it ended
-    before the future existed; ``cancelled()`` polled every two seconds —
-    the run is cancelled and ``WAIT_CANCELLED`` returned when it says so."""
-    from services.scheduler import scheduler
-    from storage import database as task_store
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future = loop.create_future()
-    _run_futures[run_id] = fut
-    try:
-        row = await asyncio.to_thread(task_store.get_run, run_id)
-        if row and run_status.is_terminal(row.get("status")):
-            return row["status"]
-        deadline = time.monotonic() + timeout
-        while True:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                scheduler.platform_cancel_run(run_id, "the check's judge timed out")
-                return WAIT_TIMED_OUT
-            try:
-                return await asyncio.wait_for(asyncio.shield(fut), timeout=min(RUN_POLL_S, left))
-            except asyncio.TimeoutError:
-                if cancelled():
-                    scheduler.platform_cancel_run(run_id, "the person sent a new message")
-                    return WAIT_CANCELLED
-    except asyncio.CancelledError:
-        # The evaluation was cut (its budget, the turn): the judge run stops
-        # with it instead of spending on for a verdict nobody reads.
-        scheduler.platform_cancel_run(run_id, "the check's evaluation was stopped")
-        raise
-    finally:
-        _run_futures.pop(run_id, None)
-
 
 def wait_budget_s(timeout: int) -> float:
     """Every wait of one judge section, end to end: the run, the one
@@ -134,25 +62,32 @@ def _read_inputs(agent: str, security, inputs: list[str]) -> list[tuple[str, str
     only when the judged session itself may read it (``security``, its
     context: another person's tree, the credential files and ``/config``
     below the owner tier stay out) and never through a hidden segment (a
-    symlink is judged by its target)."""
-    from auth.path_policy import check_host_path_access
+    symlink is judged by its target). The answer authorized is the answer
+    opened, beneath the agent's real folder with no link followed, and read
+    from its descriptor under the cap."""
+    from auth import path_policy
+    from core import agent_folder
+    from services.infra import safe_fs
     out: list[tuple[str, str]] = []
     total = 0
     base = Path(config.get_agent_dir(agent))
-    base_real = Path(os.path.realpath(base))
+    base_real = agent_folder.agent_root(agent)
     for rel in inputs:
         try:
             resolved = resolve_under(base / rel, base)
             hidden = any(seg.startswith(".") for seg in resolved.relative_to(base_real).parts)
-            if hidden or security is None or not check_host_path_access(resolved, security).allowed:
+            if (hidden or security is None
+                    or not path_policy.check_host_path_access(resolved, security).allowed):
                 out.append((rel, "(not readable)"))
                 continue
-            if not resolved.is_file():
-                out.append((rel, "(not found)"))
-                continue
-            data = resolved.read_bytes()[:INPUT_FILE_MAX_BYTES]
+            fd, _st = safe_fs.open_regular_for_read(base_real, safe_fs.rel_under(resolved, base_real))
+            with os.fdopen(fd, "rb") as fh:
+                data = fh.read(INPUT_FILE_MAX_BYTES)
             text = data.decode("utf-8", "replace")
         except ValueError:  # PathOutsideRoot, a NUL in the name
+            out.append((rel, "(not found)"))
+            continue
+        except (FileNotFoundError, safe_fs.NotRegularFile):
             out.append((rel, "(not found)"))
             continue
         except OSError:
@@ -217,11 +152,18 @@ def build_prompt(check, target, changed: dict, inputs: list[tuple[str, str]]) ->
 
 
 async def _wait_sync_quiet(machine_id: str, agent: str) -> None:
-    from core.remote.satellite_file_transfer import last_file_changed_at
+    """Until the machine's file changes of this agent went quiet: none queued
+    or being applied (a frame that waits for a slot, a large file still
+    being pulled), and the last one ``SYNC_QUIET_S`` old."""
+    from core.remote.satellite_file_transfer import (
+        file_changed_in_flight,
+        last_file_changed_at,
+    )
     deadline = time.monotonic() + SYNC_WAIT_MAX_S
     while time.monotonic() < deadline:
         last = last_file_changed_at(machine_id, agent)
-        if time.monotonic() - last >= SYNC_QUIET_S:
+        if (not file_changed_in_flight(machine_id, agent)
+                and time.monotonic() - last >= SYNC_QUIET_S):
             return
         await asyncio.sleep(0.5)
 
@@ -256,14 +198,34 @@ async def _one_run(task, *, timeout: float, cancelled, trigger_source: str) -> d
     from storage import database as task_store
     run_id = await scheduler.trigger_task_now(task, trigger_type=task_kinds.TRIGGER_CHECK,
                                               trigger_source=trigger_source)
-    status = await wait_run(run_id, timeout=timeout, cancelled=cancelled)
+    status = await wait_run(run_id, timeout=timeout, cancelled=cancelled, what="the check's judge")
     row = await asyncio.to_thread(task_store.get_run, run_id) or {"id": run_id}
     row["status"] = row.get("status") or status
     return row
 
 
+def _close_judged(chat_id: str, session_id: str) -> None:
+    """The judge's session closes with its verdict: nothing continues a
+    judge's run, so a warm session would hold a seat and its machine's
+    memory until the idle reaper. Through the one closer, which keeps the
+    judge's chat and transcript, and beside the verdict, so a slow close
+    never spends the check's budget. A turn open on the judge's chat (a
+    person who opened it and spoke) keeps the session for the reaper."""
+    from core import background
+
+    async def close() -> None:
+        from core.session import chat_rebuild
+        try:
+            await chat_rebuild.close_chat_session(
+                {"id": chat_id, "session_id": session_id}, reason="judged",
+                require_idle=True, lock=True)
+        except chat_rebuild.ChatBusy:
+            logger.info("judge: chat %s has a turn open, its session stays for the reaper",
+                        chat_id[:8])
+    background.spawn(close(), name="close-judge", owner="checks")
+
+
 async def run(check, target, changed: dict, *, round_no: int) -> Verdict:
-    _install_hook()
     from services.scheduler import task_kinds
     from services.scheduler.shared import TaskDefinition
     started = time.monotonic()
@@ -302,6 +264,10 @@ async def run(check, target, changed: dict, *, round_no: int) -> Verdict:
     scope = "user" if (target.user_sub and target.scope == "user") else "agent"
     spec = {"check": check.name, "mcps": list(judge.get("mcps") or []), "judge_on": judge_on,
             "for_chat": target.chat_id}
+    # A check is paid like the turn it judges (``core/config/spender.py``).
+    from core.config import spender
+    judged = await asyncio.to_thread(spender.judged_spender, target.session_id, target.chat,
+                                     target.user_sub or None)
     task = TaskDefinition(
         id=f"check-{uuid.uuid4().hex[:12]}", name=f"Check: {check.name} — {title}"[:120],
         agent=target.agent, prompt=prompt, timeout_seconds=timeout,
@@ -312,7 +278,7 @@ async def run(check, target, changed: dict, *, round_no: int) -> Verdict:
         task_type=task_kinds.CHECK,
         override_model=config.live_model_id(judge.get("model") or "") or None,
         override_execution_path=judge.get("engine") or None, judge=spec,
-        execution_target_override=target_override,
+        execution_target_override=target_override, spender_sub=judged.sub or "",
     )
 
     def cancelled() -> bool:
@@ -334,21 +300,23 @@ async def run(check, target, changed: dict, *, round_no: int) -> Verdict:
         v.duration_ms = ms()
         return v
     chat_id = row.get("chat_id") or ""
+    session_id = row.get("session_id") or ""
     text = await asyncio.to_thread(_last_assistant, chat_id) if chat_id else ""
     parsed = parse_verdict_json(last_json_block(text))
-    if parsed is None and chat_id and row.get("session_id"):
+    if parsed is None and chat_id and session_id:
         retry = TaskDefinition(
             id=f"check-{uuid.uuid4().hex[:12]}", name=task.name, agent=target.agent,
             prompt=RETRY_PROMPT, timeout_seconds=min(timeout, RETRY_TIMEOUT_MAX_S), created_by=task.created_by,
             scope=scope, notification_mode="none", task_type=task_kinds.CHECK,
             override_model=task.override_model, override_execution_path=task.override_execution_path,
-            judge=spec, execution_target_override=target_override,
-            continue_session=row["session_id"], target_chat_id=chat_id, use_persistent=True,
+            judge=spec, execution_target_override=target_override, spender_sub=task.spender_sub,
+            continue_session=session_id, target_chat_id=chat_id, use_persistent=True,
         )
         row2 = await _one_run(retry, timeout=min(timeout, RETRY_TIMEOUT_MAX_S) + WAIT_MARGIN_S,
                               cancelled=cancelled,
                               trigger_source=source)
         v.cost_usd += float(row2.get("cost_usd") or 0)
+        session_id = row2.get("session_id") or session_id
         if row2.get("status") == run_status.COMPLETED:
             parsed = parse_verdict_json(last_json_block(await asyncio.to_thread(_last_assistant, chat_id)))
     if chat_id:
@@ -356,6 +324,8 @@ async def run(check, target, changed: dict, *, round_no: int) -> Verdict:
         chat = await asyncio.to_thread(task_store.get_chat, chat_id)
         v.engine = (chat or {}).get("execution_path") or ""
         v.model = (chat or {}).get("model") or ""
+        if session_id:
+            _close_judged(chat_id, session_id)
     v.duration_ms = ms()
     if parsed is None:
         v.reason = "the judge returned no verdict"

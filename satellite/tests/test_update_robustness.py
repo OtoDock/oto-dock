@@ -297,3 +297,120 @@ def test_boot_guard_legacy_timestamp_stamp_is_not_stale(tmp_path, monkeypatch):
 
     assert (tmp_path / ".update_in_progress").exists()
     assert (tmp_path / ".update_in_progress").read_text().split("\n")[2] == "1"
+
+
+# --- the credential exit's packages, best effort ------------------------------
+
+def test_the_exits_packages_install_from_wheels_alone_and_a_failure_keeps_the_update(tmp_path, monkeypatch):
+    """A host with no wheel for one of the exit's packages (cryptography on
+    a 32-bit ARM without piwheels) keeps the update: the install fails fast
+    (wheels only, no compiler run), is said once and raises nothing, and the
+    satellite then runs no exit."""
+    (tmp_path / "requirements-exit.txt").write_text("cryptography==50.0.2\n")
+    calls: list[list[str]] = []
+
+    class _Done:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    def failing(argv, **kw):
+        import subprocess
+        calls.append(list(argv))
+        assert kw.get("stdin") is subprocess.DEVNULL
+        return _Done(1)
+    monkeypatch.setattr("subprocess.run", failing)
+    assert lifecycle_update.install_exit_packages("/v/bin/python", tmp_path) is False
+    argv = calls[-1]
+    assert argv[:4] == ["/v/bin/python", "-m", "pip", "install"]
+    assert "--only-binary" in argv and argv[argv.index("--only-binary") + 1] == ":all:" and "--no-input" in argv
+    assert argv[-1] == str(tmp_path / "requirements-exit.txt")
+
+    def raising(argv, **_kw):
+        raise OSError("no interpreter")
+    monkeypatch.setattr("subprocess.run", raising)
+    assert lifecycle_update.install_exit_packages("/v/bin/python", tmp_path) is False
+
+    monkeypatch.setattr("subprocess.run", lambda argv, **_kw: _Done(0))
+    assert lifecycle_update.install_exit_packages("/v/bin/python", tmp_path) is True
+    # A satellite package that carries no such file has nothing to install.
+    assert lifecycle_update.install_exit_packages("/v/bin/python", tmp_path / "none") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filtered", [True, False])
+@pytest.mark.parametrize("installed", [True, False])
+async def test_the_update_installs_the_exits_lock_into_the_swapped_venv_and_restarts_either_way(
+        tmp_path, monkeypatch, request, installed, filtered):
+    """The update (the Unix path, the requirements unchanged so the venv is
+    kept) installs the exit's lock with the new tree's interpreter after the
+    swap, and a failed install still ends in the restart: the machine then
+    runs no exit. A Python with no tar filter unpacks it too."""
+    if not filtered:
+        request.getfixturevalue("python_without_tar_filter")
+    import base64
+    import hashlib
+    import io
+    import tarfile
+
+    from satellite import config as satconfig
+    oto = tmp_path / ".oto-dock"
+    (oto / "satellite" / "venv" / "bin").mkdir(parents=True)
+    (oto / "satellite" / "requirements.txt").write_text("psutil==7.0.0\n")
+    files = {"requirements.txt": b"psutil==7.0.0\n", "requirements-exit.txt": b"cryptography==50.0.2\n",
+             "satellite/__init__.py": b""}
+    packed = io.BytesIO()
+    with tarfile.open(fileobj=packed, mode="w:gz") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    raw = packed.getvalue()
+    monkeypatch.setattr(lifecycle_update, "otodock_dir", lambda: oto)
+    monkeypatch.setattr(satconfig, "HOST", satconfig.HOST.__class__(**{**satconfig.HOST.__dict__,
+                                                                         "locks_running_files": False}))
+    calls: list[tuple[str, Path]] = []
+
+    def install(python, folder):
+        calls.append((python, folder))
+        assert (folder / "requirements-exit.txt").is_file()
+        return installed
+    monkeypatch.setattr(lifecycle_update, "install_exit_packages", install)
+    relaunched: list[int] = []
+    monkeypatch.setattr(lifecycle_update, "relaunch_self", lambda: relaunched.append(1))
+    monkeypatch.setattr(lifecycle_update, "_reap_own_children_before_restart", lambda: None)
+
+    async def no_wait(_s):
+        return None
+    monkeypatch.setattr(lifecycle_update.asyncio, "sleep", no_wait)
+    with pytest.raises(SystemExit):
+        await lifecycle_update._self_update_and_restart({
+            "target_version": "0.5.175", "previous_version": "0.5.174",
+            "tarball_b64": base64.b64encode(raw).decode(), "expected_sha256": hashlib.sha256(raw).hexdigest()})
+    assert calls == [(str(lifecycle_update.venv_exe(oto / "satellite" / "venv", "python")), oto / "satellite")]
+    assert relaunched == [1] and (oto / "satellite.previous").is_dir()
+
+
+# --- the one-time relaunch task (Windows) ------------------------------------
+
+def test_the_one_time_task_starts_on_battery(monkeypatch):
+    """The relaunch after an update or a roll back, and the uninstall, run
+    from a one-time task: registered with no settings, Windows refuses its
+    start on battery and never makes a missed start up, so a laptop's
+    program stays off. It gets the main task's three settings."""
+    from satellite import config as satconfig
+
+    commands: list[str] = []
+
+    def run(argv, **_kw):
+        commands.append(argv[-1])
+
+        class _Done:
+            returncode, stdout, stderr = 0, "", ""
+        return _Done()
+    monkeypatch.setattr(satconfig.subprocess, "run", run)
+    assert satconfig.windows_schedule_oneshot("OtoDockSatelliteRelaunch", "schtasks.exe",
+                                              "/Run /TN OtoDockSatellite", delay_s=30) == (True, "")
+    ps = commands[0]
+    assert ("$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries"
+            " -DontStopIfGoingOnBatteries -StartWhenAvailable;") in ps
+    assert "-Trigger $t -Action $a -Settings $s -Force" in ps

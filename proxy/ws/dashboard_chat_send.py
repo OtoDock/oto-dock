@@ -13,7 +13,7 @@ import logging
 from typing import TYPE_CHECKING, Any, cast
 
 import config
-from core import placement
+from core import drain, placement
 from core.background import spawn
 from core.events import chat_writer, input_queue
 from core.events.common_events import TurnInput, photos_not_attached
@@ -116,7 +116,7 @@ class ChatSendMixin(_Host):
         await self._handle_warmup({
             "agent": self.agent_name,
             "chat_id": self.chat_id,
-            "permission_mode": "default",
+            "permission_mode": ASK_MODE,
         }, background=False)
 
     async def _recycle_if_on_own_oauth(self) -> None:
@@ -138,16 +138,42 @@ class ChatSendMixin(_Host):
             return
         await self._recycle_session("pool cap reached, session on an own OAuth account")
 
+    async def _waits_for_compute(self) -> bool:
+        """The viewed chat's session ended and the install's own compute
+        machine, the only place it can start again, restarted a moment ago:
+        the send waits in the chat's queue as it does for a machine that
+        reconnects, and goes out at the machine's sign-in. Nothing of the
+        session is touched."""
+        from services.remote import compute_bootstrap
+        chat = await run_db(task_store.get_chat, self.chat_id) if self.chat_id else None
+        if not await run_db(compute_bootstrap.chat_waits, chat):
+            return False
+        logger.info("WS dashboard _handle_chat: chat=%s waits for the compute machine, "
+                    "which restarted a moment ago", self.chat_id)
+        return True
+
+    def _a_key_left_the_session(self) -> bool:
+        """The live session carries a key's mark, and nothing of it runs any
+        more: no turn on the chat, no background work it started. No await."""
+        from core.session import background_leash, key_rows
+        sid = self.session_id or ""
+        if not key_rows.marked(sid):
+            return False
+        pump = _active_pumps.get(self.chat_id or "")
+        return not (pump and not pump.is_done) and not background_leash.background_pending_count(sid)
+
     async def _heal_viewed_session(self, msg: dict) -> str:
         """The viewed chat's session, ready for a turn: warmed when there is
         none, re-warmed when it died (a live interactive revival takes the
-        send instead), recycled when a Shared-only chat changed sender, given
+        send instead), recycled when a Shared-only chat changed sender or a
+        key's turn left it with nothing running, given
         the mode or model picked while it was away. ``HEAL_ANSWERED`` when the
         send was typed into a live terminal, ``HEAL_REFUSED`` when a
         teammate's live terminal refused it read-only (the caller stops
         either way); ``HEAL_RECONNECTING`` when its
-        machine is still reconnecting after the wait (nothing was touched,
-        the send waits); else ``HEAL_READY``. ``msg`` is the composer frame a
+        machine is still reconnecting after the wait, or when the session
+        ended and the install's own compute machine restarted a moment ago
+        (nothing was touched, the send waits); else ``HEAL_READY``. ``msg`` is the composer frame a
         live terminal would take."""
         from ws.dashboard import _role_and_layer
         # Auto-warmup if we have agent but no session. background=False: this
@@ -157,11 +183,13 @@ class ChatSendMixin(_Host):
         # warmup whose inline kick this send is) is not waited for again.
         warmed_here = bool(msg.get("_reconnect_waited"))
         if not self.session_id and self.agent_name and self.chat_id:
+            if await self._waits_for_compute():
+                return HEAL_RECONNECTING
             warmed_here = True
             await self._handle_warmup({
                 "agent": self.agent_name,
                 "chat_id": self.chat_id,
-                "permission_mode": "default",
+                "permission_mode": ASK_MODE,
             }, background=False)
 
         # Auto-warmup if session died (idle reap, process crash, etc.)
@@ -222,6 +250,8 @@ class ChatSendMixin(_Host):
                                 "is still reconnecting, chat=%s — the send waits",
                                 self.session_id, self.chat_id)
                     return HEAL_RECONNECTING
+            if not alive and await self._waits_for_compute():
+                return HEAL_RECONNECTING
             if not alive:
                 logger.info(
                     "WS dashboard _handle_chat: session %s "
@@ -238,9 +268,14 @@ class ChatSendMixin(_Host):
                 await self._handle_warmup({
                     "agent": self.agent_name,
                     "chat_id": self.chat_id,
-                    "permission_mode": "default",
+                    "permission_mode": ASK_MODE,
                 }, background=False)
-            elif _vis.is_shared_only(self.agent_name):
+            elif self._a_key_left_the_session():
+                # A key's turn ran on this session and the work it started
+                # has ended: the person's own turn gets a session of its own,
+                # with their device grant and their own browser.
+                await self._recycle_session("a key's turn left this session idle")
+            elif (shared_row := await self._shared_chat_row(self.chat_id)) is not None:
                 # Sender-pays (Shared-only): the live session is bound to the
                 # subscription — and identity (JWT, OTO_USER_SUB, role) — of
                 # whoever warmed it. When the conversation changes hands
@@ -264,13 +299,22 @@ class ChatSendMixin(_Host):
                 # app action routes here), so recycling would kill a
                 # colleague's terminal mid-work. Refuse and let them take it over
                 # deliberately.
+                #
+                # The payer first: a store read takes a hop, and a pump started
+                # during it (another socket's send, a queue drain, a delegate
+                # nudge) must not meet a stale "no turn runs" and be closed.
+                # Everything the recycle decides on is read after this line.
+                payer = await self._viewed_session_payer()
+                if not self.session_id:
+                    return HEAL_READY
                 _isess = interactive_session.get(self.session_id)
                 if _isess is not None and not _isess.may_drive(self.user_sub):
                     await self._send_pty_read_only(_isess)
                     return HEAL_REFUSED
                 pump = _active_pumps.get(self.chat_id)
                 turn_in_flight = bool(pump and not pump.is_done)
-                if not turn_in_flight and not self._session_serves_sender(self.session_id):
+                if not turn_in_flight and not self._session_serves_sender(
+                        self.session_id, payer, shared_row):
                     await self._recycle_session(
                         "shared-only chat changed sender, binding the new "
                         "sender's subscription and identity")
@@ -278,7 +322,14 @@ class ChatSendMixin(_Host):
 
     async def _send_reconnecting_line(self, cid: str) -> None:
         await self._send({"type": wire.SYSTEM, "subtype": wire.SUBTYPE_MACHINE_RECONNECTING,
-                          "message": RECONNECTING_NOT_SENT, "chat_id": cid})
+                          "message": await self._reconnecting_text(cid), "chat_id": cid})
+
+    async def _reconnecting_text(self, cid: str) -> str:
+        """The reconnecting line, or the update sentence for a chat whose
+        machine its version keeps out: such a machine never comes back."""
+        from services.remote import machine_away
+        row = await run_db(task_store.get_chat, cid) if cid else None
+        return await run_db(machine_away.sentence_for_chat, row, RECONNECTING_NOT_SENT)
 
     async def _send_deferred_line(self, cid: str, deferred: TurnDeferred | None) -> None:
         """The not-sent line of a turn put off by ``deferred`` (the
@@ -286,8 +337,8 @@ class ChatSendMixin(_Host):
         if deferred is None:
             await self._send_reconnecting_line(cid)
             return
-        await self._send({"type": wire.SYSTEM, "subtype": deferred.subtype,
-                          "message": deferred.not_sent_text, "chat_id": cid})
+        text = deferred.not_sent_text if deferred.unanswered else await self._reconnecting_text(cid)
+        await self._send({"type": wire.SYSTEM, "subtype": deferred.subtype, "message": text, "chat_id": cid})
 
     async def _queue_until_reconnect(self, msg: dict, q) -> None:
         """A send whose chat's machine is still reconnecting waits in the
@@ -312,20 +363,55 @@ class ChatSendMixin(_Host):
                 await self._drain_live_queue()
         await self._send({"type": wire.DONE, "chat_id": cid})
 
-    def _session_serves_sender(self, sid: str) -> bool:
-        """Whether a warm session of a Shared-only agent runs as this
-        connection's person: its payer and the identity it was warmed with
-        (JWT, ``OTO_*`` env, platform role). Fails closed: a session whose
-        identity cannot be proven serves nobody, since a needless recycle
-        costs one respawn and a skipped one lets the turn act as the
-        previous sender."""
-        from core.session import session_state
+    @staticmethod
+    async def _session_payer(sid: str) -> str | None:
+        """Who pays for a session (``spender.session_payer``: None for one
+        the pool never bound): the in-memory maps with no hop, the store
+        only when they do not know it (bound before a restart)."""
+        from core.config import spender
         from services.engines import subscription_pool
-        payer = subscription_pool.get_session_payer_sub(sid)
+        _, payer = subscription_pool.bound_attribution(sid)
+        if payer is None:
+            payer = await run_db(spender.session_payer, sid)
+        return payer
+
+    async def _viewed_session_payer(self) -> str | None:
+        """The payer of the session this connection holds once the read is
+        done: a warmup may re-home the connection during the read's hop, and
+        the old session's payer says nothing of the new one."""
+        while True:
+            sid = self.session_id
+            payer = await self._session_payer(sid) if sid else None
+            if sid == self.session_id:
+                return payer
+
+    async def _shared_chat_row(self, chat_id: str) -> dict | None:
+        """The chat's row when it is the agent's shared chat or the agent is
+        Shared-only, else None: a session there may run as someone else
+        (another sender, or a wake with nobody behind it after the agent left
+        the mode), so the send checks whom it serves."""
+        chat = (await run_db(task_store.get_chat, chat_id) if chat_id else None) or {"id": chat_id}
+        if _vis.is_shared_only(self.agent_name) or _vis.is_shared_chat_owner(chat.get("user_sub")):
+            return chat
+        return None
+
+    def _session_serves_sender(self, sid: str, payer: str | None, chat: dict) -> bool:
+        """Whether a warm session of a Shared-only agent runs as this
+        connection's person: ``payer`` (``_session_payer``) and the identity
+        it was warmed with (JWT, ``OTO_*`` env, platform role). Fails closed:
+        a session whose identity cannot be proven serves nobody, since a
+        needless recycle costs one respawn and a skipped one lets the turn
+        act as the previous sender. A session a wake built the unattended way
+        serves nobody either, whoever it names (``runs_for_nobody``)."""
+        from core.session import session_state
+        if session_state.runs_for_nobody(sid, chat.get("id") or "",
+                                         lane=chat.get("origin") == "delegated"):
+            return False
         warmed = session_state.get_session_security(sid)
         if warmed is None or (warmed.username or "") != (self.user.get("username") or ""):
             return False
-        return not (payer and payer != self.user_sub)
+        from core.config import spender
+        return spender.serves_payer(payer, spender.Spender(self.user_sub, "chat"))
 
     async def _sender_refusal(self, cid: str, chat: dict | None = None) -> str:
         """Why this person may not start a turn on ``cid`` now, by the gates
@@ -495,15 +581,22 @@ class ChatSendMixin(_Host):
         sid = chat.get("session_id") or ""
         if layer is None or not sid:
             return input_queue.DELIVERY_DEFERRED, "the chat has no session to resume"
-        shared_only = _vis.is_shared_only(chat.get("agent") or "")
+        shared_only = (_vis.is_shared_only(chat.get("agent") or "")
+                       or _vis.is_shared_chat_owner(chat.get("user_sub")))
         waited = False
         if shared_only and not await layer.is_session_alive(sid):
             # The sender check reads the live session: a machine in its
             # reconnect grace is waited for here, once, ahead of it.
             await grace_layer(sid, layer).wait_session_reconnect(sid)
             waited = True
+        # The payer first, then the turn's check and the close with no await
+        # between them: a pump started during a hop here runs on this session.
+        payer = await self._session_payer(sid) if shared_only else ""
         if (shared_only and await layer.is_session_alive(sid)
-                and not self._session_serves_sender(sid)):
+                and not self._session_serves_sender(sid, payer, chat)):
+            running = _active_pumps.get(chat_id)
+            if running is not None and not running.is_done:
+                return input_queue.DELIVERY_DEFERRED, "a turn started on the chat"
             logger.info("queued turn: the session of chat=%s serves another "
                         "sender, closed so the turn re-warms as its author", chat_id[:8])
             await layer.close_session(sid)
@@ -610,8 +703,6 @@ class ChatSendMixin(_Host):
                             await self._send(past_ev)
                         # Install progress arrives via the per-user broadcaster
                         # (+ connect-time replay), not a per-chat attach.
-                        self.chat_id = msg_chat_id
-                        self.agent_name = chat["agent"]
                         logger.info(
                             "WS dashboard _handle_chat: attached to in-flight "
                             "warmup chat=%s, replayed "
@@ -620,6 +711,8 @@ class ChatSendMixin(_Host):
                         )
                         # The message itself waits in the chat's queue (below).
 
+                    if msg_chat_id != self.chat_id:
+                        self.session_id = None
                     self.chat_id = msg_chat_id
                     self.agent_name = chat["agent"]
                     # Pinned target for resume affinity — the recovered layer
@@ -705,7 +798,9 @@ class ChatSendMixin(_Host):
                 return
         claim = None
         if q is not None:
-            claim = q.try_claim()
+            # While the platform holds new work (``core.drain``) no turn
+            # starts: the message waits in the queue, its chip says why.
+            claim = None if drain.holding() else q.try_claim()
             if claim is None:
                 item = await self._prepare_turn_input(text, images, files)
                 if item is None:
@@ -722,6 +817,9 @@ class ChatSendMixin(_Host):
                     # No turn ran on this socket (the other starter deferred,
                     # or the chat is a call's): the message waits in the
                     # chat's queue under its chip and the composer is free.
+                    # The chip goes first: at ``done`` the page forgets which
+                    # bubble it drew for this send, and the chip takes it.
+                    await self._drain_live_queue()
                     await self._send({"type": wire.DONE, "chat_id": self.chat_id})
                 return
             if queue_id:
@@ -898,6 +996,10 @@ class ChatSendMixin(_Host):
                         _cid, new_rows=1 + len(_taken_rows or ()), inline_photos=inline_photos)
             return out
 
+        # A turn the engine ran by itself since the last one, unread, is
+        # recorded above this message, as it happened.
+        if self.layer is not None:
+            await self.layer.record_waiting_turns(self.session_id)
         sent = await chat_writer.submit(_cid, _send_job, label="chat_send")
         prev_author = sent["prev_author"]
         chat_rec = sent["rec"]
@@ -986,11 +1088,14 @@ class ChatSendMixin(_Host):
     def _maybe_stop_and_send(self, pump) -> None:
         """Typed message queued onto a busy turn → graceful stop-and-send.
 
-        Fires only on pumps OWNED by ``_start_new_stream`` (``stop_and_send``
-        flags present — its producer drains the chat's queue); foreign
-        producers (task runs, meetings, duplex turns, delegate-result
-        echoes, recovery adopts) never drain typed messages, so interrupting
-        them would destroy the turn for nothing — they keep queue-only.
+        Fires only on pumps whose end delivers the message at once
+        (``stop_and_send`` flags present): those ``_start_new_stream`` owns
+        (its producer drains the chat's queue) and a turn the engine started
+        by itself (``wake_capture``: its pump's end hands the queue on).
+        Foreign producers (task runs, meetings, duplex turns,
+        delegate-result echoes, recovery adopts) never drain typed messages,
+        so interrupting them would destroy the turn for nothing — they keep
+        queue-only.
         Steered engines (Codex) never reach the queue branch. The layer call
         is graceful-ONLY (`interrupt_for_queued`): no killpg, no watchdog —
         background bash/subagents survive, and a turn that ignores the
@@ -1194,6 +1299,8 @@ class ChatSendMixin(_Host):
         # Meeting turn flow is managed — no page-event injection mid-meeting.
         if await run_db(task_store.get_active_meeting_for_chat, chat_id):
             return await ack("unavailable", "meeting in progress")
+        if drain.holding():
+            return await ack("unavailable", wire.REASON_UPDATING)
         if refusal := await self._deny_task_continue(chat_id):
             return await ack("denied", refusal)
         if not _ai.check_rate(chat_id, token):
@@ -1266,9 +1373,11 @@ class ChatSendMixin(_Host):
             return await ack("denied", err)
         if await run_db(task_store.get_active_meeting_for_chat, chat_id):
             return await ack("unavailable", "meeting in progress")
+        if drain.holding():
+            return await ack("unavailable", wire.REASON_UPDATING)
         if refusal := await self._deny_task_continue(chat_id):
             return await ack("denied", refusal)
-        if not _ai.check_rate(chat_id, f"app:{app_id}"):
+        if not _ai.check_app_press(chat_id, self.user_sub or "", app_id):
             return await ack("denied", "rate limited")
 
         # A chat whose FIRST content is an app action (front-page button →

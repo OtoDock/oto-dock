@@ -3,7 +3,7 @@
 An optional daemon that lets an agent take and place phone calls. It answers
 a call, runs the conversation through speech-to-text, the agent and
 text-to-speech, and speaks the reply on the line. It holds no configuration
-of its own beyond how to reach the platform: routes, numbers, providers and
+of its own beyond how to reach the platform. Routes, numbers, providers and
 credentials are set in the dashboard (Setup, Phone) and pushed to it.
 
 ## Two ways in
@@ -15,8 +15,8 @@ credentials are set in the dashboard (Setup, Phone) and pushed to it.
   on the daemon's persistent event connection (`telephony/transfer.py`,
   `telephony/ami_events.py`).
 - **Twilio.** A number's voice webhook points at the platform's public
-  address: the proxy relays the `/v1/twilio/*` requests and the media
-  stream to the daemon byte for byte (`proxy/api/phone/twilio_relay.py`), so
+  address. The proxy relays the `/v1/twilio/*` requests and the media
+  stream to the daemon byte for byte (`proxy/api/phone/twilio_relay.py`). So
   the daemon's own port stays private. The daemon answers with TwiML that
   opens a Twilio Media Stream (`calls/twilio_http.py`,
   `telephony/twilio_media.py`) and checks Twilio's signature on every
@@ -25,12 +25,17 @@ credentials are set in the dashboard (Setup, Phone) and pushed to it.
 Both reach one per-call pipeline (`pipeline/core.py`): voice activity and
 turn detection, speech-to-text, the agent's reply, text-to-speech, with
 barge-in. The dashboard's live voice conversations reuse the same pipeline
-over a websocket instead of a phone line (`duplex/`). Once the proxy and the
-daemon both run 1.8.0 the agent has three call tools on every call
-(`mcps/custom/call-control-mcp`): end the call,
-transfer it to a number the route allows, and, on a call another agent
-placed, ask that agent a question mid-call. The daemon carries the action
-out once the reply has finished playing (`pipeline/call_control.py`).
+over a websocket instead of a phone line (`duplex/`).
+
+The agent has three call tools on every call
+(`mcps/custom/call-control-mcp`):
+
+- end the call
+- transfer it to a number the route allows
+- on a call another agent placed, ask that agent a question mid-call
+
+The daemon carries the action out once the reply has finished playing
+(`pipeline/call_control.py`).
 
 ## How it reaches the platform
 
@@ -70,6 +75,6 @@ cd phone && ../proxy/venv/bin/python -m pytest
 
 The suite borrows the proxy's environment and needs no database or phone
 line. Setup and the other suites are in
-[`CONTRIBUTING.md`](../CONTRIBUTING.md), and the user documentation (setting
+[`CONTRIBUTING.md`](../CONTRIBUTING.md). The user documentation (setting
 up a PBX, Twilio, routes and caller data) is at
 [docs.otodock.io](https://docs.otodock.io).

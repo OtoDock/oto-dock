@@ -206,6 +206,9 @@ def embedded_font(job: PdfJob, page: Any, text: str, family: str, *, bold: bool 
 def _op_merge(job: PdfJob, ctx: OpCtx, op: dict) -> None:
     import fitz
 
+    import safe_fs
+    import shared
+
     files = op.get("files", [])
     if not files:
         raise NoOp("no files were given to merge")
@@ -219,10 +222,15 @@ def _op_merge(job: PdfJob, ctx: OpCtx, op: dict) -> None:
     sources = []
     try:
         for name in files:
-            if not os.path.isfile(name):
+            try:
+                fd, _ = shared.safe_read_fd(name)
+            except FileNotFoundError:
                 raise OpError(Code.NOT_FOUND, f"the file {Path(name).name} does not exist", location="files",
-                              hint="Check the path, or write the PDF first.")
-            src = fitz.open(name)
+                              hint="Check the path, or write the PDF first.") from None
+            try:
+                src = fitz.open(safe_fs.fd_path(fd), filetype="pdf")
+            finally:
+                os.close(fd)
             sources.append(src)
             if protection_of(src):
                 raise OpError(Code.UNSUPPORTED, f"{Path(name).name} is protected, and its pages would lose that "
@@ -359,13 +367,26 @@ def _op_add_text(job: PdfJob, ctx: OpCtx, op: dict) -> None:
 
 
 def _op_add_image(job: PdfJob, ctx: OpCtx, op: dict) -> None:
-    import fitz
+    import safe_fs
+    import shared
 
     page = _page(job, ctx, op)
     image = op["image_path"]
-    if not os.path.isfile(image):
+    try:
+        fd, _ = shared.safe_read_fd(image)
+    except FileNotFoundError:
         raise OpError(Code.NOT_FOUND, f"the image {Path(image).name} does not exist", location="image_path",
-                      hint="Check the path.")
+                      hint="Check the path.") from None
+    try:
+        _place_image(page, op, safe_fs.fd_path(fd))
+    finally:
+        os.close(fd)
+
+
+def _place_image(page: Any, op: dict, source: str) -> None:
+    """The picture at ``source`` (a descriptor's path) placed on ``page``."""
+    import fitz
+
     if op.get("rect") is not None:
         rect = _rect(op["rect"])
     elif op.get("position") is not None:
@@ -374,7 +395,7 @@ def _op_add_image(job: PdfJob, ctx: OpCtx, op: dict) -> None:
     else:
         rect = fitz.Rect(50, 50, 200, 200)
     try:
-        page.insert_image(rect, filename=str(image))
+        page.insert_image(rect, filename=source)
     except (RuntimeError, ValueError) as exc:
         raise OpError(Code.BAD_VALUE, f"the image could not be placed: {exc}", location="image_path",
                       hint="Use a PNG or JPEG file.") from None
@@ -1018,14 +1039,17 @@ def forbids(op: str, permissions: int | None) -> str:
     return "" if any(permissions & bits[name] for name in needs) else PERM_WORDS[needs[0]]
 
 
-def _open(call: WriteCall) -> tuple[Opened | None, WriteReport | None]:
-    """The PDF opened with the best of the passwords given. Each
+def _open(call: WriteCall, fd: int) -> tuple[Opened | None, WriteReport | None]:
+    """The PDF opened with the best of the passwords given, through ``fd``
+    (MuPDF opens its own descriptor of that very file). Each
     ``authenticate`` replaces the last one's rights (a wrong password after
     the owner's takes them back), so every candidate is tried, then the
     best is authenticated last."""
     import fitz
 
-    doc = fitz.open(call.path)
+    import safe_fs
+
+    doc = fitz.open(safe_fs.fd_path(fd), filetype="pdf")
     if not protection_of(doc):
         return Opened(doc), None
     given = call.extra.get("password")
@@ -1071,14 +1095,25 @@ def _signed(doc: Any) -> bool:
 
 def edit_pdf_core(call: WriteCall, *, ocr_page: Any = None) -> WriteReport:
     """The write core: open (with the password when the file needs one), run
-    the batch, save once, commit."""
-    if not os.path.isfile(call.path):
+    the batch, save once, commit. The PDF is read through one descriptor
+    (``shared.safe_read_fd``: beneath the mount, no link followed), its size
+    from that descriptor's status."""
+    import shared
+
+    try:
+        fd, st = shared.safe_read_fd(call.path)
+    except FileNotFoundError:
         return _refused(call, "File not found: edit_pdf edits an existing PDF; write_pdf makes a new one.")
-    deadline = call.extra.get("deadline")
-    if deadline is not None and os.path.getsize(call.path) > OCR_MAX_BYTES:
-        return _refused(call, f"It is over {OCR_MAX_BYTES // (1024 * 1024)} MB, and OCR runs in the server "
-                              "process: split it (edit_pdf split) and OCR the parts.")
-    opened, refusal = _open(call)
+    except PermissionError as exc:
+        return _refused(call, f"{exc}.")
+    try:
+        deadline = call.extra.get("deadline")
+        if deadline is not None and st.st_size > OCR_MAX_BYTES:
+            return _refused(call, f"It is over {OCR_MAX_BYTES // (1024 * 1024)} MB, and OCR runs in the server "
+                                  "process: split it (edit_pdf split) and OCR the parts.")
+        opened, refusal = _open(call, fd)
+    finally:
+        os.close(fd)
     if refusal is not None or opened is None:
         return refusal
     doc = opened.doc
@@ -1098,7 +1133,7 @@ def edit_pdf_core(call: WriteCall, *, ocr_page: Any = None) -> WriteReport:
                 result.warnings.append(f"the file's owner does not allow {refused}; the edit was made, and the "
                                        "file keeps its restrictions (give the owner password to edit it as its "
                                        "owner)")
-        size_before = os.path.getsize(call.path)
+        size_before = st.st_size
         staged = call.stage(outcome, save_to=_save_to(job))
         warnings: list[str] = []
         hints = ""

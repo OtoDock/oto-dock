@@ -84,13 +84,13 @@ import errno
 import hashlib
 import logging
 import os
-import shutil
+import stat
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import config
-from core import layout
+from core import agent_folder, layout
 from core.background import spawn
 from services.infra import safe_fs
 from services.infra.path_confinement import join_under
@@ -168,56 +168,114 @@ def parse_library_rel(rel_path: str) -> tuple[str, str] | None:
     return None
 
 
-def _agent_rel(path: Path) -> str:
-    """A source or mirror path as a rel below ``AGENTS_DIR`` (every path
-    this module builds is ``config.get_agent_dir(slug)/…``)."""
-    return safe_fs.rel_under(path, config.AGENTS_DIR)
+def _beneath(path: Path) -> tuple[Path, str]:
+    """A source or mirror path (every path this module builds is
+    ``config.get_agent_dir(slug)/…``) as its agent's real folder and the
+    rel below it (``core/agent_folder.py``: an agent's folder may be the
+    operator's link, followed once, and nothing below it is)."""
+    return agent_folder.beneath_agent(path)
 
 
 def _hash_file(path: Path) -> str:
     """sha256 of a regular file reached with no symlink followed (a link
     raises, an ``OSError`` the callers already treat as "skip")."""
     h = hashlib.sha256()
-    with safe_fs.open_file_for_read(config.AGENTS_DIR, _agent_rel(path)) as f:
+    with safe_fs.open_file_for_read(*_beneath(path)) as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def _walk_rel(root: Path, *, prune_top: bool = True) -> dict[str, os.stat_result]:
-    """Relative file paths under ``root`` (excluding projector exclusions).
+def _walk_rel(root: Path, *, prune_top: bool = True) -> dict[str, os.stat_result] | None:
+    """Relative file paths under ``root`` (excluding projector exclusions),
+    walked beneath the agent's folder with no link listed or entered.
 
     ``prune_top=False`` for a SUBDIR library walk: the top-level
     ``memory``/``shared`` reservation applies at the source ROOT only —
     a subdir library's own first-level folder with one of those names is
-    legitimate content. Segment exclusions prune at every level always."""
+    legitimate content. Segment exclusions prune at every level always.
+
+    A missing root is empty. Anything else that stops the walk (a root that
+    is a link, sits under one or is a file, a folder that cannot be entered,
+    the agent's own folder not there) answers None: the caller skips the
+    library for this pass, since an empty answer would read as "every file
+    was deleted"."""
     out: dict[str, os.stat_result] = {}
-    if not root.is_dir():
-        return out
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = os.path.relpath(dirpath, root)
-        # Segment exclusions prune at EVERY level (nested .git/.credentials
-        # never even get walked); top-level exclusions prune at the root.
-        dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_SEGMENTS]
-        if rel_dir == ".":
-            if prune_top:
-                dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_TOP]
-            rel_dir = ""
-        for name in filenames:
-            rel = f"{rel_dir}/{name}" if rel_dir else name
-            if rel.endswith(".partial"):
-                continue
-            p = Path(dirpath) / name
-            # Defensive: symlinked files are rejected at promote and never
-            # projected — a link crossing knowledge subtrees would leak
-            # content past the library boundary.
-            if p.is_symlink():
-                continue
-            try:
-                out[rel] = p.stat()
-            except OSError:
-                continue
+    try:
+        base, top = _beneath(root)
+        if safe_fs.kind_beneath(base, "").kind != "dir":
+            raise NotADirectoryError(errno.ENOTDIR, "the agent's folder is not there", str(base))
+        for step in safe_fs.walk_beneath(base, top):
+            # Segment exclusions prune at EVERY level (nested .git/.credentials
+            # never even get walked); top-level exclusions prune at the root.
+            step.dirs[:] = [d for d in step.dirs if d not in _EXCLUDED_SEGMENTS]
+            rel_dir = step.rel[len(top):].lstrip("/")
+            if not rel_dir and prune_top:
+                step.dirs[:] = [d for d in step.dirs if d not in _EXCLUDED_TOP]
+            # Symlinked files are never projected: a link crossing knowledge
+            # subtrees would leak content past the library boundary.
+            for name in step.files:
+                rel = f"{rel_dir}/{name}" if rel_dir else name
+                if rel.endswith(".partial"):
+                    continue
+                with contextlib.suppress(OSError):
+                    out[rel] = os.stat(name, dir_fd=step.dirfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return {} if not out else None
+    except OSError:
+        logger.warning("library walk refused: %s (a link or an unreadable folder); the library waits",
+                       root, exc_info=True)
+        return None
     return out
+
+
+def _lstat(path: Path) -> os.stat_result | None:
+    """The status of a source or mirror file reached with no link followed;
+    None when it is missing, a link, not a plain file, or under a link."""
+    try:
+        name = safe_fs.kind_beneath(*_beneath(path))
+    except OSError:
+        return None
+    return name.st if name.is_file else None
+
+
+def _remove(path: Path) -> None:
+    """Remove a source or mirror file beneath its agent's folder: a link at
+    the name goes and its target stays, a link on the way refuses
+    (``OSError``)."""
+    safe_fs.unlink_beneath(*_beneath(path), missing_ok=True)
+
+
+def _occupied(path: Path) -> bool:
+    """Whether a link, a special file or a way that cannot be walked sits at
+    ``path``'s name: never a copy and never a delete. A folder at the name
+    or a file on the way (a name reused) reads as missing."""
+    try:
+        st = safe_fs.lstat_beneath(*_beneath(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    return not stat.S_ISDIR(st.st_mode)
+
+
+def _stat_copied(path: Path) -> os.stat_result:
+    """The status of a file ``_copy_file`` just wrote (``OSError`` when it
+    is not there as a plain file any more)."""
+    st = _lstat(path)
+    if st is None:
+        raise FileNotFoundError(errno.ENOENT, "the copy is gone", str(path))
+    return st
+
+
+def _touch(path: Path, st: os.stat_result) -> None:
+    """Carry ``st``'s times onto a mirror file, on a descriptor opened with
+    no link followed."""
+    fd = safe_fs.open_beneath(*_beneath(path), os.O_RDONLY)
+    try:
+        os.utime(fd, (st.st_atime, st.st_mtime))
+    finally:
+        os.close(fd)
 
 
 def _mirror_mode() -> int:
@@ -237,8 +295,8 @@ def _mirror_mode() -> int:
 
 
 def _copy_file(src: Path, dest: Path) -> str:
-    """`.partial` + fsync + atomic replace, both sides beneath ``AGENTS_DIR``
-    with no symlink followed: the source must be a regular file (a link,
+    """`.partial` + fsync + atomic replace, both sides beneath their agent's
+    folder with no symlink followed: the source must be a regular file (a link,
     planted in a source or in a mirror, raises and is never projected or
     adopted), and a link at the destination name is replaced, never written
     through. Carries the source mtime so the freshness comparison stays
@@ -247,7 +305,7 @@ def _copy_file(src: Path, dest: Path) -> str:
     base."""
     h = hashlib.sha256()
     safe_fs.copy_file_beneath(
-        config.AGENTS_DIR, _agent_rel(src), config.AGENTS_DIR, _agent_rel(dest),
+        *_beneath(src), *_beneath(dest),
         mode=_mirror_mode(), mkdirs=True, fsync=True, on_chunk=h.update,
     )
     return h.hexdigest()
@@ -282,7 +340,7 @@ async def _fan_out(agent_slug: str, rel_path: str, path: Path | None) -> None:
 def _capture_and_log(agent_slug: str, rel_path: str, path: Path, reason: str) -> None:
     try:
         content = safe_fs.read_bytes_beneath(
-            config.AGENTS_DIR, _agent_rel(path), max_size=config.RECOVER_BIN_MAX_BYTES,
+            *_beneath(path), max_size=config.RECOVER_BIN_MAX_BYTES,
         )
     except OSError:
         return  # a link, a special file or one over the bin's cap: nothing to keep
@@ -371,7 +429,7 @@ def _sync_pair_files(src_file: Path, mir_file: Path, *, writable: bool,
     """
     jobs: list[tuple[str, str, Path | None]] = []
     adopt = writable
-    src_exists, mir_exists = src_file.is_file(), mir_file.is_file()
+    src_st, mir_st = _lstat(src_file), _lstat(mir_file)
     mirror_rel = f"{layout.KNOWLEDGE}/{SHARED_SUBDIR}/{source}/{sub_rel}"
     source_rel = f"{layout.KNOWLEDGE}/{sub_rel}"
 
@@ -383,25 +441,40 @@ def _sync_pair_files(src_file: Path, mir_file: Path, *, writable: bool,
         if book is not None:
             book.drop(c, sub_rel)
 
-    if src_exists and not mir_exists:
+    # A link or a special file at a name (a session planted it) is neither a
+    # copy nor a delete: at the source's name nothing moves, at the mirror's
+    # name the source's copy replaces it (``_copy_file`` never writes through
+    # a link). Never read as "deleted", which would remove the file at the
+    # source or in every mirror. A folder at a name is a name reused: missing.
+    if src_st is None and _occupied(src_file):
+        return jobs, False
+    if mir_st is None and _occupied(mir_file):
+        if src_st is not None:
+            h = _copy_file(src_file, mir_file)
+            _set(h, _stat_copied(mir_file))
+            jobs.append((consumer, mirror_rel, mir_file))
+        return jobs, False
+
+    if src_st is not None and mir_st is None:
         if deliberate_delete:
             # The consumer removed a file it had converged on and the source
             # has not changed since → propagate: capture the source bytes,
             # delete at the source, remove every other mirror's copy (kept
             # in ITS recover-bin only if it diverged from the source).
-            src_st = src_file.stat()
+            assert src_st is not None
             _capture_and_log(source, source_rel, src_file, "deleted")
-            src_file.unlink(missing_ok=True)
+            _remove(src_file)
             jobs.append((source, source_rel, None))
             _drop()
             for oc, om in other_mirrors:
-                if om.is_file():
+                om_st = _lstat(om)
+                if om_st is not None:
                     try:
-                        if not _quick_same(om.stat(), src_st):
+                        if not _quick_same(om_st, src_st):
                             _capture_and_log(
                                 oc, f"{layout.KNOWLEDGE}/{SHARED_SUBDIR}/{source}/{sub_rel}",
                                 om, "conflict")
-                        om.unlink(missing_ok=True)
+                        _remove(om)
                     except OSError:
                         logger.exception("library mirror delete failed: %s %s", oc, sub_rel)
                         continue
@@ -411,42 +484,38 @@ def _sync_pair_files(src_file: Path, mir_file: Path, *, writable: bool,
                         consumer, source, sub_rel)
             return jobs, True
         h = _copy_file(src_file, mir_file)
-        _set(h, mir_file.stat())
+        _set(h, _stat_copied(mir_file))
         jobs.append((consumer, mirror_rel, mir_file))
         return jobs, False
-    if mir_exists and not src_exists:
+    if mir_st is not None and src_st is None:
         if base is not None:
             # The mirror converged on this file before and the source no
             # longer has it → the SOURCE deleted it: heal by deletion, never
             # re-adopt. A locally edited copy goes to the recover-bin.
-            try:
-                if not _matches_base(mir_file.stat(), base):
-                    _capture_and_log(consumer, mirror_rel, mir_file, "conflict")
-            except OSError:
-                pass
-            mir_file.unlink(missing_ok=True)
+            if not _matches_base(mir_st, base):
+                _capture_and_log(consumer, mirror_rel, mir_file, "conflict")
+            _remove(mir_file)
             jobs.append((consumer, mirror_rel, None))
             _drop()
             return jobs, False
         if adopt:
             # New file authored in an RW mirror → adopt into the source.
             h = _copy_file(mir_file, src_file)
-            _set(h, src_file.stat())
+            _set(h, _stat_copied(src_file))
             jobs.append((source, source_rel, src_file))
             return jobs, True
         # RO mirror holds a file the source doesn't → capture + heal (the
         # source may have deleted it, or someone smuggled a file in).
         _capture_and_log(consumer, mirror_rel, mir_file, "conflict")
-        mir_file.unlink(missing_ok=True)
+        _remove(mir_file)
         jobs.append((consumer, mirror_rel, None))
         _drop()
         return jobs, False
-    if not src_exists and not mir_exists:
+    if src_st is None or mir_st is None:
         if base is not None:
             _drop()
         return jobs, False
 
-    src_st, mir_st = src_file.stat(), mir_file.stat()
     if _quick_same(src_st, mir_st):
         # Converged pair. Record the base once (hash) when it is missing or
         # stale; steady state costs a stat per side, no reads.
@@ -457,21 +526,21 @@ def _sync_pair_files(src_file: Path, mir_file: Path, *, writable: bool,
         src_hash = _hash_file(src_file)
         if src_hash == _hash_file(mir_file):
             if int(src_st.st_mtime) != int(mir_st.st_mtime):
-                os.utime(mir_file, (src_st.st_atime, src_st.st_mtime), follow_symlinks=False)
+                _touch(mir_file, src_st)
             _set(src_hash, src_st)
             return jobs, False
 
     mirror_is_newer = mir_st.st_mtime > src_st.st_mtime
     if mirror_is_newer and adopt:
         h = _copy_file(mir_file, src_file)
-        _set(h, src_file.stat())
+        _set(h, _stat_copied(src_file))
         jobs.append((source, source_rel, src_file))
         return jobs, True
     if mirror_is_newer:
         # Local edit of a read-only mirror: revert-to-trash, then heal.
         _capture_and_log(consumer, mirror_rel, mir_file, "conflict")
     h = _copy_file(src_file, mir_file)
-    _set(h, mir_file.stat())
+    _set(h, _stat_copied(mir_file))
     jobs.append((consumer, mirror_rel, mir_file))
     return jobs, False
 
@@ -507,6 +576,8 @@ async def reconcile_source(source_agent: str) -> None:
                 if subdir else mirror_dir(consumer, source_agent)
             src_map = _walk_rel(lib_src_root, prune_top=not subdir)
             mir_map = _walk_rel(lib_mir_root, prune_top=not subdir)
+            if src_map is None or mir_map is None:
+                return
             rels = sorted(set(src_map) | set(mir_map))
 
             def _sub(lib_rel: str) -> str:
@@ -579,7 +650,7 @@ async def reconcile_source(source_agent: str) -> None:
             hook-bypassing direct-bind write can create them)."""
             mir_root = mirror_dir(consumer, source_agent)
             covered = [s for s, _w in libs]
-            for sub_rel in _walk_rel(mir_root, prune_top=False):
+            for sub_rel in _walk_rel(mir_root, prune_top=False) or {}:
                 if is_excluded_rel(sub_rel):
                     continue  # never projected either way — leave alone
                 if any(subtree_covers(s, sub_rel) for s in covered):
@@ -587,7 +658,11 @@ async def reconcile_source(source_agent: str) -> None:
                 mir_file = mir_root / sub_rel
                 mirror_rel = f"{layout.KNOWLEDGE}/{SHARED_SUBDIR}/{source_agent}/{sub_rel}"
                 _capture_and_log(consumer, mirror_rel, mir_file, "conflict")
-                mir_file.unlink(missing_ok=True)
+                try:
+                    _remove(mir_file)
+                except OSError:
+                    logger.warning("library stray not removed: %s %s", consumer, sub_rel, exc_info=True)
+                    continue
                 book.drop(consumer, sub_rel)
                 all_jobs.append((consumer, mirror_rel, None))
 
@@ -633,19 +708,24 @@ async def propagate_source_write(source_agent: str, knowledge_rel: str, *,
         return
     async with _lock(source_agent):
         src_file = source_knowledge_dir(source_agent) / knowledge_rel
+        if not deleted and _lstat(src_file) is None and _occupied(src_file):
+            # Not a plain file at the source's name (a link): nothing moves.
+            logger.warning("library source not a plain file, not projected: %s %s",
+                           source_agent, knowledge_rel)
+            return
         base_rows: list[tuple[str, str, str, str, int, float]] = []
         for att in attachments:
             consumer = att["consumer_agent"]
             mir_file = mirror_dir(consumer, source_agent) / knowledge_rel
             mirror_rel = f"{layout.KNOWLEDGE}/{SHARED_SUBDIR}/{source_agent}/{knowledge_rel}"
             try:
-                if deleted or not src_file.is_file():
-                    if mir_file.is_file():
-                        await asyncio.to_thread(mir_file.unlink)
+                if deleted or _lstat(src_file) is None:
+                    if _lstat(mir_file) is not None:
+                        await asyncio.to_thread(_remove, mir_file)
                         await _fan_out(consumer, mirror_rel, None)
                 else:
                     h = await asyncio.to_thread(_copy_file, src_file, mir_file)
-                    st = mir_file.stat()
+                    st = _stat_copied(mir_file)
                     base_rows.append((consumer, source_agent, knowledge_rel,
                                       h, st.st_size, st.st_mtime))
                     await _fan_out(consumer, mirror_rel, mir_file)
@@ -657,7 +737,7 @@ async def propagate_source_write(source_agent: str, knowledge_rel: str, *,
                 logger.exception("library projection failed: %s→%s %s",
                                  source_agent, consumer, knowledge_rel)
         try:
-            if deleted or not src_file.is_file():
+            if deleted or _lstat(src_file) is None:
                 await asyncio.to_thread(
                     db_library_mirror_state.delete_rel_all_consumers,
                     source_agent, knowledge_rel)
@@ -687,7 +767,7 @@ async def propagate_mirror_write(consumer_agent: str, source_agent: str,
         return False
     async with _lock(source_agent):
         mir_file = mirror_dir(consumer_agent, source_agent) / sub_rel
-        if not mir_file.is_file():
+        if _lstat(mir_file) is None:
             return False
         src_file = source_knowledge_dir(source_agent) / sub_rel
         try:
@@ -698,7 +778,7 @@ async def propagate_mirror_write(consumer_agent: str, source_agent: str,
                            consumer_agent, sub_rel, type(exc).__name__)
             return False
         try:
-            st = src_file.stat()
+            st = _stat_copied(src_file)
             await asyncio.to_thread(
                 db_library_mirror_state.upsert, consumer_agent, source_agent,
                 sub_rel, h, st.st_size, st.st_mtime)
@@ -726,11 +806,22 @@ async def propagate_mirror_delete(consumer_agent: str, source_agent: str,
         return False
     async with _lock(source_agent):
         src_file = source_knowledge_dir(source_agent) / sub_rel
-        if src_file.is_file():
+        kind = (await asyncio.to_thread(safe_fs.kind_beneath, *_beneath(src_file))).kind
+        # Only a plain file reached with no link is the source's copy: a link
+        # at its name or on the way removes nothing there, so the delete is
+        # not propagated either (the mirror heals).
+        if kind not in ("file", "missing"):
+            logger.warning("library delete refused at the source: %s %s", source_agent, sub_rel)
+            return False
+        if kind == "file":
             await asyncio.to_thread(
                 _capture_and_log, source_agent, f"{layout.KNOWLEDGE}/{sub_rel}",
                 src_file, "deleted")
-            await asyncio.to_thread(src_file.unlink)
+            try:
+                await asyncio.to_thread(_remove, src_file)
+            except OSError:
+                logger.warning("library delete refused at the source: %s %s", source_agent, sub_rel)
+                return False
             await _fan_out(source_agent, f"{layout.KNOWLEDGE}/{sub_rel}", None)
     await propagate_source_write(source_agent, sub_rel, deleted=True)
     return True
@@ -745,11 +836,12 @@ async def attach_setup(source_agent: str, consumer_agent: str) -> None:
 def _rm_empty_parents(leaf: Path, stop: Path) -> None:
     """Best-effort: rmdir now-empty dirs from ``leaf`` up to (and incl.)
     ``stop`` — a torn-down subdir library shouldn't leave a husk of empty
-    parents in the consumer's mirror namespace."""
+    parents in the consumer's mirror namespace. Each through the owner's
+    ``rmdir_beneath``, reached with no link followed."""
     cur = leaf
     while True:
         try:
-            cur.rmdir()
+            safe_fs.rmdir_beneath(*_beneath(cur))
         except OSError:
             return
         if cur == stop:
@@ -773,10 +865,16 @@ async def detach_teardown(source_agent: str, consumer_agent: str,
                          consumer_agent, source_agent)
     mir_root = mirror_dir(consumer_agent, source_agent)
     lib_root = mir_root / subdir if subdir else mir_root
-    rels = await asyncio.to_thread(
-        lambda: sorted(_walk_rel(lib_root, prune_top=not subdir)))
-    await asyncio.to_thread(
-        lambda: shutil.rmtree(lib_root, ignore_errors=True))
+    walked = await asyncio.to_thread(_walk_rel, lib_root, prune_top=not subdir)
+    if walked is None:
+        return
+    rels = sorted(walked)
+    try:
+        await asyncio.to_thread(
+            safe_fs.rmtree_beneath, *_beneath(lib_root), missing_ok=True)
+    except OSError:
+        logger.warning("library mirror not removed: %s %s", consumer_agent, lib_root, exc_info=True)
+        return
     if subdir:
         await asyncio.to_thread(_rm_empty_parents, lib_root.parent, mir_root)
     for lib_rel in rels:

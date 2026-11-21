@@ -8,9 +8,10 @@ name: ci
 # same tools and severities: gitleaks, hadolint, actionlint, reuse, pip-audit
 # and, on a pull request, the dependency review.
 #
-# Branch protection on main requires every job here. The dashboard's ESLint
-# gate and the proxy's mypy check run in their own jobs (`dashboard-lint`,
-# `typecheck`).
+# Branch protection on main requires every job here but `prose`, which joins
+# the required ones after the first release that carries it. The dashboard's
+# ESLint gate and the proxy's mypy check run in their own jobs
+# (`dashboard-lint`, `typecheck`), the writing rules in `prose`.
 #
 # A release candidate branch (`rc/<version>-rcN`) runs every job too: a
 # release publishes only a tree whose whole run here is green.
@@ -48,7 +49,7 @@ jobs:
         shard: [1, 2]
     services:
       postgres:
-        image: postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+        image: postgres:16.16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e
         env:
           POSTGRES_USER: otodock
           POSTGRES_PASSWORD: otodock
@@ -134,7 +135,7 @@ jobs:
     continue-on-error: true
     services:
       postgres:
-        image: postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+        image: postgres:16.16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e
         env:
           POSTGRES_USER: otodock
           POSTGRES_PASSWORD: otodock
@@ -191,7 +192,7 @@ jobs:
         shard: [1, 2]
     services:
       postgres:
-        image: postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+        image: postgres:16.16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e
         env:
           POSTGRES_USER: otodock
           POSTGRES_PASSWORD: otodock
@@ -266,6 +267,7 @@ jobs:
           cache: pip
           cache-dependency-path: |
             satellite/requirements.txt
+            satellite/requirements-exit.txt
             proxy/requirements-test.txt
 
       - name: Codex CLI at the VERSIONS.md pin
@@ -278,7 +280,7 @@ jobs:
       - name: Install satellite dependencies
         run: |
           python -m pip install -U pip
-          python -m pip install -r satellite/requirements.txt -r proxy/requirements-test.txt
+          python -m pip install -r satellite/requirements.txt -r satellite/requirements-exit.txt -r proxy/requirements-test.txt
 
       - name: pytest
         run: python -m pytest satellite/tests -q
@@ -287,6 +289,8 @@ jobs:
   # Ubuntu 22.04 host pairs with. A separate job, not a matrix, so the
   # `satellite` check keeps its name. The satellite's own requirements carry
   # tomli below 3.11 (the daemon validates a composed config.toml with it).
+  # Its last step runs the one program the proxy sends into a sandbox, which
+  # runs on a host's own python3.
   satellite-floor:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-24.04
@@ -301,6 +305,7 @@ jobs:
           cache: pip
           cache-dependency-path: |
             satellite/requirements.txt
+            satellite/requirements-exit.txt
             proxy/requirements-test.txt
 
       - name: Codex CLI at the VERSIONS.md pin
@@ -309,10 +314,16 @@ jobs:
       - name: Install satellite dependencies
         run: |
           python -m pip install -U pip
-          python -m pip install -r satellite/requirements.txt -r proxy/requirements-test.txt
+          python -m pip install -r satellite/requirements.txt -r satellite/requirements-exit.txt -r proxy/requirements-test.txt
 
       - name: pytest
         run: python -m pytest satellite/tests -q
+
+      # Direct LLM's file program runs on the sandbox's own python3, which is
+      # this floor on a bare-metal Ubuntu 22.04 host. Its tests load the
+      # program's two files alone and import nothing of the proxy.
+      - name: pytest (the Direct LLM file program, floor)
+        run: python -m pytest -c /dev/null --noconftest -q proxy/tests/execution/test_direct_file_program.py
 
   # The phone service's suite in the phone service's own environment: its
   # lockfile, then the audio package with the localmodels extra, in the
@@ -534,6 +545,29 @@ jobs:
           python -m pip install -q "ruff==0.15.22"
           ruff check .
 
+  # The writing rules (WRITING.md) on every file written for people, with
+  # the root .prose.json and its baseline, on the oldest Python the check
+  # promises. Standard library only: nothing to install.
+  prose:
+    if: github.repository == 'OtoDock/oto-dock'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.10'
+
+      - name: self-test
+        run: python scripts/prose/prose_check.py --self-test
+
+      - name: the writing rules
+        # A nested .prose.json would exempt its folder: none belongs here.
+        run: python scripts/prose/prose_check.py . --no-nested
+
   # Known vulnerabilities in every pinned Python lockfile, judged as the
   # release gate judges them: one with a fixed release fails, one without a
   # fix yet is a warning.
@@ -552,7 +586,7 @@ jobs:
       - name: pip-audit
         run: |
           python -m pip install -q "pip-audit==2.10.1"
-          python - proxy/requirements.txt phone/requirements.txt satellite/requirements.txt mcps/custom/*/requirements.txt <<'PY'
+          python - proxy/requirements.txt phone/requirements.txt satellite/requirements.txt satellite/requirements-exit.txt mcps/custom/*/requirements.txt <<'PY'
           import json, re, subprocess, sys, tempfile
           fixable = 0
           for path in sys.argv[1:]:

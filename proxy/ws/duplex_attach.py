@@ -35,13 +35,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
+from core import placement
 from core.background import spawn
-from core.session import interactive_session
+from core.session import interactive_session, session_kind
 from storage import database as task_store
 from ws import wire_events as wire
 
@@ -154,25 +156,18 @@ async def _resolve(bridge) -> _AttachState | str:
     chat = await asyncio.to_thread(task_store.get_chat, bridge.chat_id)
     if not chat:
         return "chat_not_found"
-    from core.session.visibility import SCOPE_AGENT, is_shared_chat_owner
-    if is_shared_chat_owner(chat.get("user_sub")):
-        # A pool chat runs as the agent: the editor tier at every drive. The
-        # mint and the attach judged the token's principal; this is the live
-        # role at the first utterance, ahead of both the pump and the PTY path.
-        from auth.providers import acting_role_of
-        from core.sandbox.session_config_dir import (
-            AgentStateRefused,
-            refuse_agent_state_below_editor,
-        )
-        from core.session.visibility import is_shared_only
-        from storage.pg import run_db
-        _agent = chat.get("agent") or ""
-        pool_role, shared_only = await run_db(
-            lambda: (acting_role_of(bridge.sub, _agent), is_shared_only(_agent)))
-        try:
-            refuse_agent_state_below_editor(SCOPE_AGENT, pool_role, shared_only=shared_only)
-        except AgentStateRefused as e:
-            return str(e)
+    # The live role at the first utterance, ahead of both the pump and the PTY
+    # path: the mint and the attach judged the token's principal, and the rule
+    # every door asks judges the chat now (a pool chat's editor tier, a run's
+    # own rule, a call that only the call drives).
+    from auth.providers import acting_role_of
+    from core.session.visibility import drive_refusal
+    from storage.pg import run_db
+    _agent = chat.get("agent") or ""
+    refusal = await run_db(
+        lambda: drive_refusal(chat, bridge.sub or "", acting_role_of(bridge.sub, _agent)))
+    if refusal:
+        return refusal
     session_id = chat.get("session_id") or ""
     if not session_id:
         return "no_session"
@@ -196,16 +191,8 @@ async def _resolve(bridge) -> _AttachState | str:
         _interactive_feeds[bridge.chat_id] = bridge
         return st
 
-    from auth.providers import acting_role_of
-    from core.session.session_manager import get_execution_layer
-    from storage.pg import run_db
-    role = await run_db(acting_role_of, bridge.sub, chat.get("agent") or "")
     try:
-        layer = get_execution_layer(
-            chat.get("agent") or "",
-            execution_path=chat.get("execution_path") or "",
-            user_sub=bridge.sub or None, role=role,
-        )
+        layer = await _chat_layer(bridge, chat)
     except RuntimeError:
         return "session_unreachable"
 
@@ -218,6 +205,15 @@ async def _resolve(bridge) -> _AttachState | str:
     )
     _states[bridge.duplex_id] = st
     return st
+
+
+async def _chat_layer(bridge, chat: dict) -> ExecutionLayer:
+    """The chat's layer as every chat door reads it (``layer_for_chat``,
+    with the speaker's role, in one store job)."""
+    from storage.pg import run_db
+    from ws.dashboard import _role_and_layer
+    _role, layer = await run_db(_role_and_layer, bridge.sub or "", chat.get("agent") or "", chat)
+    return layer
 
 
 def _build_prompt(st: _AttachState, text: str, barge_in_chars: int | None,
@@ -290,7 +286,10 @@ async def run_utterance(bridge, frame: dict, *, waited: bool = False) -> None:
         return
 
     if st.interactive:
-        await _run_interactive_utterance(bridge, st, turn, text, barge_in_chars)
+        try:
+            await _run_interactive_utterance(bridge, st, turn, text, barge_in_chars)
+        except placement.PlacementRefused as e:
+            await _say_refusal(bridge, st, turn, e)
         return
 
     from core.events.common_events import TurnInput
@@ -358,6 +357,9 @@ async def run_utterance(bridge, frame: dict, *, waited: bool = False) -> None:
         # into the corpse (incident 2026-08-12).
         try:
             await _ensure_live_session(bridge, st)
+        except placement.PlacementRefused as e:
+            await _say_refusal(bridge, st, turn, e)
+            return
         except Exception as e:
             logger.exception(
                 "duplex %s: dead-session heal failed: %s",
@@ -376,6 +378,43 @@ async def run_utterance(bridge, frame: dict, *, waited: bool = False) -> None:
         q.release(claim)
 
 
+#: What a spoken turn hears when the machine that holds its chat is away and
+#: the compute sentence does not fit (a paired computer's chat, a session
+#: another compute machine cannot take over).
+MACHINE_AWAY_SENTENCE = "The machine running this chat is not connected. Try again in a few minutes."
+
+#: What a spoken turn hears when its terminal is at a usage limit
+#: (``limit_ending``): its own, or its account's that another chat reached.
+LIMIT_SENTENCE = ("This chat's AI account has reached its usage limit. "
+                  "Try again after it resets, or type in the chat.")
+
+
+async def _refuse_away(bridge) -> NoReturn:
+    """Refuse a spoken turn whose chat's session or terminal is held by a
+    machine that is away. A typed message waits for that machine. A spoken
+    turn cannot, and its words are never left to be typed in later: every
+    path of this door that finds its holder away ends here, with the
+    sentence that fits. The compute sentence when no compute machine can
+    take the chat, else that the chat's machine is not connected."""
+    from core.session.session_manager import no_compute_for
+    from services.remote import machine_away
+    from storage.pg import run_db
+    row = await run_db(task_store.get_chat, bridge.chat_id)
+    if row and await run_db(functools.partial(no_compute_for, row, held=False)):
+        raise placement.NoComputeMachine()
+    raise placement.PlacementRefused(await run_db(machine_away.sentence_for_chat, row, MACHINE_AWAY_SENTENCE))
+
+
+async def _say_refusal(bridge, st: _AttachState, turn: int, refusal: placement.PlacementRefused) -> None:
+    """A turn no place can take now: its sentence on the page and spoken,
+    at once. A spoken turn does not wait in a queue."""
+    logger.info("duplex %s: the turn was refused: %s", bridge.duplex_id[:8], refusal)
+    st.active_turn = None
+    await _engine_send(bridge, {
+        "type": wire.ERROR, "turn": turn, "data": {"message": str(refusal), "say": str(refusal)},
+    })
+
+
 async def _ensure_live_session(bridge, st: _AttachState) -> None:
     """Heal a dead/reaped session before dispatching a NEW turn.
 
@@ -387,22 +426,52 @@ async def _ensure_live_session(bridge, st: _AttachState) -> None:
 
     Fails toward ALIVE on probe uncertainty (the remote layer's doctrine): a
     wrong "alive" just means this turn errors like today; a wrong "dead"
-    would respawn under a recoverable blip. A satellite inside its reconnect
-    grace window is "reconnecting", never healed."""
+    would respawn under a recoverable blip. A session whose machine is inside
+    its reconnect grace is "reconnecting", never healed: the grace is the
+    session's holder's (``live_session``), since a reading of the chat's
+    layer taken while the machine was away is the platform's own. The turn
+    goes to that holder when it is back after a short wait, and is refused
+    in words when it is not (``_refuse_away``)."""
+    from core.session.session_manager import live_session
     # The first utterance's attach set the layer.
     layer, sid = cast("ExecutionLayer", st.layer), st.session_id
+    # A session a wake built for nobody never carries a spoken turn: it is
+    # closed, and the headless resume below starts the speaker's own.
+    from core.session.session_state import runs_for_nobody
+    if runs_for_nobody(sid, bridge.chat_id) and (
+            (await asyncio.to_thread(task_store.get_chat, bridge.chat_id)) or {}).get("origin") != "delegated":
+        with contextlib.suppress(Exception):
+            await layer.close_session(sid)
+    away = False
     try:
-        grace_held = getattr(layer, "is_session_grace_held", None)
-        if grace_held is not None and grace_held(sid):
-            return
-        dead = (await layer.is_session_process_dead(sid)
-                or not await layer.is_session_alive(sid))
+        held = live_session(sid)
+        if held is not None and held.grace:
+            # Its machine is away and still holds the session. A link that
+            # dropped a moment ago is waited for, as every door does. One
+            # away for longer is not: a spoken turn must answer.
+            from core.remote.satellite_connection import get_connection_manager
+            recent = get_connection_manager().machine_dropped_recently(held.machine_id)
+            away = not await held.layer.wait_session_reconnect(sid, **({} if recent else {"timeout": 0.0}))
+            st.layer = held.layer
+            if not away:
+                return
+        dead = away or (await layer.is_session_process_dead(sid)
+                        or not await layer.is_session_alive(sid))
     except Exception:  # noqa: BLE001  # a failed liveness probe dispatches the utterance anyway
         logger.debug(
             "duplex %s: liveness probe failed for %s — dispatching anyway",
             bridge.duplex_id[:8], sid[:8], exc_info=True,
         )
         return
+    if away:
+        # The machine did not come back within the wait: the turn is
+        # refused in words, the held session left as it is (the machine's
+        # return takes it back). One that signed in during these reads is
+        # live again and takes the turn.
+        again = live_session(sid)
+        if again is not None and not again.grace:
+            return
+        await _refuse_away(bridge)
     if not dead:
         return
     # Someone may already have replaced the session (the dashboard's own
@@ -413,18 +482,37 @@ async def _ensure_live_session(bridge, st: _AttachState) -> None:
     # consistent).
     chat = await asyncio.to_thread(task_store.get_chat, bridge.chat_id)
     row_sid = (chat or {}).get("session_id") or ""
-    if row_sid and row_sid != sid:
+    adopted = bool(row_sid) and row_sid != sid
+    if adopted:
         st.session_id = sid = row_sid
         logger.info(
             "duplex %s: adopting replaced session %s from the chat row",
             bridge.duplex_id[:8], sid[:8],
         )
+    other = live_session(sid)
+    if chat and other is not None and other.layer is not layer:
+        # Another layer holds it (a reading taken while its machine was
+        # away): the chat's layer is read again, the one reading every door
+        # makes, and asked before anything is healed.
+        try:
+            st.layer = layer = await _chat_layer(bridge, chat)
+        except RuntimeError:
+            return
+        adopted = True
+    if adopted:
         try:
             if (not await layer.is_session_process_dead(sid)
                     and await layer.is_session_alive(sid)):
                 return
         except Exception:  # noqa: BLE001  # a failed liveness probe leaves the session to the turn
             return
+    # Nothing holds the session and no compute machine can start it again:
+    # refused before anything of it is touched (the resume below prepares
+    # the dead session first, then builds).
+    from core.session.session_manager import no_compute_for
+    from storage.pg import run_db
+    if chat and await run_db(no_compute_for, chat):
+        raise placement.NoComputeMachine()
     from ws.headless_resume import resume_dead_session_headless
     logger.info(
         "duplex %s: session %s dead — headless auto-resume",
@@ -466,6 +554,16 @@ async def _run_interactive_utterance(
             "type": wire.ERROR, "turn": turn, "data": {"message": "access_denied"},
         })
         return
+    if isess.limit_ending() is not None:
+        # A spoken turn never waits in a queue: at the limit it is refused at once.
+        raise placement.PlacementRefused(LIMIT_SENTENCE)
+    if isess.is_remote:
+        # A terminal whose machine is away stays live for its return, and
+        # its queue takes words whatever the link: they would be typed in
+        # then, however late.
+        from core.remote.satellite_connection import get_connection_manager
+        if get_connection_manager().is_pty_in_grace(isess.target):
+            await _refuse_away(bridge)
     st.active_turn = turn
     st.turn_saw_open = False
     prompt = _build_prompt(st, text, barge_in_chars, focus=await _focus_for(bridge))
@@ -566,15 +664,17 @@ async def _run_new_turn(
         prompt, _seed_notice = await asyncio.to_thread(
             consume_pending_seed, bridge.chat_id, prompt,
         )
+    # The first utterance's attach set the layer.
+    layer, sid = cast("ExecutionLayer", st.layer), st.session_id
+    # A turn the engine ran by itself since the last one, unread, is
+    # recorded above the spoken words, as it happened.
+    await layer.record_waiting_turns(sid)
     # Persist the user's spoken words like any user message (the prompt's
     # reminder/interruption framing stays out of the DB row).
     await asyncio.to_thread(
         task_store.add_chat_message, bridge.chat_id, "user", text,
         author_sub=bridge.sub,
     )
-
-    # The first utterance's attach set the layer.
-    layer, sid = cast("ExecutionLayer", st.layer), st.session_id
     event_queue: asyncio.Queue = asyncio.Queue()
     msg_queue: list = []
     sys_queue: list = []
@@ -586,7 +686,10 @@ async def _run_new_turn(
     drain_as = (bridge.sub or "") if _vis.is_shared_only(st.agent) else None
 
     def _queued_waiting() -> bool:
-        return any(drain_as is None or qi.author_sub == drain_as for qi in input_q.items)
+        # As the dashboard producer: nothing queued starts a turn while new
+        # work is held.
+        return not input_queue.frozen() and any(
+            drain_as is None or qi.author_sub == drain_as for qi in input_q.items)
 
     async def _send_turn(text: str, **kwargs) -> bool:
         """One engine turn onto the pump; True when it yielded an ERROR."""
@@ -659,6 +762,7 @@ async def _run_new_turn(
         event_queue=event_queue,
         perm_queue=get_permission_queue(sid),
         scope="agent" if _vis.is_shared_only(st.agent) else "user",
+        turn_kind=session_kind.DUPLEX_TURN,
     )
     pump.message_queue = msg_queue
     pump.system_queue = sys_queue
@@ -670,6 +774,12 @@ async def _run_new_turn(
     pump.start()
     st.pump = pump
     _start_forward(bridge, st, pump, turn)
+    # The work the spoken turn leaves running gets its monitors, as a typed
+    # turn's does.
+    from core.background import spawn
+    from core.events.pump_bg_monitors import arm_bg_monitors_after
+    spawn(arm_bg_monitors_after(pump, layer, sid, bridge.chat_id),
+          name="arm_bg_monitor_after", owner="duplex_attach")
 
     async def _abort_inflight():
         await _abort(bridge, st)

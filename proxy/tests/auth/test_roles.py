@@ -28,6 +28,7 @@ def test_the_members_and_the_frozen_spellings():
     assert roles.EFFECTIVE_ROLES == ("viewer", "contributor", "editor", "manager", "admin")
     assert roles.PLATFORM_BY_RANK == ("member", "creator", "admin")
     assert roles.SERVICE == "agent" and roles.NO_ACCESS == ""
+    assert roles.EXTERNAL == "external" and roles.EXTERNAL not in roles.RANK
     assert roles.OWNER_TIER == (roles.MANAGER, roles.ADMIN)
     assert roles.EDITOR_TIER == (roles.MANAGER, roles.EDITOR, roles.ADMIN)
     assert roles.WORKSPACE_TIER == (roles.MANAGER, roles.EDITOR, roles.CONTRIBUTOR, roles.ADMIN)
@@ -87,6 +88,20 @@ def test_the_questions():
     assert roles.rank("none") == 0 and roles.rank("") == 0 and roles.rank(None) == 0
     for floor in (None, "", "viewer"):
         assert roles.meets_floor("none", floor) and roles.meets_floor("viewer", floor)
+    # An outside person ranks below every floor, and the words outside the
+    # table keep their rank of 0 beside it.
+    assert roles.rank("external") == -1 and roles.is_external("external")
+    assert not roles.is_external("viewer") and not roles.is_external(None)
+    for floor in (None, "", "viewer", "contributor", "editor", "manager", "owner"):
+        assert not roles.meets_floor("external", floor)
+    # The floor an app names to open a button or a method to outside people:
+    # every role clears it, outside people included.
+    for role in ("external", "none", "", None, "agent", "viewer", "contributor", "editor", "manager", "admin"):
+        assert roles.meets_floor(role, "external")
+    assert roles.capped("external", "manager") == "external"
+    assert roles.label("external") == "external"
+    assert not roles.can_manage("external") and not roles.can_edit("external")
+    assert not roles.can_write_workspace("external") and not roles.allowed_on_shared_only("external")
     for floor in ("contributor", "editor", "manager"):
         assert not roles.meets_floor("none", floor) and not roles.meets_floor("viewer", floor)
     assert roles.meets_floor("contributor", "contributor") and roles.meets_floor("editor", "contributor")
@@ -204,7 +219,8 @@ def _ts_union(text: str, name: str) -> list[str]:
 
 def test_the_dashboard_mirror_equals_the_authority():
     text = _MIRROR.read_text(encoding="utf-8")
-    assert set(_ts_const_strings(text, "ROLE")) == set(roles.PLATFORM_ROLES) | set(roles.AGENT_ROLES)
+    assert set(_ts_const_strings(text, "ROLE")) == (
+        set(roles.PLATFORM_ROLES) | set(roles.AGENT_ROLES) | {roles.EXTERNAL})
     assert _ts_const_strings(text, "PLATFORM_ROLES") == list(roles.PLATFORM_ROLES)
     assert _ts_const_strings(text, "AGENT_ROLES") == list(roles.AGENT_ROLES)
     assert _ts_const_strings(text, "EFFECTIVE_ROLES") == list(roles.EFFECTIVE_ROLES)

@@ -58,11 +58,12 @@ def _no_user_session(sid="s-phone", agent="personal-assistant"):
 
 
 def _real_user_session(sub="user-alice", sid="s-chat", agent="personal-assistant",
-                       role="creator"):
-    """An interactive agent subprocess whose JWT carried the real user_sub."""
+                       role="creator", agent_roles=None):
+    """An interactive agent subprocess whose JWT carried the real user_sub,
+    with the per-agent rows its principal resolves with."""
     return UserContext(
         sub=sub, email="alice@test.com", name="Alice", role=role,
-        is_api_key=True, session_id=sid, agent=agent,
+        is_api_key=True, session_id=sid, agent=agent, agent_roles=dict(agent_roles or {}),
     )
 
 
@@ -185,17 +186,18 @@ def test_real_user_can_mutate_own_task():
 
 
 def test_agent_scope_editor_only_own(monkeypatch):
-    """A real-user (per-agent editor) may mutate only their own agent-scope task."""
+    """A real-user (per-agent editor) may mutate only their own agent-scope task.
+    The role is the principal's, as it resolved for the request."""
     from storage import database
     monkeypatch.setattr(database, "get_user", lambda sub: {"sub": sub, "role": "member"})
-    monkeypatch.setattr(database, "get_user_agent_roles", lambda sub: {"billing": "editor"})
+    editor = _real_user_session(sub="user-alice", role="member", agent_roles={"billing": "editor"})
 
     own = {"scope": "agent", "created_by": "user-alice", "agent": "billing"}
-    tasks._check_task_permission(own, _real_user_session(sub="user-alice"))  # no raise
+    tasks._check_task_permission(own, editor)  # no raise
 
     other = {"scope": "agent", "created_by": "user-bob", "agent": "billing"}
     with pytest.raises(HTTPException) as exc:
-        tasks._check_task_permission(other, _real_user_session(sub="user-alice"))
+        tasks._check_task_permission(other, editor)
     assert exc.value.status_code == 403
 
 
@@ -455,19 +457,14 @@ def test_a_callback_returns_only_to_the_callers_own_session_and_chat(routes):
 
     tid = _user_task(X)
     url = f"/v1/tasks/{tid}/on-complete"
+    # The callback's own route is a person's (the dashboard's): a session's
+    # token does not reach it, whatever it names.
     for body in ({"on_complete_session_id": "victim-sid"},
                  {"on_complete_chat_id": victim_chat},
-                 {"on_complete_agent": Y, "on_complete_session_id": f"sid-{X}"}):
+                 {"on_complete_agent": X, "on_complete_chat_id": own_chat}, {}):
         r = routes.patch(url, headers=h, json={"on_complete_prompt": "x", **body})
-        assert r.status_code == 403, body
+        assert r.status_code == 403 and "A session's token does not reach this route" in r.text, body
     assert task_store.get_dynamic_task(tid)["on_complete_session_id"] is None
-    r = routes.patch(url, headers=h, json={
-        "on_complete_agent": X, "on_complete_prompt": "x", "on_complete_chat_id": own_chat,
-    })
-    assert r.status_code == 200, r.text
-    assert task_store.get_dynamic_task(tid)["on_complete_chat_id"] == own_chat
-    # Clearing the callback names nobody and stays open.
-    assert routes.patch(url, headers=h, json={}).status_code == 200
 
 
 def test_a_session_cancels_with_the_persons_role(routes):
@@ -515,5 +512,6 @@ def test_a_task_session_with_no_task_row_is_not_handed_out(routes):
     rid = _run(Y, "user", "user-manager", output="x")
     task_store.update_run(rid, session_id="theirs-sid")
     r = routes.get("/v1/tasks/dyn-gone/session", headers=_session_headers(X, X, MEMBER))
-    assert r.status_code == 404
+    # A session's token does not reach the route at all.
+    assert r.status_code == 403 and "A session's token does not reach this route" in r.text
     assert "theirs-sid" not in r.text

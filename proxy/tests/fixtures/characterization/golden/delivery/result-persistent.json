@@ -1,0 +1,118 @@
+{
+ "pending": [],
+ "rows": [
+  {
+   "content": "",
+   "event_data": {
+    "agent": "char-peer",
+    "output_text": "the worker's answer",
+    "status": "completed",
+    "task_id": "t-alive",
+    "task_name": "the-worker"
+   },
+   "event_type": "delegate_result",
+   "role": "event"
+  },
+  {
+   "content": "ECHO TEXT",
+   "event_data": null,
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "content": "",
+   "event_data": {
+    "agent": "char-peer",
+    "output_text": "the chat's own session",
+    "status": "user_interrupted",
+    "task_id": "t-by-chat",
+    "task_name": "the-worker"
+   },
+   "event_type": "delegate_result",
+   "role": "event"
+  },
+  {
+   "content": "ECHO TEXT",
+   "event_data": null,
+   "event_type": "",
+   "role": "assistant"
+  }
+ ],
+ "seen": {
+  "admission": [],
+  "frames": [
+   [
+    "c-alive",
+    {
+     "agent": "char-peer",
+     "chat_id": "c-alive",
+     "output_text": "the worker's answer",
+     "status": "completed",
+     "task_id": "t-alive",
+     "task_name": "the-worker",
+     "type": "delegate_result"
+    }
+   ],
+   [
+    "c-alive",
+    {
+     "agent": "char-peer",
+     "chat_id": "c-alive",
+     "output_text": "the chat's own session",
+     "status": "user_interrupted",
+     "task_id": "t-by-chat",
+     "task_name": "the-worker",
+     "type": "delegate_result"
+    }
+   ]
+  ],
+  "layer": [
+   [
+    "is_session_alive",
+    "s-alive"
+   ],
+   [
+    "send_message",
+    "s-alive",
+    "[status=completed task=t-alive name=the-worker chat= agent=char-peer]\nthe worker's answer"
+   ],
+   [
+    "is_session_alive",
+    "s-alive"
+   ],
+   [
+    "send_message",
+    "s-alive",
+    "[status=user_interrupted task=t-by-chat name=the-worker chat= agent=char-peer]\nthe chat's own session"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   },
+   {
+    "agent": "char-agent",
+    "execution_path": "",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ }
+}

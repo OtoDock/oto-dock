@@ -1,0 +1,603 @@
+[
+ {
+  "find_live_for_chat": null,
+  "get": {
+   "sid-a": null
+  },
+  "live_local": [],
+  "live_session_ids": [],
+  "no_chat": null,
+  "step": "empty",
+  "streaming_chat_ids": []
+ },
+ {
+  "find_live_for_chat": "sid-a2",
+  "get": {
+   "sid-a": "sid-a",
+   "sid-a2": "sid-a2",
+   "sid-b": "sid-b"
+  },
+  "live_local": [
+   "sid-a",
+   "sid-a2",
+   "sid-b"
+  ],
+  "live_session_ids": [
+   "sid-a",
+   "sid-a2",
+   "sid-b"
+  ],
+  "other_target": null,
+  "slot_acquired": [
+   [
+    "sid-a",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "sid-a2",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "sid-b",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   },
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   },
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "step": "three live, one streaming",
+  "streaming_chat_ids": [
+   "chat-a"
+  ],
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ },
+ {
+  "find_live_for_chat": "sid-a",
+  "get": {
+   "sid-a": "sid-a",
+   "sid-a2": "sid-a2"
+  },
+  "live_local": [
+   "sid-a",
+   "sid-b"
+  ],
+  "live_session_ids": [
+   "sid-a",
+   "sid-b"
+  ],
+  "step": "a dead PTY is no live one",
+  "streaming_chat_ids": [
+   "chat-a"
+  ]
+ },
+ {
+  "find_live_for_chat": "sid-b",
+  "get": {
+   "sid-b": "sid-b"
+  },
+  "holds_the_new_one": true,
+  "live_local": [
+   "sid-a",
+   "sid-a2",
+   "sid-b"
+  ],
+  "live_session_ids": [
+   "sid-a",
+   "sid-a2",
+   "sid-b"
+  ],
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_acquired": [
+   [
+    "sid-b",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "slot_released": [
+   "sid-b"
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-b": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [
+     "_mark_ready"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the lease: one process per session id",
+  "streaming_chat_ids": [
+   "chat-a"
+  ],
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-a",
+    "ready",
+    {
+     "agent": "term-registry"
+    }
+   ]
+  ],
+  "closed": 2,
+  "find_live_for_chat": null,
+  "get": {
+   "sid-a": null,
+   "sid-a2": null
+  },
+  "live_local": [
+   "sid-b"
+  ],
+  "live_session_ids": [
+   "sid-b"
+  ],
+  "nothing": 0,
+  "pty_close": [
+   {
+    "signal_child": true
+   },
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_released": [
+   "sid-a",
+   "sid-a2"
+  ],
+  "step": "close_for_chat",
+  "streaming_chat_ids": [],
+  "turn_end": [
+   [
+    "sid-a",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "slot_acquired": [
+   [
+    "sid-wake",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-wake": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "not_ready",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [
+     "a stored delegate result"
+    ],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop",
+     "_mark_ready"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "a stored wake is queued at registration",
+  "stored": "",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_fire_inject_backstop",
+    5.0
+   ]
+  ]
+ },
+ {
+  "find_live_for_chat": null,
+  "get": {
+   "sid-exit": null
+  },
+  "live_local": [
+   "sid-b",
+   "sid-wake"
+  ],
+  "live_session_ids": [
+   "sid-b",
+   "sid-wake"
+  ],
+  "pty_close": [
+   {
+    "signal_child": false
+   }
+  ],
+  "slot_acquired": [
+   [
+    "sid-exit",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "slot_released": [
+   "sid-exit"
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-exit": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": 3,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the process exits",
+  "streaming_chat_ids": [],
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ },
+ {
+  "error": "no chat slot for interactive session sid-refu (busy)",
+  "find_live_for_chat": null,
+  "get": {
+   "sid-refused": null
+  },
+  "live_local": [
+   "sid-b",
+   "sid-wake"
+  ],
+  "live_session_ids": [
+   "sid-b",
+   "sid-wake"
+  ],
+  "slot_acquired": [
+   [
+    "sid-refused",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "step": "no slot",
+  "streaming_chat_ids": []
+ },
+ {
+  "error": "no pty",
+  "find_live_for_chat": null,
+  "get": {
+   "sid-nospawn": null
+  },
+  "live_local": [
+   "sid-b",
+   "sid-wake"
+  ],
+  "live_session_ids": [
+   "sid-b",
+   "sid-wake"
+  ],
+  "slot_acquired": [
+   [
+    "sid-nospawn",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "slot_released": [
+   "sid-nospawn"
+  ],
+  "step": "the spawn fails: its slot goes back",
+  "streaming_chat_ids": []
+ },
+ {
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_acquired": [
+   [
+    "sid-deleted",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "slot_released": [
+   "sid-deleted"
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-deleted": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "a deleted chat's close sends no ready frame",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ },
+ {
+  "holds_the_tokens_expiry": true,
+  "slot_acquired": [
+   [
+    "sid-token",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": null
+    }
+   ],
+   [
+    "sid-token-none",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   },
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "stands_in_a_day": true,
+  "state": {
+   "sid-token-none": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [
+     "_mark_ready"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a parked question lives as long as the token in the spawn env",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ },
+ {
+  "find_live_for_chat": null,
+  "get": {
+   "sid-b": null,
+   "sid-wake": null
+  },
+  "handed_back": [
+   {
+    "agent": "",
+    "allow_pty": false,
+    "allow_ws": false,
+    "chat_id": "chat-wake",
+    "hops": 1,
+    "oneshot_fn": null,
+    "persistent_fn": null,
+    "role": "manager",
+    "session_id": "sid-wake",
+    "source": "delegate_result_replay",
+    "text": "a stored delegate result",
+    "user_sub": null
+   }
+  ],
+  "live_local": [],
+  "live_session_ids": [],
+  "pty_close": [
+   {
+    "signal_child": true
+   },
+   {
+    "signal_child": true
+   },
+   {
+    "signal_child": true
+   },
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_released": [
+   "sid-b",
+   "sid-wake",
+   "sid-token",
+   "sid-token-none"
+  ],
+  "step": "close_all",
+  "streaming_chat_ids": []
+ }
+]

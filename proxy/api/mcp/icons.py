@@ -14,7 +14,6 @@ import asyncio
 import hashlib
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import FileResponse
 
 from auth import roles
 from auth.providers import UserContext, get_current_user, require_auth, require_user
@@ -46,12 +45,8 @@ async def mcp_icon(
     if not community_icons.valid_name(name):
         raise HTTPException(404, "No such MCP", headers=_MISS_HEADERS)
 
-    path = await asyncio.to_thread(community_icons.installed_icon_path, name)
-    if path is not None:
-        return FileResponse(path, media_type="image/png", headers=_CACHE_HEADERS)
-
-    body = None
-    if roles.is_creator_or_above(user.role):
+    body = await asyncio.to_thread(community_icons.installed_icon, name)
+    if body is None and roles.is_creator_or_above(user.role):
         body = await community_icons.catalog_icon(name)
     if body is None:
         raise HTTPException(404, "No icon", headers=_MISS_HEADERS)

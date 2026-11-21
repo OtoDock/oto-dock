@@ -422,13 +422,13 @@ async def _snapshot_folder(
         raise HTTPException(400, f"Not a directory: {folder.raw}{where}")
     return await asyncio.to_thread(
         _snapshot_template_dir, folder.platform, skip_dirs=skip_dirs, skipped=skipped,
-        what=what,
+        what=what, agent=folder.agent,
     )
 
 
 def _snapshot_template_dir(
     src: Path, *, skip_dirs: frozenset[str] = frozenset(),
-    skipped: list[str] | None = None, what: str = "template",
+    skipped: list[str] | None = None, what: str = "template", agent: str = "",
 ) -> Path:
     """Copy ``src`` into a private temp dir, rejecting anything unexpected.
 
@@ -444,12 +444,22 @@ def _snapshot_template_dir(
     ``node_modules``; ``skipped`` collects the relative names of everything
     left out, so a check that must refuse them (an MCP package's ``.env``
     or ``venv``) sees them without the copy holding them.
+
+    With ``agent`` the folder walked is the one authorized: ``src`` is also
+    opened beneath the agent's real folder with no link followed, and the
+    walk's own top must be that folder (a folder above it replaced by a
+    link since the check is refused).
     """
+    held = _held_top(src, agent, what) if agent else None
     dest = Path(tempfile.mkdtemp(prefix="oto-local-template-"))
     files = 0
     total = 0
     try:
         for root, dirnames, filenames, dirfd in os.fwalk(src, follow_symlinks=False):
+            if held is not None:
+                if not os.path.samestat(held, os.fstat(dirfd)):
+                    raise HTTPException(400, f"The {what} folder changed while it was read")
+                held = None
             rel_root = Path(root).relative_to(src)
             # Skip what a release never takes (dotfiles, node_modules, an
             # app's data/) — an author's `bun install` beside the app would
@@ -511,10 +521,28 @@ def _snapshot_template_dir(
                         f"(max {_MAX_TOTAL_BYTES // (1024 * 1024)} MB total)",
                     )
                 (dest / rel).write_bytes(data)
+        if held is not None:
+            raise HTTPException(400, f"The {what} folder changed while it was read")
         return dest
     except Exception:
         shutil.rmtree(dest, ignore_errors=True)
         raise
+
+
+def _held_top(src: Path, agent: str, what: str) -> os.stat_result:
+    """The status of the template folder reached beneath the agent's real
+    folder with no link followed (``core.agent_folder``), the folder the
+    walk's top must be."""
+    from core import agent_folder
+    from services.infra import safe_fs
+    try:
+        fd = safe_fs.open_dir_beneath(*agent_folder.beneath_agent(src, agent))
+    except OSError as e:
+        raise HTTPException(400, f"The {what} folder is reached through a link") from e
+    try:
+        return os.fstat(fd)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +614,7 @@ def _validate_apps(template) -> list[str]:
     tolerated when the template requires the MCP; everything else the
     deploy would refuse is reported here, with the file and the line."""
     from services.apps import app_deploy, app_lint, releases
+    from services.community import template_app_seeder
     errors: list[str] = []
     required = {m.name for m in template.mcps}
     for item in template.apps:
@@ -593,7 +622,9 @@ def _validate_apps(template) -> list[str]:
         required |= set(item.requires_mcps)
         doc = json.loads((item.dir / "app.json").read_text(encoding="utf-8"))
         try:
-            app_deploy.validate_app_json(doc, template.slug, item.visibility != "user", item.dir)
+            app_deploy.validate_app_json(
+                doc, template.slug, item.visibility != "user", item.dir,
+                blueprint_tasks=frozenset(template_app_seeder.blueprint_task_slugs(item.blueprint)))
         except app_deploy.DeployError as exc:
             m = _MCP_UNAVAILABLE_RE.search(str(exc))
             if not (m and m.group(1) in required):

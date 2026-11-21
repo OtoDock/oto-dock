@@ -13,6 +13,17 @@
     @android.webkit.JavascriptInterface public <methods>;
 }
 
+# Android's WebView offers full screen to a page only when the
+# WebChromeClient's class declares both of these: it looks for them by name
+# (its doesSupportFullscreen). R8 removes a method that only calls its
+# parent, which is all Capacitor's onHideCustomView does, and without the
+# pair no video goes full screen, the dashboard's player or a frame's own.
+# The build's checkReleaseFullscreen reads the shrunk dex for both.
+-keepclassmembers class * extends android.webkit.WebChromeClient {
+    public void onShowCustomView(android.view.View, android.webkit.WebChromeClient$CustomViewCallback);
+    public void onHideCustomView();
+}
+
 # Line numbers in a crash's stack trace, under one file name.
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile

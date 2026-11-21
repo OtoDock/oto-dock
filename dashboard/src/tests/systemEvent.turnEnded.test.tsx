@@ -9,9 +9,28 @@ import { render, screen, fireEvent } from '@testing-library/react'
 import SystemEvent from '@/components/chat/SystemEvent'
 import { SYSTEM_SUBTYPE, type SystemFrame } from '@/api/wireEvents'
 import {
-  eventToBlock, lastTurnPrompt, liveBlockToMessageBlock, RESUME_TEXT, sendAgainAction, sendAgainKind, turnHadWork,
+  eventToBlock, lastTurnPrompt, liveBlockToMessageBlock, RESUME_TEXT, limitCardKey, sendAgainAction, sendAgainKind, terminalLimitCard, turnHadWork,
 } from '@/lib/messageBlocks'
 import type { DisplayMessage } from '@/components/chat/types'
+
+describe('the line of a turn that waits for its machine', () => {
+  it('says so and offers no button: nothing is decided yet', () => {
+    render(<SystemEvent subtype={SYSTEM_SUBTYPE.TURN_WAITING}
+                        message="It continues by itself if that machine reports back within a day." />)
+    expect(screen.getByTestId('turn-waiting').textContent).toMatch(/waiting for its machine/)
+    expect(screen.getByText(/reports back within a day/)).toBeTruthy()
+    expect(screen.queryByRole('button')).toBeNull()
+  })
+})
+
+describe('the card of a terminal turn an Escape dropped', () => {
+  it('says the agent stopped before it answered and where the message went, with no button', () => {
+    render(<SystemEvent subtype={SYSTEM_SUBTYPE.TURN_DROPPED} />)
+    expect(screen.getByTestId('turn-dropped').textContent).toBe(
+      "The agent stopped before it answered. Your message is back in the terminal's input box.")
+    expect(screen.queryByRole('button')).toBeNull()
+  })
+})
 
 describe('the turn-ended card', () => {
   it('offers Send again when nothing ran, and says what the button does', () => {
@@ -24,6 +43,14 @@ describe('the turn-ended card', () => {
     expect(screen.getByText('Send again sends your message again.')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Send again' }))
     expect(onSendAgain).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops the outage line\'s own instruction and keeps the provider\'s words', () => {
+    render(<SystemEvent subtype={SYSTEM_SUBTYPE.TURN_ENDED} reason="error" sendAgain="again"
+                        message="⚠ The AI provider did not answer this request, so the turn ended here. This is usually an outage on the provider's side, not a problem with your sign-in or with this OtoDock install. The engine said: API Error: 529 Overloaded. Send the message again in a few minutes."
+                        onSendAgain={vi.fn()} />)
+    expect(screen.getByText(/529 Overloaded\.$/)).toBeTruthy()
+    expect(screen.queryByText(/in a few minutes/)).toBeNull()
   })
 
   it('offers Resume once the turn had started, the proxy instruction dropped', () => {
@@ -178,12 +205,21 @@ describe("Send again's prompt", () => {
   })
 })
 
+describe('a turn that started without its files', () => {
+  it("the notice reads the server's sentence", () => {
+    render(<SystemEvent subtype={SYSTEM_SUBTYPE.FILES_LATE}
+      message="The agent started before all the files reached this machine." />)
+    expect(screen.getByTestId('files-late'))
+      .toHaveTextContent('The agent started before all the files reached this machine.')
+  })
+})
+
 describe('photos that did not reach the agent', () => {
   it("the notice reads the server's sentence", () => {
     render(<SystemEvent subtype={SYSTEM_SUBTYPE.PHOTOS_NOT_ATTACHED}
-      message="The photo did not reach the agent. Attach it again to send it." />)
+      message="The photo did not reach the agent. Attach it again as JPEG or PNG." />)
     expect(screen.getByTestId('photos-not-attached'))
-      .toHaveTextContent('The photo did not reach the agent. Attach it again to send it.')
+      .toHaveTextContent('The photo did not reach the agent. Attach it again as JPEG or PNG.')
   })
 
   it('a reload draws it under the message, ahead of the reply', async () => {
@@ -193,11 +229,46 @@ describe('photos that did not reach the agent', () => {
     const msgs = dbMessagesToDisplay([
       row(1, 'user', 'look', '', JSON.stringify({ images: [{ name: 'a.jpg', path: 'users/me/uploads/photos/a.jpg' }] })),
       row(2, 'event', '', 'system', JSON.stringify({ type: 'system', subtype: 'photos_not_attached',
-        message: 'The photos did not reach the agent. Attach them again to send them.', count: 2 })),
+        message: 'The photos did not reach the agent. Attach them again as JPEG or PNG.', count: 2 })),
       row(3, 'assistant', 'I see one photo.'),
     ], undefined)
     expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant'])
     expect(msgs[1].blocks[0]).toMatchObject({ type: 'system', subtype: 'photos_not_attached' })
     expect(msgs[1].blocks[1]).toMatchObject({ type: 'text', content: 'I see one photo.' })
+  })
+})
+
+describe("a terminal's limit card", () => {
+  const limit = { type: 'system' as const, subtype: 'turn_ended', reason: 'limit', message: 'Usage limit reached.',
+                  resetsAt: '2026-11-18T06:00:00+00:00' }
+  const at = Date.parse('2026-11-14T00:00:00Z')
+  const msg = (...blocks: object[]) => ({ id: 'm', role: 'assistant', blocks }) as never
+
+  it("is the chat's last block when it is a limit's card, until its reset", () => {
+    expect(terminalLimitCard([msg({ type: 'text', content: 'hi' }, limit)], at)).toBe(limit)
+    expect(terminalLimitCard([msg(limit)], Date.parse('2026-11-18T06:00:01Z'))).toBeUndefined()
+  })
+
+  it('is no card once anything follows it, or for another ending', () => {
+    expect(terminalLimitCard([msg(limit), { id: 'u', role: 'user', blocks: [{ type: 'text', content: 'go' }] } as never], at)).toBeUndefined()
+    expect(terminalLimitCard([msg({ ...limit, reason: 'error' })], at)).toBeUndefined()
+    expect(terminalLimitCard([], at)).toBeUndefined()
+  })
+
+  it('is known by its reset, else by its line: a later limit is another card', () => {
+    expect(limitCardKey(limit)).toBe('2026-11-18T06:00:00+00:00')
+    expect(limitCardKey({ ...limit, resetsAt: undefined })).toBe('Usage limit reached.')
+    expect(limitCardKey({ ...limit, resetsAt: undefined, message: undefined })).toBe('')
+  })
+
+  it('has a Hide button under the terminal only: the history draws it without one', () => {
+    const onDismiss = vi.fn()
+    const { rerender } = render(<SystemEvent subtype="turn_ended" reason="limit" message="Usage limit reached." />)
+    expect(screen.queryByRole('button', { name: 'Hide this notice' })).toBeNull()
+    rerender(<SystemEvent subtype="turn_ended" reason="limit" message="Usage limit reached." onDismiss={onDismiss} />)
+    const hide = screen.getByRole('button', { name: 'Hide this notice' })
+    expect(hide.closest('div')).toHaveTextContent('This turn ended early')
+    fireEvent.click(hide)
+    expect(onDismiss).toHaveBeenCalledOnce()
   })
 })

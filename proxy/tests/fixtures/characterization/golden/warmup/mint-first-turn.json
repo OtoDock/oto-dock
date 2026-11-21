@@ -1,0 +1,152 @@
+{
+ "chats": [
+  {
+   "agent": "warm-mint-turn",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "autoReview",
+   "rows": [
+    [
+     "user",
+     "Say hello"
+    ],
+    [
+     "assistant",
+     "Hello there!"
+    ]
+   ],
+   "session_id": "<id2>",
+   "title": "Say hello",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  {
+   "agent": "warm-mint-turn",
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "",
+   "new_chat": true,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "fallback_reason": null,
+   "interactive": false,
+   "mode": "autoReview",
+   "model": "test-model",
+   "offline_machine_name": "",
+   "session_id": "<id2>",
+   "type": "warmup_ready"
+  },
+  {
+   "chat_id": "<id1>",
+   "status": "streaming",
+   "type": "chat_status"
+  },
+  {
+   "active_agents": [],
+   "active_commands": [],
+   "active_delegates": [],
+   "active_tools": [],
+   "chat_id": "<id1>",
+   "goal": null,
+   "live_blocks": [],
+   "meeting_agent": null,
+   "meeting_participants": [],
+   "pending_permission": null,
+   "session_id": "<id2>",
+   "started_at": "<volatile>",
+   "streaming": true,
+   "thinking_active": false,
+   "thinking_text": "",
+   "thinking_tokens": 0,
+   "todos": [],
+   "type": "live_state",
+   "workflows": {}
+  },
+  {
+   "chat_id": "<id1>",
+   "content": "Hello there!",
+   "type": "text"
+  },
+  {
+   "chat_id": "<id1>",
+   "type": "done"
+  },
+  {
+   "chat_id": "<id1>",
+   "status": "ready",
+   "type": "chat_status"
+  },
+  {
+   "body": "Response ready",
+   "chat_id": "<id1>",
+   "title": "WS Dash Test finished",
+   "type": "turn_complete"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  }
+ ],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [
+   [
+    "<id2>",
+    "Say hello",
+    {
+     "inject_time": true
+    }
+   ]
+  ],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [],
+  "started": [
+   {
+    "agent": "warm-mint-turn",
+    "chat_id": "<id1>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "autoReview",
+    "model": "test-model",
+    "resume": false,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id2>",
+    "user_sub": "user-admin",
+    "username": "admin"
+   }
+  ]
+ },
+ "slots": {
+  "acquired": [
+   [
+    "<id2>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": []
+ }
+}

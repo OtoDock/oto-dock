@@ -24,10 +24,12 @@ from core.session import session_state
 def _fresh_terminal():
     """Each test's terminal starts from its own spawn word: the mirror keeps
     the last one per session."""
+    permission._FOLLOWS.pop("s", None)
     yield
     session_state._live_words.pop("s", None)
     session_state._session_modes.pop("s", None)
     session_state._session_token_floor.pop("s", None)
+    permission._FOLLOWS.pop("s", None)
 
 
 def _local_ctx(role: str = "manager") -> SecurityContext:
@@ -66,21 +68,53 @@ def _interactive(monkeypatch):
 async def test_interactive_default_write_defers_to_cli(_interactive):
     # Post-flip: the platform has no opinion — the CLI's native trusted-dir
     # behavior governs (Write/Edit run promptless in default mode).
+    from core.session import session_state
+    session_state._session_terminal_ask.pop("s", None)
     res = await permission.decide_tool_permission(
         "s", "Write", {"file_path": "/workspace/x.md", "content": "x"},
+    )
+    assert res["decision"] == "defer"
+    # The hand-over is recorded: a woken terminal waiting on it tells its person.
+    assert session_state.terminal_ask_since("s") > 0
+    session_state._session_terminal_ask.pop("s", None)
+
+
+@pytest.mark.asyncio
+async def test_live_accept_edits_in_an_ask_chat_stays_the_terminals(_interactive):
+    # Shift+Tab to acceptEdits in the TUI of a chat a person started in Ask:
+    # the word is the session's own, so the chat stays in Ask (its ceiling)
+    # and the CLI's own engine, now in acceptEdits, takes the edit.
+    res = await permission.decide_tool_permission(
+        "s", "Write", {"file_path": "/workspace/x.md", "content": "x"},
+        live_permission_mode="acceptEdits",
     )
     assert res["decision"] == "defer"
 
 
 @pytest.mark.asyncio
-async def test_live_accept_edits_allows_write(_interactive):
-    # User pressed Shift+Tab to acceptEdits in the TUI: the hook reports it,
-    # the chat follows to Auto, and edits run though it was stored in Ask.
+async def test_live_accept_edits_allows_write_in_a_chat_picked_auto(_interactive, monkeypatch):
+    # The person picked Auto for the chat: the terminal's acceptEdits reads
+    # as Auto, where an edit by path runs.
+    monkeypatch.setattr(permission, "get_session_mode", lambda sid: "autoReview")
     res = await permission.decide_tool_permission(
         "s", "Write", {"file_path": "/workspace/x.md", "content": "x"},
         live_permission_mode="acceptEdits",
     )
     assert res["decision"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_a_forced_ask_in_a_terminal_is_recorded_for_its_call(_interactive):
+    # A destructive command no reviewer judges: the terminal asks, and a
+    # woken terminal waiting on that question tells its person.
+    from core.session import session_state
+    session_state._session_terminal_ask.pop("s", None)
+    res = await permission.decide_tool_permission(
+        "s", "Bash", {"command": "rm -rf /workspace/scratch"}, tool_use_id="toolu_1")
+    assert res["decision"] == "ask"
+    assert session_state.terminal_ask_since("s") > 0
+    session_state.end_terminal_ask("s", "toolu_1")
+    assert session_state.terminal_ask_since("s") == 0.0
 
 
 @pytest.mark.asyncio
@@ -113,12 +147,19 @@ async def test_an_auto_terminal_defers_destructive_bash_only_to_a_running_review
 
 
 @pytest.mark.asyncio
-async def test_live_bypass_maps_to_dont_ask(_interactive):
+async def test_a_reported_bypass_never_makes_an_ask_chat_dont_ask(_interactive):
+    # The hook's caller holds the session's own token: a posted
+    # ``bypassPermissions`` must not buy the platform's hard allow.
     res = await permission.decide_tool_permission(
         "s", "Write", {"file_path": "/workspace/x.md", "content": "x"},
         live_permission_mode="bypassPermissions",
     )
-    assert res["decision"] == "allow"
+    assert res["decision"] == "defer"
+    res = await permission.decide_tool_permission(
+        "s", "Bash", {"command": "rm -rf /workspace/scratch"},
+        live_permission_mode="bypassPermissions",
+    )
+    assert res["decision"] == "ask"
 
 
 @pytest.mark.asyncio
@@ -262,6 +303,13 @@ async def test_standard_tier_defers_in_default_allows_in_live_accept_edits(
     _pin_tier(monkeypatch, "standard")
     res = await permission.decide_tool_permission("s", "mcp__demo__delegate", {})
     assert res["decision"] == "defer"
+    # In an Ask chat the terminal's acceptEdits moves nothing on the platform.
+    res = await permission.decide_tool_permission(
+        "s", "mcp__demo__delegate", {}, live_permission_mode="acceptEdits",
+    )
+    assert res["decision"] == "defer"
+    # The person picks Auto for the chat: a standard tool runs there.
+    monkeypatch.setattr(permission, "get_session_mode", lambda sid: "autoReview")
     res = await permission.decide_tool_permission(
         "s", "mcp__demo__delegate", {}, live_permission_mode="acceptEdits",
     )
@@ -536,9 +584,11 @@ async def _read(live: str) -> dict:
 
 @pytest.mark.asyncio
 async def test_the_chat_follows_a_shift_tab_once_per_change(_followed):
-    # Spawned in Ask: the terminal starts in `default`, no change.
+    # A chat the person put in Don't Ask: its terminal starts in `default`,
+    # no change.
+    _followed["mode"] = "dontAsk"
     await _read("default")
-    assert (_followed["mode"], _followed["rows"], _followed["frames"]) == ("ask", [], [])
+    assert (_followed["mode"], _followed["rows"], _followed["frames"]) == ("dontAsk", [], [])
     # Shift+Tab to the CLI's auto mode: the chat moves to Auto, the row once,
     # and its viewers get a frame naming the chat.
     await _read("auto")
@@ -546,10 +596,116 @@ async def test_the_chat_follows_a_shift_tab_once_per_change(_followed):
     assert _followed["mode"] == "autoReview"
     assert _followed["rows"] == [("chat-1", {"permission_mode": "autoReview"})]
     assert _followed["frames"] == [{"type": "mode_changed", "mode": "autoReview", "chat_id": "chat-1"}]
+    # Down the cycle the chat follows. A word never brings it back up: after
+    # the Shift+Tab to Plan the ceiling is Ask.
     for live, mode in (("acceptEdits", "autoReview"), ("plan", "plan"),
-                       ("bypassPermissions", "dontAsk"), ("default", "ask")):
+                       ("bypassPermissions", "ask"), ("default", "ask")):
         await _read(live)
         assert _followed["mode"] == mode, live
+
+
+@pytest.mark.asyncio
+async def test_a_terminals_word_never_lifts_a_chat_above_its_ceiling(_followed):
+    """The route takes the session's own token, so a reported word is the
+    session's say-so: in a chat a person started in Ask no word moves the
+    session, the row or the viewers above Ask. Below it the cycle follows."""
+    for live in ("auto", "bypassPermissions", "acceptEdits", "dontAsk"):
+        await _read(live)
+        assert (_followed["mode"], _followed["rows"], _followed["frames"]) == ("ask", [], []), live
+    await _read("plan")
+    assert _followed["mode"] == "plan"
+    await _read("bypassPermissions")
+    assert _followed["mode"] == "ask"
+    assert [kw["permission_mode"] for _cid, kw in _followed["rows"]] == ["plan", "ask"]
+
+
+@pytest.mark.asyncio
+async def test_a_pick_on_the_dashboard_moves_the_ceiling_both_ways(_followed):
+    await _read("auto")
+    assert _followed["mode"] == "ask"
+    _followed["mode"] = "autoReview"          # the pill
+    await _read("bypassPermissions")
+    assert _followed["mode"] == "autoReview"   # at the ceiling: held there
+    _followed["mode"] = "dontAsk"              # the pill, up again
+    await _read("auto")
+    assert _followed["mode"] == "autoReview"   # a Shift+Tab down: followed
+    _followed["mode"] = "ask"                  # the pill, down
+    await _read("bypassPermissions")
+    assert _followed["mode"] == "ask"
+
+
+@pytest.mark.asyncio
+async def test_a_shift_tab_down_then_up_stays_down_until_the_pill(_followed):
+    """The ceiling comes down with every lower mode the follow writes, so a
+    word, posted or real, never undoes a Shift+Tab down and the row keeps
+    the lower mode for the next headless turn. Only the pill raises."""
+    _followed["mode"] = "dontAsk"
+    await _read("auto")                         # Shift+Tab down: Don't Ask to Auto
+    assert _followed["mode"] == "autoReview"
+    for up in ("bypassPermissions", "dontAsk", "bypassPermissions"):
+        await _read(up)                         # and up again: held at Auto
+        assert _followed["mode"] == "autoReview", up
+    await _read("default")                      # further down: Ask
+    for up in ("auto", "acceptEdits", "bypassPermissions"):
+        await _read(up)
+        assert _followed["mode"] == "ask", up
+    assert [kw["permission_mode"] for _cid, kw in _followed["rows"]] == ["autoReview", "ask"]
+    _followed["mode"] = "dontAsk"               # the pill
+    await _read("auto")
+    assert _followed["mode"] == "autoReview"    # down from the new pick: followed
+
+
+@pytest.mark.asyncio
+async def test_after_a_shift_tab_to_plan_a_word_brings_the_chat_back_to_ask_only(_followed):
+    """Plan is below every ceiling, so a chat can leave it again: to Ask,
+    whatever the word and whatever mode it had before the Shift+Tab."""
+    session_state._live_words["s"] = "auto"
+    _followed["mode"] = "autoReview"
+    await _read("plan")
+    assert _followed["mode"] == "plan"
+    await _read("bypassPermissions")
+    assert _followed["mode"] == "ask"
+    assert _followed["rows"][-1] == ("chat-1", {"permission_mode": "ask"})
+
+
+@pytest.mark.asyncio
+async def test_a_chat_started_in_plan_leaves_it_for_ask_and_no_further(_followed):
+    session_state._live_words["s"] = "plan"
+    _followed["mode"] = "plan"
+    await _read("acceptEdits")
+    assert _followed["mode"] == "ask"
+    await _read("bypassPermissions")
+    assert _followed["mode"] == "ask"
+
+
+@pytest.mark.asyncio
+async def test_a_new_life_of_the_session_id_starts_a_new_ceiling(_followed):
+    """A terminal closed and reopened keeps its session id: the ceiling is
+    the mode this life started in, never an earlier life's."""
+    session_state._session_token_floor["s"] = 100
+    _followed["mode"] = "dontAsk"
+    await _read("auto")
+    await _read("default")
+    assert _followed["mode"] == "ask"          # cycled down within Don't Ask
+    session_state._session_token_floor["s"] = 200   # reopened at the row's Ask
+    session_state._live_words["s"] = "default"
+    await _read("bypassPermissions")
+    assert _followed["mode"] == "ask"
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_follow_record_is_rebuilt_no_higher(_followed, monkeypatch):
+    monkeypatch.setattr(permission, "_FOLLOWS_CAP", 2)
+    _followed["mode"] = "dontAsk"
+    await _read("auto")
+    assert _followed["mode"] == "autoReview"
+    permission._FOLLOWS.pop("s")
+    permission._FOLLOWS.update({"a": permission._Follow(0, "ask", "ask"),
+                                "b": permission._Follow(0, "ask", "ask")})
+    await _read("bypassPermissions")
+    assert _followed["mode"] == "autoReview"
+    assert set(permission._FOLLOWS) == {"b", "s"}
+    permission._FOLLOWS.pop("b")
 
 
 @pytest.mark.asyncio

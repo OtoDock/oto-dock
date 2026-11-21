@@ -1,4 +1,4 @@
-<!-- Thanks for the pull request. One concern per PR; for something large, an issue first (CONTRIBUTING.md). -->
+<!-- Thanks for the pull request. One concern per PR. For something large, an issue first (CONTRIBUTING.md). -->
 
 ## What and why
 
@@ -11,9 +11,9 @@
 ## Checklist
 
 - [ ] Tests cover the behaviour change and ride in this PR.
-- [ ] CI is green (proxy, audio, phone and satellite suites, dashboard type-check, build and tests, lint and types, and the Android build and unit tests when `dashboard/android/` changed).
+- [ ] CI is green (proxy, audio, phone and satellite suites, dashboard type-check, build and tests, lint and types). The Android build and unit tests are green too when `dashboard/android/` changed.
 - [ ] A user-visible change has a line under `[Unreleased]` in `CHANGELOG.md`.
-- [ ] The READMEs and `ARCHITECTURE.md` match the change; a docs.otodock.io page that describes the old behaviour is named here (the docs site is maintained separately).
+- [ ] The READMEs and `ARCHITECTURE.md` match the change. A docs.otodock.io page that describes the old behaviour is named here (the docs site is maintained separately).
 - [ ] No secrets, no `config.env`, no personal data in the diff.
 - [ ] If AI-assisted: I have read and stand behind every line (CONTRIBUTING.md).
 - [ ] I have read the Contributor Agreement (CLA.md, version 1.0) and accept it for this contribution.

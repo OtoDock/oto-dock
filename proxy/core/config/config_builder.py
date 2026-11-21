@@ -5,6 +5,7 @@ duplicated across dashboard warmup, pre-warmup, and plan implementation.
 """
 
 import asyncio
+import functools
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
@@ -20,7 +21,7 @@ from core.execution_layer import AgentConfig, LayerCapabilities
 from core.permission_modes import ASK_MODE
 from core.session import session_kind
 from services.engines import subscription_pool
-from services.mcp import dynamic_context, mcp_registry
+from services.mcp import account_context, dynamic_context, mcp_registry, tool_limits
 from services.remote import remote_status
 from storage import database as task_store, remote_store
 from storage.agents import agent_store
@@ -46,6 +47,14 @@ def release_config_seat(session_id: str, cfg, *, keep_binding: bool = False) -> 
     riding an already-warm session, a phone reconnect reusing its pre-warmed
     session). No-op without a subscription.
     """
+    if not keep_binding:
+        # The stand-ins a terminal's first message would have waited for:
+        # the start registered them before it could fail. The build's open
+        # start goes too (``start_context.forget``).
+        from core.session import start_context
+        from services.mcp import tool_listing
+        tool_listing.drop_listed(session_id)
+        start_context.forget(session_id)
     sub_id = getattr(cfg, "subscription_id", "") or ""
     if not sub_id:
         return
@@ -53,9 +62,10 @@ def release_config_seat(session_id: str, cfg, *, keep_binding: bool = False) -> 
         subscription_pool.release_subscription(session_id)
     subscription_pool.release_unbound_seat(
         sub_id,
-        subscription_pool.credential_scope_key(
+        subscription_pool.scope_key_for(
             getattr(cfg, "execution_target", "") or placement.LOCAL,
             getattr(cfg, "sandbox_host_claude_dir", "") or "",
+            getattr(cfg, "session_home", "") or "",
         ),
     )
 
@@ -229,35 +239,37 @@ def _moved_pin(chat_id: str) -> str:
     return pin
 
 
-def personal_owner_of(target: placement.PlacementCapabilities, mount_username: str,
+def personal_owner_of(target: placement.PlacementCapabilities, agents_accounts: bool,
                       person_sub: str | None, browser) -> str:
-    """The person whose own things an agent-scope session (no mount
-    username: a Shared-only chat, a chat worker) may carry to a personal
-    machine: its person when that person owns the machine (``browser`` is
-    the target's ``remote_store.BrowserTargetSettings``, whose ``owner_sub``
-    is the row's owner, read in the same SELECT as the token), ``""``
-    otherwise. Every builder of such a session asks it once, and its answer
-    is the owner filter of the build (``build_session_mcp_config``'s
-    ``personal_owner``) and the bundles' owner (``personal_machine_bundles``)."""
-    if not (target.user_paired and not mount_username and person_sub and browser is not None):
+    """The person whose own things a session on the agent's accounts
+    (``agents_accounts``: ``account_context.credential_identity`` answered
+    the agent's, as it does for a Shared-only chat, a chat worker and a team
+    account's chat) may carry to a personal machine: its person when that
+    person owns the machine (``browser`` is the target's
+    ``remote_store.BrowserTargetSettings``, whose ``owner_sub`` is the row's
+    owner, read in the same SELECT as the token), ``""`` otherwise. Every
+    builder of such a session asks it once, and its answer is the owner
+    filter of the build (``build_session_mcp_config``'s ``personal_owner``)
+    and the bundles' owner (``personal_machine_bundles``)."""
+    if not (target.user_paired and agents_accounts and person_sub and browser is not None):
         return ""
     return person_sub if getattr(browser, "owner_sub", "") == person_sub else ""
 
 
 def personal_machine_bundles(secret_bundles: dict, target: placement.PlacementCapabilities,
-                             mount_username: str, agent_name: str, *, who: str,
+                             agents_accounts: bool, agent_name: str, *, who: str,
                              owner: str = "") -> dict:
-    """The secret bundles a session may carry to ``target``. An agent-scope
-    session (no mount username: a Shared-only chat) on a person's own
-    machine carries only what is that person's, and only when it runs as
-    them (``owner``, from ``personal_owner_of``): the machine's own browser
-    token, and the bundles of MCPs whose credential is one person's account
-    (``credential_resolver.carries_to_personal_machine``), which the build's
-    owner filter resolved from that person's bindings alone. Everything else
-    (the agent's other accounts, an admin's instance settings, a key) stays
-    on the platform, logged by name. Every build of such a session asks it
-    (the chat's, a wake's, a chat worker's)."""
-    if not (secret_bundles and target.user_paired and not mount_username):
+    """The secret bundles a session may carry to ``target``. A session on
+    the agent's accounts (``agents_accounts``, as ``personal_owner_of``) on a
+    person's own machine carries only what is that person's, and only when
+    it runs as them (``owner``, from ``personal_owner_of``): the machine's
+    own browser token, and the bundles of MCPs whose credential is one
+    person's account (``credential_resolver.carries_to_personal_machine``),
+    which the build's owner filter resolved from that person's bindings
+    alone. Everything else (the agent's other accounts, an admin's instance
+    settings, a key) stays on the platform, logged by name. Every build of
+    such a session asks it (the chat's, a wake's, a chat worker's)."""
+    if not (secret_bundles and target.user_paired and agents_accounts):
         return secret_bundles
     from core.credentials.mcp_broker import SecretBundle
     from services.oauth.credential_resolver import carries_to_personal_machine
@@ -269,7 +281,8 @@ def personal_machine_bundles(secret_bundles: dict, target: placement.PlacementCa
                 kept[key] = SecretBundle(env={mcp_registry.BROWSER_TOKEN_ENV: token})
             continue
         manifest = mcp_registry.get_manifest_by_config_key(key)
-        if manifest is not None and carries_to_personal_machine(manifest):
+        renews = getattr(getattr(bundle, "token", None), "renews", False)
+        if manifest is not None and carries_to_personal_machine(manifest) and not renews:
             kept[key] = bundle
     withheld = sorted(set(secret_bundles) - set(kept))
     if withheld:
@@ -292,12 +305,80 @@ def _placement_refusal(target: str, run_sub: str | None, role: str | None,
                             user_paired_allowed=allowed_user, agent_default=agent_default):
         return ""
     name = str(machine.get("name") or target[:8])
-    if not placement.machine_is_admin_paired(machine):
+    if placement.machine_is_compute(machine):
+        return f"This chat is on {name}, a compute machine. Chats do not run there yet."
+    if placement.machine_is_personal(machine):
         from services.remote.chat_targets import owner_name
         return (f"This chat is on {owner_name(machine.get('registered_by') or '')}'s computer "
                 f"({name}). Move it to one of your places from the Runs on menu.")
     return (f"This chat is on {name}, which your role on this agent can't use. "
             "Move it from the Runs on menu.")
+
+
+async def _with_accounts_block(
+    contexts: list, agent_name: str, assigned: list[str], person: str,
+    account_choices: dict[str, str], *, switchable: bool, scope: str = "user",
+    run: bool = False,
+) -> list:
+    """``contexts`` with the accounts block (``account_context.account_lines``):
+    whose accounts the session runs on when they are a person's, and, for a
+    session that can switch (``switchable``, ``scope`` the chat's
+    ``choice_scope``), the accounts it may switch between; ``run`` for a
+    task's session."""
+    block = await asyncio.to_thread(
+        account_context.account_lines, agent_name, assigned, user_sub=person,
+        account_choices=account_choices, scope=scope if switchable else "", run=run)
+    return [*(contexts or []), (account_context.AGENT_CONFIG_MCP, block)] if block else contexts
+
+
+def _own_engine_dir(security_ctx, agent_name: str, session_id: str, kind_rule) -> dict:
+    """The config dir arguments of a session that runs from its own scratch
+    engine home: the agent's own phone line, keyed on the call, never the agent
+    scope's own, which holds every agent-scope session's transcripts (pruned at
+    the call's end with the other scratch homes; its skills its rule's). ``{}``
+    for every other session. Makes the scratch home's folder: call it in a
+    worker thread (``_persistent_dir``), never as an argument evaluated on
+    the loop."""
+    if not (security_ctx.open_line and session_id):
+        return {}
+    from core.session import external_identity
+    home = external_identity.scratch_home(config.get_agent_dir(agent_name), external_identity.PHONE, session_id)
+    return {"external_home": str(home), "kind_rule": kind_rule}
+
+
+def _persistent_dir(agent_name: str, execution_path: str, username: str, scope: str,
+                    security_ctx, session_id: str, kind_rule):
+    """The session's persistent config dir, its scratch home included, in the
+    worker thread that calls it."""
+    from core.sandbox.sandbox import ensure_persistent_agent_dir
+    return ensure_persistent_agent_dir(
+        agent_name, execution_path=execution_path, username=username, scope=scope,
+        **_own_engine_dir(security_ctx, agent_name, session_id, kind_rule))
+
+
+async def _compute_row(target: str, execution_path: str, chat_id: str, user_role: str,
+                       phone_mode: bool, prefer: str = "", *, agent: str = "") -> dict | None:
+    """The compute machine a session resolved to ``target`` is built on
+    (``remote_status.compute_row_for``: None on a paired computer, the
+    refusal when the platform's place has no machine). ``prefer`` is the
+    machine a caller already took the session's slot on, so the build and
+    the slot agree; else the chat's place (``remote_status.chat_place``,
+    read only while a machine on another host is connected): the machine
+    its engine record lives on, or a shared one when the record is in the
+    platform's folder; an outside person's session needs the platform's own
+    folder (theirs never syncs), and so does a call (a spoken turn does not
+    wait for a sync). ``agent`` the session's: a tool of it that reaches a
+    local address keeps it beside the platform, unless its chat stays on
+    its record's machine (``ChatPlace.agent_for``)."""
+    if not placement.is_local(target):
+        return None
+    place = remote_status.ChatPlace("", False)
+    if chat_id and remote_status.any_own_copy():
+        place = remote_status.chat_place(await asyncio.to_thread(task_store.get_chat, chat_id))
+    return await asyncio.to_thread(functools.partial(
+        remote_status.compute_row_for, target, execution_path, prefer=prefer or place.machine,
+        shared_folder=place.shared or phone_mode or (user_role or "") == roles.EXTERNAL,
+        agent=place.agent_for(agent)))
 
 
 async def build_agent_config(
@@ -324,8 +405,20 @@ async def build_agent_config(
     external_claim: str = "",
     extra_mcps: list[str] | None = None,
     call_ask_back: bool = False,
+    kind_rule=None,
+    no_shell: bool = False,
+    compute_prefer: str = "",
 ) -> AgentConfig:
     """Build an AgentConfig from agent DB + user context.
+
+    ``compute_prefer`` is the compute machine a caller already took the
+    session's slot on (a wake): the build lands there while that machine
+    still serves, so the slot and the session agree.
+
+    ``kind_rule`` and ``no_shell`` are the agent's own phone line's (the
+    phone builder): its hard set of management tools through the one rule,
+    and no shell, since with the session's agent token a shell could make
+    any call the hard set keeps off.
 
     ``extra_mcps`` and ``call_ask_back`` are the phone builder's: the
     call-control MCP rides a user route's call regardless of assignment, and
@@ -336,7 +429,7 @@ async def build_agent_config(
     that user's own session: ``phone_mode`` applies the call-only MCP
     exclusions, ``trigger_payload`` feeds the ``${trigger.*}`` context
     blocks, ``subscription_pool_fallback`` lets a user without a subscription
-    ride the platform pool (today's phone behaviour), and ``external_claim``
+    ride the platform pool, bound to nobody, and ``external_claim``
     rides the session token so it dies at hangup and the call log can name
     the caller — the SecurityContext stays a USER principal.
 
@@ -417,7 +510,11 @@ async def build_agent_config(
         if placement.is_local(pinned_target):
             resolved_target = (placement.LOCAL, None)
         else:
+            from services.remote import machine_away
             from services.remote.remote_status import is_reachable as _is_reachable
+            # A machine that drops off for its update's restart is back in
+            # seconds: the start waits for it as for a machine finishing it.
+            await machine_away.update_done(placement.machine_of(pinned_target))
             reachable = await asyncio.to_thread(_is_reachable, pinned_target)
             resolved_target = (
                 (pinned_target, None) if reachable
@@ -449,16 +546,24 @@ async def build_agent_config(
     # display), from one read of its row. It feeds the SecurityContext, the
     # MCP placement / consent / display gates, the prompt and the dynamic
     # contexts below.
-    target = await asyncio.to_thread(
-        remote_store.placement_of, target_value, creds_sub, agent_name,
-    )
-    is_remote = target.is_remote
+    # The compute machine that serves the platform's place now, read once
+    # here and carried in the placement (``remote_status.compute_row_for``):
+    # the layer is resolved from it, and with none the session is refused.
+    # A call on a person's route goes to one that shares the platform's
+    # folders (the phone socket reads its layer off this build).
+    compute_row = await _compute_row(target_value, execution_path, chat_id, user_role,
+                                     phone_mode, compute_prefer, agent=agent_name)
+    # A machine still in its update is waited for, a bounded time, before
+    # its tools are built; past the wait the start is refused.
+    from services.remote import machine_away
+    target = await machine_away.settled_placement(target_value, creds_sub, agent_name, compute=compute_row)
     # Browser-control mode + extension token: a targeted read (the token
     # column never rides the machine row nor the persisted context),
-    # dedicated/no-token when local.
+    # dedicated/no-token where no device tool is offered (the platform's
+    # own places).
     target_browser = await asyncio.to_thread(
         remote_store.get_target_browser_settings, target,
-    ) if is_remote else None
+    ) if target.offers_device_tools else None
     # The agent's MCP set on this placement, read once and used by the
     # call-control check, the path_env values and the assigned names below.
     agent_mcps = await asyncio.to_thread(
@@ -495,27 +600,62 @@ async def build_agent_config(
     # builders with exactly the keywords their goldens record. The two
     # builders are read at call time, as their test stubs expect.
 
-    # An agent-scope session on a personal machine: the machine's owner when
-    # they are the person at the chat (``personal_owner_of``), else nobody.
-    personal_owner = personal_owner_of(target, vis.mount_username, creds_sub, target_browser)
-    on_personal = target.user_paired and vis.mount_scope == SCOPE_AGENT
+    # Whose credentials the session resolves (``account_context.credential_identity``,
+    # the session build asks the same). On the agent's accounts on a personal
+    # machine: the machine's owner when they are the person at the chat
+    # (``personal_owner_of``), else nobody.
+    agents_accounts = (await asyncio.to_thread(
+        account_context.credential_identity, agent_name, creds_sub,
+        mount_scope=vis.mount_scope, role=user_role or "")).agents
+    personal_owner = personal_owner_of(target, agents_accounts, creds_sub, target_browser)
+    on_personal = target.user_paired and agents_accounts
+
+    # The chat's own choice of account per tool (``credential_resolver.pick_account``):
+    # a person's own chat's among their accounts, a chat on the agent's
+    # accounts among the agent's own, none for any other chat
+    # (``account_context.choice_scope``).
+    choice_scope = ""
+    if chat_id and creds_sub and task_identity is None:
+        choice_scope = await asyncio.to_thread(
+            account_context.choice_scope, chat_id, mount_scope=vis.mount_scope,
+            role=user_role or "")
+    account_choices: dict[str, str] = {}
+    if choice_scope:
+        account_choices = await asyncio.to_thread(
+            account_context.session_choices, chat_id, creds_sub or "",
+            mount_scope=vis.mount_scope, role=user_role or "")
+
+    # The agent's tool limits for this session's kind (``tool_limits``): a
+    # person's identity behind the session takes the chats column (a task
+    # chat re-warmed, its run's person in every mode: ``TaskIdentity.person``),
+    # none the runs column (the agent's own line, the agent's own run).
+    limits = await asyncio.to_thread(
+        tool_limits.load, agent_name, tool_limits.governs_of(
+            external=False, person=task_identity.person if task_identity is not None else creds_sub))
 
     def _mcp_build(*args, **kwargs):
         if shared_chat:
             kwargs["shared_chat"] = True
+        kwargs["kind_rule"] = kind_rule
         if on_personal:
             kwargs["personal_owner"] = personal_owner
+        if account_choices:
+            kwargs["account_choices"] = account_choices
+        kwargs["limits"] = limits or None
         return mcp_registry.build_session_mcp_config(*args, **kwargs)
 
     def _prompt_build(*args, **kwargs):
         if shared_chat:
             kwargs["shared_chat"] = True
+        kwargs["kind_rule"] = kind_rule
+        kwargs["tool_limits"] = limit_pairs or None
         return config.build_agent_prompt(*args, **kwargs)
 
     mcp_config, credential_env, excluded_mcps, secret_bundles, bash_env_keys = (
         await asyncio.to_thread(
             _mcp_build, agent_name, creds_sub,
             session_id=session_id,
+            chat_id=chat_id,
             delegation_targets=resolved_targets,
             mcp_config_format=mcp_format,
             username=username or "",
@@ -530,15 +670,20 @@ async def build_agent_config(
             task_scope=vis.mount_scope,
             interactive_local=is_otodock,
             phone_mode=phone_mode,
+            call=client_type == session_kind.PHONE.name,
             placement=target,
             target_browser=target_browser,
             extra_mcps=extra_mcps,
             call_ask_back=call_ask_back,
         )
     )
-    secret_bundles = personal_machine_bundles(secret_bundles, target, vis.mount_username,
+    secret_bundles = personal_machine_bundles(secret_bundles, target, agents_accounts,
                                               agent_name, who="build_agent_config",
                                               owner=personal_owner)
+    # The limits' grants, per attached server, as the hook and the engines
+    # read them (``SecurityContext.tool_limits``).
+    limit_pairs = tool_limits.grants(
+        limits, [m for m in agent_mcps if m.name not in (excluded_mcps or {})])
 
     # Inject manifest-declared path_env values. The framework auto-resolves
     # each role to a sandbox-style virtual path based on user/agent scope
@@ -607,7 +752,7 @@ async def build_agent_config(
     from auth.session_token import mint_session_env
     token_minted_at = mint_session_env(
         credential_env, session_id or "", agent_name, creds_sub or "",
-        external=external_claim or "",
+        external=external_claim or "", role=user_role,
     )
     multi_value_envs.update(oto_env.OTO_MULTI_VALUE_ENVS)
 
@@ -646,7 +791,15 @@ async def build_agent_config(
         # server enforces from the token either way; this is prompt).
         nouser_reads=not creds_sub,
         placement=target,
+        **({"account_choices": account_choices} if account_choices else {}),
     )
+    # The accounts the chat may switch between, for a dashboard chat that
+    # chooses: the switch is refused everywhere else (a call, a task's chat).
+    dynamic_contexts = await _with_accounts_block(
+        dynamic_contexts, agent_name, assigned_mcp_names, creds_sub or "", account_choices,
+        switchable=bool(choice_scope) and client_type == session_kind.DASHBOARD.name
+        and not phone_mode,
+        scope=choice_scope)
 
     # Build agent system prompt. MOUNT username drives the workspace tree +
     # user-context sections (agent-scope for Shared-only); the REAL human
@@ -664,11 +817,9 @@ async def build_agent_config(
         placement=target,
         mount_shared=vis.mount_shared,
         execution_path=execution_path or "",
-        # A phone session on an engine that keeps a call on stdio MCPs never
-        # connects the sidecar HTTP MCPs (Direct LLM's direct_mcp_policy).
-        skip_http_mcps=bool(phone_mode and not _caps.behaviour.phone_http_mcps),
         # The person's role filters the skills by audience (a chat has one).
         user_role=user_role or None,
+        session_id=session_id,
     )
 
     # Append client-specific context (dashboard adapter injects file display
@@ -739,6 +890,9 @@ async def build_agent_config(
         # A phone route tied to this user: the claim rides the session token
         # (liveness + call-log audit); the principal stays the user.
         external_claim=external_claim or "",
+        no_shell=no_shell,
+        open_line=bool(getattr(kind_rule, "open_line", False)),
+        tool_limits=limit_pairs,
     )
     perm_ctx = build_permission_context(
         security_ctx,
@@ -756,14 +910,11 @@ async def build_agent_config(
     # Prepare the persistent config dir — .codex/ for Codex, .claude/ otherwise.
     # Single source of truth so the session-config builders can't drift (see
     # core.sandbox.sandbox.ensure_persistent_agent_dir).
-    from core.sandbox.sandbox import ensure_persistent_agent_dir
+    from core.sandbox.session_config_dir import session_home_for
     host_claude_dir = await asyncio.to_thread(
-        ensure_persistent_agent_dir,
-        agent_name,
-        execution_path=execution_path,
-        username=vis.mount_username,
-        scope=scope,
-    )
+        _persistent_dir, agent_name, execution_path, vis.mount_username, scope,
+        security_ctx, session_id, kind_rule)
+    home = session_home_for(host_claude_dir, session_id, execution_path=execution_path, ctx=security_ctx)
 
     # Resolve model and effort. Layer-aware: on a session whose layer
     # differs from the agent's engine (task/delegate overrides, engine-
@@ -772,57 +923,22 @@ async def build_agent_config(
     resolved_model, resolved_effort = await asyncio.to_thread(
         _model_and_effort, agent_name, model, execution_path,
     )
-    extra_env: dict[str, str] = {}
-    subscription_id = ""
-
-    try:
-        subscription_id, sub_env = await asyncio.to_thread(
-            subscription_pool.resolve_subscription_env,
-            execution_path, creds_sub,
-            model=resolved_model, agent_info=agent_info,
-            # Scope-sticky: sessions sharing this credential dir must run on
-            # ONE account (same key the layer stamps at bind_session).
-            sticky_scope=subscription_pool.credential_scope_key(
-                target_value, str(host_claude_dir)),
-        )
-        extra_env.update(sub_env)
-        # Direct LLM needs caller identity for mid-session provider switching
-        if execution_path == "direct-llm":
-            extra_env["_USER_SUB"] = creds_sub or ""
-    except subscription_pool.NoSubscriptionError:
-        if not subscription_pool_fallback:
-            raise
-    except Exception as e:  # noqa: BLE001  # the pool spans db, relay and engine: a miss becomes a clean block
-        logger.warning("Subscription pool error for %s: %s", agent_name, e)
-    # A phone route tied to a user without a subscription of their own rides
-    # the platform pool (today's phone behaviour) instead of failing the call.
-    if creds_sub and not subscription_id and subscription_pool_fallback:
-        try:
-            subscription_id, sub_env = await asyncio.to_thread(
-                subscription_pool.resolve_subscription_env,
-                execution_path, None, model=resolved_model, agent_info=agent_info,
-                sticky_scope=subscription_pool.credential_scope_key(
-                    target_value, str(host_claude_dir)),
-            )
-            extra_env.update(sub_env)
-            if execution_path == "direct-llm":
-                extra_env["_USER_SUB"] = ""
-            logger.info(
-                "Phone route user session for %s: no subscription for "
-                "the tied user — using the platform pool", agent_name
-            )
-        except subscription_pool.NoSubscriptionError:
-            raise
-        except Exception as e:  # noqa: BLE001  # the pool fallback spans db, relay and engine: a miss is a clean block
-            logger.warning("Subscription pool fallback error for %s: %s", agent_name, e)
-    # User-scoped work with no resolved credentials → surface a clean, actionable
-    # block (the warmup handler turns this into a dashboard message) instead of
-    # letting the layer start with an empty key and fail cryptically mid-turn.
-    # Agent-scoped work (creds_sub falsy) uses the platform pool and is left as-is.
-    if creds_sub and not subscription_id:
-        raise subscription_pool.NoSubscriptionError(
-            subscription_pool.user_scope_block_reason(execution_path, creds_sub)
-        )
+    # Who pays (``core/config/spender.py``): decided by the session being
+    # built and its person, a task chat by its run. A person who resolves nothing is refused with the reason;
+    # a call to a person's route alone falls back to the shared
+    # subscriptions, bound to nobody.
+    from core.config import spender
+    payer = await asyncio.to_thread(functools.partial(
+        spender.build_spender, chat_id, agent_name, creds_sub,
+        call=phone_mode, route=subscription_pool_fallback))
+    spent = await asyncio.to_thread(functools.partial(
+        spender.spend_env, payer, execution_path, model=resolved_model, agent_info=agent_info,
+        # Scope-sticky: sessions sharing this credential dir must run on
+        # ONE account (same key the layer stamps at bind_session).
+        sticky_scope=subscription_pool.scope_key_for(target_value, str(host_claude_dir), home),
+        agent=agent_name, call_fallback=subscription_pool_fallback))
+    subscription_id = spent.subscription_id
+    extra_env: dict[str, str] = dict(spent.env)
 
     # Prompt-size line (≈ tokens = chars / 4): the always-loaded skill text
     # is the bulk of it — this is the number the skills card/guide split
@@ -852,8 +968,9 @@ async def build_agent_config(
         extra_env=extra_env,
         security_context=security_ctx,
         subscription_id=subscription_id,
-        subscription_user_sub=creds_sub or "",
+        subscription_user_sub=spent.bound_sub,
         sandbox_host_claude_dir=str(host_claude_dir),
+        session_home=home,
         resume_handle=resume_handle,
         chat_id=chat_id,
         multi_value_envs=multi_value_envs,
@@ -863,4 +980,5 @@ async def build_agent_config(
         work_cwd=work_cwd or "",
         term=term or "",
         token_minted_at=token_minted_at,
+        account_choices=account_choices,
     )

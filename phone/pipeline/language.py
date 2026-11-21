@@ -44,6 +44,7 @@ import logging
 import time
 from collections.abc import Callable
 
+from audio.log_policy import log_transcript
 from audio.providers.lid.ecapa import (
     EcapaIdentifier,
     identifier_available,
@@ -325,6 +326,9 @@ class LanguageMixin:
         self.state._turn_typed.clear()
         self.state._language_turn_switched = False
         self._language_voiced_since_take = False
+        # The loudness behind the words just taken proves nothing for a
+        # final that lands after them (the orphan sweep, pipeline/turn.py).
+        self.state._line_frames.clear()
         turn_taken = getattr(self.stt, "turn_taken", None)
         if turn_taken is not None:
             turn_taken()
@@ -407,7 +411,9 @@ class LanguageMixin:
             logger.warning("[%s] call re-listen: the turn goes as heard: %s", self.conn.peer_addr, e)
             return joined
         if text and text != joined:
-            logger.info("[%s] call re-listen completed the turn: %s", self.conn.peer_addr, text)
+            log_transcript(
+                logger, f"[{self.conn.peer_addr}] call re-listen completed the turn",
+                text, event=True)
             self.state._turn_segments = [text]
             return text
         return joined

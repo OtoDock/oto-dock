@@ -2079,11 +2079,23 @@ def _op_add_chart(job: _XlsxJob, ctx: OpCtx, op: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+# A picture is read whole (openpyxl opens it again at the save), under the cap
+# the fetcher and the CSV import read one file with.
+_IMAGE_MAX_BYTES = 64 * 1024 * 1024
+
+
 def _op_add_image(job: _XlsxJob, ctx: OpCtx, op: dict) -> None:
     from openpyxl.drawing.image import Image as XlImage
 
+    import shared
+
     ws = _get_sheet(job.wb, op)
-    img = XlImage(op["image_path"])
+    with shared.safe_open_read(op["image_path"]) as fh:
+        data = fh.read(_IMAGE_MAX_BYTES + 1)
+    if len(data) > _IMAGE_MAX_BYTES:
+        raise OpError(Code.BAD_VALUE, f"the picture is over the {_IMAGE_MAX_BYTES // (1024 * 1024)} MB one "
+                      "picture takes", location="image_path", hint="Use a smaller picture.")
+    img = XlImage(io.BytesIO(data))
     # A size of 0 means the picture's own size, as it always did.
     if op.get("width"):
         img.width = max(round(to_px(op["width"], default="px")), 1)
@@ -2233,12 +2245,29 @@ def _unsafe_refusal(call: WriteCall, found: list[tuple[str, list[str]]]) -> str:
 def _write_xlsx_core(call: WriteCall) -> Staged | WriteReport:
     """Worker A: load (or start blank), apply the batch, then commit at
     once when the workbook holds no formula, or stage the save for the
-    recalculation and worker B."""
+    recalculation and worker B. An existing workbook is opened once
+    (``shared.safe_open_read``: beneath the mount, no link followed) and
+    every pass over the original reads that one handle."""
+    from openpyxl.reader.excel import SUPPORTED_FORMATS
+
+    import shared
+
+    if not call.edit_existing:
+        return _write_xlsx(call, None)
+    # openpyxl judges a name's suffix and skips that for a file object.
+    if Path(call.path).suffix.lower() not in SUPPORTED_FORMATS:
+        raise ValueError(f"{Path(call.path).name} is not a workbook write_xlsx edits: it edits "
+                         f"{', '.join(SUPPORTED_FORMATS)} files")
+    with shared.safe_open_read(call.path) as src:
+        return _write_xlsx(call, src)
+
+
+def _write_xlsx(call: WriteCall, src: Any) -> Staged | WriteReport:
     from openpyxl import Workbook, load_workbook
 
     path = call.path
     macro_parts: MacroParts | None = None
-    losses: list[loss.Loss] = loss.scan(path) if call.edit_existing else []
+    losses: list[loss.Loss] = loss.scan(path, src) if call.edit_existing else []
     allow_loss = values.to_flag(call.extra.get("allow_loss", False))
     if loss.refused(losses) and not allow_loss:
         from shared import _to_agents_relative
@@ -2250,16 +2279,17 @@ def _write_xlsx_core(call: WriteCall) -> Staged | WriteReport:
         # Charts, images and comments all survive the load+save round trip
         # on the pinned openpyxl (charts are re-read from xl/charts and
         # rewritten with their anchors and series).
-        check_readable(path)
+        check_readable(src)
         keep_vba = keeps_vba(path)
         _preflight_density(
-            path, "edit",
-            extra_bytes=Path(path).stat().st_size if keep_vba else 0,
+            src, "edit",
+            extra_bytes=os.fstat(src.fileno()).st_size if keep_vba else 0,
         )
-        wb = load_workbook(path, keep_vba=keep_vba)
+        src.seek(0)
+        wb = load_workbook(src, keep_vba=keep_vba)
         if keep_vba:
-            macro_parts = read_macro_parts(path)
-        by_title = sheet_parts(path)
+            macro_parts = read_macro_parts(src)
+        by_title = sheet_parts(src)
     else:
         wb = Workbook()
     wb.template = is_template(path)
@@ -2297,7 +2327,7 @@ def _write_xlsx_core(call: WriteCall) -> Staged | WriteReport:
                                baseline=baseline)
         marks: list = []
         text = _readback(job, marks)
-        outside = computed.outside_reads(wb, computed.outside_parts(path) if call.edit_existing else [])
+        outside = computed.outside_reads(wb, computed.outside_parts(src) if call.edit_existing else [])
         if cells_before is not None:
             computed.save_carry(call.work_dir, computed.carry_facts(wb, cells_before, names_before))
         return call.stage(outcome, save=save, readback=lambda: text, baseline=baseline,

@@ -45,8 +45,8 @@ class _Pump:
         self.is_done = False
         self.calls: list[str] = []
 
-    def cancel_all_queued(self):
-        self.calls.append("cancel_all_queued")
+    def cancel_all_queued(self, reason="revoked"):
+        self.calls.append(f"cancel_all_queued:{reason}")
         return ""
 
     def abort(self):
@@ -198,7 +198,7 @@ async def test_a_live_turn_is_stopped_before_the_close(world):
     pump = w.pumps["chat-9"] = _Pump("pat-a")
     db.set_user_agents(w.pat, [B], "user-admin", agent_roles={B: "contributor"})
     await closer.sweep(_event(w, offboarding.REMOVED, AgentLoss(A, "contributor", "", "contributor", "")))
-    assert pump.calls == ["cancel_all_queued", "abort"] and w.noted == ["pat-a"]
+    assert pump.calls == ["cancel_all_queued:revoked", "abort"] and w.noted == ["pat-a"]
     await _settle()
     assert w.layer.closed == ["pat-a"]
 
@@ -263,6 +263,29 @@ async def test_a_sign_out_drops_the_persons_reloaded_unheld_contexts(world, monk
     assert set(security) == {"quinn-reloaded"}
     # No username (a person with no slug): nothing reloaded is touched.
     assert session_state.drop_reloaded_contexts_of("") == []
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_reloaded_context_is_on_disk_before_the_change_is_answered(world, monkeypatch):
+    """Its machine's next report after a crash would take the session back
+    with its old token if the index still held the context."""
+    from core.session import session_state
+    w = world
+    security = {"pat-reloaded": SimpleNamespace(agent=A, username=w.pat_name, role="contributor")}
+    monkeypatch.setattr(session_state, "_session_security", security)
+    monkeypatch.setattr(session_state, "_reloaded_state", {"pat-reloaded": ("default", 0)})
+    monkeypatch.setattr(session_state, "session_is_held", lambda sid: False)
+    monkeypatch.setattr(session_state, "cleanup_session_permission_state",
+                        lambda sid: security.pop(sid, None))
+    waited: list[bool] = []
+
+    async def written() -> bool:
+        waited.append("pat-reloaded" not in security)
+        return True
+
+    monkeypatch.setattr(session_state, "security_index_written", written)
+    assert await closer.close_person_sessions(w.pat, w.pat_name, "password changed") == 1
+    assert waited == [True]
 
 
 @pytest.mark.asyncio

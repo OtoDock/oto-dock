@@ -1,16 +1,16 @@
 """Server-prompt injection queue on InteractiveSession (delegate results …).
 
-Exercises the quiescence gates one by one against real `cat`-under-PTY
-sessions (same harness as test_interactive_session.py): a queued prompt is
-injected ONLY when the CLI is idle — turn closed (transcript-derived), composer
-clean, output quiet, no pending cold-submit / permission — and close() hands
-undelivered items back to the delivery ladder with the PTY/WS rungs excluded.
+Exercises the quiescence gates one by one against sessions on a stand-in PTY
+that prints back what it reads (``tests/_terminal.py``, same harness as
+test_interactive_session.py): a queued prompt is injected ONLY when the CLI
+is idle — turn closed (transcript-derived), composer clean, output quiet, no
+pending cold-submit / permission — and close() hands undelivered items back
+to the delivery ladder with the PTY/WS rungs excluded.
 
 Run individually (conftest DB-pool gotcha):
     venv/bin/python -m pytest tests/session/test_interactive_prompt_queue.py -q
 """
 import asyncio
-import os
 import time
 
 import pytest
@@ -18,16 +18,14 @@ import pytest_asyncio
 
 import config  # noqa: F401  (ensures conftest path/env setup ran)
 from core import concurrency
-from core.session import interactive_session as isess
+from core.session import interactive_queue, interactive_session as isess
 from core.session.session_delivery import DeliveryOutcome
-
-_ENV = {"TERM": "xterm-256color", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+from tests._terminal import register
 
 
 async def _register(session_id, *, chat_id="chat-q"):
-    return await isess.register(
+    return await register(
         session_id=session_id, chat_id=chat_id, agent_name="agent",
-        argv=["cat"], env=dict(_ENV),
     )
 
 
@@ -41,7 +39,7 @@ def _make_idle(s):
 
 async def _settle_echo(s):
     """Let pending PTY echo land, then re-open the quiet + submit gates —
-    `cat`'s echo of a prior write counts as output activity (correctly resets
+    the echo of a prior write counts as output activity (correctly resets
     the quiet clock in production; here we fast-forward past it), and a first
     submit legitimately arms the deferred Enter (cancel it so each test
     isolates ITS gate)."""
@@ -247,8 +245,8 @@ class TestPromptQueueGates:
         # effects schedule a drain past the quiet window) — NOT on the 5s
         # backstop cadence. Backstop pushed out of reach to prove the kick
         # is what delivers.
-        monkeypatch.setattr(isess, "_INJECT_QUIET_S", 0.05)
-        monkeypatch.setattr(isess, "_INJECT_BACKSTOP_S", 60.0)
+        monkeypatch.setattr(interactive_queue, "_INJECT_QUIET_S", 0.05)
+        monkeypatch.setattr(interactive_queue, "_INJECT_BACKSTOP_S", 60.0)
         s = await _register("sid-kick")
         received = bytearray()
         s.add_output_listener(received.extend)
@@ -336,12 +334,8 @@ async def test_close_session_drop_queued_hands_nothing_back(monkeypatch):
 
 
 class _FakeConnMgr:
-    def __init__(self, *, supports=True):
-        self.supports = supports
+    def __init__(self):
         self.sent: list[dict] = []
-
-    def satellite_supports_pty_inject(self, machine_id):
-        return self.supports
 
     async def send_fire_and_forget(self, machine_id, msg):
         self.sent.append(msg)
@@ -349,8 +343,8 @@ class _FakeConnMgr:
 
 @pytest.mark.asyncio
 class TestSatelliteInjectPath:
-    async def _attached_session(self, monkeypatch, *, supports=True):
-        mgr = _FakeConnMgr(supports=supports)
+    async def _attached_session(self, monkeypatch):
+        mgr = _FakeConnMgr()
         import core.remote.satellite_connection as sc
         monkeypatch.setattr(sc, "get_connection_manager", lambda: mgr)
         s = await _register("sid-sat", chat_id="chat-sat")
@@ -388,21 +382,15 @@ class TestSatelliteInjectPath:
         s.handle_inject_result("not-the-inflight-id", True)
         assert len(s._prompt_queue) == 1              # unknown id → no pop
 
-    async def test_old_satellite_holds_queue(self, monkeypatch):
-        s, mgr = await self._attached_session(monkeypatch, supports=False)
-        s.queue_prompt("the result", "delegate_result", chat_id="chat-sat")
-        await asyncio.sleep(0.05)
-        assert mgr.sent == []                         # frame never sent
-        assert len(s._prompt_queue) == 1              # held for detach/close
-
 
 @pytest.mark.asyncio
 class TestSteerItems:
     """steer=True items (deliver_prompt rung 1 marks all of them): with an
-    OPEN turn on a local PTY they inject mid-turn — both TUIs consume typed
-    input between tool calls — bypassing turn_open/not_quiet/bg_pending while
-    every safety gate (dialog, dirty composer, cold submit) still holds. With
-    the turn closed the flag is inert (ordinary quiescence inject)."""
+    OPEN turn, on a terminal no local ``otodock`` command holds, they inject
+    mid-turn — both TUIs consume typed input between tool calls — bypassing
+    turn_open/not_quiet/bg_pending while every safety gate (dialog, dirty
+    composer, cold submit) still holds. With the turn closed the flag is
+    inert (ordinary quiescence inject)."""
 
     async def test_steer_injects_into_open_turn(self):
         s = await _register("sid-steer")

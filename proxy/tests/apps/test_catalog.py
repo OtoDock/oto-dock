@@ -613,3 +613,17 @@ def test_the_agents_own_work_reaches_the_editor_tier_through_the_feeds(monkeypat
     _as(_user(OTHER, agent_roles={AGENT: "editor"}))
     ids = {c["id"] for c in client.get(f"/v1/apps/{row['id']}/catalog/sessions").json()["rows"]}
     assert {human, worker} <= ids
+
+
+def test_an_outside_person_reaches_no_platform_method():
+    """S-F4: an outside person's session passes its own agent's member
+    checks, so the catalog refuses an external principal before any
+    method, whatever the route that called it."""
+    from auth.providers import UserContext
+    from services.apps import catalog
+    outsider = UserContext(sub="session:s-out", email="", name="", role="member", is_api_key=True,
+                           agent="support", agents=[], agent_roles={}, external_claim="phone:+302101234567")
+    assert outsider.is_external and outsider.can_access_agent("support")
+    for method in ("viewer.me", "files.read", "tasks.run_result", "app.audience"):
+        with pytest.raises(PermissionError):
+            catalog.run_method(method, "support", {"id": "a", "agent": "support"}, outsider, {})

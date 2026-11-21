@@ -15,16 +15,18 @@ test shares one.
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from api.apps.apps import (
+    PressTooFast,
     _can_approve_surface,
     _check_fire_rate,
     _visible_row,
@@ -69,10 +71,15 @@ async def approve_app(
     err = await asyncio.to_thread(_manifest_target_error, row, u)
     if err:
         raise HTTPException(status_code=403, detail=err)
+    from services.mcp import outside_picks
+    refused = await asyncio.to_thread(outside_picks.approval_refusal, row)
+    if refused:
+        raise HTTPException(status_code=409, detail=refused)
     ok = await asyncio.to_thread(task_store.approve_app_actions, app_id, req.sig, u.sub)
     if not ok:
         raise HTTPException(status_code=409, detail="The app.json changed. Review it again.")
     fresh = await asyncio.to_thread(task_store.get_app, app_id) or row
+    await asyncio.to_thread(outside_picks.app_released, fresh)
     out: dict = {"status": "ok"}
     # An approval here (the plain card — the deploy card runs its own
     # go-live) is also what makes the app's handlers real: its schedules
@@ -110,6 +117,39 @@ def _validate_action_args(action: dict, args) -> dict:
     return cast("dict", validated)
 
 
+FILE_ON_A_LINK = "This button names a file, and a shared link opens no file."
+
+
+def _judge_file_fields(row: dict, action: dict, validated: dict, u: UserContext | None,
+                       actor: str, handler: str) -> dict:
+    """A declared file field: every file the page named on a tool button is
+    judged for the presser, inside the app's declared folders, by the files
+    methods' own gate (``catalog.resolve_app_file``: a member of the agent,
+    the declared prefix as written and as resolved, the presser's own role
+    on the files API, the never-declarable names); the app's own handler or
+    step is judged as the app. The tool gets the checked place, ``/`` and
+    the agent-relative path. Blocking: call it in a thread."""
+    fields = _mf.file_fields(action, validated)
+    if not fields:
+        return validated
+    if not handler and (actor or u is None):
+        raise HTTPException(status_code=403, detail=FILE_ON_A_LINK)
+    from api.agents.files import safe_agent_path
+    from services.apps import catalog
+    who = catalog.app_principal(row) if handler else u
+    out = copy.deepcopy(validated)
+    for name, index, field, mode in fields:
+        holder = out if index is None else out[name][index]
+        try:
+            _raw, rel, _place = catalog.resolve_app_file(
+                "files.write" if mode == "write" else "files.read", row["agent"], row, who,
+                {"path": holder[field]}, safe_agent_path)
+        except (PermissionError, ValueError) as e:
+            raise HTTPException(status_code=403, detail=f"{field}: {e}") from e
+        holder[field] = "/" + rel
+    return out
+
+
 def merge_checks(task_checks: list[str], action_checks: list[str]) -> list[str]:
     """CHECKS.md: a button's checks (names of the agent's checks) join the
     task's refs for the pressed run; a name that is no check on the agent
@@ -134,8 +174,10 @@ async def _run_action(row: dict, action_id: str, args, u: UserContext | None,
 
     ``actor`` names a caller that is not a platform user (``share:<id>``,
     an external link): it keys the rate limits and the log, the floor sees
-    a viewer, and a task run records the share as its trigger source. No
-    principal object is ever built for a link (SHARING.md).
+    an outside person (``manifest.LINK_ROLE``: only a button floored
+    ``external`` answers it), and a task run records the share as its
+    trigger source. No principal object is ever built for a link
+    (SHARING.md).
 
     ``handler`` names the app's own handler pressing the button from inside
     a delivery (APPS.md "Handlers"): unattended, so the floor is the
@@ -156,8 +198,12 @@ async def _run_action(row: dict, action_id: str, args, u: UserContext | None,
                             detail="Platform methods are called through otodock.platform, not fired")
     if not task_store.app_actions_approved(row):
         raise HTTPException(status_code=409, detail="Actions not approved")
-    if not handler and not _mf.meets_floor(action, await asyncio.to_thread(_mf.caller_role, row, u)):
-        raise HTTPException(status_code=403, detail=_mf.floor_reason(action))
+    if not handler:
+        role = _mf.LINK_ROLE if actor.startswith("share:") else await asyncio.to_thread(_mf.caller_role, row, u)
+        if not _mf.meets_floor(action, role):
+            raise HTTPException(status_code=403, detail=(
+                "This button does not work on a shared link." if role == _mf.LINK_ROLE
+                else _mf.floor_reason(action)))
 
     if action.get("type") == "mcp_tool":
         # Click-time re-checks: the APPROVER's standing surface authority
@@ -171,6 +217,7 @@ async def _run_action(row: dict, action_id: str, args, u: UserContext | None,
         if keys.get(action.get("mcp") or "") != action.get("mcp"):
             raise HTTPException(status_code=409, detail="This action's MCP is no longer available")
         validated = _validate_action_args(action, args)
+        validated = await asyncio.to_thread(_judge_file_fields, row, action, validated, u, actor, handler)
         merged = _mf.merge_fixed_args(action.get("fixed_args") or {}, validated)
         from services.apps import headless_exec
         # `${account.email}` in an argument (fixed or page-supplied) is the
@@ -188,7 +235,12 @@ async def _run_action(row: dict, action_id: str, args, u: UserContext | None,
         args_key = hashlib.sha256(merged_json.encode("utf-8")).hexdigest()[:16]
         _check_fire_rate(app_id, action_id, who, args_key=args_key,
                          interval=2.0 if actor else 1.0)
-        return await headless_exec.execute_app_tool(row, action, merged)
+        # A value the presser chose never reaches past the presser: a press
+        # below the app's identity runs at the presser's own reach.
+        reach = await asyncio.to_thread(
+            headless_exec.press_reach, row, u, actor=actor, handler=handler,
+            chose=headless_exec.chooses(action, validated))
+        return await headless_exec.execute_app_tool(row, action, merged, reach=reach)
 
     # fire_task
     task_id = action.get("task_id") or ""
@@ -253,8 +305,25 @@ class BatchRequest(BaseModel):
     calls: list[BatchCall]
 
 
-BATCH_MAX_CALLS = 16
+BATCH_MAX_CALLS = 32   # an app's actions at most (manifest.MAX_ACTIONS)
 BATCH_MIN_INTERVAL_S = 1.0
+
+
+def paced_batch(e: PressTooFast) -> JSONResponse:
+    """A batch refused for its pace: none of its calls ran, and the 429
+    names the rest of the second, so the host sends the batch again then."""
+    return JSONResponse({"detail": e.detail, "retry_after_ms": e.retry_after_ms},
+                        status_code=429, headers=e.headers)
+
+
+def refusal_line(e: HTTPException, fires: bool) -> dict:
+    """A batch entry's refusal. A press inside its gap names its wait when a
+    host may send it once more: a tool call, never a task's, whose gap is the
+    guard against a double press (a run costs an agent turn)."""
+    out: dict = {"status": "denied", "reason": e.detail, "code": e.status_code}
+    if isinstance(e, PressTooFast) and not fires:
+        out["retry_after_ms"] = e.retry_after_ms
+    return out
 
 
 async def _delivery_caller(request: Request, app_id: str) -> tuple[dict, dict] | None:
@@ -313,9 +382,11 @@ async def run_app_actions_batch(
     batch. The response streams one JSON line per entry as it completes,
     ``{call_id, action_id, ...}`` around the single route's body — a refusal
     is that entry's ``{"status": "denied", "reason", "code"}``, never an
-    HTTP error for the batch — so a panel fills as its calls land. The
-    batch itself is limited to one per second per (app, viewer); the host
-    page paces its calls to that."""
+    HTTP error for the batch — so a panel fills as its calls land; a call
+    inside its gap adds ``retry_after_ms``. The batch itself is limited to
+    one per second per (app, viewer), whatever its buttons: the host spaces
+    its batches a second apart when it sends them, the network can bring
+    two closer, and the 429 says how long to wait (``paced_batch``)."""
     handler, actor = "", ""
     row: dict | None
     if user is None:
@@ -337,17 +408,20 @@ async def run_app_actions_batch(
     ids = [c.call_id for c in calls]
     if len(set(ids)) != len(ids) or not all(0 < len(i) <= 64 and i.isprintable() for i in ids):
         raise HTTPException(status_code=400, detail="call_id must be unique, 1 to 64 characters")
-    _check_fire_rate(app_id, "\x00batch", actor or cast("UserContext", u).sub, interval=BATCH_MIN_INTERVAL_S)
+    try:
+        _check_fire_rate(app_id, "\x00batch", actor or cast("UserContext", u).sub, interval=BATCH_MIN_INTERVAL_S)
+    except PressTooFast as e:
+        return paced_batch(e)
 
     fire_seen = False
-    entries: list[tuple[BatchCall, bool]] = []
+    entries: list[tuple[BatchCall, bool, bool]] = []
     for call in calls:
         action = _mf.find_action(row, call.action_id) or {}
         fires = action.get("type") == "fire_task"
-        entries.append((call, fires and fire_seen))
+        entries.append((call, fires, fires and fire_seen))
         fire_seen = fire_seen or fires
 
-    async def _one(call: BatchCall, extra_fire: bool) -> dict:
+    async def _one(call: BatchCall, fires: bool, extra_fire: bool) -> dict:
         out: dict = {"call_id": call.call_id, "action_id": call.action_id}
         try:
             if extra_fire:
@@ -355,7 +429,7 @@ async def run_app_actions_batch(
             out.update(await _run_action(row, call.action_id, call.args, u,
                                          actor=actor, handler=handler))
         except HTTPException as e:
-            out.update({"status": "denied", "reason": e.detail, "code": e.status_code})
+            out.update(refusal_line(e, fires))
         except Exception:
             # One entry's failure is its own line: a raise here would end
             # the stream and lose every sibling's result.
@@ -363,7 +437,7 @@ async def run_app_actions_batch(
             out.update({"status": "denied", "reason": "the action failed", "code": 500})
         return out
 
-    tasks = [asyncio.ensure_future(_one(c, extra)) for c, extra in entries]
+    tasks = [asyncio.ensure_future(_one(c, fires, extra)) for c, fires, extra in entries]
 
     async def _lines():
         for fut in asyncio.as_completed(tasks):

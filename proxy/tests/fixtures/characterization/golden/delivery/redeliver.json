@@ -1,0 +1,155 @@
+{
+ "pending": {
+  "c-gone": [],
+  "c-note": [
+   {
+    "by": "",
+    "kind": "note",
+    "person": "",
+    "prompt": "A NOTE",
+    "role": ""
+   }
+  ],
+  "c-own": [],
+  "c-parked": [
+   {
+    "by": "",
+    "person": "",
+    "prompt": "PARKED",
+    "role": ""
+   }
+  ],
+  "c-shared": [],
+  "task-run-char": []
+ },
+ "rows": {
+  "c-gone": [],
+  "c-note": [],
+  "c-own": [
+   {
+    "content": "ECHO TEXT",
+    "event_data": null,
+    "event_type": "",
+    "role": "assistant"
+   }
+  ],
+  "c-parked": [],
+  "c-shared": [
+   {
+    "content": "ECHO TEXT",
+    "event_data": null,
+    "event_type": "",
+    "role": "assistant"
+   },
+   {
+    "content": "ECHO TEXT",
+    "event_data": null,
+    "event_type": "",
+    "role": "assistant"
+   }
+  ],
+  "task-run-char": [
+   {
+    "content": "ECHO TEXT",
+    "event_data": null,
+    "event_type": "",
+    "role": "assistant"
+   }
+  ]
+ },
+ "seen": {
+  "admission": [],
+  "frames": [],
+  "layer": [
+   [
+    "is_session_alive",
+    "s-own"
+   ],
+   [
+    "is_session_alive",
+    "s-shared"
+   ],
+   [
+    "is_session_alive",
+    "s-shared"
+   ],
+   [
+    "is_session_alive",
+    "s-task"
+   ],
+   [
+    "send_message",
+    "s-own",
+    "OWN ONE\n\nOWN TWO"
+   ],
+   [
+    "send_message",
+    "s-shared",
+    "FOR MAX"
+   ],
+   [
+    "send_message",
+    "s-shared",
+    "FOR VICTORIA"
+   ],
+   [
+    "send_message",
+    "s-task",
+    "AGENT SCOPE"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "",
+    "execution_target": "",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "manager",
+    "user_sub": null
+   },
+   {
+    "agent": "char-agent",
+    "execution_path": "",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   },
+   {
+    "agent": "char-shared",
+    "execution_path": "",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-manager"
+   },
+   {
+    "agent": "char-shared",
+    "execution_path": "",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer2"
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "woken": 3
+}

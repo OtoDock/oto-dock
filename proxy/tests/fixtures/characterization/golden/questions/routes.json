@@ -1,0 +1,57 @@
+{
+ "codex_question": {
+  "body": {
+   "answers": {
+    "q1": {
+     "answers": [
+      "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call  again this turn."
+     ]
+    }
+   }
+  },
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "id": "q1",
+       "question": "Which?"
+      },
+      {
+       "question": "no id"
+      }
+     ]
+    },
+    "tool_name": ""
+   }
+  ],
+  "status": 200
+ },
+ "codex_question_no_auth": {
+  "body": {
+   "detail": "Missing Authorization header"
+  },
+  "status": 401
+ },
+ "permission": {
+  "body": {
+   "decision": "deny",
+   "reason": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call AskUserQuestion again this turn."
+  },
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "question": "Which?"
+      }
+     ]
+    },
+    "tool_name": "AskUserQuestion"
+   }
+  ],
+  "status": 200
+ }
+}

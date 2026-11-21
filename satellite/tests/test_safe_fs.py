@@ -213,6 +213,103 @@ def test_the_size_cap_is_checked(tree):
         safe_fs.read_bytes_beneath(root, "a1/workspace/sub/f.txt", max_size=2)
 
 
+def _sample_folder(tree):
+    """``a1/workspace/mix``: a folder, a file, a link and a pipe."""
+    root, outside = tree
+    mix = root / "a1" / "workspace" / "mix"
+    (mix / "dir").mkdir(parents=True)
+    (mix / "file.txt").write_bytes(b"f")
+    (mix / "link").symlink_to(outside)
+    os.mkfifo(mix / "pipe")
+    return root, outside, mix
+
+
+def test_list_beneath_names_a_folders_entries_by_kind(tree):
+    root, _outside, _mix = _sample_folder(tree)
+    got = safe_fs.list_beneath(root, "a1/workspace/mix", max_entries=10)
+    assert (got.dirs, got.files, got.links, got.other) == (["dir"], ["file.txt"], ["link"], ["pipe"])
+    top = safe_fs.list_beneath(root, max_entries=10)
+    assert top.dirs == ["a1"] and not (top.files or top.links or top.other)
+    with safe_fs.open_root(root, "a1/workspace") as r:
+        assert safe_fs.list_beneath(r, "mix", max_entries=10).links == ["link"]
+
+
+def test_list_beneath_refuses_past_its_cap_and_a_link_on_the_way(tree):
+    root, outside, _mix = _sample_folder(tree)
+    assert len(safe_fs.list_beneath(root, "a1/workspace/mix", max_entries=4).other) == 1
+    with pytest.raises(safe_fs.TooManyEntries):
+        safe_fs.list_beneath(root, "a1/workspace/mix", max_entries=3)
+    assert issubclass(safe_fs.TooManyEntries, safe_fs.SafeFsError)
+    for rel in ("a1/workspace/mix/link", "a1/workspace/mix/link/sub"):
+        with pytest.raises(safe_fs.SymlinkRefused):
+            safe_fs.list_beneath(root, rel, max_entries=10)
+    with pytest.raises(NotADirectoryError):
+        safe_fs.list_beneath(root, "a1/workspace/mix/file.txt", max_entries=10)
+    with pytest.raises(FileNotFoundError):
+        safe_fs.list_beneath(root, "a1/workspace/absent", max_entries=10)
+    with pytest.raises(safe_fs.UnsafePathError):
+        safe_fs.list_beneath(root, "a1/../a1", max_entries=10)
+    _victim_untouched(outside)
+
+
+def test_rmtree_beneath_removes_a_tree_and_only_the_links_in_it(tree):
+    root, outside, mix = _sample_folder(tree)
+    deep = mix / "dir" / "b" / "c"
+    deep.mkdir(parents=True)
+    (deep / "g.txt").write_bytes(b"g")
+    (mix / "dir" / "b" / "back").symlink_to(root / "a1" / "users", target_is_directory=True)
+    safe_fs.rmtree_beneath(root, "a1/workspace/mix")
+    assert not mix.exists()
+    _victim_untouched(outside)
+    assert (root / "a1" / "users" / "other").is_dir()
+    assert (root / "a1" / "workspace" / "sub" / "f.txt").read_bytes() == b"inside"
+
+
+def test_rmtree_beneath_refuses_a_link_a_file_and_the_root(tree):
+    root, outside, mix = _sample_folder(tree)
+    (root / "a1" / "workspace" / "alias").symlink_to(mix, target_is_directory=True)
+    with pytest.raises(safe_fs.SymlinkRefused):
+        safe_fs.rmtree_beneath(root, "a1/workspace/alias")
+    with pytest.raises(safe_fs.SymlinkRefused):
+        safe_fs.rmtree_beneath(root, "a1/workspace/mix/link/x")
+    with pytest.raises(NotADirectoryError):
+        safe_fs.rmtree_beneath(root, "a1/workspace/mix/file.txt")
+    with pytest.raises(safe_fs.UnsafePathError):
+        safe_fs.rmtree_beneath(root, "")
+    assert (mix / "dir").is_dir() and (root / "a1" / "workspace" / "alias").is_symlink()
+    _victim_untouched(outside)
+
+
+def test_rmtree_beneath_missing_ok(tree):
+    root, _ = tree
+    with pytest.raises(FileNotFoundError):
+        safe_fs.rmtree_beneath(root, "a1/workspace/absent")
+    safe_fs.rmtree_beneath(root, "a1/workspace/absent", missing_ok=True)
+    safe_fs.rmtree_beneath(root, "a1/absent/deeper", missing_ok=True)
+
+
+def test_rmtree_beneath_stops_at_a_folder_swapped_for_a_link_on_its_way_down(tree):
+    """A folder inside the tree becomes a link while the tree goes: the walk
+    down refuses it and nothing outside goes."""
+    root, outside, mix = _sample_folder(tree)
+    (mix / "dir" / "inner").mkdir()
+    real = safe_fs._step_dir
+    state = {"done": False}
+
+    def _swap(dirfd, name, shown):
+        if name == "inner" and not state["done"]:
+            state["done"] = True
+            (mix / "dir" / "inner").rmdir()
+            os.symlink(outside, mix / "dir" / "inner")
+        return real(dirfd, name, shown)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(safe_fs, "_step_dir", _swap)
+        with pytest.raises(safe_fs.SymlinkRefused):
+            safe_fs.rmtree_beneath(root, "a1/workspace/mix")
+    _victim_untouched(outside)
+
+
 def test_open_root_reaches_a_subfolder_strictly_and_passes_a_root_through(tree):
     root, outside = tree
     with safe_fs.open_root(root, "a1") as r:
@@ -253,7 +350,9 @@ class _FakeWin:
         win = config.of(config.WINDOWS)
         monkeypatch.setattr(config, "HOST", win)
         monkeypatch.setattr(safe_fs, "_w_lstat", self._lstat)
-        for name in ("_w_open", "_w_mkdir", "_w_replace", "_w_rename", "_w_unlink", "_w_rmdir", "_w_fstat"):
+        monkeypatch.setattr(safe_fs, "_w_entry_lstat", lambda entry: self._lstat(entry.path))
+        for name in ("_w_open", "_w_mkdir", "_w_replace", "_w_rename", "_w_unlink", "_w_rmdir", "_w_fstat",
+                     "_w_rmtree"):
             monkeypatch.setattr(safe_fs, name, self._record(name, getattr(safe_fs, name)))
 
     def _record(self, name, real):
@@ -346,6 +445,52 @@ def test_windows_branch_rename_unlink_and_rmdir(tree, monkeypatch):
     _FakeWin(monkeypatch, tags={sub: MOUNT_POINT_TAG})
     with pytest.raises(safe_fs.SymlinkRefused):
         safe_fs.rmdir_beneath(root, "a1/users/other")
+
+
+def test_windows_branch_lists_a_name_surrogate_as_a_link(tree, monkeypatch):
+    root, _ = tree
+    ws = root / "a1" / "workspace"
+    (ws / "junction").mkdir()
+    (ws / "placeholder.txt").write_bytes(b"p")
+    fake = _FakeWin(monkeypatch, tags={
+        os.path.normpath(str(ws / "junction")): MOUNT_POINT_TAG,
+        os.path.normpath(str(ws / "placeholder.txt")): CLOUD_PLACEHOLDER_TAG,
+    })
+    got = safe_fs.list_beneath(root, "a1/workspace", max_entries=10)
+    assert (got.dirs, got.files, got.links, got.other) == (["sub"], ["placeholder.txt"], ["junction"], [])
+    checked = [c[1] for c in fake.calls if c[0] == "_w_lstat"]
+    assert os.path.normpath(str(root / "a1")) in checked and os.path.normpath(str(ws)) in checked
+    with pytest.raises(safe_fs.TooManyEntries):
+        safe_fs.list_beneath(root, "a1/workspace", max_entries=2)
+    with pytest.raises(safe_fs.SymlinkRefused):
+        safe_fs.list_beneath(root, "a1/workspace/junction", max_entries=10)
+    _FakeWin(monkeypatch, tags={os.path.normpath(str(root / "a1")): SYMLINK_TAG})
+    with pytest.raises(safe_fs.SymlinkRefused):
+        safe_fs.list_beneath(root, "a1/workspace", max_entries=10)
+
+
+def test_windows_branch_rmtree_checks_the_chain_and_the_name_first(tree, monkeypatch):
+    root, _ = tree
+    ws = root / "a1" / "workspace"
+    fake = _FakeWin(monkeypatch, tags={os.path.normpath(str(ws / "sub")): MOUNT_POINT_TAG})
+    with pytest.raises(safe_fs.SymlinkRefused):
+        safe_fs.rmtree_beneath(root, "a1/workspace/sub")
+    assert (ws / "sub" / "f.txt").exists()
+    assert not [c for c in fake.calls if c[0] == "_w_rmtree"]
+    _FakeWin(monkeypatch, tags={os.path.normpath(str(ws)): SYMLINK_TAG})
+    with pytest.raises(safe_fs.SymlinkRefused):
+        safe_fs.rmtree_beneath(root, "a1/workspace/sub")
+    fake = _FakeWin(monkeypatch)
+    with pytest.raises(NotADirectoryError):
+        safe_fs.rmtree_beneath(root, "a1/workspace/sub/f.txt")
+    safe_fs.rmtree_beneath(root, "a1/workspace/absent", missing_ok=True)
+    safe_fs.rmtree_beneath(root, "a1/absent/deeper", missing_ok=True)
+    with pytest.raises(FileNotFoundError):
+        safe_fs.rmtree_beneath(root, "a1/workspace/absent")
+    safe_fs.rmtree_beneath(root, "a1/workspace/sub")
+    assert not (ws / "sub").exists()
+    removed = [c[1] for c in fake.calls if c[0] == "_w_rmtree"]
+    assert removed == [os.path.join(str(ws), "sub")]
 
 
 def test_the_branch_follows_the_host_table(tree, monkeypatch):

@@ -1,0 +1,151 @@
+[
+ {
+  "parked": 3,
+  "result": [],
+  "stats": {
+   "by_surface": {
+    "chat": 4,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 5,
+    "reserved_mb": 4000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "three parked"
+ },
+ {
+  "admission": {
+   "admitted": true,
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "parked": 3,
+  "stats": {
+   "by_surface": {
+    "chat": 5,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 5,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 0,
+    "fit_light": 0,
+    "reserved_mb": 5000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a chat still fits"
+ },
+ {
+  "parked": 2,
+  "result": [
+   "alice-1"
+  ],
+  "stats": {
+   "by_surface": {
+    "chat": 3,
+    "meeting": 0,
+    "phone": 0,
+    "task": 1
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 5,
+    "reserved_mb": 4000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 1
+   }
+  },
+  "step": "chat 0 released"
+ },
+ {
+  "parked": 1,
+  "result": [
+   "alice-1",
+   "bob-1"
+  ],
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 0,
+    "task": 2
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 5,
+    "reserved_mb": 4000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 2
+   }
+  },
+  "step": "chat 1 released"
+ },
+ {
+  "parked": 0,
+  "result": [
+   "alice-1",
+   "alice-2",
+   "bob-1"
+  ],
+  "stats": {
+   "by_surface": {
+    "chat": 1,
+    "meeting": 0,
+    "phone": 0,
+    "task": 3
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 4,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 1,
+    "fit_light": 5,
+    "reserved_mb": 4000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 3
+   }
+  },
+  "step": "chat 2 released"
+ }
+]

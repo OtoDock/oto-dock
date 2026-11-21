@@ -78,6 +78,8 @@ async def _owner_for_machine(machine_id: str):
     machine = await asyncio.to_thread(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise OtodockSessionError("this machine is not paired with the platform")
+    if placement.machine_is_compute(machine):
+        raise OtodockSessionError("a compute machine opens no session on its own request")
     # The session runs as the machine's REGISTERED owner — for a user-paired
     # machine that's the user; for an admin-paired machine the admin who paired it
     # (i.e. the operator who set the machine up). Either is correct: access is
@@ -369,7 +371,8 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
 
     async def _cleanup_chat():
         if created_chat:
-            await asyncio.to_thread(db.delete_chat, chat_id)
+            from services.agents import chat_removal
+            await asyncio.to_thread(chat_removal.delete_rows, chat_id)
 
     # Take over any live session for this chat (single live process per chat —
     # resuming a chat that's live in the dashboard / a duplicate otodock run).

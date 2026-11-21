@@ -37,15 +37,21 @@ Passes (the full list and its order are ``_run_sweep_sync``'s):
   Reply reports (``reply-reports``) — always on: a report a year after it
      was filed, open or closed, its chat there or not
      (``db_reply_reports.KEEP_DAYS``).
+  Working files (``working-files``) — its own toggle and window: uploads and
+     the browser's screenshots (``services/infra/working_files.py``).
+  History (``history``, on the loop before the machines' pass) — off unless
+     set: an agent's own window, and the platform's chat rows
+     (``services/infra/history_retention.py``).
 
 On a remote machine only the CLI transcripts age out (``_pass_remote_sessions``:
-the chats pinned to it are flagged like local ones, and a 0.5.150 satellite
-removes the files no row and no live session names). Never touched:
-workspaces/user content, plans, ``state_*.sqlite``, token/credential dirs.
+the chats pinned to it are flagged like local ones, and the satellite
+removes the files no row and no live session names). Never touched: a
+workspace outside those folders, plans, ``state_*.sqlite``,
+token/credential dirs.
 
 Safety model: live sessions are excluded via a snapshot of the real runtime
-registries (cli ``_persistent_sessions``, codex ``_codex_sessions`` incl.
-their exact ``config_dir``/``thread_id``, ``_session_security`` contexts,
+registries (the remote layer's sessions with their threads, Direct LLM's
+pool, the ``_session_security`` contexts of those sessions,
 ``_active_pumps``) — NOT ``session_state._sessions``, which is append-only.
 Session ids shared across chat rows (continue_session delegation chains) are
 protected by a "referenced by any fresh chat" set. Every file age-checked;
@@ -57,6 +63,7 @@ import contextlib
 import json
 import logging
 import os
+import posixpath
 import re
 import stat
 import time
@@ -67,9 +74,10 @@ from pathlib import Path
 
 import config
 from core import layout, placement
+from core.layers.codex import session_text
 from core.session import external_identity
 from core.session.external_identity import external_home_of
-from services.infra import external_retention
+from services.infra import external_retention, history_retention, working_files
 from services.infra.agent_dirs import agent_dirs
 from storage import database as task_store
 
@@ -131,6 +139,8 @@ _ARCHIVE_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 # A purge waits while the archive of a just-removed person is still due
 # to be written (the offboarding timer, plus a margin).
 _ARCHIVE_GRACE_S = 600
+# A session's home changed this recently is a start in flight (``_pass_session_homes``).
+_HOME_FRESH_S = 3600
 
 
 class ArchiveBusy(RuntimeError):
@@ -299,6 +309,10 @@ def _delete_archive(username: str) -> None:
     except PermissionError:
         _make_tree_writable(rel)
         safe_fs.rmtree_beneath(config.AGENTS_DIR, rel, missing_ok=True)
+    # The person's histories were archived beside the store, not in the
+    # folder: they go with the archive.
+    from services.infra import git_writer
+    git_writer.forget_archived(username)
 
 
 def _pass_offboarded_archives(stats: dict, dry_run: bool) -> None:
@@ -348,19 +362,22 @@ class LiveSnapshot:
     session_ids: set = field(default_factory=set)
     codex_thread_ids: set = field(default_factory=set)
     pump_chat_ids: set = field(default_factory=set)
-    codex_config_dirs: set = field(default_factory=set)   # resolved .codex paths
     busy_homes: set = field(default_factory=set)          # (agent, username)
     # Resolved ``external_home`` paths of live external sessions (phone
     # callers) — the caller-data pass never touches a tree in use.
     busy_external_homes: set = field(default_factory=set)
+    # The sessions the machines run for this platform (the remote layer's):
+    # a compute session's home sits in the platform's folder.
+    machine_session_ids: set = field(default_factory=set)
 
 
 def _build_live_snapshot() -> LiveSnapshot:
     """Snapshot every in-use signal. Must run on the event loop (the
     registries are loop-owned); the threaded sweep gets the frozen copy.
 
-    Liveness truth = the warm-daemon registries (cli _persistent_sessions +
-    codex _codex_sessions) and _active_pumps. Deliberately NOT
+    Liveness truth = the registries of who holds a session (the remote
+    layer's, a machine's sessions with their threads, and Direct LLM's
+    pool) and _active_pumps. Deliberately NOT
     core.session.session_state._sessions (append-only, persisted — would mark
     everything live) and NOT the raw _session_security map: contexts are
     cleared on clean close but survive a proxy restart for up to 24h, so
@@ -370,27 +387,18 @@ def _build_live_snapshot() -> LiveSnapshot:
     """
     snap = LiveSnapshot()
     from core.events.stream_pump import _active_pumps
-    from core.layers.cli.session import _persistent_sessions
-    from core.layers.codex.session import _codex_sessions
     from core.layers.direct.session import _direct_sessions
     from core.session.session_state import _session_security
 
-    snap.session_ids.update(_persistent_sessions.keys())
     # Direct-LLM sessions have no files of their own, but an external caller
     # on a Direct agent still has a live caller tree.
     snap.session_ids.update(_direct_sessions.keys())
-    for sid, sess in _codex_sessions.items():
-        snap.session_ids.add(sid)
-        tid = getattr(sess, "thread_id", None)
-        if tid:
-            snap.codex_thread_ids.add(tid)
-        cfg_dir = getattr(sess, "config_dir", "") or ""
-        if cfg_dir:
-            try:
-                snap.codex_config_dirs.add(str(Path(cfg_dir).resolve()))
-            except OSError:
-                snap.codex_config_dirs.add(str(cfg_dir))
-    for sid in snap.session_ids:
+    # A session a machine runs, with its thread: a compute machine's session
+    # keeps its files in the platform's folder, so its home is busy here.
+    remote_ids, _by_machine = _remote_live_ids()
+    snap.session_ids |= remote_ids
+    snap.codex_thread_ids |= remote_ids
+    for sid in list(snap.session_ids):
         ctx = _session_security.get(sid)
         agent = getattr(ctx, "agent", "") or "" if ctx else ""
         if agent:
@@ -402,6 +410,8 @@ def _build_live_snapshot() -> LiveSnapshot:
             except OSError:
                 snap.busy_external_homes.add(home)
     snap.pump_chat_ids.update(_active_pumps.keys())
+    from core.remote.remote_execution import get_remote_layer
+    snap.machine_session_ids.update(getattr(get_remote_layer(), "_sessions", {}) or {})
     return snap
 
 
@@ -462,7 +472,7 @@ def _home_for_chat(agent: str, user_sub: str) -> Path:
 def _unlink(path: Path, stats: dict, count_key: str, bytes_key: str,
             dry_run: bool) -> None:
     """Remove one session file, or a folder an engine keeps for a session,
-    beneath the agents root with no link followed (a planted link at any
+    beneath the agent's real folder with no link followed (a planted link at any
     component is left where it is, and is no error); counted under
     ``count_key``, its bytes under ``bytes_key``."""
     from services.infra import safe_fs
@@ -487,24 +497,31 @@ def _unlink(path: Path, stats: dict, count_key: str, bytes_key: str,
 
 
 def _remove_beneath(path: Path, *, tree: bool) -> None:
-    """``path`` removed beneath the agents root (its ``rel`` from the path as
-    listed, never resolved); one outside it (the legacy transcript beside
-    the proxy's own home) is removed in place."""
+    """``path`` removed beneath the agent's real folder that holds it
+    (``core.agent_folder``), or beneath the agents root for a folder of no
+    agent there, its ``rel`` from the path as listed, never resolved; one
+    outside both (the legacy transcript beside the proxy's own home) is
+    removed in place. A path whose parts are refused (a ``..`` part, a
+    relative path) raises and removes nothing."""
     import shutil
 
+    from core.agent_folder import beneath_agent
     from services.infra import safe_fs
     try:
-        rel = safe_fs.rel_under(str(path), config.AGENTS_DIR)
-    except safe_fs.SafeFsError:
-        if tree:
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-        return
+        root, rel = beneath_agent(path)
+    except safe_fs.EscapeRefused:
+        try:
+            root, rel = config.AGENTS_DIR, safe_fs.rel_under(str(path), config.AGENTS_DIR)
+        except safe_fs.EscapeRefused:
+            if tree:
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            return
     if tree:
-        safe_fs.rmtree_beneath(config.AGENTS_DIR, rel)
+        safe_fs.rmtree_beneath(root, rel)
     else:
-        safe_fs.unlink_beneath(config.AGENTS_DIR, rel)
+        safe_fs.unlink_beneath(root, rel)
 
 
 def _unlink_with_companions(layers, path: Path, stats: dict, count_key: str,
@@ -615,7 +632,10 @@ def _remote_live_ids() -> tuple[set[str], dict[str, set[str]]]:
         if info.resume_handle:
             ids.add(info.resume_handle)
         all_ids |= ids
-        by_machine.setdefault(info.machine_id, set()).update(ids)
+        # A compute session beside the platform has its files in the
+        # platform's folder: its ids are live here, and no machine is asked.
+        if getattr(info, "files_synced", True):
+            by_machine.setdefault(info.machine_id, set()).update(ids)
     return all_ids, by_machine
 
 
@@ -665,15 +685,16 @@ async def _ask_machine_retention(cm, machine_id: str, keep: set[str], dry_run: b
 
 
 async def _pass_remote_sessions(days: int, enabled: bool, live: LiveSnapshot,
-                                stats: dict, dry_run: bool) -> None:
+                                stats: dict, dry_run: bool,
+                                gone_refs: frozenset[str] | set[str] = frozenset()) -> None:
     """The sweep's remote half, on the loop after the threaded passes: the
     chats pinned to a machine age out like local ones (Pass A's guards and
     flag; the live ids are the remote layer's), then every connected
-    machine at 0.5.150 is asked to remove the transcripts no row and no
-    live session names (``session_files_retention``, a per-machine keep
-    list, the orphan grace by the machine's clock), so an aged chat's old
-    files and the orphans go together. An offline or older machine keeps
-    its files until a sweep finds it connected: the flag is set either way
+    machine is asked to remove the transcripts no row and no live session
+    names (``session_files_retention``, a per-machine keep list, the orphan
+    grace by the machine's clock), so an aged chat's old files and the
+    orphans go together. An offline machine keeps its files until a sweep
+    finds it connected: the flag is set either way
     and the chat's next open reseeds, as a local aged chat's does."""
     from core.remote.satellite_connection import get_connection_manager
     from core.session.session_manager import get_all_layers
@@ -687,7 +708,7 @@ async def _pass_remote_sessions(days: int, enabled: bool, live: LiveSnapshot,
     # The ids of the chats this pass ages: a dry run writes nothing, so they
     # leave the keep lists by hand, as the flagging takes them out of the rows
     # a real run then reads (the machines name the same candidates either way).
-    aged_refs: set[str] = set()
+    aged_refs: set[str] = set(gone_refs)
     if enabled:
         fileless = [path for path, layer in get_all_layers().items()
                     if layer.capabilities.behaviour.rebuilds_history_from_db]
@@ -713,8 +734,9 @@ async def _pass_remote_sessions(days: int, enabled: bool, live: LiveSnapshot,
                 task_store.flag_chats_for_retention, planned, cutoff)
             stats["chats_flagged"] += len(flagged)
             stats["remote_chats_flagged"] += len(flagged)
-    machines = [mid for mid in cm.get_connected_machines()
-                if cm.satellite_supports_session_retention(mid)]
+    # A compute machine beside the platform keeps no files of its own:
+    # nothing to ask it. One on another host keeps its chats' engine records.
+    machines = [mid for mid in cm.get_connected_machines() if not cm.shares_folders(mid)]
     if machines:
         # The ids by the machine their row names. The rows that name no place
         # (``""``: the scheduled tasks' continued sessions, rows minted before
@@ -787,37 +809,139 @@ def _pass_orphans(live: LiveSnapshot, stats: dict, dry_run: bool) -> None:
                                             "orphan_bytes", dry_run)
 
 
-def _pass_codex_junk(live: LiveSnapshot, stats: dict, dry_run: bool) -> None:
+RECORD_MAX_AGE_S = 30 * 86400
+
+
+def _session_live(session_id: str) -> bool:
+    """A terminal runs under this id, or a layer holds it (headless,
+    compute, paired): the registries' own single-key lookups, safe from the
+    sweep's thread."""
+    from core.session import interactive_registry, session_manager
+    return (interactive_registry.get(session_id) is not None
+            or session_manager.live_session(session_id) is not None)
+
+
+def _codex_session_leftovers(codex: Path, live: LiveSnapshot, now: float, *,
+                             sessions_known: bool = True) -> list[Path]:
+    """The own files of a session that is not live, in any home (a session
+    closed after a proxy restart has no record of the folder it wrote);
+    a thread's record after a month, unless its thread runs (its next
+    resume then gets its text once more). Young files stay (``JUNK_MIN_AGE_S``
+    at the caller): a session that starts writes them before it registers.
+    No session's own file goes while ``sessions_known`` is False: after a
+    restart, until every compute machine the session index names has sent
+    its first complete report (``compute_bootstrap.waiting``)."""
+    out: list[Path] = []
+    for f in codex.glob("*"):
+        m = session_text.SESSION_FILE_RE.fullmatch(f.name)
+        if m is None or not f.is_file():
+            continue
+        if m.group(2) == session_text.RECORD_SUFFIX:
+            if m.group(1) not in live.codex_thread_ids and _mtime_older_than(f, RECORD_MAX_AGE_S, now):
+                out.append(f)
+        elif sessions_known and not _session_live(m.group(1)):
+            out.append(f)
+    return out
+
+
+def _pass_session_homes(live: LiveSnapshot, stats: dict, dry_run: bool) -> None:
+    """The homes of sessions that are gone (``core/sandbox/session_home``) in
+    the engine folders the platform shares with a compute machine beside it:
+    each holds a sign-in file. Never inside the pool's boot grace, when a
+    session a restart left running is not back in the registries yet. One
+    answer says a session is gone (``subscription_pool.session_gone``: no
+    registry holds it, terminals included, and its machine is here and has
+    reported since this start), and its stored binding goes with its home.
+    A home that changed in the last hour is left: a start makes its home
+    long before its binding row, and touches it when it starts again in
+    one. Each home is judged by itself: one that cannot be removed keeps no
+    other. A machine with its own copy sweeps its own."""
+    import psycopg
+
+    from core.sandbox import session_home
+    from services.engines import subscription_pool
+    if subscription_pool.within_boot_grace():
+        return
     now = time.time()
+    for _agent, _username, home in iter_local_homes():
+        for name in (".claude", ".codex"):
+            own = home / name / session_home.OWN
+            if own.is_symlink() or not own.is_dir():
+                continue
+            for sid in sorted(os.listdir(own)):
+                try:
+                    if (not session_home.valid_id(sid)
+                            or not _mtime_older_than(own / sid, _HOME_FRESH_S, now)
+                            or not subscription_pool.session_gone(sid)):
+                        continue
+                    if dry_run:
+                        stats["session_homes_removed"] += 1
+                    elif session_home.drop(home / name, sid, ()):
+                        stats["session_homes_removed"] += 1
+                        subscription_pool.drop_ghost_binding(sid)
+                except (OSError, psycopg.Error):
+                    stats["errors"] = stats.get("errors", 0) + 1
+                    logger.warning("retention: the home of session %s in %s is left", sid[:8], own,
+                                   exc_info=True)
+
+
+def _codex_tmp_tree(agent: str, codex: Path) -> tuple[list[Path], list[str]]:
+    """The files and links under ``<codex>/.tmp`` (as paths, for the safe
+    ``_unlink``) and its folders below it (rels beneath the agent's real
+    folder, ``core.agent_folder.agent_root``, for ``safe_fs.rmdir_beneath``),
+    from one walk that enters no link: a ``.tmp`` that is a link, or sits
+    behind one below the agent's folder, lists nothing."""
+    from core.agent_folder import beneath_agent
+    from services.infra import safe_fs
+    files: list[Path] = []
+    dirs: list[str] = []
+    try:
+        root, base = beneath_agent(codex, agent)
+        rel = posixpath.join(base, ".tmp")
+        for step in safe_fs.walk_beneath(root, rel, onerror=lambda exc: None):
+            here = codex / ".tmp" / step.rel[len(rel):].lstrip("/")
+            files.extend(here / name for name in step.files + step.symlinks)
+            dirs.extend(step.path(name) for name in step.dirs)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.debug("retention: %s/.tmp not walked", codex, exc_info=True)
+        return [], []
+    return files, dirs
+
+
+def _pass_codex_junk(live: LiveSnapshot, stats: dict, dry_run: bool) -> None:
+    from services.remote import compute_bootstrap
+    now = time.time()
+    sessions_known = not compute_bootstrap.waiting()
     for agent, username, home in iter_local_homes():
         codex = home / ".codex"
         if not codex.is_dir():
             continue
-        if (agent, username) in live.busy_homes:
-            continue
-        try:
-            resolved = str(codex.resolve())
-        except OSError:
-            resolved = str(codex)
-        if resolved in live.codex_config_dirs:
-            continue
-        # Telemetry/log DBs (incl. -wal/-shm sidecars). state_*.sqlite is
-        # Codex's thread state — small and load-bearing, never touched.
-        targets: list[Path] = list(codex.glob("logs_*.sqlite*"))
-        tmp = codex / ".tmp"
-        if tmp.is_dir():
-            targets.extend(p for p in tmp.rglob("*")
-                           if p.is_file() or p.is_symlink())
+        targets = _codex_session_leftovers(codex, live, now, sessions_known=sessions_known)
+        # A temporary sign-in file a killed save left (Codex 0.169 saves by
+        # ``.auth-XXXXXX`` and a rename): the credentials. Past the in-flight
+        # guard below it goes whatever runs (a save takes a moment).
+        targets.extend(f for f in codex.glob(".auth-*") if f.is_file() and not f.is_symlink())
+        idle = (agent, username) not in live.busy_homes
+        tmp_dirs: list[str] = []
+        if idle:
+            # Telemetry/log DBs (incl. -wal/-shm sidecars). state_*.sqlite is
+            # Codex's thread state — small and load-bearing, never touched.
+            targets.extend(codex.glob("logs_*.sqlite*"))
+            tmp_files, tmp_dirs = _codex_tmp_tree(agent, codex)
+            targets.extend(tmp_files)
         for f in targets:
             if _mtime_older_than(f, JUNK_MIN_AGE_S, now):
                 _unlink(f, stats, "codex_junk_files", "codex_junk_bytes", dry_run)
-        if tmp.is_dir() and not dry_run:
+        if not dry_run:
             # Prune emptied staging subdirs, deepest first; keep .tmp itself.
-            subdirs = sorted((p for p in tmp.rglob("*") if p.is_dir()),
-                             key=lambda p: len(p.parts), reverse=True)
-            for d in subdirs:
+            # A folder that is not empty stays.
+            from core.agent_folder import agent_root
+            from services.infra import safe_fs
+            for rel in sorted(tmp_dirs, key=lambda r: r.count("/"), reverse=True):
                 with contextlib.suppress(OSError):
-                    d.rmdir()
+                    safe_fs.rmdir_beneath(agent_root(agent), rel)
 
 
 def _pass_tarball_gc(stats: dict, dry_run: bool) -> None:
@@ -825,6 +949,20 @@ def _pass_tarball_gc(stats: dict, dry_run: bool) -> None:
         return
     from services.mcp import mcp_tarball
     stats["tarball_bytes"] += mcp_tarball.gc()
+
+
+def _pass_orphan_histories(stats: dict, dry_run: bool) -> None:
+    """The histories of agents that are gone, and old set-aside copies
+    (services/infra/git_writer.py). An agent's delete removes its histories
+    itself: this is for a removal that failed. An agent counts as gone only
+    with no row AND no folder, so an agents folder that is not mounted, or
+    cannot be read, removes nothing."""
+    from services.infra import git_writer
+    from storage.agents import agent_store
+    removed = git_writer.remove_orphans(set(agent_store.get_agent_slugs()), dry_run=dry_run)
+    if removed:
+        logger.info("retention: %s%d histor%s of agents that are gone or set-aside copies past their keep",
+                    "would remove " if dry_run else "removed ", removed, "y" if removed == 1 else "ies")
 
 
 def _pass_orphan_partials(stats: dict, dry_run: bool) -> None:
@@ -935,6 +1073,15 @@ def _pass_reply_reports(stats: dict, dry_run: bool) -> None:
     )
 
 
+def _pass_tool_listings(stats: dict, dry_run: bool) -> None:
+    """What a tool's program answered, saved for a person's next session
+    (``services/mcp/tool_listing.py``): every row nobody used for 30 days
+    goes, whatever the chat retention toggle says (a capture can name an
+    account's email)."""
+    from services.mcp import tool_listing
+    stats["tool_listings_deleted"] += tool_listing.sweep_unused(dry_run=dry_run)
+
+
 def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
                     dry_run: bool) -> dict:
     started = time.monotonic()
@@ -950,6 +1097,7 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         "orphans_deleted": 0,
         "orphan_bytes": 0,
         "codex_junk_files": 0,
+        "session_homes_removed": 0,
         "codex_junk_bytes": 0,
         "tarball_bytes": 0,
         "partials_deleted": 0,
@@ -960,6 +1108,7 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         "shares_deleted": 0,
         "notebook_entries_pruned": 0,
         "reply_reports_deleted": 0,
+        "tool_listings_deleted": 0,
         "recover_bin_rows_pruned": 0,
         "recover_bin_orphans_deleted": 0,
         # The machines (``_pass_remote_sessions``, on the loop after this).
@@ -981,6 +1130,11 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         # The archive of removed people (its own setting, read in the pass).
         "offboarded_deleted": 0,
         "offboarded_bytes": 0,
+        # The working-files window and the history window (their own
+        # settings, read in the pass).
+        **dict.fromkeys(working_files.STAT_KEYS, 0),
+        **dict.fromkeys(history_retention.STAT_KEYS, 0),
+        "working_files_grace_until": "",
         "errors": 0,
     }
     passes = [
@@ -998,8 +1152,11 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
     passes.extend([
         ("orphans", lambda: _pass_orphans(live, stats, dry_run)),
         ("codex-junk", lambda: _pass_codex_junk(live, stats, dry_run)),
+        ("session-homes", lambda: _pass_session_homes(live, stats, dry_run)),
+        ("working-files", lambda: working_files.run_pass(stats, dry_run)),
         ("tarball-gc", lambda: _pass_tarball_gc(stats, dry_run)),
         ("orphan-partials", lambda: _pass_orphan_partials(stats, dry_run)),
+        ("orphan-histories", lambda: _pass_orphan_histories(stats, dry_run)),
         ("orphan-quota-projects", lambda: _pass_orphan_quota_projects(stats, dry_run)),
         ("mcp-autoupdate-log", lambda: _pass_mcp_autoupdate_log(stats, dry_run)),
         ("recover-bin-blobs", lambda: _pass_recover_bin_blobs(stats, dry_run)),
@@ -1007,6 +1164,7 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         ("stale-shares", lambda: _pass_stale_shares(stats, dry_run)),
         ("notebook-entries", lambda: _pass_notebook_entries(stats, dry_run)),
         ("reply-reports", lambda: _pass_reply_reports(stats, dry_run)),
+        ("tool-listings", lambda: _pass_tool_listings(stats, dry_run)),
         ("offboarded-archives", lambda: _pass_offboarded_archives(stats, dry_run)),
     ])
     for name, fn in passes:
@@ -1018,7 +1176,8 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
     stats["duration_ms"] = int((time.monotonic() - started) * 1000)
     total = (stats["bytes_freed"] + stats["orphan_bytes"]
              + stats["codex_junk_bytes"] + stats["tarball_bytes"]
-             + stats["caller_bytes_freed"] + stats["offboarded_bytes"])
+             + stats["caller_bytes_freed"] + stats["offboarded_bytes"]
+             + stats["working_files_bytes"])
     logger.info(
         "retention: sweep done in %sms "
         "(dry_run=%s, enabled=%s): "
@@ -1030,11 +1189,14 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         "%s phone chats, "
         "%s share rows, "
         "%s recover-bin rows without bytes, "
+        "%s working files, "
         "%s bytes total",
         stats['duration_ms'], dry_run, enabled, stats['chats_flagged'],
         stats['session_files_deleted'], stats['orphans_deleted'], stats['codex_junk_files'],
         stats['callers_forgotten'], stats['phone_chats_deleted'], stats['shares_deleted'],
-        stats['recover_bin_rows_pruned'], total
+        stats['recover_bin_rows_pruned'],
+        stats['working_uploads_binned'] + stats['working_screenshots_deleted'],
+        total
     )
     return stats
 
@@ -1056,8 +1218,14 @@ async def run_sweep(*, dry_run: bool = False) -> dict:
         stats = await asyncio.to_thread(
             _run_sweep_sync, days, enabled, snapshot, dry_run,
         )
+        gone_refs: set[str] = set()
         try:
-            await _pass_remote_sessions(days, enabled, snapshot, stats, dry_run)
+            gone_refs = await history_retention.run_pass(stats, dry_run)
+        except Exception:
+            stats["errors"] += 1
+            logger.exception("retention: pass 'history' failed")
+        try:
+            await _pass_remote_sessions(days, enabled, snapshot, stats, dry_run, gone_refs)
         except Exception:
             stats["errors"] += 1
             logger.exception("retention: pass 'remote-sessions' failed")
@@ -1083,9 +1251,14 @@ async def run_sweep(*, dry_run: bool = False) -> dict:
 
 async def maybe_run_daily() -> None:
     """Called every 60s from app.py's registry sweep loop; runs at most once
-    per 24h. First run lands ~60s after boot (cheap when there's nothing
-    to do)."""
+    per 24h. The first run lands once the pool's boot grace is over: the
+    pass over the sessions' homes passes over every home inside it, and the
+    next run is a day later, which an install that restarts every day never
+    reaches."""
     if time.monotonic() - _last_run < _SWEEP_INTERVAL_S and _last_run:
+        return
+    from services.engines import subscription_pool
+    if subscription_pool.within_boot_grace():
         return
     await run_sweep()
 
@@ -1095,20 +1268,10 @@ async def maybe_run_daily() -> None:
 # ---------------------------------------------------------------------------
 
 def _tree_bytes(path: Path) -> int:
-    total = 0
-    try:
-        if not path.exists():
-            return 0
-        for p in path.rglob("*"):
-            try:
-                st = p.lstat()
-            except OSError:
-                continue
-            if not (st.st_mode & 0o170000) == 0o040000:  # not a directory
-                total += st.st_size
-    except OSError:
-        pass
-    return total
+    """The bytes under ``path`` (``storage_quota.dir_usage``, the one walk
+    that counts a folder: beneath the agent's real folder, no link followed)."""
+    from services.infra import storage_quota
+    return storage_quota.dir_usage(path)[0]
 
 
 def compute_storage_usage() -> dict:
@@ -1116,17 +1279,15 @@ def compute_storage_usage() -> dict:
     asyncio.to_thread (walks the agents tree)."""
     session_files = 0
     codex_junk = 0
+    from services.infra import storage_quota
     for _agent, _username, home in iter_local_homes():
-        for f in (home / ".claude" / "projects").glob("*/*.jsonl"):
-            with contextlib.suppress(OSError):
-                session_files += f.lstat().st_size
-        for f in (home / ".codex" / "sessions").rglob("*.jsonl"):
-            with contextlib.suppress(OSError):
-                session_files += f.lstat().st_size
+        # A home's engine folders are the sessions' to write: counted
+        # beneath the agent's real folder with no link followed.
+        session_files += storage_quota.dir_usage(home / ".claude" / "projects", match="*.jsonl",
+                                                 max_depth=2)[0]
+        session_files += storage_quota.dir_usage(home / ".codex" / "sessions", match="*.jsonl")[0]
         codex = home / ".codex"
-        for f in codex.glob("logs_*.sqlite*"):
-            with contextlib.suppress(OSError):
-                codex_junk += f.lstat().st_size
+        codex_junk += storage_quota.dir_usage(codex, match="logs_*.sqlite*", max_depth=1)[0]
         codex_junk += _tree_bytes(codex / ".tmp")
 
     base = Path(config.BASE_DIR)

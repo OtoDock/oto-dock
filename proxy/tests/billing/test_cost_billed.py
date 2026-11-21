@@ -5,10 +5,11 @@ answers True; anything the pool cannot resolve answers True (show — today's
 behaviour). Recording is not this function's business and never consults it.
 """
 
-from unittest.mock import patch
 
 import psycopg
 import pytest
+
+from tests._pool_store import pool_store
 
 
 def _reset(sp):
@@ -25,7 +26,7 @@ class TestSessionCostBilled:
         ("relay", True),
         ("some-future-kind", True),  # unknown type keeps showing
     ])
-    @patch("services.engines.subscription_pool.subscription_store")
+    @pool_store()
     def test_auth_type_decides(self, mock_store, auth_type, billed):
         from services.engines import subscription_pool as sp
         _reset(sp)
@@ -37,7 +38,7 @@ class TestSessionCostBilled:
         finally:
             _reset(sp)
 
-    @patch("services.engines.subscription_pool.subscription_store")
+    @pool_store()
     def test_unbound_session_is_billed(self, mock_store):
         # No live binding and no persisted row: pool-external credentials —
         # the kind is unknowable, the cost stays visible.
@@ -47,7 +48,7 @@ class TestSessionCostBilled:
         assert sp.session_cost_billed("sess-nobody") is True
         mock_store.get_subscription.assert_not_called()
 
-    @patch("services.engines.subscription_pool.subscription_store")
+    @pool_store()
     def test_reads_through_the_persisted_binding(self, mock_store):
         # A session that outlived a proxy restart (satellite, re-adopted chat)
         # only has the persisted row — same read-through as attribution.
@@ -57,7 +58,7 @@ class TestSessionCostBilled:
         mock_store.get_subscription.return_value = {"id": "sub-p", "auth_type": "oauth"}
         assert sp.session_cost_billed("sess-restarted") is False
 
-    @patch("services.engines.subscription_pool.subscription_store")
+    @pool_store()
     def test_missing_row_or_store_error_is_billed(self, mock_store):
         from services.engines import subscription_pool as sp
         _reset(sp)

@@ -548,6 +548,128 @@ def test_delete_still_closes_a_pooled_session_through_its_layer(temp_db, monkeyp
     assert task_store.get_chat(cid) is None
 
 
+def _rebinding_delete(monkeypatch, cid, late_sid):
+    """The chat's row bound to another session after the route read it (a
+    warm-up's bind landing late): recorded closes per session id."""
+    from core.session import session_manager
+    from services.agents import chat_removal
+    closed: list[str] = []
+
+    class FakeLayer:
+        async def close_session(self, session_id):
+            closed.append(session_id)
+
+    layer = FakeLayer()
+    monkeypatch.setattr(session_manager, "find_layer_for_session", lambda s: layer)
+    real = chat_removal.close_chat_terminal
+
+    async def rebind_then_close(chat_id):
+        task_store.update_chat(chat_id, session_id=late_sid)
+        await real(chat_id)
+    monkeypatch.setattr(chat_removal, "close_chat_terminal", rebind_then_close)
+    return closed
+
+
+def test_delete_closes_a_session_bound_after_the_route_read_the_row(temp_db, monkeypatch):
+    from api.agents import chats as api
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    task_store.update_chat(cid, session_id="sess-first")
+    closed = _rebinding_delete(monkeypatch, cid, "sess-late")
+    assert asyncio.run(api.delete_chat(cid, user=EDITOR)) == {"status": "ok"}
+    assert closed == ["sess-first", "sess-late"]
+    assert task_store.get_chat(cid) is None
+
+
+def test_delete_closes_a_session_bound_while_its_own_statement_ran(temp_db, monkeypatch):
+    """A bind that lands between the delete's own read and its row delete
+    (a start that does not ride the chat's lane): the session the delete
+    took the row away from is the one closed."""
+    from api.agents import chats as api
+    from storage.chat import db_chats
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    task_store.update_chat(cid, session_id="sess-first")
+    closed = _rebinding_delete(monkeypatch, cid, "sess-first")
+    real = db_chats.get_cache_owned_media_for_chat
+
+    def bind_late(chat_id):
+        task_store.update_chat(chat_id, session_id="sess-late")
+        return real(chat_id)
+    monkeypatch.setattr(db_chats, "get_cache_owned_media_for_chat", bind_late)
+    assert asyncio.run(api.delete_chat(cid, user=EDITOR)) == {"status": "ok"}
+    assert closed == ["sess-first", "sess-late"]
+    assert task_store.get_chat(cid) is None
+
+
+def test_a_sweep_that_keeps_the_chat_closes_no_session_bound_late(temp_db, monkeypatch):
+    """The retention sweep keeps a chat a session was bound to meanwhile:
+    that live session is the chat's and stays."""
+    from services.agents import chat_removal
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    task_store.update_chat(cid, session_id="sess-first")
+    closed = _rebinding_delete(monkeypatch, cid, "sess-late")
+    monkeypatch.setattr(task_store, "delete_chat_bound", lambda *a, **k: (False, "", []))
+    chat = task_store.get_chat(cid)
+    kept = not asyncio.run(chat_removal.remove_chat(chat, untouched_before="2000-01-01T00:00:00+00:00"))
+    assert kept and "sess-late" not in closed
+
+
+def test_a_wake_starts_nothing_on_a_chat_being_deleted():
+    from core.events import input_queue
+    from services.scheduler import wake_session
+    cid = "chat-" + uuid.uuid4().hex[:8]
+
+    async def scenario():
+        assert wake_session._wake_superseded("", cid) is False
+        input_queue.mark_deleting(cid)
+        try:
+            assert wake_session._wake_superseded("", cid) is True
+        finally:
+            input_queue.unmark_deleting(cid, landed=False)
+    asyncio.run(scenario())
+
+
+def test_delete_goes_on_once_a_one_shot_turn_has_its_pump(temp_db, monkeypatch):
+    """A continued turn after a restart is a one-shot whose plan review may
+    wait on a person: once its pump is on the chat its session is in its
+    layer, so the delete ends the pump and closes the session (the review is
+    denied with it) instead of answering "still starting"."""
+    from api.agents import chats as api
+    from core.events.stream_pump import _active_pumps
+    from core.session import session_delivery, session_manager
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    task_store.update_chat(cid, session_id="sess-oneshot")
+    closed: list[str] = []
+    ended: list[str] = []
+
+    class FakeLayer:
+        async def close_session(self, session_id):
+            closed.append(session_id)
+
+    class FakePump:
+        is_done = False
+        source_type = "chat"
+
+        async def end_for_delete(self):
+            ended.append(cid)
+            self.is_done = True
+
+    layer = FakeLayer()
+    monkeypatch.setattr(session_manager, "find_layer_for_session", lambda s: layer)
+    monkeypatch.setitem(_active_pumps, cid, FakePump())
+
+    async def scenario():
+        monkeypatch.setitem(session_delivery._oneshot_inflight, cid, asyncio.Event())
+        return await api.delete_chat(cid, user=EDITOR)
+
+    assert asyncio.run(scenario()) == {"status": "ok"}
+    assert ended == [cid] and closed == ["sess-oneshot"]
+    assert task_store.get_chat(cid) is None
+
+
 def test_delete_waits_for_a_chat_that_is_still_starting(temp_db, monkeypatch):
     """A warming session is registered nowhere a close can reach, so the
     delete refuses with its own sentence until the session exists; the row
@@ -670,13 +792,14 @@ def test_a_failed_delete_lifts_the_mark_and_reloads_the_queue(temp_db, monkeypat
     from api.agents import chats as api
     from core.events import input_queue
     from core.events.common_events import TurnInput
+    from services.agents import chat_removal
     from services.scheduler import shared
     monkeypatch.setattr(shared, "_shutting_down", False)
     monkeypatch.setattr(input_queue, "VIEWER_GRACE_S", 0.0)
 
     async def _boom(chat):
         raise RuntimeError("the session's layer is gone")
-    monkeypatch.setattr(api, "_close_chat_session", _boom)
+    monkeypatch.setattr(chat_removal, "close_chat_session", _boom)
     cid = str(uuid.uuid4())
     task_store.create_chat(cid, "user-ed", AGENT)
 

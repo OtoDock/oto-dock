@@ -32,9 +32,15 @@ from core.config.task_config_builder import (
     run_allows_knowledge_rw,
     task_allows_knowledge_rw,
 )
-from core.session.visibility import _task_continue_allowed
+from core.sandbox.sandbox_render import ROOT_AGENT, ROOT_EMPTY, ROOT_NULL, Bind
+from core.session.visibility import KNOWLEDGE_RUN_REFUSED, task_continue_refusal
+
+
+def _task_continue_allowed(run: dict, *, effective_role: str, user_sub: str) -> bool:
+    return not task_continue_refusal(run, effective_role=effective_role, user_sub=user_sub)
 from storage import database as task_store
 from storage.agents import agent_store
+from tests._compute import serve
 from ws.dashboard import _rewarm_chat_allowed
 
 # ---------------------------------------------------------------------------
@@ -121,7 +127,7 @@ class TestResolveTaskIdentity:
             _mk_user(sub, sub, role="member")
             task_store.add_user_agent(sub, "voicebot", role, "admin")
         assert resolve_task_identity("voicebot", "user", "sub-v") == TaskIdentity(
-            username="", role="viewer", scope="agent", creds_user_sub=None)
+            username="", role="viewer", scope="agent", creds_user_sub=None, person="sub-v")
         assert resolve_task_identity("voicebot", "user", "sub-c").role == "contributor"
         ident = resolve_task_identity("voicebot", "user", "sub-e", allow_knowledge_rw=True)
         assert (ident.role, ident.scope, ident.knowledge_rw) == ("manager", "agent", False)
@@ -346,6 +352,390 @@ class TestTaskContinueAllowed:
         )
 
 
+class TestKnowledgeRunTakesAManager:
+    """A run whose session writes the agent's knowledge is a manager's to
+    continue: the write is the creator's, and whoever drives the run steers
+    it. An editor keeps every run that holds no such write."""
+
+    def _people(self):
+        agent_store.create_agent("ops", "Ops")
+        _mk_user("sub-m", "Max")
+        task_store.add_user_agent("sub-m", "ops", "manager", "admin")
+        _mk_user("sub-e", "Eve")
+        task_store.add_user_agent("sub-e", "ops", "editor", "admin")
+
+    def _run(self, created_by="sub-m", task_type="scheduled", status="completed", **kw) -> dict:
+        return {"scope": "agent", "agent": "ops", "created_by": created_by,
+                "task_type": task_type, "status": status, **kw}
+
+    def _refusal(self, run: dict, role: str) -> str:
+        from core.session.visibility import task_continue_refusal
+        return task_continue_refusal(run, effective_role=role, user_sub="sub-e")
+
+    def test_an_editor_is_refused_a_managers_scheduled_run_and_reads_why(self, temp_db):
+        from core.session.visibility import KNOWLEDGE_RUN_REFUSED
+        self._people()
+        for kind in ("scheduled", "delegate"):
+            assert self._refusal(self._run(task_type=kind), "editor") == KNOWLEDGE_RUN_REFUSED
+            assert not _task_continue_allowed(self._run(task_type=kind), effective_role="editor",
+                                              user_sub="sub-e")
+            for role in ("manager", "admin"):
+                assert self._refusal(self._run(task_type=kind), role) == ""
+
+    def test_an_editor_keeps_the_runs_that_hold_no_knowledge_write(self, temp_db):
+        self._people()
+        # an editor's own task, the agent's own, a trigger's with no person
+        for creator in ("sub-e", "ops", "api", None):
+            assert self._refusal(self._run(created_by=creator), "editor") == ""
+        # a manager's one-time or trigger run that ended: its re-warm never grants
+        for kind in ("one-time", "trigger", "app", "check"):
+            assert self._refusal(self._run(task_type=kind), "editor") == ""
+
+    def test_a_managers_run_in_progress_follows_the_fires_rule(self, temp_db):
+        from core.session.visibility import KNOWLEDGE_RUN_REFUSED
+        self._people()
+        for status in ("pending", "running"):
+            for kind in ("one-time", "trigger", "scheduled", "delegate"):
+                assert self._refusal(self._run(task_type=kind, status=status),
+                                     "editor") == KNOWLEDGE_RUN_REFUSED
+            assert self._refusal(self._run(task_type="app", status=status), "editor") == ""
+
+    def test_a_live_session_with_the_write_refuses_an_editor_whoever_made_the_run(self, temp_db):
+        """The creator fell to editor since: the next session takes no
+        write, but the live one holds it until it ends. Found by the run
+        row's session id, and by the chat row's (a re-warm that could not
+        resume writes its new id there alone)."""
+        from auth.path_policy import SecurityContext
+        from core.session import session_state
+        from core.session.visibility import KNOWLEDGE_RUN_REFUSED
+        self._people()
+        task_store.set_user_agent_role("sub-m", "ops", "editor")   # demoted since
+        ctx = SecurityContext(role="manager", username="", agent="ops", is_admin_agent=False,
+                              knowledge_rw=True)
+        task_store.create_chat("task-run-9", "task::ops", "ops", source_type="task")
+        task_store.update_chat("task-run-9", session_id="sid-fresh")
+        try:
+            session_state.set_session_security("sid-run", ctx)
+            assert self._refusal(self._run(session_id="sid-run"), "editor") == KNOWLEDGE_RUN_REFUSED
+            session_state.cleanup_session_permission_state("sid-run")
+            assert self._refusal(self._run(session_id="sid-run"), "editor") == ""
+            session_state.set_session_security("sid-fresh", ctx)
+            run = self._run(session_id="sid-old", chat_id="task-run-9")
+            assert self._refusal(run, "editor") == KNOWLEDGE_RUN_REFUSED
+            assert self._refusal(run, "manager") == ""
+        finally:
+            session_state.cleanup_session_permission_state("sid-run")
+            session_state.cleanup_session_permission_state("sid-fresh")
+        # the session gone and the creator an editor now: an ordinary run again
+        assert self._refusal(self._run(session_id="sid-old", chat_id="task-run-9"), "editor") == ""
+
+    def test_a_manager_is_answered_with_no_read(self, monkeypatch):
+        from core.config import task_config_builder
+
+        def _never(run):
+            raise AssertionError("a manager's answer read the store")
+        monkeypatch.setattr(task_config_builder, "run_holds_knowledge_write", _never)
+        for role in ("manager", "admin"):
+            assert self._refusal(self._run(), role) == ""
+        assert self._refusal(self._run(), "viewer") == "Access denied"
+
+    def test_a_user_scope_run_is_never_a_knowledge_run(self, temp_db):
+        from core.config.task_config_builder import run_holds_knowledge_write
+        self._people()
+        assert run_holds_knowledge_write({**self._run(), "scope": "user"}) is False
+        assert run_holds_knowledge_write(self._run()) is True
+
+
+def test_an_editors_keys_never_reach_the_terminal_of_a_knowledge_run(temp_db, monkeypatch):
+    """Every frame that acts on a task run's live terminal passes the gate:
+    an editor's keys, resize and Stop on an admin's run in progress (it fires
+    with the knowledge write) are refused with the sentence."""
+    import base64
+    import uuid
+
+    from core.session import interactive_session
+    from core.session.visibility import KNOWLEDGE_RUN_REFUSED
+    from tests.fixtures.ws_dashboard_harness import make_test_agent
+    from tests.session.test_ws_dashboard_resume_controls import (
+        _bare_connection,
+        _FakeTerminal,
+    )
+    slug = make_test_agent()
+    task_store.add_user_agent("user-viewer2", slug, "editor", "test")
+    run_id = f"run-{uuid.uuid4().hex[:12]}"
+    task_store.create_run(run_id, "dyn-x", slug, "manual", None, "go", "one-time", "agent", "user-admin")
+    held = _FakeTerminal(f"task-{run_id}", "sid-admin-term")
+    monkeypatch.setitem(interactive_session._sessions, "sid-admin-term", held)
+
+    async def scenario():
+        conn = _bare_connection(held.chat_id, "sid-admin-term", user_sub="user-viewer2", agent=slug)
+        await conn._on_pty_input({"data": base64.b64encode(b"echo x >> /knowledge/a.md\r").decode()})
+        await conn._on_pty_resize({"rows": 10, "cols": 20})
+        await conn._on_abort({})
+        return conn.sent
+
+    sent = asyncio.run(scenario())
+    assert (held.inputs, held.resized, held.interrupted) == ([], [], 0)
+    assert {"type": "error", "message": KNOWLEDGE_RUN_REFUSED} in sent
+
+
+class TestKnowledgeRunGateAtItsCallers:
+    """Every caller of the continue gate, on a finished run of an admin's
+    scheduled task (its re-warm takes the knowledge write): an editor is
+    refused at each, and nothing of the run moves."""
+
+    def _run(self, temp_db):
+        import uuid
+
+        from tests.fixtures.ws_dashboard_harness import make_test_agent
+        slug = make_test_agent()
+        task_store.add_user_agent("user-viewer2", slug, "editor", "test")
+        run_id = f"run-{uuid.uuid4().hex[:12]}"
+        task_store.create_run(run_id, "dyn-x", slug, "scheduled", None, "go",
+                              "scheduled", "agent", "user-admin")
+        cid = f"task-{run_id}"
+        task_store.create_chat(cid, f"task::{slug}", slug, permission_mode="auto",
+                               model="model-a", source_type="task")
+        task_store.update_run(run_id, status="completed", chat_id=cid)
+        return slug, cid
+
+    def _conn(self, slug, cid, sid=None):
+        from tests.session.test_ws_dashboard_resume_controls import _bare_connection
+        conn = _bare_connection(cid, sid, user_sub="user-viewer2", agent=slug)
+        conn.user_agents = [slug]
+        conn.agent_roles = {slug: "editor"}
+        return conn
+
+    def test_mode_model_compaction_and_a_cards_answer(self, temp_db):
+        from core.session.visibility import KNOWLEDGE_RUN_REFUSED
+        from tests.fixtures.ws_dashboard_harness import TEST_MODEL
+        slug, cid = self._run(temp_db)
+
+        async def scenario():
+            conn = self._conn(slug, cid, sid="sid-run")
+            await conn._handle_mode_change({"mode": "dontAsk", "chat_id": cid})
+            await conn._handle_model_change({"model": TEST_MODEL, "chat_id": cid})
+            await conn._on_compact_context({})
+            answered = await conn._may_resolve_permission("req-unknown")
+            return conn.sent, answered
+
+        sent, answered = asyncio.run(scenario())
+        assert answered is False
+        row = task_store.get_chat(cid)
+        assert (row["permission_mode"], row["model"]) == ("auto", "model-a")
+        # The two picks are answered with the chat's stored values, the
+        # compaction and the card's answer with the sentence.
+        assert {"type": "mode_changed", "chat_id": cid, "mode": "auto"} in sent
+        assert {"type": "model_changed", "chat_id": cid, "model": "model-a"} in sent
+        assert sent.count({"type": "error", "message": KNOWLEDGE_RUN_REFUSED}) == 2
+
+    def test_the_engine_switch(self, temp_db):
+        slug, cid = self._run(temp_db)
+
+        async def scenario():
+            conn = self._conn(slug, cid)
+            await conn._handle_switch_engine({"execution_path": "codex-cli", "model": "gpt-x"})
+            return conn.sent
+
+        sent = asyncio.run(scenario())
+        denied = [f for f in sent if f.get("type") == "switch_engine_denied"]
+        assert len(denied) == 1 and denied[0]["message"].startswith(
+            "Switching this task chat's engine needs the same access as continuing it.")
+        assert "a manager when the run can change the agent's knowledge" in denied[0]["message"]
+        assert ";" not in denied[0]["message"]
+        assert (task_store.get_chat(cid).get("execution_path") or "") != "codex-cli"
+
+    def test_voice_and_the_move(self, temp_db):
+        from auth.providers import UserContext
+        from services.media import duplex_service
+        from services.remote import chat_move
+        slug, cid = self._run(temp_db)
+        chat = task_store.get_chat(cid)
+
+        def person(sub, role):
+            return UserContext(sub=sub, email=f"{sub}@x.test", name=sub, role="member",
+                               agents=[slug], agent_roles={slug: role})
+
+        assert duplex_service.chat_access_denied_reason(cid, person("user-viewer2", "editor")) \
+            == KNOWLEDGE_RUN_REFUSED
+        assert chat_move.may_drive(chat, chat_move.Asker("user-viewer2", "editor", False)) is False
+        # A manager passes both.
+        task_store.add_user_agent("user-viewer", slug, "manager", "test")
+        assert duplex_service.chat_access_denied_reason(cid, person("user-viewer", "manager")) is None
+        assert chat_move.may_drive(chat, chat_move.Asker("user-viewer", "manager", False)) is True
+        # And the editor passes both on a run that holds no knowledge write
+        # (the agent's own): the refusal above is the gate's, nothing else's.
+        task_store.create_run("run-agents-own", "dyn-y", slug, "scheduled", None, "go",
+                              "scheduled", "agent", slug)
+        task_store.create_chat("task-run-agents-own", f"task::{slug}", slug, source_type="task")
+        task_store.update_run("run-agents-own", status="completed", chat_id="task-run-agents-own")
+        own = task_store.get_chat("task-run-agents-own")
+        assert duplex_service.chat_access_denied_reason(
+            "task-run-agents-own", person("user-viewer2", "editor")) is None
+        assert chat_move.may_drive(own, chat_move.Asker("user-viewer2", "editor", False)) is True
+
+
+class TestPromptEditBySessionWithNoPerson:
+    """A session with no person manages its agent's tasks, and an editor can
+    start one. It rewrites the prompt of a task that fires with a manager's
+    knowledge write only when it holds that write itself."""
+
+    def _task(self, created_by="sub-m", task_type="scheduled", **kw) -> dict:
+        return {"scope": "agent", "agent": "ops", "created_by": created_by,
+                "task_type": task_type, "transferred_from": "", **kw}
+
+    def _people(self):
+        agent_store.create_agent("ops", "Ops")
+        _mk_user("sub-m", "Max")
+        task_store.add_user_agent("sub-m", "ops", "manager", "admin")
+        _mk_user("sub-e", "Eve")
+        task_store.add_user_agent("sub-e", "ops", "editor", "admin")
+
+    def test_the_rule(self, temp_db):
+        from auth.path_policy import SecurityContext
+        from core.config.task_config_builder import (
+            PROMPT_EDIT_REFUSAL,
+            prompt_edit_refusal,
+        )
+        from core.session import session_state
+        self._people()
+        assert prompt_edit_refusal(self._task(), "sid-plain") == PROMPT_EDIT_REFUSAL
+        assert prompt_edit_refusal(self._task(), "") == PROMPT_EDIT_REFUSAL
+        # tasks that fire with no knowledge write are the session's to edit
+        assert prompt_edit_refusal(self._task(created_by="sub-e"), "sid-plain") == ""
+        assert prompt_edit_refusal(self._task(created_by="ops"), "sid-plain") == ""
+        assert prompt_edit_refusal(self._task(transferred_from="sub-gone"), "sid-plain") == ""
+        assert prompt_edit_refusal({**self._task(), "scope": "user"}, "sid-plain") == ""
+        # a session that holds the write itself (a manager's own run) may
+        ctx = SecurityContext(role="manager", username="", agent="ops", is_admin_agent=False,
+                              knowledge_rw=True)
+        session_state.set_session_security("sid-granted", ctx)
+        try:
+            assert prompt_edit_refusal(self._task(), "sid-granted") == ""
+        finally:
+            session_state.cleanup_session_permission_state("sid-granted")
+
+    def test_a_wakes_prompt_is_its_own_chats_to_change(self, temp_db):
+        """A wake's text goes into its target chat's live session as it
+        stands, and that session may hold the knowledge write (a manager's
+        scheduled run that set itself a wake). So a session with no person
+        changes a wake only when it drives the chat the wake targets, the
+        rule the wake's creation has. Whoever made the row."""
+        from core.config.task_config_builder import (
+            WAKE_EDIT_REFUSAL,
+            prompt_edit_refusal,
+        )
+        self._people()
+        task_store.create_chat("task-run-mgr", "task::ops", "ops", source_type="task")
+        task_store.update_chat("task-run-mgr", session_id="sid-managers-run")
+        task_store.create_chat("task-run-ed", "task::ops", "ops", source_type="task")
+        task_store.update_chat("task-run-ed", session_id="sid-editors-run")
+        for creator in ("ops", "sub-m", "sub-e", None):
+            wake = self._task(created_by=creator, task_type="continuation",
+                              target_chat_id="task-run-mgr")
+            assert prompt_edit_refusal(wake, "sid-editors-run") == WAKE_EDIT_REFUSAL, creator
+            assert prompt_edit_refusal(wake, "sid-unknown") == WAKE_EDIT_REFUSAL
+            assert prompt_edit_refusal(wake, "") == WAKE_EDIT_REFUSAL
+            assert prompt_edit_refusal(wake, "sid-managers-run") == ""
+        # a wake with no target names no chat a session could drive
+        assert prompt_edit_refusal(self._task(task_type="continuation"), "sid-editors-run") \
+            == WAKE_EDIT_REFUSAL
+        assert prompt_edit_refusal(
+            {**self._task(task_type="continuation", target_chat_id="task-run-mgr"), "scope": "user"},
+            "sid-editors-run") == ""   # a person's own wake: the route's own rule refuses the session
+
+    def test_what_counts_as_a_change_of_what_runs(self):
+        from core.config.task_config_builder import changes_what_runs
+        row = {"prompt": "p", "permission_mode": ""}
+        assert changes_what_runs(row, {"prompt": "other"})
+        assert changes_what_runs(row, {"permission_mode": "autoReview"})
+        assert changes_what_runs({**row, "permission_mode": "autoReview"}, {"permission_mode": "dontAsk"})
+        assert changes_what_runs(row, {"checks": []}) and changes_what_runs(row, {"checks": ["style"]})
+        # sent back as stored, or another field: no change
+        assert not changes_what_runs(row, {"prompt": "p", "name": "n"})
+        assert not changes_what_runs(row, {"permission_mode": "dontAsk"})
+        assert not changes_what_runs({**row, "permission_mode": "autoReview"},
+                                     {"permission_mode": "autoReview"})
+        assert not changes_what_runs(row, {"timeout_seconds": 600, "schedule": "0 9 * * 1"})
+
+    def test_the_edit_route_refuses_the_prompt_and_takes_the_rest(self, temp_db, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        from app import app
+        from core.config.task_config_builder import (
+            PROMPT_EDIT_REFUSAL,
+            prompt_edit_refusal,
+        )
+        from services.scheduler import scheduler
+        from tests.conftest import live_session_token
+        self._people()
+        monkeypatch.setattr(scheduler, "_register_task", lambda task: None)
+        monkeypatch.setattr(scheduler, "_unregister_task", lambda task_id: None, raising=False)
+        task_store.create_dynamic_task("dyn-mgr", "ops", "Weekly", "the manager's prompt", "auto",
+                                       "scheduled", "0 9 * * 1", None, None, 300, "sub-m",
+                                       scope="agent", notification_mode="none")
+        task_store.create_dynamic_task("dyn-ed", "ops", "Mine", "an editor's prompt", "auto",
+                                       "scheduled", "0 9 * * 1", None, None, 300, "sub-e",
+                                       scope="agent", notification_mode="none")
+        client = TestClient(app)
+        h = {"Authorization": f"Bearer {live_session_token('sid-editors-run', 'ops')}"}
+        # The dashboard's edit route is off a session token's route list:
+        # every edit a session sends is refused before the route's own
+        # rule, which ``prompt_edit_refusal`` above holds for the callers
+        # that reach it (a person, the tool's own edit route).
+        for body in ({"prompt": "write the knowledge"}, {"name": "Weekly report"},
+                     {"timeout_seconds": 600}, {"permission_mode": "dontAsk"}):
+            r = client.patch("/v1/tasks/dyn-mgr", headers=h, json=body)
+            assert (r.status_code, r.json()["detail"]) == (403, "A session's token does not reach this route"), body
+        assert task_store.get_dynamic_task("dyn-mgr")["prompt"] == "the manager's prompt"
+        assert client.patch("/v1/tasks/dyn-ed", headers=h, json={"prompt": "changed"}).status_code == 403
+        assert task_store.get_dynamic_task("dyn-ed")["prompt"] == "an editor's prompt"
+        # The tool's own edit route is on the list: there the route's rule
+        # refuses the prompt, the mode and the checks of a task that fires
+        # with a manager's knowledge write, and takes the rest.
+        edit = "/v1/tasks/dyn-mgr/edit"
+        r = client.post(edit, headers=h, json={"prompt": "write the knowledge"})
+        assert (r.status_code, r.json()["detail"]) == (403, PROMPT_EDIT_REFUSAL)
+        assert task_store.get_dynamic_task("dyn-mgr")["prompt"] == "the manager's prompt"
+        r = client.post(edit, headers=h, json={"prompt": "the manager's prompt", "name": "Weekly report"})
+        assert r.status_code == 200, r.text
+        assert client.post(edit, headers=h, json={"timeout_seconds": 600}).status_code == 200
+        task_store.update_dynamic_task("dyn-mgr", {"permission_mode": "autoReview"})
+        for body in ({"permission_mode": "dontAsk"}, {"checks": []}):
+            r = client.post(edit, headers=h, json=body)
+            assert (r.status_code, r.json()["detail"]) == (403, PROMPT_EDIT_REFUSAL), body
+        assert task_store.get_dynamic_task("dyn-mgr")["permission_mode"] == "autoReview"
+        assert client.post(edit, headers=h, json={"permission_mode": "autoReview", "name": "Weekly"}).status_code == 200
+        r = client.post("/v1/tasks/dyn-ed/edit", headers=h, json={"prompt": "changed"})
+        assert r.status_code == 200, r.text
+        assert task_store.get_dynamic_task("dyn-ed")["prompt"] == "changed"
+        # A wake a manager's run set for its own chat: an editor's session
+        # may not change what it says, the run's own session may.
+        from core.config.task_config_builder import WAKE_EDIT_REFUSAL
+        task_store.create_chat("task-run-mgr", "task::ops", "ops", source_type="task")
+        task_store.update_chat("task-run-mgr", session_id="sid-managers-run")
+        task_store.create_dynamic_task("dyn-wake", "ops", "Wake", "check the build", "auto",
+                                       "continuation", None, None, 600, 300, "ops",
+                                       scope="agent", notification_mode="none",
+                                       target_chat_id="task-run-mgr")
+        own = {"Authorization": f"Bearer {live_session_token('sid-managers-run', 'ops')}"}
+        for headers in (h, own):
+            r = client.patch("/v1/tasks/dyn-wake", headers=headers, json={"prompt": "write the knowledge"})
+            assert (r.status_code, r.json()["detail"]) == (403, "A session's token does not reach this route")
+        assert task_store.get_dynamic_task("dyn-wake")["prompt"] == "check the build"
+        assert prompt_edit_refusal(
+            {**self._task(task_type="continuation", target_chat_id="task-run-mgr"), "scope": "agent"},
+            "sid-editors-run") == WAKE_EDIT_REFUSAL
+        # On the tool's own edit route the wake's rule applies: the editor's
+        # session may not change what it says, the run's own session may.
+        r = client.post("/v1/tasks/dyn-wake/edit", headers=h, json={"prompt": "write the knowledge"})
+        assert (r.status_code, r.json()["detail"]) == (403, WAKE_EDIT_REFUSAL)
+        assert client.post("/v1/tasks/dyn-wake/edit", headers=h, json={"name": "Later"}).status_code == 200
+        r = client.post("/v1/tasks/dyn-wake/edit", headers=own, json={"prompt": "check the build twice"})
+        assert r.status_code == 200, r.text
+        assert task_store.get_dynamic_task("dyn-wake")["prompt"] == "check the build twice"
+
+
 # ---------------------------------------------------------------------------
 # _rewarm_chat_allowed — the warmup's existing-chat reuse gate
 # ---------------------------------------------------------------------------
@@ -416,9 +806,8 @@ def _sandbox_for(agents_dir, mcps_dir, *, username: str, role: str):
         host_mcps_dir=mcps_dir.resolve(),
         host_claude_dir=claude_dir.resolve(),
         mcp_sandbox_mounts=[],
-        # Egress is orthogonal to what these tests assert (mount identity);
-        # supply a resolved value so build_command_prefix's "egress must be
-        # resolved via resolve_sandbox_config()" guard doesn't trip.
+        # Egress is orthogonal to what these tests assert (mount identity):
+        # a resolved session always carries the proxy port.
         net_forwards=["8400"],
     )
     return SandboxBuilder(cfg)
@@ -429,19 +818,16 @@ class TestIdentityDrivesMounts:
         agents_dir, mcps_dir = tmp_agents
         ident = TaskIdentity(username="", role="manager", scope="agent", creds_user_sub=None)
         sb = _sandbox_for(agents_dir, mcps_dir, username=ident.username, role=ident.role)
-        cmd_str = " ".join(sb.build_command_prefix(["claude"]))
-        agent_dir = str((agents_dir / "pa").resolve())
-        assert "/workspace" in cmd_str
+        # The session's description: every source hangs off the agent's
+        # folder (or is a mask), named by its path below it.
+        binds = sb.describe().binds
+        assert all(b.root in (ROOT_AGENT, ROOT_EMPTY, ROOT_NULL) for b in binds), binds
+        assert Bind(ROOT_AGENT, "workspace", "/workspace", True) in binds
         # No escalation: no per-user dir, no behavior-layer config.
-        assert f"{agent_dir}/users" not in cmd_str
-        assert f"{agent_dir}/config" not in cmd_str
+        assert not [b for b in binds if b.root == ROOT_AGENT and b.rel.split("/")[0] in ("users", "config")]
+        assert not [b for b in binds if b.sandbox.split("/")[1] in ("users", "config")]
         # Knowledge is read-only in agent scope.
-        bind_pairs = list(zip(sb.build_command_prefix(["claude"]),
-                             sb.build_command_prefix(["claude"])[1:], strict=False))
-        assert any(
-            a == "--ro-bind" and b == f"{agent_dir}/knowledge"
-            for a, b in bind_pairs
-        )
+        assert Bind(ROOT_AGENT, "knowledge", "/knowledge", False) in binds
 
     def test_user_scope_identity_yields_creator_user_dir(self, tmp_agents):
         agents_dir, mcps_dir = tmp_agents
@@ -450,9 +836,8 @@ class TestIdentityDrivesMounts:
             username="creator", role="manager", scope="user", creds_user_sub="sub-c",
         )
         sb = _sandbox_for(agents_dir, mcps_dir, username=ident.username, role=ident.role)
-        cmd_str = " ".join(sb.build_command_prefix(["claude"]))
-        agent_dir = str((agents_dir / "pa").resolve())
-        assert f"{agent_dir}/users/creator" in cmd_str
+        assert [b for b in sb.describe().binds
+                if b.root == ROOT_AGENT and b.rel == "users/creator" and b.sandbox == "/users/creator"]
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +845,12 @@ class TestIdentityDrivesMounts:
 # the AgentConfig. Heavy collaborators are stubbed so the test isolates the
 # identity-resolution path (MCP/dynamic/subscription/remote are out of scope).
 # ---------------------------------------------------------------------------
+
+def _placement_of(*_a, compute=None, **_k):
+    """``remote_store.placement_of`` for a session of the platform's place:
+    the compute machine the builder was answered, when it passes one."""
+    return placement.from_machine(placement.KIND_COMPUTE, compute) if compute else placement.LOCAL_PLACEMENT
+
 
 def _stub_heavy(monkeypatch, tmp_path):
     from core.config import config_builder as cb
@@ -482,9 +873,10 @@ def _stub_heavy(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cb.remote_status, "resolve_execution_target", lambda *a, **k: ("local", None),
     )
-    monkeypatch.setattr(
-        cb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT,
-    )
+    # The platform's place is served by a compute machine: the builder
+    # places the session there, as the store's own reader answers it.
+    serve(monkeypatch)
+    monkeypatch.setattr(cb.remote_store, "placement_of", _placement_of)
     monkeypatch.setattr(cb.config, "build_agent_prompt", lambda *a, **k: "PROMPT")
     monkeypatch.setattr(cb.config, "get_cli_model", lambda *a, **k: "m")
     monkeypatch.setattr(cb.config, "get_cli_effort", lambda *a, **k: "")
@@ -634,7 +1026,8 @@ class TestSharedOnlyBelowEditorRefused:
         from core.sandbox.session_config_dir import AgentStateRefused
         self._shared_only()
         monkeypatch.setattr(tcb.remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
-        monkeypatch.setattr(tcb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT)
+        serve(monkeypatch)
+        monkeypatch.setattr(tcb.remote_store, "placement_of", _placement_of)
         monkeypatch.setattr(tcb.remote_store, "get_target_browser_settings", lambda *a, **k: None)
         monkeypatch.setattr(tcb.mcp_registry, "build_session_mcp_config",
                             lambda *a, **k: (None, {}, {}, {}, set()))

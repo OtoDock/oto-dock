@@ -5,6 +5,7 @@ import { subscribePush, unsubscribePush } from '../api/notifications'
 import { askNative } from '../lib/nativeBridge'
 import { debugWarn } from '../lib/debug/log'
 import { noteStoreReviewMoment } from '../lib/device/storeReview'
+import { agentLinkHere } from '../lib/chat/agentLink'
 
 /** A click_url is only safe to navigate if it is a plain absolute path — a
  *  notification's source server is untrusted, so reject scheme/host/protocol-
@@ -131,7 +132,8 @@ export function useFcmPush(navigate?: (path: string) => void, enabled: boolean =
 
         const clickUrl = appNotificationPath(data) ?? safeClickPath(data.click_url)
         if (clickUrl && clickUrl !== '/' && navigateRef.current) {
-          navigateRef.current(clickUrl)
+          // The page the tap wakes is the router's location (a browser router).
+          navigateRef.current(agentLinkHere(clickUrl, window.location))
           if (clickUrl.startsWith('/chat/')) noteStoreReviewMoment('push')
         }
       })

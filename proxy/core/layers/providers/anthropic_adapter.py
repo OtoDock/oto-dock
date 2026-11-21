@@ -139,7 +139,9 @@ class AnthropicAdapter(ProviderAdapter):
         # /v1/messages). When unset, the SDK's default Anthropic endpoint is used.
         client_kwargs: dict = {"api_key": api_key}
         if endpoint_url:
+            from services.infra import pinned_http
             client_kwargs["base_url"] = endpoint_url
+            client_kwargs["http_client"] = pinned_http.sdk_client(endpoint_url)
         client = anthropic.AsyncAnthropic(**client_kwargs)
 
         try:

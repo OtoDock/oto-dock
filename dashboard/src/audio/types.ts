@@ -30,25 +30,11 @@ export interface TTSPlayOptions {
   providerId?: number | null // platform provider
 }
 
-export interface TtsStream {
-  /** Feed one complete sentence to speak — queued/streamed in order. */
-  push(text: string): void
-  /** No more text — let queued audio finish playing, then resolve `done`. */
-  finish(): void
-  /** Barge-in / abort — stop immediately and resolve `done`. */
-  cancel(): void
-  /** Resolves when playback has finished (or cancel/finish has settled it). */
-  done: Promise<void>
-}
-
 export interface TTSBackend {
   kind: 'native' | 'platform'
   isAvailable(): boolean
   play(text: string, opts: TTSPlayOptions): Promise<void>
   stop(): void
-  /** Incremental sink for voice mode — speak sentences as a reply generates.
-   *  Native backends queue utterances; the platform backend streams over WS. */
-  createStream(opts: TTSPlayOptions): TtsStream
 }
 
 export interface STTSession {

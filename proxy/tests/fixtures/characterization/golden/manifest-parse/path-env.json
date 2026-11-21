@@ -1,0 +1,83 @@
+{
+ "absent": {
+  "parsed": {}
+ },
+ "both": {
+  "parsed": {},
+  "warnings": [
+   "path_env A for char-mcp must set exactly one of 'role' or 'values' (got role='workspace', values=[{'role': 'workspace'}]); skipping"
+  ]
+ },
+ "credentials without subpath": {
+  "parsed": {},
+  "warnings": [
+   "path_env A for char-mcp declares unknown role 'credentials_dir' (valid: ('workspace', 'user_root', 'shared_workspace', 'config', 'knowledge_dir'))"
+  ]
+ },
+ "entry not an object": {
+  "parsed": {},
+  "warnings": [
+   "path_env A for char-mcp must be an object, got str"
+  ]
+ },
+ "good": {
+  "parsed": {
+   "A": {
+    "role": "workspace",
+    "subpath": "files"
+   },
+   "D": {
+    "join": "|",
+    "values": [
+     {
+      "role": "config"
+     }
+    ]
+   }
+  },
+  "warnings": [
+   "path_env B for char-mcp declares unknown role 'credentials_dir' (valid: ('workspace', 'user_root', 'shared_workspace', 'config', 'knowledge_dir'))",
+   "path_env C for char-mcp values[1] declares unknown role 'credentials_dir' (valid: ('workspace', 'user_root', 'shared_workspace', 'config', 'knowledge_dir')); skipping entry",
+   "path_env E for char-mcp declares unknown role 'nope' (valid: ('workspace', 'user_root', 'shared_workspace', 'config', 'knowledge_dir'))"
+  ]
+ },
+ "neither": {
+  "parsed": {},
+  "warnings": [
+   "path_env A for char-mcp must set exactly one of 'role' or 'values' (got role=None, values=None); skipping"
+  ]
+ },
+ "not an object": {
+  "parsed": {}
+ },
+ "unknown role": {
+  "parsed": {},
+  "warnings": [
+   "path_env A for char-mcp declares unknown role 'nope' (valid: ('workspace', 'user_root', 'shared_workspace', 'config', 'knowledge_dir'))"
+  ]
+ },
+ "value credentials without subpath": {
+  "parsed": {},
+  "warnings": [
+   "path_env A for char-mcp values[0] declares unknown role 'credentials_dir' (valid: ('workspace', 'user_root', 'shared_workspace', 'config', 'knowledge_dir')); skipping entry"
+  ]
+ },
+ "value not an object": {
+  "parsed": {},
+  "warnings": [
+   "path_env A for char-mcp values[0] must be an object; skipping entry"
+  ]
+ },
+ "value unknown role": {
+  "parsed": {},
+  "warnings": [
+   "path_env A for char-mcp values[0] declares unknown role 'nope' (valid: ('workspace', 'user_root', 'shared_workspace', 'config', 'knowledge_dir')); skipping entry"
+  ]
+ },
+ "values not a list": {
+  "parsed": {},
+  "warnings": [
+   "path_env A for char-mcp 'values' must be a non-empty list; skipping"
+  ]
+ }
+}

@@ -1,4 +1,6 @@
-import { useEffect, useId, useRef, type CSSProperties, type Ref, type SyntheticEvent } from 'react'
+import { useEffect, useId, useLayoutEffect, useRef, type CSSProperties, type Ref, type SyntheticEvent } from 'react'
+import { useTheme } from '../../../contexts/useTheme'
+import { seedEditorPrefs } from './editorPrefs'
 
 /** The editor frame's sandbox: Collabora runs scripts, keeps its own
  * same-origin state, posts its dialogs' forms and opens the links and
@@ -32,13 +34,26 @@ interface Props {
 
 /** The Collabora editor frame. With a token it starts blank and the form
  * posts into it; without one (a URL that still carries its token, from
- * before the token left the URL) it loads the URL as is. */
+ * before the token left the URL) it loads the URL as is. Before each load
+ * the editor's theme follows the dashboard's and its page stays white
+ * (`editorPrefs`). */
 export default function CollaboraFrame({
   url, accessToken, accessTokenTtl, frameKey = 0, iframeRef, className, style, onLoad,
 }: Props) {
   const name = `collabora-${useId().replace(/[^A-Za-z0-9_-]/g, '')}`
   const formRef = useRef<HTMLFormElement | null>(null)
   const posted = !!accessToken
+  // Read at each load, never a reason to load: a theme switch must not
+  // post the frame again (unsaved edits would go).
+  const dark = useTheme().resolvedTheme === 'dark'
+  const darkRef = useRef(dark)
+  useLayoutEffect(() => { darkRef.current = dark })
+
+  // Before the editor's page runs: the post below, or the address the
+  // iframe starts loading as it mounts.
+  useLayoutEffect(() => {
+    seedEditorPrefs(url, darkRef.current)
+  }, [posted, url, accessToken, frameKey])
 
   useEffect(() => {
     if (posted) formRef.current?.submit()

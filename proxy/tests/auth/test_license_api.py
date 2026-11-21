@@ -245,13 +245,13 @@ def test_mcp_list_surfaces_hosted_for_type_none(admin, monkeypatch):
     # branch, so a type='none' api_key_relay MCP (image-gen) returned hosted=null
     # → the dashboard never got apiKeyRelay → no availability banner /
     # Credentials-source note.
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_manifest_store, mcp_registry
     m = mcp_registry._parse_manifest(
         config.MCPS_DIR / "custom" / "image-gen-mcp" / "manifest.json"
     )
     if not (m.hosted and m.hosted.api_key_relay):
         pytest.skip("image-gen manifest carries no hosted block in this cut")
-    monkeypatch.setitem(mcp_registry._manifests, m.name, m)
+    monkeypatch.setitem(mcp_manifest_store._manifests, m.name, m)
     data = client.get("/v1/admin/mcps").json()
     entry = next((x for x in data.get("mcps", []) if x["name"] == m.name), None)
     assert entry is not None

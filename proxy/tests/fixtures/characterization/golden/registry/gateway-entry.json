@@ -1,0 +1,151 @@
+{
+ "bearer": {
+  "credential": {
+   "allowlist_key": "char-oauth",
+   "manifest": "char-bearer",
+   "path": "/mcp",
+   "token_ref": {
+    "account_label": "main",
+    "token_dir": "<tmp>/sessions/char-oauth-tokens/ada"
+   },
+   "upstream": "https://vendor.example.test"
+  },
+  "entry": {
+   "headers": {
+    "Authorization": "Bearer OTO_SESSION_JWT"
+   },
+   "type": "http",
+   "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-bearer/mcp"
+  },
+  "reason": null
+ },
+ "bearer_agent_scope": {
+  "credential": {
+   "allowlist_key": "char-oauth",
+   "manifest": "char-bearer",
+   "path": "/mcp",
+   "token_ref": {
+    "account_label": "main",
+    "token_dir": "<tmp>/sessions/char-oauth-tokens/ada"
+   },
+   "upstream": "https://vendor.example.test"
+  },
+  "entry": {
+   "headers": {
+    "Authorization": "Bearer OTO_SESSION_JWT"
+   },
+   "type": "http",
+   "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-bearer/mcp"
+  },
+  "reason": null
+ },
+ "bearer_dead_account": {
+  "credential": null,
+  "entry": {
+   "type": "http",
+   "url": "https://vendor.example.test/mcp"
+  },
+  "reason": "Char Bearer: the vendor ended the account's grant; reconnect it in Settings > Integrations"
+ },
+ "bearer_no_account": {
+  "credential": null,
+  "entry": {
+   "type": "http",
+   "url": "https://vendor.example.test/mcp"
+  },
+  "reason": "Char Bearer: no account is connected for this session"
+ },
+ "bearer_owner_filter_nobody": {
+  "credential": null,
+  "entry": {
+   "type": "http",
+   "url": "https://vendor.example.test/mcp"
+  },
+  "reason": "Char Bearer: no account is connected for this session"
+ },
+ "bearer_sidecar": {
+  "credential": {
+   "allowlist_key": "char-oauth",
+   "kind": "container",
+   "manifest": "char-bearer-sidecar",
+   "path": "/mcp/",
+   "proxy_local": true,
+   "token_ref": {
+    "account_label": "main",
+    "token_dir": "<tmp>/sessions/char-oauth-tokens/ada"
+   },
+   "upstream": "http://localhost:8934"
+  },
+  "entry": {
+   "headers": {
+    "Authorization": "Bearer OTO_SESSION_JWT"
+   },
+   "type": "http",
+   "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-bearer-sidecar/mcp/"
+  },
+  "reason": null
+ },
+ "key": {
+  "credential": {
+   "allowlist_key": "char-keyed",
+   "header": "X-Char-Key",
+   "manifest": "char-keyed",
+   "path": "/mcp",
+   "prefix": "",
+   "upstream": "https://api.example.test",
+   "value": "key-value",
+   "value_from": "CHAR_KEY"
+  },
+  "entry": {
+   "headers": {
+    "Authorization": "Bearer OTO_SESSION_JWT"
+   },
+   "type": "http",
+   "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-keyed/mcp"
+  },
+  "reason": null
+ },
+ "key_empty": {
+  "credential": null,
+  "entry": {
+   "type": "http",
+   "url": "https://api.example.test/mcp"
+  },
+  "reason": "Char Keyed: no CHAR_KEY value is set for this session; enter it in Settings > Integrations or ask an admin"
+ },
+ "key_on_loopback": {
+  "credential": null,
+  "entry": {
+   "type": "http",
+   "url": "http://localhost:9/mcp"
+  },
+  "reason": "Char Keyed names a loopback host; a hosted MCP must name its vendor's host"
+ },
+ "key_unapproved": {
+  "credential": null,
+  "entry": {
+   "type": "http",
+   "url": "https://attacker.example.test/mcp"
+  },
+  "reason": "Char Unapproved: the host attacker.example.test is not approved for char-unapproved; an admin can approve it in Admin > Security"
+ },
+ "stdio": [
+  [
+   null,
+   null
+  ],
+  {
+   "args": [],
+   "command": "x",
+   "type": "stdio"
+  }
+ ],
+ "uncredentialed": {
+  "credential": null,
+  "entry": {
+   "type": "http",
+   "url": "https://sse.example.test/sse"
+  },
+  "reason": null
+ }
+}

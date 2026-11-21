@@ -97,10 +97,28 @@ def save(monkeypatch):
     monkeypatch.setattr(credential_store, "set_account_display_email", lambda *a: None)
     user = UserContext(sub="u1", email="u@x", name="u", role="member")
 
-    async def _put(creds: dict):
-        return await api.set_my_integration(
-            "email", api.SetCredentialRequest(credentials=creds), user)
+    async def _put(creds: dict, label: str | None = None):
+        body = api.SetCredentialRequest(credentials=creds, **({"account_label": label} if label else {}))
+        return await api.set_my_integration("email", body, user)
     return _put, stored, written
+
+
+@pytest.mark.asyncio
+async def test_a_new_accounts_label_is_one_plain_line(save):
+    """The label is the person's own word for the account, and their agents
+    read it in their prompt. An account saved before the rule keeps its
+    label: an edit of it is not refused."""
+    put, stored, written = save
+    full = {"EMAIL_USER": "u", "EMAIL_PASSWORD": "p", "SIGNATURE": "s"}
+    for label in ("two\nlines", "back`tick", "x" * 65):
+        with pytest.raises(HTTPException) as ei:
+            await put(full, label)
+        assert ei.value.status_code == 400 and "label" in ei.value.detail
+    assert written == []
+    await put(full, "work mail")
+    stored.update(full)
+    await put({"EMAIL_ADDRESS": "me@example.com"}, "x" * 65)
+    assert len(written) == 2
 
 
 @pytest.mark.asyncio

@@ -206,6 +206,17 @@ def build_tarball(mcp_name: str) -> TarballResult:
     )
 
 
+def pack_folder(mcp_dir: Path, data_dirs: dict | None = None) -> str:
+    """The folder's tarball, base64, for an install's own build on a compute
+    machine: packed from the folder as the install copied it in (the
+    registry does not know it yet), with the exclusions every tarball has
+    (``data_dirs`` as the incoming manifest declares them). Never cached:
+    the folder's version hash is settled only after the build."""
+    from types import SimpleNamespace
+    exclude = _data_dir_names(SimpleNamespace(data_dirs=data_dirs))
+    return base64.b64encode(_build_bytes(Path(mcp_dir), exclude)).decode()
+
+
 def invalidate(mcp_name: str) -> None:
     """Drop any cached tarballs for an MCP (after install/update/delete).
 

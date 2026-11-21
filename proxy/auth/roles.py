@@ -43,6 +43,13 @@ SERVICE = "agent"
 # The effective role of a principal on an agent that holds no row for it.
 NO_ACCESS = ""
 
+# The acting role of an outside person: a caller on the agent's phone line
+# or a visitor of a shared link. Below every member floor (``rank`` -1): an
+# app opens a button or a method to outside people by naming them, the
+# floor ``external`` that every role clears, never by ranking them. Never
+# stored (no CHECK knows it) and never a member's role.
+EXTERNAL = "external"
+
 # The tiers the mounts, the path policy and the file API key on. Spelled
 # out in words (not through the constants above) so a row reads at a
 # glance; ``tests/auth/test_roles.py`` binds them to the constants. An MCP
@@ -104,17 +111,30 @@ def allowed_on_shared_only(role: str | None) -> bool:
     return role in SHARED_ONLY_ROLES
 
 
+def is_external(role: str | None) -> bool:
+    """An outside person's acting role."""
+    return role == EXTERNAL
+
+
 def rank(role: str | None) -> int:
+    """The rank an action floor is judged by: the table's for a member,
+    0 for a word outside it (the viewer floor and no other), -1 for an
+    outside person (no floor at all)."""
+    if role == EXTERNAL:
+        return -1
     return RANK.get(role or "", 0)
 
 
 def meets_floor(role: str | None, floor: str | None) -> bool:
     """Whether ``role`` clears an action floor; an empty floor is the
-    viewer floor (the default, never stored in a signed manifest). A floor
-    the table does not know is unreachable — the manifest parsers refuse
-    one at deploy, so none is stored; this keeps a typo from opening an
-    action to everyone."""
+    viewer floor (the default, never stored in a signed manifest), and the
+    floor ``external`` opens the action to everyone, outside people
+    included. A floor the table does not know is unreachable — the manifest
+    parsers refuse one at deploy, so none is stored; this keeps a typo from
+    opening an action to everyone."""
     wanted = floor or VIEWER
+    if wanted == EXTERNAL:
+        return True
     return wanted in RANK and rank(role) >= RANK[wanted]
 
 
@@ -172,6 +192,9 @@ def may_mutate_shared(role: str | None, *, own: bool) -> bool:
 
 
 def label(role: str | None) -> str:
-    """The word a prompt or a badge shows: any member as it is; a spelling
-    outside them (NO_ACCESS, SERVICE, a stranger's word) reads viewer."""
+    """The word a prompt or a badge shows: any member as it is, an outside
+    person as ``external``; a spelling outside them (NO_ACCESS, SERVICE, a
+    stranger's word) reads viewer."""
+    if role == EXTERNAL:
+        return EXTERNAL
     return role if role in RANK or role in PLATFORM_RANK else VIEWER

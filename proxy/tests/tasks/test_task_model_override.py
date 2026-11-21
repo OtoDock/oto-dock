@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from core.execution_layer import ResumeVerdict
+from tests._compute import COMPUTE, serve
 from tests._paths import PROXY_DIR
 
 _proxy_root = str(PROXY_DIR)
@@ -363,6 +364,23 @@ class TestConsumption:
 
 
 class TestListing:
+    @pytest.mark.parametrize(("chat_model", "want", "source"), [
+        (MODEL_STRONG, MODEL_STRONG, "the chat's"), ("", "", "the chat's")])
+    def test_a_chats_own_continuation_names_the_chats_model(self, client, chat_model, want, source):
+        """A continuation wakes the chat's own session on the chat's model,
+        whatever a pin or a default says: the listing names that model, or
+        none when the chat has none."""
+        cid = f"chat-cont-{uuid.uuid4().hex[:6]}"
+        task_store.create_chat(cid, "user-admin", AGENT, model=chat_model)
+        task_store.create_dynamic_task(
+            f"dyn-{uuid.uuid4().hex[:8]}", AGENT, "wake", "carry on", "auto", "continuation",
+            None, None, 600, 600, "user-admin", target_chat_id=cid, scope="user",
+            notification_mode="none", override_model=MODEL_DEFAULT)
+        t = next(t for t in client.get("/v1/tasks").json()["tasks"] if t.get("target_chat_id") == cid)
+        assert (t["effective_model"], t["effective_model_source"]) == (want, source)
+        assert t["effective_execution_path"] == "claude-code-cli"
+        assert t["pin_warnings"] == []
+
     def test_effective_model_is_the_override(self, client):
         _create_scheduled(client, model=MODEL_STRONG)
         t = client.get("/v1/tasks").json()["tasks"][0]
@@ -417,6 +435,89 @@ class TestListing:
         assert row["effective_model"] == "" and row["effective_model_tier"] is None
         one = client.get("/v1/tasks/app-kanban-republish").json()
         assert one["effective_model"] == "" and one["triggers"] == []
+
+    def test_a_one_shot_past_its_time_with_nothing_to_run_it_will_not_fire(
+            self, client, monkeypatch):
+        """A one-shot whose time passed with no job left and no fire of it
+        under way can no longer fire by itself: the listing and the read say
+        so beside ``enabled``. A row still due, a row with its job, a fire
+        under way or held, a fired row, a paused row, a recurring row and the
+        standalone scheduler's rows are not that."""
+        from datetime import datetime, timedelta, timezone
+
+        from services.scheduler import shared
+        tid = _create_one_time(client).json()["task_id"]
+
+        def listed():
+            return {t["id"]: t for t in client.get("/v1/tasks").json()["tasks"]}[tid]
+
+        assert listed()["will_not_fire"] is False                       # due in ten minutes
+        _set_row(tid, created_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat())
+        assert listed()["will_not_fire"] is True
+        assert client.get(f"/v1/tasks/{tid}").json()["will_not_fire"] is True
+        with monkeypatch.context() as m:
+            m.setattr(scheduler, "next_run_times", lambda: {tid: None})
+            assert listed()["will_not_fire"] is False                   # its job is there
+        shared._fires_under_way.add(tid)
+        try:
+            assert listed()["will_not_fire"] is False                   # its fire runs now
+        finally:
+            shared._fires_under_way.discard(tid)
+        shared._held_wakes.append(tid)
+        try:
+            assert listed()["will_not_fire"] is False                   # held for a planned stop
+        finally:
+            shared._held_wakes.remove(tid)
+        with monkeypatch.context() as m:
+            m.setattr(config, "SCHEDULER_MODE", "standalone")
+            assert listed()["will_not_fire"] is False
+        _set_row(tid, fired=True)
+        assert listed()["will_not_fire"] is False
+        _set_row(tid, fired=False, enabled=False)
+        assert listed()["will_not_fire"] is False
+        recurring = _create_scheduled(client).json()["task_id"]
+        rows = {t["id"]: t for t in client.get("/v1/tasks").json()["tasks"]}
+        assert rows[recurring]["will_not_fire"] is False
+
+    def test_a_skipped_wake_is_counted_on_its_row(self, client):
+        """A recurring wake skipped because its chat had not taken the previous
+        one says how many times in a row, on the listing and on the read."""
+        from services.scheduler import firing
+        tid = _create_scheduled(client).json()["task_id"]
+        assert client.get(f"/v1/tasks/{tid}").json()["wake_skips"] == 0
+        firing._continuation_skip_counts[tid] = 3
+        try:
+            assert client.get("/v1/tasks").json()["tasks"][0]["wake_skips"] == 3
+            assert client.get(f"/v1/tasks/{tid}").json()["wake_skips"] == 3
+        finally:
+            firing._continuation_skip_counts.pop(tid, None)
+
+    def test_a_scheduled_fire_is_under_way_until_its_execution_returns(self, client, monkeypatch):
+        """From the job's call until its execution returns, the row's fire is
+        under way (APScheduler removed a one-shot's job before the call): the
+        listing never calls it a row that will not fire. A fire of a paused
+        row leaves no mark."""
+        import asyncio
+
+        from services.scheduler import runner, shared
+        tid = _create_one_time(client).json()["task_id"]
+        paused = _create_one_time(client).json()["task_id"]
+        task_store.set_dynamic_task_enabled(paused, False)
+        seen: list = []
+
+        async def _execute(task, trigger_type="scheduled", **kw):
+            seen.append(task.id in shared._fires_under_way)
+            return "run-x"
+        monkeypatch.setattr(runner, "_execute_task", _execute)
+
+        async def _fire():
+            for one in (tid, paused):
+                await runner._fire_task(scheduler._row_to_task(task_store.get_dynamic_task(one)))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        asyncio.run(_fire())
+        assert seen == [True]
+        assert tid not in shared._fires_under_way and paused not in shared._fires_under_way
 
     def test_tier_and_source_ride_along(self, client):
         _create_scheduled(client, model=MODEL_STRONG)
@@ -531,6 +632,53 @@ class TestGetTask:
         assert any("disabled" in w for w in t["pin_warnings"])
         assert any("not enabled for this agent" in w for w in t["pin_warnings"])
 
+    def test_the_pool_pin_warning_follows_who_pays_not_the_scope(self, client, monkeypatch):
+        """A pinned engine the shared subscriptions lack warns only for a
+        task they pay for (``core/config/spender.py``): a person's own task
+        on a Shared-only agent is theirs to pay no more."""
+        from services.engines import subscription_pool
+        monkeypatch.setattr(subscription_pool, "layer_platform_configured", lambda layer: False)
+        tid = _create_scheduled(client, layer="claude-code-cli").json()["task_id"]
+        warned = lambda: any("subscription for the agent's own runs" in w
+                             for w in client.get(f"/v1/tasks/{tid}").json()["pin_warnings"])
+        assert not warned()                                   # a person pays for their own task
+        monkeypatch.setattr("core.config.spender.is_shared_only", lambda agent: True)
+        assert warned()                                       # on a Shared-only agent the pool pays
+
+    def test_a_task_its_creator_cannot_run_carries_the_refusals_sentence(self, client, monkeypatch):
+        from services.engines import subscription_pool
+        monkeypatch.setattr(subscription_pool, "user_can_run", lambda layer, sub, **kw: False)
+        monkeypatch.setattr(subscription_pool, "user_scope_block_reason", lambda layer, sub, **kw: "auth_off")
+        tid = _create_scheduled(client).json()["task_id"]
+        t = client.get(f"/v1/tasks/{tid}").json()
+        assert t["engine_notice"] == "This runs on an AI engine you have not connected yet."
+
+    def test_no_notice_when_the_creator_can_run_it(self, client, monkeypatch):
+        from services.engines import subscription_pool
+        monkeypatch.setattr(subscription_pool, "user_can_run", lambda layer, sub, **kw: True)
+        tid = _create_scheduled(client).json()["task_id"]
+        assert client.get(f"/v1/tasks/{tid}").json()["engine_notice"] == ""
+
+    def test_no_notice_on_an_agent_scope_task_or_a_shared_only_agent(self, client, monkeypatch):
+        from services.engines import subscription_pool
+        monkeypatch.setattr(subscription_pool, "user_can_run", lambda layer, sub, **kw: False)
+        monkeypatch.setattr(subscription_pool, "user_scope_block_reason", lambda layer, sub, **kw: "auth_off")
+        tid = _create_scheduled(client).json()["task_id"]
+        _set_row(tid, scope="agent")
+        assert client.get(f"/v1/tasks/{tid}").json()["engine_notice"] == ""
+        _set_row(tid, scope="user")
+        monkeypatch.setattr("core.session.visibility.is_shared_only", lambda agent: True)
+        monkeypatch.setattr("core.config.spender.is_shared_only", lambda agent: True)
+        assert client.get(f"/v1/tasks/{tid}").json()["engine_notice"] == ""
+
+    def test_no_notice_to_anyone_but_its_creator(self, client, monkeypatch):
+        from services.engines import subscription_pool
+        monkeypatch.setattr(subscription_pool, "user_can_run", lambda layer, sub, **kw: False)
+        monkeypatch.setattr(subscription_pool, "user_scope_block_reason", lambda layer, sub, **kw: "auth_off")
+        tid = _create_scheduled(client).json()["task_id"]
+        _set_row(tid, created_by="someone-else")
+        assert client.get(f"/v1/tasks/{tid}?audit=true").json()["engine_notice"] == ""
+
     def test_missing_foreign_and_delegate_rows_are_404(self, client):
         assert client.get("/v1/tasks/dyn-nope").status_code == 404
         tid = _create_scheduled(client).json()["task_id"]
@@ -641,6 +789,8 @@ class TestContinuedLaneModelChange:
         async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):
             yield
 
+        # The round's slot is taken on the compute machine that serves.
+        serve(monkeypatch)
         monkeypatch.setattr(concurrency, "task_slot", _instant_slot)
         monkeypatch.setattr(concurrency, "acquire", _acquire)
         monkeypatch.setattr(task_config_builder, "build_task_agent_config", _cfg)
@@ -756,6 +906,8 @@ class TestAFreshContinueRound:
         async def _reuse(*a, **k):
             return False
 
+        # The round's slot is taken on the compute machine that serves.
+        serve(monkeypatch)
         monkeypatch.setattr(concurrency, "task_slot", _instant_slot)
         monkeypatch.setattr(task_config_builder, "build_task_agent_config", _cfg)
         monkeypatch.setattr(task_config_builder, "resolve_task_identity",
@@ -1133,6 +1285,91 @@ class TestTaskMachineAtRunTime:
         theirs = worker.model_copy(update={"created_by": "user-viewer2"})
         assert tcb.task_target(theirs, _agent_identity()).fallback_reason == tcb.FALLBACK_TASK_MACHINE
 
+    def test_a_continue_round_runs_where_its_chats_session_is(self, client, machines, resolver):
+        """A delegate's continue resumes its chat's session: its machine is
+        read from the chat when the round starts (a move since the spawn is
+        followed), and an offline one is waited for, never swapped for the
+        default. A scheduled task naming a session keeps its own rule."""
+        from core import placement
+        from core.config import task_config_builder as tcb
+        from services.scheduler import task_kinds
+        sid, cid = str(uuid.uuid4()), str(uuid.uuid4())
+        task_store.create_chat(cid, "user-viewer", AGENT, "auto", origin="delegated")
+        task_store.update_chat(cid, session_id=sid, execution_target="m-rack")
+        task = self._task(task_type=task_kinds.DELEGATE, scope="agent", target_chat_id=cid,
+                          continue_session=sid, created_by="user-viewer")
+        assert tcb.continues_in_chat(task)
+        assert tcb.task_target(task, _agent_identity()) == ("m-rack", None, "")
+        machines.discard("m-rack")
+        waiting = tcb.task_target(task, _agent_identity())
+        assert placement.is_offline_sentinel(waiting.target) and waiting.fallback_reason is None
+        sched = self._task(task_type=task_kinds.SCHEDULED, continue_session=sid,
+                           target_machine="m-rack", created_by="user-viewer")
+        assert not tcb.continues_in_chat(sched)
+        assert tcb.task_target(sched, _agent_identity()).fallback_reason == tcb.FALLBACK_TASK_MACHINE
+
+    def test_a_continue_round_whose_machine_is_away_ends_with_the_workers_words(
+            self, client, machines, monkeypatch):
+        import asyncio as _asyncio
+        from types import SimpleNamespace
+
+        from core import placement
+        from core.config import config_builder, task_config_builder as tcb
+        from services.scheduler import task_kinds
+        from services.scheduler.task_run import TaskRun
+        sid, cid = str(uuid.uuid4()), str(uuid.uuid4())
+        task_store.create_chat(cid, "user-viewer", AGENT, "auto", origin="delegated")
+
+        async def _cfg(*a, **kw):
+            return SimpleNamespace(execution_target=placement.offline_sentinel("m-rack"))
+        monkeypatch.setattr(tcb, "build_task_agent_config", _cfg)
+        monkeypatch.setattr(config_builder, "release_config_seat", lambda *a, **k: None)
+        task = self._task(task_type=task_kinds.DELEGATE, scope="agent", target_chat_id=cid,
+                          continue_session=sid, created_by="user-viewer")
+        run = TaskRun("run-c", sid, task, "go", "delegate", None, 1, None, _agent_identity(), "")
+        with pytest.raises(RuntimeError) as e:
+            _asyncio.run(run._build_config())
+        assert str(e.value) == ("rack-1 is offline, so this work cannot run there now. "
+                                "Reconnect it, then continue the work.")
+
+    def test_a_continue_its_guard_refuses_at_the_start_keeps_the_refusal(
+            self, client, machines, resolver, monkeypatch):
+        """A continue that passed the spawn but whose round's guard refuses its
+        chat's machine when it starts (here its delegator lost the editor
+        tier meanwhile) never starts fresh on the default: its round ends
+        with the spawn's own sentence and the chat keeps its pin."""
+        import asyncio as _asyncio
+        from types import SimpleNamespace
+
+        from core import placement
+        from core.config import config_builder, task_config_builder as tcb
+        from services.scheduler import task_kinds
+        from services.scheduler.task_run import TaskRun
+        from storage.identity import db_users
+        sid, cid = str(uuid.uuid4()), str(uuid.uuid4())
+        task_store.create_chat(cid, "user-viewer", AGENT, "auto", origin="delegated")
+        task_store.update_chat(cid, session_id=sid, execution_target="m-own")
+        task = self._task(task_type=task_kinds.DELEGATE, scope="agent", target_chat_id=cid,
+                          continue_session=sid, created_by="user-viewer")
+        assert tcb.task_target(task, _agent_identity()) == ("m-own", None, "")
+        db_users.set_user_agent_role("user-viewer", AGENT, "contributor")
+        chosen = tcb.task_target(task, _agent_identity())
+        assert placement.offline_machine_of(chosen.target) == "m-own"
+        assert (chosen.fallback_reason, chosen.wanted_label) == (tcb.FALLBACK_CONTINUE_REFUSED,
+                                                                 "viewer-laptop")
+
+        async def _cfg(*a, **kw):
+            got = tcb.task_target(task, _agent_identity())
+            return SimpleNamespace(execution_target=got.target, fallback_reason=got.fallback_reason)
+        monkeypatch.setattr(tcb, "build_task_agent_config", _cfg)
+        monkeypatch.setattr(config_builder, "release_config_seat", lambda *a, **k: None)
+        run = TaskRun("run-r", sid, task, "go", "delegate", None, 1, None, _agent_identity(), "")
+        with pytest.raises(RuntimeError) as e:
+            _asyncio.run(run._build_config())
+        assert str(e.value) == ("This chat runs on viewer-laptop, which this work can't use. "
+                                "Move the chat, then continue it.")
+        assert task_store.get_chat(cid)["execution_target"] == "m-own"
+
     def test_a_queued_round_leaves_the_computer_of_a_delegator_below_the_tier(
             self, client, machines, resolver):
         """A delegator moved below the editor tier, or removed, names no
@@ -1153,24 +1390,23 @@ class TestTaskMachineAtRunTime:
 
     def test_a_worker_on_its_delegators_computer_meets_their_own_limit(
             self, client, machines, monkeypatch):
-        """Its spend is the delegator's own account: the delegator's own
-        limit stops the round as the agent's does. On the platform only the
-        agent's limit applies."""
+        """Its spend is the delegator's own account (``core/config/spender.py``):
+        the delegator's own limit stops the round, on their computer and on
+        the platform alike, and the agent's limit does not."""
         import asyncio as _asyncio
 
-        from core.config import task_config_builder as tcb
         from services.billing import usage_service
         from services.scheduler import runner, task_kinds
-        monkeypatch.setattr(usage_service, "check_agent_limit", lambda a: {"allowed": True})
+        monkeypatch.setattr(usage_service, "check_agent_limit", lambda a: {"allowed": False})
         monkeypatch.setattr(usage_service, "check_user_limit",
                             lambda sub, role: {"allowed": sub != "user-viewer"})
         worker = self._task(target_machine="m-own", task_type=task_kinds.DELEGATE, scope="agent",
-                            target_chat_id=str(uuid.uuid4()), created_by="user-viewer")
-        assert tcb.owners_computer_person(worker) == "user-viewer"
-        assert tcb.owners_computer_person(worker.model_copy(update={"target_machine": "m-rack"})) is None
-        run_id = _asyncio.run(runner._execute_task(worker, trigger_type="delegate"))
-        row = task_store.get_run(run_id)
-        assert (row["status"], row["error_message"]) == ("limit_exceeded", "User usage limit exceeded")
+                            target_chat_id=str(uuid.uuid4()), created_by="user-viewer",
+                            spender_sub="user-viewer")
+        for one in (worker, worker.model_copy(update={"target_machine": "m-rack"})):
+            run_id = _asyncio.run(runner._execute_task(one, trigger_type="delegate"))
+            row = task_store.get_run(run_id)
+            assert (row["status"], row["error_message"]) == ("limit_exceeded", "User usage limit exceeded")
 
     def test_the_start_guard_judges_the_runs_own_person(self, client, machines):
         """An agent-scope task names nobody to the start guard, whoever made
@@ -1236,6 +1472,9 @@ class TestTaskMachineAtRunTime:
         machines.discard("m-own")
         monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
         monkeypatch.setattr(tcb, "resolve_task_identity", lambda *a, **k: _viewer_identity())
+        # The platform's place is served by a compute machine: the run that
+        # gave way to it takes its slot there.
+        serve(monkeypatch)
         slots: list = []
 
         @contextlib.asynccontextmanager
@@ -1281,7 +1520,7 @@ class TestTaskMachineAtRunTime:
         finally:
             session_state._sessions.pop(sid, None)
             shared._active_task_ids.pop(task.id, None)
-        assert slots == ["local"]          # the slot counted where the run went
+        assert slots == [COMPUTE["id"]]    # the slot counted where the run went
         assert task_store.get_run(run_id)["execution_target"] == "local"
         chat_id = task_store.get_run(run_id)["chat_id"]
         import json as _json

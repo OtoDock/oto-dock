@@ -1,21 +1,21 @@
 """The app sandbox and supervisor (APPS.md "The app sandbox", "The
 supervisor").
 
-Load-bearing: an app server sees its release read-only, its data
-read-write and nothing else; it reaches the proxy port and nothing on the
-host or the internet; a sibling app's port is unreachable; the launch
+Load-bearing: a server's environment carries only what it needs. The launch
 token and the viewer claims are signed with keys the session validators
-reject; a crash goes to backoff and the routes learn a retry time; an idle
-server stops; the smoke never touches the live data.
+reject. A start is refused by a machine that cannot run it, and before any
+machine for a manifest nobody approved. An idle server stops, an open
+bridged socket holds one, and a server goes with its row. The smoke runs the
+working tree on scratch data and never touches the live data. The table a
+machine renders, a crash and a lost machine are ``test_app_compute.py``.
+What the sandbox lets a server see and reach is the satellite's suite
+(``satellite/tests/test_app_server.py``).
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-import shutil
-import socket
-import subprocess
 import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -24,64 +24,18 @@ from unittest.mock import patch
 import pytest
 
 import config
-from services.apps import app_sandbox, app_supervisor, app_tokens, releases
+from services.apps import app_compute, app_sandbox, app_supervisor, app_tokens, releases
 from storage import database as task_store
+from tests.apps.conftest import MACHINE
 
 AGENT = "app-sup-agent"
 
-_needs_runtime = pytest.mark.skipif(
-    not (shutil.which("pasta") and shutil.which("bwrap") and app_sandbox.bun_binary()),
-    reason="requires pasta + bwrap + Bun on this host",
-)
-
-# A server that reports what it can see and reach: the acceptance probes.
-PROBE_SERVER = """
-const port = Number(process.env.PORT || 3000);
-console.log("probe server starting on " + port);
-Bun.serve({ port, hostname: "0.0.0.0", async fetch(req) {
-  const u = new URL(req.url);
-  if (u.pathname === "/_health") return new Response("ok");
-  if (u.pathname === "/env") return Response.json({
-    app: process.env.OTODOCK_APP_ID, token: !!process.env.OTODOCK_APP_TOKEN,
-    key: process.env.OTODOCK_APP_PUBLIC_KEY || "", cwd: process.cwd(),
-    home: process.env.HOME, preview: process.env.OTODOCK_PREVIEW || "" });
-  if (u.pathname === "/probe") {
-    const t = u.searchParams.get("url");
-    try { const r = await fetch(t, { signal: AbortSignal.timeout(2500) });
-          return new Response("reached:" + r.status); }
-    catch (e) { return new Response("err:" + String(e).slice(0, 80)); }
-  }
-  if (u.pathname === "/write") { await Bun.write("/app/data/probe.txt", "x"); return new Response("written"); }
-  if (u.pathname === "/readonly") {
-    try { await Bun.write("/app/client/x.txt", "x"); return new Response("wrote"); }
-    catch (e) { return new Response("refused"); }
-  }
-  if (u.pathname === "/ls") {
-    const { readdirSync } = await import("node:fs");
-    const seen = {};
-    for (const p of ["/workspace", "/users", "/config", "/knowledge", "/home", "/app", "/app/data"]) {
-      try { seen[p] = readdirSync(p).length; } catch (e) { seen[p] = "absent"; }
-    }
-    return Response.json(seen);
-  }
-  if (u.pathname === "/crash") { setTimeout(() => process.exit(3), 50); return new Response("bye"); }
-  return new Response("hello");
-}});
-"""
+SERVER = 'Bun.serve({ port: Number(process.env.PORT), fetch() { return new Response("ok"); } });\n'
 
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
     yield
-    # A test's loop is gone by now: kill what is left synchronously (the
-    # tests stop their own servers; this catches a failed assertion).
-    import contextlib
-    import signal
-    for inst in list(app_supervisor._instances.values()):
-        proc = inst.proc
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(Exception):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     app_supervisor._instances.clear()
     app_supervisor._locks.clear()
 
@@ -108,7 +62,7 @@ def _row(slug: str = "probe", username: str = "alice", owner: str | None = "alic
                                  rel_path=f"{root}/apps/{slug}", kind="folder")
 
 
-def _tree(root: Path, server: str = PROBE_SERVER) -> Path:
+def _tree(root: Path, server: str = SERVER) -> Path:
     (root / "client").mkdir(parents=True, exist_ok=True)
     (root / "server").mkdir(parents=True, exist_ok=True)
     (root / "app.json").write_text('{"title": "Probe"}')
@@ -124,48 +78,7 @@ def _released(agent_tree: Path, slug: str = "probe") -> dict:
     return task_store.set_app_release(row["id"], rel, sha)
 
 
-def _get(url: str, timeout: float = 5.0) -> str:
-    import httpx
-    return httpx.get(url, timeout=timeout).text
-
-
-# ───────────────────────────── the sandbox (no process) ─────────────────────
-
-
-def test_app_sandbox_mounts_only_the_release_and_its_data(agent_tree, tmp_path, monkeypatch):
-    fake_bun = tmp_path / "bun"
-    fake_bun.write_text("#!/bin/sh\n")
-    fake_bun.chmod(0o755)
-    monkeypatch.setattr(config, "BUN_BIN", str(fake_bun))
-    row = _row()
-    release = tmp_path / "rel"
-    _tree(release)
-    data = tmp_path / "data"
-    data.mkdir()
-    argv = app_sandbox.build_command(row, release, data, 18081, "server/index.ts",
-                                     ["203.0.113.5"])
-    assert argv[0].endswith("oto-sandbox-net")
-    launcher = argv[: argv.index("--")]
-    assert "--block-private" in launcher and "--egress-deny" in launcher
-    assert launcher[launcher.index("--inbound") + 1] == "18081:3000"
-    assert launcher[launcher.index("--forward") + 1] == str(config.PORT)
-    assert launcher[launcher.index("--allow-host") + 1] == "203.0.113.5"
-    bwrap = argv[argv.index("--") + 1:]
-    joined = " ".join(bwrap)
-    assert f"--ro-bind {release} /app" in joined
-    assert f"--bind {data} /app/data" in joined
-    assert f"--ro-bind {fake_bun} /opt/otodock/bin/bun" in joined
-    assert "--chdir /app" in joined
-    assert "--cap-drop ALL" in joined and "--unshare-pid" in joined
-    # No workspace, no users, no config, no knowledge, no MCP tree.
-    for forbidden in ("/workspace", "/users", "/config", "/knowledge", str(config.MCPS_DIR)):
-        assert forbidden not in bwrap
-    assert bwrap[-3:] == ["/opt/otodock/bin/bun", "run", "server/index.ts"]
-    # A Bun under /usr rides the system bind; nothing extra is bound.
-    monkeypatch.setattr(config, "BUN_BIN", "/usr/local/bin/bun")
-    monkeypatch.setattr(app_sandbox, "bun_binary", lambda: "/usr/local/bin/bun")
-    argv2 = app_sandbox.build_command(row, release, data, 18081, "server/index.ts")
-    assert "/opt/otodock/bin/bun" not in argv2 and argv2[-3] == "/usr/local/bin/bun"
+# ───────────────────────────── the environment and a start ──────────────────
 
 
 def test_app_env_carries_only_what_the_server_needs(agent_tree):
@@ -184,29 +97,27 @@ def test_app_env_carries_only_what_the_server_needs(agent_tree):
     assert live["NODE_ENV"] == "production" and live["SMTP_PASSWORD"] == "x"
 
 
-def test_start_refuses_without_bun_or_approval(agent_tree, tmp_path, monkeypatch):
+def test_start_refuses_without_bun_or_approval(agent_tree, tmp_path, placed):
     row = _released(agent_tree)
-    monkeypatch.setattr(config, "BUN_BIN", "")
-    with pytest.raises(app_sandbox.AppStartError):
+    # A machine with no Bun refuses, and its sentence is the reason.
+    placed.answer = lambda msg: RuntimeError("Satellite command error: Bun is not installed on this machine.")
+    with pytest.raises(app_sandbox.AppStartError, match="Bun is not installed on this machine"):
         asyncio.run(app_supervisor.start(row))
-    # A manifest waiting for approval never starts a process (checked before
-    # the launch, so no Bun is needed to prove it).
-    fake_bun = tmp_path / "bun"
-    fake_bun.write_text("#!/bin/sh\n")
-    fake_bun.chmod(0o755)
-    monkeypatch.setattr(config, "BUN_BIN", str(fake_bun))
+    sent = len(placed.sent)
+    # A manifest waiting for approval never reaches a machine (checked
+    # before the launch).
     row = task_store.upsert_app(AGENT, "alice", "alice-sub", "probe", actions_json='[{"id":"x"}]')
     row = task_store.get_app(row["id"])
     with pytest.raises(app_supervisor.AppUnavailable) as e:
         asyncio.run(app_supervisor.start(row))
-    assert e.value.state == "unapproved"
+    assert e.value.state == "unapproved" and len(placed.sent) == sent
     # A folder without a server is a static app: no process, "static".
     static = _row("static")
     tree = tmp_path / "static"
     (tree / "client").mkdir(parents=True)
     (tree / "client" / "index.html").write_text("<p>s</p>")
     inst = asyncio.run(app_supervisor.start(static, release_dir=tree, data_dir=tmp_path / "d"))
-    assert inst.state == "static" and inst.proc is None
+    assert inst.state == "static" and inst.proc is None and len(placed.sent) == sent
 
 
 # ───────────────────────────── the claims ───────────────────────────────────
@@ -279,51 +190,6 @@ def test_the_pump_keeps_reading_past_a_line_over_the_limit(agent_tree, tmp_path)
     assert inst._tail[-1] == "after" and any("was not kept" in t for t in inst._tail)
 
 
-def test_a_start_the_caller_gives_up_on_leaves_nothing_running(agent_tree, tmp_path, monkeypatch):
-    """A cancelled start (a check's budget ran out, the request went away)
-    kills the process it spawned instead of leaving it unregistered."""
-    row = _row()
-    tree = _tree(tmp_path / "tree", "export {}")
-    monkeypatch.setattr(app_sandbox, "build_command", lambda *a, **k: ["sleep", "60"])
-    monkeypatch.setattr(app_sandbox, "bun_binary", lambda: "/bin/true")
-
-    async def never_healthy(inst):
-        await asyncio.sleep(60)
-        return False
-
-    monkeypatch.setattr(app_supervisor, "_health", never_healthy)
-    seen: dict = {}
-
-    async def run():
-        task = asyncio.create_task(app_supervisor.start(row, "check", release_dir=tree,
-                                                        data_dir=tmp_path / "d", allow_hosts=[]))
-        for _ in range(50):
-            if pid_box:
-                break
-            await asyncio.sleep(0.1)
-        await asyncio.sleep(1.2)       # past the launch's first second: in the health wait
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        await asyncio.sleep(0.3)
-        seen["pid"] = pid_box[0]
-
-    pid_box: list[int] = []
-    real = asyncio.create_subprocess_exec
-
-    async def spy(*argv, **kw):
-        proc = await real(*argv, **kw)
-        pid_box.append(proc.pid)
-        return proc
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
-    asyncio.run(run())
-    pid = seen["pid"]
-    alive = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
-    assert alive == "" or alive.startswith("Z"), alive
-    assert app_supervisor._instances.get((row["id"], "check")) is None
-
-
 def test_egress_carves_are_public_addresses_only():
     """A carve outranks the private-range blackholes, so an approved name
     its author points at the LAN, a container or the metadata service must
@@ -339,57 +205,18 @@ def test_egress_carves_are_public_addresses_only():
     assert got == ["93.184.216.34", "2606:4700::1111"]
 
 
-# ───────────────────────────── real processes ───────────────────────────────
+# ───────────────────────────── on the compute machine ───────────────────────
 
 
-def _host_ip() -> str:
-    try:
-        out = subprocess.run(["ip", "-o", "route", "get", "1.1.1.1"],
-                             capture_output=True, text=True, timeout=5).stdout.split()
-        return out[out.index("src") + 1] if "src" in out else ""
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
-@_needs_runtime
-def test_server_runs_isolated_reaches_nothing_and_stops_when_idle(agent_tree, monkeypatch):
-    row1 = _released(agent_tree, "one")
-    row2 = _released(agent_tree, "two")
+def test_an_idle_server_stops_and_an_open_socket_holds_another_through_the_same_sweep(
+        agent_tree, placed, healthy, monkeypatch):
+    row1, row2 = _released(agent_tree, "one"), _released(agent_tree, "two")
 
     async def run() -> None:
         inst1 = await app_supervisor.start(row1)
-        assert inst1.state == "up" and inst1.proc is not None
-        assert _get(f"{inst1.base_url}/_health") == "ok"
-        env = __import__("json").loads(_get(f"{inst1.base_url}/env"))
-        assert env["app"] == row1["id"] and env["token"] and env["cwd"] == "/app"
-        assert env["key"] == app_tokens.public_key_b64(row1["id"]) and env["preview"] == ""
-        # Its data is the only writable place; the release is read-only.
-        assert _get(f"{inst1.base_url}/write") == "written"
-        assert (releases.app_data_dir(row1) / "probe.txt").is_file()
-        assert _get(f"{inst1.base_url}/readonly") == "refused"
-        seen = __import__("json").loads(_get(f"{inst1.base_url}/ls"))
-        assert seen["/workspace"] == "absent" and seen["/users"] == "absent"
-        assert seen["/config"] == "absent" and seen["/home"] == "absent"
-        assert seen["/app"] != "absent" and seen["/app/data"] != "absent"
-        # The launch token is the one the registry holds and verifies.
-        assert app_tokens.verify(inst1.token, row1["id"], app_tokens.PURPOSE_LAUNCH)
-        # A sibling app cannot reach it, on loopback or on the host's LAN
-        # address; the public internet is closed too.
         inst2 = await app_supervisor.start(row2)
-        assert inst2.host_port != inst1.host_port
-        assert _get(f"{inst2.base_url}/probe?url=http://127.0.0.1:{inst1.host_port}/").startswith("err")
-        host_ip = _host_ip()
-        if host_ip:
-            assert _get(f"{inst2.base_url}/probe?url=http://{host_ip}:{inst1.host_port}/",
-                        timeout=8).startswith("err")
-        assert _get(f"{inst2.base_url}/probe?url=https://example.com/", timeout=8).startswith("err")
-        # The log has the server's own lines, timestamped and tagged.
-        await asyncio.sleep(0.2)
-        assert "probe server starting on 3000" in app_supervisor.read_log_tail(row1)
+        first, second = [m["server_id"] for m in placed.of("app_server_start")]
         assert app_supervisor.status(row1["id"])["server"] == "up"
-        # Idle: nothing happened for longer than the limit → stopped; an
-        # open bridged socket keeps the other server alive through the
-        # same sweep.
         monkeypatch.setattr(app_supervisor, "IDLE_STOP_S", 0)
         app_supervisor.ws_opened(row2["id"])
         inst1.last_activity -= 1
@@ -397,66 +224,132 @@ def test_server_runs_isolated_reaches_nothing_and_stops_when_idle(agent_tree, mo
         await app_supervisor.sweep_once()
         assert app_supervisor.get(row1["id"]) is None and inst1.proc.returncode is not None
         assert app_supervisor.status(row1["id"])["server"] == "stopped"
-        assert app_supervisor.get(row2["id"]) is inst2
+        assert [m["server_id"] for m in placed.of("app_server_stop")] == [first]
+        assert app_supervisor.get(row2["id"]) is inst2 and inst2.proc.returncode is None
+        # Its socket closed: the next sweep stops it too.
         app_supervisor.ws_closed(row2["id"])
-        # A row that disappeared takes its process with it.
-        task_store.delete_app(row2["id"])
+        inst2.last_activity -= 1
         await app_supervisor.sweep_once()
         assert app_supervisor.get(row2["id"]) is None and inst2.proc.returncode is not None
-        await app_supervisor.stop_all()
+        assert [m["server_id"] for m in placed.of("app_server_stop")] == [first, second]
 
     asyncio.run(run())
 
 
-@_needs_runtime
-def test_crash_goes_to_backoff_with_a_retry_time_and_one_notification(agent_tree):
-    row = _released(agent_tree, "crashy")
-    notified: list[str] = []
-
-    async def fake_notify(inst):
-        notified.append(inst.row_id)
+def test_a_server_goes_with_its_row(agent_tree, placed, healthy):
+    row = _released(agent_tree)
 
     async def run() -> None:
-        with patch.object(app_supervisor, "_notify_crash", fake_notify):
-            inst = await app_supervisor.start(row)
-            assert _get(f"{inst.base_url}/crash") == "bye"
-            await asyncio.wait_for(inst.closed.wait(), timeout=10)
-            assert inst.state == "backoff" and "code 3" in inst.last_error
-            with pytest.raises(app_supervisor.AppUnavailable) as e:
-                await app_supervisor.ensure_up(row)
-            assert e.value.retry_after >= 1 and e.value.state == "backoff"
-            assert app_supervisor.status(row["id"])["retry_after"] >= 0
-            assert notified == [row["id"]]
-            # After the backoff a request starts it again; the backoff
-            # doubled and resets on a healthy start.
-            await asyncio.sleep(max(0.0, inst.next_start_at - time.monotonic()) + 0.1)
-            fresh = await app_supervisor.ensure_up(row)
-            assert fresh.state == "up" and fresh is not inst
-            assert fresh.backoff_s == app_supervisor.BACKOFF_MIN_S
-            assert notified == [row["id"]]
-            await app_supervisor.stop_all()
+        inst = await app_supervisor.start(row)
+        task_store.delete_app(row["id"])
+        await app_supervisor.sweep_once()
+        assert app_supervisor.get(row["id"]) is None and inst.proc.returncode is not None
+        assert [m["server_id"] for m in placed.of("app_server_stop")] == [inst.proc.server_id]
 
     asyncio.run(run())
 
 
-@_needs_runtime
-def test_smoke_runs_the_working_tree_on_scratch_data(agent_tree):
+def _printing(placed, monkeypatch) -> list[str]:
+    """What a server prints reaches the platform ahead of its start's ack:
+    the list holds the lines of the next start."""
+    lines: list[str] = []
+    answer = placed.send_command
+
+    async def send(machine_id, msg, *, timeout=30.0, command_id=None):
+        if msg["type"] == "app_server_start":
+            app_compute.on_frame(MACHINE, {"type": "app_server_output", "server_id": msg["server_id"],
+                                           "text": "".join(lines)})
+            await asyncio.sleep(0.05)
+        return await answer(machine_id, msg, timeout=timeout, command_id=command_id)
+
+    monkeypatch.setattr(placed, "send_command", send)
+    return lines
+
+
+def test_smoke_runs_the_working_tree_on_scratch_data(agent_tree, placed, healthy, monkeypatch):
     row = _row("smoke")
     tree = _tree(agent_tree / row["rel_path"])
+    printed = _printing(placed, monkeypatch)
 
     async def run() -> None:
+        printed[:] = ["probe server starting on 3000\n"]
         report = await app_supervisor.smoke(row, tree)
         assert report["ok"] and report["server"] == "up"
         assert "probe server starting" in report["log"]
-        assert not releases.app_data_dir(row).exists()
+        # The machine ran the working tree read-only as a check instance, on
+        # a scratch folder beside the releases, with no host opened.
+        start = placed.of("app_server_start")[0]
+        binds = {b["sandbox"]: b for b in start["sandbox"]["binds"]}
+        assert start["instance"] == "check" and not start["sandbox"]["allow_hosts"]
+        assert binds["/app"]["rel"] == row["rel_path"] and not binds["/app"]["rw"]
+        scratch = agent_tree / binds["/app/data"]["rel"]
+        assert binds["/app/data"]["rw"] and scratch.parent == releases.app_release_dir(row)
+        assert scratch.name.startswith(releases.SCRATCH_DATA_PREFIX)
+        # The smoke stopped it and left nothing: no scratch, no live data.
+        assert [m["server_id"] for m in placed.of("app_server_stop")] == [start["server_id"]]
+        assert not scratch.exists() and not releases.app_data_dir(row).exists()
         assert app_supervisor.get(row["id"], "check") is None
-        broken = _tree(agent_tree / "users/alice/workspace/apps/broken",
-                       server='console.log("dying"); process.exit(7);\n')
-        report = await app_supervisor.smoke(_row("broken"), broken)
-        assert not report["ok"] and "dying" in report["log"]
-        await app_supervisor.stop_all()
+        # A server that dies at once: the machine's refusal is the reason,
+        # and what the server printed is in the report.
+        other = _row("broken")
+        broken = _tree(agent_tree / other["rel_path"])
+        printed[:] = ["dying\n"]
+        placed.answer = lambda msg: RuntimeError("Satellite command error: The app server exited at once.\ndying")
+        report = await app_supervisor.smoke(other, broken)
+        assert not report["ok"] and report["server"] == "failed"
+        assert "exited at once" in report["reason"] and "dying" in report["log"]
+        assert not list(releases.app_release_dir(other).glob(f"{releases.SCRATCH_DATA_PREFIX}*"))
+        assert app_supervisor.get(other["id"], "check") is None
 
     asyncio.run(run())
+
+
+def test_a_check_instances_scratch_sits_beside_the_releases(agent_tree):
+    row = _row("scratch")
+    d = releases.scratch_data_dir(row)
+    assert d.is_dir() and d.parent == releases.app_release_dir(row)
+    assert d.resolve().is_relative_to(agent_tree.resolve())
+
+
+def test_a_stale_scratch_is_swept_and_a_fresh_one_kept(agent_tree):
+    row = _row("scratch")
+    stale, fresh = releases.scratch_data_dir(row), releases.scratch_data_dir(row)
+    old = time.time() - releases.STALE_SCRATCH_S - 60
+    os.utime(stale, (old, old))
+    releases.scratch_data_dir(row)
+    assert not stale.exists() and fresh.exists()
+
+
+def test_a_scratch_folder_is_never_served_as_a_release(agent_tree):
+    """Code nobody approved writes this folder: a manifest.json it plants
+    must not make it addressable by hash as a client release."""
+    row = _row("scratch")
+    d = releases.scratch_data_dir(row)
+    (d / releases.MANIFEST_NAME).write_text("{}")
+    assert not d.name.startswith(releases.CHECK_DIR_PREFIX)
+    assert releases.find_release_by_sha(row, releases.tree_sha(d)) is None
+
+
+def test_the_smoke_runs_on_a_scratch_folder_it_removes(agent_tree, monkeypatch):
+    row = _row("smoke")
+    tree = _tree(agent_tree / row["rel_path"])
+    seen: dict = {}
+
+    async def fake_start(r, name, *, release_dir=None, data_dir=None, allow_hosts=None):
+        seen["data_dir"] = data_dir
+        assert data_dir.is_dir()
+        return app_supervisor.Instance(row_id=r["id"], name=name, row=r, release_dir=release_dir,
+                                       data_dir=data_dir)
+
+    async def fake_stop(row_id, name=None):
+        return 1
+
+    monkeypatch.setattr(app_supervisor, "start", fake_start)
+    monkeypatch.setattr(app_supervisor, "stop", fake_stop)
+    report = asyncio.run(app_supervisor.smoke(row, tree))
+    assert report["ok"]
+    assert seen["data_dir"].parent == releases.app_release_dir(row)
+    assert not seen["data_dir"].exists()
 
 
 def test_the_start_probe_waits_out_a_server_that_binds_late(monkeypatch):
@@ -493,13 +386,6 @@ def test_the_start_probe_waits_out_a_server_that_binds_late(monkeypatch):
     inst.host_port = 1
     assert asyncio.run(app_supervisor._health(inst)) is True
     assert answers == []
-
-
-def test_free_port_is_a_loopback_port():
-    port = app_supervisor._free_port()
-    assert 1024 < port < 65536
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", port))
 
 
 def test_supervisor_log_rotates_at_the_cap(agent_tree, monkeypatch):
@@ -545,3 +431,121 @@ def test_the_launchers_startup_chatter_stays_out_of_the_log(agent_tree):
         assert "listening on 3000" in app_supervisor.read_log_tail(row)
 
     asyncio.run(run())
+
+
+# ── the app's folders beside its releases, reached with no link ─────────────
+
+
+def _outside(tmp_path: Path) -> Path:
+    """A stand-in folder beside the agents folder, with a kept file."""
+    out = tmp_path / "outside"
+    out.mkdir()
+    (out / "kept.log").write_text("kept\n")
+    return out
+
+
+def _swap_for_link(path: Path, target: Path) -> None:
+    path.rename(path.with_name(path.name + "-moved"))
+    path.symlink_to(target, target_is_directory=target.is_dir())
+
+
+def test_the_log_is_never_written_or_read_through_a_link(agent_tree, tmp_path):
+    row = _row("logs")
+    out = _outside(tmp_path)
+    log = releases.log_path(row)
+    log.parent.mkdir(parents=True)
+    log.symlink_to(out / "kept.log")
+    asyncio.run(app_supervisor.append_log(row, "a line\n"))
+    assert (out / "kept.log").read_text() == "kept\n"
+    assert not log.is_symlink() and log.read_text() == "a line\n"
+    log.unlink()
+    log.symlink_to(out / "kept.log")
+    assert app_supervisor.read_log_tail(row) == ""
+
+
+def test_a_link_put_at_the_log_after_its_check_is_never_written_through(agent_tree, tmp_path, monkeypatch):
+    row = _row("logs")
+    out = _outside(tmp_path)
+    log = releases.log_path(row)
+    log.parent.mkdir(parents=True)
+    real = app_supervisor._clear_odd_name
+
+    def cleared_then_planted(root, rel):
+        real(root, rel)
+        if rel.endswith("app.log") and not log.is_symlink():
+            log.symlink_to(out / "kept.log")
+    monkeypatch.setattr(app_supervisor, "_clear_odd_name", cleared_then_planted)
+    asyncio.run(app_supervisor.append_log(row, "a line\n"))
+    assert (out / "kept.log").read_text() == "kept\n"
+
+
+def test_a_log_whose_folder_is_a_link_is_left_and_the_pump_goes_on(agent_tree, tmp_path):
+    row = _row("logs")
+    out = _outside(tmp_path)
+    folder = releases.app_release_dir(row)
+    folder.parent.mkdir(parents=True)
+    folder.symlink_to(out, target_is_directory=True)
+    asyncio.run(app_supervisor.append_log(row, "a line\n"))
+    assert sorted(p.name for p in out.iterdir()) == ["kept.log"]
+    assert app_supervisor.read_log_tail(row) == ""
+
+
+def test_a_long_log_tail_reads_its_last_window(agent_tree, monkeypatch):
+    row = _row("logs")
+    monkeypatch.setattr(app_supervisor, "LOG_MAX_BYTES", 32)
+    log = releases.log_path(row)
+    log.parent.mkdir(parents=True)
+    log.write_text("".join(f"line {i}\n" for i in range(40)))
+    tail = app_supervisor.read_log_tail(row, lines=3)
+    assert tail == "line 37\nline 38\nline 39"
+    assert "line 0\n" not in app_supervisor.read_log_tail(row, lines=2000)
+
+
+def test_the_smokes_scratch_removal_never_follows_a_link_above_it(agent_tree, tmp_path, monkeypatch):
+    row = _row("smoke")
+    tree = _tree(agent_tree / row["rel_path"])
+    out = tmp_path / "outside"
+
+    async def fake_start(r, name, *, release_dir=None, data_dir=None, allow_hosts=None):
+        bucket = releases.app_release_dir(r).parent
+        out.mkdir()
+        (out / r["id"] / data_dir.name).mkdir(parents=True)
+        (out / r["id"] / data_dir.name / "kept").write_text("kept")
+        _swap_for_link(bucket, out)
+        return app_supervisor.Instance(row_id=r["id"], name=name, row=r, release_dir=release_dir,
+                                       data_dir=data_dir)
+
+    async def fake_stop(row_id, name=None):
+        return 1
+
+    monkeypatch.setattr(app_supervisor, "start", fake_start)
+    monkeypatch.setattr(app_supervisor, "stop", fake_stop)
+    asyncio.run(app_supervisor.smoke(row, tree))
+    (scratch,) = (out / row["id"]).iterdir()
+    assert (scratch / "kept").read_text() == "kept"
+
+
+def test_the_start_makes_its_folders_with_no_link_followed(agent_tree, tmp_path, monkeypatch):
+    row = _row("start")
+    launched: list[str] = []
+
+    async def fake_launch(inst, *, preview, allow_hosts=None, secrets=None):
+        launched.append(inst.name)
+        raise app_sandbox.AppStartError("not really")
+
+    monkeypatch.setattr(app_supervisor, "_launch", fake_launch)
+    release = releases.app_release_dir(row) / "1"
+    _tree(release)
+    out = tmp_path / "outside"
+    out.mkdir()
+    data = releases.app_data_dir(row)
+    data.parent.parent.mkdir(parents=True)
+    data.parent.symlink_to(out, target_is_directory=True)
+    with pytest.raises(app_sandbox.AppStartError):
+        asyncio.run(app_supervisor.start(row, app_supervisor.CHECK, release_dir=release, data_dir=data))
+    assert list(out.iterdir()) == [] and launched == []
+    data.parent.unlink()
+    app_supervisor._instances.clear()
+    with pytest.raises(app_sandbox.AppStartError):
+        asyncio.run(app_supervisor.start(row, app_supervisor.CHECK, release_dir=release, data_dir=data))
+    assert data.is_dir() and (release / "data").is_dir() and launched == ["check"]

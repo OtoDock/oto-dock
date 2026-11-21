@@ -75,6 +75,16 @@ def list_file_pins(*, chat_id: str = "", project_id: str = "") -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def pinned_paths(agent: str) -> set[str]:
+    """Every path pinned on one agent's Docks: the retention sweep leaves
+    these alone, whatever their age."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT rel_path FROM pinned_files WHERE agent=%s", (agent,),
+        ).fetchall()
+    return {r["rel_path"] for r in rows}
+
+
 def delete_file_pins(
     *, chat_id: str = "", project_id: str = "", rel_path: str = "",
 ) -> int:

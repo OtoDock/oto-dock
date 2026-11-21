@@ -14,11 +14,14 @@ before asserting on the store mock, and the mock is patched at
 """
 
 import asyncio
+import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from core.remote.satellite_connection import SatelliteConnectionManager
+from services.infra import safe_fs
 
 
 class _FakeWS:
@@ -185,8 +188,9 @@ async def test_a_transfer_that_starts_across_a_replacement_uses_the_new_connecti
         old_ws = _RecWS()
         old_conn = await mgr.register("m1", old_ws, {})
         monkeypatch.setattr("core.remote.file_sync._hash_file", _hash_during_reconnect)
+        held = os.open(src, os.O_RDONLY)
         push = asyncio.create_task(mgr.push_file(
-            "m1", PathRef("agent_tree", "w.bin"), src, agent_slug="a1"))
+            "m1", PathRef("agent_tree", "w.bin"), Path(safe_fs.fd_path(held)), agent_slug="a1"))
         frames: list[dict] = []
         for _ in range(200):
             await asyncio.sleep(0.01)
@@ -199,8 +203,9 @@ async def test_a_transfer_that_starts_across_a_replacement_uses_the_new_connecti
         assert old_conn.bulk_credit.inflight == 0
         # Answer the frame on the new connection: the push lands.
         await mgr.handle_message("m1", {"type": "ack", "command_id": frames[0]["command_id"],
-                                        "status": "ok", "error": ""})
+                                        "status": "ok", "error": "", "size": 1, "mtime_ns": 1})
         assert await asyncio.wait_for(push, 2) is True
+        os.close(held)
         await mgr.deregister("m1", expected=new_conn)
         assert await mgr.drain_persists()
 
@@ -265,3 +270,51 @@ async def test_a_replaced_sockets_late_heartbeat_leaves_the_live_connection_alon
         await _dispatch_frame(mgr, "m1", new, json.dumps(stale))
         assert mgr.tunnel_port("m1") == 41000 and mgr.tunnel_ok("m1") is False
         assert await mgr.drain_persists()
+
+
+def _relayed_tool(machine_id, session_id="s-1"):
+    from core.remote import tool_relay
+    child = tool_relay._Child(machine_id, session_id, "memory", "k" * 32, asyncio.get_running_loop(), None)
+    tool_relay._children[(machine_id, session_id, "memory")] = child
+    return child
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_reconnect_ends_the_old_links_relayed_tools():
+    """The machine closed its tools when its old link went, and the old
+    handler's deregister is a no-op once the entry is replaced: the swap is
+    the one word of it here, and it reaches the old link's children alone."""
+    from core.remote import tool_relay
+    mgr = SatelliteConnectionManager()
+    with patch("storage.remote_store.update_machine_status"), \
+         patch("storage.remote_store.update_machine_capabilities"), \
+         patch("storage.remote_store.get_remote_machine", return_value=None):
+        old_conn = await mgr.register("m1", _FakeWS(), {})
+        old_child, other_machine = _relayed_tool("m1"), _relayed_tool("m2")
+        try:
+            await mgr.register("m1", _FakeWS(), {})
+            assert old_child.lost is True and other_machine.lost is False
+            # A child of the new link is not marked by the old handler's end.
+            new_child = _relayed_tool("m1", "s-2")
+            await mgr.deregister("m1", expected=old_conn)
+            assert new_child.lost is False
+            assert await mgr.drain_persists()
+        finally:
+            tool_relay._children.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_link_ends_its_relayed_tools():
+    from core.remote import tool_relay
+    mgr = SatelliteConnectionManager()
+    with patch("storage.remote_store.update_machine_status"), \
+         patch("storage.remote_store.update_machine_capabilities"), \
+         patch("storage.remote_store.get_remote_machine", return_value=None):
+        conn = await mgr.register("m1", _FakeWS(), {})
+        child, other_machine = _relayed_tool("m1"), _relayed_tool("m2")
+        try:
+            await mgr.deregister("m1", expected=conn)
+            assert child.lost is True and other_machine.lost is False
+            assert await mgr.drain_persists()
+        finally:
+            tool_relay._children.clear()

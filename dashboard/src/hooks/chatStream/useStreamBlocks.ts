@@ -47,6 +47,9 @@ export function useStreamBlocks(core: StreamCore, deps: {
   onMeetingSystem: (data: SystemFrame) => boolean
   /** The meeting hook's: the identity a permission card names in a meeting. */
   meetingParticipants: MeetingParticipant[]
+  /** A reloaded terminal chat's new terminal is up (`session_reloaded` with
+   *  `terminal`, live only): no card, the page attaches to it. */
+  onTerminalReloaded: (data: SystemFrame) => void
 }) {
   const {
     agents, chatIdRef, discardingRef, abortedRef, thinkingBufRef, messagesRef, meetingSpeakerRef, prePlanModeRef,
@@ -58,7 +61,7 @@ export function useStreamBlocks(core: StreamCore, deps: {
     setTotalCost, setBilledCost, setToolCost, setCostBilled, setContextUsed, setContextMax, setCacheStats, setCurrentTodos, setCurrentGoal,
     setLimitWarning, setLimitReached, setLimitReachedInfo,
   } = core
-  const { flushPendingSteer, onMeetingSystem, meetingParticipants } = deps
+  const { flushPendingSteer, onMeetingSystem, meetingParticipants, onTerminalReloaded } = deps
   // One delivery can reach this socket as two frames (the ladder's pump push
   // and the socket handler's own send) moments apart: the first one renders,
   // and decides whether the streaming turn continues below the result. A
@@ -336,6 +339,10 @@ export function useStreamBlocks(core: StreamCore, deps: {
       if (discardingRef.current) return
       // The turn a result starts is its synthesis, never a background review.
       reviewNudgeRef.current = null
+      // Its badge goes even when its block is not loaded (its spawn older
+      // than the page). A frame with no task id drops nothing: dropRunning
+      // without an id clears the kind.
+      if (data.task_id) dropRunning('delegates', data.task_id)
       // Mark the matching delegate block completed — by task_id when present
       // (stable key), else by task_name. The badge derives from the block.
       setMessages((prev) =>
@@ -694,6 +701,13 @@ export function useStreamBlocks(core: StreamCore, deps: {
       if (discardingRef.current) return
       const subtype = data.subtype
 
+      // A reload's new terminal, announced live alone: it renders nothing
+      // (the reload's note came as its own block), the page attaches to it.
+      if (subtype === SYSTEM_SUBTYPE.SESSION_RELOADED && data.terminal) {
+        onTerminalReloaded(data)
+        return
+      }
+
       if (onMeetingSystem(data)) return
 
       // Non-meeting system events: default behavior. `message` carries the
@@ -701,7 +715,7 @@ export function useStreamBlocks(core: StreamCore, deps: {
       // a card's wording (undelivered_input's `queued`, sent live when the
       // drive gate refuses a held message).
       ensureAssistantMsg()
-      appendBlock({ type: 'system', subtype, message: data.message, reason: data.reason })
+      appendBlock({ type: 'system', subtype, message: data.message, reason: data.reason, resetsAt: data.resets_at })
     },
 
     onImages: (data) => {

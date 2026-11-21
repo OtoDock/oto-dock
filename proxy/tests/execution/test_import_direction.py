@@ -31,11 +31,15 @@ def _modules_after(*imports: str) -> set[str]:
     return set(json.loads(out.stdout))
 
 
-def test_the_contract_module_is_a_leaf():
-    loaded = _modules_after("core.execution_layer")
-    ours = {m for m in loaded if m.startswith(("core.", "services.", "storage.", "config"))}
-    assert ours == {"core.events", "core.events.common_events", "core.execution_layer",
-                    "core.host_os", "core.permission_modes", "core.placement"}, ours
+def _ours(loaded: set[str]) -> set[str]:
+    return {m for m in loaded if m.startswith(("core.", "services.", "storage.", "config"))}
+
+
+def test_the_contract_modules_are_leaves():
+    engine = _ours(_modules_after("core.engine"))
+    assert engine == {"core.engine", "core.engine_records", "core.events", "core.events.common_events",
+                      "core.host_os", "core.permission_modes", "core.placement", "core.remote_engine_adapter"}, engine
+    assert _ours(_modules_after("core.execution_layer")) == engine | {"core.execution_layer"}
 
 
 def test_the_subscription_services_do_not_import_the_registry():

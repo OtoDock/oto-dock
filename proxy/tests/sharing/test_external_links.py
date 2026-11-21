@@ -396,11 +396,13 @@ def _mk_task() -> str:
     return tid
 
 
-def _approved_shared_app() -> dict:
+def _approved_shared_app(go_floor: str | None = "external") -> dict:
     tid = _mk_task()
+    go = {"id": "go", "label": "Go", "type": "fire_task", "task_id": tid}
+    if go_floor:
+        go["min_role"] = go_floor
     canonical, err = _mf.validate_actions([
-        {"id": "go", "label": "Go", "type": "fire_task", "task_id": tid},
-        {"id": "ask", "label": "Ask", "type": "send_prompt", "prompt": "hi"},
+        go, {"id": "ask", "label": "Ask", "type": "send_prompt", "prompt": "hi"},
     ], AGENT, True)
     assert err == "", err
     row = _app(actions_json=canonical, shared=True)
@@ -442,7 +444,7 @@ def test_actions_are_off_until_the_switch_and_never_prompts(monkeypatch):
     assert res["1"]["status"] == "ok" and res["1"]["run_id"] == "run-1"
     assert fired["trigger_source"] == f"share:{out['share']['id']}:go"
     assert res["2"]["status"] == "denied" and "shared links" in res["2"]["reason"]
-    # A link is a viewer: an editor floor refuses it.
+    # A link's visitor is an outside person: an editor floor refuses it.
     canonical, _ = _mf.validate_actions([
         {"id": "go", "label": "Go", "type": "fire_task", "task_id": _mk_task(), "min_role": "editor"},
     ], AGENT, True)
@@ -452,6 +454,66 @@ def test_actions_are_off_until_the_switch_and_never_prompts(monkeypatch):
     apps_api._fire_rate.clear()
     res = _batch(token, [{"call_id": "1", "action_id": "go"}])
     assert res["1"]["status"] == "denied" and res["1"]["code"] == 403
+
+
+def test_a_link_presses_only_a_button_open_to_outside_people(monkeypatch):
+    """Every visitor of a link is an outside person (2.0): a button with no
+    floor, or a member's floor, answers them with a plain refusal, and the
+    page is told its Buttons are off; one floored ``external`` works."""
+    row = _approved_shared_app(go_floor=None)
+    out = _link(row["id"], public=True, allow_actions=True)
+    token = _token(out["link"])
+    res = _batch(token, [{"call_id": "1", "action_id": "go"}])
+    assert res["1"]["status"] == "denied" and res["1"]["code"] == 403
+    assert res["1"]["reason"] == "This button does not work on a shared link."
+    assert '"actions": false' in client.get(f"/s/{token}").text
+    open_row = _approved_shared_app()
+    out = _link(open_row["id"], public=True, allow_actions=True)
+    token = _token(out["link"])
+    assert '"actions": true' in client.get(f"/s/{token}").text
+
+    async def _fake_trigger(task_def, **kw):
+        return "run-open"
+    from services.scheduler import scheduler
+    monkeypatch.setattr(scheduler, "trigger_task_now", _fake_trigger)
+    apps_api._fire_rate.clear()
+    assert _batch(token, [{"call_id": "1", "action_id": "go"}])["1"]["status"] == "ok"
+
+
+def test_a_link_batch_inside_its_second_names_the_wait_and_a_task_gap_none(monkeypatch):
+    """The link's batch gap (one a second for the link) names the rest of
+    its second, so the host sends the batch again; a task pressed twice
+    inside its own gap names no wait."""
+    row = _approved_shared_app()
+    out = _link(row["id"], public=True, allow_actions=True)
+    token = _token(out["link"])
+
+    async def _fake_trigger(task_def, **kw):
+        return "run-1"
+    from services.scheduler import scheduler
+    monkeypatch.setattr(scheduler, "trigger_task_now", _fake_trigger)
+    apps_api._fire_rate.clear()
+    assert _batch(token, [{"call_id": "1", "action_id": "go"}])["1"]["status"] == "ok"
+    r = client.post(f"/s/{token}/actions/batch", json={"calls": [{"call_id": "2", "action_id": "go"}]},
+                    headers=ORIGIN)
+    assert r.status_code == 429 and r.headers["retry-after"] == "1"
+    assert 0 < r.json()["retry_after_ms"] <= 1000
+    apps_api._fire_rate.pop((row["id"], "\x00batch", f"share:{out['share']['id']}"))
+    res = _batch(token, [{"call_id": "3", "action_id": "go"}])
+    assert res["3"]["code"] == 429 and "retry_after_ms" not in res["3"]
+
+
+def test_the_outside_floor_opens_only_a_tool_or_a_task_button():
+    """``min_role: external`` is stored on a tool or a task button and
+    refused on any other kind, where no outsider can press."""
+    canonical, err = _mf.validate_actions([
+        {"id": "go", "label": "Go", "type": "fire_task", "task_id": _mk_task(), "min_role": "external"},
+    ], AGENT, True)
+    assert err == "" and '"min_role":"external"' in canonical
+    _, err = _mf.validate_actions([
+        {"id": "ask", "label": "Ask", "type": "send_prompt", "prompt": "hi", "min_role": "external"},
+    ], AGENT, True)
+    assert "only a tool or a task button" in err
 
 
 def test_daily_cap_and_cross_site_actions(monkeypatch):

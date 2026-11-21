@@ -16,6 +16,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import config
+from tests._compute import serve
 from tests.fixtures.loop_builder_rig import AGENT, install
 
 # flow -> {(proxy-relative file, function): why it stays on the loop}
@@ -41,7 +43,7 @@ ALLOWED: dict[str, dict[tuple[str, str], str]] = {
 
 
 def _check(flow: str, recorded: set[tuple[str, str]]) -> None:
-    allowed = set(ALLOWED[flow])
+    allowed = set(ALLOWED.get(flow, ()))
     new = sorted(recorded - allowed)
     stale = sorted(allowed - recorded)
     assert not new, f"{flow}: store calls on the event loop: {new}"
@@ -60,11 +62,17 @@ def _user(sub: str) -> dict:
 
 @pytest.fixture
 def rig(temp_db, monkeypatch, tmp_path):
+    # A compute machine serves the platform's place: the builders build
+    # their sessions on it (with none they refuse before most of their reads).
+    serve(monkeypatch)
     return install(monkeypatch, tmp_path)
 
 
 def _record(loop_db_guard, make_coro) -> set[tuple[str, str]]:
     async def scenario():
+        # A warm platform timezone: its 60 s cache makes a per-turn read a
+        # once-a-minute one, which only this order would catch (roadmap).
+        await asyncio.to_thread(config.get_platform_timezone)
         _cold_agents()
         with loop_db_guard.recording() as sites:
             await make_coro()

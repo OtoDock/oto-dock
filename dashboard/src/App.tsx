@@ -11,7 +11,6 @@ import Layout from './components/Layout'
 import AgentLayout from './components/AgentLayout'
 import RequireAuth from './components/RequireAuth'
 import RequireRole from './components/RequireRole'
-import PlatformSetupGuard from './components/PlatformSetupGuard'
 import RouteBoundary from './components/RouteBoundary'
 import AgentGuard from './components/AgentGuard'
 import DefaultAgentRedirect from './components/DefaultAgentRedirect'
@@ -22,6 +21,7 @@ import UserSettings, {
   UsageRoute, UnknownSection,
 } from './pages/UserSettings'
 import HistoryTrail from './components/settings/HistoryTrail'
+import TabTitle from './components/common/TabTitle'
 import AppPage from './pages/apps/AppPage'
 import AgentOverview from './pages/agent/AgentOverview'
 import AgentChat from './pages/agent/AgentChat'
@@ -118,6 +118,8 @@ export default function App() {
       {/* Records the tab's history for the settings areas' back and Back to
           Chat; after the guard, so a cold load records the guard's entry. */}
       <HistoryTrail />
+      {/* The tab's title, from the route and the names the pages loaded. */}
+      <TabTitle />
       <ToastViewport />
       <AppToastHost />
       <DialogsHost />
@@ -133,8 +135,6 @@ export default function App() {
           {/* Force password change / 2FA enrollment (exempt from setup guard) */}
           <Route path="change-password" element={<ChangePassword />} />
           <Route path="setup-2fa" element={<Setup2FA />} />
-          {/* Platform setup guard — blocks non-admin if no subscriptions configured */}
-          <Route element={<PlatformSetupGuard />}>
           {/* A crash in one page shows its card, never a blank app. */}
           <Route element={<RouteBoundary />}>
           {/* Landing page: redirect to default agent chat */}
@@ -218,7 +218,6 @@ export default function App() {
           <Route path="runs/:runId" element={<RunRedirect />} />
           <Route path="conversations/:chatId" element={<ConversationView />} />
           </Route>{/* end RouteBoundary */}
-          </Route>{/* end PlatformSetupGuard */}
         </Route>
 
         <Route path="*" element={<Navigate to="/" replace />} />

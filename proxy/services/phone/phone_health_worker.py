@@ -97,7 +97,11 @@ async def _reconcile_server(server: dict) -> None:
     from services.phone import phone_adapters
     from storage.phone import phone_route_store, phone_server_store
 
-    adapter = await asyncio.to_thread(phone_adapters.load_adapter, server)
+    try:
+        adapter = await asyncio.to_thread(phone_adapters.load_adapter, server)
+    except phone_adapters.PhoneAdapterError:
+        logger.debug("Phone server %s skipped: its type is not available", server.get("id"))
+        return
 
     # 1. Health probe (all servers) → persist health columns.
     try:

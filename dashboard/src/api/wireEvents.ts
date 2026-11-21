@@ -100,6 +100,7 @@ export const WIRE = {
   WARMUP_READY: 'warmup_ready',
   WARMUP_FAILED: 'warmup_failed',
   PRE_WARMUP_READY: 'pre_warmup_ready',
+  PRE_WARMUP_REFUSED: 'pre_warmup_refused',
   CHAT_HISTORY: 'chat_history',
   CHAT_HISTORY_DELTA: 'chat_history_delta',
   CHAT_STATUS: 'chat_status',
@@ -113,6 +114,7 @@ export const WIRE = {
   ENGINE_SWITCHED: 'engine_switched',
   SWITCH_ENGINE_DENIED: 'switch_engine_denied',
   LIVENESS: 'liveness',
+  TARGET_MISMATCH: 'target_mismatch',
   TITLE_UPDATED: 'title_updated',
   TURN_COMPLETE: 'turn_complete',
   // The interactive terminal.
@@ -149,6 +151,7 @@ export const WIRE = {
   SATELLITE_UPDATED: 'satellite_updated',
   SATELLITE_UPDATE_FAILED: 'satellite_update_failed',
   SATELLITE_UPDATE_SYNC: 'satellite_update_sync',
+  MACHINE_LINK: 'machine_link',
   // The connection itself.
   SERVER_INFO: 'server_info',
   PONG: 'pong',
@@ -164,6 +167,16 @@ export const PERSISTED = {
   BG_NUDGE: 'bg_nudge',
   BG_COMMAND_NUDGE: 'bg_command_nudge',
   SCHEDULE_WAKE: 'schedule_wake',
+} as const
+
+/** The event rows a feature writes under a chat with no frame of their own
+ *  and no place in the frame table. The proxy names each beside the frames
+ *  (`ws/wire_events.py`: `WRAPUP` sits after `CHECK_VERDICT`), so it stays
+ *  out of `WIRE`, `FRAMES` and `PERSISTED`, which the mirror test holds
+ *  equal to the frame table. `WRAPUP`: the wrap-up after a call, one row at
+ *  the end of a phone conversation (`services/phone/wrapup.py`). */
+export const EVENT_ROW = {
+  WRAPUP: 'wrapup',
 } as const
 
 /** The live-block kinds (`live_state.live_blocks[].type`). */
@@ -262,6 +275,7 @@ export const FRAMES: Record<WireType, FrameMeta> = {
   warmup_ready: { perChat: false, persisted: null },
   warmup_failed: { perChat: false, persisted: null },
   pre_warmup_ready: { perChat: false, persisted: null },
+  pre_warmup_refused: { perChat: false, persisted: null },
   chat_history: { perChat: false, persisted: null },
   chat_history_delta: { perChat: true, persisted: null },
   chat_status: { perChat: false, persisted: null },
@@ -275,6 +289,7 @@ export const FRAMES: Record<WireType, FrameMeta> = {
   engine_switched: { perChat: false, persisted: null },
   switch_engine_denied: { perChat: false, persisted: null },
   liveness: { perChat: false, persisted: null },
+  target_mismatch: { perChat: false, persisted: null },
   title_updated: { perChat: false, persisted: null },
   turn_complete: { perChat: false, persisted: null },
   pty_output: { perChat: true, persisted: null },
@@ -309,6 +324,7 @@ export const FRAMES: Record<WireType, FrameMeta> = {
   satellite_updated: { perChat: false, persisted: null },
   satellite_update_failed: { perChat: false, persisted: null },
   satellite_update_sync: { perChat: false, persisted: null },
+  machine_link: { perChat: false, persisted: null },
   server_info: { perChat: false, persisted: null },
   pong: { perChat: false, persisted: null },
 }
@@ -328,7 +344,8 @@ export function isWireType(t: unknown): t is WireType {
 /** `system.subtype`: the ones the proxy mints or persists (the meeting
  *  orchestrator's seven, the reseed card, the undelivered-input card, the
  *  self-wake marker, the install progress, the tailers' compaction
- *  separator, the not-sent line of a turn whose machine is reconnecting)
+ *  separator, the not-sent line of a turn whose machine is reconnecting,
+ *  the session reload's note)
  *  and, marked, the ones the DASHBOARD synthesises from other
  *  frames (`warmup_failed.reason`, the two nudge rows, the live compaction).
  *  The CLI passes raw subtypes through as well; the renderer ignores what
@@ -344,20 +361,31 @@ export const SYSTEM_SUBTYPE = {
   MEETING_TURN_END: 'meeting_turn_end',
   MEETING_CONCLUDED: 'meeting_concluded',
   MEETING_AGENT_FAILED: 'meeting_agent_failed',
+  MEETING_AGENT_STOPPED: 'meeting_agent_stopped',
   MEETING_AGENT_LEFT: 'meeting_agent_left',
   MEETING_FAILED: 'meeting_failed',
   MACHINE_RECONNECTING: 'machine_reconnecting',
   MACHINE_NOT_ANSWERING: 'machine_not_answering',
+  // A turn cut by a restart whose machine has not reported yet: told once.
+  TURN_WAITING: 'turn_waiting',
+  TURN_DROPPED: 'turn_dropped',
   ENGINE_PROMPT_REFUSED: 'engine_prompt_refused',
   // A person's move of the chat: where it went, or why it did not finish
   // (`reason` CHAT_MOVED_REASON).
   CHAT_MOVED: 'chat_moved',
+  // The agent asked the platform to rebuild the chat's session (a reload):
+  // the server's note (a row and the same block live, `reason` the words of
+  // CHAT_MOVED_REASON, none when it went through). A terminal chat's new
+  // terminal is announced live alone by `terminal: true` with no message:
+  // no card, the page attaches to it.
+  SESSION_RELOADED: 'session_reloaded',
   // The chat's machine still installs some of its tools, or they ended: the
   // server's sentence names them.
   TOOLS_INSTALLING: 'tools_installing',
   // Photos of the person's message that did not reach the agent (the
   // server's sentence, and `count`).
   PHOTOS_NOT_ATTACHED: 'photos_not_attached',
+  FILES_LATE: 'files_late',
   // Dashboard-synthesised (never sent by the proxy).
   NO_SUBSCRIPTION: 'no_subscription',
   POOL_CAP: 'pool_cap',
@@ -381,11 +409,17 @@ export const UNDELIVERED_REASON = {
 
 /** `chat_moved.reason` (the proxy's `MOVED_*`): none for a move that
  *  finished, `failed` for one that did not (the chat stayed), and the two
- *  ends of the agent's own move that did not resume the chat by itself. */
+ *  ends of the agent's own move that did not resume the chat by itself.
+ *  A `session_reloaded` note's `reason` takes the same words,
+ *  `account_changed` for a line about an account a chat uses, and
+ *  `account_change_waits` for a change of AI account that waits on the text
+ *  typed in the chat's terminal. */
 export const CHAT_MOVED_REASON = {
   FAILED: 'failed',
   RESUME_STOPPED: 'resume_stopped',
   RESUME_SKIPPED: 'resume_skipped',
+  ACCOUNT_CHANGED: 'account_changed',
+  ACCOUNT_CHANGE_WAITS: 'account_change_waits',
 } as const
 
 /** `chat_move_progress.phase` (the proxy's `MOVE_PHASES`): the platform's
@@ -397,9 +431,10 @@ export const MOVE_PHASE = {
 } as const
 export type MovePhase = (typeof MOVE_PHASE)[keyof typeof MOVE_PHASE]
 
-/** A `schedule_wake` row's `source` (the proxy's `WAKE_SOURCE_MOVE`): the
- *  platform resumed the chat after the agent moved it. */
-export const WAKE_SOURCE = { MOVE: 'move' } as const
+/** A `schedule_wake` row's `source` (the proxy's `WAKE_SOURCE_*`): the
+ *  platform resumed the chat after the agent moved it, after the agent
+ *  reloaded its session, or after its own restart in the middle of a turn. */
+export const WAKE_SOURCE = { MOVE: 'move', RELOAD: 'reload', CONTINUE: 'continue' } as const
 
 /** `server_turn_start.cause` (the proxy's `SERVER_TURN_CAUSES`): what started
  *  the turn. Only a review's own turn draws the nudge line the
@@ -444,6 +479,7 @@ export const OUT = {
   ARTIFACT_INTERACTION: 'artifact_interaction',
   APP_ACTION: 'app_action',
   RESUME_CHAT: 'resume_chat',
+  LEAVE_CHAT: 'leave_chat',
   CHAT_READ: 'chat_read',
   PERMISSION_RESPONSE: 'permission_response',
   QUESTION_RESPONSE: 'question_response',
@@ -462,6 +498,7 @@ export const OUT = {
   MOVE_CHAT: 'move_chat',
   SWITCH_ENGINE: 'switch_engine',
   PROBE_LIVENESS: 'probe_liveness',
+  TARGET_CHECK: 'target_check',
   IMPLEMENT_PLAN: 'implement_plan',
   ABORT: 'abort',
   CANCEL_QUEUED: 'cancel_queued',
@@ -567,7 +604,7 @@ export interface PromptRetiredFrame extends PerChat { type: typeof WIRE.PROMPT_R
 export interface PermissionResolvedFrame extends PerChat { type: typeof WIRE.PERMISSION_RESOLVED; request_id: string; approved?: boolean; action?: string }
 export interface LocationRequestFrame extends PerChat { type: typeof WIRE.LOCATION_REQUEST; request_id: string }
 export interface PlanModeFrame extends PerChat { type: typeof WIRE.PLAN_MODE; action: string; plan?: string; filename?: string; tool_input?: ToolInput | null }
-export interface SystemFrame extends PerChat { type: typeof WIRE.SYSTEM; subtype: string; message?: string; agent?: string; agent_display_name?: string; agent_color?: string; round?: number; participants?: MeetingParticipant[]; max_rounds?: number; max_turns?: number; meeting_id?: string; machine_name?: string; reason?: string; mcp?: string; pct?: number; phase?: string }
+export interface SystemFrame extends PerChat { type: typeof WIRE.SYSTEM; subtype: string; message?: string; agent?: string; agent_display_name?: string; agent_color?: string; round?: number; participants?: MeetingParticipant[]; max_rounds?: number; max_turns?: number; meeting_id?: string; machine_name?: string; reason?: string; resets_at?: string; mcp?: string; pct?: number; phase?: string; terminal?: boolean }
 export interface MetadataFrame extends PerChat { type: typeof WIRE.METADATA; cost_usd?: number; cost_billed?: boolean; duration_ms?: number; duration_api_ms?: number; context_used?: number; context_max?: number; cache_read?: number; cache_write?: number; input_tokens?: number; output_tokens?: number }
 export interface McpCostFrame extends PerChat { type: typeof WIRE.MCP_COST; cost_usd: number; cost_billed?: boolean; provider: string; model: string; tool: string; mcp: string }
 export interface TodoUpdateFrame extends PerChat { type: typeof WIRE.TODO_UPDATE; todos: Array<{ content: string; status: string; activeForm?: string }> }
@@ -662,11 +699,14 @@ export interface QueueChip extends QueueAttachments {
 }
 /** `QueueChip.waiting` (the proxy's `input_queue.WAITING_*`): the chat's
  *  machine is reconnecting, the message goes out when it is back; or a
- *  teammate's terminal is open on the chat, it goes out when that closes. */
+ *  teammate's terminal is open on the chat, it goes out when that closes;
+ *  or the platform is about to stop for an update, it goes out when the
+ *  platform is back. */
 export const QUEUE_WAITING = {
   RECONNECT: 'reconnect',
   MACHINE: 'machine',
   TERMINAL: 'terminal',
+  UPDATING: 'updating',
 } as const
 /** On the author's sockets only: the message handed back to the composer. */
 export interface QueueReturned extends QueueAttachments { returned?: boolean; text?: string }
@@ -706,7 +746,8 @@ export interface SteeredFrame extends PerChat, QueueAttachments {
   message_id?: number | null
   event_data?: { agent_slug?: string; agent_display_name?: string; agent_color?: string; badge?: string }
 }
-export interface ModeChangedFrame extends PerChat { type: typeof WIRE.MODE_CHANGED; mode: string }
+/** `refusal`: why a live terminal took no pick; `mode` is then the chat's own. */
+export interface ModeChangedFrame extends PerChat { type: typeof WIRE.MODE_CHANGED; mode: string; refusal?: string }
 export interface ModelChangedFrame extends PerChat { type: typeof WIRE.MODEL_CHANGED; model: string }
 /** The ack of `execution_mode_change` and the echo of a refused terminal
  *  pick: the chat's stored mode. Applied to the viewed chat only (`chat_id`);
@@ -747,18 +788,25 @@ export interface WarmupReadyFrame {
  * (a send below the editor role on a Shared-only agent writes nothing). */
 export interface WarmupFailedFrame { type: typeof WIRE.WARMUP_FAILED; chat_id?: string; error: string; reason?: string }
 export interface PreWarmupReadyFrame { type: typeof WIRE.PRE_WARMUP_READY; session_id: string }
-/** A background sub-agent or command that still runs: its spawn's
- *  `tool_use_id` and the text its badge shows. */
+/** A new chat's pre-warm the builders refused: the same sentence a send would meet. */
+export interface PreWarmupRefusedFrame { type: typeof WIRE.PRE_WARMUP_REFUSED; agent: string; execution_path: string; reason: string; error: string }
+/** Work of the chat that still runs: a background sub-agent's or command's
+ *  spawn `tool_use_id`, or a delegation's task id (the one its
+ *  `delegate_spawn` row carries), and the text its badge shows; a
+ *  delegation also names its agent. */
 export interface RunningBackgroundEntry {
   id: string
   description: string
+  agent?: string
 }
-/** What a history's rows cannot say (every stored spawn reads finished):
- *  the background work of the chat that still runs. Sent only when there is
- *  some. */
+/** What a history's rows cannot say (every stored spawn reads finished, a
+ *  delegation's spawn may be older than the page): the work of the chat
+ *  that still runs. Sent only when there is some; `delegates` only by a
+ *  2.0 proxy or later. */
 export interface RunningBackgroundWire {
   agents?: RunningBackgroundEntry[]
   commands?: RunningBackgroundEntry[]
+  delegates?: RunningBackgroundEntry[]
 }
 export interface ChatHistoryFrame {
   type: typeof WIRE.CHAT_HISTORY
@@ -766,7 +814,9 @@ export interface ChatHistoryFrame {
   agent?: string
   messages: DbMessageRow[]
   has_more?: boolean
-  restore?: { todos?: TodoItemWire[]; meeting?: MeetingRestore | null; goal?: ThreadGoal | null }
+  /** `cost`: the gauge's word over the whole chat (a 2.0 proxy or later): the
+   *  newest turn's account and the sum of its tool fee rows. */
+  restore?: { todos?: TodoItemWire[]; meeting?: MeetingRestore | null; goal?: ThreadGoal | null; cost?: ChatCostWire }
   plans?: DbPlanRow[]
   total_cost?: number
   context_used?: number
@@ -833,11 +883,24 @@ export interface ChatMoveProgressFrame {
   phase: MovePhase
 }
 /** The viewed chat is driven from outside (`kind`: `phone`): sent before the
- *  read-only history of a full resume; the page re-resumes on `ready`. */
-export interface ChatViewOnlyFrame { type: typeof WIRE.CHAT_VIEW_ONLY; chat_id: string; kind: string }
+ *  read-only history of a full resume; the page re-resumes on `ready`.
+ *  `lock`: a call holds the chat (the agent's conversation for good, a
+ *  person's own until the call ends), the composer's sentence meanwhile;
+ *  absent for a call that runs inside the chat (typed messages wait). */
+export interface ChatViewOnlyFrame { type: typeof WIRE.CHAT_VIEW_ONLY; chat_id: string; kind: string; lock?: string }
 export interface EngineSwitchedFrame { type: typeof WIRE.ENGINE_SWITCHED; chat_id: string; execution_path: string; model: string }
 export interface SwitchEngineDeniedFrame { type: typeof WIRE.SWITCH_ENGINE_DENIED; chat_id: string; message: string; process_alive?: boolean }
 export interface LivenessFrame { type: typeof WIRE.LIVENESS; chat_id: string; process_alive: boolean }
+/** `target_check`'s answer for the socket's chat: the banner's four fields
+ *  when it runs elsewhere than the agent's new chats, none when it does not. */
+export interface TargetMismatchFrame {
+  type: typeof WIRE.TARGET_MISMATCH
+  chat_id: string
+  pinned_target?: string
+  pinned_label?: string
+  resolved_target?: string
+  resolved_label?: string
+}
 export interface TitleUpdatedFrame { type: typeof WIRE.TITLE_UPDATED; chat_id: string; title: string }
 export interface TurnCompleteFrame { type: typeof WIRE.TURN_COMPLETE; chat_id?: string; title?: string; body?: string }
 export interface PtyOutputFrame extends PerChat { type: typeof WIRE.PTY_OUTPUT; session_id: string; data: string; replay?: boolean; reset?: boolean }
@@ -894,7 +957,12 @@ export interface SatelliteUpdateSyncFrame {
   type: typeof WIRE.SATELLITE_UPDATE_SYNC
   inflight: Array<{ machine_id: string; machine_name?: string; from_version?: string; to_version: string }>
 }
-export interface ServerInfoFrame { type: typeof WIRE.SERVER_INFO; build_id: string; version: string }
+/** A machine connected or left: every place the page shows is read again. */
+export interface MachineLinkFrame { type: typeof WIRE.MACHINE_LINK; machine_id: string }
+/** `updating`: the platform holds new work before it stops for an update.
+ *  The connect frame carries the key only while it holds; the frame pushed
+ *  at every change carries it either way. */
+export interface ServerInfoFrame { type: typeof WIRE.SERVER_INFO; build_id: string; version: string; updating?: boolean }
 export interface PongFrame { type: typeof WIRE.PONG; build_id?: string }
 
 /** Every frame the dashboard socket carries, discriminated on `type`. */
@@ -914,15 +982,16 @@ export type WireFrame =
   | QueuedFrame | QueueRemovedFrame | QueueSentFrame | QueueClearedFrame | QueueSnapshotFrame | SteeredFrame
   | ModeChangedFrame | ModelChangedFrame | ExecutionModeChangedFrame | PlanStatusFrame | ServerTurnStartFrame
   | WarmupStartedFrame | WarmupHeartbeatFrame | WarmupReadyFrame | WarmupFailedFrame | PreWarmupReadyFrame
+  | PreWarmupRefusedFrame
   | ChatHistoryFrame | ChatHistoryDeltaFrame | ChatStatusFrame | ChatStatusSnapshotFrame | ChatReadFrame | ChatRowsFrame | ChatMetaFrame
-  | ChatMovedFrame | ChatMoveProgressFrame | ChatViewOnlyFrame | EngineSwitchedFrame | SwitchEngineDeniedFrame | LivenessFrame | TitleUpdatedFrame | TurnCompleteFrame
+  | ChatMovedFrame | ChatMoveProgressFrame | ChatViewOnlyFrame | EngineSwitchedFrame | SwitchEngineDeniedFrame | LivenessFrame | TargetMismatchFrame | TitleUpdatedFrame | TurnCompleteFrame
   | PtyOutputFrame | PtyExitFrame | PtyPermissionFrame | PtyArtifactFrame | PtyStatusFrame
   | NotificationFrame | NotificationSilentFrame | NotificationCountFrame | ShareInboxFrame | FileUpdatedFrame
   | AppPushFrame | AppStateFrame | OpenAppFrame | AppDeployedFrame | CatalogFrame
   | InstallStartedFrame | InstallMcpPlanFrame | InstallProgressFrame | InstallHeartbeatFrame
   | InstallVerifyingFrame | InstallDoneFrame | InstallFailedFrame | McpInstallFailedFrame
   | TransferStartedFrame | TransferMachineStateFrame | TransferProgressFrame | TransferDoneFrame | TransferStateFrame
-  | SatelliteUpdatingFrame | SatelliteUpdatedFrame | SatelliteUpdateFailedFrame | SatelliteUpdateSyncFrame
+  | SatelliteUpdatingFrame | SatelliteUpdatedFrame | SatelliteUpdateFailedFrame | SatelliteUpdateSyncFrame | MachineLinkFrame
   | ServerInfoFrame | PongFrame
 
 /** The payload of one frame kind: `WirePayload<'text'>` is `TextFrame`. */
@@ -935,6 +1004,9 @@ export type WirePayload<T extends WireType> = Extract<WireFrame, { type: T }>
 
 /** A meeting participant as the live `meeting_started` event names it. */
 export interface MeetingParticipant { slug: string; display_name: string; color: string }
+/** The cost gauge's facts the history's restore carries: whether the newest
+ *  turn's account bills money, and the chat's tool fees. */
+export interface ChatCostWire { billed: boolean; fees: number }
 /** A participant in the history's restore: an older proxy sent the slug alone. */
 export type MeetingParticipantWire = string | Partial<MeetingParticipant>
 /** The meeting half of the history's restore. */
@@ -977,6 +1049,18 @@ export interface ToolBlockWire {
 /** The persisted kinds that are no frame of their own. */
 export interface ScheduleWakeEvent { type: typeof PERSISTED.SCHEDULE_WAKE; prompt?: string; source?: string }
 export interface BgNudgeEvent { type: typeof PERSISTED.BG_NUDGE | typeof PERSISTED.BG_COMMAND_NUDGE; count?: number; labels?: string[] }
+/** The wrap-up after a call (`EVENT_ROW.WRAPUP`): how it ended (`state`, the
+ *  record's `wrapup`), the outcome, the follow-ups and what it wrote (a
+ *  memory topic or a file of the person's). The row's data carries no
+ *  `type`: its column names it. */
+export interface WrapupEvent {
+  type: typeof EVENT_ROW.WRAPUP
+  state?: string
+  outcome?: string
+  follow_ups?: string[]
+  wrote?: { kind: string; name: string }[]
+  run_id?: string
+}
 
 /** The keys the store adds to a frame it persists. */
 interface PersistedExtras { _meeting_agent?: string; dismissed?: boolean }
@@ -990,7 +1074,7 @@ export type PersistedEvent = PersistedExtras & (
   | (PlanReviewFrame & { action?: string })
   | (TaskSpawnFrame & { tool_result?: string })
   | (ThinkingFrame & { content?: string })
-  | ToolBlockWire | ScheduleWakeEvent | BgNudgeEvent
+  | ToolBlockWire | ScheduleWakeEvent | BgNudgeEvent | WrapupEvent
 )
 
 /** The live state's own cards (`live_blocks[]` beside the replayed frames). */

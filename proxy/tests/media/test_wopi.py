@@ -25,6 +25,7 @@ from tests._timing import bound
 from tests.media.wopi_signing import sign_request_async, signed_client, signing
 
 _REAL_PERSON_HOLDS: dict = {}
+_REAL_STANDING: dict = {}
 
 
 @pytest.fixture(autouse=True)
@@ -37,15 +38,20 @@ def _collabora_signs(monkeypatch):
 @pytest.fixture(autouse=True)
 def _wopi_persons_hold(monkeypatch):
     """The WOPI routes judge the person a token names (the users row, the
-    credential timeline, the forced change): these tests mint tokens for
-    subs with no row, so the person holds unless a test asks otherwise
-    (``_REAL_PERSON_HOLDS``)."""
+    credential timeline, the forced change) and what that person may do
+    with its document now: these tests mint tokens for subs with no row, so
+    the person holds and the token's own word stands unless a test asks
+    otherwise (``_REAL_PERSON_HOLDS``, ``_REAL_STANDING``)."""
     from api.media import wopi
     _REAL_PERSON_HOLDS.setdefault("fn", wopi._person_holds_now)
+    _REAL_STANDING.setdefault("fn", wopi._standing_now)
     monkeypatch.setattr(wopi, "_person_holds_now", lambda sub, iat: True)
-    wopi._holder_answers.clear()
+    monkeypatch.setattr(wopi, "_standing_now", lambda sub, agent, path, chat: "edit")
+    wopi._holders.answers.clear()
+    wopi._documents.answers.clear()
     yield
-    wopi._holder_answers.clear()
+    wopi._holders.answers.clear()
+    wopi._documents.answers.clear()
 
 def _encode_file_id(rel: str) -> str:
     return base64.urlsafe_b64encode(rel.encode()).decode().rstrip("=")
@@ -811,6 +817,28 @@ def test_the_workspace_mint_reads_off_the_loop(temp_db, tmp_path, monkeypatch):
     resp = _ask_url(app, "workspace/x.docx")
     assert resp.status_code == 200 and resp.json()["permissions"] == "edit"
     assert on_loop and not any(on_loop)
+
+
+
+def test_the_workspace_mint_names_the_agent_never_where_its_folder_resolves(temp_db, tmp_path, monkeypatch):
+    """The minted rel starts with the agent's own name: an agent folder
+    that is a link to another agent's folder, or out of the agents folder,
+    mints nothing."""
+    other = tmp_path / "other-agent" / "workspace" / "x.docx"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"theirs")
+    os.symlink(tmp_path / "other-agent", tmp_path / "test-agent")
+    app = _make_url_app(monkeypatch, tmp_path, role="manager", username="mgr")
+    moved = "This agent's folder was moved, so its documents cannot open here."
+    resp = _ask_url(app, "workspace/x.docx")
+    assert resp.status_code == 403 and resp.json()["detail"] == moved
+    (tmp_path / "test-agent").unlink()
+    away = tmp_path.parent / f"{tmp_path.name}-disk2"
+    (away / "workspace").mkdir(parents=True)
+    (away / "workspace" / "x.docx").write_bytes(b"moved")
+    os.symlink(away, tmp_path / "test-agent")
+    resp = _ask_url(app, "workspace/x.docx")
+    assert resp.status_code == 403 and resp.json()["detail"] == moved
 
 
 def test_the_snapshot_mint_reads_off_the_loop(temp_db, tmp_path, monkeypatch):
@@ -1850,7 +1878,7 @@ def test_a_token_stops_at_its_persons_sign_out_everywhere(temp_db, tmp_path, mon
     token = _token_for(sub, int(_time.time()) - 3)
     assert client.get(f"/wopi/files/{file_id}?access_token={token}").status_code == 200
     task_store.bump_token_epoch(sub)
-    wopi._holder_answers.clear()
+    wopi._holders.answers.clear()
     assert client.get(f"/wopi/files/{file_id}?access_token={token}").status_code == 401
     assert client.get(f"/wopi/files/{file_id}/contents?access_token={token}").status_code == 401
     assert _save(client, file_id, token, b"x").status_code == 401
@@ -1916,40 +1944,42 @@ async def test_the_person_is_read_once_per_issue_time_and_a_failure_is_not_kept(
     assert await wopi.person_standing("pat", 8) is None
     assert calls.count("down") == 2          # a failure refuses, and is read again
     # Every answer expires: the forced change can clear with the same cookie.
-    wopi._holder_answers[("pat", 7)] = (True, 0.0)
+    wopi._holders.answers[("pat", 7)] = (True, 0.0)
     assert await wopi.person_holds("pat", 7) is False
     # An epoch bump can drop a person's kept answers at once.
-    wopi._holder_answers[("pat", 9)] = (True, float("inf"))
-    wopi._holder_answers[("kim", 9)] = (True, float("inf"))
+    wopi._holders.answers[("pat", 9)] = (True, float("inf"))
+    wopi._holders.answers[("kim", 9)] = (True, float("inf"))
     wopi.forget_person("pat")
-    assert ("pat", 9) not in wopi._holder_answers and ("kim", 9) in wopi._holder_answers
+    assert ("pat", 9) not in wopi._holders.answers and ("kim", 9) in wopi._holders.answers
     # The sites that bump an epoch call the holder cache's forget once; the
     # WOPI cache hears it from there.
     from auth import token_holder
     token_holder.forget("kim")
-    assert ("kim", 9) not in wopi._holder_answers
+    assert ("kim", 9) not in wopi._holders.answers
 
 
 @pytest.mark.asyncio
 async def test_a_forget_during_a_read_in_flight_keeps_nothing(monkeypatch):
     """The read may predate the change that caused the forget: its answer
     reaches the requests that waited for it and no one else, and a request
-    arriving after the forget starts its own read."""
+    arriving after the forget starts its own read. The overtaken read lands
+    last here, and still keeps nothing."""
     import asyncio
     import threading
 
     from api.media import wopi
-    wopi._holder_answers.clear()
-    wopi._holder_reads.clear()
+    wopi._holders.answers.clear()
+    wopi._holders.reads.clear()
     started = threading.Event()                      # the reads run on the DB executor's threads
-    release = threading.Event()
+    releases = [threading.Event(), threading.Event()]
     calls = []
 
     def _slow(sub, iat):
+        n = len(calls)
         calls.append((sub, iat))
         started.set()
-        release.wait(5)
-        return True
+        releases[n].wait(5)
+        return n == 1                                # the overtaken read says no, the late one yes
 
     async def _reading():
         while not started.is_set():  # noqa: ASYNC110  # a thread sets this event: there is nothing to await
@@ -1962,11 +1992,13 @@ async def test_a_forget_during_a_read_in_flight_keeps_nothing(monkeypatch):
     started.clear()
     second = asyncio.ensure_future(wopi.person_standing("pat", 7))
     await _reading()                                 # the late request reads for itself
-    release.set()
-    assert await first is True and await second is True
+    releases[1].set()
+    assert await second is True
+    releases[0].set()
+    assert await first is False
     assert calls == [("pat", 7), ("pat", 7)]
-    assert wopi._holder_answers[("pat", 7)][0] is True   # the late read's answer is the one kept
-    assert not wopi._holder_reads
+    assert wopi._holders.answers[("pat", 7)][0] is True   # the late read's answer is the one kept
+    assert not wopi._holders.reads
 
 
 def test_the_mints_claim_the_generation_their_url_opens(temp_db, tmp_path, monkeypatch):
@@ -2028,3 +2060,350 @@ def test_a_file_on_the_sessions_machine_is_edited_only_by_its_person():
     assert rule("alice", "viewer", "alice") == "view"
     assert rule("alice", "editor", "") == "view"
     assert rule("", "editor", "") == "view"
+
+
+# ---------------------------------------------------------------------------
+# What a token's person may do with its document now: the rule that made the
+# token, at the person's role now, on every route
+# ---------------------------------------------------------------------------
+
+
+def _judged_for_real(monkeypatch):
+    """The real person check and the real judgement of their document."""
+    from api.media import wopi
+    monkeypatch.setattr(wopi, "_person_holds_now", _REAL_PERSON_HOLDS["fn"])
+    monkeypatch.setattr(wopi, "_standing_now", _REAL_STANDING["fn"])
+
+
+def _member(role, email="pat@t.com"):
+    """A person of test-agent with ``role``."""
+    from storage import database as task_store
+    sub = _person(email)
+    task_store.add_user_agent(sub, "test-agent", role, "test")
+    return sub
+
+
+def _lock_op(client, file_id, token, override, lock="L1"):
+    return client.post(f"/wopi/files/{file_id}?access_token={token}",
+                       headers={"X-WOPI-Override": override, "X-WOPI-Lock": lock})
+
+
+def test_a_person_lowered_to_reading_keeps_the_view_and_cannot_save(temp_db, tmp_path, monkeypatch):
+    """An editor lowered to viewer: the open document goes on reading, a
+    save is refused with the answer a read-only token gets and writes
+    nothing, a lock is neither taken nor renewed, and the editor still gives
+    back the lock it holds."""
+    from api.media import wopi
+    from storage import database as task_store
+    client, target, file_id, _token, pw, _bc = _save_rig(monkeypatch, tmp_path)
+    _judged_for_real(monkeypatch)
+    wopi._wopi_locks.clear()
+    sub = _member("editor")
+    token, _ = wopi.create_wopi_token("test-agent/workspace/x.docx", sub, "Pat", "edit", "test-agent")
+    info = client.get(f"/wopi/files/{file_id}?access_token={token}")
+    assert info.status_code == 200 and info.json()["UserCanWrite"] is True
+    assert _lock_op(client, file_id, token, "LOCK").status_code == 200
+
+    task_store.set_user_agent_role(sub, "test-agent", "viewer")
+    wopi.forget_person(sub)                          # what the offboarding event does
+
+    info = client.get(f"/wopi/files/{file_id}?access_token={token}")
+    assert info.status_code == 200 and info.json()["UserCanWrite"] is False
+    assert client.get(f"/wopi/files/{file_id}/contents?access_token={token}").content == b"agent bytes"
+    resp = _save(client, file_id, token, b"x", **{"X-WOPI-Lock": "L1"})
+    assert resp.status_code == 403 and resp.json()["detail"] == "Write permission required"
+    pw.assert_not_awaited()
+    assert target.read_bytes() == b"agent bytes"
+    assert _lock_op(client, file_id, token, "REFRESH_LOCK").status_code == 403
+    assert _lock_op(client, file_id, token, "LOCK", "L2").status_code == 403
+    assert _lock_op(client, file_id, token, "UNLOCK").status_code == 200
+    assert wopi._get_lock(file_id) is None
+
+
+def test_a_person_removed_from_the_agent_is_refused_on_every_route(temp_db, tmp_path, monkeypatch):
+    """A person removed from the agent: every request of their open
+    document is refused at once and nothing is written. Their editor can
+    still give back the lock it took, so the lock keeps no one out."""
+    from api.media import wopi
+    from storage import database as task_store
+    client, target, file_id, _token, pw, _bc = _save_rig(monkeypatch, tmp_path)
+    _judged_for_real(monkeypatch)
+    wopi._wopi_locks.clear()
+    sub = _member("editor")
+    token, _ = wopi.create_wopi_token("test-agent/workspace/x.docx", sub, "Pat", "edit", "test-agent")
+    assert client.get(f"/wopi/files/{file_id}?access_token={token}").status_code == 200
+    assert _lock_op(client, file_id, token, "LOCK").status_code == 200
+
+    task_store.set_user_agents(sub, [], "test")
+    wopi.forget_person(sub)
+
+    assert client.get(f"/wopi/files/{file_id}?access_token={token}").status_code == 401
+    assert client.get(f"/wopi/files/{file_id}/contents?access_token={token}").status_code == 401
+    assert _save(client, file_id, token, b"x", **{"X-WOPI-Lock": "L1"}).status_code == 401
+    for override in ("GET_LOCK", "LOCK", "REFRESH_LOCK"):
+        assert _lock_op(client, file_id, token, override).status_code == 401, override
+    pw.assert_not_awaited()
+    assert target.read_bytes() == b"agent bytes"
+    assert _lock_op(client, file_id, token, "UNLOCK").status_code == 200
+    assert wopi._get_lock(file_id) is None
+
+
+def test_a_chats_documents_follow_the_chats_own_rule(temp_db, tmp_path, monkeypatch):
+    """A document of a chat's pane, and a version of it, are judged by the
+    chat's own access rule, and a save by the live document rule, at the
+    person's role now."""
+    from api.media import wopi
+    from storage import database as task_store
+    client, _target, file_id, _token, pw, _bc = _save_rig(monkeypatch, tmp_path)
+    _judged_for_real(monkeypatch)
+    sub = _member("editor")
+    task_store.create_chat("pool", "agent::test-agent", "test-agent")
+    live, _ = wopi.create_wopi_token("test-agent/workspace/x.docx", sub, "Pat", "edit", "test-agent",
+                                     chat_id="pool")
+    version = {"user_sub": sub, "agent": "test-agent", "permissions": "view",
+               "file_path": wopi.snapshot_rel_path("pool", "s1")}
+    assert asyncio.run(wopi.document_standing(version)) == "view"
+    assert client.get(f"/wopi/files/{file_id}?access_token={live}").json()["UserCanWrite"] is True
+
+    task_store.set_user_agent_role(sub, "test-agent", "viewer")
+    wopi.forget_person(sub)
+    assert client.get(f"/wopi/files/{file_id}?access_token={live}").json()["UserCanWrite"] is False
+    assert _save(client, file_id, live, b"x").status_code == 403
+
+    task_store.set_user_agents(sub, [], "test")
+    wopi.forget_person(sub)
+    assert client.get(f"/wopi/files/{file_id}?access_token={live}").status_code == 401
+    assert asyncio.run(wopi.document_standing(version)) == ""
+    pw.assert_not_awaited()
+
+
+def test_the_answer_is_kept_seconds_and_dropped_at_the_events(temp_db, tmp_path, monkeypatch):
+    """One store read answers a burst. A change no event names shows once
+    the answer's seconds pass. The offboarding event, an epoch move and an
+    agent deleted drop it at once. A store that cannot be read refuses and
+    keeps nothing."""
+    from types import SimpleNamespace
+
+    from api.media import wopi
+    from auth import token_holder
+    from services.agents import offboarding
+    from storage import database as task_store
+    _wopi_config(monkeypatch, tmp_path)
+    reads: list = []
+
+    def _counted(*key):
+        reads.append(key)
+        return _REAL_STANDING["fn"](*key)
+
+    monkeypatch.setattr(wopi, "_standing_now", _counted)
+    sub = _member("editor")
+    claims = {"user_sub": sub, "agent": "test-agent", "file_path": "test-agent/workspace/x.docx",
+              "permissions": "edit"}
+
+    async def _burst():
+        return await asyncio.gather(*(wopi.document_standing(claims) for _ in range(10)))
+
+    def _now():
+        return asyncio.run(wopi.document_standing(claims))
+
+    assert asyncio.run(_burst()) == ["edit"] * 10 and len(reads) == 1
+    task_store.set_user_agent_role(sub, "test-agent", "viewer")
+    assert _now() == "edit"                          # kept for its seconds
+    monkeypatch.setattr(offboarding, "_subscribers", {})
+    wopi.register_offboarding()
+    priority, on_offboard = offboarding._subscribers["documents"]
+    assert priority == 1
+    asyncio.run(on_offboard(SimpleNamespace(sub=sub, reason="demoted")))
+    assert _now() == "view"
+    task_store.set_user_agent_role(sub, "test-agent", "editor")   # a promotion names no event
+    assert _now() == "view"
+    for key, (answer, _until) in list(wopi._documents.answers.items()):
+        wopi._documents.answers[key] = (answer, 0.0)
+    assert _now() == "edit"
+    task_store.set_user_agent_role(sub, "test-agent", "viewer")
+    token_holder.forget(sub)                         # an epoch move
+    assert _now() == "view"
+    task_store.set_user_agent_role(sub, "test-agent", "editor")
+    wopi.forget_agent("test-agent")                  # the agent deleted
+    assert _now() == "edit"
+
+    def _down(*key):
+        raise psycopg.OperationalError("store down")
+
+    monkeypatch.setattr(wopi, "_standing_now", _down)
+    wopi.forget_agent("test-agent")
+    assert _now() is None and _now() is None
+    assert not wopi._documents.answers
+
+
+def test_a_principal_that_is_no_person_keeps_what_its_token_says(temp_db, tmp_path, monkeypatch):
+    from api.media import wopi
+    _wopi_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(wopi, "_standing_now", _REAL_STANDING["fn"])
+
+    def standing(sub):
+        return asyncio.run(wopi.document_standing({
+            "user_sub": sub, "agent": "test-agent", "file_path": "test-agent/workspace/x.docx"}))
+
+    assert [standing(s) for s in ("api-key", "session:abc", "agent")] == ["edit"] * 3
+    assert standing("gone-sub") == "" and standing("") == ""
+
+
+def test_each_mint_writes_the_claims_of_the_rule_that_judges_its_tokens(temp_db, tmp_path, monkeypatch):
+    """The judgement reads which rule made a token from its claims: each
+    mint's tokens must read as its own rule (the push's is pinned beside its
+    hook)."""
+    import json
+
+    import config
+    from api.media import wopi
+    from auth import tokens
+    from services.media import preview_snapshots
+    from storage import database as db
+    client = _chat_mint_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "PREVIEW_SNAPSHOT_DIR", tmp_path / "snaps", raising=False)
+    src = _seed_file(tmp_path, "workspace/a.docx")
+    fid = _encode_file_id("test-agent/workspace/a.docx")
+    db.create_chat("c1", "alice-sub", "test-agent")
+    sid = preview_snapshots.create_snapshot("c1", src)
+    db.add_chat_message("c1", "event", "", event_type="document_preview", event_data=json.dumps({
+        "type": "document_preview", "file_id": fid, "filename": "a.docx",
+        "download_url": "/v1/media/a", "snapshot_id": sid, "generation": 1000}))
+
+    def rule_of(resp):
+        assert resp.status_code == 200, resp.text
+        return wopi._rule_of(tokens.decode(resp.json()["access_token"], tokens.WOPI))
+
+    workspace = client.post("/v1/documents/wopi-url",
+                            json={"file_path": "workspace/a.docx", "agent": "test-agent", "edit": True})
+    assert rule_of(workspace) == wopi._FILE_RULE
+    live = client.get(f"/v1/documents/preview-wopi-url?chat_id=c1&file_id={fid}")
+    assert rule_of(live) == wopi._CHAT_RULE
+    version = client.get(f"/v1/documents/snapshot-wopi-url?chat_id=c1&snapshot_id={sid}")
+    assert rule_of(version) == wopi._SNAPSHOT_RULE
+
+
+# A token made through each real mint reads back the same under the real
+# judge, at the moment of the mint (the stubbed fixtures above never ask it).
+
+
+def _mint_member(role, email):
+    from storage import database as db
+    sub = db.create_local_user(email, role.title(), role.title(), "member", "x")
+    db.add_user_agent(sub, "test-agent", role, "test")
+    return sub, db.get_username_by_sub(sub)
+
+
+def _real_client_for(sub, monkeypatch, tmp_path):
+    """The mint routes for ``sub``'s real principal, with the real judge."""
+    from api.media import wopi
+    from auth.providers import get_current_user, user_context_for_sub
+    _wopi_config(monkeypatch, tmp_path)
+    _judged_for_real(monkeypatch)
+    user = user_context_for_sub(sub)
+
+    async def _stub():
+        return user
+
+    app = FastAPI()
+    app.include_router(wopi.router)
+    app.dependency_overrides[get_current_user] = _stub
+    wopi._documents.answers.clear()
+    return signed_client(app)
+
+
+def _minted_and_judged(resp):
+    from api.media import wopi
+    from auth import tokens
+    assert resp.status_code == 200, resp.text
+    claims = tokens.decode(resp.json()["access_token"], tokens.WOPI)
+    wopi._documents.answers.clear()
+    return claims["permissions"], asyncio.run(wopi.document_standing(claims))
+
+
+@pytest.mark.parametrize("role", ["manager", "editor", "contributor", "viewer"])
+def test_the_workspace_mint_agrees_with_the_judge(role, temp_db, tmp_path, monkeypatch):
+    sub, username = _mint_member(role, f"{role}@t.com")
+    paths = ["workspace/x.docx", f"users/{username}/workspace/own.docx", "knowledge/k.docx",
+             "config/c.docx"]
+    for p in paths:
+        _seed_file(tmp_path, p)
+    client = _real_client_for(sub, monkeypatch, tmp_path)
+    seen = 0
+    for p in paths:
+        resp = client.post("/v1/documents/wopi-url",
+                           json={"file_path": p, "agent": "test-agent", "edit": True})
+        if resp.status_code == 403:
+            continue
+        minted, judged = _minted_and_judged(resp)
+        assert minted == judged, (role, p, minted, judged)
+        seen += 1
+    assert seen >= 2
+
+
+@pytest.mark.parametrize("role", ["manager", "editor", "contributor", "viewer"])
+@pytest.mark.parametrize("owner", ["own", "pool"])
+def test_the_pane_mint_agrees_with_the_judge(role, owner, temp_db, tmp_path, monkeypatch):
+    import json
+
+    from storage import database as db
+    sub, username = _mint_member(role, f"{role}@t.com")
+    rels = ["workspace/a.docx", f"users/{username}/workspace/b.docx"]
+    db.create_chat("c1", sub if owner == "own" else "agent::test-agent", "test-agent")
+    for rel in rels:
+        _seed_file(tmp_path, rel)
+        db.add_chat_message("c1", "event", "", event_type="document_preview", event_data=json.dumps({
+            "type": "document_preview", "file_id": _encode_file_id(f"test-agent/{rel}"),
+            "filename": rel.rsplit("/", 1)[-1], "download_url": "/v1/media/a", "snapshot_id": "",
+            "generation": 1000}))
+    client = _real_client_for(sub, monkeypatch, tmp_path)
+    for rel in rels:
+        fid = _encode_file_id(f"test-agent/{rel}")
+        minted, judged = _minted_and_judged(client.get(f"/v1/documents/preview-wopi-url?chat_id=c1&file_id={fid}"))
+        assert minted == judged, (role, owner, rel, minted, judged)
+
+
+def test_a_sub_spelled_like_no_person_is_a_person_once_a_users_row_bears_it(temp_db, tmp_path, monkeypatch):
+    """A principal that is no person keeps its token's word only when no
+    users row bears its sub: an identity provider's raw sub could spell one."""
+    from api.media import wopi
+    from storage import database as task_store
+    _wopi_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(wopi, "_standing_now", _REAL_STANDING["fn"])
+    task_store.upsert_user("session:x", "sx@t.com", "Sx", "member")
+    claims = {"user_sub": "session:x", "agent": "test-agent",
+              "file_path": "test-agent/workspace/x.docx", "permissions": "edit"}
+    assert asyncio.run(wopi.document_standing(claims)) == ""
+
+
+def test_a_kept_answer_is_per_chat_claim(temp_db, tmp_path, monkeypatch):
+    """The same person and path answer by their own rule for a workspace
+    token and for a chat's token: another person's file is refused from the
+    workspace and shown read only in a shared chat that holds it."""
+    from api.media import wopi
+    from storage import database as task_store
+    _wopi_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(wopi, "_standing_now", _REAL_STANDING["fn"])
+    sub = _member("editor")
+    task_store.create_chat("pool", "agent::test-agent", "test-agent")
+    path = "test-agent/users/bob/workspace/x.docx"
+    workspace = {"user_sub": sub, "agent": "test-agent", "file_path": path, "permissions": "view"}
+    assert asyncio.run(wopi.document_standing(workspace)) == ""
+    assert asyncio.run(wopi.document_standing({**workspace, "chat_id": "pool"})) == "view"
+
+
+def test_a_store_that_cannot_be_read_refuses_every_editor_request(temp_db, tmp_path, monkeypatch):
+    """What the person may do now could not be read: the routes refuse, and
+    nothing is written."""
+    from api.media import wopi
+    client, target, file_id, token, pw, _bc = _save_rig(monkeypatch, tmp_path)
+
+    def _down(*key):
+        raise psycopg.OperationalError("store down")
+
+    monkeypatch.setattr(wopi, "_standing_now", _down)
+    assert client.get(f"/wopi/files/{file_id}?access_token={token}").status_code == 401
+    assert client.get(f"/wopi/files/{file_id}/contents?access_token={token}").status_code == 401
+    assert _save(client, file_id, token, b"x").status_code == 401
+    pw.assert_not_awaited()
+    assert target.read_bytes() == b"agent bytes"

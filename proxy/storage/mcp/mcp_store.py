@@ -22,7 +22,7 @@ def _now() -> str:
 def get_mcp_state(name: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT name, enabled, updated_at, tool_filter_regex "
+            "SELECT name, enabled, updated_at, tool_filter_regex, keep_running "
             "FROM mcp_state WHERE name = %s",
             (name,),
         ).fetchone()
@@ -56,6 +56,24 @@ def set_tool_filter_regex(name: str, regex: str) -> None:
             (regex or "", _now(), name),
         )
         conn.commit()
+
+
+def set_keep_running(name: str, keep: bool) -> None:
+    """An admin's "Keep running" on a Docker tool (the row exists once the
+    MCP is registered, ``ensure_mcp_state``)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE mcp_state SET keep_running = %s, updated_at = %s WHERE name = %s",
+            (bool(keep), _now(), name),
+        )
+        conn.commit()
+
+
+def get_keep_running() -> set[str]:
+    """The MCPs an admin keeps running."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT name FROM mcp_state WHERE keep_running").fetchall()
+    return {str(r["name"]) for r in rows}
 
 
 def get_all_mcp_states() -> dict[str, bool]:
@@ -299,6 +317,145 @@ def set_mcp_config_values(mcp_name: str, values: dict[str, str]) -> None:
                 (mcp_name, key, value),
             )
         conn.commit()
+
+
+def get_all_tool_labels() -> dict[str, dict[str, dict]]:
+    """``{server_name: {tool_name: labels}}`` for every function a server's
+    tool list named (``mcp_tool_labels``)."""
+    out: dict[str, dict[str, dict]] = {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT server_name, tool_name, labels FROM mcp_tool_labels"
+        ).fetchall()
+    for r in rows:
+        try:
+            labels = json.loads(r["labels"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            labels = {}
+        out.setdefault(r["server_name"], {})[r["tool_name"]] = labels if isinstance(labels, dict) else {}
+    return out
+
+
+def replace_tool_labels(server_name: str, labels: dict[str, dict]) -> None:
+    """One server's whole tool list as its server last sent it: the rows
+    of the functions it no longer names go."""
+    now = _now()
+    with get_conn() as conn:
+        conn.execute("DELETE FROM mcp_tool_labels WHERE server_name = %s", (server_name,))
+        for tool_name, hints in labels.items():
+            conn.execute(
+                "INSERT INTO mcp_tool_labels (server_name, tool_name, labels, listed_at) "
+                "VALUES (%s, %s, %s, %s)",
+                (server_name, tool_name, json.dumps(hints or {}, sort_keys=True), now),
+            )
+        conn.commit()
+
+
+def get_tool_listing(agent_name: str, person: str, server_name: str, fingerprint: str) -> dict | None:
+    """One saved listing (``mcp_tool_listings``) with its ``used_at``, or None."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT listing, used_at FROM mcp_tool_listings "
+            "WHERE agent_name=%s AND person=%s AND server_name=%s AND fingerprint=%s",
+            (agent_name, person, server_name, fingerprint),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def find_tool_listing(person: str, server_name: str, fingerprint: str) -> dict | None:
+    """The most recently used listing of one person, server and fingerprint
+    under any agent, with its agent and ``used_at``, or None (a container's
+    platform record, written under every agent that has the tool)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT agent_name, listing, used_at FROM mcp_tool_listings "
+            "WHERE person=%s AND server_name=%s AND fingerprint=%s "
+            "ORDER BY used_at DESC LIMIT 1",
+            (person, server_name, fingerprint),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def touch_tool_listing(agent_name: str, person: str, server_name: str, fingerprint: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE mcp_tool_listings SET used_at=%s "
+            "WHERE agent_name=%s AND person=%s AND server_name=%s AND fingerprint=%s",
+            (_now(), agent_name, person, server_name, fingerprint),
+        )
+        conn.commit()
+
+
+def put_tool_listing(agent_name: str, person: str, server_name: str, fingerprint: str,
+                     listing: str, *, keep: int, unused_before: str) -> int:
+    """Keep one listing, drop the scope and server's rows unused since
+    ``unused_before`` and all but the ``keep`` most recently used. Answers
+    how many fingerprints the scope and server held a listing for within the
+    last day, this one included (a churn reading)."""
+    now = _now()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO mcp_tool_listings
+                   (agent_name, person, server_name, fingerprint, listing, listed_at, used_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (agent_name, person, server_name, fingerprint)
+               DO UPDATE SET listing=EXCLUDED.listing, listed_at=EXCLUDED.listed_at,
+                             used_at=EXCLUDED.used_at""",
+            (agent_name, person, server_name, fingerprint, listing, now, now),
+        )
+        conn.execute(
+            "DELETE FROM mcp_tool_listings WHERE agent_name=%s AND person=%s AND server_name=%s "
+            "AND used_at < %s",
+            (agent_name, person, server_name, unused_before),
+        )
+        conn.execute(
+            """DELETE FROM mcp_tool_listings WHERE agent_name=%s AND person=%s AND server_name=%s
+               AND fingerprint NOT IN (
+                   SELECT fingerprint FROM mcp_tool_listings
+                   WHERE agent_name=%s AND person=%s AND server_name=%s
+                   ORDER BY used_at DESC, fingerprint LIMIT %s)""",
+            (agent_name, person, server_name, agent_name, person, server_name, keep),
+        )
+        day_ago = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - 86400,
+                                         tz=timezone.utc).isoformat()
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM mcp_tool_listings WHERE agent_name=%s AND person=%s "
+            "AND server_name=%s AND listed_at >= %s",
+            (agent_name, person, server_name, day_ago),
+        ).fetchone()
+        conn.commit()
+    return int(row["n"]) if row else 0
+
+
+def delete_tool_listings(*, server_name: str | None = None, person: str | None = None,
+                         agent_name: str | None = None) -> int:
+    """Drop the saved listings of one server (an update or a reinstall) or of
+    one person (their removal), on one agent when ``agent_name`` names it."""
+    with get_conn() as conn:
+        if server_name is not None:
+            cur = conn.execute("DELETE FROM mcp_tool_listings WHERE server_name=%s", (server_name,))
+        elif person and agent_name:
+            cur = conn.execute("DELETE FROM mcp_tool_listings WHERE person=%s AND agent_name=%s",
+                               (person, agent_name))
+        elif person:
+            cur = conn.execute("DELETE FROM mcp_tool_listings WHERE person=%s", (person,))
+        else:
+            return 0
+        conn.commit()
+        return cur.rowcount
+
+
+def delete_unused_tool_listings(unused_before: str, *, dry_run: bool = False) -> int:
+    """Every saved listing not used since ``unused_before`` (ISO); how many
+    (counted only on a dry run)."""
+    with get_conn() as conn:
+        if dry_run:
+            row = conn.execute("SELECT count(*) AS n FROM mcp_tool_listings WHERE used_at < %s",
+                               (unused_before,)).fetchone()
+            return int(row["n"]) if row else 0
+        cur = conn.execute("DELETE FROM mcp_tool_listings WHERE used_at < %s", (unused_before,))
+        conn.commit()
+        return cur.rowcount
 
 
 def get_all_mcp_config_values() -> dict[str, dict[str, str]]:

@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from core import placement
-from services.mcp import mcp_registry as reg
+from services.mcp import mcp_manifest_store, mcp_registry as reg
 from services.mcp.mcp_registry import CredentialConfig, McpManifest, ServerConfig
 from storage import remote_store
 
@@ -38,7 +38,7 @@ def _mk(name, *, placement="any", requires_display=False, device_capability=None
 # ---------------------------------------------------------------------------
 
 def _reason(m, *, is_remote=False, target_has_display=None, target_device_grants=None):
-    return reg._device_placement_reason(m, placement=placement.PlacementCapabilities(
+    return mcp_manifest_store._device_placement_reason(m, placement=placement.PlacementCapabilities(
         kind=placement.KIND_ADMIN_REMOTE if is_remote else placement.KIND_LOCAL,
         machine_id="m" if is_remote else "", has_display=target_has_display,
         device_grants=target_device_grants or set(),
@@ -91,7 +91,7 @@ def registry(monkeypatch):
             requires_display=True, device_capability="computer",
         ),
     }
-    monkeypatch.setattr(reg, "_manifests", manifests)
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", manifests)
     monkeypatch.setattr(reg.mcp_store, "get_manager_enabled_mcps", lambda a: list(manifests))
     monkeypatch.setattr(reg.mcp_store, "get_all_mcp_states", lambda: {k: True for k in manifests})
     monkeypatch.setattr(reg.mcp_store, "get_visible_explicit_mcps", lambda a: set(manifests))
@@ -242,7 +242,7 @@ def test_device_capability_for_server(monkeypatch):
                                 device_capability="computer"),
         "file-tools": _mk("file-tools"),  # no device_capability
     }
-    monkeypatch.setattr(reg, "_manifests", manifests)
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", manifests)
     assert reg.device_capability_for_server("computer") == "computer"
     assert reg.device_capability_for_server("file-tools") is None
     assert reg.device_capability_for_server("nope") is None
@@ -266,7 +266,7 @@ def _hook_env(monkeypatch, *, grants):
         "computer-control", placement="satellite_only",
         device_capability="computer", server_name="computer",
     )}
-    monkeypatch.setattr(reg, "_manifests", manifests)
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", manifests)
 
     ctx = SecurityContext(
         role="manager", username="u", agent="a", is_admin_agent=False,
@@ -321,7 +321,7 @@ def test_hook_does_not_auto_approve_nondevice_mcp(monkeypatch):
     # A non-device MCP (no device_capability) must still prompt even though a
     # device capability is granted — the grant is per-capability, not blanket.
     permission, _ = _hook_env(monkeypatch, grants={"computer"})
-    hooks_reg = reg._manifests
+    hooks_reg = mcp_manifest_store._manifests
     hooks_reg["slack"] = _mk("slack", server_name="slack")  # no device_capability
 
     class _Q:
@@ -345,7 +345,7 @@ def test_hook_a_device_code_tool_follows_the_grant_like_its_other_tools(monkeypa
     # its raw-code tool (Blender's execute_blender_code) included: the
     # machine's grant is the consent, as for the browser's code tool.
     permission, _ = _hook_env(monkeypatch, grants={"app"})
-    reg._manifests["blender-bridge"] = _mk(
+    mcp_manifest_store._manifests["blender-bridge"] = _mk(
         "blender-bridge", placement="satellite_only", device_capability="app",
         server_name="blender",
     )
@@ -365,7 +365,7 @@ def _browser_env(monkeypatch, *, client_type, mode, grants=frozenset({"browser"}
     admin-paired machine that grants ``grants``, with browser-control
     (server key ``local``) loaded."""
     permission, _ = _hook_env(monkeypatch, grants=set(grants))
-    reg._manifests["browser-control"] = _mk(
+    mcp_manifest_store._manifests["browser-control"] = _mk(
         "browser-control", placement="satellite_only", device_capability="browser",
         server_name="local",
     )
@@ -440,3 +440,90 @@ def test_hook_a_device_code_tool_without_the_grant_asks_once_in_default(monkeypa
         out = _call(permission, "mcp__local__browser_run_code_unsafe", {"code": "async (p) => 1"})
         assert out == {"decision": "allow"}
     assert prompted == ["mcp__local__browser_run_code_unsafe"]
+
+
+# ---------------------------------------------------------------------------
+# The device grant in a key's turn: nobody sits at that screen
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def device_session(monkeypatch):
+    """A dashboard session on a paired computer whose owner granted the
+    browser, with the browser tool at a tier that is not open."""
+    import uuid
+
+    from api.hooks import routing
+    from auth.path_policy import SecurityContext
+    from core.session import key_rows, session_state
+    from services.mcp import mcp_permissions
+    made: list[str] = []
+    chats: dict[str, str] = {}
+    monkeypatch.setattr(reg, "device_capability_for_server", lambda s: "browser" if s == "local" else None)
+    monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda server, tool: "sensitive")
+    monkeypatch.setattr(remote_store, "get_remote_machine", lambda mid: {"id": mid})
+
+    async def chat_of(sid):
+        return chats.get(sid, "")
+    monkeypatch.setattr(routing, "resolve_hook_chat_id", chat_of)
+
+    def make(mode: str, chat_id: str = "") -> str:
+        sid = str(uuid.uuid4())
+        session_state.register_session_state(sid, mode, SecurityContext(
+            role="manager", username="alice", agent="pa", is_admin_agent=False, session_scope="user",
+            placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m-1",
+                                                      device_grants={"browser"})))
+        session_state._sessions.setdefault(sid, {"created": True, "message_count": 0})["client_type"] = "dashboard"
+        chats[sid] = chat_id
+        made.append(sid)
+        return sid
+    yield make
+    for sid in made:
+        key_rows.forget_session(sid)
+        session_state.cleanup_session_permission_state(sid)
+        session_state._sessions.pop(sid, None)
+    key_rows._in_flight.clear()
+
+
+async def _decide(sid):
+    from api.hooks.hooks import decide_tool_permission
+    return (await decide_tool_permission(sid, "mcp__local__browser_click", {"ref": "e1"}, wait_s=0.2))["decision"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["ask", "autoReview"])
+async def test_a_granted_device_tool_needs_no_card_with_a_person_at_the_screen(device_session, mode):
+    assert await _decide(device_session(mode, "chat-own")) == "allow"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["ask", "autoReview"])
+async def test_in_a_keys_turn_a_device_tool_follows_the_chats_mode(device_session, mode):
+    """A key's turn is an unattended run for the paired computer: the grant
+    approves nothing, so in Ask the call waits on a person's card (here it
+    runs out) and in Auto the tier rule decides."""
+    from core.session import key_rows
+    sid = device_session(mode, "chat-key")
+    key_rows.hold("chat-key", "req-1")
+    assert await _decide(sid) != "allow"
+    key_rows.release("chat-key", "req-1")
+    assert await _decide(sid) == "allow"
+
+
+@pytest.mark.asyncio
+async def test_after_a_keys_turn_its_background_work_still_gets_no_grant(device_session):
+    from core.session import key_rows
+    sid = device_session("ask", "chat-bg")
+    key_rows.mark_session(sid)
+    assert await _decide(sid) != "allow"
+    key_rows.forget_session(sid)  # the session's close
+    assert await _decide(sid) == "allow"
+
+
+@pytest.mark.asyncio
+async def test_a_call_whose_chat_cannot_be_read_counts_as_a_keys_while_one_runs(device_session):
+    from core.session import key_rows
+    sid = device_session("ask", "")
+    key_rows.hold("chat-elsewhere", "req-2")
+    assert await _decide(sid) != "allow"
+    key_rows.release("chat-elsewhere", "req-2")
+    assert await _decide(sid) == "allow"

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._compute import serve
 from tests.fixtures.loop_builder_rig import AGENT, install, run
 
 PERSON = "user-viewer"   # an editor on AGENT (the rig)
@@ -20,7 +21,10 @@ PERSON = "user-viewer"   # an editor on AGENT (the rig)
 
 @pytest.fixture
 def rig(temp_db, monkeypatch, tmp_path):
-    return install(monkeypatch, tmp_path)
+    rec = install(monkeypatch, tmp_path)
+    # A lane of the platform's place is built on the compute machine that serves.
+    serve(monkeypatch)
+    return rec
 
 
 def _chat(chat_id: str, owner: str = PERSON, **fields) -> str:
@@ -107,7 +111,7 @@ def test_the_builder_keeps_a_task_run_in_the_task_context(rig):
 
 def test_the_contexts_of_a_chat_lane_and_a_task():
     from services.mcp import mcp_registry
-    from services.mcp.mcp_registry import _exclusion_contexts
+    from services.mcp.mcp_session_filter import _exclusion_contexts
     base = dict(phone_mode=False, interactive_local=False, meeting_mode=False, external=False)
     assert _exclusion_contexts(task_mode=True, **base) == {"task"}
     assert _exclusion_contexts(task_mode=True, chat_worker=True, shared_chat=True, **base) == {
@@ -120,7 +124,7 @@ def test_the_config_and_the_prompt_agree_for_a_chat_lane(monkeypatch, tmp_path):
     neither; the same build as a task leaves the first out."""
     import re
 
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_agent_skills, mcp_registry
     from tests.mcp.test_mcp_broker_activation import _stub_assembly
     from tests.mcp.test_meeting_mcp_exclusion import _catalog_manifest
 
@@ -130,7 +134,7 @@ def test_the_config_and_the_prompt_agree_for_a_chat_lane(monkeypatch, tmp_path):
                           skill=[mcp_registry.SHARED_CHAT_CONTEXT], tmp_path=tmp_path),
     ]
     _stub_assembly(monkeypatch, manifests, env_by_mcp={}, tmp_path=tmp_path)
-    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: list(manifests))
+    monkeypatch.setattr(mcp_agent_skills, "get_agent_mcps", lambda *a, **k: list(manifests))
 
     path, _env, excluded, _b, _k = mcp_registry.build_session_mcp_config(
         "agent", "sub", task_mode=True, chat_worker=True, shared_chat=True)

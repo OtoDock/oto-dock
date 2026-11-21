@@ -115,6 +115,9 @@ class AppServerClient:
         # One warning banner per daemon for inner-sandbox failures on stderr
         # (the raw bwrap error repeats per command; the pointer shouldn't).
         self._sandbox_stderr_warned = False
+        # The last line the daemon wrote to stderr: what an exit inside a
+        # turn says of itself.
+        self.last_stderr_line = ""
 
         # Notifications (method, params) for the session to drain per turn.
         self.notif_queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
@@ -393,6 +396,7 @@ class AppServerClient:
                 text = line.decode("utf-8", errors="replace").rstrip()
                 if not text:
                     continue
+                self.last_stderr_line = text[:400]
                 if _looks_like_sandbox_failure(text):
                     hint = "" if self._sandbox_stderr_warned else (
                         " — the Codex inner sandbox is failing; commands "

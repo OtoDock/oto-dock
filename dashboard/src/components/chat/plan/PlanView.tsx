@@ -49,6 +49,17 @@ export default function PlanView({ action, toolInput, superseded, onImplement, o
     )
   }
 
+  // Claude Code's exit carries no plan: the plan review card shows it from
+  // the plan file. An exit with nothing to show draws no block, only a
+  // terminal's hint.
+  if (!planContent) {
+    return readOnly && !superseded ? (
+      <p data-testid="plan-readonly" className="my-2 text-xs text-tertiary">
+        Approve or reject in the terminal. The agent is waiting there.
+      </p>
+    ) : null
+  }
+
   // Exit — show plan content + action buttons
   const displayName = planFilename || 'Plan'
   // A superseded card (a later plan turn replaced it) is inert — content only.
@@ -73,17 +84,11 @@ export default function PlanView({ action, toolInput, superseded, onImplement, o
       {/* Plan content */}
       {!collapsed && (
         <>
-          {planContent ? (
-            <div className="px-4 py-3 border-t border-subtle max-h-96 overflow-y-auto">
-              <div className="text-sm prose prose-sm max-w-none prose-li:text-primary">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{planContent}</ReactMarkdown>
-              </div>
+          <div className="px-4 py-3 border-t border-subtle max-h-96 overflow-y-auto">
+            <div className="text-sm prose prose-sm max-w-none prose-li:text-primary">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{planContent}</ReactMarkdown>
             </div>
-          ) : (
-            <div className="px-4 py-3 border-t border-subtle text-sm text-tertiary">
-              No plan content available
-            </div>
-          )}
+          </div>
 
           {readOnly && !superseded && (
             <p

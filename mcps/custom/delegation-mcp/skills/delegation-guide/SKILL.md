@@ -44,14 +44,16 @@ continued worker to that model (below).
 machines, or an admin machine when they are a platform admin, by its name or
 id. Leave it out (the agent's default) unless the person asks. A `chat` lane
 may run on the person's own computer, even a lane that works for the whole
-agent. There it works as that person, with their role on the agent and their
-own AI account. It works in the agent's files, but tools that sign in with the
-agent's own accounts are not there. A `task` lane never runs on a personal
+agent. There it works as that person, with their role on the agent. Like
+every `chat` lane, it runs on their own AI account. It works in the agent's
+files, but tools that sign in with the agent's own accounts are not there. A `task` lane never runs on a personal
 computer. A chat lane whose computer is offline waits for it: the round ends
 and says so. Any other run on an offline machine uses the default and its
 record says so. A lane on the person's computer stops when they lose the
-editor role or their place on the agent, and its next round runs on the
-default. With `continue_id` the argument is ignored. The lane stays on the
+editor role or their place on the agent. Its next round runs on the default
+machine. That round is refused when the lane works for the whole agent, or
+when the person left the agent: it never moves to the subscriptions shared
+with agents. With `continue_id` the argument is ignored. The lane stays on the
 person's own computer when they continue it themselves. When someone else
 continues it, it runs on the default. While it is running on the person's
 computer, nobody else can continue it.
@@ -67,7 +69,12 @@ previous worker in its own chat with full context — use it for follow-up
 questions or iterative refinement instead of starting fresh. Omit `agent` on
 continues: the continued worker's own agent is used automatically (works
 cross-agent). `continue_id` must name a worker this chat delegated or one of
-your own chats. When a `chat` lane has a live terminal someone other than
+your own chats. A worker whose run can change its agent's knowledge (an
+agent-scope worker a manager started) is continued only by a manager of that
+agent (or an admin), or by a run that holds that right itself. An editor, or
+a run without that right, gets "Only a manager of this agent can continue
+this run. It can change the agent's knowledge." Tell your user who can
+continue it. When a `chat` lane has a live terminal someone other than
 your user opened, the follow-up fails with that reason instead of typing into
 it — tell your user. A follow-up to a worker in the middle of its turn never
 counts against the limit on parallel workers: the worker reads it in that
@@ -89,6 +96,15 @@ stopping) before it attached a file or wrote a `Blocked on:` line. Its last
 message is not the outcome: continue the lane with the `continue_id` that
 line names (on another model after a limit or a refusal) to get the report.
 
+**A restart.** A worker the platform's restart cut goes on by itself under
+its own id, in its own chat, and reports once. Do not delegate it again:
+wait for its result. After a restore, after more than a day down, or when it
+cannot go on, it fails with one result, which says the platform restarted
+and names the `continue_id` to use. A worker on a machine waits for that
+machine up to 30 minutes, then reports the same way. While OtoDock updates,
+`delegate` still answers with its id: the run waits and starts when OtoDock
+is back.
+
 **When YOU are the worker** (your prompt starts with `[DELEGATED_WORK]`),
 attach the files you produced with `attach_result_files(paths, dest_dir?)`
 before your final message, then write that message as a report — what you
@@ -109,7 +125,11 @@ the send_files per-call count after expansion and a per-run total (60 by
 default); a call over a cap is refused whole: split it or send an archive.
 Stop your own background wait loops (a polling shell you backgrounded) before
 the final message: the run waits for background work up to its ceiling, so a
-loop you no longer need holds the result back for that long.
+loop you no longer need holds the result back for that long. Your chat cannot
+be reloaded: a tool enabled while you work is there at your next round.
+If you read "The platform restarted while you were working", you are the
+same run. Check what is already done, finish, attach and report as usual.
+It reports once.
 
 ## Choosing a model for a lane
 
@@ -118,12 +138,13 @@ use most on that agent (their own dashboard chats there in the last 30 days,
 else on every agent); with no such chats, the agent's default engine when
 they can run it, else an allowed engine on their own account, else one the
 platform lends them; the agent's own work (agent-scope tasks and triggers, a
-Shared-only agent's work, calls) runs on the agent's default engine from the
+Shared-only agent's tasks, calls) runs on the agent's default engine from the
 platform pool. A worker runs on the engine and model your person's own new
 chat on the target agent would take, unless `delegate` says otherwise. A
-lane that runs as the agent itself, and a lane on a Shared-only agent, runs
-on the agent's default engine, except on your person's own computer, where
-it takes their engine. That choice is right almost always: leave `model` and
+`chat` lane does so on every agent, Shared-only ones included, wherever it
+runs, and it runs on your person's own AI account. A task lane that runs as
+the agent, or any task lane on a Shared-only agent, takes the agent's
+default. That choice is right almost always: leave `model` and
 `layer` out. Pin one lane only when its work genuinely differs from the
 agent's everyday load, and ask the user first unless they asked for it (a
 lane's model is their spend).
@@ -134,10 +155,11 @@ lane's model is their spend).
   first; the allowlist's order in a session with no person), each tagged
   `person` or `platform`, the person's pick marked `default`, the agent's
   own engine `agent default` where it differs, and `no paired machine` on an
-  engine that runs on the platform host alone. `person` is the person in
-  this chat and `platform` the platform pool (the pool's engines alone in a
-  session with no person); your person's lane takes the `default` engine and
-  a lane that runs as the agent the `agent default` one; each row lists its
+  engine that runs on the platform host alone. `person` is the person this
+  chat runs for and `platform` the platform pool (the pool's engines alone in
+  a session with no person). Your person's `chat` lanes take the `default`
+  engine on every agent. A task lane that runs as the agent, or any task lane
+  on a Shared-only agent, takes the `agent default` one. Each row lists its
   model ids and its default model `[default, tN]`. An id that is not on that
   line is rejected. A model pinned alone runs on the engine the lane would
   take unpinned when that engine offers it, else on the first engine of the
@@ -174,7 +196,7 @@ for an admin.
 - **You continue there.** After the move the platform starts your next turn on the new place by itself, with "You now run on <place>. Continue the work." Carry on with the task from where you stopped. A message the person sent meanwhile comes first instead. After ten moves in a row with no message from the person the chat stops and waits for them. A move of another chat (`chat_id`) does not continue it.
 - `machine="default"` moves it back to the person's default.
 - `chat_id` names another chat of the same person (from `list_sessions`). A session without a person can only name `default`.
-- A refusal is one sentence that says why. A scheduled move whose turn does not end within 30 minutes does not happen, and the chat says so. A scheduled move does not survive a restart of the platform.
+- A refusal is one sentence that says why. A scheduled move whose turn does not end within 30 minutes does not happen, and the chat says so. A scheduled move does not survive a restart of the platform: the chat stays where it was and shows "The chat did not move: the platform restarted. Ask again." The words you read when the chat continues do not mention it, so if you called `move_chat` in that turn, call it again.
 
 ## Monitoring — `list_sessions` / `peek_session`
 

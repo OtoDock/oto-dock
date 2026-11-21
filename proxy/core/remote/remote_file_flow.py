@@ -24,7 +24,8 @@ Host-path additions
 ``pull_through_host_path`` + ``push_back_host_path`` extend the same
 pull-cache-push pattern to absolute paths on the satellite (e.g. the
 user's ``~/Desktop/foo.png``). These live in ``AGENTS_DIR/.remote-host-cache/``
-with a metadata sidecar so write-back targets the original abs_path. The
+with a record in the server's own folder (``SESSIONS_DIR/host-cache/``) so
+write-back targets the original abs_path. The
 per-(machine_id, abs_path) write lock prevents concurrent Docker-MCP
 edits from clobbering each other.
 
@@ -40,8 +41,9 @@ Public API
   a file. Pending readers on the same path block until the push completes
   (write-barrier).
 - ``pull_through_host_path(session_id, abs_path)`` — lazy-pull
-  a satellite-host absolute path into a session-scoped temp dir; metadata
-  sidecar records the (machine_id, abs_path) for push-back.
+  a satellite-host absolute path into a session-scoped temp dir; a record in
+  the server's own folder (``SESSIONS_DIR/host-cache/``) keeps the
+  (machine_id, abs_path) for push-back.
 - ``push_back_host_path(session_id, cache_path)`` — push the
   cache file's bytes back to the satellite at the recorded abs_path.
 - ``is_host_cache_path(host_path)`` — does the path live in
@@ -63,496 +65,73 @@ collaborative agent can't clobber each other on a shared workspace file.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
 import os
 import time
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+from core.remote.remote_file_cache import (  # noqa: F401
+    PUSH_ACK_STALE,
+    _acquire_global_path_lock,
+    _acquire_machine_host_lock,
+    _back_off,
+    _cache_rel,
+    _cached_regular,
+    _fanout_locks,
+    _get_or_create_lock,
+    _global_path_locks,
+    _host_cache_paths,
+    _host_cache_root,
+    _lose_baseline,
+    _make_cache_folder,
+    _mark_current,
+    _normalize_abs_path_for_key,
+    _open_platform_copy,
+    _PathLock,
+    _platform_ahead,
+    _probe_baseline,
+    _probe_stat,
+    _pull_stat_records,
+    _read_host_meta,
+    _read_old_host_meta,
+    _record_agent_stat,
+    _repush,
+    _repush_tasks,
+    _same_machine_copy,
+    _standing_platform_ahead,
+    _stats_match,
+    _workspace_path,
+    _write_host_meta,
+    acquire_fanout_lock,
+    capture_losing_platform_copy,
+    clear_platform_ahead,
+    delete_stands,
+    end_in_flight,
+    forget_merges,
+    host_cache_entry,
+    host_cache_session_root,
+    host_meta_matches,
+    is_host_cache_path,
+    note_merge_left,
+    note_merge_left_one,
+    note_merged,
+    note_platform_ahead,
+    note_push_failed,
+    note_signed_in,
+    platform_copy_unsettled,
+    push_expectation_of,
+    record_committed_stat,
+    record_held,
+    record_pushed_stat,
+    refused_save_stands,
+    stale_hold,
+    stale_machine_stat,
+    take_push_record,
+)
+
 logger = logging.getLogger("otodock.remote-file-flow")
-
-
-# ---------------------------------------------------------------------------
-# Satellite-host path cache + locks
-# ---------------------------------------------------------------------------
-
-# Per-(machine_id, abs_path) lock. Held during the satellite-host
-# pull→edit→push window so concurrent Docker-MCP edits to the same
-# satellite file don't clobber each other.
-_machine_host_locks: dict[tuple[str, str], asyncio.Lock] = {}
-_machine_host_locks_lock = asyncio.Lock()
-
-
-async def _acquire_machine_host_lock(
-    machine_id: str, abs_path: str,
-) -> asyncio.Lock:
-    """Return the lock for a (machine_id, abs_path) pair.
-
-    Uses the same normalization as the cache key so equivalent forms
-    (case-twin Windows paths, backslash variants, trailing slash) share
-    a single lock — without this, concurrent pulls via different case
-    forms could clobber each other.
-    """
-    key = (machine_id, _normalize_abs_path_for_key(abs_path))
-    async with _machine_host_locks_lock:
-        lock = _machine_host_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _machine_host_locks[key] = lock
-        return lock
-
-
-def _host_cache_root() -> Path:
-    """The proxy temp dir for satellite-host pulls. Lives under
-    ``AGENTS_DIR/.remote-host-cache/`` so the Docker MCP's ``/agents``
-    mount resolves the path without extra mounts.
-    """
-    import config as _cfg
-    return _cfg.AGENTS_DIR / ".remote-host-cache"
-
-
-def _normalize_abs_path_for_key(abs_path: str) -> str:
-    """Normalize a satellite-host path for cache-key purposes.
-
-    Folds backslash → forward-slash, lowercases Windows drive letters,
-    strips trailing slash. This makes ``C:\\Users\\...``, ``C:/Users/...``,
-    and ``c:/users/...`` all map to the same cache entry — preventing
-    concurrent pulls of the "same" file from racing on different cache
-    entries.
-    """
-    s = abs_path.replace("\\", "/")
-    if len(s) >= 2 and s[1] == ":":
-        s = s[0].lower() + s[1:]
-    if len(s) > 1 and s.endswith("/"):
-        s = s.rstrip("/")
-    return s
-
-
-def _host_cache_paths(
-    session_id: str, machine_id: str, abs_path: str,
-) -> tuple[Path, Path]:
-    """Return ``(cache_path, sidecar_path)`` for a satellite-host pull.
-
-    The sha256 of (machine_id, normalized abs_path) namespaces the
-    cache so two paths with the same basename don't collide AND two
-    case/slash variants of the same path share one cache entry. The
-    sidecar JSON stores the original (un-normalized) abs_path so the
-    push-back targets exactly what the satellite expects.
-    """
-    normalized = _normalize_abs_path_for_key(abs_path)
-    digest = hashlib.sha256(
-        f"{machine_id}\x00{normalized}".encode()
-    ).hexdigest()[:32]
-    basename = normalized.rsplit("/", 1)[-1] or "_root"
-    cache_dir = _host_cache_root() / session_id / digest
-    return cache_dir / basename, cache_dir / "_meta.json"
-
-
-def host_cache_session_root(session_id: str) -> Path:
-    """Root of THIS session's lazy-pull host cache. RBAC carve-outs key on
-    it: the cache holds only files this session's own path policy admitted
-    at pull time, and other sessions' caches stay invisible."""
-    return _host_cache_root() / session_id
-
-
-# --- Pull-stat revalidation (satellite ≥ 0.5.95) ---------------------------
-#
-# Both pull paths historically re-transferred the FULL file on every call —
-# correct, but over a WAN/tunnel link every repeated read of the same
-# unchanged document costs seconds. With a new-enough satellite we probe
-# (size, mtime_ns) via the cheap `file_stat` RPC and serve the cached copy
-# when it matches the stat RECORDED AT PULL TIME. Both values come from the
-# satellite's own clock/filesystem, so no cross-host clock skew is involved.
-#
-# Fail-open to the transfer, never to staleness: any doubt — old satellite,
-# probe timeout, policy reject, no recorded stat, mismatch, missing cache
-# file — falls through to the full pull (the pre-existing behavior). The
-# recorded stat is the PRE-pull probe, so a file that changes mid-pull
-# mismatches on the next read and re-pulls (wasteful once, never wrong).
-# Writes invalidate: push_back drops the record, so a read after a write
-# re-pulls (phase 2 — stat-enriched push acks — can tighten that).
-
-# Agent-tree records: (machine_id, agent_slug, rel_path) → stat dict.
-# In-memory (lost on restart → first read re-pulls, correct); bounded.
-_pull_stat_records: dict[tuple[str, str, str], dict] = {}
-_PULL_STAT_RECORDS_MAX = 4096
-
-
-def _stats_match(recorded: dict | None, fresh: dict | None) -> bool:
-    """Exact-match gate for the cache fast path."""
-    return (
-        isinstance(recorded, dict)
-        and isinstance(fresh, dict)
-        and bool(fresh.get("exists"))
-        and recorded.get("size") == fresh.get("size")
-        and recorded.get("mtime_ns") == fresh.get("mtime_ns")
-        and recorded.get("size") is not None
-        and recorded.get("mtime_ns") is not None
-    )
-
-
-async def _probe_stat(cm, machine_id: str, ref, agent_slug: str = "") -> dict | None:
-    """Version-gated `file_stat` probe; None = don't trust the cache.
-
-    Strictly best-effort: ANY failure (old satellite, timeout, disconnect,
-    or a bug in the probe path itself) returns None and the caller does the
-    full pull — the probe must never be able to break a read."""
-    try:
-        if not cm.satellite_supports_file_stat(machine_id):
-            return None
-        res = await cm.stat_file(machine_id, ref, agent_slug=agent_slug)
-        # Type-gate the reply: callers `.get()` it, JSON-serialize it into
-        # the cache sidecar, and store it in `_pull_stat_records` — anything
-        # that isn't a plain dict (malformed ack, test double) must degrade
-        # to "no probe" instead of breaking the read downstream.
-        return res if isinstance(res, dict) else None
-    except (ValueError, TypeError) as e:
-        logger.debug("file_stat probe failed (%s) — falling back to pull", e)
-        return None
-
-
-def _record_agent_stat(key: tuple[str, str, str], stat: dict) -> None:
-    if len(_pull_stat_records) >= _PULL_STAT_RECORDS_MAX:
-        _pull_stat_records.pop(next(iter(_pull_stat_records)))
-    _pull_stat_records[key] = stat
-
-
-def record_pushed_stat(machine_id: str, agent_slug: str, rel_path: str,
-                       size: int, mtime_ns: int) -> None:
-    """A push landed and the machine (0.5.150+) answered the committed
-    file's stat: recorded as the machine's copy, so a read fast-paths onto
-    it and the next push of the path expects exactly it
-    (``take_push_record``), never refused as a live write of the platform's
-    own previous push."""
-    _record_agent_stat((machine_id, agent_slug, rel_path),
-                       {"exists": True, "size": size, "mtime_ns": mtime_ns})
-
-
-def take_push_record(machine_id: str, agent_slug: str, rel_path: str) -> dict | None:
-    """The machine's copy of ``rel_path`` as last pulled, probed or pushed,
-    taken off the records before a push of the path: the push expects it
-    (``push_expectation_of``), the ack re-records the committed copy, a
-    failed push leaves the next read to pull (the caller keeps it as the
-    mark's fallback baseline, ``note_push_failed``)."""
-    return _pull_stat_records.pop((machine_id, agent_slug, rel_path), None)
-
-
-def push_expectation_of(stat: dict | None) -> dict | str:
-    """The ``expect`` a stat record makes: its size and mtime_ns, or
-    ``"live"`` for a record without both."""
-    if (isinstance(stat, dict) and isinstance(stat.get("size"), int)
-            and isinstance(stat.get("mtime_ns"), int)):
-        return {"size": stat["size"], "mtime_ns": stat["mtime_ns"]}
-    return "live"
-
-
-def stale_machine_stat(stale: dict) -> dict | None:
-    """The machine's copy as a stale ack reported it (``push_file``'s
-    ``stale_out``), in the shape of a pull-stat record: the baseline of a
-    platform-ahead mark. None when the ack carried no stat."""
-    size, mtime_ns = stale.get("size"), stale.get("mtime_ns")
-    if isinstance(size, int) and isinstance(mtime_ns, int) and not isinstance(size, bool):
-        return {"exists": True, "size": size, "mtime_ns": mtime_ns}
-    return None
-
-
-# Platform-ahead markers: the machine holds older bytes than the platform,
-# because a push of the platform copy to it failed (``push_back``, a
-# fan-out) or is on its way (a fan-out in flight, which runs outside the
-# path lock). Without one, ``pull_through`` on that machine could pull the
-# older bytes over the platform copy and revert the write (the agent's
-# file-tools edit, a person's save). Keyed (machine_id, agent_slug,
-# rel_path) and read only for the reading session's own machine: the push
-# missed one machine, the others may hold the bytes. Each records the
-# platform copy's size and mtime_ns (a later platform write drops it) and
-# the machine's stat before the push, as last pulled or probed at the
-# failure, None when unknown (a machine whose copy changed since wins: a
-# native edit, a merge push, a lost ack). In memory, bounded: a restart
-# forgets them and the next merge reconciles.
-_platform_ahead: OrderedDict[tuple[str, str, str], dict] = OrderedDict()
-_PLATFORM_AHEAD_MAX = 4096
-# A failing re-push from a read waits this long before the next read tries.
-_REPUSH_BACKOFF_S = 30.0
-# The baseline probe at a failure: the machine just missed a push.
-_BASELINE_PROBE_S = 3.0
-
-
-def note_platform_ahead(machine_id: str, agent_slug: str, rel_path: str,
-                        size: int, mtime_ns: int, *, in_flight_s: float = 0.0,
-                        machine: dict | None = None, stale: bool = False) -> None:
-    """Mark the platform copy (``size``, ``mtime_ns``) ahead on
-    ``machine_id``: a push of it failed, or (``in_flight_s``) one is on its
-    way for at most that long. ``machine`` is the machine's stat before the
-    push when the caller probed it, else the one last pulled. ``stale``: the
-    machine refused the push because it is changing the file; should its
-    copy win later, the platform copy (a person's save) is kept in the
-    recover bin first. A mark of a newer platform copy on the same machine
-    stands (``_mark_current``). A mark of the same copy is updated in place:
-    its window, and its baseline only when the caller probed one (the mark
-    may already know the machine holds bytes its record does not name,
-    ``clear_platform_ahead``)."""
-    key = (machine_id, agent_slug, rel_path)
-    if not _mark_current(key, (size, mtime_ns)):
-        return
-    standing = _platform_ahead.get(key)
-    if standing is not None and (standing["size"], standing["mtime_ns"]) == (size, mtime_ns):
-        if machine is not None:
-            standing["machine"] = machine
-        if stale:
-            standing["stale"] = True
-        standing["in_flight_until"] = time.monotonic() + in_flight_s if in_flight_s else 0.0
-        _platform_ahead.move_to_end(key)
-        return
-    _platform_ahead[key] = {
-        "size": size, "mtime_ns": mtime_ns,
-        "machine": machine if machine is not None else _pull_stat_records.get(key),
-        "in_flight_until": time.monotonic() + in_flight_s if in_flight_s else 0.0,
-        "retry_at": 0.0,
-        "stale": stale,
-    }
-    _platform_ahead.move_to_end(key)
-    while len(_platform_ahead) > _PLATFORM_AHEAD_MAX:
-        _platform_ahead.popitem(last=False)
-
-
-def stale_hold(machine_id: str, agent_slug: str, rel_path: str) -> bool:
-    """Whether the platform copy of ``rel_path`` is marked ahead on
-    ``machine_id`` because the machine refused its push as stale (it is
-    changing the file): the merge that then takes the machine's copy keeps
-    the platform's in the recover bin first."""
-    marker = _platform_ahead.get((machine_id, agent_slug, rel_path))
-    return bool(marker and marker.get("stale"))
-
-
-async def capture_losing_platform_copy(agent_slug: str, rel_path: str, why: str) -> bool:
-    """A save the machine refused as stale loses to the copy the machine kept
-    changing: the platform copy goes to the recover bin (reason conflict)
-    before the machine's bytes replace it, whatever the merge's own capture
-    rule says for the path (a person's own file, a same-user divergence).
-    Best effort: True when an entry was made."""
-    import config
-    from core.remote.file_sync import MAX_FILE_SIZE
-    from services.infra import safe_fs
-    from storage.files import recover_bin_store
-
-    def _capture() -> dict | None:
-        try:
-            data = safe_fs.read_bytes_beneath(
-                config.AGENTS_DIR, f"{agent_slug}/{rel_path}", max_size=MAX_FILE_SIZE)
-        except OSError:
-            return None
-        if not data:
-            return None
-        return recover_bin_store.capture(agent_slug, rel_path, data, "conflict")
-
-    try:
-        entry = await asyncio.to_thread(_capture)
-    except Exception:  # noqa: BLE001  # a safety net on the way to a pull must never stop the pull
-        logger.warning("recover-bin capture of %s failed", rel_path, exc_info=True)
-        return False
-    if entry is not None:
-        logger.info("the platform copy of %s is kept in the recover bin: %s", rel_path, why)
-    return entry is not None
-
-
-# The push ack's third answer beside ``ok`` and ``error`` (0.5.150): the
-# machine left the file alone because it changed under the platform.
-PUSH_ACK_STALE = "stale"
-
-
-def record_committed_stat(machine_id: str, agent_slug: str, rel_path: str, ack: dict) -> None:
-    """The committed file's stat a 0.5.150 satellite puts on a write's
-    ``ok`` ack becomes the machine's copy on record; an older satellite's
-    bare ack records nothing."""
-    size, mtime_ns = ack.get("size"), ack.get("mtime_ns")
-    if not (isinstance(size, int) and isinstance(mtime_ns, int)) or isinstance(size, bool):
-        return
-    record_pushed_stat(machine_id, agent_slug, rel_path, size, mtime_ns)
-
-
-async def note_push_failed(cm, machine_id: str, agent_slug: str, rel_path: str,
-                           size: int, mtime_ns: int, *, fallback: dict | None = None) -> None:
-    """A push of the platform copy to ``machine_id`` failed: the marker,
-    with the machine's stat probed once (the baseline that tells a machine
-    still behind from one changed since), the last pulled one when the
-    machine does not answer (a record can be older than a change applied
-    since; ``fallback`` is the record the push took, ``take_push_record``).
-    A newer write's mark standing there loses its baseline
-    (``_lose_baseline``)."""
-    if not _mark_current((machine_id, agent_slug, rel_path), (size, mtime_ns)):
-        _lose_baseline((machine_id, agent_slug, rel_path))
-        return
-    machine = await _probe_baseline(cm, machine_id, agent_slug, rel_path)
-    if machine is None:
-        machine = fallback
-    note_platform_ahead(machine_id, agent_slug, rel_path, size, mtime_ns, machine=machine)
-
-
-def _mark_current(key: tuple[str, str, str], stat: tuple[int, int]) -> bool:
-    """Whether a mark write for the platform copy ``stat`` may replace the
-    mark standing for ``key``: no mark stands, the standing one is of the
-    same copy, or the platform copy is now the one of ``stat`` (the standing
-    mark is of an older write). A fan-out of older bytes that is still on
-    its way, acks or fails after a newer write marked the machine must not
-    overwrite or clear that mark: the next read would pull the machine's
-    older bytes over the newer write."""
-    marker = _platform_ahead.get(key)
-    if marker is None or (marker["size"], marker["mtime_ns"]) == stat:
-        return True
-    try:
-        st = _workspace_path(key[1], key[2]).stat()
-    except (OSError, ValueError):
-        return False
-    return (st.st_size, st.st_mtime_ns) == stat
-
-
-async def _probe_baseline(cm, machine_id: str, agent_slug: str, rel_path: str) -> dict | None:
-    try:
-        if not cm.satellite_supports_file_stat(machine_id):
-            return None
-        from services.path_policy_v2 import PathRef
-        res = await cm.stat_file(machine_id, PathRef("agent_tree", rel_path),
-                                 agent_slug=agent_slug, timeout=_BASELINE_PROBE_S)
-        return res if isinstance(res, dict) else None
-    except (ImportError, ValueError, TypeError) as e:
-        logger.debug("baseline probe failed (%s)", e)
-        return None
-
-
-def clear_platform_ahead(machine_id: str, agent_slug: str, rel_path: str, *,
-                         stat: tuple[int, int] | None = None) -> None:
-    """A push of the file to ``machine_id`` landed: of the platform copy
-    ``stat`` when the caller knows which (a fan-out), which leaves a newer
-    write's mark standing, else of the copy as it is (a merge push, a read's
-    re-push, under the path lock)."""
-    key = (machine_id, agent_slug, rel_path)
-    if stat is not None and not _mark_current(key, stat):
-        _lose_baseline(key)
-        return
-    _platform_ahead.pop(key, None)
-
-
-def _lose_baseline(key: tuple[str, str, str]) -> None:
-    """A push of older bytes than the standing mark's acked or failed on the
-    machine (an ack can be lost): the machine may hold those bytes now, which
-    no baseline names, so a read there serves the platform copy and pushes
-    it again instead of taking the machine's copy as a later edit."""
-    marker = _platform_ahead.get(key)
-    if marker is not None:
-        marker["machine"] = None
-
-
-def end_in_flight(machine_id: str, agent_slug: str, rel_path: str,
-                  stat: tuple[int, int]) -> None:
-    """A mark of the platform copy ``stat`` set in flight before a fan-out
-    that will not push there (the machine left its targets, the fan-out
-    ended early): its window ends and the failure's rules apply. A mark of
-    another copy is a later write's, left as it is."""
-    marker = _platform_ahead.get((machine_id, agent_slug, rel_path))
-    if marker is not None and (marker["size"], marker["mtime_ns"]) == stat:
-        marker["in_flight_until"] = 0.0
-
-
-# The re-pushes a read started (held so the loop keeps them).
-_repush_tasks: set[asyncio.Task] = set()
-
-
-async def _repush(cm, machine_id: str, agent_slug: str, rel_path: str, ref,
-                  host_path: Path, key: tuple[str, str, str]) -> None:
-    """Push the platform copy a read found ahead on ``machine_id``, under the
-    path lock and a transfer slot, if the marker still stands then. An ack
-    drops the marker and the machine's stat record, a failure keeps the
-    marker and backs off."""
-    src_fd = -1
-    try:
-        lock = await _acquire_global_path_lock(agent_slug, rel_path)
-        async with lock:
-            # The platform copy is opened with no component followed and
-            # judged and pushed from that descriptor (push_back's rule).
-            try:
-                src_fd, src_st = await asyncio.to_thread(_open_platform_copy, agent_slug, rel_path)
-            except OSError:
-                _platform_ahead.pop(key, None)
-                return
-            ahead = _standing_platform_ahead(key, host_path, st=src_st)
-            if ahead is None:
-                return
-            from core.remote import transfer_gate
-            from core.remote.satellite_file_transfer import push_ceiling_s
-            from services.infra import safe_fs
-            async with transfer_gate.slot(machine_id, agent_slug, rel_path, ahead["size"]):
-                # The window counts from the slot, as a fan-out's does: a
-                # push that queued behind others still covers the reads.
-                note_platform_ahead(machine_id, agent_slug, rel_path, ahead["size"],
-                                    ahead["mtime_ns"], in_flight_s=push_ceiling_s(ahead["size"]))
-                # The push expects the copy the mark knows: the machine's
-                # record, else the baseline probed at the failure. A copy
-                # changed since is refused as stale and wins at the next read.
-                record = take_push_record(machine_id, agent_slug, rel_path)
-                expect = push_expectation_of(record if record is not None else ahead.get("machine"))
-                ok = await cm.push_file(machine_id, ref, Path(safe_fs.fd_path(src_fd)),
-                                        agent_slug=agent_slug, expect=expect)
-            if ok:
-                _platform_ahead.pop(key, None)
-            else:
-                _back_off(key, ahead)
-    except Exception:  # noqa: BLE001  # a re-push task nobody awaits: a raise would vanish unlogged
-        logger.warning("re-push of %s to machine %s failed", rel_path, machine_id[:8],
-                       exc_info=True)
-        _back_off(key, _platform_ahead.get(key))
-    finally:
-        if src_fd >= 0:
-            os.close(src_fd)
-        _repush_tasks.discard(asyncio.current_task())
-
-
-def _back_off(key: tuple[str, str, str], pushed: dict | None) -> None:
-    """A re-push of the copy ``pushed`` names failed: the mark standing for
-    that copy waits its backoff, out of flight (a mark of another copy is a
-    later write's, left as it is)."""
-    marker = _platform_ahead.get(key)
-    if marker is None or pushed is None or (
-            (marker["size"], marker["mtime_ns"]) != (pushed["size"], pushed["mtime_ns"])):
-        return
-    marker["in_flight_until"] = 0.0
-    marker["retry_at"] = time.monotonic() + _REPUSH_BACKOFF_S
-
-
-def _standing_platform_ahead(key: tuple[str, str, str], host_path: Path, *,
-                             st: os.stat_result | None = None) -> dict | None:
-    """The marker for ``key`` while the platform copy still has the size and
-    mtime it had at the push, else None (a later platform write, or the copy
-    gone, drops it). ``st``: the copy's stat when the caller holds it open."""
-    marker = _platform_ahead.get(key)
-    if marker is None:
-        return None
-    if st is None:
-        try:
-            st = host_path.stat()
-        except OSError:
-            st = None
-    if st is None or (st.st_size, st.st_mtime_ns) != (marker["size"], marker["mtime_ns"]):
-        _platform_ahead.pop(key, None)
-        return None
-    return marker
-
-
-def _same_machine_copy(before: dict, now: dict) -> bool:
-    """The machine's copy is the one it held before the push: both absent,
-    or both there with the same size and mtime (satellite-clock facts)."""
-    if not now.get("exists") or not before.get("exists"):
-        return not now.get("exists") and not before.get("exists")
-    return (before.get("size"), before.get("mtime_ns")) == (now.get("size"), now.get("mtime_ns"))
-
-
-def is_host_cache_path(host_path: str) -> bool:
-    """Does ``host_path`` live in the satellite-host cache subtree?"""
-    root = str(_host_cache_root())
-    return host_path == root or host_path.startswith(root + "/")
 
 
 async def pull_through_host_path(
@@ -568,8 +147,13 @@ async def pull_through_host_path(
     info = _get_remote_session_info(session_id)
     if info is None:
         return None
-    cache_path, sidecar = _host_cache_paths(session_id, info.machine_id, abs_path)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path, meta_path = _host_cache_paths(session_id, info.machine_id, abs_path)
+    try:
+        await asyncio.to_thread(_make_cache_folder, cache_path.parent)
+    except OSError as e:
+        logger.warning("pull_through_host_path: the cache folder of session %s refused: %s",
+                       session_id[:8], e)
+        return None
 
     lock = await _acquire_machine_host_lock(info.machine_id, abs_path)
     async with lock:
@@ -581,11 +165,8 @@ async def pull_through_host_path(
         # Revalidation fast path: cached copy + recorded pull-time stat +
         # matching fresh probe → skip the transfer entirely.
         fresh = await _probe_stat(cm, info.machine_id, ref)
-        if fresh is not None and cache_path.is_file():
-            try:
-                recorded = json.loads(sidecar.read_text()).get("stat")
-            except (OSError, json.JSONDecodeError):
-                recorded = None
+        if fresh is not None and await asyncio.to_thread(_cached_regular, cache_path):
+            recorded = (await asyncio.to_thread(_read_host_meta, meta_path) or {}).get("stat")
             if _stats_match(recorded, fresh):
                 return cache_path
 
@@ -593,180 +174,111 @@ async def pull_through_host_path(
         if not ok:
             return None
         # The file itself was already committed atomically (.partial + fsync
-        # + rename) by pull_file_to_path. Write the sidecar metadata so a
-        # later push-back targets the original abs_path — plus the PRE-pull
-        # stat for the next read's revalidation (absent when the probe was
+        # + rename) by pull_file_to_path. Write the record so a later
+        # push-back targets the original abs_path — plus the PRE-pull stat
+        # for the next read's revalidation (absent when the probe was
         # unavailable → next read pulls, today's behavior).
         meta = {"machine_id": info.machine_id, "abs_path": abs_path}
         if fresh is not None and fresh.get("exists"):
             meta["stat"] = fresh
-        await asyncio.to_thread(_write_sidecar, sidecar, meta)
+        await asyncio.to_thread(_write_host_meta, meta_path, meta)
         return cache_path
-
-
-def _write_sidecar(sidecar: Path, meta: dict) -> None:
-    """The host cache's metadata beside the cached file, in one rename. The
-    explicit ``str`` + ``.partial`` (not ``with_suffix``) keeps a dot-file's
-    name whole."""
-    partial = Path(str(sidecar) + ".partial")
-    partial.write_text(json.dumps(meta))
-    partial.replace(sidecar)
-
-
-def _resolved_cache(cache_path: str, session_id: str) -> tuple[Path, Path]:
-    """The cache path and the session's own cache root, links resolved."""
-    return Path(cache_path).resolve(), host_cache_session_root(session_id).resolve()
 
 
 async def push_back_host_path(session_id: str, cache_path: str) -> bool:
     """Push a satellite-host cache file's bytes back to the satellite.
 
-    Looks up the (machine_id, abs_path) via the sidecar written at
-    pull time. Acquires the same per-(machine_id, abs_path) lock to
-    serialize concurrent edits. Returns True on satellite ack.
+    Looks up the (machine_id, abs_path) in the record written at pull time
+    (``_host_cache_paths``: the server's own folder, never the cache). Acquires
+    the same per-(machine_id, abs_path) lock to serialize concurrent edits.
+    Returns True on satellite ack.
 
-    Only this session's own cache counts, and only toward its own machine:
-    ``is_host_cache_path`` is a prefix test, so a path that climbs out of
-    the cache (``.remote-host-cache/../<agent>/…``) would otherwise read a
-    sidecar the caller synced into its own workspace, naming any machine
-    and any absolute path.
+    Only a file of this session's own cache counts, by the path as written
+    (``<cache>/<session>/<digest>/<name>``, never resolved), only toward its
+    own machine, only to the machine path that folder was made for, and only
+    where the session may write now. The cached file is opened with no link
+    followed and pushed from that descriptor.
     """
+    from core.remote import remote_file_cache
     info = _get_remote_session_info(session_id)
-    try:
-        cp, session_root = await asyncio.to_thread(_resolved_cache, cache_path, session_id)
-    except OSError:
-        return False
-    if info is None or not cp.is_relative_to(session_root) or cp == session_root:
+    entry = host_cache_entry(cache_path, session_id)
+    if info is None or entry is None:
         logger.warning(
             "push_back_host_path: %s is not in session %s's own cache, refused",
             cache_path, session_id[:8],
         )
         return False
-    sidecar = cp.parent / "_meta.json"
-    try:
-        meta = json.loads(sidecar.read_text())
-    except (OSError, json.JSONDecodeError) as e:
+    digest, name = entry
+    cp = Path(cache_path)
+    meta_path = remote_file_cache._host_meta_root() / session_id / f"{digest}.json"
+    meta = await asyncio.to_thread(_read_host_meta, meta_path)
+    adopted = meta is None
+    if adopted:
+        meta = await asyncio.to_thread(_read_old_host_meta, cp)
+    abs_path = host_meta_matches(meta or {}, info.machine_id, digest, name)
+    if not abs_path:
         logger.warning(
-            "push_back_host_path: cannot read sidecar for %s: %s",
-            cache_path, e,
+            "push_back_host_path: no record of session %s's machine names %s, refused",
+            session_id[:8], cache_path,
         )
         return False
-    machine_id = meta.get("machine_id", "")
-    abs_path = meta.get("abs_path", "")
-    if not machine_id or not abs_path:
+    meta = cast(dict, meta)
+    if not _may_write_host_path(session_id, abs_path):
+        logger.warning("push_back_host_path: session %s may not write %s on its machine, refused",
+                       session_id[:8], abs_path)
         return False
-    if machine_id != info.machine_id:
-        logger.warning(
-            "push_back_host_path: the sidecar of %s names another machine than "
-            "session %s's, refused", cache_path, session_id[:8],
-        )
-        return False
+    if adopted:
+        await asyncio.to_thread(_write_host_meta, meta_path, meta)
+    machine_id = info.machine_id
 
     lock = await _acquire_machine_host_lock(machine_id, abs_path)
     async with lock:
         from core.remote.satellite_connection import get_connection_manager
+        from services.infra import safe_fs
         from services.path_policy_v2 import PathRef
         cm = get_connection_manager()
-        # Pass the PATH — push_file streams from disk (a vanished/unreadable
-        # cache file returns False with its own warning log).
-        ok = await cm.push_file(
-            machine_id, PathRef("satellite_host", abs_path), cp,
-        )
+        try:
+            src_fd, _st = await asyncio.to_thread(
+                safe_fs.open_regular_for_read, remote_file_cache._host_cache_root().parent,
+                _cache_rel(cp))
+        except OSError as e:
+            logger.warning("push_back_host_path: %s not pushed: %s", cache_path, e)
+            return False
+        try:
+            # The descriptor's PATH: push_file streams from it.
+            ok = await cm.push_file(
+                machine_id, PathRef("satellite_host", abs_path), Path(safe_fs.fd_path(src_fd)),
+            )
+        finally:
+            os.close(src_fd)
         if ok and "stat" in meta:
             # The write changed the satellite file's mtime — the recorded
             # pull-time stat is stale. Invalidate it so the next read
             # re-pulls instead of fast-pathing onto a pre-write comparison.
             meta.pop("stat", None)
             try:
-                await asyncio.to_thread(_write_sidecar, sidecar, meta)
+                await asyncio.to_thread(_write_host_meta, meta_path, meta)
             except OSError as e:
                 logger.warning(
-                    "push_back_host_path: sidecar stat invalidation failed "
+                    "push_back_host_path: record stat invalidation failed "
                     "for %s: %s", cache_path, e,
                 )
         return ok
 
 
-# ---------------------------------------------------------------------------
-# Global per-(agent_slug, rel_path) workspace write lock
-# ---------------------------------------------------------------------------
-
-# Serializes ALL platform-side writes to a given agent-tree file ACROSS sessions
-# and machines: pull_through, push_back, the per-turn file_changed applier
-# (core/remote/satellite_connection.py), and the active-session fan-out
-# (services/remote/workspace_fanout.py) all take this lock keyed by
-# (agent_slug, rel_path). Two different sessions (e.g. satellite-A and
-# satellite-B running the same collaborative agent) editing the same workspace
-# file therefore serialize against each other — last writer wins on a consistent
-# byte sequence, never a torn interleave.
-#
-# Lifecycle: the registry grows by the number of DISTINCT files ever written for
-# the life of the process (one tiny asyncio.Lock each) — bounded and acceptable
-# for v1; there is no per-session cleanup hook (these locks are NOT session-scoped,
-# unlike the pending_push events in _SessionState).
-class _PathLock(asyncio.Lock):
-    """An asyncio.Lock that can say whether anyone is using it: held, or with
-    a waiter (a woken waiter stays in ``_waiters`` until its task resumes, so
-    a lock in hand-off is never idle)."""
-
-    def idle(self) -> bool:
-        return not self.locked() and not self._waiters
-
-
-# One lock per distinct (agent_slug, rel_path) written through the platform,
-# insertion-ordered and bounded: past the bound the oldest IDLE entries are
-# evicted. Eviction is safe because of the shape every caller keeps (pinned
-# by tests/remote/test_remote_file_flow.py): the lock handed out by
-# ``_acquire_global_path_lock`` is entered on the caller's next statement
-# with no await in between, and the acquire itself never suspends, so a lock
-# that is idle here is referenced by nobody about to enter it. A second map
-# with the same rule serializes fan-outs per path (``acquire_fanout_lock``);
-# the lock order is the path lock, then the fan-out lock, then the transfer
-# gate, and no caller takes them the other way round.
-_PATH_LOCKS_MAX = 4096
-_global_path_locks: OrderedDict[tuple[str, str], _PathLock] = OrderedDict()
-_fanout_locks: OrderedDict[tuple[str, str], _PathLock] = OrderedDict()
-
-
-def _get_or_create_lock(table: OrderedDict, key: tuple[str, str]) -> _PathLock:
-    lock = table.get(key)
-    if lock is None:
-        lock = _PathLock()
-    else:
-        del table[key]
-    table[key] = lock
-    if len(table) > _PATH_LOCKS_MAX:
-        # A bounded scan from the oldest end: idle entries go until the table
-        # fits; an entry in use stays whatever its age.
-        for old_key in list(table.keys())[:64]:
-            if len(table) <= _PATH_LOCKS_MAX:
-                break
-            if old_key != key and table[old_key].idle():
-                del table[old_key]
-    return lock
-
-
-async def _acquire_global_path_lock(agent_slug: str, rel_path: str) -> _PathLock:
-    """Get-or-create the global per-(agent_slug, rel_path) workspace write lock.
-
-    The SINGLE serialization point for platform-side writes to an agent-tree
-    file. Cross-module + cross-session: pull_through / push_back (this module),
-    the ``file_changed`` applier (core/remote/satellite_file_transfer.py), and
-    the fan-out (services/remote/workspace_fanout.py) all serialize on the same
-    key so concurrent writers to one shared workspace file can't clobber each
-    other mid-write. Never suspends (the map belongs to the loop thread); the
-    caller enters the lock on its next statement (see the note on the map).
-    """
-    return _get_or_create_lock(_global_path_locks, (agent_slug, rel_path))
-
-
-async def acquire_fanout_lock(agent_slug: str, rel_path: str) -> _PathLock:
-    """The per-(agent_slug, rel_path) lock that serializes fan-outs of one
-    file to the other machines. Taken INSIDE the path lock and kept after it
-    is released, so same-path fan-outs run in apply order while a slow
-    target no longer holds the next writer of the path back. Same shape rule
-    as the path lock."""
-    return _get_or_create_lock(_fanout_locks, (agent_slug, rel_path))
+def _may_write_host_path(session_id: str, abs_path: str) -> bool:
+    """Whether the session may write ``abs_path`` on its machine now: the
+    path policy's own answer for a write (a pull admits paths only read)."""
+    from core.session.session_state import get_session_security
+    from services import path_policy_v2
+    ctx = get_session_security(session_id)
+    if ctx is None:
+        return False
+    answer = path_policy_v2.resolve_path_for_session(
+        path_policy_v2.context_from_security(ctx), abs_path, writing=True)
+    ref = answer.path_ref
+    return bool(answer.allowed and ref is not None and ref.kind == "satellite_host"
+                and _normalize_abs_path_for_key(ref.value) == _normalize_abs_path_for_key(abs_path))
 
 
 @dataclass
@@ -835,10 +347,14 @@ def _get_remote_session_info(session_id: str):
     except ImportError:
         info = None
     if info is not None:
-        return info
+        # A compute machine's session works on the platform's folder: the
+        # platform's own flows serve it, as a local session's.
+        return info if getattr(info, "files_synced", True) else None
     from core.session.session_state import get_session_security
     ctx = get_session_security(session_id)
-    machine_id = ctx.placement.machine_id if ctx is not None else ""
+    # A machine whose files are its own synced copy: a compute machine works
+    # on the platform's folder, where the platform's own flows serve it.
+    machine_id = ctx.placement.machine_id if ctx is not None and ctx.placement.files_synced else ""
     if not machine_id:
         return None
     if session_id not in _fallback_logged:
@@ -870,10 +386,10 @@ def remote_session_agent(session_id: str) -> str:
 
 async def stat_probe(session_id: str, rel_path: str) -> dict | None:
     """Best-effort ``file_stat`` of an agent-tree path on the session's
-    satellite (0.5.95+): ``{"exists", "size", "mtime_ns"}`` — ``exists`` is
+    satellite: ``{"exists", "size", "mtime_ns"}`` — ``exists`` is
     False for a directory as well as for an absent path. ``None`` when the
-    session is not remote, the path is non-canonical, the satellite predates
-    the probe, or the probe failed; callers then fall back to
+    session is not remote, the path is non-canonical, or the probe failed.
+    Callers then fall back to
     ``pull_through`` (which re-probes and never trusts a missing answer).
 
     A pure read: no lock, no platform-side write, no mkdir — the safe way to
@@ -913,22 +429,21 @@ async def list_remote_entries(session_id: str, rel_prefix: str, *,
     """``list_remote_files`` with each file's size as the machine listed it:
     ``[{"path", "size"}]``, sorted by path, same ``None`` cases. ``agent``
     names the agent the caller authorized the path against: a session held
-    for another agent answers ``None``. ``report_skipped`` adds what a
-    satellite that lists them (0.5.145) could not read, as
-    ``{"path", "size": 0, "skipped": <why>}`` entries, a folder's with
-    ``"dir": True`` (``""`` = the whole tree): a caller that removes what
-    the machine lacks keeps those, and the unreadable folder's contents."""
+    for another agent answers ``None``. ``report_skipped`` adds what the
+    satellite could not read, as ``{"path", "size": 0, "skipped": <why>}``
+    entries, a folder's with ``"dir": True`` (``""`` = the whole tree): a
+    caller that removes what the machine lacks keeps those, and the
+    unreadable folder's contents."""
     info = _get_remote_session_info(session_id)
     if info is None or (agent and info.agent_name != agent):
         return None
     from core.remote.remote_workspace_sync import manifest_request
     from core.remote.satellite_connection import get_connection_manager
     cm = get_connection_manager()
-    ask_skipped = report_skipped and cm.satellite_supports_skipped_manifest(info.machine_id)
     try:
         ack = await cm.send_command(
             info.machine_id,
-            manifest_request(cm, info.machine_id, info.agent_name, report_skipped=ask_skipped),
+            manifest_request(info.agent_name, report_skipped=report_skipped),
             timeout=30.0,
         )
     except RuntimeError as e:
@@ -944,7 +459,7 @@ async def list_remote_entries(session_id: str, rel_prefix: str, *,
         if not isinstance(path, str) or path.endswith(".partial"):
             continue
         skipped = entry.get("skipped")
-        if skipped and not ask_skipped:
+        if skipped and not report_skipped:
             continue
         if not isinstance(skipped, str) or not skipped:
             if not path:
@@ -965,18 +480,6 @@ async def list_remote_entries(session_id: str, rel_prefix: str, *,
             row["dir"] = True
         out.append(row)
     return sorted(out, key=lambda e: e["path"])
-
-
-def absence_is_reliable(session_id: str) -> bool:
-    """Whether a file missing from the session's machine listing is one the
-    machine lacks: false for a Windows satellite whose manifest may leave
-    out files it has (the hash bug of 0.5.130 to 0.5.143), where a caller
-    must not remove the platform's copy of what the listing lacks."""
-    info = _get_remote_session_info(session_id)
-    if info is None:
-        return False
-    from core.remote.satellite_connection import get_connection_manager
-    return not get_connection_manager().satellite_absence_unreliable(info.machine_id)
 
 
 async def pull_into(session_id: str, rel_path: str, dest: Path, *,
@@ -1004,14 +507,6 @@ async def pull_into(session_id: str, rel_path: str, dest: Path, *,
     except (OSError, RuntimeError):
         logger.warning("pull_into: pull of %s failed", rel_path, exc_info=True)
         return False
-
-
-def _workspace_path(agent_slug: str, rel_path: str) -> Path:
-    """Compute the platform's host path for (agent, rel_path): the agent's
-    folder (``config.get_agent_dir``, which refuses a name that is no agent
-    folder with ``PathOutsideRoot``) / ``rel_path``, resolved."""
-    import config
-    return (config.get_agent_dir(agent_slug) / rel_path).resolve()
 
 
 async def write_back_allowed(session_id: str, agent: str, rel_path: str) -> bool:
@@ -1052,11 +547,22 @@ def _platform_copy(agent_slug: str, rel_path: str) -> Path | None:
     return agent_dir / rel_path if stat.S_ISREG(st.st_mode) else None
 
 
+async def _served(agent_slug: str, rel_path: str) -> Path | None:
+    """The file a read serves: the platform copy at the canonical name, when
+    it is a regular file reached with no link (``_platform_copy``)."""
+    return await asyncio.to_thread(_platform_copy, agent_slug, rel_path)
+
+
 def held_reason(rel_path: str) -> str:
     """Why a held read found nothing: the path is not on the platform, and
     the session may not bring it there from its machine."""
     return (f"{rel_path} is not on the platform, and this session may not copy "
             "files from its machine into that folder (its role cannot write there)")
+
+
+def _owed_by_lane(machine_id: str, agent_slug: str, rel_path: str) -> str:
+    from core.remote import machine_push_lane
+    return machine_push_lane.owed(machine_id, agent_slug, rel_path)
 
 
 async def pull_through(session_id: str, rel_path: str, *,
@@ -1072,7 +578,8 @@ async def pull_through(session_id: str, rel_path: str, *,
     Returns ``None`` if:
       - the session isn't remote (caller should fall back to local resolution)
       - the satellite is unreachable / file doesn't exist
-      - the resolved host path escapes the agent dir (path traversal)
+      - the platform copy at the name is not a regular file reached with
+        no link at any part (the answer is always that name, never resolved)
 
     ``cm.pull_file_to_path`` streams the body to a staging file of its own and
     atomically renames it into place, so parallel pull_through calls never
@@ -1118,7 +625,7 @@ async def pull_through(session_id: str, rel_path: str, *,
             "write it back (platform copy served when there is one)",
             rel_path, info.machine_id[:8], session_id[:8],
         )
-        return await asyncio.to_thread(_platform_copy, info.agent_name, rel_path)
+        return await _served(info.agent_name, rel_path)
 
     st = await _state(session_id)
 
@@ -1137,30 +644,34 @@ async def pull_through(session_id: str, rel_path: str, *,
     except ValueError:
         logger.warning("Path refused: session=%s names no agent folder", session_id)
         return None
-    early_path = (agent_dir / rel_path).resolve()
-    try:
-        early_path.relative_to(agent_dir.resolve())
-    except ValueError:
-        pass
-    else:
-        early = _standing_platform_ahead((info.machine_id, info.agent_name, rel_path), early_path)
-        if early is not None and time.monotonic() < early["in_flight_until"]:
-            return early_path
+    # The path is never resolved (the rel is canonical: no `..`), and every
+    # file this read serves is the platform copy AT that name, a regular
+    # file reached with no link at any part (``_served``): the answer is the
+    # very name the caller judged, never where a link put in meanwhile (the
+    # wait for the path lock, the machine's probe) would lead.
+    early_path = agent_dir / rel_path
+    early = _standing_platform_ahead((info.machine_id, info.agent_name, rel_path), early_path)
+    if early is not None and time.monotonic() < early["in_flight_until"]:
+        return await _served(info.agent_name, rel_path)
+    owed = _owed_by_lane(info.machine_id, info.agent_name, rel_path)
+    if owed == "delete":
+        # The platform removed the file and this machine has not heard
+        # yet: its copy is never pulled back.
+        return None
+    if owed:
+        # The platform's copy waits its turn in this machine's lane: it
+        # is the file, and the machine's older bytes are never pulled
+        # over it.
+        served = await _served(info.agent_name, rel_path)
+        if served is not None:
+            return served
 
     lock = await _acquire_global_path_lock(info.agent_name, rel_path)
     async with lock:
-        host_path = (agent_dir / rel_path).resolve()
-
-        # Path traversal check — the path is resolved (`..` segments
-        # folded), so a malicious rel_path can't escape AGENTS_DIR/<slug>/.
-        try:
-            host_path.relative_to(agent_dir.resolve())
-        except ValueError:
-            logger.warning("Path traversal blocked: session=%s path=%s", session_id, rel_path)
-            return None
+        host_path = agent_dir / rel_path
 
         # Stream the body from the satellite straight into the workspace at
-        # host_path (already traversal-checked above). pull_file_to_path
+        # host_path (a canonical rel, never resolved). pull_file_to_path
         # commits atomically (.partial + fsync + rename), so Docker MCP code
         # paths (`/agents/...` mount) and the dashboard workspace listing see
         # a complete file — never a torn write.
@@ -1169,7 +680,7 @@ async def pull_through(session_id: str, rel_path: str, *,
         from services.path_policy_v2 import PathRef
         ref = PathRef("agent_tree", rel_path)
 
-        # Revalidation fast path (satellite ≥ 0.5.95): the workspace copy +
+        # Revalidation fast path: the workspace copy +
         # the stat recorded at the last pull + a matching fresh probe → the
         # satellite file hasn't changed, serve the workspace copy without
         # re-transferring it.
@@ -1177,7 +688,14 @@ async def pull_through(session_id: str, rel_path: str, *,
         ahead = _standing_platform_ahead(key, host_path)
         if ahead is not None and time.monotonic() < ahead["in_flight_until"]:
             # A fan-out is pushing the platform copy there now: it is the file.
-            return host_path
+            return await _served(info.agent_name, rel_path)
+        owed = _owed_by_lane(info.machine_id, info.agent_name, rel_path)
+        if owed == "delete":
+            return None
+        if owed:
+            served = await _served(info.agent_name, rel_path)
+            if served is not None:
+                return served
         fresh = await _probe_stat(cm, info.machine_id, ref,
                                   agent_slug=info.agent_name)
         if ahead is not None:
@@ -1185,17 +703,17 @@ async def pull_through(session_id: str, rel_path: str, *,
             if fresh is not None and machine is not None and not _same_machine_copy(machine, fresh):
                 # The machine's copy changed after the missed push: the later
                 # write wins, the read pulls it as below. A save the machine
-                # refused as stale is kept first.
+                # refused as stale, or a merge could not deliver, is kept first.
                 logger.warning(
                     "pull_through: %s changed on machine %s after a failed push "
                     "of the platform copy, the machine's copy is taken",
                     rel_path, info.machine_id[:8],
                 )
-                if ahead.get("stale"):
+                if ahead.get("stale") and await refused_save_stands(key, host_path):
                     await capture_losing_platform_copy(
                         info.agent_name, rel_path,
-                        f"machine {info.machine_id[:8]} kept changing the file after "
-                        "refusing the save")
+                        f"machine {info.machine_id[:8]} changed the file after the save "
+                        "missed it")
                 _platform_ahead.pop(key, None)
             else:
                 # The machine still holds the older bytes (or cannot tell):
@@ -1218,10 +736,19 @@ async def pull_through(session_id: str, rel_path: str, *,
                     _repush_tasks.add(asyncio.create_task(_repush(
                         cm, info.machine_id, info.agent_name, rel_path, ref, host_path, key,
                     )))
-                return host_path
-        if (fresh is not None and host_path.is_file()
-                and _stats_match(_pull_stat_records.get(key), fresh)):
-            return host_path
+                return await _served(info.agent_name, rel_path)
+        if fresh is not None and _stats_match(_pull_stat_records.get(key), fresh):
+            served = await _served(info.agent_name, rel_path)
+            if served is not None:
+                return served
+        if await delete_stands(cm, key, host_path, fresh):
+            logger.info("pull_through: %s was deleted here, the copy on machine %s is not "
+                        "brought back", rel_path, info.machine_id[:8])
+            return None
+        if await platform_copy_unsettled(key, host_path):
+            logger.info("pull_through: %s on machine %s awaits its merge, the platform "
+                        "copy is served", rel_path, info.machine_id[:8])
+            return await _served(info.agent_name, rel_path)
 
         # The gate once more, right before the bytes move: a library
         # attachment may have turned read-only while this read waited for
@@ -1229,17 +756,19 @@ async def pull_through(session_id: str, rel_path: str, *,
         if not await write_back_allowed(session_id, info.agent_name, rel_path):
             if held is not None:
                 held.append(rel_path)
-            return await asyncio.to_thread(_platform_copy, info.agent_name, rel_path)
+            return await _served(info.agent_name, rel_path)
         # The pull runs while the file moves, however large (its own
         # progress deadline). Its destination is the path as written, never
         # resolved: the pull opens it with no component followed, so a link
         # planted in the platform tree refuses the pull instead of carrying
         # the bytes out of the path the gate judged.
+        pulled: dict = {}
         ok = await cm.pull_file_to_path(
             info.machine_id,
             ref,
             agent_dir / rel_path,
             agent_slug=info.agent_name,
+            hash_out=pulled,
         )
         if not ok:
             # Serve the platform mirror when the satellite can't provide the
@@ -1248,23 +777,31 @@ async def pull_through(session_id: str, rel_path: str, *,
             # satellite yet (write-then-preview race, live-hit 2026-07-19).
             # Availability over freshness: the preview/display/media read
             # paths prefer last-known bytes + a log line over a hard 400.
-            if host_path.is_file():
+            served = await _served(info.agent_name, rel_path)
+            if served is not None:
                 logger.info(
                     "pull_through: satellite pull failed for %s — serving "
                     "the platform mirror", rel_path,
                 )
                 if fallback is not None:
                     fallback.append(rel_path)
-                return host_path
-            return None
+            return served
+        # The bytes the machine sent are the copy both sides hold now
+        # (``record_held``).
+        if pulled.get("hash"):
+            try:
+                base_mtime = os.lstat(agent_dir / rel_path).st_mtime
+            except OSError:
+                base_mtime = 0.0
+            await record_held(info.machine_id, info.agent_name, rel_path,
+                              pulled["hash"], base_mtime, pulled["size"])
         # Record the PRE-pull probe for the next read's revalidation; a probe
-        # that was unavailable leaves no record (next read pulls — the
-        # pre-0.5.95 behavior).
+        # that was unavailable leaves no record (the next read pulls).
         if fresh is not None and fresh.get("exists"):
             _record_agent_stat(key, fresh)
         else:
             _pull_stat_records.pop(key, None)
-        return host_path
+        return await _served(info.agent_name, rel_path)
 
 
 async def push_back(session_id: str, rel_path: str) -> bool:
@@ -1326,6 +863,17 @@ async def push_back(session_id: str, rel_path: str) -> bool:
             # copy and is served the platform's.
             record = take_push_record(info.machine_id, info.agent_name, rel_path)
             stale: dict = {}
+            # The push carries the hash of the descriptor it streams, which
+            # the machine checks before its ack (``record_held``). A copy
+            # that cannot be read for its hash is pushed as before, with no
+            # hash and so no base.
+            from core.remote.file_sync import _hash_fd
+            content_hash: str | None
+            try:
+                content_hash = await asyncio.to_thread(_hash_fd, src_fd)
+            except OSError as e:
+                logger.warning("push_back: %s pushed with no hash to check: %s", rel_path, e)
+                content_hash = None
             # Pass a PATH — push_file streams from disk (memory O(chunk)
             # even for 1GB files; unreadable → False with its own warning).
             ok = await cm.push_file(
@@ -1333,10 +881,13 @@ async def push_back(session_id: str, rel_path: str) -> bool:
                 PathRef("agent_tree", rel_path),
                 Path(safe_fs.fd_path(src_fd)),
                 agent_slug=info.agent_name, expect=push_expectation_of(record),
-                stale_out=stale,
+                stale_out=stale, content_hash=content_hash,
             )
             if ok:
                 clear_platform_ahead(info.machine_id, info.agent_name, rel_path)
+                if content_hash:
+                    await record_held(info.machine_id, info.agent_name, rel_path,
+                                      content_hash, src_st.st_mtime, src_st.st_size)
             else:
                 try:
                     now_st = os.fstat(src_fd)
@@ -1402,15 +953,6 @@ async def push_back(session_id: str, rel_path: str) -> bool:
             cast("_PathLock", fanout_lock).release()
 
 
-def _open_platform_copy(agent_slug: str, rel_path: str) -> tuple[int, os.stat_result]:
-    """``(fd, stat)`` of the platform copy of a canonical agent-tree path,
-    a regular file reached with no component followed (``OSError``
-    otherwise). The caller closes the descriptor. Blocking."""
-    import config
-    from services.infra import safe_fs
-    return safe_fs.open_regular_for_read(config.AGENTS_DIR, f"{agent_slug}/{rel_path}")
-
-
 def cleanup_session(session_id: str) -> None:
     """Drop per-session lock state and purge the satellite-host pull cache.
     Called on session close.
@@ -1419,15 +961,25 @@ def cleanup_session(session_id: str) -> None:
     to the agent across sessions. The ``.remote-host-cache/{session_id}/`` dir,
     however, holds throwaway copies of satellite-host files (e.g. a user's
     ``~/Desktop/foo.png`` pulled in for a Docker MCP this session) and must be
-    removed or it leaks a copy per session (close_session's docstring claimed
-    this cleanup happened, but it was never wired).
+    removed or it leaks a copy per session. The folder is removed off the
+    event loop (``file_commit.behind``); the next start of the id waits for it.
     """
     _sessions.pop(session_id, None)
     _fallback_logged.discard(session_id)
-    try:
-        import shutil
-        shutil.rmtree(_host_cache_root() / session_id, ignore_errors=True)
-    except Exception as e:  # noqa: BLE001  # removing a closed session's host cache, the session is gone
-        logger.warning(
-            "remote-host-cache cleanup failed for %s: %s", session_id[:8], e,
-        )
+    from core import file_commit
+    file_commit.behind(_remove_host_cache, session_id,
+                       name="host_cache_removal", key=session_id)
+
+
+def _remove_host_cache(session_id: str) -> None:
+    """The session's host cache and its records, each removed beneath its
+    root with no link followed (a link in their place is refused, logged)."""
+    import config
+    from core.remote import remote_file_cache
+    from services.infra import safe_fs
+    for root, rel in ((_host_cache_root().parent, _cache_rel(host_cache_session_root(session_id))),
+                      (config.SESSIONS_DIR, f"{remote_file_cache._host_meta_root().name}/{session_id}")):
+        try:
+            safe_fs.rmtree_beneath(root, rel, missing_ok=True)
+        except OSError as e:
+            logger.warning("host cache of session %s left in place: %s", session_id[:8], e)

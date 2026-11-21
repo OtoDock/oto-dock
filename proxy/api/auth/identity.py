@@ -237,23 +237,6 @@ async def _new_password_hash(plain: str) -> str:
         raise _hash_busy() from exc
 
 
-def _check_platform_configured(user_sub: str, role: str) -> bool:
-    """Whether a user-scoped session would resolve to SOME credential on any layer.
-
-    Delegates to subscription_pool.user_can_run (own usable sub, or a borrowable
-    platform API sub when Platform Auth is on) so this gate and the resolver can
-    never disagree — in particular it must NOT report "configured" when the only
-    platform subscriptions are admin OAuth logins, which a user may not borrow.
-    """
-    from core.session.session_manager import valid_execution_paths
-    from services.engines import subscription_pool
-
-    return any(
-        subscription_pool.user_can_run(layer, user_sub)
-        for layer in sorted(valid_execution_paths())
-    )
-
-
 def _oidc_state_cookie_name() -> str:
     return "__Host-oidc_state" if config.COOKIE_SECURE else "oidc_state"
 
@@ -996,21 +979,18 @@ async def auth_me(user: UserContext | None = Depends(get_current_user)):
             "sub": user.sub, "email": user.email, "name": user.name, "username": "",
             "role": user.role, "agents": user.agents, "default_agent": "",
             "display_name": user.display_name, "agent_roles": user.agent_roles,
-            "platform_configured": True, "has_own_engine": False,
+            "has_own_engine": False,
             "auth_provider": "render", "totp_enabled": False, "is_owner": False,
             "must_change_password": False, "must_enroll_2fa": False, "render": True,
             "feature_flags": await asyncio.to_thread(build_feature_flags),
         }}
 
     # Whether THIS user has connected their OWN AI engine (a personal
-    # subscription on a CODING engine — Claude Code, Codex). Distinct from
-    # platform_configured (which is true if they can merely BORROW a platform
-    # sub): drives the per-user "connect an AI engine" banner — the user is
-    # nudged to add their own even when borrowing works, because borrowing is
-    # for agent/phone work, not their personal user-scoped chats. A supporting
-    # engine (Direct LLM, the low-latency phone path) is deliberately not
-    # counted — ``identity.role``; a row on an engine no longer registered is
-    # skipped, as it always was.
+    # subscription on a CODING engine — Claude Code, Codex): the admin's
+    # "connect an AI engine" strip on an install still being set up. A
+    # supporting engine (Direct LLM, the low-latency phone path) is
+    # deliberately not counted — ``identity.role``; a row on an engine no
+    # longer registered is skipped, as it always was.
     def _has_own_engine(sub: str) -> bool:
         from core.session.session_manager import get_layer_capabilities
         from storage.billing import subscription_store
@@ -1032,11 +1012,10 @@ async def auth_me(user: UserContext | None = Depends(get_current_user)):
         from auth.providers import GATE_CHANGE_PASSWORD, GATE_ENROLL_2FA, auth_gate
         db_user = task_store.get_user(user.sub)
         gate = auth_gate(db_user)
-        return (_check_platform_configured(user.sub, user.role), _has_own_engine(user.sub),
-                db_user, gate == GATE_CHANGE_PASSWORD, gate == GATE_ENROLL_2FA,
-                build_feature_flags())
+        return (_has_own_engine(user.sub), db_user, gate == GATE_CHANGE_PASSWORD,
+                gate == GATE_ENROLL_2FA, build_feature_flags())
 
-    (platform_configured, has_own_engine, db_user, must_change_password,
+    (has_own_engine, db_user, must_change_password,
      must_enroll_2fa, feature_flags) = await run_db(_me_job)
     totp_enabled = bool(db_user.get("totp_enabled")) if db_user else False
     is_owner = bool(db_user.get("is_owner")) if db_user else False
@@ -1055,7 +1034,6 @@ async def auth_me(user: UserContext | None = Depends(get_current_user)):
             "default_agent": user.default_agent,
             "display_name": user.display_name,
             "agent_roles": user.agent_roles,
-            "platform_configured": platform_configured,
             "has_own_engine": has_own_engine,
             "auth_provider": user.auth_provider,
             "totp_enabled": totp_enabled,

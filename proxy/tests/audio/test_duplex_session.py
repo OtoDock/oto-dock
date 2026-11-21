@@ -158,9 +158,14 @@ def test_access_missing_chat_and_unknown_user(temp_db):
 def test_access_follows_the_chat_owner_not_the_agent_mode(temp_db):
     """The by-id rule resume_chat binds by: on a Shared-only agent an
     assigned editor drives the ``agent::`` pool, never a colleague's chat
-    from before the switch, and a phone call only as a manager."""
+    from before the switch. A phone call opens to a manager to read and is
+    driven by nobody's voice: the call drives it."""
     from core.session import session_kind
-    from core.session.visibility import PHONE_CHAT_OWNER, shared_chat_owner
+    from core.session.visibility import (
+        PHONE_CHAT_OWNER,
+        PHONE_CHAT_READ_ONLY,
+        shared_chat_owner,
+    )
     from storage.agents import agent_store
     agent_store.create_agent("agent-so", "Shared only", collaborative=False,
                              default_scope="agent")
@@ -173,7 +178,7 @@ def test_access_follows_the_chat_owner_not_the_agent_mode(temp_db):
     assert duplex_service.chat_access_denied_reason("c-pre", editor) == "Access denied"
     assert duplex_service.chat_access_denied_reason("c-pool", editor) is None
     assert duplex_service.chat_access_denied_reason("c-call", editor) == "Access denied"
-    assert duplex_service.chat_access_denied_reason("c-call", manager) is None
+    assert duplex_service.chat_access_denied_reason("c-call", manager) == PHONE_CHAT_READ_ONLY
 
 
 def test_access_pooled_chat_takes_the_editor_tier(temp_db):
@@ -418,3 +423,37 @@ def test_duplex_config_names_the_chat_and_the_speaker_for_the_usage_report(temp_
     cfg = phone_config.assemble_duplex_session_config("user-1", "en-US", "chat-77")
     assert (cfg["chat_id"], cfg["sub"]) == ("chat-77", "user-1")
     assert phone_config.assemble_duplex_session_config("user-1")["chat_id"] == ""
+
+
+def test_an_editors_voice_never_drives_a_worker_whose_run_writes_knowledge(temp_db):
+    """A chat-surface worker of a delegation (the agent's own chat with a run
+    row, its id a plain uuid) whose run writes the agent's knowledge is a
+    manager's to drive: the socket and a key refuse an editor, and so does
+    the voice door, which once asked the run only for a ``task-`` id."""
+    from core.session.visibility import shared_chat_owner
+    from storage.agents import agent_store
+    agent_store.create_agent("agent-kw", "Knowledge", collaborative=True, default_scope="user")
+    task_store.upsert_user("user-mgr", "mgr@test.com", "Mgr", "member")
+    task_store.add_user_agent("user-mgr", "agent-kw", "manager", "test")
+    _mk_chat("c-worker", shared_chat_owner("agent-kw"), agent="agent-kw")
+    task_store.create_run("run-kw1", "dyn-kw", "agent-kw", "delegate", None, "go",
+                          "delegate", "agent", "user-mgr")
+    task_store.update_run("run-kw1", status="completed", chat_id="c-worker")
+    editor = _ctx("user-ed", agent_roles={"agent-kw": "editor"})
+    manager = _ctx("user-mgr", agent_roles={"agent-kw": "manager"})
+    denial = duplex_service.chat_access_denied_reason("c-worker", editor)
+    assert denial and "manager" in denial
+    assert duplex_service.chat_access_denied_reason("c-worker", manager) is None
+
+
+def test_a_managers_voice_never_speaks_into_a_call(temp_db):
+    """A phone call's conversation opens to the agent's managers to read and
+    only the call drives it: the voice door refuses a manager and an admin,
+    as the socket does."""
+    from core.session import session_kind
+    from core.session.visibility import PHONE_CHAT_OWNER
+    _mk_chat("c-call2", PHONE_CHAT_OWNER, source_type=session_kind.PHONE.source_type)
+    manager = _ctx("user-m2", agent_roles={"agent-a": "manager"})
+    admin = _ctx("user-admin", role="admin")
+    assert duplex_service.chat_access_denied_reason("c-call2", manager)
+    assert duplex_service.chat_access_denied_reason("c-call2", admin)

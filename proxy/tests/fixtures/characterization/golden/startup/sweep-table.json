@@ -1,0 +1,90 @@
+{
+ "items": [
+  {
+   "coroutine": true,
+   "function": "sweep_stale",
+   "name": "warmup_registry sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "sweep_stale",
+   "name": "install_registry sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "sweep_stale",
+   "name": "transfer_registry sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_catalog_installs",
+   "name": "catalog_install_registry sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_media",
+   "name": "media cache sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_preview_snapshots",
+   "name": "preview snapshot sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_recover_bin",
+   "name": "recover-bin reap"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_tombstones",
+   "name": "tombstone reap"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_idle_fingerprints",
+   "name": "idle fingerprint sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_retention",
+   "name": "retention sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_quotas",
+   "name": "quota monitor sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_subscription_health",
+   "name": "subscription health sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_window_alerts",
+   "name": "subscription window alert sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_mcp_autoupdate",
+   "name": "mcp auto-update sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_agent_updates",
+   "name": "agent template update sweep"
+  },
+  {
+   "coroutine": true,
+   "function": "_sweep_tools_idle",
+   "name": "docker tools idle sweep"
+  }
+ ],
+ "pairs": true,
+ "registries_are_bound": [
+  true,
+  true,
+  true
+ ]
+}

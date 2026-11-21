@@ -23,14 +23,14 @@ class TestRegistry:
 
     def test_the_ranking_the_registry_comments_describe(self):
         tier = {m: e["tier"] for m, e in app_config.MODEL_REGISTRY.items()}
-        assert tier["claude-fable-5-1"] < tier["claude-opus-5-5"] < tier["claude-sonnet-5-5"] < tier["claude-haiku-5-5"]
-        assert tier["gpt-6-astra"] < tier["gpt-6.1-sol"] < tier["gpt-6.1-terra"] < tier["gpt-6-luna"]
+        assert tier["claude-fable-5-2"] < tier["claude-opus-5-5"] < tier["claude-sonnet-5-5"] < tier["claude-haiku-5-5"]
+        assert tier["gpt-6.2-astra"] < tier["gpt-6.2-sol"] < tier["gpt-6.1-terra"] < tier["gpt-6-luna"]
         assert tier["qwen/qwen3.8-27b"] == tier["openai/gpt-oss-120b"] == 4
-        assert tier["claude-fable-5-1"] == tier["gpt-6-astra"] == 1
+        assert tier["claude-fable-5-2"] == tier["gpt-6.2-astra"] == 1
 
     def test_get_model_tier_reads_the_registry_first(self):
-        assert app_config.get_model_tier("claude-fable-5-1") == (
-            1, "frontier", app_config.MODEL_REGISTRY["claude-fable-5-1"]["good_at"])
+        assert app_config.get_model_tier("claude-fable-5-2") == (
+            1, "frontier", app_config.MODEL_REGISTRY["claude-fable-5-2"]["good_at"])
         assert app_config.get_model_tier("no-such-model") == (None, "", "")
 
     def test_layer_models_emit_the_tier_fields(self):
@@ -45,12 +45,12 @@ class TestRegistry:
             {"model_id": "custom-untiered", "is_builtin": False, "created_at": "2"},
             {"model_id": "claude-sonnet-5-5", "is_builtin": True, "tier": 3},
             {"model_id": "custom-fast", "is_builtin": False, "tier": 4, "created_at": "1"},
-            {"model_id": "claude-fable-5-1", "is_builtin": True, "tier": 1},
+            {"model_id": "claude-fable-5-2", "is_builtin": True, "tier": 1},
             {"model_id": "gpt-6-astra", "is_builtin": True, "tier": 1},
         ]
         rows.sort(key=app_config.model_catalog_sort_key)
         assert [r["model_id"] for r in rows] == [
-            "claude-fable-5-1", "gpt-6-astra", "claude-sonnet-5-5", "custom-fast", "custom-untiered",
+            "claude-fable-5-2", "gpt-6-astra", "claude-sonnet-5-5", "custom-fast", "custom-untiered",
         ]
 
 
@@ -60,8 +60,8 @@ class TestStore:
         subscription_store.sync_builtin_models(
             "claude-code-cli", app_config.get_layer_models("claude-code-cli"))
         rows = {m["model_id"]: m for m in subscription_store.list_models("claude-code-cli")}
-        assert rows["claude-fable-5-1"]["tier"] == 1
-        assert rows["claude-fable-5-1"]["good_at"] == app_config.MODEL_REGISTRY["claude-fable-5-1"]["good_at"]
+        assert rows["claude-fable-5-2"]["tier"] == 1
+        assert rows["claude-fable-5-2"]["good_at"] == app_config.MODEL_REGISTRY["claude-fable-5-2"]["good_at"]
         custom = subscription_store.add_model(
             "claude-code-cli", "local-x", "Local X", provider="ollama", tier=4, good_at="quick")
         assert custom["tier"] == 4 and custom["good_at"] == "quick"

@@ -78,7 +78,7 @@ async def test_run_deferred_pulls_applies_and_broadcasts(tmp_path):
          patch("storage.files.file_tombstones_store.drop") as drop, \
          patch("services.notifications.notification_manager.broadcast_file_updated",
                new=AsyncMock()) as bcast:
-        await layer._run_deferred_pulls("m1", "agent-1", [action], "alice")
+        await layer._run_deferred_pulls("m1", "agent-1", [action], "alice", {})
 
     cm.pull_file_to_path.assert_awaited_once()
     rec.assert_called_once()                      # base advanced
@@ -104,7 +104,7 @@ async def test_run_deferred_pulls_failure_skips_bookkeeping_and_broadcast(tmp_pa
          patch("storage.files.sync_state_store.record_one") as rec, \
          patch("services.notifications.notification_manager.broadcast_file_updated",
                new=AsyncMock()) as bcast:
-        await layer._run_deferred_pulls("m1", "agent-1", [action], "alice")
+        await layer._run_deferred_pulls("m1", "agent-1", [action], "alice", {})
 
     cm.pull_file_to_path.assert_awaited_once()
     rec.assert_not_called()       # no base advance on a failed pull
@@ -133,7 +133,7 @@ async def test_a_deferred_pull_is_handed_the_named_path(tmp_path):
          patch("config.AGENTS_DIR", tmp_path), \
          patch("core.remote.remote_file_flow._acquire_global_path_lock",
                new=AsyncMock(return_value=asyncio.Lock())):
-        await layer._run_deferred_pulls("m1", "agent-1", actions, "alice")
+        await layer._run_deferred_pulls("m1", "agent-1", actions, "alice", {})
         cm.pull_file_to_path.assert_awaited_once()
         dest = cm.pull_file_to_path.await_args.args[2]
         assert dest == ws / "alias" / "big.bin"

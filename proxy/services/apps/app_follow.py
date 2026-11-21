@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import config
-from core import layout
+from core import agent_folder, layout
 from services.apps import app_blueprints, app_deploy, releases
 from services.apps.manifest import parse_actions
 from services.infra import path_confinement, safe_fs
@@ -430,7 +430,7 @@ async def _put(target: dict, source_row: dict, release_dir: Path) -> tuple[int, 
         data, _blueprint = await asyncio.to_thread(app_blueprints.export_bundle, source_row, release_dir=release_dir)
         folder, blueprint = await asyncio.to_thread(app_blueprints.read_bundle, data)
     except (app_blueprints.BlueprintError, app_deploy.DeployError) as exc:
-        await asyncio.to_thread(shutil.rmtree, backup, True)
+        await asyncio.to_thread(releases.remove_tree, backup)
         raise FollowRefused(409, _sentence(str(exc))) from exc
     try:
         out = await app_blueprints.import_folder(
@@ -458,9 +458,9 @@ async def _put(target: dict, source_row: dict, release_dir: Path) -> tuple[int, 
             # it stays (the next move's snapshot replaces it), named in the log.
             logger.error("App %s: the working folder was not put back; its files stay at %s", slug, backup)
             raise FollowRefused(409, f"{text} {NOT_PUT_BACK}")
-        await asyncio.to_thread(shutil.rmtree, backup, True)
+        await asyncio.to_thread(releases.remove_tree, backup)
         raise FollowRefused(409, text)
-    await asyncio.to_thread(shutil.rmtree, backup, True)
+    await asyncio.to_thread(releases.remove_tree, backup)
     seeded = sorted(await asyncio.to_thread(_seeded_tasks, agent, slug) - before)
     return int(out.get("release") or 0), seeded
 
@@ -637,9 +637,11 @@ def _note_path(row: dict) -> Path:
 
 
 def _note(row: dict) -> dict:
-    """The source's note of a release a copy sent ({} when none)."""
+    """The source's note of a release a copy sent ({} when none), read
+    beneath the agent's real folder with no link followed."""
     try:
-        note = json.loads(_note_path(row).read_text("utf-8"))
+        note = json.loads(releases.read_tree_file(releases.app_release_dir(row), SENT_BACK_NAME,
+                                                  max_size=releases.MANIFEST_MAX_BYTES))
     except (OSError, ValueError):
         return {}
     return note if isinstance(note, dict) else {}
@@ -658,7 +660,7 @@ def _drop_note(row: dict, n: int) -> None:
     rejected or was replaced; a note for another release stays."""
     if _note_release(row) == n:
         with contextlib.suppress(OSError):
-            _note_path(row).unlink()
+            safe_fs.unlink_beneath(*agent_folder.beneath_agent(_note_path(row), row["agent"]), missing_ok=True)
 
 
 def _clear_sent(copy_id: str, n: int) -> None:

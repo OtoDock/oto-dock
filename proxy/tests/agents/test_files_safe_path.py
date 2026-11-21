@@ -30,8 +30,10 @@ def _editor() -> UserContext:
 
 @pytest.fixture
 def agent_dir(tmp_path, monkeypatch):
+    import config
     from storage import database as task_store
     monkeypatch.setattr(task_store, "get_username_by_sub", lambda sub: "mgr")
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
     d = tmp_path / "agents" / "test-agent"
     (d / "workspace").mkdir(parents=True)
     (d / "config").mkdir()
@@ -289,10 +291,14 @@ def _stub_spawn_side(monkeypatch):
     import core.layers.cli.config_dir as cli_cd
     from core import placement
     from core.config import task_config_builder as tcb
+    from tests._compute import serve
     monkeypatch.setattr(cli_cd, "ensure_persistent_claude_dir",
                         lambda *a, **k: _Path("/tmp/agents/x/workspace/.claude"))
     monkeypatch.setattr(tcb.remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
-    monkeypatch.setattr(tcb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT)
+    # A compute machine serves the platform's place: the task is built on it.
+    serve(monkeypatch)
+    monkeypatch.setattr(tcb.remote_store, "placement_of", lambda *a, compute=None, **k: (
+        placement.from_machine(placement.KIND_COMPUTE, compute) if compute else placement.LOCAL_PLACEMENT))
     monkeypatch.setattr(tcb.remote_store, "get_target_browser_settings", lambda *a, **k: None)
     monkeypatch.setattr(tcb.mcp_registry, "build_session_mcp_config",
                         lambda *a, **k: (None, {}, {}, {}, set()))
@@ -306,9 +312,15 @@ def _stub_spawn_side(monkeypatch):
     monkeypatch.setattr(tcb.config, "get_cli_effort", lambda *a, **k: "")
     monkeypatch.setattr(tcb.subscription_pool, "resolve_subscription_env",
                         lambda *a, **k: ("sub-test", {}))
-    from core.remote import satellite_connection as sc
+    from core.remote import satellite_connection as sc, satellite_link
     monkeypatch.setattr(sc, "get_connection_manager",
-                        lambda: SimpleNamespace(satellite_supports_pty=lambda *_: True))
+                        lambda: SimpleNamespace(satellite_supports_pty=lambda *_: True,
+                                                compute_machine_ids=frozenset,
+                                                is_compute=lambda _mid: False,
+                                                exit_state=lambda _mid: (0, False),
+                                                exit_report=lambda _mid: {},
+                                                is_connected=lambda _mid: True,
+                                                links=satellite_link.MachineLinks(None)))
     return tcb
 
 

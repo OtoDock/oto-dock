@@ -1,0 +1,262 @@
+{
+  "_comment": "The writing rules every OtoDock repository shares, read by prose_check.py and by the checks that judge the changelog, the release cards, the screens and apps. WRITING.md says what each rule is for. Word lists are regular expression fragments valid in Python and in JavaScript, matched as whole words with an optional s, case-insensitive. The long list (the changelog, the cards, the screens) is words.plain and words.inside together. words.inside is the changelog's list as it stands: the app lint's two lists split it, and a test holds them to it. symbols.pictographs is every emoji and pictograph and every arrow but \u2192, the arrow of a path through menus.",
+  "sentence": {
+    "cap": 30,
+    "warn": 20,
+    "screen": 20,
+    "abbreviations": ["e.g.", "E.g.", "i.e.", "I.e.", "etc.", "vs.", "cf.", "approx.", "U.S.", "Mr.", "Mrs.", "Ms.", "Dr."]
+  },
+  "paragraph": {
+    "words": 80,
+    "sentences": 5
+  },
+  "changelog": {
+    "lines": 80,
+    "lines_target": 50,
+    "words": 1400,
+    "words_target": 900,
+    "entry_lines": 4,
+    "entry_words": 50
+  },
+  "dash": "[\u2014\u2013]|(?<=\\s)--?(?=\\s)",
+  "symbols": {
+    "pictographs": "[\u2190\u2191\u2193-\u21ff\u2300-\u23ff\u2460-\u24ff\u25a0-\u27bf\u2900-\u297f\u2b00-\u2bff\u3030\u303d\u3297\u3299\ufe0f\ud83c\udc00-\ud83e\udeff]",
+    "arrows": "(?<![<=!-])(?:<=>|->|=>|<-)(?![>=-])"
+  },
+  "version": {
+    "products": [
+      "OtoDock"
+    ],
+    "own_names": [
+      "Satellite", "App", "Apps", "Dashboard", "Proxy", "Platform"
+    ],
+    "address_words": [
+      "address", "addresses", "subnet", "subnets", "network", "networks", "range", "IP", "IPs", "CIDR",
+      "host", "gateway"
+    ],
+    "not_after": [
+      "section", "sections", "RFC", "chapter", "figure", "table", "\u00a7"
+    ],
+    "before": [
+      "versions?",
+      "releases?",
+      "since",
+      "from",
+      "before",
+      "until",
+      "older than",
+      "newer than"
+    ],
+    "after": [
+      "and later",
+      "or later",
+      "and newer",
+      "or newer",
+      "and earlier",
+      "or earlier",
+      "and older",
+      "or older",
+      "onwards"
+    ],
+    "other_software": [
+      "Node", "Node.js", "Python", "PostgreSQL", "Postgres", "Docker", "Engine", "Compose",
+      "Debian", "Ubuntu", "Android", "macOS", "iOS", "Windows", "Linux", "Collabora", "OAuth",
+      "TLS", "HTTP", "LTS", "Xcode", "JDK", "Java", "Swift", "Kotlin", "Gradle", "Capacitor",
+      "npm", "pip", "uv", "ruff", "mypy", "Chrome", "Edge", "Firefox", "Safari", "Torch",
+      "Silero", "VAD", "Whisper", "Playwright", "SQLite", "Bun", "glibc", "kernel", "systemd",
+      "OpenSSL", "passt", "bubblewrap", "FFmpeg", "LibreOffice", "Asterisk", "FreePBX", "API",
+      "Ollama", "vLLM", "LiteLLM", "Homebrew", "Git", "winget", "PowerShell", "Bash", "Deepgram"
+    ],
+    "licences": [
+      "Apache(?: License)?,?(?: Version)?",
+      "CC[ -]BY(?:[ -](?:SA|NC|ND))*",
+      "CC0",
+      "(?:A|L)?GPL(?:v)?",
+      "MPL",
+      "EPL",
+      "License,? Version"
+    ],
+    "units": [
+      "GB", "MB", "KB", "TB", "GiB", "MiB", "KiB", "%", "per cent", "percent", "seconds?",
+      "minutes?", "hours?", "days?", "s", "ms", "px", "rem", "em", "pt", "Hz", "kHz", "dB",
+      "fps", "x", "times"
+    ],
+    "release_floor": "OtoDock \\d+\\.\\d+ or later"
+  },
+  "words": {
+    "plain": [
+      "brokers?", "carves?", "carved", "daemons?", "probes?", "ratchet", "sidecars?", "fan-?out"
+    ],
+    "inside": [
+      "carve", "floor", "hook", "broker", "probe", "egress", "daemon", "endpoint",
+      "handler", "payload", "regex", "mutex", "socket", "stdout", "stderr", "cgroup",
+      "namespace", "userns", "asyncio", "coroutine", "mixin", "adapter", "tombstone",
+      "manifest", "runtime", "sentinel", "heuristic", "idempotent", "pool"
+    ]
+  },
+  "present_tense": {
+    "phrases": [
+      "no longer(?! than)",
+      "(?:is|are|was|were) now",
+      "can now",
+      "now (?:has|have|can|runs?|works?|shows?|asks?|counts?|goes|uses?|lets?|takes?|offers?|moves?|transfers?)",
+      "used to",
+      "any ?more",
+      "previously",
+      "as of",
+      "in the past",
+      "(?:is|are) gone",
+      "(?:was|were|has been|have been) (?:replaced|removed|renamed)",
+      "since (?:otodock|version|release) v?\\d",
+      "before (?:otodock|version|release) v?\\d",
+      "from (?:otodock|version|release) v?\\d",
+      "in (?:otodock|version) v?\\d",
+      "older (?:release|version|install|agent)s?",
+      "earlier (?:release|version)s?",
+      "(?:made|paired|installed|created|added) before",
+      "upgraded from",
+      "after the update",
+      "after an upgrade",
+      "this release",
+      "new in",
+      "not (?:counted )?yet"
+    ],
+    "used_to_after": [
+      "is", "are", "was", "were", "be", "been", "being", "get", "gets", "got",
+      "field", "fields", "key", "keys", "token", "tokens", "value", "values", "word", "words",
+      "setting", "settings", "file", "files", "tool", "tools", "name", "names", "data", "one",
+      "ones", "command", "commands", "account", "accounts", "address", "addresses"
+    ]
+  },
+  "screen_parts": [
+    "pills?", "badges?", "chips?", "toasts?", "tooltips?", "history strip"
+  ],
+  "models": {
+    "names": [
+      "Fable 5.2", "GPT-6.2 Sol", "GPT-6.2 Astra", "GPT-6.1 Sol", "GPT-6.1 Terra", "GPT-6 Astra", "GPT-6 Luna", "GPT-OSS 120B",
+      "Haiku 5.5", "Opus 5.5", "Qwen3.8 27B", "Sonnet 5.5", "System Default",
+      "Nano Banana", "Runway", "Veo"
+    ],
+    "patterns": [
+      "GPT-\\d[\\w.]*",
+      "gpt-\\d[\\w.-]*",
+      "claude-(?:opus|sonnet|haiku|fable)[\\w.-]*",
+      "Qwen[\\w. -]*\\d[\\w.]*",
+      "qwen[\\w./-]*",
+      "Fable",
+      "Opus",
+      "Sonnet",
+      "Haiku",
+      "Terra",
+      "Luna",
+      "Astra",
+      "Sol",
+      "Gemma",
+      "Llama \\d[\\w.]*",
+      "Gemini \\d[\\w.]*"
+    ]
+  },
+  "samples": {
+    "commands": [
+      "docker", "sudo", "bash", "sh", "python", "python3", "pip", "curl", "wget", "openssl", "git", "systemctl",
+      "journalctl", "cd", "npm", "npx", "psql", "export", "source", "ssh", "scp", "kubectl"
+    ]
+  },
+  "sets": {
+    "developer": [],
+    "reader": [
+      "present-tense",
+      "plain-words",
+      "model-names",
+      "screen-parts"
+    ]
+  },
+  "self_test": {
+    "_comment": "The engine runs these before every real run, and refuses to run when the list is missing or empty. A case raises the rules it names and no other that fails; use and read pick the set and the reader (reader and markdown when absent). A limit is a sentence the rules let pass though they should not, named so a change that catches it updates the case. rows is the number of table rows of data the page has.",
+    "cases": [
+      {"text": "The agent no longer asks; fine.", "allowed": [{"phrase": "no longer\nasks", "rule": "present-tense", "reason": "a case"}], "raises": ["semicolon"]},
+      {"text": "The agent asks.", "allowed": [{"phrase": "no longer\nasks", "rule": "present-tense", "reason": "a case"}], "raises": ["stale-exception"]},
+      {"text": "First line.\nSecond line has a dash \u2014 here.", "raises": ["dash"], "lines": [2]},
+      {"text": "# \u2500\u2500 Database \u2500\u2500\n# Text one here.\n#   continued here.\n#   docker compose up\n# POSTGRES_PASSWORD=\n# --flag does x\nKEY=1\n", "read": "hash-comments", "raises": [], "blocks": ["heading", "para", "para"], "code": 3},
+      {"text": "{\"description\": \"One; two\", \"skills\": [{\"description\": \"Agent; text\"}], \"config\": [{\"help\": \"A help\"}]}", "read": "json-fields", "fields": ["description", "config[].help", "config[].x"], "raises": ["semicolon"], "texts": ["One; two", "A help"], "matched": ["config[].help", "description"]},
+      {"text": "An agent \u2014 your agent \u2014 works.", "raises": ["dash"]},
+      {"text": "An agent - your agent - works.", "raises": ["dash"]},
+      {"text": "````md\n```\n````\n\nAfter the fence \u2014 a dash.", "raises": ["dash"]},
+      {"text": "Write `<!--` to open a comment.\n\nThis \u2014 dash counts.", "raises": ["dash"]},
+      {"text": "An agent works; you watch.", "raises": ["semicolon"]},
+      {"text": "Done \u2705 and moved.", "raises": ["symbol"]},
+      {"text": "The proxy -> the satellite.", "raises": ["symbol"]},
+      {"text": "viewer \u21d2 CODE stays.", "raises": ["symbol"]},
+      {"text": "A route made before 1.8 keeps its language.", "raises": ["present-tense", "version"]},
+      {"text": "Paired machines on 0.5.160 update.", "raises": ["version"]},
+      {"text": "```bash\nbash upgrade.sh --to 1.9.1\n```", "raises": ["version"]},
+      {"text": "```text\nghcr.io/otodock/otodock-proxy:1.9.1\n```", "raises": ["version"]},
+      {"text": "The OtoDock 1.9 release.", "raises": ["version"]},
+      {"text": "OtoDock's 2.0 release is out.", "raises": ["version"]},
+      {"text": "Upgrade from 1.8 to 1.9 first.", "raises": ["version"]},
+      {"text": "Apps with a server (1.7 and later) call it.", "raises": ["version"]},
+      {"text": "Satellite 0.5 or later is needed.", "raises": ["version"]},
+      {"text": "Requires Apps 1.7 and later.", "raises": ["version"]},
+      {"text": "Engine 26 and Compose 2.26 or later since 1.9.0 are checked.", "raises": ["version"]},
+      {"text": "Tools in Python may not install. From 0.5.160 the satellite builds them.", "raises": ["version"]},
+      {"text": "Python is pinned, since OtoDock 1.9 at least.", "raises": ["present-tense", "version"]},
+      {"text": "Every call carries Collabora's signature since 1.9.0 today.", "raises": ["version"]},
+      {"text": "Python, Node and the proxy 1.9.1 ship together.", "raises": ["version"]},
+      {"text": "It was raised for the OAuth file delivery and to 0.5.171.", "raises": ["version"]},
+      {"text": "Agents move to GPT-6.1 Terra.", "raises": ["model-names"]},
+      {"text": "```json\n{\"model\": \"claude-opus-5-5\"}\n```", "raises": ["model-names"]},
+      {"text": "The agent no longer asks.", "raises": ["present-tense"]},
+      {"text": "Chats can now move.", "raises": ["present-tense"]},
+      {"text": "We used to ask first.", "raises": ["present-tense"]},
+      {"text": "A Mac paired before 1.9.1 is fine.", "raises": ["present-tense", "version"]},
+      {"text": "Click the Runs on pill.", "raises": ["screen-parts"]},
+      {"text": "The broker adds the token.", "raises": ["plain-words"]},
+      {"text": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word.", "raises": ["long-sentence"]},
+      {"text": "The U.S. office word word word word word word word word word word word word word word word word word word word word word word word word word word word ends here.", "raises": ["long-sentence"]},
+      {"text": "The Windows satellite 0.5.160 pairs.", "raises": ["version"]},
+      {"text": "The macOS app 1.9.1 is signed.", "raises": ["version"]},
+      {"text": "On Linux the proxy 1.9.1 is fine.", "raises": ["version"]},
+      {"text": "Install Docker, then the proxy 1.9.1 runs.", "raises": ["version"]},
+      {"text": "```text\npip install otodock-cli==1.9.1\n```", "raises": ["version"]},
+      {"text": "```text\npython3 -m pip install ruff==0.15.22 && ./upgrade.sh 1.9.1\n```", "raises": ["version"]},
+      {"text": "Ms. Smith wrote word word word word word word word word word word word word word word word word word word word word word word word word word word word here.", "raises": ["long-sentence"]},
+      {"text": "#   It is the one \u2014 the only one.\n", "raises": ["dash"], "read": "hash-comments"},
+      {"text": "Open **Setup \u2192 Security** to see it.", "raises": []},
+      {"text": "The skills are (Agent Settings \u2192 Skills, visible to editors).", "raises": []},
+      {"text": "Go to Admin \u2192 MCP Servers and pick one.", "raises": []},
+      {"text": "Set proxy provider \u2192 *Advanced protocol settings* \u2192 **Unauthenticated Paths** there.", "raises": []},
+      {"text": "Under **Setup \u2192 Security \u2192\nPlatform** the switch sits.", "raises": []},
+      {"text": "- **[Install OtoDock \u2192](/getting-started/installation)**: get it running.", "raises": []},
+      {"text": "The radius is 1.25 and the gain 0.3, about 98.5 per cent, and 0.5 to 1 GB more.", "raises": []},
+      {"text": "It ships under the Apache 2.0 licence, CC BY 4.0 for the models, and FSL-1.1-ALv2.", "raises": []},
+      {"text": "It is the Functional Source License, Version 1.1, ALv2 Future License.", "raises": []},
+      {"text": "Addresses such as 172.31, 192.168.x, 169.254.x and 0.0.0.0 stay local.", "raises": []},
+      {"text": "The subnet 10.0.x and the address 10.8.0 stay local.", "raises": []},
+      {"text": "It was written on 11.11.2026, see section 4.2.1 of RFC 7231.", "raises": []},
+      {"text": "A Docker Compose older than 2.26 is refused, and Docker Engine 26 works.", "raises": []},
+      {"text": "It needs Blender 5.1 or newer with the add-on, and Node 22.13 or newer.", "raises": []},
+      {"text": "```bash\npip install \"ruff==0.15.22\" \"mypy==2.4.0\" @playwright/mcp@0.0.78\nNODE_VERSION=22.13.0\n```", "raises": []},
+      {"text": "```text\n>=0.6.2,<1\n```", "raises": []},
+      {"text": "The instance fields used to populate the form.", "raises": []},
+      {"text": "Keep it no longer than you keep applications.", "raises": []},
+      {"text": "None from OtoDock or Meta. Before OtoDock's app is reviewed, wait.", "raises": []},
+      {"text": "A span `launchctl\nbootstrap gui/<uid>` wraps a line.", "raises": []},
+      {"text": "> - one item in a quote\n> - another item", "raises": []},
+      {"text": "<p align=\"center\"><img alt=\"License: FSL-1.1-ALv2 v1.9.1\" src=\"https://example.com/x.svg\"></p>", "raises": []},
+      {"text": "\u03a4\u03b9 \u03ba\u03ac\u03bd\u03b5\u03b9\u03c2; \u039a\u03b1\u03bb\u03ac.", "raises": []},
+      {"text": "Text before.\n\n    export A=1; ./run.sh --to-latest\n\nText after.", "raises": []},
+      {"text": "import Thing from '@site/src/Thing';\n\nA page.", "raises": []},
+      {"text": "Run it again. git and gh fetch word word word word word word word word word word word word word word word word word word word word.", "raises": []},
+      {"text": "<!-- a note; for the maintainers \u2014 1.9.1 -->\n\nA page.", "raises": []},
+      {"text": "The paired machine reads the 3.10 floor, below 3.11.", "raises": []},
+      {"text": "It waits at most 200 ms. Then word word word word word word word word word word word word word word word word word word word word word word word word here.", "raises": []},
+      {"text": "It exits 2 on a Docker install older than 2.0.", "raises": [], "limit": "another program's name within four words excuses our number"},
+      {"text": "Upgrade to 2.0 first.", "raises": [], "limit": "to is no word of time"},
+      {"text": "The 2.0 release is out.", "raises": [], "limit": "a release after the number is no trigger"},
+      {"text": "After 1.9 it changed.", "raises": [], "limit": "after is no word of time"},
+      {"text": "Prior to 1.9 it changed.", "raises": [], "limit": "prior to is no word of time"},
+      {"text": "In 1.9 the API changed.", "raises": [], "limit": "in is no word of time"},
+      {"text": "---\ntitle: Clean\n---\n\nimport Thing from '@site/src/Thing';\n\n# Clean page\n\nDocker Engine 26 and Ubuntu 22.04 work. It takes 1.5 GB and 0.5 to 1 GB more.\n\n- **Bold item**: a list item with [a link](https://example.com/a-b-c;d).\n\n| Name | Use |\n| --- | --- |\n| One | `127.0.0.1` and `10.200.0.0/24` |\n\nDepartments &amp; maps. The new release arrives before the next one, since you asked.\n\n```bash\nexport A=1; ./run.sh 192.168.1.20\n```\n", "raises": [], "use": "reader", "rows": 1}
+    ]
+  }
+}

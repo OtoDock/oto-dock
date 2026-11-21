@@ -20,6 +20,9 @@ export type MessageBlock =
   | { type: 'delegate_files'; files: Array<{ path: string; bytes: number }>; skipped: Array<{ path: string; reason: string }> }
   // A check's verdict on this turn (CHECKS.md): the compact card.
   | { type: 'checkverdict'; check: string; status: string; pass: boolean; score?: number | null; summary: string; findings: Array<{ location: string; severity: string; text: string }>; findingsTotal: number; round: number; rounds: number; ranOn: string; costUsd: number; verdictId?: string }
+  // The wrap-up after a call (WrapupCard): how it ended, the outcome, the
+  // follow-ups and what it wrote, under the phone conversation.
+  | { type: 'wrapup'; state: string; outcome: string; followUps: string[]; wrote: Array<{ kind: string; name: string }> }
   | { type: typeof BG_COMMAND_BLOCK; command: string; description?: string; isActive?: boolean; failed?: boolean; _toolId?: string | null }
   | {
       type: 'permission'
@@ -52,7 +55,7 @@ export type MessageBlock =
   // terminal's read-only hint stands down (`followedInTurn` as above).
   | { type: 'plan'; action: string; toolInput?: unknown; superseded?: boolean; resolved?: boolean; followedInTurn?: boolean }
   | { type: 'plan_review'; requestId: string; plan: string; toolInput: unknown; filename?: string; resolved?: boolean; action?: string; unanswered?: boolean }
-  | { type: 'system'; subtype: string; agentName?: string; agentColor?: string; message?: string; reason?: string; returned?: boolean; count?: number }
+  | { type: 'system'; subtype: string; agentName?: string; agentColor?: string; message?: string; reason?: string; resetsAt?: string; returned?: boolean; count?: number }
   | { type: 'images'; images: GalleryImage[] }
   | { type: 'video'; srcKind: 'url' | 'token'; url?: string; mediaUrl?: string; token?: string; mime?: string; caption?: string; title?: string; poster?: string }
   | { type: 'audio'; srcKind: 'url' | 'token'; url?: string; mediaUrl?: string; token?: string; mime?: string; caption?: string; title?: string }
@@ -98,6 +101,9 @@ export interface DisplayMessage {
    *  `event_data.card`, the `queue_sent` frame's `card`): the bubble wears
    *  the caption. */
   fromCard?: boolean
+  /** Sent with this API key of the person (the row's `event_data.api_key`):
+   *  the bubble names it. */
+  sentWithKey?: string
 }
 
 /** What the page may ask of the message list (`ChatMessages`' ref). */

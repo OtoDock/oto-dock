@@ -12,8 +12,10 @@ What closes: the person's chat sessions in every pool (Claude, Codex,
 Direct, a paired machine), their interactive terminals, their pre-warms, a
 Shared-only chat's session when the person is the one who warmed it, and
 their user-scope task runs (delegate workers included) on an agent they can
-no longer reach, and a chat lane they delegated that runs as them on their
-own computer (its session and its run: it took their role and token there).
+no longer reach, a chat lane they delegated that runs as them on their
+own computer (its session and its run: it took their role and token there),
+and a lane that runs as the agent on their own AI accounts once they are
+below the editor tier there.
 What does not: other agent-scope runs (they act as the agent; their
 ownership moves to the admin who made the change), meetings, phone
 calls (they end at hangup and the next call re-resolves its route),
@@ -33,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from auth import roles
@@ -53,7 +56,7 @@ CLOSE_BATCH_TIMEOUT_S = 120.0
 _CHAT_CLIENT_TYPES = ("dashboard", "")
 _LOGGED = 10
 # The kinds of live session the closer tells apart.
-_POOL, _INTERACTIVE, _PREWARM, _WORKER = "pool", "interactive", "prewarm", "worker"
+POOL, INTERACTIVE, PREWARM, WORKER = "pool", "interactive", "prewarm", "worker"
 
 _background: set[asyncio.Task] = set()
 # The pending later passes per person, with the event they sweep.
@@ -61,11 +64,11 @@ _resweeps: dict[str, tuple[asyncio.Task, offboarding.OffboardEvent]] = {}
 
 
 @dataclass(frozen=True)
-class _Live:
+class Live:
     """One live chat session with a person behind it."""
     session_id: str
     agent: str
-    kind: str       # _POOL | _INTERACTIVE | _PREWARM
+    kind: str       # POOL | INTERACTIVE | PREWARM | WORKER
     role: str       # the role it started with ("" when unknown)
     user_sub: str   # "" when only the username is known
     username: str
@@ -77,9 +80,11 @@ def _keep(task: asyncio.Task) -> asyncio.Task:
     return task
 
 
-def _live_sessions() -> list[_Live]:
+def live_sessions() -> list[Live]:
     """Every live chat session with a person behind it. On the loop, with no
-    await (the registries are loop-owned; the snapshot is atomic)."""
+    await (the registries are loop-owned; the snapshot is atomic). The
+    offboarding passes read it, and so does the team account's flip
+    (``chat_reload.team_account_changed``)."""
     from core.session import (
         interactive_session,
         prewarm_session_registry as prewarm,
@@ -92,34 +97,46 @@ def _live_sessions() -> list[_Live]:
         get_session_security,
     )
     from core.session.visibility import SCOPE_AGENT
+    from services.engines import subscription_pool
 
-    out: dict[str, _Live] = {}
+    out: dict[str, Live] = {}
     for sid, entry in list(prewarm._entries.items()):
         if entry.user_sub:
-            out[sid] = _Live(sid, entry.agent, _PREWARM, entry.role or "", entry.user_sub, "")
+            out[sid] = Live(sid, entry.agent, PREWARM, entry.role or "", entry.user_sub, "")
     for sid in interactive_session.live_session_ids():
         s = interactive_session.get(sid)
         if s is None or not s.user_sub or session_kind.is_task_chat_id(s.chat_id):
             continue
-        out.setdefault(sid, _Live(sid, s.agent_name, _INTERACTIVE, s.role or "",
+        out.setdefault(sid, Live(sid, s.agent_name, INTERACTIVE, s.role or "",
                                   s.user_sub, s.username or ""))
     for layer in _iter_session_holders():
         for sid in layer.local_session_ids():
             if sid in out or sid in _meeting_session_info:
                 continue
             ctx = get_session_security(sid)
-            if ctx is None or not ctx.username or ctx.is_external:
+            if ctx is None or ctx.is_external:
                 continue
             client = get_session_client_type(sid)
             if client == session_kind.TASK.name:
-                # A chat lane on its delegator's own computer runs as them
-                # (their name and role in an agent-scope context).
-                if ctx.session_scope == SCOPE_AGENT and ctx.placement.user_paired:
-                    out[sid] = _Live(sid, ctx.agent, _WORKER, ctx.role or "", "", ctx.username)
+                if ctx.session_scope != SCOPE_AGENT:
+                    continue
+                if ctx.username and ctx.placement.user_paired:
+                    # A chat lane on its delegator's own computer runs as
+                    # them (their name and role in an agent-scope context).
+                    out[sid] = Live(sid, ctx.agent, WORKER, ctx.role or "", "", ctx.username)
+                    continue
+                # A lane that runs as the agent on a person's own accounts
+                # (``core/config/spender.py``) is theirs to lose: it may run
+                # on while they hold the editor tier there.
+                payer = subscription_pool.bound_attribution(sid)[1]
+                if payer:
+                    out[sid] = Live(sid, ctx.agent, WORKER, roles.EDITOR, payer, "")
+                continue
+            if not ctx.username:
                 continue
             if client not in _CHAT_CLIENT_TYPES:
                 continue
-            out[sid] = _Live(sid, ctx.agent, _POOL, ctx.role or "", "", ctx.username)
+            out[sid] = Live(sid, ctx.agent, POOL, ctx.role or "", "", ctx.username)
     return list(out.values())
 
 
@@ -151,10 +168,14 @@ def _outranked(start: str, now: str, lost_here: bool) -> bool:
     return roles.rank(start) > roles.rank(now)
 
 
-def _stop_turn(session_id: str) -> None:
+def stop_turn(session_id: str, *, queue_reason: str = "revoked") -> None:
     """Stop the session's live turn the way the Stop button's hard path
-    does: no check judges the cut turn, queued messages are dropped, the
-    pump is aborted. Synchronous, before the close."""
+    does, before its session is closed: no check judges the cut turn, the
+    chat's queue goes back to its authors (``queue_reason``), the pump is
+    aborted. The turn ends here, so the close never reaches the chat as a
+    lost machine or an engine that exited. Synchronous. The one owner of this
+    stop: offboarding and an account leaving an agent's set
+    (``services/remote/chat_reload.py``) call it."""
     from core.events.stream_pump import _active_pumps
     from core.session import session_events
     pump = next((p for p in list(_active_pumps.values())
@@ -162,7 +183,7 @@ def _stop_turn(session_id: str) -> None:
     if pump is None:
         return
     session_events.note_user_message(session_id)
-    pump.cancel_all_queued()
+    pump.cancel_all_queued(queue_reason)
     pump.abort()
 
 
@@ -189,13 +210,14 @@ def _stop_worker_run(session_id: str) -> None:
             platform_cancel_run(rid, REASON)
 
 
-async def _close_one(v: _Live) -> None:
-    if v.kind == _INTERACTIVE:
+async def _close_one(v: Live, reason: str, drop_queued: bool) -> None:
+    if v.kind == INTERACTIVE:
         from core.session import interactive_session
-        # The close itself drops the queued server prompts (a queue that
-        # filled between the early drop in _close and this close included).
+        # Revoked: the close itself drops the queued server prompts (a queue
+        # that filled between the early drop in close_sessions and this
+        # close included).
         await interactive_session.close_session(
-            v.session_id, reason=REASON, drop_queued=True)
+            v.session_id, reason=reason, drop_queued=drop_queued)
         return
     from core.session.session_manager import find_layer_for_session
     layer = find_layer_for_session(v.session_id)
@@ -203,36 +225,49 @@ async def _close_one(v: _Live) -> None:
         await layer.close_session(v.session_id)
 
 
-async def _close(victims: list[_Live], why: str) -> None:
-    """Close ``victims``: the turn stopped and the queues dropped at once,
-    the closes (slow: a CLI waits up to 10 s, a paired machine 15 s) in a
-    bounded background batch. A close is never cancelled half-way (that
-    would leak its slot, its seat and its context)."""
+async def close_sessions(victims: list[Live], why: str, *, reason: str = REASON,
+                         revoked: bool = True,
+                         after: Callable[[Live], Awaitable[None]] | None = None) -> None:
+    """Close ``victims``: each turn stopped (``stop_turn``) at once, the
+    closes (slow: a CLI waits up to 10 s, a paired machine 15 s) in a bounded
+    background batch, with ``after`` run for each once its close is done,
+    failed or not. A close is never cancelled half-way (that would leak its
+    slot, its seat and its context). ``revoked``: the person lost access, so
+    a terminal's queued prompts are dropped instead of handed back and the
+    chat's queue goes back as revoked; ``reason``: what the closes are
+    recorded under."""
     if not victims:
         return
     from core.session import prewarm_session_registry as prewarm
     for v in victims:
-        if v.kind == _INTERACTIVE:
-            _drop_queued_prompts(v.session_id)
+        if v.kind == INTERACTIVE:
+            if revoked:
+                _drop_queued_prompts(v.session_id)
         else:
-            _stop_turn(v.session_id)
-        if v.kind == _WORKER:
+            stop_turn(v.session_id, queue_reason="revoked" if revoked else "stopped")
+        if v.kind == WORKER:
             _stop_worker_run(v.session_id)
     for v in victims:
-        if v.kind == _PREWARM:
+        if v.kind == PREWARM:
             await prewarm.claim(v.session_id)
     logger.info("offboarding: closing %d live session(s) (%s) [%s%s]", len(victims), why,
                 ", ".join(f"{v.agent}:{v.session_id[:8]}" for v in victims[:_LOGGED]),
                 f", +{len(victims) - _LOGGED} more" if len(victims) > _LOGGED else "")
     gate = asyncio.Semaphore(CLOSE_CONCURRENCY)
 
-    async def one(v: _Live) -> None:
+    async def one(v: Live) -> None:
         async with gate:
             try:
-                await _close_one(v)
+                await _close_one(v, reason, revoked)
             except Exception:  # noqa: BLE001  # offboarding closes each session: one failure must not stop the rest
                 logger.warning("offboarding: closing %s session %s on %s failed",
                                v.kind, v.session_id[:8], v.agent, exc_info=True)
+            if after is not None:
+                try:
+                    await after(v)
+                except Exception:  # noqa: BLE001  # each session's own follow-up: one failure must not stop the rest
+                    logger.warning("offboarding: after closing session %s on %s",
+                                   v.session_id[:8], v.agent, exc_info=True)
 
     async def batch() -> None:
         tasks = [asyncio.ensure_future(one(v)) for v in victims]
@@ -244,7 +279,7 @@ async def _close(victims: list[_Live], why: str) -> None:
     _keep(asyncio.ensure_future(batch()))
 
 
-def _person_matches(v: _Live, sub: str, username: str) -> bool:
+def _person_matches(v: Live, sub: str, username: str) -> bool:
     return (bool(v.user_sub) and v.user_sub == sub) or (
         not v.user_sub and bool(username) and v.username == username)
 
@@ -295,14 +330,14 @@ async def sweep(event: offboarding.OffboardEvent) -> int:
     # created under the same name) is not this person's any more.
     username = event.username if by_name.get(event.username, "") in ("", event.sub) else ""
     victims = []
-    for v in _live_sessions():
+    for v in live_sessions():
         if not _person_matches(v, event.sub, username):
             continue
         if lost is not None and v.agent not in lost:
             continue
         if _outranked(v.role, _role_now(rows, event.sub, v.agent), True):
             victims.append(v)
-    await _close(victims, f"{event.sub} {event.reason}")
+    await close_sessions(victims, f"{event.sub} {event.reason}")
     await _stop_runs(event.sub, lost, rows)
     return len(victims)
 
@@ -361,7 +396,7 @@ async def reconcile() -> int:
     """One pass over every live chat session: close what its person may no
     longer hold (an event a restart dropped, a session re-adopted from a
     paired machine). Returns how many it closes."""
-    live = _live_sessions()
+    live = live_sessions()
     if not live:
         return 0
     rows, by_name = await run_db(_people, {v.user_sub for v in live if v.user_sub},
@@ -371,7 +406,7 @@ async def reconcile() -> int:
         sub = v.user_sub or by_name.get(v.username, "")
         if _outranked(v.role, _role_now(rows, sub, v.agent), False):
             victims.append(v)
-    await _close(victims, "reconcile")
+    await close_sessions(victims, "reconcile")
     return len(victims)
 
 
@@ -389,14 +424,17 @@ async def close_person_sessions(sub: str, username: str, reason: str) -> int:
     """Close the person's chat sessions on every agent (not their runs): for
     a change that ends their old credentials, a password change, so a warm
     chat starts again with a fresh token. Returns how many."""
-    victims = [v for v in _live_sessions() if _person_matches(v, sub, username)]
-    await _close(victims, f"{sub} {reason}")
+    victims = [v for v in live_sessions() if _person_matches(v, sub, username)]
+    await close_sessions(victims, f"{sub} {reason}")
     # A remote session the index kept across a restart, not yet reported by
     # its machine, is held by nothing: drop its context so the re-adoption
     # closes it instead of bringing back its old token.
     from core.session import session_state
     dropped = session_state.drop_reloaded_contexts_of(username)
     if dropped:
+        # On disk before the change is answered: a crash after it never lets
+        # their machine's report take them back.
+        await session_state.security_index_written()
         logger.info("offboarding: %s %s: %d reloaded session(s) awaiting re-adoption dropped",
                     sub[:12], reason, len(dropped))
     return len(victims) + len(dropped)

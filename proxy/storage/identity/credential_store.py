@@ -1,25 +1,31 @@
 """Encrypted credential storage for MCP server credentials.
 
-Five tables:
+Six tables:
   - user_credentials:            per-user, per-account credential rows
                                  (one or more labeled accounts per
                                  (user_sub, mcp_name); each row carries
                                  ``account_label``).
   - user_credential_accounts:    account list — one row per labeled account a
                                  user has connected. ``is_default=TRUE`` picks
-                                 the catch-all account used by agents without
-                                 an explicit binding.
-  - agent_account_bindings:      per-agent override — pin a specific account
-                                 for a specific agent. Takes precedence over
-                                 the user's default account, and carries the
-                                 person's own GitHub reach for that agent.
+                                 the catch-all account used by agents with an
+                                 empty set.
+  - agent_account_bindings:      per agent, the set of a person's accounts the
+                                 agent may use, one of them its default. A set
+                                 takes precedence over the user's default
+                                 account, and each row carries the person's
+                                 own GitHub reach for that agent and account.
+  - chat_account_choices:        a chat's own choice of account per MCP among
+                                 the agent's set, for the person who made it.
   - infra_credentials:           shared infrastructure creds (Uptime Kuma,
                                  UniFi, HA, etc.). Single tier, no accounts.
-  - service_agent_bindings:      per-agent service identity — pins an agent to
-                                 a USER's own connected account (the binding's
-                                 ``account_owner_sub``). Agent-scope sessions
-                                 read that user's tokens. There is no platform
-                                 "service account" storage.
+  - service_agent_bindings:      per agent and tool, the set of accounts the
+                                 agent itself uses, one of them its default:
+                                 each a USER's own connected account (its
+                                 ``account_owner_sub``, the lender). Agent-scope
+                                 sessions read that user's tokens. There is no
+                                 platform "service account" storage. The set's
+                                 writers but the removal, and a chat's choice
+                                 among it, are ``service_account_set``.
 
 All values are Fernet-encrypted at rest under a MultiFernet: the keys of
 ``CREDENTIAL_ENCRYPTION_KEY`` (config.env or the environment; the first one
@@ -183,8 +189,9 @@ def set_user_credentials(
 def delete_user_credentials(
     user_sub: str, mcp_name: str, account_label: str,
 ) -> None:
-    """Delete one labeled account: credential rows, account row, and
-    any per-agent bindings pinned to that label."""
+    """Delete one labeled account: credential rows, account row, and the
+    account's row in every agent's set (each set left without its default
+    promotes its oldest; a chat's choice of it goes with the row)."""
     with get_conn() as conn:
         conn.execute(
             "DELETE FROM user_credentials "
@@ -196,11 +203,20 @@ def delete_user_credentials(
             "WHERE user_sub=%s AND mcp_name=%s AND account_label=%s",
             (user_sub, mcp_name, account_label),
         )
+        agents = [r["agent_name"] for r in conn.execute(
+            "SELECT DISTINCT agent_name FROM agent_account_bindings "
+            "WHERE user_sub=%s AND mcp_name=%s AND account_label=%s ORDER BY agent_name",
+            (user_sub, mcp_name, account_label),
+        ).fetchall()]
+        for agent_name in agents:
+            _lock_set(conn, user_sub, mcp_name, agent_name)
         conn.execute(
             "DELETE FROM agent_account_bindings "
             "WHERE user_sub=%s AND mcp_name=%s AND account_label=%s",
             (user_sub, mcp_name, account_label),
         )
+        for agent_name in agents:
+            _promote_default(conn, user_sub, mcp_name, agent_name)
         conn.commit()
 
 
@@ -461,112 +477,322 @@ def set_account_display_email(
 # ---------------------------------------------------------------------------
 
 class AccountAgentBinding(NamedTuple):
-    """A person's own choice of account for one agent, and their own GitHub
+    """One account of the set a person's agent may use, and their own GitHub
     reach for it: the repositories the agent may reach with that account
-    (``()`` = every one it reaches, ``owner/name`` as stored) and whether it
-    may only read."""
+    (``()`` = every one it reaches, ``owner/name`` as stored), whether it
+    may only read, and whether it is the set's default (the account a chat
+    that chose none runs on)."""
 
     account_label: str
     repositories: tuple[str, ...] = ()
     read_only: bool = False
+    is_default: bool = False
+
+
+_SET_COLUMNS = "account_label, repositories, read_only, is_default"
+_SET_WHERE = "user_sub=%s AND mcp_name=%s AND agent_name=%s"
+# The set's four-column key (``storage/identity/schema.py``).
+_SET_KEY = "agent_account_bindings_set_key"
+# The key of an agent's own set (``storage/identity/schema.py``).
+_SERVICE_SET_KEY = "service_agent_bindings_set_key"
+
+
+def _set_row(row: Any) -> AccountAgentBinding:
+    return AccountAgentBinding(
+        row["account_label"], _stored_repositories(row["repositories"]),
+        bool(row["read_only"]), bool(row["is_default"]),
+    )
+
+
+def _lock_set(conn: Any, user_sub: str, mcp_name: str, agent_name: str) -> None:
+    """Serialise the writes to one agent's set until the transaction ends:
+    two writers never both leave a default, nor none."""
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        ("\n".join(("agent_account_set", user_sub, mcp_name, agent_name)),),
+    )
+
+
+def _holds_account(conn: Any, user_sub: str, mcp_name: str, account_label: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM user_credential_accounts "
+        "WHERE user_sub=%s AND mcp_name=%s AND account_label=%s",
+        (user_sub, mcp_name, account_label),
+    ).fetchone() is not None
+
+
+def _repositories_text(repositories: list[str] | None, kept: str) -> str:
+    if repositories is None:
+        return kept
+    return json.dumps(list(dict.fromkeys(r.strip() for r in repositories if r.strip())))
+
+
+def _promote_default(conn: Any, user_sub: str, mcp_name: str, agent_name: str) -> None:
+    """A set that holds rows and no default: its oldest row (``set_at``,
+    then ``id``) becomes the default. Every path that deletes set rows
+    calls it, so a set that is not empty always has one."""
+    key = (user_sub, mcp_name, agent_name)
+    conn.execute(
+        "UPDATE agent_account_bindings SET is_default=TRUE WHERE id = ("
+        f"  SELECT id FROM agent_account_bindings WHERE {_SET_WHERE} ORDER BY set_at, id LIMIT 1"
+        ") AND NOT EXISTS ("
+        f"  SELECT 1 FROM agent_account_bindings WHERE {_SET_WHERE} AND is_default"
+        ")",
+        key + key,
+    )
 
 
 def get_account_agent_binding(
-    user_sub: str, mcp_name: str, agent_name: str,
+    user_sub: str, mcp_name: str, agent_name: str, account_label: str | None = None,
 ) -> AccountAgentBinding | None:
-    """The person's binding of (user, mcp, agent), or None.
+    """One row of the agent's set: with ``account_label`` that account's
+    (None when the set does not hold it), without it the set's default.
 
-    None means "no explicit binding — fall back to default account" (with no
-    reach: the default account reaches what it reaches).
+    None without a label means an empty set: fall back to the person's
+    default account (with no reach: the default account reaches what it
+    reaches).
     """
+    sql = f"SELECT {_SET_COLUMNS} FROM agent_account_bindings WHERE {_SET_WHERE}"
+    params: tuple = (user_sub, mcp_name, agent_name)
+    if account_label is not None:
+        sql += " AND account_label=%s"
+        params += (account_label,)
+    else:
+        sql += " ORDER BY is_default DESC, set_at, id LIMIT 1"
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT account_label, repositories, read_only FROM agent_account_bindings "
-            "WHERE user_sub=%s AND mcp_name=%s AND agent_name=%s",
+        row = conn.execute(sql, params).fetchone()
+    return _set_row(row) if row else None
+
+
+def list_agent_account_set(
+    user_sub: str, mcp_name: str, agent_name: str,
+) -> list[AccountAgentBinding]:
+    """Every account of the agent's set, the default first, then by
+    ``set_at`` and ``id``."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT {_SET_COLUMNS} FROM agent_account_bindings WHERE {_SET_WHERE} "
+            "ORDER BY is_default DESC, set_at, id",
             (user_sub, mcp_name, agent_name),
+        ).fetchall()
+    return [_set_row(r) for r in rows]
+
+
+def add_account_to_agent(
+    user_sub: str, mcp_name: str, agent_name: str, account_label: str, *,
+    repositories: list[str] | None = None, read_only: bool | None = None,
+    make_default: bool = False,
+) -> bool:
+    """Add one of the person's accounts to the agent's set, or update its
+    reach when the set holds it already.
+
+    A new row takes the reach the caller names, else the whole account
+    (``[]``, writes allowed); an existing row keeps its own for a field the
+    caller leaves ``None``. The first row of a set is its default;
+    ``make_default`` moves the default to this account.
+
+    Returns False if ``account_label`` doesn't exist (no-op), True on success.
+    """
+    key = (user_sub, mcp_name, agent_name)
+    with get_conn() as conn:
+        if not _holds_account(conn, user_sub, mcp_name, account_label):
+            return False
+        _lock_set(conn, *key)
+        prior = conn.execute(
+            f"SELECT repositories, read_only FROM agent_account_bindings "
+            f"WHERE {_SET_WHERE} AND account_label=%s",
+            key + (account_label,),
         ).fetchone()
-    if not row:
-        return None
-    return AccountAgentBinding(
-        row["account_label"], _stored_repositories(row["repositories"]), bool(row["read_only"]))
+        stored = _repositories_text(repositories, prior["repositories"] if prior else "[]")
+        if read_only is None:
+            read_only = bool(prior["read_only"]) if prior else False
+        has_default = conn.execute(
+            f"SELECT 1 FROM agent_account_bindings WHERE {_SET_WHERE} AND is_default", key,
+        ).fetchone() is not None
+        if make_default:
+            conn.execute(
+                f"UPDATE agent_account_bindings SET is_default=FALSE "
+                f"WHERE {_SET_WHERE} AND is_default AND account_label<>%s",
+                key + (account_label,),
+            )
+        conn.execute(
+            f"""INSERT INTO agent_account_bindings
+               (user_sub, mcp_name, agent_name, account_label, set_at, repositories,
+                read_only, is_default)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT ON CONSTRAINT {_SET_KEY}
+               DO UPDATE SET repositories=EXCLUDED.repositories,
+                             read_only=EXCLUDED.read_only,
+                             is_default=agent_account_bindings.is_default OR EXCLUDED.is_default""",
+            key + (account_label, _now(), stored, bool(read_only), make_default or not has_default),
+        )
+        conn.commit()
+        return True
 
 
 def set_account_agent_binding(
     user_sub: str, mcp_name: str, agent_name: str, account_label: str, *,
     repositories: list[str] | None = None, read_only: bool | None = None,
 ) -> bool:
-    """Pin an agent to a specific account. Upsert via UNIQUE constraint.
+    """Make the agent's set exactly this one account, its default (the
+    1.9.1 meaning of an agent's choice of account).
 
     ``repositories`` and ``read_only``, the person's own GitHub reach for the
-    agent: ``None`` keeps what the row holds, whatever else changes (a client
-    that knows nothing of the reach never widens it; a list kept across
-    another account only narrows more).
+    agent: ``None`` keeps what the agent's prior choice holds (the same
+    account's row when the set holds it, else the set's default), whatever
+    else changes (a client that knows nothing of the reach never widens it;
+    a list kept across another account only narrows more).
 
     Returns False if ``account_label`` doesn't exist (no-op), True on success.
     """
+    key = (user_sub, mcp_name, agent_name)
     with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT 1 FROM user_credential_accounts "
-            "WHERE user_sub=%s AND mcp_name=%s AND account_label=%s",
-            (user_sub, mcp_name, account_label),
-        ).fetchone()
-        if not existing:
+        if not _holds_account(conn, user_sub, mcp_name, account_label):
             return False
+        _lock_set(conn, *key)
         prior = conn.execute(
-            "SELECT repositories, read_only FROM agent_account_bindings "
-            "WHERE user_sub=%s AND mcp_name=%s AND agent_name=%s",
-            (user_sub, mcp_name, agent_name),
+            f"SELECT repositories, read_only FROM agent_account_bindings WHERE {_SET_WHERE} "
+            "ORDER BY account_label=%s DESC, is_default DESC, set_at, id LIMIT 1",
+            key + (account_label,),
         ).fetchone()
-        if repositories is None:
-            stored = prior["repositories"] if prior else "[]"
-        else:
-            stored = json.dumps(list(dict.fromkeys(r.strip() for r in repositories if r.strip())))
+        stored = _repositories_text(repositories, prior["repositories"] if prior else "[]")
         if read_only is None:
             read_only = bool(prior["read_only"]) if prior else False
-        now = _now()
         conn.execute(
-            """INSERT INTO agent_account_bindings
-               (user_sub, mcp_name, agent_name, account_label, set_at, repositories, read_only)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)
-               ON CONFLICT(user_sub, mcp_name, agent_name)
-               DO UPDATE SET account_label=EXCLUDED.account_label,
-                             set_at=EXCLUDED.set_at,
+            f"DELETE FROM agent_account_bindings WHERE {_SET_WHERE} AND account_label<>%s",
+            key + (account_label,),
+        )
+        conn.execute(
+            f"""INSERT INTO agent_account_bindings
+               (user_sub, mcp_name, agent_name, account_label, set_at, repositories,
+                read_only, is_default)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+               ON CONFLICT ON CONSTRAINT {_SET_KEY}
+               DO UPDATE SET set_at=EXCLUDED.set_at,
                              repositories=EXCLUDED.repositories,
-                             read_only=EXCLUDED.read_only""",
-            (user_sub, mcp_name, agent_name, account_label, now, stored, bool(read_only)),
+                             read_only=EXCLUDED.read_only,
+                             is_default=TRUE""",
+            key + (account_label, _now(), stored, bool(read_only)),
         )
         conn.commit()
         return True
 
 
 def remove_account_agent_binding(
-    user_sub: str, mcp_name: str, agent_name: str,
-) -> None:
-    """Drop the per-agent override (agent reverts to user's default account,
-    and the reach the row carried goes with it)."""
+    user_sub: str, mcp_name: str, agent_name: str, account_label: str | None = None,
+) -> bool:
+    """With ``account_label``, take that account out of the agent's set (the
+    oldest left becomes the default when it was); without, empty the set
+    (the agent reverts to the user's default account). The reach a row
+    carried goes with it, and a chat's choice of it too. Returns whether a
+    row went."""
+    key = (user_sub, mcp_name, agent_name)
+    sql = f"DELETE FROM agent_account_bindings WHERE {_SET_WHERE}"
+    params: tuple = key
+    if account_label is not None:
+        sql += " AND account_label=%s"
+        params += (account_label,)
     with get_conn() as conn:
+        _lock_set(conn, *key)
+        gone = conn.execute(sql, params).rowcount
+        _promote_default(conn, *key)
+        conn.commit()
+    return bool(gone)
+
+
+def set_agent_default_account(
+    user_sub: str, mcp_name: str, agent_name: str, account_label: str,
+) -> bool:
+    """Make one account of the agent's set its default. Returns False when
+    the set does not hold it (no-op)."""
+    key = (user_sub, mcp_name, agent_name)
+    with get_conn() as conn:
+        _lock_set(conn, *key)
+        held = conn.execute(
+            f"SELECT 1 FROM agent_account_bindings WHERE {_SET_WHERE} AND account_label=%s",
+            key + (account_label,),
+        ).fetchone()
+        if not held:
+            conn.rollback()
+            return False
         conn.execute(
-            "DELETE FROM agent_account_bindings "
-            "WHERE user_sub=%s AND mcp_name=%s AND agent_name=%s",
-            (user_sub, mcp_name, agent_name),
+            f"UPDATE agent_account_bindings SET is_default=FALSE "
+            f"WHERE {_SET_WHERE} AND is_default AND account_label<>%s",
+            key + (account_label,),
+        )
+        conn.execute(
+            f"UPDATE agent_account_bindings SET is_default=TRUE WHERE {_SET_WHERE} AND account_label=%s",
+            key + (account_label,),
         )
         conn.commit()
+        return True
 
 
 def list_agent_account_bindings(user_sub: str, mcp_name: str) -> list[dict]:
-    """Return all per-agent bindings for (user_sub, mcp_name) — used in UI:
-    ``{agent_name, account_label, set_at, repositories, read_only}``
-    (``repositories`` the stored list, parsed)."""
+    """Return every set row for (user_sub, mcp_name) — used in UI:
+    ``{agent_name, account_label, set_at, repositories, read_only,
+    is_default}`` (``repositories`` the stored list, parsed), by agent,
+    each set's default first."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT agent_name, account_label, set_at, repositories, read_only "
+            "SELECT agent_name, account_label, set_at, repositories, read_only, is_default "
             "FROM agent_account_bindings "
             "WHERE user_sub=%s AND mcp_name=%s "
-            "ORDER BY agent_name ASC",
+            "ORDER BY agent_name ASC, is_default DESC, set_at, id",
             (user_sub, mcp_name),
         ).fetchall()
     return [{**dict(r), "repositories": list(_stored_repositories(r["repositories"])),
-             "read_only": bool(r["read_only"])} for r in rows]
+             "read_only": bool(r["read_only"]), "is_default": bool(r["is_default"])} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# A chat's choice of account
+# ---------------------------------------------------------------------------
+
+def get_chat_account_choices(chat_id: str, user_sub: str) -> dict[str, str]:
+    """``{mcp_name: account_label}``: the accounts this person chose for
+    the chat, each among the agent's set (a row the set lost went with it)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT mcp_name, account_label FROM chat_account_choices "
+            "WHERE chat_id=%s AND user_sub=%s",
+            (chat_id, user_sub),
+        ).fetchall()
+    return {r["mcp_name"]: r["account_label"] for r in rows}
+
+
+def set_chat_account_choice(
+    chat_id: str, user_sub: str, agent_name: str, mcp_name: str, account_label: str,
+) -> bool:
+    """Record the person's choice of account for one MCP in the chat.
+    Returns False when the agent's set does not hold the account (or the
+    chat is gone): the foreign keys refuse the row."""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO chat_account_choices
+                   (chat_id, user_sub, agent_name, mcp_name, account_label, set_at)
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (chat_id, user_sub, mcp_name)
+                   DO UPDATE SET agent_name=EXCLUDED.agent_name,
+                                 account_label=EXCLUDED.account_label,
+                                 set_at=EXCLUDED.set_at""",
+                (chat_id, user_sub, agent_name, mcp_name, account_label, _now()),
+            )
+            conn.commit()
+    except psycopg.errors.ForeignKeyViolation:
+        return False
+    return True
+
+
+def clear_chat_account_choice(chat_id: str, user_sub: str, mcp_name: str) -> None:
+    """The chat runs on the set's default for this MCP again."""
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM chat_account_choices WHERE chat_id=%s AND user_sub=%s AND mcp_name=%s",
+            (chat_id, user_sub, mcp_name),
+        )
+        conn.commit()
 
 
 #: The platform setting that remembers the fingerprint of every value the
@@ -919,13 +1145,20 @@ def cleanup_service_agent_bindings_for_owner(owner_sub: str) -> list[dict]:
             "FROM service_agent_bindings WHERE account_owner_sub=%s",
             (owner_sub,),
         ).fetchall()
-        snapshot = [dict(r) for r in rows]
+    snapshot = [dict(r) for r in rows]
+    sets = sorted({(r["mcp_name"], r["agent_name"]) for r in snapshot})
+    standing = {key: _standing_lenders(*key) for key in sets}
+    with get_conn() as conn:
+        for key in sets:
+            _lock_service_set(conn, *key)
         conn.execute(
             "DELETE FROM service_agent_bindings WHERE account_owner_sub=%s",
             (owner_sub,),
         )
+        for key in sets:
+            _promote_service_default(conn, *key, standing[key])
         conn.commit()
-        return snapshot
+    return snapshot
 
 
 def list_service_agent_bindings_for_owner(owner_sub: str) -> list[dict]:
@@ -965,17 +1198,67 @@ def _owner_manages(owner_sub: str, agent_name: str) -> bool:
 
 
 class ServiceBinding(NamedTuple):
-    """An agent's service identity: a person's own account, and on a
-    GitHub-App account optionally one of its installations (``""`` = the
-    account itself); and the agent's GitHub reach: the repositories it may
+    """One of an agent's own accounts of a tool: a person's own account,
+    and on a GitHub-App account optionally one of its installations (``""``
+    = the account itself); the agent's GitHub reach: the repositories it may
     reach (``()`` = every one the identity reaches, ``owner/name`` as
-    stored) and whether it may only read."""
+    stored) and whether it may only read; whether it is the set's default
+    (the account a session that chose none runs on)."""
 
     account_label: str
     account_owner_sub: str
     installation_id: str = ""
     repositories: tuple[str, ...] = ()
     read_only: bool = False
+    is_default: bool = False
+
+
+_SERVICE_COLUMNS = ("account_label, account_owner_sub, installation_id, repositories, read_only, "
+                    "is_default")
+
+
+def _lock_service_set(conn: Any, mcp_name: str, agent_name: str) -> None:
+    """Serialise the writes to one agent's own set of a tool until the
+    transaction ends: two writers never both leave a default, nor none."""
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        ("\n".join(("service_account_set", mcp_name, agent_name)),),
+    )
+
+
+def _standing_lenders(mcp_name: str, agent_name: str) -> set[str]:
+    """The lenders of the agent's own set of a tool who still manage it. Read
+    before the set's lock: each read takes a connection of its own, and under
+    the lock that second checkout could wait on the pool it holds from."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT account_owner_sub FROM service_agent_bindings "
+            "WHERE mcp_name=%s AND agent_name=%s",
+            (mcp_name, agent_name),
+        ).fetchall()
+    return {r["account_owner_sub"] for r in rows if _owner_manages(r["account_owner_sub"], agent_name)}
+
+
+def _promote_service_default(conn: Any, mcp_name: str, agent_name: str, standing: set[str]) -> None:
+    """A set that holds rows and no default: its oldest row whose lender
+    stands (``_standing_lenders``) becomes the default, else its oldest row
+    (a set that is not empty always has one). Every path that deletes set
+    rows calls it, under the set's lock."""
+    key = (mcp_name, agent_name)
+    if conn.execute(
+        "SELECT 1 FROM service_agent_bindings WHERE mcp_name=%s AND agent_name=%s AND is_default",
+        key,
+    ).fetchone():
+        return
+    rows = conn.execute(
+        "SELECT id, account_owner_sub FROM service_agent_bindings "
+        "WHERE mcp_name=%s AND agent_name=%s ORDER BY set_at, id",
+        key,
+    ).fetchall()
+    if not rows:
+        return
+    chosen = next((r for r in rows if r["account_owner_sub"] in standing), rows[0])
+    conn.execute("UPDATE service_agent_bindings SET is_default=TRUE WHERE id=%s", (chosen["id"],))
 
 
 def _stored_repositories(text: Any) -> tuple[str, ...]:
@@ -990,28 +1273,40 @@ def _binding_of(row: Any) -> ServiceBinding:
     return ServiceBinding(
         row["account_label"], row["account_owner_sub"], row["installation_id"] or "",
         _stored_repositories(row["repositories"]), bool(row["read_only"]),
+        bool(row["is_default"]),
     )
 
 
-def get_service_agent_binding(
-    mcp_name: str, agent_name: str,
-) -> ServiceBinding | None:
-    """The binding of (mcp, agent), or None.
+def service_binding_stands(binding: ServiceBinding, agent_name: str) -> bool:
+    """Whether a row of the agent's set still lends its account: its lender
+    still manages the agent (``_owner_manages``)."""
+    return _owner_manages(binding.account_owner_sub, agent_name)
 
-    ``account_owner_sub`` is always a real ``<user_sub>`` — the binding points
+
+def get_service_agent_binding(
+    mcp_name: str, agent_name: str, account_label: str | None = None,
+) -> ServiceBinding | None:
+    """One row of the agent's own set of a tool, or None: with
+    ``account_label`` that account's row, without it the set's default.
+
+    ``account_owner_sub`` is always a real ``<user_sub>`` — the row points
     at that user's ``user_credential_accounts(<sub>, mcp, account_label)`` row
-    (a manager/admin designated their connected account as the agent's service
-    identity for agent-scope sessions). ``None`` → no binding, or a binding
-    whose owner no longer manages the agent (demoted, unassigned, deleted):
-    the row stays for the next bind or clear, but the agent gets no
-    credential for this MCP in agent scope (no platform default).
+    (a manager/admin lent their connected account to the agent for
+    agent-scope sessions). ``None`` → no such row, or a row whose owner no
+    longer manages the agent (demoted, unassigned, deleted): the row stays
+    for the next bind or clear, but the agent gets no credential from it in
+    agent scope (no platform default, no other row in its place).
     """
+    sql = (f"SELECT {_SERVICE_COLUMNS} FROM service_agent_bindings "
+           "WHERE mcp_name=%s AND agent_name=%s")
+    params: tuple = (mcp_name, agent_name)
+    if account_label is not None:
+        sql += " AND account_label=%s"
+        params += (account_label,)
+    else:
+        sql += " ORDER BY is_default DESC, set_at, id LIMIT 1"
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT account_label, account_owner_sub, installation_id, repositories, read_only "
-            "FROM service_agent_bindings WHERE mcp_name=%s AND agent_name=%s",
-            (mcp_name, agent_name),
-        ).fetchone()
+        row = conn.execute(sql, params).fetchone()
         if not row:
             return None
     if not _owner_manages(row["account_owner_sub"], agent_name):
@@ -1021,101 +1316,21 @@ def get_service_agent_binding(
     return _binding_of(row)
 
 
-def service_agent_binding_row_exists(mcp_name: str, agent_name: str) -> bool:
-    """Whether (mcp, agent) has a service binding row at all, whoever owns
-    it (a row whose owner stopped managing the agent still holds its own
-    reach, which a rebind keeps)."""
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT 1 FROM service_agent_bindings WHERE mcp_name=%s AND agent_name=%s",
-            (mcp_name, agent_name),
-        ).fetchone() is not None
-
-
-def set_service_agent_binding(
-    mcp_name: str, agent_name: str, *,
-    account_label: str, owner_sub: str, set_by: str = "",
-    installation_id: str | None = None,
-    repositories: list[str] | None = None, read_only: bool | None = None,
-) -> bool:
-    """Pin an agent to a user's own connected account as its service identity.
-
-    The bound account is identified by ``(owner_sub, mcp_name, account_label)``
-    in ``user_credential_accounts``. ``owner_sub`` MUST be a real user_sub —
-    there is no platform-tier account. Validates the target row exists first.
-
-    ``installation_id``: an installation of that account as the identity
-    (it must stand in the account's meta: a GitHub-App account, the person
-    owning the installation's target, not suspended); ``""`` the account
-    itself; ``None`` keeps what the row holds (a client that knows nothing
-    of installations never widens one to the whole account).
-
-    ``repositories`` and ``read_only``, the agent's GitHub reach: ``None``
-    keeps what the row holds, whatever else changes (a client that knows
-    nothing of the reach never widens it; a list kept across another
-    account only narrows more).
-
-    Returns False if ``owner_sub`` is empty, the target row doesn't exist or
-    the installation does not stand (no-op), True on success.
-    """
-    if not owner_sub:
-        return False
-    with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT meta FROM user_credential_accounts "
-            "WHERE user_sub=%s AND mcp_name=%s AND account_label=%s",
-            (owner_sub, mcp_name, account_label),
-        ).fetchone()
-        if not existing:
-            return False
-        prior = conn.execute(
-            "SELECT installation_id, account_owner_sub, account_label, repositories, read_only "
-            "FROM service_agent_bindings WHERE mcp_name=%s AND agent_name=%s",
-            (mcp_name, agent_name),
-        ).fetchone()
-        same_account = bool(prior) and (prior["account_owner_sub"], prior["account_label"]) == (owner_sub, account_label)
-        if installation_id is None:
-            installation_id = (prior["installation_id"] or "") if same_account else ""
-        if installation_id and oauth_app_kinds.installation_standing(_parse_meta(existing["meta"]), installation_id):
-            return False
-        if repositories is None:
-            stored = prior["repositories"] if prior else "[]"
-        else:
-            stored = json.dumps(list(dict.fromkeys(r.strip() for r in repositories if r.strip())))
-        if read_only is None:
-            read_only = bool(prior["read_only"]) if prior else False
-        now = _now()
-        conn.execute(
-            """INSERT INTO service_agent_bindings
-               (mcp_name, agent_name, account_label, account_owner_sub, set_by, set_at,
-                installation_id, repositories, read_only)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-               ON CONFLICT(mcp_name, agent_name)
-               DO UPDATE SET account_label=EXCLUDED.account_label,
-                             account_owner_sub=EXCLUDED.account_owner_sub,
-                             set_by=EXCLUDED.set_by,
-                             set_at=EXCLUDED.set_at,
-                             installation_id=EXCLUDED.installation_id,
-                             repositories=EXCLUDED.repositories,
-                             read_only=EXCLUDED.read_only""",
-            (mcp_name, agent_name, account_label, owner_sub, set_by, now, installation_id,
-             stored, bool(read_only)),
-        )
-        conn.commit()
-        return True
-
-
 def remove_service_agent_binding(
     mcp_name: str, agent_name: str, *,
     owner_sub: str | None = None, account_label: str | None = None,
     installation_id: str | None = None,
 ) -> bool:
-    """Drop the per-agent service binding (the agent is left with no service
-    identity for this MCP until a new binding is set). With ``owner_sub``,
-    ``account_label`` and ``installation_id`` only while the binding still
-    names that lender's account (and that installation): a clear that ran
-    for seconds never removes the binding a manager set meanwhile. Returns
-    whether a row went."""
+    """Drop rows of the agent's own set of a tool: without a filter the whole
+    set (the agent is left with no account for this MCP until one is set);
+    with ``owner_sub``, ``account_label`` and ``installation_id`` only the
+    rows that still name that lender's account (and that installation): a
+    clear that ran for seconds never removes a row a manager set meanwhile.
+    The oldest standing row left becomes the default when the default went,
+    and the chats' choices of a removed row go with it. Returns whether a
+    row went. A caller that may hold a session on the row goes through
+    ``services/remote/chat_reload.remove_service_account``, which closes
+    the sessions built on it."""
     sql = "DELETE FROM service_agent_bindings WHERE mcp_name=%s AND agent_name=%s"
     params: tuple = (mcp_name, agent_name)
     if owner_sub is not None:
@@ -1127,25 +1342,29 @@ def remove_service_agent_binding(
     if installation_id is not None:
         sql += " AND installation_id=%s"
         params += (installation_id,)
+    standing = _standing_lenders(mcp_name, agent_name)
     with get_conn() as conn:
+        _lock_service_set(conn, mcp_name, agent_name)
         gone = conn.execute(sql, params).rowcount
+        _promote_service_default(conn, mcp_name, agent_name, standing)
         conn.commit()
     return bool(gone)
 
 
 def list_service_agent_bindings(mcp_name: str) -> list[dict]:
-    """Return all per-agent service-account bindings for this MCP — used in UI.
+    """Return every row of every agent's own set for this MCP — used in UI.
 
     Each row has ``{agent_name, account_label, account_owner_sub, set_by,
-    set_at, installation_id, repositories, read_only}`` (``repositories`` the
-    stored JSON list).
+    set_at, installation_id, repositories, read_only, is_default}``
+    (``repositories`` the stored JSON list), by agent, each set's default
+    first.
     """
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT agent_name, account_label, account_owner_sub, set_by, set_at, "
-            "installation_id, repositories, read_only FROM service_agent_bindings "
+            "installation_id, repositories, read_only, is_default FROM service_agent_bindings "
             "WHERE mcp_name=%s "
-            "ORDER BY agent_name ASC",
+            "ORDER BY agent_name ASC, is_default DESC, set_at, id",
             (mcp_name,),
         ).fetchall()
         return [dict(r) for r in rows]

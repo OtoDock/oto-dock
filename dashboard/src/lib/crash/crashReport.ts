@@ -29,31 +29,3 @@ export function crashReport(f: CrashFacts): string {
     (f.componentStack || 'None').trim(),
   ].join('\n')
 }
-
-/** The clipboard where the browser offers it (a secure origin), else a
- * selected textarea and the copy command (a plain-http install). */
-export async function copyText(text: string): Promise<boolean> {
-  try {
-    if (window.isSecureContext && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text)
-      return true
-    }
-  } catch {
-    // Refused (no focus, no permission): the fallback below.
-  }
-  const ta = document.createElement('textarea')
-  ta.value = text
-  ta.setAttribute('readonly', '')
-  ta.style.position = 'fixed'
-  ta.style.opacity = '0'
-  document.body.appendChild(ta)
-  ta.select()
-  let ok: boolean
-  try {
-    ok = document.execCommand('copy')
-  } catch {
-    ok = false
-  }
-  ta.remove()
-  return ok
-}

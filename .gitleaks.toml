@@ -36,4 +36,12 @@ regexes = [
     # A test fixture's project rows: a slug whose words look like a secret's
     # name, followed by the row's id (a UUID, not a key).
     '''(?:credential-broker-1-7-2|oauth-verification)', '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'''',
+    # The rig's redaction test plants obviously synthetic values and asserts
+    # the evidence folder drops them.
+    '''jwt-secret-0123456789''',
+    '''abcdefghijklmnop1234''',
+    '''tok-0123456789abcdef''',
+    # proxy/tests/remote/test_exit_on_machines.py — the exit tests' planted
+    # value, searched for afterwards to prove it reached no file.
+    '''sk-eleven-0123456789''',
 ]

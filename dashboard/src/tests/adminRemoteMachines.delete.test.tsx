@@ -278,3 +278,106 @@ describe('Admin machine: every role of its agents runs here', () => {
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
   })
 })
+
+// A compute machine: the platform's own, owned by nobody. It has its own
+// section, no settings, no agents and no owner, and its own remove confirm.
+describe('Admin compute machines', () => {
+  const COMPUTE = {
+    ...USER_MACHINE, id: 'c-compute-1', name: 'Compute one', status: 'never_connected',
+    pairing_scope: 'compute', registered_by: '', owner_display_name: '', owner_email: '',
+  }
+  const ADMIN = { ...USER_MACHINE, id: 'm-adm-0009', name: 'Office PC', pairing_scope: 'admin', registered_by: 'admin-sub' }
+  beforeEach(() => {
+    h.machines = [ADMIN, COMPUTE, USER_MACHINE]
+    h.del.mockClear()
+  })
+
+  it('lists a compute machine apart, plainly, with nothing to set', () => {
+    mount()
+    const section = screen.getByTestId('compute-machines')
+    expect(within(section).getByText('Compute one')).toBeInTheDocument()
+    expect(within(section).getByText('Machines the platform runs itself.')).toBeInTheDocument()
+    fireEvent.click(within(section).getByRole('button', { name: 'About Compute machines' }), { detail: 0 })
+    expect(screen.getByRole('tooltip')).toHaveTextContent(
+      'No person owns them. Chats, terminals, tasks, calls and meetings on the platform run on them. '
+      + 'Apps run on the one beside the platform, never on an added server. '
+      + 'While none is online, these cannot run. Chats on a remote machine still can.')
+    expect(within(section).getByText('Never connected')).toBeInTheDocument()
+    expect(within(section).queryByText('Not in use')).toBeNull()
+    // With none online the card says what that means.
+    expect(within(section).getByTestId('compute-none-online')).toHaveTextContent(
+      'No compute machine is online, so chats, tasks and calls cannot run.')
+    // An added machine that never signed in says so in place of its id.
+    expect(within(section).getByText('Waiting for its first sign-in')).toBeInTheDocument()
+    expect(within(section).queryByText(/Owner/)).toBeNull()
+    expect(within(section).queryByText('never_connected')).toBeNull()
+    // Not among the admin's machines, whose cards hold the settings.
+    expect(screen.getAllByText('Compute one')).toHaveLength(1)
+    expect(screen.getByText('Office PC')).toBeInTheDocument()
+  })
+
+  it('removes one after its own confirm, which names no uninstall', async () => {
+    mount()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove Compute one' }))
+    const dialog = screen.getByRole('alertdialog')
+    expect(within(dialog).getByText(/A chat running on it stops\./)).toBeInTheDocument()
+    expect(within(dialog).queryByText(/uninstalls itself/)).toBeNull()
+    personClick(within(dialog).getByRole('button', { name: 'Remove machine' }))
+    await waitFor(() => expect(h.del).toHaveBeenCalledWith('c-compute-1'))
+  })
+
+  it('shows each machine\'s state word, what runs there and the stop on remove', () => {
+    h.machines = [ADMIN, { ...COMPUTE, status: 'stale' },
+                  { ...COMPUTE, id: 'c-compute-2', name: 'Compute two', status: 'never_connected' }]
+    mount()
+    const section = screen.getByTestId('compute-machines')
+    expect(within(section).getByText('Slow connection')).toBeInTheDocument()
+    expect(within(section).getByText('Never connected')).toBeInTheDocument()
+    expect(within(section).queryByText('Not in use')).toBeNull()
+    fireEvent.click(within(section).getByRole('button', { name: 'About Compute machines' }), { detail: 0 })
+    expect(screen.getByRole('tooltip')).toHaveTextContent(
+      'No person owns them. Chats, terminals, tasks, calls and meetings on the platform run on them. '
+      + 'Apps run on the one beside the platform, never on an added server. '
+      + 'While none is online, these cannot run. Chats on a remote machine still can.')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove Compute one' }))
+    expect(within(screen.getByRole('alertdialog')).getByText(
+      'A chat running on it stops. Its next message runs on another compute machine and keeps the conversation. '
+      + 'If the server connects within 30 days, OtoDock removes itself from it.')).toBeInTheDocument()
+  })
+
+  it('shows what the compute machine runs, its memory, and work held for an update', () => {
+    h.machines = [ADMIN, {
+      ...COMPUTE, status: 'online',
+      compute: { own: true, sessions: 3, holding: true,
+                 memory: { total_mb: 16384, available_mb: 9830, reserved_mb: 2550, capped: false } },
+    }]
+    mount()
+    const section = screen.getByTestId('compute-machines')
+    expect(within(section).getByText('3 sessions, 9.6 GB free of 16 GB')).toBeInTheDocument()
+    expect(within(section).getByText('Online')).toBeInTheDocument()
+    expect(within(section).queryByTestId('compute-none-online')).toBeNull()
+    expect(within(section).getByTestId('compute-holding')).toHaveTextContent(
+      'New chats wait while OtoDock updates, restarts or makes a backup.')
+    // The install keeps its own compute machine: no Remove.
+    expect(within(section).queryByRole('button', { name: 'Remove Compute one' })).toBeNull()
+  })
+
+  it('says one session and leaves memory out before the first report', () => {
+    h.machines = [ADMIN, {
+      ...COMPUTE, status: 'online', compute_address: '192.168.50.7',
+      last_seen: '2026-11-11T03:00:00Z',
+      compute: { own: false, sessions: 1, holding: false, memory: null },
+    }]
+    mount()
+    const section = screen.getByTestId('compute-machines')
+    expect(within(section).getByText('On another server, last signed in from 192.168.50.7, 1 session')).toBeInTheDocument()
+    expect(within(section).queryByTestId('compute-holding')).toBeNull()
+    expect(within(section).getByRole('button', { name: 'Remove Compute one' })).toBeInTheDocument()
+  })
+
+  it('shows no section when there is no compute machine', () => {
+    h.machines = [ADMIN, USER_MACHINE]
+    mount()
+    expect(screen.queryByTestId('compute-machines')).toBeNull()
+  })
+})

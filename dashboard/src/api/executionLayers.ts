@@ -5,7 +5,7 @@
  * User:  personal subscriptions + platform availability.
  */
 
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient, useIsFetching, useIsMutating } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import type { EngineDescriptor } from './engineDescriptor'
 import { ENGINE_SUBSCRIPTION_STATUS, type EngineSubscriptionStatus } from '../lib/status/engineSubscription'
@@ -56,6 +56,52 @@ export interface Subscription {
   // platform does not know it (absence never means "ending"). Absent on
   // every other row.
   login_expires_at?: string | null
+  // What runs on the account now, as this list may show it: the person's own
+  // sessions in User Settings, the pool's in Admin.
+  live?: AccountLive
+}
+
+/** The sessions working on an account now, and how many run each model,
+ *  most first (a session with no model is counted, not named). */
+export interface AccountLive {
+  sessions: number
+  per_model: { name: string; sessions: number }[]
+}
+
+/** What a list polls while it is open, by account id. */
+export type AccountsLive = Record<string, { live: AccountLive | null; windows?: SubscriptionWindows | null }>
+
+/** Where a list of accounts stands: a change of the person's still saving,
+ *  the list being read, and a read to ask for when the list opens (it shows
+ *  the pool's order as it is now). */
+export function useListReading(list: 'own' | 'pool') {
+  const qc = useQueryClient()
+  const key = list === 'pool' ? 'admin-execution-layers' : 'user-execution-layers'
+  const saving = useIsMutating({ mutationKey: ENGINE_ACCOUNT }) > 0
+  const reading = useIsFetching({ queryKey: [key] }) > 0
+  return {
+    pending: saving || reading,
+    reread: () => {
+      void qc.invalidateQueries({ queryKey: [key] })
+      void qc.invalidateQueries({ queryKey: ['accounts-live', list] })
+    },
+  }
+}
+
+/** The live numbers of a list's accounts, polled every 15 seconds while the
+ *  list is open and no change of the person's is saving. Never the order: the
+ *  list keeps its own. */
+export function useAccountsLive(list: 'own' | 'pool', open: boolean, paused: boolean) {
+  return useQuery({
+    queryKey: ['accounts-live', list],
+    queryFn: async (): Promise<AccountsLive> => {
+      const path = list === 'pool' ? '/v1/admin/execution-layers/live' : '/v1/users/me/execution-layers/live'
+      const data = await apiJson<{ accounts?: AccountsLive }>(path).catch(withMessage('Could not load the accounts'))
+      return data.accounts ?? {}
+    },
+    enabled: open,
+    refetchInterval: open && !paused ? 15_000 : false,
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +230,11 @@ export interface UserLayerInfo {
 // cached for five minutes (useExecutionLayers), so a mutation that only
 // touched the admin key left a newly discovered model invisible until a
 // full reload.
-const ENGINE_QUERY_KEYS = ['admin-execution-layers', 'user-execution-layers', 'execution-layers'] as const
+const ENGINE_QUERY_KEYS = ['admin-execution-layers', 'user-execution-layers', 'execution-layers', 'accounts-live'] as const
+
+/** The mutations that change an account row (connect, add, a tick, remove):
+ *  what a list of accounts waits for before it orders itself again. */
+const ENGINE_ACCOUNT = ['engine-account']
 
 function invalidateEngineQueries(qc: ReturnType<typeof useQueryClient>) {
   return Promise.all(ENGINE_QUERY_KEYS.map((key) => qc.invalidateQueries({ queryKey: [key] })))
@@ -280,6 +330,7 @@ export function useDeleteLocalEndpoint() {
 export function useAddSubscription() {
   const qc = useQueryClient()
   return useMutation({
+    mutationKey: ENGINE_ACCOUNT,
     mutationFn: async ({
       layer,
       ...body
@@ -305,6 +356,7 @@ export function useAddSubscription() {
 export function useUpdateSubscription() {
   const qc = useQueryClient()
   return useMutation({
+    mutationKey: ENGINE_ACCOUNT,
     mutationFn: async ({
       layer,
       id,
@@ -322,13 +374,14 @@ export function useUpdateSubscription() {
         body: JSON.stringify(body),
       }).catch(withMessage('Failed to update subscription'))
     },
-    // Optimistic: reflect the toggle instantly in User Settings (the user-scope
-    // query it reads from), then reconcile. Without this the row only updated
-    // after a full reload, because the prior code invalidated ONLY the admin
-    // query key — never ['user-execution-layers'] that User Settings renders.
+    // Optimistic: reflect the toggle instantly in both lists (User Settings
+    // and the admin tab read their own keys), then reconcile; a tick shows its
+    // saved state where the card is, at once.
     onMutate: async (vars) => {
       await qc.cancelQueries({ queryKey: ['user-execution-layers'] })
+      await qc.cancelQueries({ queryKey: ['admin-execution-layers'] })
       const prev = qc.getQueryData(['user-execution-layers'])
+      const prevAdmin = qc.getQueryData(['admin-execution-layers'])
       qc.setQueryData<UserLayerInfo[]>(['user-execution-layers'], (old) =>
         Array.isArray(old)
           ? old.map((l) => ({
@@ -337,10 +390,24 @@ export function useUpdateSubscription() {
                 s.id === vars.id ? { ...s, ...vars } : s),
             }))
           : old)
-      return { prev }
+      qc.setQueryData<AdminEnginesPayload>(['admin-execution-layers'], (old) =>
+        old && Array.isArray(old.layers)
+          ? {
+              ...old,
+              layers: old.layers.map((l) => ({
+                ...l,
+                subscriptions: {
+                  ...l.subscriptions,
+                  platform: (l.subscriptions?.platform ?? []).map((s) => (s.id === vars.id ? { ...s, ...vars } : s)),
+                },
+              })),
+            }
+          : old)
+      return { prev, prevAdmin }
     },
     onError: (_e, _vars, ctx) => {
       if (ctx?.prev !== undefined) qc.setQueryData(['user-execution-layers'], ctx.prev)
+      if (ctx?.prevAdmin !== undefined) qc.setQueryData(['admin-execution-layers'], ctx.prevAdmin)
     },
     onSettled: () => invalidateEngineQueries(qc),
   })
@@ -352,6 +419,7 @@ export function useUpdateSubscription() {
 export function useUserUpdateSubscription() {
   const qc = useQueryClient()
   return useMutation({
+    mutationKey: ENGINE_ACCOUNT,
     mutationFn: async ({
       layer,
       id,
@@ -393,6 +461,7 @@ export function useUserUpdateSubscription() {
 export function useDeleteSubscription() {
   const qc = useQueryClient()
   return useMutation({
+    mutationKey: ENGINE_ACCOUNT,
     // `force` deletes past live sessions: the server re-homes them onto the
     // remaining subscriptions. A stale counter alone never blocks — the
     // server reconciles it against the live bindings first.
@@ -594,6 +663,7 @@ export class ClaudeExchangeError extends Error {
 export function useExchangeClaudeOAuth() {
   const qc = useQueryClient()
   return useMutation({
+    mutationKey: ENGINE_ACCOUNT,
     mutationFn: async ({ code, state, layer, label }: { code: string; state: string; layer: string; label?: string }): Promise<ClaudeExchangeResult> => {
       const res = await apiFetch('/v1/oauth/claude/exchange', {
         method: 'POST',
@@ -671,6 +741,7 @@ export function loginAlreadyFinished(err: unknown): boolean {
 export function useFinishOpenAIOAuth() {
   const qc = useQueryClient()
   return useMutation({
+    mutationKey: ENGINE_ACCOUNT,
     mutationFn: async ({ loginId, layer, label }: { loginId: string; layer: string; label?: string }) => {
       return apiJson<{ subscription?: Subscription; created?: boolean }>('/v1/oauth/openai/finish', {
         method: 'POST',
@@ -701,6 +772,7 @@ export const useUserExecutionLayers = () =>
 export function useUserAddSubscription() {
   const qc = useQueryClient()
   return useMutation({
+    mutationKey: ENGINE_ACCOUNT,
     mutationFn: async ({
       layer,
       ...body
@@ -724,6 +796,7 @@ export function useUserAddSubscription() {
 export function useUserDeleteSubscription() {
   const qc = useQueryClient()
   return useMutation({
+    mutationKey: ENGINE_ACCOUNT,
     mutationFn: async ({ layer, id }: { layer: string; id: string }) => {
       return apiJson(`/v1/users/me/execution-layers/${layer}/subscriptions/${id}`, {
         method: 'DELETE',

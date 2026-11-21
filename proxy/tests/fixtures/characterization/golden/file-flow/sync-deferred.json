@@ -1,0 +1,38 @@
+{
+ "authors": [
+  {
+   "last_writer": "alice",
+   "rel_path": "workspace/deferred.bin"
+  }
+ ],
+ "file_updated": [
+  "flow-agent/workspace/deferred.bin disk"
+ ],
+ "mtime": 12345.5,
+ "platform": {
+  "workspace/deferred.bin": "deferred bytes"
+ },
+ "sync_state": [
+  {
+   "base_hash": "sha256:s",
+   "rel_path": "workspace/deferred.bin"
+  }
+ ],
+ "tombstones": [],
+ "wire": [
+  {
+   "agent_slug": "flow-agent",
+   "path": "workspace/deferred.bin",
+   "path_kind": "agent_tree",
+   "request_id": "<id>",
+   "type": "file_pull"
+  },
+  {
+   "agent_slug": "flow-agent",
+   "path": "workspace/missing.bin",
+   "path_kind": "agent_tree",
+   "request_id": "<id>",
+   "type": "file_pull"
+  }
+ ]
+}

@@ -1,0 +1,29 @@
+{
+ "a_frame_shed_past_the_ceiling_stamps_too": {
+  "inflight": 1,
+  "log": [
+   "file_changed: machine sat-one- has 1 frame(s) in flight; 1 frame(s) shed (the next merge reconciles them)"
+  ],
+  "stamp": 1005.0
+ },
+ "a_machine_evicted": {
+  "sat-two-0|flow-agent": 1010.0
+ },
+ "a_refused_frame_stamps_nothing": {},
+ "no_such_machine": {
+  "sat-two-0|flow-agent": 1010.0
+ },
+ "stamped": 1000.0,
+ "the_applier_stamps_at_its_end": {
+  "inflight": 0,
+  "stamp": 1010.0,
+  "tree": {
+   "workspace/a.txt": "x"
+  }
+ },
+ "the_map_is_bounded_oldest_out": {
+  "sat-one-0|agent-b": 1010.0,
+  "sat-two-0|flow-agent": 1010.0
+ },
+ "unstamped": 0.0
+}

@@ -18,8 +18,7 @@ interface Props {
 
 const REASON_LABEL: Record<RecoverBinEntry['reason'], string> = {
   deleted: 'Deleted',
-  overwritten: 'Replaced by a newer version',
-  reconciled: 'Removed',
+  conflict: 'Replaced by a newer version',
 }
 
 function parentFolder(relPath: string): string {

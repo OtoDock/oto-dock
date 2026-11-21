@@ -722,7 +722,8 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "propose_move": {
         "description": (
             "Draw a card proposing to move an agent into a department at a level. Whoever "
-            "presses it moves it with their own role (an admin, or a creator who manages the agent); "
+            "presses it moves it with their own role (an admin, or a creator who manages the agent "
+            "and either made the department or manages all its agents); "
             "nothing moves by this call. Use list_departments for the ids."
         ),
         "inputSchema": {

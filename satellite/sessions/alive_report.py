@@ -24,8 +24,6 @@ import logging
 import secrets
 from typing import TYPE_CHECKING
 
-from ..engines import ENGINES
-
 if TYPE_CHECKING:
     from .session_manager import SessionManager
 
@@ -42,13 +40,13 @@ def next_incarnation() -> str:
 def other_sessions_held(sm: SessionManager) -> list[dict]:
     out = []
     for sid, session in list(sm.sessions.items()):
-        engine = ENGINES.get(getattr(session, "execution_path", ""))
+        path = getattr(session, "execution_path", "")
         alive = bool(session.is_alive)
-        if engine is not None and engine.turn_replay and alive:
+        if alive and sm.replays_turns(path):
             continue   # the turn-replay list names it
         config = getattr(session, "config", None)
         config = config if isinstance(config, dict) else {}
-        if engine is not None and engine.turn_replay:
+        if sm.replays_turns(path):
             turn_active = bool((sm.turn_state.get(sid) or {}).get("active"))
         else:
             turn_active = bool(getattr(session, "turn_active", False))
@@ -80,4 +78,7 @@ def sessions_alive_frame(sm: SessionManager) -> dict | None:
         frame["other_sessions"] = other_sessions_held(sm)
     except Exception:  # noqa: BLE001  # the other-sessions list is optional: a fault costs only that key
         logger.warning("sessions_alive: the other sessions' list failed", exc_info=True)
+        # Said outright (0.5.170): the platform reads this report as not
+        # complete and continues nothing on it.
+        frame["partial"] = True
     return frame

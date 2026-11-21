@@ -1,0 +1,250 @@
+{
+ "a rung raises": {
+  "pending": [
+   {
+    "by": "",
+    "person": "user-viewer",
+    "prompt": "RESULT a rung raises",
+    "role": "editor"
+   }
+  ],
+  "rows": [
+   {
+    "content": "",
+    "event_data": {
+     "agent": "char-peer",
+     "output_text": "out",
+     "status": "failed",
+     "task_id": "t-none",
+     "task_name": "the-worker"
+    },
+    "event_type": "delegate_result",
+    "role": "event"
+   }
+  ],
+  "seen": {
+   "admission": [],
+   "frames": [
+    [
+     "c-raise",
+     {
+      "agent": "char-peer",
+      "chat_id": "c-raise",
+      "output_text": "out",
+      "status": "failed",
+      "task_id": "t-none",
+      "task_name": "the-worker",
+      "type": "delegate_result"
+     }
+    ]
+   ],
+   "layer": [],
+   "layers_asked": [
+    {
+     "agent": "char-agent",
+     "execution_path": "",
+     "execution_target": "local",
+     "placement_built": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "user_sub": "user-viewer"
+    }
+   ],
+   "released": [],
+   "seats": []
+  }
+ },
+ "the person left during the ladder": {
+  "pending": [],
+  "rows": [
+   {
+    "content": "",
+    "event_data": {
+     "agent": "char-peer",
+     "output_text": "out",
+     "status": "failed",
+     "task_id": "t-none",
+     "task_name": "the-worker"
+    },
+    "event_type": "delegate_result",
+    "role": "event"
+   }
+  ],
+  "seen": {
+   "admission": [],
+   "frames": [
+    [
+     "c-revoked",
+     {
+      "agent": "char-peer",
+      "chat_id": "c-revoked",
+      "output_text": "out",
+      "status": "failed",
+      "task_id": "t-none",
+      "task_name": "the-worker",
+      "type": "delegate_result"
+     }
+    ]
+   ],
+   "layer": [
+    [
+     "is_session_alive",
+     "s-none"
+    ],
+    [
+     "can_resume_session",
+     "s-none",
+     "char-agent",
+     "vic"
+    ]
+   ],
+   "layers_asked": [
+    {
+     "agent": "char-agent",
+     "execution_path": "",
+     "execution_target": "local",
+     "placement_built": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "user_sub": "user-viewer"
+    },
+    {
+     "agent": "char-agent",
+     "execution_path": "claude-code-cli",
+     "execution_target": "local",
+     "placement_built": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "user_sub": "user-viewer"
+    }
+   ],
+   "released": [],
+   "seats": []
+  }
+ },
+ "the session moved on, no conversation": {
+  "pending": [],
+  "rows": [
+   {
+    "content": "",
+    "event_data": {
+     "agent": "char-peer",
+     "background_pending": 2,
+     "output_text": "half an answer",
+     "reason": "exited",
+     "report_missing": true,
+     "resets_at": "",
+     "status": "failed",
+     "task_id": "t-none",
+     "task_name": "the-worker"
+    },
+    "event_type": "delegate_result",
+    "role": "event"
+   },
+   {
+    "content": "",
+    "event_data": {
+     "machine_name": "",
+     "message": "The previous session could not be resumed — this chat continued with a fresh session. The conversation was restored from history; the previous session's working files may no longer be available.",
+     "reason": "resume_failed",
+     "subtype": "session_reseeded",
+     "type": "system"
+    },
+    "event_type": "system",
+    "role": "event"
+   },
+   {
+    "content": "ECHO TEXT",
+    "event_data": null,
+    "event_type": "",
+    "role": "assistant"
+   }
+  ],
+  "seen": {
+   "admission": [
+    {
+     "path": "claude-code-cli",
+     "session": "<uuid>",
+     "superseded": false,
+     "target": "compute-0123456789ab"
+    }
+   ],
+   "frames": [
+    [
+     "c-none",
+     {
+      "agent": "char-peer",
+      "background_pending": 2,
+      "chat_id": "c-none",
+      "output_text": "half an answer",
+      "reason": "exited",
+      "report_missing": true,
+      "resets_at": "",
+      "status": "failed",
+      "task_id": "t-none",
+      "task_name": "the-worker",
+      "type": "delegate_result"
+     }
+    ]
+   ],
+   "layer": [
+    [
+     "is_session_alive",
+     "s-chat-now"
+    ],
+    [
+     "can_resume_session",
+     "s-chat-now",
+     "char-agent",
+     "vic"
+    ],
+    [
+     "start_session",
+     "<uuid>"
+    ],
+    [
+     "send_message",
+     "<uuid>",
+     "[Context restore: this conversation previously ran in a different session. The transcript below is a digest restored from the platform's database. Files, working directories, and any other on-disk state from the previous machine/session are NOT available — verify with tools before assuming they exist.]\n\n[delegate result: char-peer · the-worker · ended without a report] half an answer\n\n[End of restored conversation digest. The latest message follows.]\n\n[The worker ended without a report: the program stopped. Its last message below is not the outcome. Continue the lane with delegate(continue_id=…) to get the report.]\n\n[status=failed task=t-none name=the-worker chat= agent=char-peer]\nhalf an answer\n\n[The worker's engine process exited before it answered. Its session resumes where it left off: continue it with delegate(continue_id=…).]\n\n[The worker's run ended with 2 background job(s) still running; their results are not in this report. Continue the worker with delegate(continue_id=…) to collect them.]"
+    ]
+   ],
+   "layers_asked": [
+    {
+     "agent": "char-agent",
+     "execution_path": "",
+     "execution_target": "local",
+     "placement_built": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "user_sub": "user-viewer"
+    },
+    {
+     "agent": "char-agent",
+     "execution_path": "claude-code-cli",
+     "execution_target": "local",
+     "placement_built": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "user_sub": "user-viewer"
+    }
+   ],
+   "released": [],
+   "seats": []
+  }
+ }
+}

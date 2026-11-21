@@ -1,0 +1,255 @@
+[
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-back",
+    "ready",
+    {
+     "agent": "term-handback"
+    }
+   ]
+  ],
+  "handed_back": [
+   {
+    "agent": "term-handback",
+    "allow_pty": false,
+    "allow_ws": false,
+    "chat_id": "chat-back",
+    "hops": 1,
+    "oneshot_fn": null,
+    "persistent_fn": null,
+    "role": "editor",
+    "session_id": "sid-back",
+    "source": "delegate_result",
+    "text": "undelivered result",
+    "user_sub": "user-admin"
+   }
+  ],
+  "outcomes": [
+   "pump"
+  ],
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_acquired": [
+   [
+    "sid-back",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "sid-drop",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "sid-capped",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "slot_released": [
+   "sid-back"
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   },
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   },
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-back": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "not_ready",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "a close hands it back with no PTY or socket rung",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_fire_inject_backstop",
+    5.0
+   ],
+   [
+    "_fire_inject_backstop",
+    5.0
+   ],
+   [
+    "_fire_inject_backstop",
+    5.0
+   ]
+  ],
+  "turn_end": [
+   [
+    "sid-back",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-drop",
+    "ready",
+    {
+     "agent": "term-handback"
+    }
+   ]
+  ],
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_released": [
+   "sid-drop"
+  ],
+  "state": {
+   "sid-drop": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "not_ready",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "drop_queued hands nothing back",
+  "turn_end": [
+   [
+    "sid-drop",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-capped",
+    "ready",
+    {
+     "agent": "term-handback"
+    }
+   ]
+  ],
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_released": [
+   "sid-capped"
+  ],
+  "state": {
+   "sid-capped": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "not_ready",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "past two handbacks it is dropped",
+  "turn_end": [
+   [
+    "sid-capped",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ }
+]

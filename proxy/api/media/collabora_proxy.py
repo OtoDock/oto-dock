@@ -19,7 +19,7 @@ import contextlib
 import ipaddress
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from urllib.parse import unquote, urlparse, urlsplit
 
 import httpx
@@ -242,7 +242,8 @@ async def _collabora_authorized(scope: Mapping, cookies: dict) -> str | None:
     handed, so a token copied from its log would otherwise open the
     document through here. Every token the request carries (the query, the
     legacy socket path, a WOPISrc value; ``_request_tokens``) must name the
-    cookie's person, and a socket must carry one.
+    cookie's person, a socket must carry one, and the person must still be
+    allowed to read each token's document (``_documents_readable``).
     """
     from api.media.wopi import person_holds
     from auth.providers import validate_session_jwt
@@ -258,24 +259,78 @@ async def _collabora_authorized(scope: Mapping, cookies: dict) -> str | None:
         return None
     if not all(_token_names(tok, sub) for tok in found):
         return None
+    if not await _documents_readable(found, open_socket=False):
+        return None
     return sub
 
 
-def _load_frame_ok(frame: str | bytes, sub: str) -> bool:
-    """A client frame the relay passes upstream, text or binary: every WOPI
-    token a ``load`` frame carries must be minted for the socket's person
-    (the frame, not the socket's URL, names the document Collabora opens)."""
-    head = frame[:16].lstrip()
-    if not (head.startswith(b"load") if isinstance(head, bytes) else head.startswith("load")):
-        return True
+# A client frame's first word, after any run of leading spaces (Collabora's
+# own reader skips them, however many): a document's load, or a new token for
+# the open session (``resetaccesstoken <token> [ttl]``, its next WOPI calls').
+_FRAME_TEXT = re.compile(r"[ \t\r\n]*(load|resetaccesstoken(?= |$))")
+_FRAME_BYTES = re.compile(rb"[ \t\r\n]*(load|resetaccesstoken(?= |$))")
+
+
+def _frame_tokens(frame: str | bytes) -> list[str]:
+    """The WOPI tokens a client frame hands Collabora, text or binary: a
+    ``load``'s (it carries the document's address too) and a
+    ``resetaccesstoken``'s new one. None for any other frame."""
+    found = _FRAME_BYTES.match(frame) if isinstance(frame, bytes) else _FRAME_TEXT.match(frame)
+    if not found:
+        return []
     text = frame.decode("utf-8", "replace") if isinstance(frame, bytes) else frame
-    return all(_token_names(tok, sub) for tok in _tokens_in(text))
+    if found.group(1) in ("load", b"load"):
+        return _tokens_in(text)
+    return [w for w in text.split(" ") if w][1:2]
 
 
-# An open editor socket judges the credential that admitted it again at
-# this interval (the dashboard socket's): a sign out everywhere, a password
-# change or the forced change closes it within the window.
+def _load_frame_ok(frame: str | bytes, sub: str) -> bool:
+    """A client frame the relay passes upstream: every WOPI token it hands
+    Collabora (``_frame_tokens``) must be minted for the socket's person."""
+    return all(_token_names(tok, sub) for tok in _frame_tokens(frame))
+
+
+# An open editor socket judges the credential that admitted it, and the
+# documents it loaded, again at this interval (the dashboard socket's), or
+# at once when ``wake_sockets`` names its person: a sign out everywhere, a
+# password change, the forced change or a person's access to a document
+# ending closes it.
 _RELAY_REVALIDATE_S = 60.0
+# The documents an open socket may name for its re-judgement. An editor's
+# socket loads one: a socket past this is closed, never trimmed, because its
+# frames come from the person it judges.
+_SOCKET_DOCUMENTS_MAX = 16
+_open_sockets: dict[str, set[asyncio.Event]] = {}
+
+
+def wake_sockets(sub: str | None) -> None:
+    """Make the open editor sockets of ``sub`` (every one, for None) judge
+    again now instead of at their next tick. Call it on the event loop."""
+    groups = _open_sockets.values() if sub is None else [_open_sockets.get(sub, set())]
+    for group in groups:
+        for wake in group:
+            wake.set()
+
+
+async def _documents_readable(tokens: Iterable[str], *, open_socket: bool) -> bool:
+    """Whether the person may still read every document ``tokens`` name
+    (``wopi.document_standing``). Reading only is enough: their view goes on
+    and a save is refused at the WOPI host. For an open socket a token is
+    judged without its expiry (the page outlives the token's four hours, as
+    the sign-in cookie is judged there) and a store that could not be read
+    keeps it. A new request refuses an unread store, and its tokens passed
+    ``_token_names`` with their expiry."""
+    from api.media.wopi import document_standing
+    from auth import tokens as token_kinds
+    with_expiry = not open_socket
+    for token in list(tokens):
+        claims = token_kinds.verify(token, token_kinds.WOPI, verify_exp=with_expiry)
+        if claims is None:
+            continue
+        answer = await document_standing(claims)
+        if answer == "" or (answer is None and not open_socket):
+            return False
+    return True
 
 
 async def _socket_still_authorized(scope: Mapping, cookies: dict) -> bool:
@@ -299,21 +354,40 @@ async def _socket_still_authorized(scope: Mapping, cookies: dict) -> bool:
 
 
 async def _close_when_unauthorized(websocket: WebSocket, upstream, scope: Mapping,
-                                   cookies: dict, path: str) -> None:
-    """Re-judge an open editor socket every ``_RELAY_REVALIDATE_S``; when it
-    no longer holds, close both ends (the browser's with 1008: Collabora's
-    reconnect is then refused at the handshake and it says it cannot
+                                   cookies: dict, path: str, *, person: str = "",
+                                   documents: dict[str, None] | None = None) -> None:
+    """Re-judge an open editor socket every ``_RELAY_REVALIDATE_S``, or at
+    once when ``wake_sockets`` names ``person``; when its sign-in no longer
+    holds, or its person may no longer read a document it loaded, close both
+    ends (the browser's with 1008: Collabora's reconnect is then refused, at
+    the handshake or at the document's load, and it says it cannot
     connect)."""
-    while True:
-        await asyncio.sleep(_RELAY_REVALIDATE_S)
-        if await _socket_still_authorized(scope, cookies):
-            continue
-        logger.info("Collabora WS closed: its sign-in no longer holds (%s)", path[:60])
-        with contextlib.suppress(Exception):
-            await upstream.close()
-        with contextlib.suppress(Exception):
-            await websocket.close(code=1008, reason="sign-in ended")
-        return
+    wake = asyncio.Event()
+    _open_sockets.setdefault(person, set()).add(wake)
+    wake.set()  # a drop between the handshake and here woke nobody: judge now
+    try:
+        while True:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(wake.wait(), _RELAY_REVALIDATE_S)
+            wake.clear()
+            if not await _socket_still_authorized(scope, cookies):
+                why, reason = "its sign-in no longer holds", "sign-in ended"
+            elif not await _documents_readable(documents or {}, open_socket=True):
+                why, reason = "its person may no longer open the document", "access ended"
+            else:
+                continue
+            logger.info("Collabora WS closed: %s (%s)", why, path[:60])
+            with contextlib.suppress(Exception):
+                await upstream.close()
+            with contextlib.suppress(Exception):
+                await websocket.close(code=1008, reason=reason)
+            return
+    finally:
+        group = _open_sockets.get(person)
+        if group is not None:
+            group.discard(wake)
+            if not group:
+                _open_sockets.pop(person, None)
 
 
 def _raw_subpath(scope: Mapping) -> str:
@@ -617,6 +691,10 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
     if forwarded_cookie:
         additional_headers.append(("Cookie", forwarded_cookie))
 
+    # The documents the socket names (the handshake's tokens, then every load
+    # frame's), for the re-judgement.
+    documents: dict[str, None] = dict.fromkeys(_request_tokens(websocket.scope))
+
     try:
         connect_kwargs = _upstream_connect_kwargs(
             additional_headers, forwarded_origin, chosen_subproto
@@ -634,6 +712,14 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
                         if data is not None and not _load_frame_ok(data, person):
                             logger.info("Collabora WS closed: a document token of "
                                         "another person (%s)", path[:60])
+                            await upstream.close()
+                            await websocket.close(code=1008, reason="unauthorized")
+                            return
+                        for tok in _frame_tokens(data) if data is not None else ():
+                            documents[tok] = None
+                        if len(documents) > _SOCKET_DOCUMENTS_MAX:
+                            logger.info("Collabora WS closed: more documents than a socket loads (%s)",
+                                        path[:60])
                             await upstream.close()
                             await websocket.close(code=1008, reason="unauthorized")
                             return
@@ -657,7 +743,8 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
                     pass
 
             watch = asyncio.create_task(_close_when_unauthorized(
-                websocket, upstream, websocket.scope, dict(websocket.cookies), path))
+                websocket, upstream, websocket.scope, dict(websocket.cookies), path,
+                person=person, documents=documents))
             try:
                 await asyncio.gather(
                     client_to_upstream(),

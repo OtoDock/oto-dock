@@ -132,6 +132,16 @@ const calls = (m) => (fs.existsSync(m.log) ? fs.readFileSync(m.log, "utf8") : ""
     ]);
     assert.match(lost.get(1).error.message, /^The browser token was not handed to this session\./);
     assert.ok(!/new chat/.test(lost.get(1).error.message));
+    // An unattended session with no token: it names a key's message too, and
+    // asks for the owner's tick as well as a saved token.
+    const unattended = await run(machine(), { unattended: true, hasToken: false }, [
+      { id: 1, method: "tools/call", params: { name: "browser_navigate", arguments: { url: "https://example.test" } } },
+    ]);
+    assert.strictEqual(unattended.get(1).error.message,
+      "Nobody is at this computer's screen for this session: it is a task, a trigger, a call, a meeting or a " +
+      "message sent with an API key. So it cannot click Allow in the browser. It can use this browser once a " +
+      "token is saved and the computer's owner ticks \"Also let unattended runs use this browser\" in the " +
+      "machine's settings, under Remote Machines.");
   }
   console.log("own_supervisor tests passed");
 })().catch((e) => {

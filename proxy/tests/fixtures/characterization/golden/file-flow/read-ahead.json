@@ -1,0 +1,240 @@
+{
+ "recover_bin": [
+  {
+   "file_hash": "sha256:76cd553f258de82bc0d10e299822d1376b5c4133443fa4567d8ad826a72d7751",
+   "reason": "conflict",
+   "rel_path": "workspace/ahead.txt",
+   "size": 12
+  }
+ ],
+ "steps": [
+  {
+   "bytes": "platform bytes",
+   "marks": {
+    "sat-one-0|flow-agent|workspace/ahead.txt": {
+     "in_flight_until": 60.0,
+     "machine": {
+      "exists": true,
+      "mtime_ns": 33,
+      "size": 3
+     },
+     "mtime_ns": 500,
+     "retry_at": 0.0,
+     "size": 14,
+     "stale": false
+    }
+   },
+   "path": "<agents>/flow-agent/workspace/ahead.txt",
+   "record": null,
+   "step": "in flight: served with no probe",
+   "wire": []
+  },
+  {
+   "bytes": "platform bytes",
+   "marks": {
+    "sat-one-0|flow-agent|workspace/ahead.txt": {
+     "in_flight_until": 0.0,
+     "machine": {
+      "exists": true,
+      "mtime_ns": 33,
+      "size": 3
+     },
+     "mtime_ns": 500,
+     "retry_at": 30.0,
+     "size": 14,
+     "stale": false
+    }
+   },
+   "path": "<agents>/flow-agent/workspace/ahead.txt",
+   "record": null,
+   "step": "past the window, the machine behind: served and pushed, the push fails",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "command_id": "<id>",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "type": "file_stat"
+    },
+    {
+     "action": "write",
+     "agent_slug": "flow-agent",
+     "body": "platform bytes",
+     "command_id": "<id>",
+     "expect": {
+      "mtime_ns": 33,
+      "size": 3
+     },
+     "hash": "sha256:1f93f99bcc53f8c66af69cf4320ebddca31aaa73f8ae02b5e094636a84de6dc6",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "type": "file_push"
+    }
+   ]
+  },
+  {
+   "bytes": "platform bytes",
+   "marks": {
+    "sat-one-0|flow-agent|workspace/ahead.txt": {
+     "in_flight_until": 0.0,
+     "machine": {
+      "exists": true,
+      "mtime_ns": 33,
+      "size": 3
+     },
+     "mtime_ns": 500,
+     "retry_at": 30.0,
+     "size": 14,
+     "stale": false
+    }
+   },
+   "path": "<agents>/flow-agent/workspace/ahead.txt",
+   "record": null,
+   "step": "inside the backoff: served, no push",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "command_id": "<id>",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "type": "file_stat"
+    }
+   ]
+  },
+  {
+   "bytes": "platform bytes",
+   "marks": {},
+   "path": "<agents>/flow-agent/workspace/ahead.txt",
+   "record": {
+    "exists": true,
+    "mtime_ns": 7000000000,
+    "size": 14
+   },
+   "step": "past the backoff: pushed, the mark goes",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "command_id": "<id>",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "type": "file_stat"
+    },
+    {
+     "action": "write",
+     "agent_slug": "flow-agent",
+     "body": "platform bytes",
+     "command_id": "<id>",
+     "expect": {
+      "mtime_ns": 33,
+      "size": 3
+     },
+     "hash": "sha256:1f93f99bcc53f8c66af69cf4320ebddca31aaa73f8ae02b5e094636a84de6dc6",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "type": "file_push"
+    }
+   ]
+  },
+  {
+   "bytes": "platform bytes",
+   "marks": {},
+   "path": "<agents>/flow-agent/workspace/ahead.txt",
+   "record": {
+    "exists": true,
+    "mtime_ns": 7000000000,
+    "size": 14
+   },
+   "step": "no mark: the record the ack left fast-paths",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "command_id": "<id>",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "type": "file_stat"
+    }
+   ]
+  },
+  {
+   "bytes": "platform bytes",
+   "marks": {},
+   "path": "<agents>/flow-agent/workspace/ahead.txt",
+   "record": {
+    "exists": true,
+    "mtime_ns": 7000000000,
+    "size": 14
+   },
+   "step": "no baseline: served and pushed",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "command_id": "<id>",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "type": "file_stat"
+    },
+    {
+     "action": "write",
+     "agent_slug": "flow-agent",
+     "body": "platform bytes",
+     "command_id": "<id>",
+     "expect": {
+      "mtime_ns": 7000000000,
+      "size": 14
+     },
+     "hash": "sha256:1f93f99bcc53f8c66af69cf4320ebddca31aaa73f8ae02b5e094636a84de6dc6",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "type": "file_push"
+    }
+   ]
+  },
+  {
+   "bytes": "platform bytes",
+   "marks": {},
+   "path": "<agents>/flow-agent/workspace/ahead.txt",
+   "record": {
+    "exists": true,
+    "mtime_ns": 7000000000,
+    "size": 14
+   },
+   "step": "a later platform write drops the mark",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "command_id": "<id>",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "type": "file_stat"
+    }
+   ]
+  },
+  {
+   "bytes": "machine wins",
+   "marks": {},
+   "path": "<agents>/flow-agent/workspace/ahead.txt",
+   "record": {
+    "exists": true,
+    "mtime_ns": 44,
+    "size": 12
+   },
+   "step": "the machine changed after a stale refusal: its copy wins, the save is kept",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "command_id": "<id>",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "type": "file_stat"
+    },
+    {
+     "agent_slug": "flow-agent",
+     "path": "workspace/ahead.txt",
+     "path_kind": "agent_tree",
+     "request_id": "<id>",
+     "type": "file_pull"
+    }
+   ]
+  }
+ ]
+}

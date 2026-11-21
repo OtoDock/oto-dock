@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # OtoDock's admin command line: sign-in recovery when nobody can sign in,
-# support information for a bug report, and the platform's background jobs.
+# support information for a bug report, the platform's background jobs, and
+# the wait for open work before a restart or an update.
 #
 #   bash otodock-admin.sh user reset-password you@example.com
 #   bash otodock-admin.sh user reset-password you@example.com --password-stdin
@@ -9,6 +10,10 @@
 #   bash otodock-admin.sh support-info
 #   bash otodock-admin.sh jobs list
 #   bash otodock-admin.sh jobs run recover-bin-reap
+#   bash otodock-admin.sh status
+#   bash otodock-admin.sh compute [--wait SECONDS]
+#   bash otodock-admin.sh drain [--bound SECONDS] [--away SECONDS] [--quiet] [--probe]
+#   bash otodock-admin.sh resume
 #
 # A Docker install: run it in the install folder, the one holding .env and
 # docker-compose.yml (fetch it there with
@@ -25,7 +30,9 @@
 # --password-stdin reads the new password from stdin; typed at a terminal it
 # is asked twice and never echoed. OTODOCK_ADMIN_MODE=docker|source picks the
 # branch; OTODOCK_COMPOSE_PROJECT names the compose project (default otodock).
-# Exit status: 0 done, 1 refused, 2 usage.
+# Exit status: 0 done, 1 refused, 2 usage; for status, drain and resume also 3
+# when no server runs (no container on a Docker install) and 4 when it is older
+# than 2.0 (a Docker install's older command line answers 2).
 set -euo pipefail
 
 fail() { echo "otodock-admin: $*" >&2; exit 1; }
@@ -103,10 +110,12 @@ fi
 case "$MODE" in
     docker)
         if [ -z "$CID" ]; then
-            fail "no running otodock-proxy container belongs to this install (project $PROJECT).
+            case "${1:-}" in status|drain|resume) not_running=3 ;; *) not_running=1 ;; esac
+            echo "otodock-admin: no running otodock-proxy container belongs to this install (project $PROJECT).
   Start the stack (docker compose up -d) and run this again. While the platform
   cannot start, run it from the install folder with the database up:
-    docker compose run --rm --no-deps --entrypoint $CONTAINER_PROXY/venv/bin/python otodock-proxy $CONTAINER_PROXY/admin_cli.py <command>"
+    docker compose run --rm --no-deps --entrypoint $CONTAINER_PROXY/venv/bin/python otodock-proxy $CONTAINER_PROXY/admin_cli.py <command>" >&2
+            exit "$not_running"
         fi
         docker exec "$CID" test -f "$CONTAINER_PROXY/admin_cli.py" \
             || fail "this install's platform has no admin command line: it needs OtoDock 1.9.0 or later (upgrade.sh)"

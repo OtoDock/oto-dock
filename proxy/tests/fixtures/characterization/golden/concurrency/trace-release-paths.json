@@ -1,0 +1,180 @@
+[
+ {
+  "parked": 0,
+  "result": 0,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 0,
+    "task": 1
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 10,
+    "reserved_mb": 3000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 1
+   }
+  },
+  "step": "a fresh slot is spared, a task is never touched"
+ },
+ {
+  "parked": 0,
+  "result": false,
+  "stats": {
+   "by_surface": {
+    "chat": 2,
+    "meeting": 0,
+    "phone": 0,
+    "task": 1
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 3,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 2,
+    "fit_light": 10,
+    "reserved_mb": 3000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 1
+   }
+  },
+  "step": "a live session keeps its slot"
+ },
+ {
+  "parked": 0,
+  "result": true,
+  "stats": {
+   "by_surface": {
+    "chat": 1,
+    "meeting": 0,
+    "phone": 0,
+    "task": 1
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 2,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 3,
+    "fit_light": 15,
+    "reserved_mb": 2000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 1
+   }
+  },
+  "step": "an orphan gives it up"
+ },
+ {
+  "parked": 0,
+  "result": false,
+  "stats": {
+   "by_surface": {
+    "chat": 1,
+    "meeting": 0,
+    "phone": 0,
+    "task": 1
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 2,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 3,
+    "fit_light": 15,
+    "reserved_mb": 2000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 1
+   }
+  },
+  "step": "nothing left to give up"
+ },
+ {
+  "parked": 0,
+  "result": {
+   "closed": [
+    "live"
+   ],
+   "seats": [
+    "live"
+   ]
+  },
+  "stats": {
+   "by_surface": {
+    "chat": 0,
+    "meeting": 0,
+    "phone": 0,
+    "task": 1
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 1,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 4,
+    "fit_light": 20,
+    "reserved_mb": 1000,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 1
+   }
+  },
+  "step": "a reap frees slot and seat"
+ },
+ {
+  "parked": 0,
+  "result": {
+   "closed": [
+    "live",
+    "job"
+   ],
+   "seats": [
+    "live",
+    "job"
+   ]
+  },
+  "stats": {
+   "by_surface": {
+    "chat": 0,
+    "meeting": 0,
+    "phone": 0,
+    "task": 0
+   },
+   "compute": [],
+   "satellites": [],
+   "sessions": {
+    "active": 0,
+    "available_mb": 100000,
+    "budget_mb": 5000,
+    "fit_heavy": 5,
+    "fit_light": 25,
+    "reserved_mb": 0,
+    "total_mb": 8000
+   },
+   "tasks": {
+    "active": 0
+   }
+  },
+  "step": "a failed close frees them too"
+ }
+]

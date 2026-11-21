@@ -9,7 +9,7 @@ import type {
   LocationRequestFrame, McpCostFrame, MediaFailedFrame, MediaProcessingFrame, MetadataFrame,
   NotificationCountFrame, NotificationFrame, NotificationSilentFrame, PermissionPromptFrame,
   PermissionResolvedFrame, PromptRetiredFrame,
-  PlanModeFrame, PlanReviewFrame, PlanStatusFrame, PreWarmupReadyFrame, QuestionFrame,
+  PlanModeFrame, PlanReviewFrame, PlanStatusFrame, PreWarmupReadyFrame, PreWarmupRefusedFrame, QuestionFrame,
   SettingsCardFrame, ActionCardFrame, ListCardFrame, ScheduleWakeFrame, ShareInboxFrame,
   QueueRemovedFrame, QueueSentFrame, QueuedFrame, SatelliteUpdateFailedFrame,
   SatelliteUpdatedFrame, SatelliteUpdatingFrame, ServerTurnStartFrame, SteeredFrame, SwitchEngineDeniedFrame,
@@ -149,7 +149,9 @@ export interface WsCallbacks {
   onSatelliteUpdated?: (data: SatelliteUpdatedFrame) => void
   onSatelliteUpdateFailed?: (data: SatelliteUpdateFailedFrame) => void
   onPreWarmupReady?: (data: PreWarmupReadyFrame) => void
-  onModeChanged?: (mode: string) => void
+  onPreWarmupRefused?: (data: PreWarmupRefusedFrame) => void
+  /** `refusal`: why a live terminal took no pick (the mode is the chat's own). */
+  onModeChanged?: (mode: string, refusal?: string) => void
   onExecutionModeChanged?: (data: ExecutionModeChangedFrame) => void
   onModelChanged?: (model: string) => void
   onChatHistory?: (data: ChatHistoryFrame) => void

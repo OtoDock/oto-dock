@@ -12,10 +12,14 @@ documented at [docs.otodock.io](https://docs.otodock.io).
 - **The proxy** is the platform core, in `proxy/`. It is a FastAPI
   application on Python 3.13. It owns sessions, the security model,
   scheduling, MCP wiring and files, and it serves the built dashboard.
+  It starts no session, tool or build itself. Every Claude Code and Codex
+  session runs on a compute machine or on a paired computer.
   PostgreSQL is the only service it requires. Its entry point is
-  `proxy/app.py`. Startup and shutdown live in `proxy/startup.py`. The proxy
+  `proxy/app.py`. Startup lives in `proxy/startup.py`, the periodic sweeps in
+  `proxy/startup_sweeps.py` and shutdown in `proxy/startup_shutdown.py`. The proxy
   is the hub: it answers REST under `/v1/` and its main websockets under
-  `/ws/`.
+  `/ws/`. A person's API key reaches only the public routes under `/v1/api/`
+  and the webhook fires.
 - **The dashboard** is the web app, in `dashboard/`. It is built with React
   19, Vite, TypeScript and Tailwind 4. Its entry point is
   `dashboard/src/main.tsx`. It calls the proxy's REST API under `/v1/`. One
@@ -30,9 +34,12 @@ documented at [docs.otodock.io](https://docs.otodock.io).
   it. Its rules and their tests are a Swift package in
   `dashboard/ios/OtoDockShell/`. It runs the same dashboard over the same
   sockets.
-- **The satellite** is a daemon for remote Linux, macOS and Windows
-  machines, in `satellite/`. It runs agent sessions on those machines, on
-  Python 3.10 and newer. It starts with `python -m satellite`. It keeps one
+- **The satellite** is the program on every machine that runs agent
+  sessions, in `satellite/`. That is the compute machine OtoDock comes with,
+  any compute machine an admin adds on another server, and the Linux, macOS
+  and Windows computers people pair. It runs on Python 3.10 and newer. A
+  paired computer starts it with `python -m satellite`, and a compute machine
+  through `proxy/compute_start.py`. It keeps one
   outbound websocket to the proxy, `/v1/satellite`, and the hook and MCP HTTP
   calls ride it back. [`satellite/PROTOCOL.md`](satellite/PROTOCOL.md)
   describes that wire.
@@ -51,22 +58,28 @@ documented at [docs.otodock.io](https://docs.otodock.io).
 - **The first-party MCPs** live in `mcps/custom/`, one MCP server per folder.
   Each folder has a `manifest.json`. The manifests follow the schema in
   `mcps/manifest.schema.json`. The parts the container MCPs share are in
-  `mcps/_shared/`. An MCP runs inside a session's sandbox over stdio, or as a
-  container. It calls back to the proxy over HTTP with the session's token.
+  `mcps/_shared/`. A stdio MCP's program runs beside its session: in the
+  session's sandbox on a compute machine, as a plain process on a paired
+  computer. By default it starts at the agent's first call. A container MCP runs beside the
+  proxy and stops when nobody uses it. An MCP calls back to the proxy over
+  HTTP with the session's token.
 - **The catalogs** install at run time, through `proxy/services/community/`.
   Each kind has its schema beside the manifest one:
   `mcps/agent-template.schema.json` (an agent template's folder, read as one
   document) and `mcps/skill.schema.json` (a skill's front matter), read
   through `proxy/storage/catalog_schema.py`.
   Their sources are the OtoDock/community-mcps, community-skills and
-  community-agents repositories. Community MCPs install into
-  `mcps/community/`. Skills install into `mcps/skills/`.
+  community-agents repositories. The proxy keeps a community MCP's sources
+  in `mcps/community/`, and a compute machine builds and keeps the MCP.
+  Skills install into `mcps/skills/`.
 
 ### Deployment
 
 - `docker-compose.yml` is the default self-hosted stack, with everything in
-  containers. It runs PostgreSQL, the proxy, a socket proxy, the file tools
-  container and Collabora. The proxy runs from the release image as a
+  containers. It runs PostgreSQL, the proxy, the compute machine
+  (`otodock-compute`, where Claude Code and Codex sessions run), a socket
+  proxy, the file tools container and Collabora. The proxy runs from the
+  release image as a
   non-root user (uid 1000). It starts MCP containers through the socket
   proxy. The installer is `scripts/install.sh`. It writes the stack's `.env`
   and starts it. `scripts/upgrade.sh` moves an install to a new release.
@@ -76,7 +89,9 @@ documented at [docs.otodock.io](https://docs.otodock.io).
   pulling them. `scripts/compose.sh` stacks it and passes it the pinned
   versions.
 - `docker-compose.t1.yml` runs PostgreSQL alone. It serves a proxy that runs
-  on the host from the checkout, as `scripts/dev-setup.sh` sets it up.
+  on the host from the checkout, as `scripts/dev-setup.sh` sets it up. The
+  compute machine runs beside that proxy as a unit of its own,
+  `proxy/compute.service`.
 
 Every pinned version lives in one place, `VERSIONS.md`. That covers the
 runtimes, the images, the engine CLIs and the satellite.
@@ -113,8 +128,8 @@ happens, then where it happens in the code.
    `_create_or_resume_session`, except the pre-warm a new chat gets before
    its first message. The function builds the session's configuration and
    prompt, takes a slot from the admission gate, resolves the engine and
-   starts it. The function lives in the warmup controller,
-   `proxy/ws/dashboard_warmup.py`. The configuration and the prompt come from
+   starts it. The function lives in the warmup controller's spawn half,
+   `proxy/ws/dashboard_warmup_spawn.py`. The configuration and the prompt come from
    `proxy/core/config/config_builder.py`. The admission gate is
    `proxy/core/concurrency.py`.
 5. **Resolve the engine and where it runs.** An agent lists the engines it
@@ -123,30 +138,35 @@ happens, then where it happens in the code.
    `proxy/services/engines/engine_resolution.py`. The page sends that engine
    when the chat starts. Without one the proxy takes the agent's default. It
    also reads the placement. A person's own machine comes first, then the
-   agent's machine, then the platform itself. A remote placement returns
-   the remote layer. An unknown engine id is refused. `get_execution_layer`
+   agent's machine, then the platform's own place, which a compute machine
+   serves. With no compute machine connected the start is refused. Every
+   Claude Code and Codex session takes the remote layer. An unknown engine
+   id is refused. `get_execution_layer`
    does this, in `proxy/core/session/session_manager.py`. The placement
    order is decided in `proxy/services/remote/remote_status.py`
    (`resolve_execution_target`), and `proxy/storage/remote_store.py` holds
    the paired machines.
 6. **Start the engine in a sandbox.** For Claude Code, the CLI layer
-   resolves the sandbox, and a persistent session spawns the CLI inside it.
+   plans the start, and the compute machine's satellite starts the CLI in
+   the sandbox it renders from that plan.
    The sandbox is bubblewrap in its own network namespace. That namespace
    reaches the public internet but not the host, the local network or the
    cloud metadata address. The only local doors it opens are the proxy's
    port and the hosts the session's MCPs and local models need. The hook
    scripts are written into the session's config folder first. Codex has
    the same shape around a `codex app-server` daemon. The CLI layer is
-   `CLIExecutionLayer`, in `proxy/core/layers/cli/layer.py`. The session is
-   `PersistentSession`, in `proxy/core/layers/cli/session.py`. The sandbox
-   wrapper is `proxy/core/sandbox/sandbox.py`.
+   `CLIExecutionLayer`, in `proxy/core/layers/cli/layer.py`. The plan is
+   `ClaudeSpawn`, in `proxy/core/layers/cli/spawn.py`. The sandbox's
+   description is `proxy/core/sandbox/sandbox.py`, and its one render is
+   `proxy/core/sandbox/sandbox_render.py`.
 7. **Run the turn.** A producer holds the session's lock and iterates the
    layer's `send_message`. Between turns it drains the queued messages.
    `_start_new_stream` starts the producer, in
    `proxy/ws/dashboard_chat_stream.py`.
 8. **Translate.** Each engine's native output becomes the common event
-   types. The direct engine translates in process. Local and remote sessions
-   share the translators. The event types are in
+   types. The direct engine translates in the proxy. Claude Code's and
+   Codex's translators run in the proxy too, over the lines a machine sends.
+   The event types are in
    `proxy/core/events/common_events.py`. Claude Code's translator is
    `ClaudeCLIEventTranslator`, in `proxy/core/layers/cli/translator.py`.
    Codex's is `CodexEventTranslator`, in
@@ -166,11 +186,12 @@ happens, then where it happens in the code.
     module is `proxy/storage/chat/db_chats.py`. The table's schema is in
     `proxy/storage/chat/schema.py`.
 
-On a remote machine, steps 6 and 7 go through the remote layer instead. That
-layer is a placement rather than an engine. It sends `start_session` and
-`send_message` frames to the machine's satellite. The satellite spawns the
-CLI as a plain subprocess and forwards its output verbatim. Steps 8 to 11 are
-the same. The remote layer is `RemoteExecutionLayer`, in
+Every Claude Code and Codex session takes the remote layer at steps 6 and 7.
+That layer is a placement rather than an engine. It sends `start_session` and
+`send_message` frames to the machine's satellite. On a compute machine the
+satellite starts the CLI in the sandbox. On a paired computer it starts it as
+a plain subprocess. Either way it forwards the output verbatim. Steps 8 to 11
+are the same. The remote layer is `RemoteExecutionLayer`, in
 `proxy/core/remote/remote_execution.py`. The satellite's connection is
 `proxy/core/remote/satellite_connection.py`.
 
@@ -189,8 +210,9 @@ the same. The remote layer is `RemoteExecutionLayer`, in
   - `visibility.py` holds the agent visibility modes.
 - **The execution layer.** `ExecutionLayer` is the base every engine
   implements. Its methods start a session, send a turn, abort, steer and
-  compact. A start is given an `AgentConfig`. Both are defined in
-  `proxy/core/execution_layer.py`.
+  compact. A start is given an `AgentConfig`. `ExecutionLayer` is in
+  `proxy/core/execution_layer.py`, `AgentConfig` in
+  `proxy/core/engine_records.py`.
 - **The engine descriptor.** Each engine declares what it is and what it can
   do in a `LayerCapabilities` constant, next to its layer. The descriptor
   covers identity, runtime, behaviour, model policy, authentication and
@@ -199,7 +221,8 @@ the same. The remote layer is `RemoteExecutionLayer`, in
   - `proxy/core/layers/cli/` is Claude Code.
   - `proxy/core/layers/codex/` is Codex.
   - `proxy/core/layers/direct/` is the direct engine. It makes direct model
-    API calls and always runs locally.
+    API calls from the proxy. Its file tools and tool programs run in the
+    session's sandbox on a compute machine.
   - `proxy/core/layers/providers/` holds the direct engine's provider
     adapters.
 - **Remote placement.** `proxy/core/remote/` holds the remote layer and the
@@ -232,9 +255,12 @@ the same. The remote layer is `RemoteExecutionLayer`, in
   - `subagent_tracker.py` tells the proxy a sub-agent finished.
   - `stop_tracker.py` tells the proxy the turn ended and asks whether it may
     end.
-  - `credential_helper.py` hands `git` and `gh` the account token for each
-    command, so no environment or file holds it. It asks with the session's
-    command-line token, which the shell holds and no MCP server is given.
+  - `credential_helper.py` answers `git` and `gh` for each command, so no
+    environment or file holds the account token. It hands them a
+    placeholder, and the credential exit puts the token into the request on
+    its way out. A paired macOS or Windows computer gets the token itself,
+    for that command alone. The helper asks with the session's command-line
+    token, which the shell holds and no MCP server is given.
 - **The decision.** The gate posts to `/v1/hooks/permission`. There,
   `decide_tool_permission` is the single authority. It checks the path
   policy and the revocations first. Then it applies the session's permission
@@ -275,13 +301,17 @@ the same. The remote layer is `RemoteExecutionLayer`, in
 
 ### MCP servers and credentials
 
-- **The registry.** `proxy/services/mcp/mcp_registry.py` scans the manifests
-  at startup. It builds each session's MCP configuration, as JSON for Claude
+- **The registry.** `proxy/services/mcp/mcp_registry.py` is the surface of the
+  modules beside it. `mcp_manifest_store.py` scans the manifests at startup, and
+  `mcp_session_config.py` builds each session's MCP configuration, as JSON for Claude
   Code and as TOML for Codex.
 - **The broker.** `proxy/core/credentials/mcp_broker.py` holds a session's
-  MCP secrets in memory. A stdio MCP fetches its own secrets when it spawns,
+  MCP secrets in memory. A stdio MCP fetches its own secrets when it starts,
   from `/v1/hooks/mcp-credentials`. It uses a token scoped to that session
-  and that server, never the session's own token.
+  and that server, never the session's own token. For a key its manifest
+  declares for the credential exit it gets a placeholder, and the exit
+  (`proxy/core/credentials/exit_relay.py`) writes the key into the request on
+  its way out.
 - **The gateway.** `proxy/core/credentials/mcp_gateway.py` adds an HTTP
   MCP's vendor credential to each request on its way out, through
   `/v1/mcp-gateway/{mcp}/...`. The session never sees that credential. A
@@ -323,8 +353,9 @@ the same. The remote layer is `RemoteExecutionLayer`, in
   - `task_run.py` holds the steps of one admitted run, from its start to
     its result.
   - `trigger_manager.py` registers, validates and fires triggers.
-- **Apps.** `proxy/services/apps/` runs each app's server in its own
-  sandbox, from a hash-checked release copy. `proxy/api/apps/app_proxy.py`
+- **Apps.** `proxy/services/apps/` runs each app's server on the compute
+  machine OtoDock comes with, in a sandbox of its own, from a hash-checked
+  release copy. `proxy/api/apps/app_proxy.py`
   serves the apps' routes. Its main modules for the servers are these:
   - `app_supervisor.py` runs one process per app server.
   - `app_sandbox.py` builds the sandbox an app server runs in.
@@ -335,11 +366,11 @@ the same. The remote layer is `RemoteExecutionLayer`, in
 
 ### The satellite's shared modules
 
-`satellite/_vendored/` holds byte-for-byte copies of seven proxy modules. They
-are the MCP installer, the stdio path interceptor, the Codex app-server
-client, its approval bridge, the terminal query strips, the agent tree
-layout and the event-loop watchdog. `scripts/sync-satellite-code.sh` copies
-them. It pins their hashes in
+`satellite/_vendored/` holds byte-for-byte copies of the proxy modules a
+machine runs. Among them are the MCP installer, the stdio path interceptor,
+the Codex app-server client and its approval bridge, the sandbox's one
+render, and the credential exit's relay and authority.
+`scripts/sync-satellite-code.sh` copies them. It pins their hashes in
 `satellite/config.py`, and the satellite refuses to start on a mismatch.
 
 The host OS table is a twin instead. The proxy defines it in
@@ -397,8 +428,9 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `mcps/` | first-party MCP servers, shared helpers, the catalog's installed skill packages |
 | `phone/` | phone-call service: telephony, STT/TTS pipeline, proxy client |
 | `proxy/` | FastAPI backend, the platform core |
+| `rig/` | the end-to-end test rig: a fresh install, the scripted and live layers, the claims, the upgrade run, the scripted model server |
 | `satellite/` | remote-machine agent (Windows / Linux / macOS) |
-| `scripts/` | install and operations scripts |
+| `scripts/` | install and operations scripts, and the writing check every repository runs (prose/) |
 
 ### `audio/`
 
@@ -525,6 +557,7 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `proxy/api/notebook/` | the Notebook: the delegation tools' two routes, the agent and department pages' reads, a manager's delete |
 | `proxy/api/notifications/` | notifications |
 | `proxy/api/phone/` | phone servers, routes, call log, caller data, the call relay, the Twilio relay, the call tools' endpoint |
+| `proxy/api/public/` | the public routes a person's API key reaches (auth/api_key_endpoints.py), their typed answers, their description |
 | `proxy/api/remote/` | remote machines and targets |
 | `proxy/api/sessions/` | session control, plans, models, health |
 | `proxy/api/settings/` | the settings catalog a person's own session reads, and the card a setting draws in the chat |
@@ -570,6 +603,7 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `proxy/services/cards/` | cards in the chat: the words, the action catalog, the draw and the click |
 | `proxy/services/checks/` | checks: documents and their index, the changed set, the evaluator and the four kinds, the judge's spend |
 | `proxy/services/community/` | community catalogs: MCPs, agents (the template loader and its signatures), department sets and their installer, skills |
+| `proxy/services/containers/` | a Docker tool's container: the door every call passes, its sleep and its wake, its compose files |
 | `proxy/services/delegation/` | agent-to-agent delegation |
 | `proxy/services/departments/` | placing an agent in a department, and the department-to-delegation-edge compiler |
 | `proxy/services/engines/` | engine subscriptions, the pool, local endpoints, and the engine each person's chats and tasks take |
@@ -594,6 +628,7 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | Directory | What it holds |
 |---|---|
 | `proxy/storage/agents/` | agents, agent memory, departments, department set installs |
+| `proxy/storage/apps/` | the apps domain's schema (its stores sit one level up, in db_apps and db_app_*) |
 | `proxy/storage/automation/` | tasks, triggers, notifications, webhook subscriptions |
 | `proxy/storage/billing/` | subscriptions and usage |
 | `proxy/storage/cards/` | the cards a tool draws and the clicks a person makes |

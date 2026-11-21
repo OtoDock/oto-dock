@@ -24,9 +24,10 @@ from services.community import (
     community_installer as ci,
     mcp_source_swap as swap,
 )
-from services.mcp import mcp_registry
+from services.mcp import mcp_manifest_store, mcp_registry
 from storage.identity import credential_store
 from storage.mcp import mcp_store, mcp_update_state_store as store
+from tests._compute import builds
 
 # ── fixtures ───────────────────────────────────────────────────────
 
@@ -35,7 +36,7 @@ def mcps_dir(temp_db, tmp_path, monkeypatch):
     root = tmp_path / "opt" / "otodock" / "mcps"
     (root / "community").mkdir(parents=True)
     monkeypatch.setattr(config, "MCPS_DIR", root)
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     return root
 
 
@@ -53,7 +54,7 @@ def fake_package_install(monkeypatch):
             ok=True, log="", version_hash="h", resolved_version="1.0.0",
         )
 
-    monkeypatch.setattr(ci.mcp_installer, "install_mcp", _install)
+    builds(monkeypatch, install=_install)
     return state
 
 
@@ -127,13 +128,21 @@ async def test_the_accepted_hash_pins_the_catalog_manifest(mcps_dir, tmp_path, f
 
 
 @pytest.mark.asyncio
-async def test_a_switch_drops_the_runtime_dirs_and_an_update_keeps_them(mcps_dir, tmp_path, fake_package_install):
+async def test_a_switch_and_an_update_drop_the_runtime_dirs_and_a_failed_update_restores_them(
+        mcps_dir, tmp_path, fake_package_install):
+    """The platform keeps no environment of a tool a machine builds."""
     await _install(tmp_path, _packaged("npm:pkg"), "a")
     target = _target(mcps_dir)
     _plant_runtime_dirs(target)
-    await _install(tmp_path, _packaged("npm:pkg"), "b")
+    fake_package_install["fail"] = True
+    with pytest.raises(HTTPException):
+        await _install(tmp_path, _packaged("npm:pkg"), "b")
     assert (target / "node_modules" / "marker").is_file() and (target / "venv" / "marker").is_file()
-    await _install(tmp_path, _packaged("npm:other"), "c", accepted_source=("npm", "other"))
+    fake_package_install["fail"] = False
+    await _install(tmp_path, _packaged("npm:pkg"), "c")
+    assert not (target / "node_modules").exists() and not (target / "venv").exists()
+    _plant_runtime_dirs(target)
+    await _install(tmp_path, _packaged("npm:other"), "d", accepted_source=("npm", "other"))
     assert not (target / "node_modules").exists() and not (target / "venv").exists()
     assert not target.with_suffix(".bak").exists()
 
@@ -360,8 +369,8 @@ async def test_a_failure_after_the_install_ends_switched_with_the_error(rig, mon
 @pytest.mark.asyncio
 async def test_an_installer_error_past_the_point_of_no_return_ends_switched(rig, monkeypatch):
     """An installer error after the folder is replaced and its backup gone
-    (a T2 compose refusal, a failed container start): the MCP runs from the
-    new source, so the switch finishes on it with the error noted."""
+    (a failure after the install's own steps): the MCP runs from the new
+    source, so the switch finishes on it with the error noted."""
     state = await rig()
     credential_store.set_infra_credentials("pkg-mcp", {"USER": "infra-u"})
     real = ci.install_from_catalog
@@ -532,8 +541,8 @@ async def test_reconcile_restores_the_backup_of_an_interrupted_switch(rig, mcps_
     assert state["installed_calls"] == []
     # The restore rescanned under this loop's rescan lock, not beside it.
     import asyncio
-    assert mcp_registry._rescan_lock is not None
-    assert mcp_registry._rescan_lock[0] is asyncio.get_running_loop()
+    assert mcp_manifest_store._rescan_lock is not None
+    assert mcp_manifest_store._rescan_lock[0] is asyncio.get_running_loop()
 
 
 @pytest.mark.asyncio
@@ -554,21 +563,70 @@ async def test_reconcile_finishes_an_interrupted_switch_past_its_install(rig, mc
 
 
 @pytest.mark.asyncio
-async def test_reconcile_moves_an_interrupted_switch_back_and_removes_a_stray_backup(rig, mcps_dir):
-    """A restart before any file moved: the row goes back to pending; and a
-    backup a crashed ordinary update left beside a complete folder is swept."""
+async def test_reconcile_moves_an_interrupted_switch_back_and_removes_a_backup_remnant(rig, mcps_dir):
+    """A restart before any file moved: the row goes back to pending; and
+    what a failed removal left of a backup (no manifest: no tool in it) is
+    swept, the tool as it is."""
     state = await rig()
     store.set_source_change_status("pkg-mcp", store.STATUS_SWITCHING)
     moved = await swap.reconcile_interrupted()
     assert moved == ["pkg-mcp"]
     assert store.get_source_change("pkg-mcp")["status"] == "pending"
     bak = _target(mcps_dir).with_suffix(".bak")
-    bak.mkdir()
-    (bak / "manifest.json").write_text("{}")
+    (bak / "node_modules" / "left").mkdir(parents=True)
     assert await swap.reconcile_interrupted() == []
     assert not bak.exists()
     assert mcp_registry.get_manifest("pkg-mcp").server.source == "npm:pkg@1.0.0"
     assert state["installed_calls"] == []
+
+
+def _died_mid_update(target: Path, *, stripped_only: bool) -> Path:
+    """What an update leaves when the platform dies in its middle: the old
+    tool in ``<tool>.bak``, its keys and data with it (they also stay in the
+    folder), and the folder half the new one, or stripped and not yet
+    copied."""
+    import shutil
+    bak = target.with_suffix(".bak")
+    (target / "keys").mkdir(exist_ok=True)
+    (target / "keys" / "api.key").write_text("secret\n")
+    shutil.copytree(target, bak, symlinks=True)
+    for item in target.iterdir():
+        if item.name != "keys":
+            shutil.rmtree(item) if item.is_dir() else item.unlink()
+    if not stripped_only:
+        (target / "manifest.json").write_text(json.dumps({"name": "pkg-mcp", "version": "2.0.0"}))
+        (target / "README.md").write_text("Pkg b, half built.\n")
+    return bak
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stripped_only", [False, True])
+async def test_an_update_the_platform_died_in_comes_back_at_the_next_start(rig, mcps_dir, stripped_only):
+    """A backup beside a community tool whose install lock is free is an
+    update that never finished (a finished one removes it): the old tool
+    comes back, with the keys the folder kept, never the half-built one."""
+    await rig()
+    target = _target(mcps_dir)
+    bak = _died_mid_update(target, stripped_only=stripped_only)
+    mcp_registry.scan_manifests()
+    assert await swap.reconcile_interrupted() == []
+    assert not bak.exists()
+    assert (target / "README.md").read_text() == "Pkg a.\n"
+    assert (target / "keys" / "api.key").read_text() == "secret\n"
+    assert mcp_registry.get_manifest("pkg-mcp").server.source == "npm:pkg@1.0.0"
+
+
+@pytest.mark.asyncio
+async def test_a_backup_is_never_read_as_the_tool_and_an_install_running_keeps_it(rig, mcps_dir):
+    from core.credentials import catalog_install_registry
+    await rig()
+    target = _target(mcps_dir)
+    bak = _died_mid_update(target, stripped_only=True)
+    mcp_registry.scan_manifests()
+    assert mcp_registry.get_manifest("pkg-mcp") is None  # the backup is no tool
+    async with catalog_install_registry.lock_for("pkg-mcp"):
+        assert await swap.reconcile_interrupted() == []
+        assert bak.is_dir() and not (target / "README.md").exists()
 
 
 @pytest.mark.asyncio
@@ -592,8 +650,10 @@ async def test_an_unexpected_error_during_the_install_rolls_back_and_restarts(
         real_apply(src, target, is_update, backup, **kw)
         raise OSError("disk full")
     monkeypatch.setattr(ci, "_apply_extracted_files", _half_copy)
-    with pytest.raises(OSError):
+    with pytest.raises(HTTPException) as ei:
         await _install(tmp_path, _packaged("npm:other"), "b", accepted_source=("npm", "other"))
+    assert ei.value.status_code == 500
+    assert ei.value.detail.startswith("The install failed and nothing was changed.\n\ndisk full")
     assert calls == ["stop", "start"]
     target = _target(mcps_dir)
     assert (target / "README.md").read_text() == "Pkg a.\n"
@@ -714,7 +774,7 @@ def test_delete_takes_an_interrupted_switch_s_row_with_the_install(mcps_dir, tmp
 
 
 def test_update_state_reads_the_persisted_check(temp_db, monkeypatch):
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     r = _client(_principal("admin")).get("/v1/admin/mcps/update-state")
     assert r.status_code == 200
     assert r.json() == {"updates": {}, "checked": 0, "checked_at": "",

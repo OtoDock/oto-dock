@@ -1,0 +1,39 @@
+{
+ "args not an object": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].builder.args must be an object, got list"
+ },
+ "bad tool": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].builder.tool='mcp__X__y' must match 'mcp__<server>__<tool>' with lowercase slugs"
+ },
+ "defaults": {
+  "parsed": [
+   {
+    "builder": {
+     "tool": "mcp__x__y"
+    },
+    "template": "t"
+   }
+  ]
+ },
+ "empty tool": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].builder.tool must be a non-empty string"
+ },
+ "label not text": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].builder.account_label must be a string"
+ },
+ "timeout bool": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].builder.timeout_seconds must be an integer"
+ },
+ "timeout high": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].builder.timeout_seconds must be between 1 and 30, got 31"
+ },
+ "timeout low": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].builder.timeout_seconds must be between 1 and 30, got 0"
+ },
+ "timeout text": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].builder.timeout_seconds must be an integer"
+ },
+ "unknown key": {
+  "refused": "char-mcp: invalid agent_context block — agent_context[0].builder has unknown keys: ['retries']"
+ }
+}

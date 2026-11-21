@@ -48,3 +48,50 @@ def _refuse_real_codex_app_server(request, monkeypatch):
             f"{_REAL_CODEX_MARKER}",
             pytrace=False,
         )
+
+
+_STREAM_READS = (".stdout.read", ".stderr.read", ".stdout.readline", ".stderr.readline",
+                 ".stdout.readexactly", ".stdout.readuntil")
+
+
+@pytest.fixture(autouse=True)
+def _fake_streams_answer_bytes(monkeypatch):
+    """A fake process's stream that answers a read with anything but bytes
+    fails the test at once: an ``AsyncMock`` process answers every read
+    with a mock, never ``b""``, and a reader looping to end-of-stream on it
+    spins and records every call until the kernel ends the run (a proxy
+    test grew to 13 GB that way, 2026-11-11). Give the fake a real
+    ``asyncio.StreamReader``, fed and closed with ``feed_eof()``."""
+    from unittest import mock
+    execute = mock.AsyncMockMixin._execute_mock_call
+
+    async def _checked(self, /, *args, **kwargs):
+        result = await execute(self, *args, **kwargs)
+        if not isinstance(result, (bytes, bytearray)) and self._extract_mock_name().endswith(_STREAM_READS):
+            raise AssertionError(
+                f"{self._extract_mock_name()} answered {type(result).__name__}, not bytes: give the "
+                "fake process a real asyncio.StreamReader (feed_data, then feed_eof)")
+        return result
+    monkeypatch.setattr(mock.AsyncMockMixin, "_execute_mock_call", _checked)
+
+
+@pytest.fixture(autouse=True)
+def _no_update_claim_left():
+    """An update claimed by one test (``claim_update``) is not another's."""
+    from satellite.transport import lifecycle_update
+    lifecycle_update.release_update()
+    yield
+    lifecycle_update.release_update()
+
+
+@pytest.fixture
+def python_without_tar_filter(monkeypatch):
+    """``tarfile`` as python.org's last 3.10 for Windows has it: no
+    ``data_filter``, and an ``extractall`` that takes no ``filter``."""
+    import tarfile
+    real = tarfile.TarFile.extractall
+
+    def extractall(self, path=".", members=None, *, numeric_owner=False):
+        return real(self, path, members, numeric_owner=numeric_owner, filter="fully_trusted")
+    monkeypatch.delattr(tarfile, "data_filter")
+    monkeypatch.setattr(tarfile.TarFile, "extractall", extractall)

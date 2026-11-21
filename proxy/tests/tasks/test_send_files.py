@@ -19,6 +19,7 @@ Run: cd proxy && python -m pytest tests/tasks/test_send_files.py -v
 """
 
 import asyncio
+import hashlib
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
@@ -476,16 +477,14 @@ class _FakeSatellite:
     parent chain before asking, returns False when not connected)."""
 
     def __init__(self, tree: dict[str, bytes], *, online: bool = True,
-                 stat: bool = True, name: str = "drill-sat"):
+                 name: str = "drill-sat"):
         self.tree = dict(tree)
         self.online = online
-        self.stat = stat
         self.name = name
         self.probes: list[str] = []
         self.pulls: list[str] = []
         self.manifests = 0
         cm = MagicMock()
-        cm.satellite_supports_file_stat.side_effect = lambda mid: self.online and self.stat
         cm.stat_file = AsyncMock(side_effect=self._stat)
         cm.pull_file_to_path = AsyncMock(side_effect=self._pull)
         cm.send_command = AsyncMock(side_effect=self._command)
@@ -496,13 +495,16 @@ class _FakeSatellite:
         self.cm = cm
 
     async def _stat(self, machine_id, ref, agent_slug=""):
+        if not self.online:
+            return None
         self.probes.append(ref.value)
         data = self.tree.get(ref.value)
         if data is None:
             return {"exists": False, "size": 0, "mtime_ns": 0}
         return {"exists": True, "size": len(data), "mtime_ns": 1}
 
-    async def _pull(self, machine_id, ref, dest_path, *, agent_slug="", timeout=180.0):
+    async def _pull(self, machine_id, ref, dest_path, *, agent_slug="", timeout=180.0,
+                    hash_out=None):
         self.pulls.append(ref.value)
         if not self.online:
             return False
@@ -512,6 +514,8 @@ class _FakeSatellite:
         if data is None:
             return False
         dest.write_bytes(data)  # noqa: ASYNC240  # a test's own temporary files
+        if hash_out is not None:   # the real helper hands back the committed bytes' hash
+            hash_out.update(hash="sha256:" + hashlib.sha256(data).hexdigest(), size=len(data))
         return True
 
     async def _command(self, machine_id, msg, *, timeout=30.0, command_id=None):
@@ -731,18 +735,6 @@ class TestRemotePrefetch:
         assert exc.value.detail == "No such file or directory in your workspace: 'reprots/q3.md'"
 
     @pytest.mark.asyncio
-    async def test_old_satellite_without_stat_still_pulls(self, send_env, flow_reset):
-        sat = _FakeSatellite({f"{USER_WS}/today.md": b"fresh"}, stat=False)
-        authz = _authz(_user_session())
-        with _remote(sat):
-            unavailable = await prefetch_remote_sources(
-                "s-1", authz, ["today.md"], max_files=20,
-            )
-        assert unavailable == [] and sat.probes == []
-        assert sat.pulls == [f"{USER_WS}/today.md"]
-        assert (config.get_agent_dir(SRC) / USER_WS / "today.md").read_bytes() == b"fresh"
-
-    @pytest.mark.asyncio
     async def test_offline_satellite_degrades_to_the_platform_tree(self, send_env, flow_reset):
         sat = _FakeSatellite({f"{USER_WS}/reports/q3.md": b"never served"}, online=False)
         authz = _authz(_user_session())
@@ -815,6 +807,37 @@ class TestRemotePrefetch:
         assert cancelled.is_set()
         assert "the platform's copy was sent" in caplog.text
         assert (config.get_agent_dir(SRC) / USER_WS / "notes.md").read_text() == "notes"
+
+    @pytest.mark.asyncio
+    async def test_a_platform_copy_reached_through_a_link_is_never_reported_as_sent(
+        self, send_env, flow_reset, monkeypatch, caplog, tmp_path,
+    ):
+        """Past the budget the note names the platform's copy only when the
+        send will open it: a folder swapped for a link on the way is no
+        copy, since the send follows no link."""
+        import shutil as _shutil
+
+        from services.delegation import file_transfer
+        monkeypatch.setattr(file_transfer, "_PREFETCH_BUDGET_S", 0.2)
+        sat = _FakeSatellite({f"{USER_WS}/notes.md": b"a slow link"})
+        ws = config.get_agent_dir(SRC) / USER_WS
+        stand_in = tmp_path / "stand-in"
+        stand_in.mkdir()
+        (stand_in / "notes.md").write_text("elsewhere")
+
+        async def _endless(*_a, **_k):
+            _shutil.rmtree(ws)
+            ws.symlink_to(stand_in)
+            await asyncio.sleep(60)
+
+        sat.cm.pull_file_to_path = AsyncMock(side_effect=_endless)
+        authz = _authz(_user_session())
+        with _remote(sat), caplog.at_level("WARNING", logger="otodock"):
+            got = await asyncio.wait_for(
+                prefetch_remote_sources("s-1", authz, ["notes.md"], max_files=20), 5)
+        # Neither side can give it: the send answers that it is not there.
+        assert got == ["notes.md"]
+        assert "the platform's copy was sent" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_prefetch_defects_degrade_and_never_abort(self, send_env, flow_reset):

@@ -122,9 +122,9 @@ class TestComputeManifest:
         # fan-out push); syncing it would race the dedicated push channel.
         (cl / ".credentials.json").write_text("{}")
         (cx / "models_cache.json").write_text("{}")
-        # Runtime cruft dirs — EXCLUDE. ``ssh`` holds the per-session
-        # $OTO_SSH_KEY_DIR private keys (broker-delivered on satellites) —
-        # syncing it would persist keys on every satellite of the agent.
+        # Runtime cruft dirs — EXCLUDE. ``ssh`` holds the session's
+        # $OTO_SSH_KEY_DIR public halves, made again at every start — a copy
+        # on every satellite of the agent would only go stale.
         # ``tasks`` is the Claude Code task store (keyed by the session id
         # ``--resume`` keeps) — syncing it wiped the task list on re-warm.
         for cruft in ("projects", "tasks", "backups", "shell-snapshots", "plans", "ssh"):
@@ -845,7 +845,7 @@ class TestFileChangedInnerRouting:
     """`_apply_file_changed_inner` routing: content key present (even "") =
     inline write; absent + size>0 = chunked pull; absent + size 0 = drop."""
 
-    def _host(self, pulls):
+    def _host(self, pulls, ok=True):
         from core.remote.satellite_file_transfer import SatelliteFileTransferMixin
 
         class H(SatelliteFileTransferMixin):
@@ -855,7 +855,7 @@ class TestFileChangedInnerRouting:
             async def pull_file_to_path(self, machine_id, ref, dest,
                                         agent_slug="", timeout=0.0):
                 pulls.append(str(dest))
-                return True
+                return ok
 
         return H()
 
@@ -863,26 +863,43 @@ class TestFileChangedInnerRouting:
         import asyncio as _a
         pulls: list = []
         msg = {"path": "workspace/pkg/__init__.py", "content_b64": ""}
-        _a.run(self._host(pulls)._apply_file_changed_inner(
-            tmp_path, msg, "m1", "agent-x", "write"))
+        assert _a.run(self._host(pulls)._apply_file_changed_inner(
+            tmp_path, msg, "m1", "agent-x", "write")) is True
         assert (tmp_path / "workspace/pkg/__init__.py").exists()
         assert pulls == []
 
-    def test_large_file_routes_to_pull(self, tmp_path):
+    def test_a_delete_lands(self, tmp_path):
+        import asyncio as _a
+        (tmp_path / "workspace").mkdir()
+        (tmp_path / "workspace/gone.md").write_text("x")
+        assert _a.run(self._host([])._apply_file_changed_inner(
+            tmp_path, {"path": "workspace/gone.md"}, "m1", "agent-x", "delete")) is True
+        assert not (tmp_path / "workspace/gone.md").exists()
+
+    @pytest.mark.parametrize("ok", [True, False])
+    def test_large_file_routes_to_pull_and_answers_whether_it_landed(self, tmp_path, ok):
         import asyncio as _a
         pulls: list = []
         msg = {"path": "workspace/big.bin", "size": 999}
-        _a.run(self._host(pulls)._apply_file_changed_inner(
-            tmp_path, msg, "m1", "agent-x", "write"))
+        assert _a.run(self._host(pulls, ok)._apply_file_changed_inner(
+            tmp_path, msg, "m1", "agent-x", "write")) is ok
         assert len(pulls) == 1
         assert not (tmp_path / "workspace/big.bin").exists()
+
+    def test_a_large_file_on_a_refused_path_is_not_pulled(self, tmp_path):
+        import asyncio as _a
+        pulls: list = []
+        msg = {"path": "workspace/../big.bin", "size": 999}
+        assert _a.run(self._host(pulls)._apply_file_changed_inner(
+            tmp_path, msg, "m1", "agent-x", "write")) is False
+        assert pulls == []
 
     def test_no_content_no_size_drops(self, tmp_path):
         import asyncio as _a
         pulls: list = []
         msg = {"path": "workspace/mystery"}
-        _a.run(self._host(pulls)._apply_file_changed_inner(
-            tmp_path, msg, "m1", "agent-x", "write"))
+        assert _a.run(self._host(pulls)._apply_file_changed_inner(
+            tmp_path, msg, "m1", "agent-x", "write")) is False
         assert pulls == []
         assert not (tmp_path / "workspace/mystery").exists()
 
@@ -949,13 +966,14 @@ class TestManifestCapAndHashCache:
             _os.utime(f, (old, old))
         return d
 
-    def test_max_file_size_override_excludes(self, tmp_path):
+    def test_the_sync_cap_excludes(self, tmp_path, monkeypatch):
+        from core.remote import file_sync as fs
+
         d = self._tree(tmp_path)
         paths_all = {e.path for e in compute_manifest(d)}
         assert {"workspace/small.txt", "workspace/big.bin"} <= paths_all
-        # The per-machine override (old satellite) drops the big file even
-        # though the config-driven MAX_FILE_SIZE would include it.
-        paths_capped = {e.path for e in compute_manifest(d, max_file_size=50)}
+        monkeypatch.setattr(fs, "MAX_FILE_SIZE", 50)
+        paths_capped = {e.path for e in compute_manifest(d)}
         assert "workspace/small.txt" in paths_capped
         assert "workspace/big.bin" not in paths_capped
 
@@ -968,13 +986,13 @@ class TestManifestCapAndHashCache:
 
         d = self._tree(tmp_path)
         calls = {"n": 0}
-        real = fs._hash_file
+        real = fs._hash_fd
 
-        def _counting(path):
+        def _counting(fd):
             calls["n"] += 1
-            return real(path)
+            return real(fd)
 
-        monkeypatch.setattr(fs, "_hash_file", _counting)
+        monkeypatch.setattr(fs, "_hash_fd", _counting)
         fs._HASH_CACHE.clear()
 
         first = compute_manifest(d)
@@ -1009,13 +1027,13 @@ class TestManifestCapAndHashCache:
         fs.prime_hash_cache(f, expected)
 
         calls = {"n": 0}
-        real = fs._hash_file
+        real = fs._hash_fd
 
-        def _counting(path):
+        def _counting(fd):
             calls["n"] += 1
-            return real(path)
+            return real(fd)
 
-        monkeypatch.setattr(fs, "_hash_file", _counting)
+        monkeypatch.setattr(fs, "_hash_fd", _counting)
         entries = compute_manifest(d)
         assert [e.hash for e in entries] == [expected]
         assert calls["n"] == 0  # primed — never re-hashed
@@ -1043,3 +1061,28 @@ def test_real_venv_and_dependency_dirs_never_enter_the_manifest(tmp_path):
 
     paths = {e.path for e in compute_manifest(agent_dir, target_role="manager")}
     assert paths == {"workspace/app/index.js", "workspace/venv/notes.md"}
+
+
+class TestReplacedNotice:
+    """The words a person reads when a conflict replaced their version."""
+
+    def test_one_file_names_it_and_the_recover_bin(self):
+        from core.remote.file_sync import replaced_notice
+        assert replaced_notice(["notes.md"]) == (
+            "Recover your file",
+            "Your version of “notes.md” was replaced by a newer version. It is in the Recover bin.",
+        )
+
+    def test_several_files_are_counted_and_three_are_named(self):
+        from core.remote.file_sync import replaced_notice
+        title, body = replaced_notice(["a.md", "b.md", "c.md", "d.md", "e.md"])
+        assert title == "Recover your files"
+        assert body == ("5 of your files were replaced by newer versions. "
+                        "They are in the Recover bin: a.md, b.md, c.md +2 more.")
+        assert replaced_notice(["a.md", "b.md"])[1].endswith("They are in the Recover bin: a.md, b.md.")
+
+    def test_no_notice_names_another_user(self):
+        from core.remote.file_sync import replaced_notice
+        for names in (["a.md"], ["a.md", "b.md"]):
+            assert "another user" not in replaced_notice(names)[1]
+            assert "other users" not in replaced_notice(names)[1]

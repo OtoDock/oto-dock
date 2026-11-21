@@ -1,0 +1,42 @@
+{
+ "chats": [],
+ "frames": [],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [],
+  "started": []
+ },
+ "results": {
+  "adopt=False": {
+   "execution_target": "compute-0123456789ab",
+   "fallback_reason": null,
+   "interactive": true,
+   "session_id": "<id1>",
+   "viewed": [
+    null,
+    false,
+    ""
+   ]
+  },
+  "adopt=True": {
+   "execution_target": "compute-0123456789ab",
+   "fallback_reason": null,
+   "interactive": true,
+   "session_id": "<id1>",
+   "viewed": [
+    "<id1>",
+    true,
+    "compute-0123456789ab"
+   ]
+  }
+ },
+ "slots": {
+  "acquired": [],
+  "released": []
+ }
+}

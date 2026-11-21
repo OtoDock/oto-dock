@@ -48,6 +48,7 @@ from ws.dashboard_chat_text import (
     MACHINE_BUSY_NOT_SENT,
     MACHINE_GONE,
     MACHINE_GONE_NOT_SENT,
+    NO_COMPUTE_NOT_SENT,
     SESSION_FILES_UNREAD_NOT_SENT,
 )
 
@@ -58,6 +59,27 @@ else:
     _Host = object
 
 logger = logging.getLogger("otodock")
+
+
+def _built_where_it_starts(session_id: str | None, exec_path: str) -> bool:
+    """Whether a pre-warm runs where a new chat on the platform's place starts
+    now: in the proxy while no compute machine serves, on the compute machine
+    that serves it otherwise (``compute_placement_for``, the builders' own
+    answer). A pre-warm made before the compute machine signed in, or on one
+    that left, is not reused: one person's sessions stay on one side. With
+    several compute machines the balancer is asked with the pre-warm's own
+    machine preferred: its reservation lowers that machine's room."""
+    from core.session.session_manager import compute_placement_for, live_session
+    held = live_session(session_id) if session_id else None
+    where = held.machine_id if held is not None else ""
+    if held is not None and not where:
+        # A Direct LLM pre-warm is held in the proxy; its tools' machine is in
+        # its own record.
+        from core.concurrency_scan import placed_on_compute
+        where = placed_on_compute(session_id or "")
+    built = compute_placement_for(exec_path, prefer=where)
+    now = str(built.machine_id) if built is not None else ""
+    return where == now
 
 
 @dataclass
@@ -88,6 +110,16 @@ class _TailArgs:
     # checked; ``""``: the person's default) and when it was minted.
     w_place: str = ""
     w_minted_at: float = 0.0
+
+
+def machine_dropped_off(e: BaseException) -> bool:
+    """The connection layer's words for a machine that stopped answering
+    while a start waited on it (``...not connected``, ``...command timeout``):
+    an availability event, never a fault of the start."""
+    if isinstance(e, placement.NoComputeMachine):
+        return False
+    emsg = str(e)
+    return "not connected" in emsg or "command timeout" in emsg
 
 
 @dataclass
@@ -156,6 +188,14 @@ async def _restore_seed(chat_id: str, reason: str, *, best_effort: bool = False)
     await chat_writer.submit(chat_id, _job, label="seed_restore")
 
 
+def _bind_reused(chat_id: str, *, session_id: str, execution_target: str) -> None:
+    """A chat adopts a pre-warmed session: its id and pin, and where the
+    session runs (``session_manager.record_chat_place``). One chat-lane job."""
+    from core.session.session_manager import record_chat_place
+    task_store.update_chat(chat_id, session_id=session_id, execution_target=execution_target)
+    record_chat_place(chat_id, session_id)
+
+
 class WarmupTail(_Host):
     """The spawn tail's phases, in the order ``_spawn_tail`` runs them: the
     seed claim, the spawn (a resume or a fresh start for an existing chat,
@@ -172,6 +212,7 @@ class WarmupTail(_Host):
     _pre_warmed_role: "str"
     _pre_warmed_place: "str"
     _pre_warmed_sid: "str | None"
+    _pre_warmup_task: "asyncio.Task | None"
     _warmup_abort_chat: "str | None"
     layer: "ExecutionLayer | None"
     session_id: "str | None"
@@ -195,15 +236,56 @@ class WarmupTail(_Host):
         from core.session import prewarm_session_registry as _prewarm
         if await _prewarm.claim(old_sid):
             try:
-                from core.session.session_manager import layer_for_prewarm
+                from core.session.session_manager import (
+                    layer_for_prewarm,
+                    release_unheld,
+                )
                 old_layer = layer_for_prewarm(old_sid, old_exec_path)
                 if old_layer:
                     await old_layer.close_session(old_sid)
+                else:
+                    release_unheld(old_sid)
             except Exception:  # noqa: BLE001  # closing a pre-warmed session nobody will use
                 logger.debug("closing pre-warm %s failed", old_sid[:8], exc_info=True)
             from core.concurrency import release_chat_slot
             release_chat_slot(old_sid)
             logger.info("WS dashboard: pre-warmed session %s closed", old_sid[:8])
+
+    async def _default_place_now(self, agent: str, role: str,
+                                 exec_path: str) -> tuple[str, str | None]:
+        """Where a new chat of ``agent`` with no pick starts now, with the
+        resolver's reason. The platform when the chat's engine runs only
+        there (the resolver reads the agent's main engine, the build the
+        chat's own); a database error reads as the platform."""
+        from core.session.session_manager import get_layer_capabilities
+        caps = get_layer_capabilities(exec_path) if exec_path else None
+        if caps is not None and not caps.runtime.supports_remote_execution:
+            return placement.LOCAL, None
+        from ws import dashboard_warmup
+        try:
+            return await dashboard_warmup.run_db(
+                remote_status.resolve_execution_target, agent, self.user_sub, role)
+        except psycopg.Error:
+            return placement.LOCAL, None
+
+    async def _prewarm_on_its_place(self, agent: str, role: str, exec_path: str,
+                                    pick: str) -> bool:
+        """Whether the held pre-warm, which runs on the platform's place, is
+        still where its new chat would start, read as a send reads it: the
+        page's pick as checked now (a pick of the default is no pick, a
+        refused one holds nothing), else the place the agent's new chats take
+        now (its machine may have come back, or gone); and on the same side
+        of that place, the proxy or the compute machine serving it now."""
+        if pick:
+            from ws.dashboard_chat_move import new_chat_place
+            place, _label, _default, refusal = await new_chat_place(self, agent, pick, exec_path)
+            if refusal:
+                return False
+            if place:
+                return placement.is_local(place) and _built_where_it_starts(
+                    self._pre_warmed_sid, exec_path)
+        target, _reason = await self._default_place_now(agent, role, exec_path)
+        return placement.is_local(target) and _built_where_it_starts(self._pre_warmed_sid, exec_path)
 
     async def _tail_claim_seed(self, w: _TailArgs, run: _TailRun) -> None:
         """An interactive chat's DB-digest reseed claimed before the spawn; the
@@ -377,25 +459,40 @@ class WarmupTail(_Host):
         # spawn fresh. We never CLOSE a mismatched pre-warm from the tail
         # (a concurrent new-chat pre-warm may own _pre_warmed_sid by now);
         # the next pre_warm/warmup or the idle reaper reclaims a stale one.
+        # Every pre-warm runs on the platform's place (the proxy, or the
+        # compute machine serving it), so one is reused only while the chat
+        # starts there: its page's pick (checked at this send), else where
+        # the agent's new chats go now, since its machine may have come back
+        # after the pre-warm; and on the same side of that place now. Read
+        # before the wait. The wait holds for a chat going elsewhere too: the
+        # pre-warm sets the socket's layer as it starts, which must land
+        # before this chat's.
+        place_now, place_reason = w.w_place or placement.LOCAL, None
+        if not w.w_place and not run.wants_interactive:
+            place_now, place_reason = await self._default_place_now(
+                w.w_agent, w.w_role, w.effective_exec_path)
+        elsewhere = not placement.is_local(place_now)
         if w.pw_task is not None and not w.pw_task.done():
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await w.pw_task
-        # A pre-warm is local by construction: a chat its page placed on a
-        # machine reuses none, and the one this page made before the mint
-        # (for the platform) is closed now rather than left to the reaper.
-        on_machine = bool(w.w_place) and not placement.is_local(w.w_place)
-        if on_machine and self._pre_warmed_at and self._pre_warmed_at <= w.w_minted_at:
+        # A chat that starts elsewhere reuses no pre-warm: the one this page
+        # made before the mint (for the platform), or the one it was still
+        # making then while no newer pre_warmup replaced it, is closed now
+        # rather than left to the reaper.
+        own_late = w.pw_task is not None and self._pre_warmup_task is w.pw_task
+        if elsewhere and self._pre_warmed_at and (self._pre_warmed_at <= w.w_minted_at or own_late):
             await self._release_prewarm()
         from ws.dashboard_chat_move import picked_place
         place_key = picked_place(w.msg)
         pw_match = (
-            not on_machine
+            not elsewhere
             and self._pre_warmed_sid is not None
             and self._pre_warmed_agent == w.w_agent
             and self._pre_warmed_exec_path == w.effective_exec_path
             and self._pre_warmed_model == w.w_target_model
             and self._pre_warmed_role == w.w_role
             and self._pre_warmed_place == place_key
+            and _built_where_it_starts(self._pre_warmed_sid, w.effective_exec_path)
         )
         # Claim the pre-warm out of the TTL reaper's reach as the FINAL
         # gate — if the reaper already took it (claim False), it's being
@@ -427,7 +524,7 @@ class WarmupTail(_Host):
             self._pre_warmed_role = ""
             self._pre_warmed_place = ""
             self._pre_warmed_at = 0.0
-        elif not run.wants_interactive and w.w_layer is not None and not w.w_place:
+        elif not elsewhere and not run.wants_interactive and w.w_layer is not None and not w.w_place:
             # DETACHED pre-warm fallback: wake-word detection fires
             # an HTTP pre-warm with no WS connection to remember it
             # on — claim by full key from the global registry, one made for
@@ -441,37 +538,34 @@ class WarmupTail(_Host):
             if claimed is not None:
                 c_sid, c_age = claimed
                 c_layer = layer_for_prewarm(c_sid, w.effective_exec_path)
-                if c_layer is not None and await c_layer.is_session_alive(c_sid):
+                if (c_layer is not None and _built_where_it_starts(c_sid, w.effective_exec_path)
+                        and await c_layer.is_session_alive(c_sid)):
                     reuse_sid, reuse_layer = c_sid, c_layer
                     reuse_note = f", detached pre-warm {c_age:.1f}s old"
                 elif c_layer is not None:
-                    # Claimed a dead one — close it on its own (local)
-                    # layer so its slot/subscription accounting frees.
+                    # Claimed a dead one: close it on the layer that holds
+                    # it so its slot and its seat are given back.
                     with contextlib.suppress(Exception):
                         await c_layer.close_session(c_sid)
+                else:
+                    from core.session.session_manager import release_unheld
+                    release_unheld(c_sid)
         if reuse_sid is not None:
             # A pre-warm runs on the platform: the chat is pinned there. The
             # resolver's reason rides along when it named the platform too
             # (a session below manager on an admin-targeted agent runs
             # locally, and the badge says so only when the frame carries it).
-            from ws import dashboard_warmup
-            try:
-                resolved, reuse_reason = await dashboard_warmup.run_db(
-                    remote_status.resolve_execution_target,
-                    w.w_agent, self.user_sub, w.w_role,
-                )
-            except psycopg.Error:
-                resolved, reuse_reason = placement.LOCAL, None
-            if w.w_place or not placement.is_local(resolved):
-                reuse_reason = None
+            reuse_reason = None if w.w_place else place_reason
             reuse_target = placement.LOCAL
             run.res = _SpawnResult(
                 session_id=reuse_sid, layer=cast("ExecutionLayer", reuse_layer),
                 execution_target=reuse_target, fallback_reason=reuse_reason,
             )
+            # The pre-warm was built with no chat: the chat that adopts it
+            # records where its engine record will live.
             await chat_writer.submit(
                 w.wcid,
-                functools.partial(task_store.update_chat, w.wcid, session_id=reuse_sid,
+                functools.partial(_bind_reused, w.wcid, session_id=reuse_sid,
                                   execution_target=reuse_target),
                 label="session_bind",
             )
@@ -673,18 +767,29 @@ class WarmupTail(_Host):
             # for true unavailability; a satellite that ran the command and
             # returned an error surfaces as "Satellite command error: ...".
             emsg = str(e)
-            gone = "not connected" in emsg or "command timeout" in emsg
+            no_compute = isinstance(e, placement.NoComputeMachine)
+            gone = machine_dropped_off(e)
+            from services.remote import machine_away
+            away = isinstance(e, machine_away.MachineAway)
             if isinstance(e, AgentStateRefused):
                 fail_reason = wire.REASON_BELOW_EDITOR
             else:
-                fail_reason = "target_unavailable" if gone else "session_error"
+                fail_reason = "target_unavailable" if gone or no_compute or away else "session_error"
+            if no_compute and (carries_prompt(w.msg) or bool(input_queue.peek(w.wcid))):
+                # No compute machine can take the chat: the refusal's own
+                # sentence, and what became of the message above it.
+                emsg = NO_COMPUTE_NOT_SENT
             if gone:
                 logger.info("WS dashboard warmup: the machine dropped off chat=%s: %s", w.wcid, emsg)
                 # The connection layer's own words name the machine by its
                 # id: the person reads what happened and what to do, and
                 # "your message" only when one rides the start.
                 waiting = carries_prompt(w.msg) or bool(input_queue.peek(w.wcid))
-                emsg = MACHINE_GONE_NOT_SENT if waiting else MACHINE_GONE
+                # One that dropped off for its update says so.
+                from ws import dashboard_warmup
+                emsg = await dashboard_warmup.run_db(
+                    machine_away.sentence_for_chat, {"execution_target": w.w_pinned or w.w_place},
+                    MACHINE_GONE_NOT_SENT if waiting else MACHINE_GONE)
             await warmup_registry.emit(w.wcid, {
                 "type": wire.WARMUP_FAILED,
                 "chat_id": w.wcid,
@@ -780,7 +885,7 @@ class WarmupTail(_Host):
                         "chat=%s session=%s",
                         w.wcid[:8], res.session_id[:8]
                     )
-                    isess.submit_prompt(stamped)
+                    isess.submit_prompt(stamped, typed=True)
             # What was sent while it got ready is typed after it.
             self._drop_warmup_mark(w.wcid)
             if input_queue.peek(w.wcid):

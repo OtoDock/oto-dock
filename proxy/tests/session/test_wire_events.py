@@ -45,7 +45,7 @@ def test_every_frame_is_a_constant_and_every_constant_a_frame():
     # Every FRAMES key is the value of an upper-case module constant.
     values = set(_constants(wire).values())
     assert names <= values, sorted(names - values)
-    assert len(names) == 122
+    assert len(names) == 125
     # No frame name is spelled twice.
     assert len(_frame_constants()) == len(names)
 
@@ -153,19 +153,20 @@ def test_the_three_error_shapes_share_one_string():
 # ---------------------------------------------------------------------------
 
 BETWEEN_TURNS_NAMES = {
-    "pre_warmup", "warmup", "chat", "artifact_interaction", "app_action", "resume_chat",
+    "pre_warmup", "warmup", "chat", "artifact_interaction", "app_action", "resume_chat", "leave_chat",
     "chat_read", "permission_response", "question_response", "pty_attach", "pty_takeover",
     "pty_input", "pty_resize", "pty_attachments", "location_response", "plan_review_response",
     "mode_change", "model_change", "execution_mode_change", "execution_mode_switch",
-    "compact_context", "move_chat", "switch_engine", "probe_liveness", "implement_plan",
-    "abort", "cancel_queued", "cancel_all_queued", "client_info", "user_active", "user_idle",
+    "compact_context", "move_chat", "switch_engine", "probe_liveness", "target_check",
+    "implement_plan", "abort", "cancel_queued", "cancel_all_queued", "client_info", "user_active", "user_idle",
     "focus", "catalog_subscribe", "catalog_unsubscribe", "ping", "close",
 }
 MID_STREAM_NAMES = {
     "permission_response", "question_response", "location_response", "plan_review_response",
     "chat", "artifact_interaction", "app_action", "cancel_queued", "cancel_all_queued", "abort",
-    "resume_chat", "mode_change", "model_change", "ping", "close", "warmup", "pre_warmup",
+    "resume_chat", "leave_chat", "mode_change", "model_change", "ping", "close", "warmup", "pre_warmup",
     "user_active", "user_idle", "focus", "catalog_subscribe", "catalog_unsubscribe", "chat_read",
+    "target_check",
 }
 
 
@@ -177,7 +178,7 @@ def test_the_inbound_table_names_every_message_the_two_chains_handled():
         wire.MID_STREAM_SAME, wire.MID_STREAM_DETACH, wire.MID_STREAM_END, wire.MID_STREAM_DROP}
     assert wire.INBOUND["close"].mid_stream == wire.MID_STREAM_END
     assert {n for n, s in wire.INBOUND.items() if s.mid_stream == wire.MID_STREAM_DETACH} == {
-        "resume_chat", "warmup", "pre_warmup"}
+        "resume_chat", "leave_chat", "warmup", "pre_warmup"}
 
 
 def test_every_handler_in_the_table_is_a_connection_method():
@@ -255,14 +256,18 @@ def test_the_dashboard_mirror_equals_the_authority():
         "STOPPED": wire.UNDELIVERED_STOPPED}
     assert _ts_const_object(text, "CHAT_MOVED_REASON") == {
         "FAILED": wire.MOVED_FAILED, "RESUME_STOPPED": wire.MOVED_RESUME_STOPPED,
-        "RESUME_SKIPPED": wire.MOVED_RESUME_SKIPPED}
+        "RESUME_SKIPPED": wire.MOVED_RESUME_SKIPPED, "ACCOUNT_CHANGED": wire.MOVED_ACCOUNT_CHANGED,
+        "ACCOUNT_CHANGE_WAITS": wire.MOVED_ACCOUNT_CHANGE_WAITS}
     assert tuple(_ts_const_object(text, "MOVE_PHASE").values()) == wire.MOVE_PHASES
-    assert _ts_const_object(text, "WAKE_SOURCE") == {"MOVE": wire.WAKE_SOURCE_MOVE}
+    assert _ts_const_object(text, "WAKE_SOURCE") == {"MOVE": wire.WAKE_SOURCE_MOVE,
+                                                     "RELOAD": wire.WAKE_SOURCE_RELOAD,
+                                                     "CONTINUE": wire.WAKE_SOURCE_CONTINUE}
     assert set(_ts_const_object(text, "SERVER_TURN_CAUSE").values()) == wire.SERVER_TURN_CAUSES
     from core.events import input_queue
     assert _ts_const_object(text, "QUEUE_WAITING") == {"RECONNECT": input_queue.WAITING_RECONNECT,
                                                        "MACHINE": input_queue.WAITING_MACHINE,
-                                                       "TERMINAL": input_queue.WAITING_TERMINAL}
+                                                       "TERMINAL": input_queue.WAITING_TERMINAL,
+                                                       "UPDATING": input_queue.WAITING_UPDATING}
     # The artifact kinds' replayable set derives from the facts table in
     # lib/kinds/artifact.ts — bound by tests/core/test_kinds.py (phase 9).
     # Every frame has a payload interface in the union.
@@ -319,7 +324,8 @@ _KEY_BOUND_FRAMES = ("DocumentPreviewFrame", "PromptRetiredFrame", "QueueCleared
                      "SteeredFrame", "QueueSnapshotFrame", "LiveStateFrame", "ErrorFrame",
                      "PermissionPromptFrame", "PlanReviewFrame", "QuestionFrame",
                      "DelegateResultFrame", "ShareInboxFrame", "PermissionResolvedFrame",
-                     "TextFrame", "ThinkingFrame", "ServerTurnStartFrame", "ScheduleWakeFrame")
+                     "TextFrame", "ThinkingFrame", "ServerTurnStartFrame", "ScheduleWakeFrame",
+                     "MachineLinkFrame", "TargetMismatchFrame")
 
 
 def test_the_mirror_declares_the_same_keys_per_frame():

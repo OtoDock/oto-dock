@@ -1,0 +1,16 @@
+{
+ "in_sync_wire": [
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "page_size": 4096,
+   "report_skipped": true,
+   "type": "request_manifest"
+  }
+ ],
+ "no_folder_wire": [],
+ "offline_log": [
+  "workspace sync skipped: 'a/b' names no agent folder",
+  "request_manifest failed for flow-agent: Satellite sat-one- not connected — skipping initial sync"
+ ]
+}

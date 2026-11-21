@@ -1,0 +1,695 @@
+[
+ {
+  "is_remote": true,
+  "registry": {
+   "find_live_for_chat": "sid-remote",
+   "get": {
+    "sid-remote": "sid-remote"
+   },
+   "live_local": [],
+   "live_session_ids": [
+    "sid-remote"
+   ],
+   "streaming_chat_ids": []
+  },
+  "remote_os": "windows",
+  "slot_acquired": [
+   [
+    "sid-remote",
+    {
+     "per_user_cap": false,
+     "target": "m-1",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn_remote": [
+   {
+    "agent_slug": "term-remote",
+    "cols": 80,
+    "config_payload": [
+     "argv",
+     "env"
+    ],
+    "execution_path": "claude-code-cli",
+    "machine_id": "m-1",
+    "rows": 24,
+    "scrollback_limit": 262144,
+    "session_id": "sid-remote"
+   }
+  ],
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [
+     "_mark_ready"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "registered on its machine",
+  "target": "m-1",
+  "theme": "light",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ },
+ {
+  "replay": "earlier\u001b[6n",
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": false,
+    "submitted_once": false,
+    "timers": [
+     "_mark_ready",
+     "_mark_ready"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "a remote ring is stripped at its feed, not here",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ],
+  "viewer_output": [
+   "\u001b[2Joutput\u001b[6n"
+  ]
+ },
+ {
+  "pty": [
+   "cold prompt",
+   "\r"
+  ],
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": "cold prompt\r"
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_check_cold_flush",
+     "_fire_submit",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the first Enter arms the ConPTY backstop",
+  "timers": [
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ],
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ],
+   [
+    "_check_cold_flush",
+    5.0
+   ],
+   [
+    "_fire_submit",
+    7.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "\r"
+  ],
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": "cold prompt\r"
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_check_cold_flush",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the backstop Enter, once",
+  "timers": [
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ],
+   [
+    "_check_cold_flush",
+    5.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-remote",
+    "streaming",
+    {
+     "agent": "term-remote"
+    }
+   ]
+  ],
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_title_timer",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "no mid-turn tail on a satellite",
+  "timers": [
+   [
+    "_fire_title_timer",
+    30.0
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-remote",
+    {
+     "agent": "term-remote"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-remote",
+    "ready",
+    {
+     "agent": "term-remote"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-remote",
+    "ready",
+    {
+     "agent": "term-remote"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Response ready",
+    "chat_id": "chat-remote",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test finished",
+    "user_sub": "user-admin"
+   }
+  ],
+  "library_reconcile": [
+   "term-remote"
+  ],
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "forwarded lines fold into the turn's end",
+  "tailed": [
+   [
+    "sid-remote",
+    "chat-remote",
+    [
+     "{\"type\": \"user\"}",
+     "{\"type\": \"assistant\"}"
+    ]
+   ]
+  ],
+  "title": [
+   [
+    "chat-remote",
+    "from the satellite"
+   ]
+  ],
+  "turn_end": [
+   [
+    "sid-remote",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "satellite": [
+   {
+    "inject_id": "<inject>",
+    "machine": "m-1",
+    "session_id": "sid-remote",
+    "source": "delegate_result",
+    "text": "kept",
+    "type": "pty_inject"
+   }
+  ],
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": true,
+    "question_parked": false,
+    "queue": [
+     "kept"
+    ],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the satellite is told to type the head",
+  "timers": [
+   [
+    "_fire_inject_backstop",
+    5.0
+   ]
+  ]
+ },
+ {
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": true,
+    "question_parked": false,
+    "queue": [
+     "kept"
+    ],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a stale result changes nothing"
+ },
+ {
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": true,
+    "question_parked": false,
+    "queue": [
+     "kept"
+    ],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a decline keeps it queued"
+ },
+ {
+  "satellite": [
+   {
+    "inject_id": "<inject>",
+    "machine": "m-1",
+    "session_id": "sid-remote",
+    "source": "delegate_result",
+    "text": "kept",
+    "type": "pty_inject"
+   }
+  ],
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": true,
+    "question_parked": false,
+    "queue": [
+     "kept"
+    ],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the retry sends it again"
+ },
+ {
+  "same_id": true,
+  "satellite": [
+   {
+    "inject_id": "<inject>",
+    "machine": "m-1",
+    "session_id": "sid-remote",
+    "source": "delegate_result",
+    "text": "kept",
+    "type": "pty_inject"
+   }
+  ],
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": true,
+    "question_parked": false,
+    "queue": [
+     "kept"
+    ],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a lost result re-sends the same id"
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-remote",
+    "streaming",
+    {
+     "agent": "term-remote"
+    }
+   ]
+  ],
+  "injected": [
+   true
+  ],
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": true,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": false,
+    "turn_open": true
+   }
+  },
+  "step": "the ACK takes it and opens the turn"
+ },
+ {
+  "broadcast_chat_read": [
+   [
+    "user-admin",
+    "chat-remote",
+    {
+     "agent": "term-remote"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-remote",
+    "ready",
+    {
+     "agent": "term-remote"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-remote",
+    "streaming",
+    {
+     "agent": "term-remote"
+    }
+   ]
+  ],
+  "cancelled": false,
+  "satellite": [
+   {
+    "inject_id": "<inject>",
+    "machine": "m-1",
+    "session_id": "sid-remote",
+    "source": "delegate_result",
+    "text": "cancelled",
+    "type": "pty_inject"
+   }
+  ],
+  "state": {
+   "sid-remote": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": true,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": false,
+    "turn_open": true
+   }
+  },
+  "step": "cancelled in flight: nothing else leaves the queue",
+  "turn_end": [
+   [
+    "sid-remote",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ }
+]

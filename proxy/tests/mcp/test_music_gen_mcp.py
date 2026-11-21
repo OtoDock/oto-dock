@@ -170,6 +170,19 @@ class TestValidation:
         ))
         assert "must be a number" in res.text
 
+    def test_music_v1_is_no_longer_offered(self, mod):
+        # ElevenLabs removes music_v1 on 2027-01-31; the listed schema
+        # refuses it with the allowed values, so the model calls again.
+        tools = {t.name: t for t in asyncio.run(mod.list_tools())}
+        schema = tools["compose_music"].inputSchema["properties"]["model"]
+        assert schema["enum"] == ["music_v2_5", "music_v2"]
+        assert schema["default"] == "music_v2_5"
+        result = asyncio.run(mod.call_tool("compose_music", {"prompt": "x", "model": "music_v1"}))
+        assert result.isError
+        assert '"music_v2_5", "music_v2"' in result.content[0].text
+        (res,) = asyncio.run(mod._handle_compose({"prompt": "x", "model": "music_v1"}))
+        assert res.text.startswith("Error: unknown model")
+
     def test_compose_unknown_model(self, mod):
         (res,) = asyncio.run(mod._handle_compose(
             {"prompt": "calm piano", "model": "music_v9"}
@@ -212,7 +225,7 @@ class TestGeneration:
         assert calls["body"] == {
             "prompt": "uplifting launch track",
             "music_length_ms": 45000,
-            "model_id": "music_v1",
+            "model_id": "music_v2_5",
             "force_instrumental": True,
         }
         saved = calls["played"][0]
@@ -236,7 +249,9 @@ class TestGeneration:
         calls = _stub_generation(monkeypatch, mod, audio=b"SFXDATA")
         (res,) = asyncio.run(mod._handle_sfx({"prompt": "soft chime"}))
         assert calls["path"] == "/v1/sound-generation"
-        assert calls["body"] == {"text": "soft chime", "loop": False}
+        # ElevenLabs removes the default SFX model on 2027-03-01: name v3.
+        assert calls["body"] == {"text": "soft chime", "loop": False,
+                                 "model_id": "eleven_text_to_sound_v3"}
         saved = calls["played"][0]
         assert saved.startswith(str(tmp_path / "generated-assets" / "sfx_"))
         assert Path(saved).read_bytes() == b"SFXDATA"
@@ -253,6 +268,7 @@ class TestGeneration:
         assert calls["body"] == {
             "text": "rain ambience",
             "loop": True,
+            "model_id": "eleven_text_to_sound_v3",
             "duration_seconds": 12.0,
             "prompt_influence": 0.7,
         }

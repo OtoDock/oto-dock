@@ -1,0 +1,27 @@
+{
+ "by_surface": {
+  "chat": 0,
+  "meeting": 0,
+  "phone": 0,
+  "task": 0
+ },
+ "compute": [],
+ "satellites": [
+  {
+   "machine_id": "m1",
+   "sessions": 2
+  }
+ ],
+ "sessions": {
+  "active": 0,
+  "available_mb": 100000,
+  "budget_mb": 5000,
+  "fit_heavy": 5,
+  "fit_light": 25,
+  "reserved_mb": 0,
+  "total_mb": 8000
+ },
+ "tasks": {
+  "active": 0
+ }
+}

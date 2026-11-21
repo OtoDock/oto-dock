@@ -1,11 +1,13 @@
 """The script runner (APPS.md "Steps", CHECKS.md "The script kind"): runs a
-script text where an identity's sessions run — the local sandbox built by
-``resolve_sandbox_config`` + ``build_command_prefix`` with that identity's
-mount row (never ``/config``, no MCP, the script's own folder read-only), or
-a machine through the satellite's ``step_run`` frame (the private steps
-directory there, the hash checked, the output streamed back). No model. The
-verdict is the exit code and the first 32 KB of output; every value the
-platform handed the script is scrubbed from what it printed.
+script text where an identity's sessions run, on a machine, through the
+satellite's ``step_run`` frame. A compute machine beside the platform gets
+the description of the sandbox ``resolve_sandbox_config`` builds with that
+identity's mount row (never ``/config``, no MCP, the script's own folder
+read-only) and reads the script from the agent's folder. A paired machine
+gets the script's bytes (the private steps directory there, the hash
+checked). The output streams back. No model. The verdict is the exit code
+and the first 32 KB of output. Every value the platform handed the script is
+scrubbed from what it printed.
 
 The two callers keep their own vocabulary (a delivery, a check run) and
 hand this module a ``ScriptSpec``.
@@ -14,15 +16,12 @@ hand this module a ``ScriptSpec``.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import json
 import logging
-import os
 import re
 import shlex
 import shutil
-import signal
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -30,16 +29,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import config
-from core import layout, placement
+from core import layout
 
 logger = logging.getLogger("otodock.scripts")
 
 OUTPUT_KEEP_BYTES = 32 * 1024
-TAIL_KEEP_BYTES = 4096
-KILL_GRACE_S = 5.0
 # The satellite's ack has the script's timeout plus this to arrive.
 REMOTE_MARGIN_S = 60
 REDACTED = "[redacted]"
+# The script's hashed bytes in the run's own folder (``_stage_run``).
+STAGED_SCRIPT = "script"
 
 
 class ScriptRefused(Exception):
@@ -75,7 +74,7 @@ class ScriptSpec:
     script: bytes
     sha256: str
     run_name: str                    # the file name the script is written as
-    # The identity's mount row (the local sandbox).
+    # The identity's mount row (the sandbox a compute machine renders).
     role: str
     username: str                    # the mount username ("" agent scope)
     user_sub: str = ""
@@ -102,7 +101,7 @@ class ScriptSpec:
     timeout: int = 60
     # Values that must never land in the output.
     secrets: list[str] = field(default_factory=list)
-    # The scratch directory the local run writes the payload into.
+    # The scratch directory a compute machine's run reads its payload from.
     scratch_root: Path | None = None
     on_output: Callable[[str], Awaitable[None]] | None = None
 
@@ -184,135 +183,142 @@ def scrub(text: str, secrets) -> str:
     return text
 
 
-async def _read_capped(stream: asyncio.StreamReader) -> tuple[bytes, bytes, int]:
-    head = bytearray()
-    tail = bytearray()
-    total = 0
-    while True:
-        chunk = await stream.read(65536)
-        if not chunk:
-            break
-        total += len(chunk)
-        if len(head) < OUTPUT_KEEP_BYTES:
-            head.extend(chunk[:OUTPUT_KEEP_BYTES - len(head)])
-        tail.extend(chunk)
-        if len(tail) > TAIL_KEEP_BYTES:
-            del tail[:len(tail) - TAIL_KEEP_BYTES]
-    return bytes(head), bytes(tail), total
+# ── the sandbox of a run ────────────────────────────────────────────────────
 
 
-def _kill_group(proc: asyncio.subprocess.Process) -> None:
+def _stage_run(spec: ScriptSpec, step_dir: Path) -> Path:
+    """The run's own folder beneath the agent's real folder
+    (``core.agent_folder``), with no link followed: the payload, and the
+    script's bytes as they were read and hashed (``STAGED_SCRIPT``), which
+    the sandbox binds over the script's name. The staged file's path."""
+    from core import agent_folder
+    from services.infra import safe_fs
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return
+        root, rel = agent_folder.beneath_agent(step_dir, spec.agent)
+        safe_fs.mkdirs_beneath(root, rel)
+        safe_fs.atomic_write_beneath(root, f"{rel}/payload.json", spec.payload_json.encode("utf-8"),
+                                     mode=0o644, fsync=False)
+        safe_fs.atomic_write_beneath(root, f"{rel}/{STAGED_SCRIPT}", spec.script, mode=0o644, fsync=False)
+    except OSError as e:
+        raise ScriptRefused(f"the run's folder could not be made: {type(e).__name__}") from e
+    return step_dir / STAGED_SCRIPT
 
 
-async def _reap(proc: asyncio.subprocess.Process) -> None:
-    _kill_group(proc)
+def remove_run_folder(agent: str, step_dir: Path) -> None:
+    """A run's folder removed beneath the agent's real folder, no link
+    followed on the way; best-effort, as the run is over. Blocking."""
+    from core import agent_folder
+    from services.infra import safe_fs
     try:
-        await asyncio.wait_for(proc.wait(), timeout=KILL_GRACE_S)
-    except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        await proc.wait()
+        safe_fs.rmtree_beneath(*agent_folder.beneath_agent(step_dir, agent), missing_ok=True)
+    except OSError:
+        logger.warning("scripts: the run's folder %s was not removed", step_dir, exc_info=True)
 
 
-def output_text(head: bytes, total: int) -> str:
-    text = head.decode("utf-8", "replace").replace("\x00", "")
-    if total > len(head):
-        text += f"\n… [{total - len(head)} more bytes not kept]"
-    return text
-
-
-# ── the local run ───────────────────────────────────────────────────────────
-
-
-def build_local(spec: ScriptSpec) -> tuple[list[str], dict[str, str], Path]:
-    """The argv (the netns launcher, bwrap with the identity's mount row,
-    the script's folder read-only at ``mount_at`` and the run's scratch
-    directory at ``/step``) and the env; synchronous."""
-    from core.sandbox import oto_env
+def _build_sandbox(spec: ScriptSpec):
+    """The sandbox of a run on a compute machine: ``(the description that
+    was checked, the inner command, the env, the scratch directory)``. The
+    payload and the script's hashed bytes are staged into that directory,
+    which sits in the agent's folder (so the machine sees it); the staged
+    script is bound read-only over the script's name, after the script's own
+    folder, so the bytes run are the bytes judged and ``$0`` and the
+    script's siblings keep their paths. The folder is bound at its own place
+    beneath the agent's real folder, never where a link at it or above it
+    leads. Synchronous."""
+    from core import agent_folder
+    from core.sandbox import oto_env, sandbox_render
     from core.sandbox.sandbox import (
         SandboxBuilder,
         SandboxMount,
         resolve_sandbox_config,
     )
     if spec.script_dir is None or spec.scratch_root is None:
-        raise ScriptRefused("the local run needs the script's folder and a scratch root")
+        raise ScriptRefused("a run on a compute machine needs the script's folder and a scratch root")
     agents_dir = Path(config.AGENTS_DIR).resolve()
     step_dir = Path(spec.scratch_root) / spec.run_id
-    step_dir.mkdir(parents=True, exist_ok=True)
-    (step_dir / "payload.json").write_text(spec.payload_json, "utf-8")
-    cfg = resolve_sandbox_config(
-        role=spec.role, username=spec.username, agent_name=spec.agent,
-        is_admin_agent=spec.is_admin_agent,
-        host_claude_dir=agents_dir / spec.agent / layout.WORKSPACE / ".claude",
-        user_sub=spec.user_sub or "",
-        mcp_sandbox_mounts=[SandboxMount(str(spec.script_dir), spec.mount_at, "ro"),
-                            SandboxMount(str(step_dir), "/step", "ro")],
-        config_visible=False, mount_shared=spec.mount_shared, knowledge_rw=spec.knowledge_rw,
-        mcp_dir_binds=[], read_only=spec.read_only,
-    )
-    # The working folder follows the session's scope: the person's workspace
-    # for a personal session, the agent's for a shared one (the sandbox's own
-    # default for a named person is their tree's root, not a workspace).
-    scope = spec.default_scope or ("user" if spec.username else "agent")
-    personal = bool(spec.username) and scope == "user"
-    cfg = dataclasses.replace(
-        cfg, app_cwd=f"{layout.virtual_user_root(spec.username)}/{layout.WORKSPACE}" if personal else layout.V_WORKSPACE,
-    )
-    builder = SandboxBuilder(cfg)
-    inner = argv_for(spec.script, f"{spec.mount_at}/{spec.run_name}")
-    argv = builder.build_command_prefix(inner)
-    env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-           "HOME": "/tmp", "TMPDIR": "/tmp", "LANG": "C.UTF-8"}
-    env.update(oto_env.build_oto_env(
-        agent_name=spec.agent, username=spec.username, user_sub=spec.user_sub or "",
-        user_role=spec.role, session_id="",
-        default_scope=spec.default_scope or ("user" if spec.username else "agent"),
-        task_type=spec.env.get("OTO_TASK_TYPE", "step"),
-        available_scopes=spec.available_scopes or (("user", "agent") if spec.mount_shared else ("user",)),
-    ))
-    env.update(spec.env)
-    env["OTODOCK_PROXY_URL"] = f"http://127.0.0.1:{config.PORT}"
-    for name in spec.payload_env:
-        env[name] = "/step/payload.json"
-    env["OTODOCK_WORKSPACE_DIR"] = builder.get_cwd()
-    env["OTODOCK_KNOWLEDGE_DIR"] = layout.V_KNOWLEDGE if (spec.knowledge_relative and spec.mount_shared) else ""
-    return argv, env, step_dir
-
-
-async def run_local(spec: ScriptSpec) -> ScriptResult:
-    argv, env, step_dir = await asyncio.to_thread(build_local, spec)
-    started = time.monotonic()
-    proc = await asyncio.create_subprocess_exec(
-        *argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT, env=env, start_new_session=True,
-    )
-    timed_out = False
-    head, total = b"", 0
     try:
-        assert proc.stdout is not None
-        head, _tail, total = await asyncio.wait_for(_read_capped(proc.stdout), timeout=spec.timeout)
-        await asyncio.wait_for(proc.wait(), timeout=max(1.0, spec.timeout - (time.monotonic() - started)))
-    except asyncio.TimeoutError:
-        timed_out = True
-        await _reap(proc)
-    except asyncio.CancelledError:
-        await _reap(proc)
+        staged = _stage_run(spec, step_dir)
+        run_at = f"{spec.mount_at}/{spec.run_name}"
+        cfg = resolve_sandbox_config(
+            role=spec.role, username=spec.username, agent_name=spec.agent,
+            is_admin_agent=spec.is_admin_agent,
+            host_claude_dir=agents_dir / spec.agent / layout.WORKSPACE / ".claude",
+            user_sub=spec.user_sub or "",
+            mcp_sandbox_mounts=[SandboxMount(str(spec.script_dir), spec.mount_at, "ro"),
+                                SandboxMount(str(staged), run_at, "ro"),
+                                SandboxMount(str(step_dir), "/step", "ro")],
+            config_visible=False, mount_shared=spec.mount_shared, knowledge_rw=spec.knowledge_rw,
+            mcp_dir_binds=[], read_only=spec.read_only,
+        )
+        # The working folder follows the session's scope: the person's workspace
+        # for a personal session, the agent's for a shared one (the sandbox's own
+        # default for a named person is their tree's root, not a workspace).
+        scope = spec.default_scope or ("user" if spec.username else "agent")
+        personal = bool(spec.username) and scope == "user"
+        cfg = dataclasses.replace(
+            cfg, app_cwd=f"{layout.virtual_user_root(spec.username)}/{layout.WORKSPACE}" if personal else layout.V_WORKSPACE,
+        )
+        builder = SandboxBuilder(cfg)
+        desc = builder.describe()
+        binds = {b.sandbox: b for b in desc.extra_binds}
+        if run_at not in binds:
+            # A bind whose source is missing is left out at the build and at the
+            # render: the run would then execute the folder's own file.
+            raise ScriptRefused("the script could not be staged for its run")
+        # The script's folder is bound as it was read: at its own place beneath
+        # the agent's real folder, never where a link at it or above it leads.
+        _root, folder_rel = agent_folder.beneath_agent(spec.script_dir, spec.agent)
+        folder = binds.get(spec.mount_at)
+        if folder is None or folder.root != sandbox_render.ROOT_AGENT or folder.rel != folder_rel:
+            raise ScriptRefused("the script's folder is reached through a link")
+        inner = argv_for(spec.script, run_at)
+        env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+               "HOME": "/tmp", "TMPDIR": "/tmp", "LANG": "C.UTF-8"}
+        env.update(oto_env.build_oto_env(
+            agent_name=spec.agent, username=spec.username, user_sub=spec.user_sub or "",
+            user_role=spec.role, session_id="",
+            default_scope=spec.default_scope or ("user" if spec.username else "agent"),
+            task_type=spec.env.get("OTO_TASK_TYPE", "step"),
+            available_scopes=spec.available_scopes or (("user", "agent") if spec.mount_shared else ("user",)),
+        ))
+        env.update(spec.env)
+        env["OTODOCK_PROXY_URL"] = f"http://127.0.0.1:{config.PORT}"
+        for name in spec.payload_env:
+            env[name] = "/step/payload.json"
+        env["OTODOCK_WORKSPACE_DIR"] = builder.get_cwd()
+        env["OTODOCK_KNOWLEDGE_DIR"] = layout.V_KNOWLEDGE if (spec.knowledge_relative and spec.mount_shared) else ""
+        return desc, inner, env, step_dir
+    except BaseException:
+        # A refusal at the staging or after it: the run never reaches the
+        # step that removes its folder after.
+        remove_run_folder(spec.agent, step_dir)
         raise
-    finally:
-        await asyncio.to_thread(shutil.rmtree, step_dir, True)
-    return ScriptResult(exit_code=None if timed_out else proc.returncode,
-                        output=scrub(output_text(head, total), spec.secrets), timed_out=timed_out,
-                        ran_on=placement.LOCAL, seconds=time.monotonic() - started)
 
 
-# ── the remote run (satellite 0.5.122 ``step_run``; 0.5.123 the two fields) ─
+# ── the remote run (the satellite's ``step_run``) ───────────────────────────
 
 
-def remote_frame(spec: ScriptSpec, *, with_checks_fields: bool) -> dict:
+def compute_frame(spec: ScriptSpec) -> tuple[dict, Path]:
+    """``(the frame, the scratch directory to remove after)`` of a run on a
+    compute machine: the sandbox as its description, the command to run in
+    it and the env. The script itself stays in the agent's folder, staged
+    read-only by ``spec.script_dir``. Synchronous."""
+    desc, inner, env, step_dir = _build_sandbox(spec)
+    return {
+        "type": "step_run",
+        "delivery_id": spec.run_id,
+        "app_id": spec.env.get("OTODOCK_APP_ID", ""),
+        "agent_slug": spec.agent,
+        "run": spec.run_name,
+        "sha256": spec.sha256,
+        "sandbox": desc.to_dict(),
+        "argv": inner,
+        "env": env,
+        "timeout": int(spec.timeout),
+    }, step_dir
+
+
+def remote_frame(spec: ScriptSpec) -> dict:
     frame = {
         "type": "step_run",
         "delivery_id": spec.run_id,
@@ -327,35 +333,36 @@ def remote_frame(spec: ScriptSpec, *, with_checks_fields: bool) -> dict:
         "payload_json": spec.payload_json,
         "timeout": int(spec.timeout),
     }
-    if with_checks_fields:
-        extra = [n for n in spec.payload_env if n != "OTODOCK_STEP_PAYLOAD"]
-        if extra:
-            frame["payload_env"] = extra
-        if spec.cwd_absolute:
-            frame["cwd_absolute"] = spec.cwd_absolute
+    extra = [n for n in spec.payload_env if n != "OTODOCK_STEP_PAYLOAD"]
+    if extra:
+        frame["payload_env"] = extra
+    if spec.cwd_absolute:
+        frame["cwd_absolute"] = spec.cwd_absolute
     return frame
 
 
-async def run_remote(spec: ScriptSpec, machine_id: str, *, needs_checks_fields: bool = False) -> ScriptResult:
+async def run_remote(spec: ScriptSpec, machine_id: str) -> ScriptResult:
     """One ``step_run`` frame to the machine; the ack carries the verdict.
-    ``needs_checks_fields``: the run needs 0.5.123's fields (an absolute
-    cwd, an extra payload env name) and is refused below it."""
+    A compute machine beside the platform reads the agent's folder itself: it
+    takes the sandbox's description, and the scratch directory is removed
+    here afterwards. One with its own copy holds neither: refused."""
     from core.remote.satellite_connection import get_connection_manager
     cm = get_connection_manager()
     if not cm.is_connected(machine_id):
         raise ScriptUnavailable("the machine is offline")
-    if not cm.satellite_supports_steps(machine_id):
-        raise ScriptRefused(
-            f"this machine's satellite is too old for scripts "
-            f"({cm.satellite_version(machine_id) or 'unknown'} < 0.5.122) — it updates at "
-            "its next reconnect")
-    supports_checks = getattr(cm, "satellite_supports_checks", None)
-    with_fields = bool(supports_checks(machine_id)) if supports_checks else False
-    if needs_checks_fields and not with_fields:
-        raise ScriptRefused(
-            f"this machine's satellite is too old for a check outside the synced tree "
-            f"({cm.satellite_version(machine_id) or 'unknown'} < 0.5.123)")
-    frame = remote_frame(spec, with_checks_fields=with_fields)
+    if cm.owns_copy(machine_id):
+        raise ScriptRefused("a compute machine with its own copy runs no script")
+    step_dir: Path | None = None
+    if cm.shares_folders(machine_id):
+        frame, step_dir = await asyncio.to_thread(compute_frame, spec)
+    else:
+        frame = remote_frame(spec)
+        # The files a person or a platform tool just wrote (a deploy's, an
+        # import's) reach this machine before the script reads them: the
+        # turn's barrier, capped at ``BARRIER_TIMEOUT_S``.
+        from core.remote import upload_inflight
+        await upload_inflight.wait_settled(spec.agent, machine_id=machine_id,
+                                           ceiling=upload_inflight.BARRIER_TIMEOUT_S)
     command_id = f"step-{uuid.uuid4().hex[:12]}"
     started = time.monotonic()
 
@@ -378,6 +385,8 @@ async def run_remote(spec: ScriptSpec, machine_id: str, *, needs_checks_fields: 
         raise ScriptRefused("the machine's link dropped while the script ran") from e
     finally:
         cm.unregister_step_output(command_id)
+        if step_dir is not None:
+            await asyncio.to_thread(remove_run_folder, spec.agent, step_dir)
     code = ack.get("exit_code")
     return ScriptResult(exit_code=int(code) if isinstance(code, int) else None,
                         output=scrub(str(ack.get("output") or ""), spec.secrets),

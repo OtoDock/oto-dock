@@ -12,7 +12,6 @@ needed). Run with the proxy venv (it has ``mcp`` + ``pytest`` + ``PIL``):
 
 import asyncio
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -26,8 +25,8 @@ if str(_MCP_DIR) not in sys.path:
 import environment
 import executor
 import geometry
-import screen
 import server
+import steps
 
 # ===========================================================================
 # geometry — scaling
@@ -267,107 +266,33 @@ def test_manifest_device_fields():
 
 
 # ===========================================================================
-# server — action dispatch (screen/executor/gates mocked, no display)
+# server — the gates, the save folder, the error mapping (the runner's own
+# behaviour is test_computer_steps.py)
 # ===========================================================================
 
-class _FakeCapture:
-    def __init__(self, saved_path=None):
-        self.png_b64 = "QUJD"  # "ABC"
-        self.model_width = 1280
-        self.model_height = 720
-        self.scale = 0.5
-        self.monitor = geometry.Monitor(1, 0, 0, 2560, 1440, 2560, 1440)
-        self.monitor_count = 1
-        self.saved_path = saved_path
-
-
-@pytest.fixture
-def open_gates(monkeypatch):
-    """Make all environment gates pass so dispatch reaches the action."""
-    monkeypatch.setattr(server, "check_capture_supported", lambda: None)
-    monkeypatch.setattr(server, "check_input_supported", lambda: None)
-    monkeypatch.setattr(server, "check_session_active", lambda: None)
-    monkeypatch.setattr(server, "os_kind", lambda: "linux")  # no Windows elevation probe
-
-
-def test_screenshot_action_returns_image_and_text(monkeypatch, open_gates):
-    monkeypatch.setattr(screen, "capture", lambda d, m, save_path=None: _FakeCapture())
-    blocks = server._run_action({"action": "screenshot"})
-    assert blocks[0].type == "image" and blocks[0].mimeType == "image/png"
-    assert blocks[1].type == "text" and "1280x720" in blocks[1].text
-
-
-def test_unknown_action_raises_valueerror(open_gates):
-    with pytest.raises(ValueError):
-        server._run_action({"action": "frobnicate"})
-
-
-def test_key_without_text_raises(open_gates):
-    with pytest.raises(ValueError):
-        server._run_action({"action": "key"})
-
-
-def test_left_click_converts_and_calls_executor(monkeypatch, open_gates):
-    calls = {}
-    mon = geometry.Monitor(1, 0, 0, 2560, 1440, 2560, 1440)
-    monkeypatch.setattr(screen, "resolve_target", lambda d, m: (mon, 0.5))
-    monkeypatch.setattr(screen, "capture", lambda d, m, save_path=None: _FakeCapture())
-
-    def fake_click(mx, my, monitor, scale, **kw):
-        calls["args"] = (mx, my, scale, kw)
-        return 0, 0
-    monkeypatch.setattr(executor, "click", fake_click)
-
-    server._run_action({"action": "left_click", "coordinate": [100, 200]})
-    assert calls["args"][0] == 100.0 and calls["args"][1] == 200.0
-    assert calls["args"][3]["button"] == "left" and calls["args"][3]["clicks"] == 1
-
-
-def test_double_click_uses_two_clicks(monkeypatch, open_gates):
-    calls = {}
-    monkeypatch.setattr(screen, "resolve_target", lambda d, m: (geometry.Monitor(1, 0, 0, 100, 100, 100, 100), 1.0))
-    monkeypatch.setattr(screen, "capture", lambda d, m, save_path=None: _FakeCapture())
-    monkeypatch.setattr(executor, "click", lambda *a, **k: calls.update(k) or (0, 0))
-    server._run_action({"action": "double_click", "coordinate": [5, 5]})
-    assert calls["clicks"] == 2 and calls["button"] == "left"
-
-
-def test_click_with_modifier_text(monkeypatch, open_gates):
-    calls = {}
-    monkeypatch.setattr(screen, "resolve_target", lambda d, m: (geometry.Monitor(1, 0, 0, 100, 100, 100, 100), 1.0))
-    monkeypatch.setattr(screen, "capture", lambda d, m, save_path=None: _FakeCapture())
-    monkeypatch.setattr(executor, "click", lambda *a, **k: calls.update(k) or (0, 0))
-    server._run_action({"action": "left_click", "coordinate": [5, 5], "text": "ctrl"})
-    assert calls["modifiers"] == ["ctrl"]
-
-
-def test_type_action(monkeypatch, open_gates):
-    seen = {}
-    monkeypatch.setattr(executor, "type_text", lambda t: seen.setdefault("t", t) or "typed 5 characters")
-    monkeypatch.setattr(screen, "capture", lambda d, m, save_path=None: _FakeCapture())
-    server._run_action({"action": "type", "text": "hello"})
-    assert seen["t"] == "hello"
-
-
-def test_wayland_input_refusal_bubbles(monkeypatch):
-    # Real gate, forced Wayland: an input action must raise DeviceUnavailable.
+def test_wayland_refuses_a_call_that_acts_before_anything_runs(monkeypatch):
+    # Real gates, forced Wayland: a click is refused with the actionable text.
     monkeypatch.setattr(environment, "display_backend", lambda: "wayland")
-    monkeypatch.setattr(server, "check_session_active", lambda: None)
-    with pytest.raises(environment.DeviceUnavailable):
-        server._run_action({"action": "left_click", "coordinate": [1, 1]})
+    monkeypatch.setattr(environment, "check_session_active", lambda: None)
+    out = asyncio.run(server.call_tool("computer", {"steps": [{"action": "left_click", "coordinate": [1, 1]}]}))
+    assert out[0].text.startswith("⚠️") and "Wayland" in out[0].text
 
 
-# ===========================================================================
-# server — deliberate save goes to a NORMAL folder, never .screenshots
-# ===========================================================================
+def test_no_display_refuses_even_a_screenshot(monkeypatch):
+    monkeypatch.setattr(environment, "display_backend", lambda: "none")
+    out = asyncio.run(server.call_tool("computer", {"steps": [{"action": "screenshot"}]}))
+    assert "no active graphical display" in out[0].text
+
 
 def test_alloc_save_path_uses_plain_screenshots_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("OTO_WORKSPACE_DIR", str(tmp_path))
     abs_path, rel = server._alloc_save_path(1)
-    assert rel.startswith("screenshots/")
+    assert rel.startswith("screenshots/screen-1-")
     assert "/.screenshots" not in abs_path and not rel.startswith(".screenshots")
     assert (tmp_path / "screenshots").is_dir()  # folder created
     assert abs_path.endswith(".png")
+    _abs, zoom_rel = server._alloc_save_path(2, "zoom")
+    assert zoom_rel.startswith("screenshots/zoom-2-")
 
 
 def test_alloc_save_path_none_without_workspace(monkeypatch):
@@ -375,54 +300,34 @@ def test_alloc_save_path_none_without_workspace(monkeypatch):
     assert server._alloc_save_path(1) == (None, None)
 
 
-def test_screenshot_save_passes_path_to_capture(monkeypatch, open_gates, tmp_path):
-    monkeypatch.setenv("OTO_WORKSPACE_DIR", str(tmp_path))
-    seen = {}
-
-    def fake_capture(d, m, save_path=None):
-        seen["save_path"] = save_path
-        return _FakeCapture(saved_path=save_path)
-    monkeypatch.setattr(screen, "capture", fake_capture)
-
-    blocks = server._run_action({"action": "screenshot", "save": True})
-    assert seen["save_path"] is not None
-    assert os.sep + "screenshots" + os.sep in seen["save_path"]
-    assert ".screenshots" not in seen["save_path"]
-    assert "screenshots/" in blocks[1].text  # path surfaced to the user
-
-
-def test_reactive_frame_is_not_saved(monkeypatch, open_gates, tmp_path):
-    """A result-screenshot after a click must NOT save (save flag only on the
-    explicit screenshot action)."""
-    monkeypatch.setenv("OTO_WORKSPACE_DIR", str(tmp_path))
-    seen = {}
-    monkeypatch.setattr(screen, "resolve_target", lambda d, m: (geometry.Monitor(1, 0, 0, 100, 100, 100, 100), 1.0))
-    monkeypatch.setattr(executor, "click", lambda *a, **k: (0, 0))
-
-    def fake_capture(d, m, save_path=None):
-        seen["save_path"] = save_path
-        return _FakeCapture()
-    monkeypatch.setattr(screen, "capture", fake_capture)
-    server._run_action({"action": "left_click", "coordinate": [1, 1]})
-    assert seen["save_path"] is None
-
-
-# ===========================================================================
-# server — call_tool error mapping + check_permissions (async)
-# ===========================================================================
-
 def test_call_tool_maps_device_unavailable(monkeypatch):
-    def boom(args):
+    def boom(*a, **k):
         raise environment.DeviceUnavailable("no display here")
-    monkeypatch.setattr(server, "_run_action", boom)
-    out = asyncio.run(server.call_tool("computer", {"action": "screenshot"}))
+    monkeypatch.setattr(steps, "run", boom)
+    out = asyncio.run(server.call_tool("computer", {"steps": [{"action": "screenshot"}]}))
     assert out[0].type == "text" and "no display here" in out[0].text
 
 
 def test_call_tool_maps_valueerror(monkeypatch):
-    monkeypatch.setattr(server, "_run_action", lambda a: (_ for _ in ()).throw(ValueError("bad arg")))
-    out = asyncio.run(server.call_tool("computer", {"action": "x"}))
+    monkeypatch.setattr(steps, "run", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad arg")))
+    out = asyncio.run(server.call_tool("computer", {"steps": [{"action": "screenshot"}]}))
     assert "bad arg" in out[0].text
+
+
+def test_an_unexpected_error_names_only_its_type(monkeypatch, caplog):
+    monkeypatch.setattr(steps, "run", lambda *a, **k: (_ for _ in ()).throw(KeyError("typed secret")))
+    out = asyncio.run(server.call_tool("computer", {"steps": [{"action": "screenshot"}]}))
+    assert out[0].text == "⚠️ Unexpected error performing the action: KeyError."
+    assert all("typed secret" not in r.getMessage() for r in caplog.records)
+
+
+def test_a_bad_display_is_refused(monkeypatch):
+    asyncio.run(server.list_tools())
+    out = asyncio.run(server.call_tool("computer", {"steps": [{"action": "screenshot"}], "display": "two"}))
+    assert out.isError is True and "display" in out.content[0].text
+    server.TOOL_ARGS._schemas = {}  # unlisted again: the runner's own refusal
+    out = asyncio.run(server.call_tool("computer", {"steps": [{"action": "screenshot"}], "display": "two"}))
+    assert out[0].text == "⚠️ 'display' must be an integer monitor index (1 = primary)."
 
 
 def test_call_tool_unknown_tool():
@@ -443,8 +348,18 @@ def test_list_tools_shape():
     names = {t.name for t in tools}
     assert names == {"computer", "check_permissions"}
     computer = next(t for t in tools if t.name == "computer")
-    assert "action" in computer.inputSchema["required"]
-    assert set(computer.inputSchema["properties"]["action"]["enum"]) == server._ALL_ACTIONS
+    assert computer.inputSchema["required"] == ["steps"]
+    item = computer.inputSchema["properties"]["steps"]["items"]
+    assert set(item["properties"]["action"]["enum"]) == set(server._ACTIONS)
+    assert set(item["properties"]) == {
+        "action", "coordinate", "start_coordinate", "text", "scroll_direction", "scroll_amount", "duration",
+        "region", "save", "window",
+    }
+
+
+def test_the_docstring_says_a_granted_computer_shows_no_card():
+    assert "every `mcp__computer__*`" not in server.__doc__
+    assert "no approval card in every mode" in server.__doc__
 
 
 # ===========================================================================
@@ -521,14 +436,14 @@ def test_a_bare_program_is_never_named_as_the_one_to_turn_on(monkeypatch, mac, a
     assert ("Start the satellite from its login item" in msg) is (app is not None)
 
 
-def test_a_click_macos_would_drop_is_never_sent(monkeypatch, open_gates, mac):
+def test_a_click_macos_would_drop_is_never_sent(monkeypatch, mac):
     mac["accessibility"] = False
-    monkeypatch.setattr(server, "check_macos_grants", environment.check_macos_grants)
+    for name in ("check_capture_supported", "check_input_supported", "check_session_active"):
+        monkeypatch.setattr(environment, name, lambda: None)
     sent = []
-    monkeypatch.setattr(screen, "resolve_target", lambda d, m: (geometry.Monitor(1, 0, 0, 100, 100, 100, 100), 1.0))
-    monkeypatch.setattr(executor, "click", lambda *a, **k: sent.append(a) or (0, 0))
-    with pytest.raises(environment.DeviceUnavailable):
-        server._run_action({"action": "left_click", "coordinate": [1, 1]})
+    monkeypatch.setattr(executor, "_gui", lambda: sent.append("gui") or None)
+    out = asyncio.run(server.call_tool("computer", {"steps": [{"action": "left_click", "coordinate": [1, 1]}]}))
+    assert "control the mouse and keyboard" in out[0].text
     assert sent == []
 
 

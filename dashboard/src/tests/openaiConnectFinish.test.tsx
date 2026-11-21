@@ -25,6 +25,9 @@ vi.mock('@/api/executionLayers', async (importOriginal) => {
   const idle = () => ({ mutate: () => {}, mutateAsync: async () => ({}), isPending: false, isError: false, error: null })
   return {
     ...mod,
+    // The list's own reads need a query client this test does not mount: answered as a list at rest.
+    useListReading: () => ({ pending: false, reread: () => {} }),
+    useAccountsLive: () => ({ data: undefined }),
     useStartOpenAIOAuth: () => ({
       mutateAsync: async () => ({ url: 'https://auth.openai.com/device', user_code: 'ABCD-EFGH', login_id: 'login-1' }),
       isPending: false,

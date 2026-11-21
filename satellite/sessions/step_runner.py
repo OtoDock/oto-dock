@@ -32,7 +32,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .. import config
-from .._vendored import layout
+from .._vendored import layout, sandbox_render as render
 from ..config import (
     force_rmtree,
     kill_process_tree,
@@ -43,6 +43,7 @@ from ..config import (
 from ..host.auth_paths import is_safe_slug
 from ..host.env_hygiene import curate_satellite_env
 from ..host.interpreters import windows_interpreters
+from . import sandbox_host
 
 logger = logging.getLogger("satellite")
 
@@ -242,6 +243,169 @@ class _Capture:
         return out
 
 
+async def _execute(plan: dict, argv: list[str], env: dict[str, str], cwd, ws, command_id: str,
+                   _ack, running: dict[str, asyncio.subprocess.Process], *, send_output=None) -> None:
+    """Spawn one script, stream its output, end it at its timeout and ack the
+    verdict: a paired machine's run and a compute machine's sandboxed one.
+    ``send_output`` is the lane the output frames take (the control lane when
+    unset)."""
+    send = send_output or ws.enqueue_send
+    spawn_kwargs: dict = {"start_new_session": True} if config.HOST.posix else {}
+    started = time.monotonic()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=str(cwd) if cwd else None, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=env, **spawn_kwargs)
+    except (OSError, ValueError) as e:
+        await _ack(status="error", error=f"the script could not start: {e}")
+        return
+    running[plan["delivery"]] = proc
+    cap = _Capture()
+    pending = bytearray()
+    last_flush = time.monotonic()
+
+    async def _flush(force: bool = False) -> None:
+        nonlocal pending, last_flush
+        if not pending:
+            return
+        if force or len(pending) >= _FLUSH_BYTES or time.monotonic() - last_flush >= _FLUSH_S:
+            text = bytes(pending).decode("utf-8", "replace")
+            pending = bytearray()
+            last_flush = time.monotonic()
+            await send({"type": "step_output", "command_id": command_id,
+                        "delivery_id": plan["delivery"], "text": text})
+
+    async def _pump() -> None:
+        assert proc.stdout is not None
+        while True:
+            chunk = await proc.stdout.read(65536)
+            if not chunk:
+                break
+            cap.add(chunk)
+            pending.extend(chunk)
+            await _flush()
+        await _flush(force=True)
+
+    def _kill_group() -> None:
+        # What the script left behind dies with it, as the local run's
+        # pid namespace does; a child that kept the pipe open would
+        # otherwise hold the run to its timeout. The tree walk alone
+        # finds nothing once the script itself has exited.
+        if spawn_kwargs:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+
+    async def _exited() -> None:
+        # The return code, not wait(): wait() also waits for the pipe,
+        # which a child the script left behind can hold open.
+        while proc.returncode is None:  # noqa: ASYNC110  # wait() also waits for the pipes a stray child may hold open
+            await asyncio.sleep(0.1)
+
+    timed_out = False
+    pump = asyncio.create_task(_pump())
+    try:
+        await asyncio.wait_for(_exited(), timeout=plan["timeout"])
+    except asyncio.TimeoutError:
+        timed_out = True
+        # A script that exited inside the last poll has nothing to signal,
+        # and its pid may already name another process.
+        running_still = proc.returncode is None
+        if running_still and config.HOST.posix:
+            stray = _signal_step(proc, signal.SIGTERM)
+            try:
+                await asyncio.wait_for(_exited(), timeout=_KILL_GRACE_S)
+            except asyncio.TimeoutError:
+                _signal_step(proc, signal.SIGKILL)
+            await asyncio.to_thread(reap_descendants, stray, _KILL_GRACE_S)
+        elif running_still:
+            kill_process_tree(proc.pid, timeout=5.0)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(_exited(), timeout=10.0)
+    try:
+        try:
+            await asyncio.wait_for(asyncio.shield(pump), timeout=_DRAIN_S)
+        except asyncio.TimeoutError:
+            _kill_group()
+            try:
+                await asyncio.wait_for(pump, timeout=_DRAIN_S)
+            except asyncio.TimeoutError:
+                pump.cancel()
+        _kill_group()
+    finally:
+        running.pop(plan["delivery"], None)
+    seconds = time.monotonic() - started
+    logger.info("step %s (%s): exit=%s timed_out=%s %.1fs", plan["delivery"][:8], plan["name"],
+                proc.returncode, timed_out, seconds)
+    await _ack(status="ok", exit_code=None if timed_out else proc.returncode,
+               output=cap.text(), timed_out=timed_out, seconds=round(seconds, 1))
+
+
+def _validate_compute(msg: dict, local_tunnel_port: int) -> tuple[dict, render.SandboxDescription]:
+    """A compute machine's step: the platform staged the script and its
+    payload in the agent's folder and bound them read-only, so only the
+    sandbox's description and the command to run in it arrive here."""
+    delivery = str(msg.get("delivery_id") or "")
+    if not _DELIVERY_RE.match(delivery):
+        raise StepRefused("delivery id is not a uuid")
+    sandbox = msg.get("sandbox")
+    if not isinstance(sandbox, dict):
+        raise StepRefused("a compute machine runs no step without its sandbox")
+    argv = msg.get("argv")
+    if not isinstance(argv, list) or not argv or any(not isinstance(a, str) for a in argv):
+        raise StepRefused("the step has no command")
+    timeout = msg.get("timeout", 60)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= TIMEOUT_MAX_S:
+        raise StepRefused("the timeout is out of bounds")
+    env = msg.get("env") or {}
+    if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str)
+                                        for k, v in env.items()):
+        raise StepRefused("the environment is not a map of strings")
+    if local_tunnel_port <= 0:
+        raise StepRefused("this machine has no local link to the platform")
+    desc = render.SandboxDescription.from_dict(sandbox)
+    return {"delivery": delivery, "name": str(msg.get("run") or "script"), "timeout": int(timeout),
+            "env": env, "argv": argv}, desc
+
+
+async def run_compute_step(msg: dict, ws, sat_config, local_tunnel_port: int,
+                           running: dict[str, asyncio.subprocess.Process]) -> None:
+    """The ``step_run`` handler on a compute machine: rendered in the
+    platform's sandbox with this machine's values, the scratch and the
+    working folder the sandbox's own, nothing written here."""
+    command_id = str(msg.get("command_id") or "")
+    acked = False
+
+    async def _ack(**fields) -> None:
+        nonlocal acked
+        acked = True
+        await ws.enqueue_send({"type": "ack", "command_id": command_id, **fields})
+
+    try:
+        plan, desc = _validate_compute(msg, local_tunnel_port)
+    except (StepRefused, render.RenderRefused, KeyError, TypeError, ValueError) as e:
+        await _ack(status="error", error=str(e))
+        return
+    if plan["delivery"] in running:
+        await _ack(status="error", error="this delivery is already running here")
+        return
+    try:
+        cmd = sandbox_host.render_command(desc, sat_config, tunnel_port=local_tunnel_port,
+                                          argv=plan["argv"])
+        # The bounded lane: every session of the install shares the control
+        # lane here, and a full one drops the oldest frame of any kind. The ack
+        # carries the verdict, so a line still queued behind it costs only log text.
+        await _execute(plan, cmd, plan["env"], None, ws, command_id, _ack, running,
+                       send_output=ws.enqueue_bulk)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001  # the step answers an error ack whatever failed before its verdict
+        logger.warning("step %s: failed before its verdict", plan["delivery"][:8], exc_info=True)
+        if not acked:
+            with contextlib.suppress(Exception):
+                await _ack(status="error", error=f"the step could not run: {e}")
+
+
 async def run_step(msg: dict, ws, agents_dir: Path, local_tunnel_port: int,
                    running: dict[str, asyncio.subprocess.Process]) -> None:
     """The ``step_run`` handler: validate, write, run, stream, ack."""
@@ -253,6 +417,11 @@ async def run_step(msg: dict, ws, agents_dir: Path, local_tunnel_port: int,
         acked = True
         await ws.enqueue_send({"type": "ack", "command_id": command_id, **fields})
 
+    if "sandbox" in msg:
+        # The platform renders that for a compute machine alone (the kind is
+        # this machine's own configuration, never the frame's shape).
+        await _ack(status="error", error="this machine runs no sandboxed step")
+        return
     try:
         plan = _validate(msg, agents_dir)
     except StepRefused as e:
@@ -299,95 +468,7 @@ async def run_step(msg: dict, ws, agents_dir: Path, local_tunnel_port: int,
         except MissingInterpreter as e:
             await _ack(status="error", error=missing_sentence(str(e)))
             return
-        spawn_kwargs: dict = {"start_new_session": True} if config.HOST.posix else {}
-        started = time.monotonic()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv, cwd=str(plan["cwd"]), stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                env=env, **spawn_kwargs)
-        except (OSError, ValueError) as e:
-            await _ack(status="error", error=f"the script could not start: {e}")
-            return
-        running[plan["delivery"]] = proc
-        cap = _Capture()
-        pending = bytearray()
-        last_flush = time.monotonic()
-
-        async def _flush(force: bool = False) -> None:
-            nonlocal pending, last_flush
-            if not pending:
-                return
-            if force or len(pending) >= _FLUSH_BYTES or time.monotonic() - last_flush >= _FLUSH_S:
-                text = bytes(pending).decode("utf-8", "replace")
-                pending = bytearray()
-                last_flush = time.monotonic()
-                await ws.enqueue_send({"type": "step_output", "command_id": command_id,
-                                       "delivery_id": plan["delivery"], "text": text})
-
-        async def _pump() -> None:
-            assert proc.stdout is not None
-            while True:
-                chunk = await proc.stdout.read(65536)
-                if not chunk:
-                    break
-                cap.add(chunk)
-                pending.extend(chunk)
-                await _flush()
-            await _flush(force=True)
-
-        def _kill_group() -> None:
-            # What the script left behind dies with it, as the local run's
-            # pid namespace does; a child that kept the pipe open would
-            # otherwise hold the run to its timeout. The tree walk alone
-            # finds nothing once the script itself has exited.
-            if spawn_kwargs:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-
-        async def _exited() -> None:
-            # The return code, not wait(): wait() also waits for the pipe,
-            # which a child the script left behind can hold open.
-            while proc.returncode is None:  # noqa: ASYNC110  # wait() also waits for the pipes a stray child may hold open
-                await asyncio.sleep(0.1)
-
-        timed_out = False
-        pump = asyncio.create_task(_pump())
-        try:
-            await asyncio.wait_for(_exited(), timeout=plan["timeout"])
-        except asyncio.TimeoutError:
-            timed_out = True
-            # A script that exited inside the last poll has nothing to signal,
-            # and its pid may already name another process.
-            running_still = proc.returncode is None
-            if running_still and config.HOST.posix:
-                stray = _signal_step(proc, signal.SIGTERM)
-                try:
-                    await asyncio.wait_for(_exited(), timeout=_KILL_GRACE_S)
-                except asyncio.TimeoutError:
-                    _signal_step(proc, signal.SIGKILL)
-                await asyncio.to_thread(reap_descendants, stray, _KILL_GRACE_S)
-            elif running_still:
-                kill_process_tree(proc.pid, timeout=5.0)
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(_exited(), timeout=10.0)
-        try:
-            try:
-                await asyncio.wait_for(asyncio.shield(pump), timeout=_DRAIN_S)
-            except asyncio.TimeoutError:
-                _kill_group()
-                try:
-                    await asyncio.wait_for(pump, timeout=_DRAIN_S)
-                except asyncio.TimeoutError:
-                    pump.cancel()
-            _kill_group()
-        finally:
-            running.pop(plan["delivery"], None)
-        seconds = time.monotonic() - started
-        logger.info("step %s (%s): exit=%s timed_out=%s %.1fs", plan["delivery"][:8], plan["name"],
-                    proc.returncode, timed_out, seconds)
-        await _ack(status="ok", exit_code=None if timed_out else proc.returncode,
-                   output=cap.text(), timed_out=timed_out, seconds=round(seconds, 1))
+        await _execute(plan, argv, env, plan["cwd"], ws, command_id, _ack, running)
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001  # the step answers an error ack whatever failed before its verdict

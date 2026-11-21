@@ -5,9 +5,9 @@ The value never enters the sandbox: the server holds a name, the route
 holds the key.
 
 The bearer is the running instance's launch token (basis ``app``); the
-host must be one of the app's approved egress hosts; the call is always
-``https://`` to a host that answers with a public address (403 with the
-reason otherwise); the app's own ``Authorization``, the hop-by-hop set and every
+host must be one of the app's approved egress hosts and never the
+install's own public name; the call is always ``https://`` to a host that
+answers with a public address (403 with the reason otherwise); the app's own ``Authorization``, the hop-by-hop set and every
 ``X-OtoDock-*`` / ``X-Forwarded-*`` header are dropped; a redirect is not
 followed (502); 1 MB in, 30 s, twenty calls a second per app; the answer is
 streamed back minus ``Set-Cookie`` and the hop-by-hop set. Nothing of the
@@ -16,12 +16,14 @@ exchange — the headers least of all — is logged.
 
 import asyncio
 import logging
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
+import config
 from api.apps import app_proxy
 from auth.request_path import has_traversal
 from services.apps import app_secrets, app_supervisor, manifest as _mf
@@ -75,6 +77,11 @@ def _outbound_headers(request: Request, injected: dict[str, str]) -> list[tuple[
     return out
 
 
+def _own_host() -> str:
+    """The host of the install's own public address, "" when none is set."""
+    return (urlsplit("//" + config.get_platform_public_url()).hostname or "").rstrip(".")
+
+
 def _raw_rest(request: Request, app_id: str, path: str) -> str:
     """The path after the host as the server sent it (no decoding, no
     re-encoding), so the vendor receives exactly what was checked."""
@@ -107,6 +114,11 @@ async def app_egress(app_id: str, host: str, path: str, request: Request):
     host = (host or "").strip().lower().rstrip(".")
     if not host or host not in _mf.parse_egress(row):
         raise app_proxy._refuse(404, "not an egress host of this app")
+    # The platform is reached by an app's own routes with its own token. Its
+    # public name answers with a public address, so the check below would
+    # let a call through to the dashboard's routes as an outside caller.
+    if host == _own_host():
+        raise app_proxy._refuse(403, "egress refused: that host is this install itself")
     rest = _raw_rest(request, app_id, path)
     if has_traversal(path) or has_traversal(rest):
         raise app_proxy._refuse(404, "Not found")

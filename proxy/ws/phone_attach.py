@@ -119,7 +119,11 @@ def live_for_chat(chat_id: str) -> CallAttach | None:
 
 async def begin(msg: dict, send, close=None) -> CallAttach | str:
     """The daemon's warmup with a grant: the attach, or a refusal line."""
+    from core import drain
     from services.phone import call_control, in_session_calls
+    if drain.holding():
+        # The grant is kept: the agent may place the call again after the update.
+        return drain.refusal("OtoDock is updating. Place the call again in a few minutes.")
     agent = str(msg.get("model") or "")
     session_id = str(msg.get("attach_session_id") or "")
     grant = str(msg.get("attach_grant") or "")
@@ -133,22 +137,13 @@ async def begin(msg: dict, send, close=None) -> CallAttach | str:
     if not chat or (chat.get("session_id") or "") != session_id:
         in_session_calls.release(grant)
         return "The chat moved to another session; the call cannot run in it."
-    from auth.providers import acting_role_of
-    from core.session.session_manager import get_execution_layer
-    from storage.pg import run_db
-    role = await run_db(acting_role_of, g.user_sub, agent)
-    try:
-        layer = get_execution_layer(
-            agent, execution_path=chat.get("execution_path") or "",
-            user_sub=g.user_sub or None, role=role)
-    except RuntimeError:
+    from services.remote import chat_move
+    lock = await asyncio.to_thread(chat_move.lock_sentence, chat, g.user_sub)
+    if lock:
         in_session_calls.release(grant)
-        return DEAD_LINE
-    try:
-        alive = await layer.is_session_alive(session_id)
-    except Exception:  # noqa: BLE001  # a failed liveness probe reads as not alive
-        alive = False
-    if not alive:
+        return lock
+    layer = await _live_layer(chat, g.user_sub, agent, session_id)
+    if layer is None:
         in_session_calls.release(grant)
         return DEAD_LINE
     number = str(msg.get("caller_phone") or g.phone_number or "")
@@ -165,6 +160,36 @@ async def begin(msg: dict, send, close=None) -> CallAttach | str:
         "phone attach: call in chat=%s session=%s "
         "agent=%s", g.chat_id[:8], session_id[:8], agent)
     return attach
+
+
+async def _chat_layer(chat: dict, sub: str, agent: str) -> ExecutionLayer:
+    """The chat's layer as every chat door reads it (``layer_for_chat``,
+    with the role, in one store job)."""
+    from storage.pg import run_db
+    from ws.dashboard import _role_and_layer
+    _role, layer = await run_db(_role_and_layer, sub, agent, chat)
+    return layer
+
+
+async def _live_layer(chat: dict, sub: str, agent: str, sid: str) -> ExecutionLayer | None:
+    """The chat's layer while its session answers there, else None. A
+    reading taken while the session's machine reconnects is the platform's
+    own (``layer_for_chat`` takes a compute machine's session only over its
+    link), so the reconnect is waited for on the session's holder
+    (``live_session``) and, once it is back, the chat's layer is read again."""
+    from core.session.session_manager import live_session
+    try:
+        layer = await _chat_layer(chat, sub, agent)
+        if await layer.is_session_alive(sid):
+            return layer
+        live = live_session(sid)
+        if live is None or not await live.layer.wait_session_reconnect(sid):
+            return None
+        layer = await _chat_layer(chat, sub, agent)
+        return layer if await layer.is_session_alive(sid) else None
+    except Exception:  # noqa: BLE001  # a layer that cannot be read or probed reads as not alive
+        logger.warning("phone attach: no live layer for session %s", sid[:8], exc_info=True)
+        return None
 
 
 def _context_text(route_id: str, can_transfer: bool = True) -> str:
@@ -193,8 +218,8 @@ def _build_prompt(attach: CallAttach, text: str, barge_in_chars: int | None) -> 
     if attach.interrupted_last_turn or barge_in_chars:
         # An engine that rebuilds its history from the DB gets the precise
         # annotation through the kwarg; the others need the note in text.
-        behaviour = getattr(getattr(attach.layer, "capabilities", None), "behaviour", None)
-        if not getattr(behaviour, "rebuilds_history_from_db", False):
+        behaviour = attach.layer.capabilities_for(attach.session_id).behaviour
+        if not behaviour.rebuilds_history_from_db:
             heard = (f"; they heard only the first {barge_in_chars} characters"
                      if barge_in_chars else "")
             parts.append("[The person interrupted your previous spoken reply"
@@ -343,8 +368,14 @@ async def _run_call(attach: CallAttach, event_queue: asyncio.Queue) -> None:
 
 
 async def _session_alive(layer, sid: str) -> bool:
+    """Whether the call's session still answers on its layer, after one
+    short wait while its machine reconnects (the turn that failed was told)."""
+    from core.session.session_manager import live_session
     try:
-        return bool(await layer.is_session_alive(sid))
+        if await layer.is_session_alive(sid):
+            return True
+        live = live_session(sid)
+        return live is not None and live.layer is layer and bool(await layer.wait_session_reconnect(sid))
     except Exception:  # noqa: BLE001  # a failed liveness probe reads as not alive
         return False
 

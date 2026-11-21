@@ -1,8 +1,9 @@
 """The sandbox's /tmp on LOCAL targets.
 
 The CLI keeps its scratchpad + background-task outputs under
-``/tmp/claude-<proxy uid>/<cwd-slug>/<session id>/`` inside the sandbox's
-private tmpfs, which is also the agent's HOME. The local path gate admits the
+``/tmp/claude-<uid>/<cwd-slug>/<session id>/`` inside the sandbox's private
+tmpfs, which is also the agent's HOME (the root is a fact the machine that
+runs the session reports, ``placement.claude_runtime_root``). The local path gate admits the
 whole of that tmpfs read + write (``auth/path_policy._is_local_tmp_path``):
 nothing of another session or user is there. Remote targets keep the
 session-scoped predicate (``services/path_roles.is_session_runtime_path``,
@@ -15,8 +16,8 @@ Run standalone:
     proxy/venv/bin/python -m pytest tests/execution/test_local_runtime_tree.py -x
 """
 
-import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -34,14 +35,14 @@ from auth.path_policy import (
     check_tool_access,
 )
 from core import placement
-from core.sandbox.sandbox import claude_runtime_root
 from services import path_roles
 from services.path_policy_v2 import PathPolicyContext, _is_session_runtime_path
 
 _AGENTS = config.AGENTS_DIR.resolve()
 SID = "76fe15d2-9b5b-495c-9c6c-42e6626f88f6"
 OTHER_SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-ROOT = claude_runtime_root()
+#: The CLI's runtime root inside a sandbox, as a machine reports it.
+ROOT = "/tmp/claude-1000"
 TREE = f"{ROOT}/-users-alice/{SID}"
 
 
@@ -54,12 +55,8 @@ def _ctx(role="manager", username="alice", agent="personal-assistant",
 
 
 # --------------------------------------------------------------------------- #
-# The root + the shared predicate
+# The shared predicate
 # --------------------------------------------------------------------------- #
-
-def test_local_root_is_tmp_claude_uid():
-    assert ROOT == f"/tmp/claude-{os.getuid()}"
-
 
 def test_predicate_matches_tree_and_rejects_root_and_others():
     ok = path_roles.is_session_runtime_path
@@ -214,17 +211,19 @@ def test_traversal_collapses_before_matching():
     assert not d.allowed
 
 
-def test_agent_tree_under_tmp_keeps_the_role_matrix(monkeypatch, tmp_path):
+def test_agent_tree_under_tmp_keeps_the_role_matrix(monkeypatch):
     # The sandbox's /tmp shares only its name with the host's: a data dir
-    # placed under /tmp (the test suite's is) must not open the agent tree.
+    # placed under /tmp must not open the agent tree. The tree is made in
+    # /tmp itself, since the test's own folder follows TMPDIR.
     from auth import path_policy
-    agents = (tmp_path / "agents").resolve()
-    monkeypatch.setattr(path_policy, "_AGENTS_DIR", agents)
-    assert str(agents).startswith(str(path_policy._SANDBOX_TMP))
-    viewer = _ctx(role="viewer")
-    assert not _check_write_path(agents / "personal-assistant" / "knowledge" / "x.md", viewer).allowed
-    assert not _check_read_path(agents / "personal-assistant" / "config" / "p.md", viewer).allowed
-    assert _check_write_path(Path("/tmp/scratch.txt"), viewer).allowed
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+        agents = (Path(tmp) / "agents").resolve()
+        monkeypatch.setattr(path_policy, "_AGENTS_DIR", agents)
+        assert str(agents).startswith(str(path_policy._SANDBOX_TMP))
+        viewer = _ctx(role="viewer")
+        assert not _check_write_path(agents / "personal-assistant" / "knowledge" / "x.md", viewer).allowed
+        assert not _check_read_path(agents / "personal-assistant" / "config" / "p.md", viewer).allowed
+        assert _check_write_path(Path("/tmp/scratch.txt"), viewer).allowed
 
 
 def test_cross_user_deny_runs_before_the_carve():

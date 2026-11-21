@@ -1,0 +1,17 @@
+{
+ "a former shared chat": "",
+ "a shared chat, machine": "m-online",
+ "a shared chat, machine away": "__offline__:m-offline",
+ "a shared chat, no placement": "local",
+ "a task chat pinned local": "local",
+ "a task chat pinned to a reachable machine": "m-online",
+ "a task chat pinned to an unreachable machine": "__offline__:m-offline",
+ "a task chat with no pin": "",
+ "no chat": "",
+ "no person": "",
+ "someone else's chat": "",
+ "their own chat, local": "local",
+ "their own chat, machine": "m-online",
+ "their own chat, machine away": "__offline__:m-offline",
+ "their own chat, no placement": ""
+}

@@ -23,13 +23,14 @@ Two scopes (XFS project IDs) per agent:
 
 import logging
 import os
-import stat as _stat
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 import config
 from core import layout
+from services.infra import safe_fs
 from storage.pg import get_conn
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,11 @@ _ALLOC_LOCK_KEY = 5102024_0616
 # on disk this process. Lets the belt-and-braces ensure_scope() call (before
 # every sandbox build) skip the subprocess shell-out after the first time.
 _assigned_this_process: set[str] = set()
+# Scopes the helper would refuse (a folder name outside its plain set, or a
+# link on the way): logged once, then left to the soft tier this process.
+_refused_this_process: set[str] = set()
+# One part of a path the helper takes: twin of ``oto-quota``'s PLAIN_PART.
+_PLAIN_PART = re.compile(r"[A-Za-z0-9._@+-]+")
 
 # Resolved once at startup by quotas_preflight(): True iff the agents dir is on a
 # project-quota-capable XFS mount AND enforcement isn't force-disabled AND the
@@ -286,6 +292,21 @@ def _helper_argv(args: list[str]) -> list[str]:
     return ["sudo", "-n", helper, *args]
 
 
+def _plain_path(path: str) -> bool:
+    """Whether the helper takes ``path``: absolute, every part a plain name
+    (``_PLAIN_PART``, and not dots alone)."""
+    parts = path.split("/")[1:] if path.startswith("/") else []
+    return bool(parts) and all(_PLAIN_PART.fullmatch(p) and p.strip(".") for p in parts)
+
+
+def _helper_path(d: Path) -> str:
+    """A scope folder as the helper takes it: the agents folder's real path
+    (an install's data folder moved behind a link is resolved here, once)
+    joined with the scope's own parts, which are never resolved: the helper
+    refuses a link among them."""
+    return os.path.join(os.path.realpath(config.AGENTS_DIR), safe_fs.rel_under(d, config.AGENTS_DIR))
+
+
 def _run_helper(*args, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess:
     argv = _helper_argv([str(a) for a in args])
     cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
@@ -329,20 +350,31 @@ def ensure_scope(agent_slug: str, scope_type: str, username: str | None = None) 
     else:
         raise ValueError(f"unknown scope_type {scope_type!r}")
 
-    if scope_key in _assigned_this_process:
-        return None  # already stamped this process — keep the hot path O(1)
+    if scope_key in _assigned_this_process or scope_key in _refused_this_process:
+        return None  # already stamped (or refused) this process — keep the hot path O(1)
 
     for d in dirs:
         try:
-            d.mkdir(parents=True, exist_ok=True)
+            safe_fs.mkdirs_beneath(config.AGENTS_DIR, safe_fs.rel_under(d, config.AGENTS_DIR))
+        except safe_fs.SafeFsError:
+            _refused_this_process.add(scope_key)
+            logger.warning("storage_quota: scope %s has a link among its folders; it gets no hard "
+                           "quota (soft tier only)", scope_key)
+            return None
         except OSError:
             logger.exception("storage_quota: could not create scope dir %s", d)
             return None
+    paths = [_helper_path(d) for d in dirs]
+    if not all(_plain_path(path) for path in paths):
+        _refused_this_process.add(scope_key)
+        logger.warning("storage_quota: scope %s has a folder name the quota helper does not take; it "
+                       "gets no hard quota (soft tier only)", scope_key)
+        return None
 
     pid = get_or_alloc_project(scope_key, agent_slug, scope_type, username)
     try:
-        for d in dirs:
-            _run_helper("assign", str(d), pid)
+        for path in paths:
+            _run_helper("assign", path, pid)
         limit_bytes, inode_limit = limits_for(scope_type)
         _run_helper("setlimit", str(config.AGENTS_DIR), pid, limit_bytes, inode_limit)
     except Exception:
@@ -386,6 +418,7 @@ def reclaim_project(scope_key: str) -> None:
     retention orphan-project reaper handles long-term drift.
     """
     _assigned_this_process.discard(scope_key)
+    _refused_this_process.discard(scope_key)
     # Clear the scope's threshold-alert dedup state regardless of tier, so a
     # later re-creation of the same scope_key starts from a clean slate.
     try:
@@ -423,27 +456,45 @@ def reclaim_agent(agent_slug: str) -> None:
 # Usage measurement
 # ---------------------------------------------------------------------------
 
-def dir_usage(path: Path) -> tuple[int, int]:
+def dir_usage(path: Path, *, match: str = "", max_depth: int | None = None) -> tuple[int, int]:
     """``(bytes, file_count)`` under ``path``, best-effort.
 
-    Uses ``lstat`` (never follows symlinks → no escape / double-count), skips
-    unreadable entries, and never raises. A permission error mid-walk yields an
-    undercount, so callers treat the result as a FLOOR.
-    """
+    Walked beneath the agent's real folder when ``path`` is in an agent's
+    folder (``core.agent_folder``), with no link followed at any part: a
+    folder replaced by a link counts nothing of its target. A folder of the
+    server's own outside every agent is walked from itself. Every entry but
+    a folder counts by its own ``lstat`` (a link by its own size), one that
+    cannot be read is skipped, and it never raises: a permission error
+    mid-walk yields an undercount, so callers treat the result as a FLOOR.
+    ``match`` counts only names matching that pattern; ``max_depth`` stops
+    the walk that many folders below ``path`` (1: its own entries)."""
+    import fnmatch
+
+    from core import agent_folder
+    from services.infra import safe_fs
+    try:
+        root, rel = agent_folder.beneath_agent(path)
+    except safe_fs.EscapeRefused:
+        root, rel = path, ""
+    except OSError:
+        return (0, 0)
     total = 0
     files = 0
     try:
-        if not path.exists():
-            return (0, 0)
-        for p in path.rglob("*"):
-            try:
-                st = p.lstat()
-            except OSError:
-                continue
-            if _stat.S_ISDIR(st.st_mode):
-                continue
-            total += st.st_size
-            files += 1
+        for step in safe_fs.walk_beneath(root, rel, onerror=lambda _exc: None):
+            sub = step.rel[len(rel):].lstrip("/")
+            depth = 1 + (sub.count("/") + 1 if sub else 0)
+            if max_depth is not None and depth >= max_depth:
+                step.dirs[:] = []
+            for name in step.files + step.symlinks + step.other:
+                if match and not fnmatch.fnmatchcase(name, match):
+                    continue
+                try:
+                    st = os.stat(name, dir_fd=step.dirfd, follow_symlinks=False)
+                except OSError:
+                    continue
+                total += st.st_size
+                files += 1
     except OSError:
         pass
     return (total, files)
@@ -471,7 +522,7 @@ def report_usage(project_id: int) -> tuple[int, int] | None:
 
 
 # ---------------------------------------------------------------------------
-# Boot preflight (mirrors core/sandbox/sandbox.py::netns_preflight)
+# Boot preflight
 # ---------------------------------------------------------------------------
 
 def _mount_info(path: Path) -> tuple[str, str] | None:
@@ -539,6 +590,12 @@ def quotas_preflight() -> None:
             "with the 'prjquota' option.",
             fstype, opts,
         )
+        return
+
+    real = os.path.realpath(agents_dir)
+    if not _plain_path(real):
+        logger.warning("storage_quota: the agents dir %s holds a folder name the oto-quota helper "
+                       "does not take (letters, digits and . _ @ + - only) — soft tier only", real)
         return
 
     # Capable filesystem. Hard enforcement also needs to actually drive

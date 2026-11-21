@@ -27,15 +27,20 @@ class CostHit:
     currency: str       # "USD" for v1
 
 
-def _matches(rule: CostRule, tool_name: str, tool_input: dict) -> bool:
+def _matches(rule: CostRule, tool_name: str, tool_input: dict, tool_result: str | None) -> bool:
     """Does this rule apply to this call?
 
     A ``match`` value is either a SCALAR (exact equality) or a LIST (membership) —
     the list form lets one rule cover several arg values that share a price tier
     (e.g. all non-square aspect ratios). An absent key never matches, so a rule
     keyed on an omitted arg falls through to a broader rule (with first-match-wins
-    ordering, list the most specific rules first)."""
+    ordering, list the most specific rules first). A ``result_has`` rule also needs
+    those words in the first sentence of the tool's answer, the tool's own words (a
+    path the caller chose comes later); an answer the pump never saw matches none."""
     if rule.tool != "*" and rule.tool != tool_name:
+        return False
+    if rule.result_has and not (isinstance(tool_result, str)
+                                and rule.result_has in tool_result.partition(". ")[0] + "."):
         return False
     for k, v in rule.match.items():
         if k not in tool_input:
@@ -65,6 +70,7 @@ def evaluate(
     tool_name: str,
     tool_input: dict | None,
     costs_block: CostsBlock | None,
+    tool_result: str | None = None,
 ) -> CostHit | None:
     """Return a CostHit if a rule matches, else None.
 
@@ -82,7 +88,7 @@ def evaluate(
         return None
 
     for rule in costs_block.rules:
-        if _matches(rule, tool_name, tool_input):
+        if _matches(rule, tool_name, tool_input, tool_result):
             mult = _multiplier(rule, tool_input)
             amount = round(rule.amount * mult, 6)
             return CostHit(

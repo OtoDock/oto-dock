@@ -240,10 +240,13 @@ def delete_older_than(days: int, *, dry_run: bool = False) -> int:
         return cur.rowcount
 
 
-def delete_for_chat(chat_id: str) -> int:
-    """A phone conversation's reports, before the caller-data pass deletes
-    the conversation: what its caller was promised to have forgotten."""
-    with get_conn() as conn:
-        cur = conn.execute("DELETE FROM reply_reports WHERE chat_id = %s", (chat_id,))
-        conn.commit()
+def delete_for_chat(chat_id: str, *, conn=None) -> int:
+    """One chat's reports, before its rows go: a phone conversation's (what
+    its caller was promised to have forgotten) and a chat the platform's
+    chat-rows window deletes, inside that delete's transaction (``conn``)."""
+    if conn is not None:
+        return conn.execute("DELETE FROM reply_reports WHERE chat_id = %s", (chat_id,)).rowcount
+    with get_conn() as own:
+        cur = own.execute("DELETE FROM reply_reports WHERE chat_id = %s", (chat_id,))
+        own.commit()
         return cur.rowcount

@@ -1,0 +1,33 @@
+{
+ "push_ceiling_s": {
+  "0": 600.0,
+  "1": 600.0,
+  "1073741824": 65536.0,
+  "10737418240": 655360.0,
+  "16384": 600.0,
+  "9830400": 600.0,
+  "9830401": 600.0000610351562
+ },
+ "staging": [
+  {
+   "bytes": 31,
+   "name": ".a.txt.<hex>.partial"
+  },
+  {
+   "bytes": 33,
+   "name": "..hidden.<hex>.partial"
+  },
+  {
+   "bytes": 226,
+   "name": ".xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.<hex>.partial"
+  },
+  {
+   "bytes": 226,
+   "name": ".éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé.<hex>.partial"
+  },
+  {
+   "bytes": 226,
+   "name": ".abééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé.<hex>.partial"
+  }
+ ]
+}

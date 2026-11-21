@@ -90,7 +90,7 @@ const INTEGRATION = {
   supports_multi_account: true, candidate_agents: ['alpha', 'beta'], reach_supported: true,
   accounts: [{
     account_label: 'work', display_email: 'dev@example.com', is_default: true, created_at: '2026-01-01',
-    configured_keys: [], connected_services: ['repos'], agent_overrides: ['alpha'],
+    configured_keys: [], connected_services: ['repos'], agent_overrides: ['alpha'], agent_defaults: ['alpha'],
     agent_reaches: [{ agent: 'alpha', repositories: [], read_only: false }], missing_scopes: [],
     kind: 'github_app',
     installations: [{ id: 1, account: 'otodock', target_type: 'Organization', repository_selection: 'selected', repositories: ['oto-dock'], admin: true }],
@@ -108,7 +108,7 @@ const SUBSCRIPTION = {
   status: 'active', last_error: null, last_event_at: null, event_count: 0, expires_at: null, created_by: 'u1',
   webhook_url: 'https://example.test/hook', created_at: '2026-01-01',
 }
-const API_KEY = { id: 'key1', name: 'GitHub webhook', prefix: 'otok_ab', permissions: ['triggers'], created_at: '2026-01-01', last_used_at: null, revoked_at: null }
+const API_KEY = { id: 'key1', name: 'GitHub webhook', prefix: 'otok_ab', permissions: ['triggers'], agents: [], expires_at: '2036-01-01', run_without_asking: false, created_at: '2026-01-01', last_used_at: null, revoked_at: null }
 
 const MACHINE = {
   id: 'm-0001', name: 'Work laptop', status: 'online', last_seen: null, last_heartbeat_age_s: 2, reachable: true,

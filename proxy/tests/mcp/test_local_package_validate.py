@@ -39,14 +39,19 @@ def _session_user(*, role="editor", agent="pa", session_id="sid-1", is_api_key=T
 def resolved_dir(monkeypatch, tmp_path):
     """The path resolver replaced by a map from the raw path to a real
     folder: the policy walk is the local-template route's own, tested there."""
+    import config
     folders: dict[str, Path] = {}
+    # Each package folder stands in the folder of an agent of its own name,
+    # as the real resolver answers a folder inside the session's agent.
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
 
     def _resolve(user, raw_path):
         from fastapi import HTTPException
         if raw_path not in folders:
             raise HTTPException(403, "access denied")
         return local_templates._Folder(
-            raw=raw_path, rel=raw_path.strip("/"), platform=folders[raw_path], agent="pa",
+            raw=raw_path, rel=raw_path.strip("/"), platform=folders[raw_path],
+            agent=folders[raw_path].relative_to(tmp_path).parts[0],
         )
 
     monkeypatch.setattr(local_templates, "_resolve_template_dir", _resolve)
@@ -164,3 +169,59 @@ def test_a_package_on_a_remote_machine_is_read_from_it(temp_db, resolved_dir, tm
     body = r.json()
     assert ".env: a .env file is refused" in "\n".join(body["errors"])
     assert sorted(pulled) == ["workspace/weather-tools/README.md", "workspace/weather-tools/manifest.json"]
+
+
+@pytest.fixture
+def shared_only_chat(monkeypatch, tmp_path):
+    """A Shared-only agent's chat: the session mounts the agent's scope (no
+    person's folder) and its security context names the person who drives
+    it. The real path policy resolves ``/workspace/...`` into the agent's
+    shared workspace; nothing is stubbed between the route and the check."""
+    import auth.path_policy as _pp
+    import config
+    import services.path_policy_v2 as _v2
+    from auth.path_policy import SecurityContext
+    from core.session import session_state
+    agents_dir = tmp_path / "agents"
+    shared = agents_dir / "pa" / "workspace"
+    shared.mkdir(parents=True)
+    monkeypatch.setattr(config, "AGENTS_DIR", agents_dir)
+    monkeypatch.setattr(_pp, "_AGENTS_DIR", agents_dir.resolve())
+    if hasattr(_v2, "_AGENTS_DIR"):
+        monkeypatch.setattr(_v2, "_AGENTS_DIR", agents_dir.resolve())
+    contexts: dict[str, SecurityContext] = {}
+    monkeypatch.setattr(session_state, "get_session_security", contexts.get)
+
+    def _open(sid: str, role: str, username: str = "alice") -> None:
+        contexts[sid] = SecurityContext(role=role, username=username, agent="pa", is_admin_agent=False,
+                                        session_scope="agent", available_scopes=("agent",))
+
+    return shared, _open
+
+
+def test_a_shared_only_chat_checks_a_package_in_the_agents_workspace(temp_db, shared_only_chat, tmp_path):
+    """An editor driving a Shared-only agent's chat: the token names the
+    person, the folder resolves into the agent's shared workspace, and the
+    check runs. A viewer is refused, and so is a session nobody drives."""
+    shared, open_chat = shared_only_chat
+    _package(shared)
+    open_chat("sid-editor", "editor")
+    r = _client(_session_user(role="editor", session_id="sid-editor")).post(
+        "/v1/mcps/local-package/validate", json={"path": "/workspace/weather-tools"})
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True and r.json()["summary"]["name"] == "weather-tools"
+
+    open_chat("sid-viewer", "viewer")
+    r = _client(_session_user(role="viewer", session_id="sid-viewer")).post(
+        "/v1/mcps/local-package/validate", json={"path": "/workspace/weather-tools"})
+    assert r.status_code == 403
+
+    from auth import roles
+    from auth.providers import SESSION_SUB_PREFIX
+    open_chat("sid-nobody", "manager", username="")
+    nobody = UserContext(sub=f"{SESSION_SUB_PREFIX}sid-nobody", email="session@internal", name="Session Token",
+                         role=roles.SERVICE, is_api_key=True, session_id="sid-nobody", agent="pa")
+    assert nobody.acting_sub is None
+    r = _client(nobody).post("/v1/mcps/local-package/validate", json={"path": "/workspace/weather-tools"})
+    assert r.status_code == 403
+    assert "signed-in user" in r.json()["detail"]

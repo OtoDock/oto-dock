@@ -9,8 +9,10 @@ verdict is the exit code, kept on the delivery with the output, and a
 finished step wakes the ``step:<name>`` subscribers; the step's claim is a
 bearer the platform and the action routes accept only while the delivery
 is in flight; the card learns the scripts, their place, the link warning
-and who may approve; a real script runs in the sandbox with the identity's
-mounts and never sees ``/config``.
+and who may approve. A step of the platform's place goes to the compute
+machine that serves it, with the identity's mounts, never ``/config``, and
+its signed script alone. What the machine does with that sandbox is the
+satellite's suite (``satellite/tests/test_step_runner.py``).
 """
 
 from __future__ import annotations
@@ -30,14 +32,15 @@ from api.apps import app_proxy
 from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
+from core import placement
 from core.session import session_state
 from services.apps import (
     app_deploy,
     app_handlers,
-    app_sandbox,
     app_steps,
     app_supervisor,
     app_tokens,
+    call_rate,
     catalog,
     manifest as _mf,
     releases,
@@ -46,16 +49,12 @@ from services.scheduler import shared
 from services.scripts import runner as script_runner
 from storage import database as task_store, db_app_deliveries as deliveries
 from storage.pg import get_conn
+from tests.apps.conftest import MACHINE
 
 client = TestClient(app)
 
 AGENT = "steps-agent"
 SID_SHARED = "sess-steps-shared"
-
-_needs_runtime = pytest.mark.skipif(
-    not (shutil.which("pasta") and shutil.which("bwrap")),
-    reason="requires pasta + bwrap on this host",
-)
 
 SCRIPT = "#!/bin/sh\necho hi\n"
 SHA = hashlib.sha256(SCRIPT.encode()).hexdigest()
@@ -83,12 +82,11 @@ def _clean(monkeypatch):
     app_proxy._buckets.clear()
     app_supervisor._client = None
     catalog._loop = None
-    catalog._app_subs.clear()
     app_handlers._drains.clear()
     app_handlers._drain_locks.clear()
     app_handlers._step_runs.clear()
     app_handlers.mark_dirty()
-    monkeypatch.setattr(app_proxy, "PLATFORM_RATE", 1000.0)
+    monkeypatch.setattr(call_rate, "RESERVE", 1000.0)
     yield
     app.dependency_overrides.pop(get_current_user, None)
     shared._shutting_down = False
@@ -201,7 +199,7 @@ def test_a_deploy_that_replaces_the_waiting_copy_rings_no_second_time(agent_tree
 
 
 def _result(**over) -> app_steps.StepResult:
-    base = dict(exit_code=0, output="hello", timed_out=False, ran_on="local", seconds=0.1)
+    base = dict(exit_code=0, output="hello", timed_out=False, ran_on=MACHINE, seconds=0.1)
     base.update(over)
     return app_steps.StepResult(**base)
 
@@ -328,7 +326,7 @@ def test_a_deploy_hashes_the_script_and_a_rollback_rehashes_it(agent_tree):
     assert _mf.parse_steps(row)["sync"]["sha256"] == new_sha and task_store.app_actions_approved(row)
     # A rollback serves the previous script again and re-hashes it, so the
     # signature no longer matches and the card comes back.
-    asyncio.run(app_deploy.rollback_folder(row))
+    asyncio.run(app_deploy.rollback_folder(row, by_person=True))
     back = task_store.get_app(row["id"])
     assert _mf.parse_steps(back)["sync"]["sha256"] == SHA
     assert not task_store.app_actions_approved(back)
@@ -337,25 +335,25 @@ def test_a_deploy_hashes_the_script_and_a_rollback_rehashes_it(agent_tree):
 # ── the fire ────────────────────────────────────────────────────────────────
 
 
-def test_a_step_runs_in_its_lane_with_the_verdict_on_the_delivery(agent_tree, monkeypatch):
+def test_a_step_runs_in_its_lane_with_the_verdict_on_the_delivery(agent_tree, placed, monkeypatch):
     row = _deploy_approved(agent_tree, "flow", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
     seen: list = []
 
-    async def fake_local(plan, claim):
-        seen.append((plan, claim))
+    async def fake_run(plan, claim, machine_id):
+        seen.append((plan, claim, machine_id))
         return _result(output=f"hello\nclaim={claim}\n")
 
-    monkeypatch.setattr(app_steps, "run_local", fake_local)
+    monkeypatch.setattr(app_steps, "run_remote", fake_run)
 
     async def go():
         got = await _run_step(row, "sync", {"n": 1})
-        assert got["status"] == "done" and got["exit_code"] == 0 and got["ran_on"] == "local"
+        assert got["status"] == "done" and got["exit_code"] == 0 and got["ran_on"] == MACHINE
         assert got["started_at"] and got["done_at"]
         # The claim never lands in the output: it is scrubbed.
         assert "hello" in got["output"] and "claim=[redacted]" in got["output"]
-        plan, claim = seen[0]
+        plan, claim, machine_id = seen[0]
         assert plan.name == "sync" and plan.run == "scripts/sync.sh" and plan.sha256 == SHA
-        assert plan.script == SCRIPT.encode() and plan.target == "local"
+        assert plan.script == SCRIPT.encode() and plan.target == machine_id == MACHINE
         assert plan.identity.scope == "agent" and plan.identity.knowledge_rw is True
         assert plan.workspace_relative == "workspace" and plan.knowledge_relative == "knowledge"
         claims = app_tokens.verify(claim, row["id"], app_tokens.PURPOSE_CALLER)
@@ -371,24 +369,25 @@ def test_a_step_runs_in_its_lane_with_the_verdict_on_the_delivery(agent_tree, mo
         assert payload["delivery_id"] == got["id"] and "hello" in payload["output"]
         assert deliveries.get(after[0]["id"])["last_error"] == "the app has no server"
         # The trailer in the app log, and the status with the step's columns.
-        assert "step sync: done" in releases.log_path(row).read_text()
+        trailer = releases.log_path(row).read_text()
+        assert "step sync: done" in trailer and "on the sandbox" in trailer
         st = app_deploy.status(task_store.get_app(row["id"]))
         mine = [w for w in st["wakes"] if w["handler"] == "sync"][0]
-        assert mine["exit_code"] == 0 and mine["ran_on"] == "local"
+        assert mine["exit_code"] == 0 and mine["ran_on"] == MACHINE
 
     asyncio.run(go())
 
 
-def test_verdicts_by_exit_code_timeout_and_refusals(agent_tree, monkeypatch):
+def test_verdicts_by_exit_code_timeout_and_refusals(agent_tree, placed, monkeypatch):
     row = _deploy_approved(agent_tree, "flow", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
     outcome: dict = {}
 
-    async def fake_local(plan, claim):
+    async def fake_run(plan, claim, machine_id):
         if isinstance(outcome.get("raise"), Exception):
             raise outcome["raise"]
         return _result(**outcome.get("result", {}))
 
-    monkeypatch.setattr(app_steps, "run_local", fake_local)
+    monkeypatch.setattr(app_steps, "run_remote", fake_run)
 
     async def go():
         outcome["result"] = {"exit_code": 3, "output": "a\nb\nboom\n"}
@@ -418,11 +417,11 @@ def test_verdicts_by_exit_code_timeout_and_refusals(agent_tree, monkeypatch):
         # read-only; the fake runner sees the identity.
         plans: list = []
 
-        async def spy(plan, claim):
+        async def spy(plan, claim, machine_id):
             plans.append(plan)
             return _result()
 
-        monkeypatch.setattr(app_steps, "run_local", spy)
+        monkeypatch.setattr(app_steps, "run_remote", spy)
         row2 = _deploy_approved(agent_tree, "flow2", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
         task_store.set_user_agent_role("alice-sub", AGENT, "editor")
         await _run_step(row2, "sync")
@@ -479,18 +478,18 @@ def test_the_step_claim_calls_the_platform_and_presses_buttons_while_in_flight(a
     assert client.post(f"/v1/apps/{row['id']}/actions/run", json={}, headers=hdr).status_code == 403
 
 
-def test_steps_run_beside_the_server_lane_one_per_handler_under_the_caps(agent_tree, monkeypatch):
+def test_steps_run_beside_the_server_lane_one_per_handler_under_the_caps(agent_tree, placed, monkeypatch):
     manifest = {"title": "Lanes", "handlers": {"on_trigger": ["a", "b", "ping"]},
                 "steps": {"a": {"run": "scripts/a.sh"}, "b": {"run": "scripts/b.sh"}}}
     row = _deploy_approved(agent_tree, "lanes", manifest,
                            {"scripts/a.sh": SCRIPT, "scripts/b.sh": SCRIPT})
     gates: dict[str, asyncio.Event] = {}
 
-    async def fake_local(plan, claim):
+    async def fake_run(plan, claim, machine_id):
         await gates[plan.name].wait()
         return _result(output=plan.name)
 
-    monkeypatch.setattr(app_steps, "run_local", fake_local)
+    monkeypatch.setattr(app_steps, "run_remote", fake_run)
 
     async def go():
         gates["a"], gates["b"] = asyncio.Event(), asyncio.Event()
@@ -628,18 +627,75 @@ def test_an_interpreter_the_machine_lacks_is_named(script, word):
     assert str(e.value) == word
 
 
-def test_a_local_step_mounts_only_its_signed_script(agent_tree, monkeypatch):
-    """The approval signs the step's script alone, so a local run sees that
-    script and nothing else of the release (a paired machine already runs
-    only the verified bytes): the bytes are staged into the run's scratch
-    directory and mounted at ``/app`` in place of the live release."""
-    monkeypatch.setattr(app_sandbox, "bun_binary", lambda: "")
+# ── on a compute machine ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("resolved,place,expected", [
+    (placement.LOCAL, {"id": "m-compute"}, "m-compute"),
+    ("m-admin", {"id": "m-compute"}, "m-admin"),
+    ("m-admin", None, "m-admin"),
+])
+def test_a_step_takes_the_platforms_place_where_a_session_would(agent_tree, monkeypatch, resolved, place, expected):
+    from services.apps import app_compute
+    monkeypatch.setattr("services.remote.remote_status.resolve_execution_target", lambda *a: (resolved, None))
+    monkeypatch.setattr(app_compute, "place", lambda: place)
+    row = _deploy_approved(agent_tree, f"place-{resolved[:3].lower()}-{1 if place else 0}", STEP_MANIFEST,
+                           {"scripts/sync.sh": SCRIPT})
+    identity, _vis = app_steps.identity_for(row)
+    assert app_steps.placement_for(row, identity) == expected
+
+
+def test_a_step_of_the_platforms_place_waits_while_no_compute_machine_serves(agent_tree, monkeypatch):
+    """The platform runs no step itself: with no compute machine the step
+    is not there to run, as for a machine that is offline. Its delivery is
+    armed again and nothing is counted against it."""
+    from services.apps import app_compute
+    monkeypatch.setattr("services.remote.remote_status.resolve_execution_target",
+                        lambda *a: (placement.LOCAL, None))
+    monkeypatch.setattr(app_compute, "place", lambda: None)
+    row = _deploy_approved(agent_tree, "place-none", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
+    identity, _vis = app_steps.identity_for(row)
+    with pytest.raises(app_steps.StepUnavailable) as away:
+        app_steps.placement_for(row, identity)
+    assert away.value.reason == "the machine is offline"
+
+
+def test_a_compute_step_ships_its_sandbox_and_never_its_script(agent_tree, placed):
+    from services.scripts import runner as _runner
+    row = _deploy_approved(agent_tree, "cstep", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
+    plan = app_steps.plan_for(row, {"id": "d-compute-1", "handler": "sync", "event": "trigger:t", "payload": {"n": 1}})
+    assert plan.target == MACHINE
+    spec = app_steps._spec_for(plan, "claim")
+    try:
+        frame, step_dir = _runner.compute_frame(spec)
+        assert "script" not in frame and frame["argv"][-1] == "/app/scripts/sync.sh"
+        assert frame["sha256"] == plan.sha256 and frame["timeout"] == plan.timeout
+        desc = frame["sandbox"]
+        mounts = {b["sandbox"]: b for b in desc["extra_binds"]}
+        assert mounts["/app"]["root"] == mounts["/step"]["root"] == "agents"
+        assert not mounts["/app"]["rw"] and not mounts["/step"]["rw"]
+        assert not any(b["root"] == "abs" for b in (*desc["binds"], *desc["extra_binds"]))
+        assert desc["cwd"] == "/workspace"
+        assert (step_dir / "payload.json").read_text() == '{"n":1}'
+        assert frame["env"]["OTODOCK_STEP_PAYLOAD"] == "/step/payload.json"
+        assert frame["env"]["OTODOCK_WORKSPACE_DIR"] == "/workspace"
+    finally:
+        shutil.rmtree(spec.scratch_root / "d-compute-1", ignore_errors=True)
+
+
+def test_a_compute_steps_sandbox_holds_its_signed_script_alone(agent_tree, placed):
+    """The approval signs the step's script alone, so the folder the machine
+    binds at ``/app`` is the run's own, with that script and nothing else of
+    the release: a sibling the script sources is not there, and a redeploy
+    that changes only the sibling changes nothing a step runs."""
+    from services.scripts import runner as _runner
     row = _deploy_approved(agent_tree, "staged", STEP_MANIFEST,
                            {"scripts/sync.sh": SCRIPT, "scripts/lib.sh": "echo sibling\n"})
     plan = app_steps.plan_for(row, {"id": "d-staged-1", "handler": "sync", "event": "trigger:t", "payload": {}})
     spec = app_steps._spec_for(plan, "claim")
     try:
         live = releases.live_release_dir(row)
+        assert (live / "scripts" / "lib.sh").is_file()
         assert spec.script_dir is not None and spec.mount_at == "/app"
         assert spec.script_dir != live and not spec.script_dir.is_relative_to(live)
         staged = sorted(p.relative_to(spec.script_dir).as_posix()
@@ -647,97 +703,74 @@ def test_a_local_step_mounts_only_its_signed_script(agent_tree, monkeypatch):
         assert staged == ["scripts/sync.sh"]
         assert (spec.script_dir / "scripts" / "sync.sh").read_bytes() == SCRIPT.encode()
         assert spec.script_dir.is_relative_to(spec.scratch_root / "d-staged-1")
-        argv, _env, _step_dir = app_steps._build_local(plan, "claim")
-        assert argv[-1] == "/app/scripts/sync.sh"
+        frame, _step_dir = _runner.compute_frame(spec)
+        app = next(b for b in frame["sandbox"]["extra_binds"] if b["sandbox"] == "/app")
+        assert (agent_tree / app["rel"]).resolve() == spec.script_dir.resolve()
+        assert frame["argv"][-1] == "/app/scripts/sync.sh"
     finally:
         shutil.rmtree(spec.scratch_root / "d-staged-1", ignore_errors=True)
 
 
-def test_a_failed_local_start_leaves_no_staged_script(agent_tree, monkeypatch):
+def test_a_compute_steps_sandbox_is_the_identitys_mount_row_and_never_config(agent_tree, placed):
+    """A shared app's step: the agent's workspace writable, the shared
+    knowledge writable while its approver is a manager and read-only once
+    they are not, no ``/config``, and the claim in the environment alone."""
     from services.scripts import runner as _runner
-    monkeypatch.setattr(app_sandbox, "bun_binary", lambda: "")
-    row = _deploy_approved(agent_tree, "staged2", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
-    plan = app_steps.plan_for(row, {"id": "d-staged-2", "handler": "sync", "event": "trigger:t", "payload": {}})
+    row = _deploy_approved(agent_tree, "mounts", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
 
-    def _broken(spec):
-        raise _runner.ScriptRefused("the sandbox could not be built")
-    monkeypatch.setattr(_runner, "build_local", _broken)
-    with pytest.raises(app_steps.StepRefused):
-        asyncio.run(app_steps.run_local(plan, "claim"))
-    assert not (releases.app_release_dir(row) / app_steps.STEPS_DIR_NAME / "d-staged-2").exists()
+    def frame_of(delivery_id: str) -> dict:
+        plan = app_steps.plan_for(row, {"id": delivery_id, "handler": "sync", "event": "trigger:t", "payload": {}})
+        spec = app_steps._spec_for(plan, "the-step-claim")
+        try:
+            return _runner.compute_frame(spec)[0]
+        finally:
+            shutil.rmtree(spec.scratch_root / delivery_id, ignore_errors=True)
 
-
-# ── the real thing ──────────────────────────────────────────────────────────
-
-REAL_SCRIPT = """#!/bin/sh
-echo hello from step
-echo payload: $(cat "$OTODOCK_STEP_PAYLOAD")
-test -n "$OTODOCK_STEP_TOKEN" && echo token-set
-echo token: $OTODOCK_STEP_TOKEN
-echo cwd: $(pwd)
-echo ws: $OTODOCK_WORKSPACE_DIR kn: $OTODOCK_KNOWLEDGE_DIR
-test -e /config && echo config-mounted || echo no-config
-echo written > "$OTODOCK_WORKSPACE_DIR/notes/step.txt"
-echo knowledge > /knowledge/step.txt && echo knowledge-writable
-exit 0
-"""
-
-
-@_needs_runtime
-def test_a_step_really_runs_in_the_sandbox_with_the_identitys_mounts(agent_tree, monkeypatch):
-    monkeypatch.setattr(app_sandbox, "bun_binary", lambda: "")
-    row = _deploy_approved(agent_tree, "real", STEP_MANIFEST, {"scripts/sync.sh": REAL_SCRIPT})
-
-    async def go():
-        got = await _run_step(row, "sync", {"n": 1})
-        assert got["status"] == "done", got
-        out = got["output"]
-        assert "hello from step" in out and 'payload: {"n":1}' in out and "token-set" in out
-        assert "token: [redacted]" in out
-        assert "cwd: /workspace" in out and "ws: /workspace kn: /knowledge" in out
-        assert "no-config" in out and "config-mounted" not in out
-        # Knowledge RW on the manager's approval; the workspace RW.
-        assert "knowledge-writable" in out
-        assert (agent_tree / "workspace" / "notes" / "step.txt").read_text().strip() == "written"
-        assert (agent_tree / "knowledge" / "step.txt").read_text().strip() == "knowledge"
-        # The step's scratch directory is gone with the run.
-        assert not (releases.app_release_dir(row) / app_steps.STEPS_DIR_NAME).exists() \
-            or not any((releases.app_release_dir(row) / app_steps.STEPS_DIR_NAME).iterdir())
-
-    asyncio.run(go())
+    frame = frame_of("d-mounts-1")
+    desc = frame["sandbox"]
+    binds = {b["sandbox"]: b for b in desc["binds"]}
+    assert set(binds) == {"/workspace", "/knowledge"}
+    assert binds["/workspace"]["rw"] and binds["/knowledge"]["rw"]
+    # The script's folder, the verified bytes over its name, the scratch.
+    assert {b["sandbox"] for b in desc["extra_binds"]} == {"/app", "/app/scripts/sync.sh", "/step"}
+    assert frame["env"]["OTODOCK_STEP_TOKEN"] == "the-step-claim" and frame["env"]["OTO_CONFIG_DIR"] == ""
+    assert "the-step-claim" not in " ".join(frame["argv"])
+    task_store.set_user_agent_role("alice-sub", AGENT, "editor")
+    try:
+        later = {b["sandbox"]: b for b in frame_of("d-mounts-2")["sandbox"]["binds"]}
+    finally:
+        task_store.set_user_agent_role("alice-sub", AGENT, "manager")
+    assert later["/workspace"]["rw"] and not later["/knowledge"]["rw"]
 
 
-@_needs_runtime
-def test_a_local_step_cannot_source_a_sibling_the_approval_never_signed(agent_tree, monkeypatch):
-    """A sibling the script sources is not in the step's sandbox, as on a
-    machine: a redeploy that changes only that file changes nothing a step
-    runs."""
-    monkeypatch.setattr(app_sandbox, "bun_binary", lambda: "")
-    script = "#!/bin/sh\n. /app/scripts/lib.sh\necho after-source\n"
-    row = _deploy_approved(agent_tree, "sibling", STEP_MANIFEST,
-                           {"scripts/sync.sh": script,
-                            "scripts/lib.sh": "echo SIBLING-RAN\n"})
-
-    async def go():
-        got = await _run_step(row, "sync")
-        assert got["status"] == "dead", got
-        assert "SIBLING-RAN" not in (got["output"] or "")
-        assert "lib.sh" in (got["output"] or "")
-
-    asyncio.run(go())
+def test_a_compute_steps_scratch_is_removed_after_its_run(agent_tree, placed):
+    row = _deploy_approved(agent_tree, "cstep2", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
+    plan = app_steps.plan_for(row, {"id": "d-compute-2", "handler": "sync", "event": "trigger:t", "payload": {}})
+    result = asyncio.run(app_steps.run_remote(plan, "claim", MACHINE))
+    assert result.exit_code == 0 and result.ran_on == MACHINE
+    assert placed.sent[0]["type"] == "step_run" and "sandbox" in placed.sent[0]
+    assert not (releases.app_release_dir(row) / app_steps.STEPS_DIR_NAME / "d-compute-2").exists()
 
 
-@_needs_runtime
-def test_a_timeout_kills_the_script(agent_tree, monkeypatch):
-    monkeypatch.setattr(app_sandbox, "bun_binary", lambda: "")
-    manifest = {"title": "Slow", "handlers": {"on_trigger": ["slow"]},
-                "steps": {"slow": {"run": "scripts/slow.sh", "timeout": 2}}}
-    row = _deploy_approved(agent_tree, "slow", manifest,
-                           {"scripts/slow.sh": "#!/bin/sh\necho start\nsleep 30\necho never\n"})
+def test_a_compute_step_its_machine_refuses_leaves_no_staged_script(agent_tree, placed):
+    row = _deploy_approved(agent_tree, "cstep4", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
+    plan = app_steps.plan_for(row, {"id": "d-compute-4", "handler": "sync", "event": "trigger:t", "payload": {}})
+    placed.answer = lambda msg: RuntimeError("Satellite command error: the sandbox could not be rendered")
+    with pytest.raises(app_steps.StepRefused, match="the sandbox could not be rendered"):
+        asyncio.run(app_steps.run_remote(plan, "claim", MACHINE))
+    assert placed.of("step_run")
+    assert not (releases.app_release_dir(row) / app_steps.STEPS_DIR_NAME / "d-compute-4").exists()
 
-    async def go():
-        got = await _run_step(row, "slow")
-        assert got["status"] == "dead" and got["last_error"] == "timed out after 2 s"
-        assert got["exit_code"] is None
 
-    asyncio.run(go())
+def test_a_paired_machine_still_gets_the_scripts_bytes(agent_tree, placed, monkeypatch):
+    row = _deploy_approved(agent_tree, "cstep3", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
+
+    async def settled(*a, **k):
+        return None
+
+    monkeypatch.setattr("core.remote.upload_inflight.wait_settled", settled)
+    plan = app_steps.plan_for(row, {"id": "d-paired-1", "handler": "sync", "event": "trigger:t", "payload": {}})
+    # The same machine, paired: it shares no folder with the platform.
+    placed.compute.clear()
+    asyncio.run(app_steps.run_remote(plan, "claim", MACHINE))
+    assert placed.sent[0]["script"] == SCRIPT and "sandbox" not in placed.sent[0]

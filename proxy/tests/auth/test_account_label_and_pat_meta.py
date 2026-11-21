@@ -58,7 +58,7 @@ class TestPatDescriptionMeta:
     ):
         from types import SimpleNamespace
 
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_store, mcp_registry
         from services.mcp.mcp_manifest_types import CredentialConfig
 
         def make(oauth: dict) -> SimpleNamespace:
@@ -80,8 +80,7 @@ class TestPatDescriptionMeta:
             "provider_id": "postiz",
             "flows": ["personal_access_token"],
         })
-        monkeypatch.setattr(
-            mcp_registry, "_manifests",
+        monkeypatch.setattr(mcp_manifest_store, "_manifests",
             {"with-copy": with_copy, "without": without},
         )
 

@@ -37,26 +37,27 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from auth import tokens
-from core.credentials.mcp_gateway import CliCredential, GatewayCredential
+from core.credentials.mcp_gateway import (
+    TOKEN_RENEWAL_ENV,
+    TOKEN_RENEWAL_LIFE_S,
+    CliCredential,
+    ExitCredential,
+    GatewayCredential,
+    TokenCredential,
+)
 
 logger = logging.getLogger("otodock")
 
-# Capability-token lifetime — SHORT by design (NOT the 24h session-JWT TTL). The
-# wrapper fetches once, at MCP-child startup, immediately after the token is
-# minted, so this only has to span spawn/install latency. A token replayed after
-# the session closes finds a purged store anyway; the short TTL is belt-and-
-# suspenders against a captured-but-unused token.
-MCP_CRED_TOKEN_TTL_S = 30 * 60
+# The fetch token's life: a session's token's. A tool starts at the agent's
+# first call to it, hours into a chat, and fetches its secrets then. The
+# session's own processes can read the token (in the tool's config and its
+# stand-in's environment) as they read a started tool's secrets in /proc, so
+# a longer life reaches nothing more; the bundle's purge at the session's end
+# still closes it (SECURITY-DECISIONS, decision 35).
+MCP_FETCH_TOKEN_TTL_S = TOKEN_RENEWAL_LIFE_S
 
 # session_id -> mcp_name -> SecretBundle.  IN-MEMORY ONLY (see module docstring).
 _store: dict[str, dict[str, SecretBundle]] = {}
-
-# session_id -> relpath -> SessionFile. Per-SESSION secret FILES (not per-MCP
-# env) — SSH private keys today, credentials_dir token files next. A remote
-# session's satellite fetches these once at start via a session-files
-# capability token, materializes them 0600 under its per-session secrets dir,
-# and wipes them at session close. Same in-memory-only rule as ``_store``.
-_file_store: dict[str, dict[str, SessionFile]] = {}
 
 
 @dataclass
@@ -70,14 +71,16 @@ class SecretBundle:
     env: dict[str, str] = field(default_factory=dict)
     gateway: GatewayCredential | None = None
     cli: CliCredential | None = None
-
-
-@dataclass
-class SessionFile:
-    """One secret file delivered to a remote session's satellite at start."""
-
-    content_b64: str
-    mode: int = 0o600
+    # The secrets of ``env`` the session holds as placeholders, each swapped
+    # for its value by the credential exit on the way out.
+    exit: tuple[ExitCredential, ...] = ()
+    # The account token ``env`` holds by value, by reference too: read fresh
+    # at every fetch, and read again by the tool itself when it expires.
+    token: TokenCredential | None = None
+    # The account the build resolved this tool on (``"<owner's sub>|<label>"``,
+    # "" for a tool with none): a session taken back after a restart gets its
+    # secrets again only on this account (``mcp_gateway.accounts_of``).
+    account: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -90,10 +93,15 @@ def provision(session_id: str, secrets: dict[str, SecretBundle]) -> None:
 
     Called at MCP materialization and re-called on every (re)warmup, so the
     store always reflects the latest build. An empty/falsy mapping clears the
-    session (nothing to broker)."""
+    session (nothing to broker). A bundle whose account token expires takes
+    the tool's renewal token here, where the session's id is known."""
     if not session_id:
         return
     if secrets:
+        for mcp, bundle in secrets.items():
+            token = getattr(bundle, "token", None)
+            if token is not None and token.renews:
+                bundle.env[TOKEN_RENEWAL_ENV] = mint_renewal(session_id, mcp)
         _store[session_id] = dict(secrets)
     else:
         _store.pop(session_id, None)
@@ -108,6 +116,37 @@ def get(session_id: str, mcp: str) -> SecretBundle | None:
 def bundles_of(session_id: str) -> dict[str, SecretBundle]:
     """Every bundle a session holds, by MCP key (a copy)."""
     return dict(_store.get(session_id, {}))
+
+
+def exit_credentials(session_id: str) -> list[ExitCredential]:
+    """Every placeholder a session holds, with its credential."""
+    return [c for bundle in _store.get(session_id, {}).values() for c in bundle.exit]
+
+
+def exit_credential(session_id: str, placeholder: str) -> ExitCredential | None:
+    """The credential behind ``placeholder`` when the session holds it."""
+    for cred in exit_credentials(session_id):
+        if cred.placeholder == placeholder:
+            return cred
+    return None
+
+
+def exit_placeholder_for_cli(session_id: str, cred: CliCredential) -> str:
+    """The placeholder the session holds for a command-line credential, or
+    ``""`` when it holds none (the hook then hands the token only to a
+    credential built per command, ``CliCredential.per_command``)."""
+    for c in exit_credentials(session_id):
+        # By value, never identity: a session taken back after a restart
+        # holds the descriptor's copies.
+        if c.cli is not None and c.cli == cred:
+            return c.placeholder
+    return ""
+
+
+def exit_takes_host(session_id: str, host: str) -> bool:
+    """Whether the session holds a placeholder whose value may be sent to
+    ``host``: the exit ends such a connection and reads inside."""
+    return any(c.takes_host(host) for c in exit_credentials(session_id))
 
 
 def cli_credential(session_id: str, host: str) -> CliCredential | None:
@@ -128,28 +167,8 @@ def purge_session(session_id: str) -> None:
     replayed afterwards (within its TTL) finds nothing. The gateway forgets
     the session's descriptor and tells the push registry."""
     _store.pop(session_id, None)
-    _file_store.pop(session_id, None)
     from core.credentials import mcp_gateway
     mcp_gateway.on_purge(session_id)
-
-
-def provision_session_files(
-    session_id: str, files: dict[str, SessionFile],
-) -> None:
-    """Install (replace) the per-session secret FILES for a session.
-
-    Empty/falsy mapping clears the session's files."""
-    if not session_id:
-        return
-    if files:
-        _file_store[session_id] = dict(files)
-    else:
-        _file_store.pop(session_id, None)
-
-
-def get_session_files(session_id: str) -> dict[str, SessionFile] | None:
-    """The session's secret files, or None when none were provisioned."""
-    return _file_store.get(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +184,7 @@ def mint_token(session_id: str, mcp: str) -> str:
         "type": "mcp_cred",
         "sid": session_id,
         "mcp": mcp,
-        "exp": datetime.now(timezone.utc) + timedelta(seconds=MCP_CRED_TOKEN_TTL_S),
+        "exp": datetime.now(timezone.utc) + timedelta(seconds=MCP_FETCH_TOKEN_TTL_S),
     }
     return tokens.mint(tokens.MCP_CREDENTIALS, payload)
 
@@ -187,23 +206,54 @@ def verify_token(token: str) -> tuple[str, str] | None:
     return sid, mcp
 
 
-def mint_files_token(session_id: str) -> str:
-    """Mint the session-files capability token. Rides the start payload; the
-    SATELLITE presents it once (before the CLI spawns) to fetch this session's
-    secret files over the tunnel. It never enters the spawned CLI/agent env,
-    so the agent's bash cannot replay it — and like the per-MCP token it is
-    the ONLY accepted credential on the endpoint."""
-    payload = {
-        "type": "session_files",
-        "sid": session_id,
-        "exp": datetime.now(timezone.utc) + timedelta(seconds=MCP_CRED_TOKEN_TTL_S),
-    }
-    return tokens.mint(tokens.SESSION_FILES, payload)
+def live_token(token: str) -> tuple[str, str, SecretBundle] | int:
+    """The one check of a fetch token, for every route that takes it (the
+    secrets, a tool's saved answers, its start): ``(session_id, mcp, bundle)``
+    while the token is valid and its session still holds that tool's bundle,
+    else the status to answer: 401 for a token that is not one, 404 once the
+    session is gone (its bundles are purged at its end, so a token copied out
+    of a closed session reaches nothing)."""
+    ident = verify_token(token)
+    if ident is None:
+        return 401
+    bundle = get(*ident)
+    if bundle is None:
+        return 404
+    return ident[0], ident[1], bundle
 
 
-def verify_files_token(token: str) -> str | None:
-    """Validate a session-files capability token → session_id (or None)."""
-    payload = tokens.verify(token, tokens.SESSION_FILES)
+def mint_renewal(session_id: str, mcp: str) -> str:
+    """Mint the renewal token of ``(session_id, mcp)``: what a stdio tool
+    presents on the bundle's route when its account token runs out, for the
+    token alone. It stays in the tool's environment, unlike the fetch token,
+    so a process that reads that environment can ask for the tool's token
+    while the session's bundle stands (SECURITY-DECISIONS); never a static
+    secret, another tool's token, or the refresh token, which no session
+    holds."""
+    payload = {"sid": session_id, "mcp": mcp}
+    return tokens.mint(tokens.MCP_TOKEN, payload, ttl_s=TOKEN_RENEWAL_LIFE_S)
+
+
+def verify_renewal(token: str) -> tuple[str, str] | None:
+    """Validate a renewal token. Returns ``(session_id, mcp)`` or ``None``."""
+    payload = tokens.verify(token, tokens.MCP_TOKEN)
     if payload is None:
         return None
-    return payload.get("sid") or None
+    sid = payload.get("sid") or ""
+    mcp = payload.get("mcp") or ""
+    if not sid or not mcp:
+        return None
+    return sid, mcp
+
+
+def renewal_ended(token: str) -> bool:
+    """Whether ``token`` is a genuine renewal token past its life: a tool
+    that holds one is told to start a new chat, where any other refusal would
+    read as a passing one and be tried for ever."""
+    try:
+        tokens.decode(token, tokens.MCP_TOKEN)
+    except tokens.TokenExpired:
+        return True
+    except tokens.TokenInvalid:
+        return False
+    return False

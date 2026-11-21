@@ -25,12 +25,13 @@ from services.memory.memory_file import Caps, MemoryCapError, MemoryOpError
 
 @pytest.fixture
 def root(monkeypatch):
-    """A scope root under the agents root (every memory write opens beneath
-    ``config.AGENTS_DIR``; a root outside it is refused)."""
+    """A scope root in an agent's folder (every memory read and write opens
+    beneath the agent's folder; a root in no agent's folder is refused)."""
     import config
     with tempfile.TemporaryDirectory() as d:
         monkeypatch.setattr(config, "AGENTS_DIR", Path(d))
-        yield Path(d) / "memory"
+        (Path(d) / "pa").mkdir()
+        yield Path(d) / "pa" / "knowledge" / "memory"
 
 
 def _create(root: Path, rel: str, text: str):
@@ -98,14 +99,270 @@ def test_rename_file_to_bad_extension_denied(root):
         memory_file.op_rename(root, "a.md", "a.py")
 
 
-def test_resolve_strict_blocks_symlink_escape(root):
+def test_a_link_inside_a_scope_is_never_followed(root):
     root.mkdir(parents=True)
     outside = root.parent / "outside"
     outside.mkdir()
     (outside / "secret.md").write_text("s")
     (root / "link").symlink_to(outside)
     with pytest.raises(MemoryOpError, match="does not exist"):
-        memory_file._resolve_strict(root, "link/secret.md")
+        memory_file.op_view(root, "link/secret.md")
+    assert "link" not in memory_file.op_view(root, "").output
+
+
+# A person's own sessions write their context/ (and an owner's knowledge/):
+# a link at the memory folder itself is planted, and no command reads,
+# lists, writes or clears through it.
+
+
+def _linked_root(root: Path) -> Path:
+    outside = root.parent / "outside"
+    outside.mkdir(parents=True)
+    (outside / "secret.md").write_text("not memory")
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.symlink_to(outside)
+    return outside
+
+
+def test_a_linked_scope_root_is_never_read_or_listed(root):
+    outside = _linked_root(root)
+    with pytest.raises(MemoryOpError, match="does not exist"):
+        memory_file.op_view(root, "secret.md")
+    with pytest.raises(MemoryOpError):
+        memory_file.op_view(root, "")
+    assert memory_file.iter_topic_files(root) == []
+    with pytest.raises((MemoryOpError, OSError)):
+        memory_file.op_str_replace(root, "secret.md", "not", "now")
+    assert (outside / "secret.md").read_text() == "not memory"
+
+
+def test_a_linked_scope_root_is_never_written_through(root):
+    outside = _linked_root(root)
+    with pytest.raises((MemoryOpError, OSError)):
+        _create(root, "new.md", "# new")
+    assert sorted(p.name for p in outside.iterdir()) == ["secret.md"]
+
+
+def test_a_folder_swapped_after_the_look_is_never_read(root, monkeypatch):
+    _create(root, "topics/a.md", "# a\nmine")
+    outside = root.parent / "outside"
+    outside.mkdir()
+    (outside / "a.md").write_text("ORIGINAL")
+    real = memory_file._kind
+
+    def _kind_then_swap(path):
+        kind = real(path)
+        topics = root / "topics"
+        if not topics.is_symlink():
+            for child in topics.iterdir():
+                child.unlink()
+            topics.rmdir()
+            topics.symlink_to(outside)
+        return kind
+
+    monkeypatch.setattr(memory_file, "_kind", _kind_then_swap)
+    with pytest.raises(MemoryOpError):
+        memory_file.op_view(root, "topics/a.md")
+
+
+def test_a_folder_swapped_after_the_clear_listed_it_is_never_removed(root, monkeypatch):
+    import config
+    from api.agent_data import memory as memory_api
+    agent_dir = config.AGENTS_DIR / "clear-agent"
+    context = agent_dir / "users" / "u" / "context"
+    (context / "memory").mkdir(parents=True)
+    (context / "memory" / "mine.md").write_text("mine")
+    outside = root.parent / "outside"
+    (outside / "memory").mkdir(parents=True)
+    (outside / "memory" / "kept.md").write_text("keep")
+    real = memory_file.files_below
+
+    def _list_then_swap(folder):
+        out = real(folder)
+        context.rename(context.parent / "context-aside")
+        context.symlink_to(outside)
+        return out
+
+    monkeypatch.setattr(memory_file, "files_below", _list_then_swap)
+    assert memory_api._clear_memory_dir("clear-agent", "user", "u") == []
+    assert (outside / "memory" / "kept.md").read_text() == "keep"
+
+
+def test_the_clear_never_follows_a_linked_folder(root, monkeypatch):
+    import config
+    from api.agent_data import memory as memory_api
+    agent_dir = config.AGENTS_DIR / "clear-agent"
+    outside = root.parent / "outside"
+    (outside / "memory").mkdir(parents=True)
+    (outside / "memory" / "kept.md").write_text("keep")
+    (agent_dir / "users" / "u").mkdir(parents=True)
+    (agent_dir / "users" / "u" / "context").symlink_to(outside)
+    assert memory_api._clear_memory_dir("clear-agent", "user", "u") == []
+    assert (outside / "memory" / "kept.md").read_text() == "keep"
+
+
+# An agent's folder may itself be a link the install's operator made
+# (core/agent_folder.py): memory follows that one link and none below it.
+
+
+@pytest.fixture
+def linked_agent(tmp_path, monkeypatch):
+    """A stand-in agents folder whose agent ``pa`` is a link to a folder
+    outside it: the agent's folder as named, and its real place."""
+    import config
+    agents = tmp_path / "agents"
+    real = tmp_path / "disk2" / "pa"
+    agents.mkdir()
+    real.mkdir(parents=True)
+    (agents / "pa").symlink_to(real)
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    return agents / "pa", real
+
+
+def test_a_linked_agents_memory_is_read_at_a_sessions_start(linked_agent):
+    agent_dir, real = linked_agent
+    (real / "knowledge" / "memory").mkdir(parents=True)
+    (real / "knowledge" / "memory" / "a.md").write_text("# Colour\nTeal (2026-11-14)")
+    root = memory_file.scope_root(agent_dir, "agent")
+    assert [f.heading for f in memory_index.scope_facts(root, today=date(2026, 11, 14))] == ["Colour"]
+    assert "Colour" in memory_index.build_index_content(root, today=date(2026, 11, 14))
+
+
+def test_a_linked_agents_memory_is_viewed(linked_agent):
+    agent_dir, real = linked_agent
+    (real / "knowledge" / "memory").mkdir(parents=True)
+    (real / "knowledge" / "memory" / "a.md").write_text("# Colour\nTeal")
+    root = memory_file.scope_root(agent_dir, "agent")
+    assert "Teal" in memory_file.op_view(root, "a.md").output
+    assert "a.md" in memory_file.op_view(root, "").output
+    assert "1 topic file" in memory_file.view_root({"agent": root}).output
+
+
+def test_a_linked_agents_memory_is_written(linked_agent):
+    # Refused on 1.9.1 too (its scope lock opened beneath the agents folder).
+    agent_dir, real = linked_agent
+    root = memory_file.scope_root(agent_dir, "user", "u")
+    memory_file.op_create(root, "a.md", "# A\nfirst")
+    memory_file.op_str_replace(root, "a.md", "first", "second")
+    memory_file.op_rename(root, "a.md", "b.md")
+    mine = real / "users" / "u" / "context" / "memory"
+    assert (mine / "b.md").read_text() == "# A\nsecond"
+    memory_file.op_delete(root, "b.md")
+    assert not (mine / "b.md").exists()
+    assert (mine / memory_file.INDEX_FILENAME).is_file()
+
+
+def test_a_linked_agents_memory_is_cleared(linked_agent):
+    from api.agent_data import memory as memory_api
+    _agent_dir, real = linked_agent
+    mine = real / "users" / "u" / "context" / "memory"
+    mine.mkdir(parents=True)
+    (mine / "a.md").write_text("# A\nmine")
+    assert memory_api._clear_memory_dir("pa", "user", "u") == ["a.md"]
+    assert not (mine / "a.md").exists()
+
+
+def test_a_linked_agents_memory_write_is_fanned_out(linked_agent, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from services.memory import memory_publish
+    from services.notifications import notification_manager
+    from services.remote import workspace_fanout
+    from storage.files import file_tombstones_store
+    agent_dir, _real = linked_agent
+    root = memory_file.scope_root(agent_dir, "agent")
+    memory_file.op_create(root, "a.md", "# A\nteal")
+    sent = {}
+
+    async def _fan_out(agent, path, content, **kw):
+        sent[path] = content
+
+    monkeypatch.setattr(file_tombstones_store, "drop", lambda *a: None)
+    monkeypatch.setattr(workspace_fanout, "shared_only_of", AsyncMock(return_value=False))
+    monkeypatch.setattr(workspace_fanout, "has_fanout_candidates", lambda *a, **k: True)
+    monkeypatch.setattr(workspace_fanout, "fan_out_write", _fan_out)
+    monkeypatch.setattr(notification_manager, "broadcast_file_updated", AsyncMock())
+    asyncio.run(memory_publish.publish_changes(
+        "pa", agent_dir, root, memory_file.OpResult(output="", changed=["a.md"]), writer_slug=None))
+    assert sent == {"knowledge/memory/a.md": b"# A\nteal"}
+
+
+@pytest.mark.parametrize("where", ["knowledge", "memory"])
+def test_a_link_below_a_linked_agents_folder_is_still_refused(linked_agent, tmp_path, where):
+    from api.agent_data import memory as memory_api
+    agent_dir, real = linked_agent
+    outside = tmp_path / "outside"
+    (outside / "memory").mkdir(parents=True)
+    (outside / "memory" / "secret.md").write_text("# Secret\nnot memory")
+    if where == "knowledge":
+        (real / "knowledge").symlink_to(outside)
+    else:
+        (real / "knowledge").mkdir()
+        (real / "knowledge" / "memory").symlink_to(outside / "memory")
+    root = memory_file.scope_root(agent_dir, "agent")
+    assert memory_index.scope_facts(root, today=date(2026, 11, 14)) == []
+    with pytest.raises(MemoryOpError):
+        memory_file.op_view(root, "secret.md")
+    with pytest.raises((MemoryOpError, OSError)):
+        memory_file.op_create(root, "new.md", "# new")
+    assert memory_api._clear_memory_dir("pa", "agent", None) == []
+    assert sorted(p.name for p in (outside / "memory").iterdir()) == ["secret.md"]
+
+
+def test_one_folder_that_cannot_be_entered_leaves_the_rest_of_the_scope_listed(root):
+    import os
+    _create(root, "a.md", "# A\nkept")
+    _create(root, "sub/b.md", "# B\nlocked away")
+    os.chmod(root / "sub", 0)
+    try:
+        assert [p.name for p in memory_index.iter_topic_files(root)] == ["a.md"]
+        assert [f.heading for f in memory_index.scope_facts(root, today=date(2026, 11, 14))] == ["A"]
+        # The clear stays strict: a part of the scope is never removed.
+        assert memory_file.files_below(root) == []
+    finally:
+        os.chmod(root / "sub", 0o755)
+
+
+def test_a_link_in_a_memory_folder_is_never_published_as_removed(root):
+    from api.agent_data import memory as memory_api
+    _create(root, "sub/a.md", "# A\nmine")
+    outside = root.parent / "outside.md"
+    outside.write_text("not memory")
+    (root / "sub" / "b.md").symlink_to(outside)
+    assert memory_file.op_delete(root, "sub").deleted == ["sub/a.md"]
+    _create(root, "c.md", "# C\nmine")
+    (root / "d.md").symlink_to(outside)
+    assert memory_api._clear_memory_dir("pa", "agent", None) == [memory_file.INDEX_FILENAME, "c.md"]
+    assert outside.read_text() == "not memory"
+
+
+def test_a_topic_swapped_for_a_link_after_the_write_is_never_fanned_out(root, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from services.memory import memory_publish
+    from services.notifications import notification_manager
+    from services.remote import workspace_fanout
+    from storage.files import file_tombstones_store
+    memory_file.op_create(root, "a.md", "# A\nmine")
+    outside = root.parent / "outside.md"
+    outside.write_text("not memory")
+    (root / "a.md").unlink()
+    (root / "a.md").symlink_to(outside)
+    sent: list = []
+
+    async def _fan_out(agent, path, content, **kw):
+        sent.append(content)
+
+    monkeypatch.setattr(file_tombstones_store, "drop", lambda *a: None)
+    monkeypatch.setattr(workspace_fanout, "shared_only_of", AsyncMock(return_value=False))
+    monkeypatch.setattr(workspace_fanout, "has_fanout_candidates", lambda *a, **k: True)
+    monkeypatch.setattr(workspace_fanout, "fan_out_write", _fan_out)
+    monkeypatch.setattr(notification_manager, "broadcast_file_updated", AsyncMock())
+    asyncio.run(memory_publish.publish_changes(
+        "pa", root.parent.parent, root, memory_file.OpResult(output="", changed=["a.md"]), writer_slug=None))
+    assert sent == []
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +732,7 @@ def test_scope_roots_refuse_a_username_that_leaves_the_agent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The memory writes open beneath the agents root
+# The memory writes open beneath the agent's folder
 # ---------------------------------------------------------------------------
 
 
@@ -483,6 +740,7 @@ def test_scope_roots_refuse_a_username_that_leaves_the_agent(tmp_path):
 def agents_root(tmp_path, monkeypatch):
     import config
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    (tmp_path / "pa").mkdir()
     return tmp_path
 
 
@@ -510,7 +768,7 @@ def _swap_on_open(monkeypatch, root, victim):
 
 
 def test_memory_write_refuses_a_swapped_component(agents_root, monkeypatch):
-    root = agents_root / "memory"
+    root = agents_root / "pa" / "memory"
     memory_file.op_create(root, "topics/a.md", "# a\nfirst")
     victim = agents_root.parent / f"victim-{agents_root.name}"
     victim.mkdir(exist_ok=True)
@@ -532,7 +790,7 @@ def test_memory_root_outside_the_agents_tree_is_refused(tmp_path, monkeypatch):
 
 
 def test_memory_delete_and_rename_open_beneath_the_root(agents_root):
-    root = agents_root / "memory"
+    root = agents_root / "pa" / "memory"
     memory_file.op_create(root, "topics/a.md", "# a\nx")
     memory_file.op_rename(root, "topics/a.md", "moved/b.md")
     assert (root / "moved" / "b.md").read_text().startswith("# a")
@@ -930,3 +1188,52 @@ def test_a_giant_hand_dropped_topic_is_read_capped_and_sized_by_stat(root):
     assert f.newest == date(2026, 10, 1)
     index = memory_index.build_index_content(root, today=date(2026, 10, 28))
     assert "- giant.md: Giant (" in index and "Late" not in index
+
+
+def test_a_refused_clear_publishes_nothing(root, monkeypatch):
+    # A person's memory folder is a link to another person's: nothing is
+    # removed there, and no delete is published for the other person's file.
+    import asyncio
+
+    import config
+    from api.agent_data import memory as memory_api
+    from services.memory import memory_publish
+    agent_dir = config.AGENTS_DIR / "clear-agent"
+    bob = agent_dir / "users" / "bob" / "context" / "memory"
+    bob.mkdir(parents=True)
+    (bob / "b.md").write_text("# B\nbob's")
+    (agent_dir / "users" / "u" / "context").mkdir(parents=True)
+    (agent_dir / "users" / "u" / "context" / "memory").symlink_to(bob)
+    published = []
+
+    async def _publish(*a, **kw):
+        published.append(a)
+
+    monkeypatch.setattr(memory_publish, "publish_changes", _publish)
+    assert asyncio.run(memory_api._clear_and_tombstone("clear-agent", "user", "u")) == 0
+    assert published == [] and (bob / "b.md").read_text() == "# B\nbob's"
+
+
+def test_a_published_path_is_the_joined_one_never_where_a_link_lands(root):
+    import config
+    from services.memory import memory_publish
+    agent_dir = config.AGENTS_DIR / "pub-agent"
+    bob = agent_dir / "users" / "bob" / "context" / "memory"
+    bob.mkdir(parents=True)
+    (agent_dir / "users" / "u" / "context").mkdir(parents=True)
+    mine = agent_dir / "users" / "u" / "context" / "memory"
+    mine.symlink_to(bob)
+    assert memory_publish.tree_rel(agent_dir, mine, "b.md") == "users/u/context/memory/b.md"
+    assert memory_publish.tree_rel(agent_dir, config.AGENTS_DIR / "other" / "memory", "b.md") is None
+
+
+def test_a_topic_at_a_link_is_never_read_for_the_index(root):
+    # Held twice (the scan lists no link): the facts' own read alone.
+    from datetime import date
+    root.mkdir(parents=True)
+    outside = root.parent / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("# Secret heading\nnot memory")
+    (root / "x.md").symlink_to(outside / "secret.md")
+    facts = memory_index.topic_facts(root / "x.md", root, today=date(2026, 11, 14))
+    assert facts.heading == "(empty)" and facts.size == 0

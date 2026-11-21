@@ -13,8 +13,10 @@ Permission resolution lives in :func:`_resolve_tool_set` and runs once at
 module load using the auto-injected ``OTO_*`` env vars (mirror of
 ``mcps-mcp/server.py``):
 
-- ``viewer`` (any scope) → ``complete_setup`` only; viewers don't manage
-  agents, but they do walk their own per-user onboarding.
+- Below the editor tier (a viewer, a contributor, any scope) →
+  ``complete_setup`` and the two session tools (``reload_session``,
+  ``switch_account``): they don't manage agents, but they walk their own
+  per-user onboarding and their own chat's session is theirs to reload.
 - ``editor``/``manager``/``admin`` → the full tool set (the proxy refuses
   the owner-tier writes an editor cannot make, per call).
 - ``scope=agent`` — a person's chat on a Shared-only agent, or a user-tied
@@ -45,6 +47,7 @@ from _tool_args import ToolArgs
 # The sibling module (the tool schemas, pure data): found on sys.path[0] when
 # the MCP runs as ``python server.py`` from its folder, and put there by the
 # proxy's test loader while this module executes.
+from agent_config_limits import limits_body, limits_lines
 from agent_config_tool_schemas import _TOOL_SCHEMAS
 
 # ---------------------------------------------------------------------------
@@ -73,6 +76,8 @@ _READ_TOOLS = {
     "list_context_files",
     "get_memory_settings",
     "list_knowledge_libraries",
+    "get_outside_people",
+    "get_tool_limits",
 }
 _WRITE_TOOLS = {
     # Platform-role tools (admin/creator, server-enforced; CRITICAL tier —
@@ -93,26 +98,41 @@ _WRITE_TOOLS = {
     "set_visibility_mode",
     "update_user_memory_enabled",
     "update_agent_memory_enabled",
+    "set_outside_people",
+    "set_tool_limits",
     "complete_setup",
+}
+# The chat's own session: open to every person's chat at any role, since a
+# reload builds the session from what is stored and widens nothing. A run
+# (a task, a delegated worker) is handed these two alone: the run goes on
+# with the account from its next round.
+_SESSION_TOOLS = {
+    "reload_session",
+    "switch_account",
 }
 
 
 def _resolve_tool_set() -> set[str]:
+    if TASK_TYPE:
+        # A run, whatever the role behind it: the session tools alone. The
+        # hook holds the run to the same two (the task builders' limit on
+        # this MCP), so a run's environment is not the wall.
+        return set(_SESSION_TOOLS)
     if ROLE and not CAN_EDIT:
         # A person below the editor tier (a viewer, a contributor) gets
-        # exactly complete_setup: per-user onboarding (user-setup.md)
-        # targets the default-attach audience, who join as viewers — the
-        # endpoint's user scope only ever touches the caller's own file.
-        # Everything else stays manager-tier.
+        # complete_setup and the session tools: per-user onboarding
+        # (user-setup.md) targets the default-attach audience, who join as
+        # viewers — the endpoint's user scope only ever touches the caller's
+        # own file. Everything else stays manager-tier.
         #
         # Scope-independent on purpose: a Shared-only agent mounts agent-scope
         # for HUMAN chats too (OTO_SCOPE=="agent" with a real viewer driving),
         # so keying on scope advertised a surface every endpoint then refused.
-        # No service session loads this MCP (the manifest excludes task,
-        # meeting and external), so only a person's session reaches here.
-        return {"complete_setup"}
+        # A run never reaches here (above); the manifest excludes meetings
+        # and outside people, so only a person's session does.
+        return {"complete_setup"} | _SESSION_TOOLS
     if SCOPE in ("user", "agent"):
-        return _READ_TOOLS | _WRITE_TOOLS
+        return _READ_TOOLS | _WRITE_TOOLS | _SESSION_TOOLS
     return set()
 
 
@@ -126,7 +146,15 @@ HEX_COLOR_REGEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
 # ---------------------------------------------------------------------------
 
 class _ApiError(RuntimeError):
-    pass
+    #: The status and the ``detail`` sentence of a refused request (0 and
+    #: ``""`` for a network error).
+    status: int = 0
+    detail: str = ""
+
+
+class _Refused(RuntimeError):
+    """The platform's own sentence for a request it refused, written for the
+    person: the tool answers it without the request's method and path."""
 
 
 async def _request(method: str, path: str, **kwargs) -> Any:
@@ -155,7 +183,10 @@ async def _request(method: str, path: str, **kwargs) -> Any:
                     detail = js.get("detail") or js
                 except (ValueError, AttributeError):
                     pass
-                raise _ApiError(f"{method} {path} → {resp.status_code}: {detail}")
+                err = _ApiError(f"{method} {path} → {resp.status_code}: {detail}")
+                err.status = resp.status_code
+                err.detail = detail if isinstance(detail, str) else ""
+                raise err
             if resp.status_code == 204 or not resp.content:
                 return None
             return resp.json()
@@ -868,6 +899,144 @@ async def _tool_update_agent_memory_enabled(enabled: bool) -> str:
     )
 
 
+def _outside_lines(page: dict) -> list[str]:
+    rows = [f"# External identities of `{AGENT_NAME}`",
+            "What a caller on this agent's phone line, or another person who is not a member, gets. "
+            "Nothing is given until a manager picks it; nothing they say changes it."]
+    tools = page.get("tools") or []
+    if not tools:
+        rows.append("- No tool of this agent can be given to external identities.")
+    for t in tools:
+        access = t.get("access") or ""
+        if not access:
+            state = "not added"
+        elif access == "custom":
+            state = "custom: " + ", ".join(t.get("functions") or [])
+        elif access == "read_only":
+            known = t.get("known_functions")
+            reads = [f["name"] for f in (known or []) if f.get("reads_only")]
+            state = "read only: " + (", ".join(reads) if reads else
+                                     "nothing listed yet" if known is None else "nothing only reads")
+        else:
+            state = "read and write"
+        changed = " (the maker changed which functions only read since the pick)" if t.get("changed") else ""
+        rows.append(f"- **{t.get('mcp')}** ({t.get('label')}): {state}{changed}")
+    files = {"read_only": "read only", "read_write": "read and write"}.get(page.get("files") or "", "read only")
+    rows.append(f"- **This person's files**: {files}")
+    rows.append(f"- **Web search**: {'on' if page.get('web') else 'off'}")
+    if page.get("wrapup_enabled", True):
+        model = page.get("wrapup_model") or "the conversation's own"
+        notes = "on" if page.get("shared_notes") else "off"
+        rows.append(f"- **Remember each conversation**: on (notes for the team {notes}, model {model})")
+    else:
+        rows.append("- **Remember each conversation**: off")
+    knowledge = page.get("knowledge") or []
+    rows.append("- **Knowledge folders**: " + (", ".join(knowledge) if knowledge else "none"))
+    choices = page.get("knowledge_choices") or []
+    rows.append("- Folders on offer: " + (", ".join(choices) + ", and any folder inside them" if choices else "none"))
+    apps = page.get("apps") or []
+    if apps:
+        rows.append("- **Apps**:")
+        for a in apps:
+            state = a.get("problem") or ("opens " + ", ".join(a.get("methods") or []))
+            changed = " (a new release changed what it opens since it was added)" if a.get("changed") else ""
+            rows.append(f"  - `{a.get('slug')}` ({a.get('title')}): {state}{changed}")
+    else:
+        rows.append("- **Apps**: none")
+    offered = [a for a in (page.get("app_choices") or []) if a.get("id") not in {p.get("id") for p in apps}]
+    rows.append("- Apps on offer: " + (", ".join(
+        f"`{a.get('slug')}`" + (f" (opens {', '.join(a.get('methods') or [])})" if a.get("methods")
+                                else " (opens nothing to them yet)")
+        for a in offered) if offered else "none"))
+    return rows
+
+
+async def _tool_get_outside_people() -> str:
+    """Show what external identities get on this agent, as the card shows
+    it, with what is on offer. Read-only."""
+    page = await _request("GET", f"/v1/agents/{AGENT_NAME}/outside")
+    if not isinstance(page, dict):
+        return "❌ Error: unexpected /outside response"
+    return "\n".join(_outside_lines(page))
+
+
+# The tool's argument names and the route's (``PUT /v1/agents/{name}/outside``).
+_OUTSIDE_FIELDS = {
+    "remove_tools": "remove_tools", "files": "files", "web": "web",
+    "add_folders": "add_knowledge", "remove_folders": "remove_knowledge",
+    "wrapup": "wrapup_enabled", "notes_for_team": "shared_notes", "wrapup_model": "wrapup_model",
+}
+
+
+async def _tool_set_outside_people(args: dict) -> str:
+    """Change what external identities get on this agent: only the fields
+    given. The platform refuses a tool that is not enabled on the agent, a
+    folder it does not offer, or a custom pick with no function."""
+    body: dict = {}
+    if "tools" in args:
+        tools = args["tools"]
+        if not isinstance(tools, list):
+            return "❌ Error: `tools` is a list of {mcp, access, functions?}"
+        picks = []
+        for t in tools:
+            if not isinstance(t, dict) or not t.get("mcp") or not t.get("access"):
+                return "❌ Error: each tool is {mcp, access, functions?}"
+            picks.append({"mcp": t["mcp"], "access": t["access"],
+                          "functions": [str(f) for f in (t.get("functions") or [])]})
+        body["tools"] = picks
+    for arg, field in _OUTSIDE_FIELDS.items():
+        if arg in args and args[arg] is not None:
+            value = args[arg]
+            body[field] = [str(v) for v in value] if isinstance(value, list) else value
+    if args.get("add_apps") or args.get("remove_apps"):
+        # The agent names its apps by their short name; the route takes ids.
+        current = await _request("GET", f"/v1/agents/{AGENT_NAME}/outside")
+        if not isinstance(current, dict):
+            return "❌ Error: unexpected /outside response"
+        by_slug = {a.get("slug"): a.get("id") for a in (current.get("app_choices") or []) + (current.get("apps") or [])}
+        for arg, field in (("add_apps", "add_apps"), ("remove_apps", "remove_apps")):
+            names = [str(n) for n in (args.get(arg) or [])]
+            unknown = [n for n in names if n not in by_slug]
+            if unknown:
+                return f"❌ Error: no app of this agent is named {', '.join(unknown)}"
+            if names:
+                body[field] = [by_slug[n] for n in names]
+    if not body:
+        return "❌ Error: name at least one thing to change"
+    page = await _request("PUT", f"/v1/agents/{AGENT_NAME}/outside", json=body)
+    if not isinstance(page, dict):
+        return "❌ Error: unexpected /outside response"
+    return "✅ Saved. New conversations get this.\n" + "\n".join(_outside_lines(page))
+
+
+_LIMITS_PATH = f"/v1/agents/{AGENT_NAME}/tool-limits"
+
+
+async def _tool_get_tool_limits() -> str:
+    """Show what this agent may use of each MCP, as the card shows it."""
+    page = await _request("GET", _LIMITS_PATH)
+    if not isinstance(page, dict):
+        return "❌ Error: unexpected /tool-limits response"
+    return "\n".join(limits_lines(AGENT_NAME, page))
+
+
+async def _tool_set_tool_limits(args: dict) -> str:
+    """Limit what this agent may use of an MCP: only the columns named. A
+    session may only tighten; the platform's refusal is read as written."""
+    body, error = limits_body(args)
+    if body is None:
+        return error
+    try:
+        page = await _request("PUT", _LIMITS_PATH, json=body, attempts=1)
+    except _ApiError as exc:
+        if 400 <= exc.status < 500 and exc.detail:
+            raise _Refused(exc.detail) from None
+        raise
+    if not isinstance(page, dict):
+        return "❌ Error: unexpected /tool-limits response"
+    return "✅ Saved. New sessions get this.\n" + "\n".join(limits_lines(AGENT_NAME, page))
+
+
 async def _tool_complete_setup(summary: str = "", scope: str = "") -> str:
     """Mark this agent's post-install setup complete.
 
@@ -1115,6 +1284,51 @@ async def _tool_set_department(department: str, level: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The chat's own session
+# ---------------------------------------------------------------------------
+
+_RELOAD_PATH = f"/v1/agents/{AGENT_NAME}/reload-session"
+
+
+async def _post_reload(payload: dict) -> Any:
+    """Post the reload route once. A refusal (a 4xx with a sentence) is the
+    platform's words for the person, raised as ``_Refused``."""
+    try:
+        return await _request("POST", _RELOAD_PATH, json=payload, attempts=1)
+    except _ApiError as exc:
+        if 400 <= exc.status < 500 and exc.detail:
+            raise _Refused(exc.detail) from None
+        raise
+
+
+async def _tool_reload_session(reason: str) -> str:
+    """Ask the platform to rebuild this chat's session when the turn ends:
+    it is built again from the agent's tools and the person's accounts as
+    they are stored then, and the chat continues by itself. In a run, the
+    run goes on in a next round."""
+    await _post_reload({"reason": reason})
+    if TASK_TYPE:
+        return "The run goes on with today's tools from its next round. End your turn now."
+    return ("The session reloads when this turn ends, and the chat continues where it was. "
+            "End your turn now.")
+
+
+async def _tool_switch_account(tool: str, account: str, reason: str) -> str:
+    """Switch this chat to another account of one tool:
+    the same reload, with the chat's choice of account for that tool."""
+    data = await _post_reload({"reason": reason, "accounts": {tool: account}})
+    # The platform's own answer: the label it recorded, or none for the
+    # agent's default account (an account may itself be labelled "default").
+    recorded = ((data or {}).get("accounts") or {}).get(tool, account)
+    uses = recorded or "the agent's default account"
+    if TASK_TYPE:
+        return (f"The run goes on with {uses} for {tool} from its next round. "
+                "End your turn now.")
+    return (f"This chat uses {uses} for {tool} from the reload on. The session reloads "
+            "when this turn ends, and the chat continues where it was. End your turn now.")
+
+
+# ---------------------------------------------------------------------------
 # MCP dispatch (the tool schemas: agent_config_tool_schemas.py)
 # ---------------------------------------------------------------------------
 
@@ -1136,10 +1350,18 @@ _TOOL_HANDLERS = {
     "list_context_files": lambda args: _tool_list_context_files(),
     "update_persona": lambda args: _tool_update_persona(args.get("content", "")),
     "get_memory_settings": lambda args: _tool_get_memory_settings(),
+    "get_outside_people": lambda args: _tool_get_outside_people(),
+    "set_outside_people": _tool_set_outside_people,
+    "get_tool_limits": lambda args: _tool_get_tool_limits(),
+    "set_tool_limits": _tool_set_tool_limits,
     "update_user_memory_enabled": lambda args: _tool_update_user_memory_enabled(args.get("enabled")),
     "update_agent_memory_enabled": lambda args: _tool_update_agent_memory_enabled(args.get("enabled")),
     "complete_setup": lambda args: _tool_complete_setup(
         args.get("summary", ""), args.get("scope", ""),
+    ),
+    "reload_session": lambda args: _tool_reload_session(args.get("reason", "")),
+    "switch_account": lambda args: _tool_switch_account(
+        args.get("tool", ""), args.get("account", ""), args.get("reason", ""),
     ),
     "list_knowledge_libraries": lambda args: _tool_list_knowledge_libraries(),
     "share_knowledge_folder": lambda args: _tool_share_knowledge_folder(
@@ -1226,6 +1448,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=f"❌ Error: unknown tool '{name}'")]
     try:
         result = await handler(arguments or {})
+    except _Refused as exc:
+        return [TextContent(type="text", text=f"Not done. {exc} Tell the person this in these words.")]
     except _ApiError as exc:
         return [TextContent(type="text", text=f"❌ Error: {exc}")]
     except Exception as exc:  # noqa: BLE001  # the tool answers with the error text whatever failed

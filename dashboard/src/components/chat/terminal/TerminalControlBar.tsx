@@ -16,6 +16,9 @@ import { isCtrlHeld, setCtrlHold, subscribeCtrlHold } from '@/lib/terminalCtrlHo
  * modifier for keyboards without the key: arm it, type a letter, the terminal
  * receives the control byte (c → ^C). While armed a highlighted Ctrl chip
  * shows in the bar — tap it to disarm.
+ *
+ * The popover spans the host's positioned box, not the bar's own: the status
+ * row's key area, so it keeps that width when the keys take only their own.
  */
 interface Props {
   send: (seq: string) => void
@@ -70,7 +73,7 @@ export default function TerminalControlBar({ send, className }: Props) {
   }
 
   return (
-    <div ref={expandRef} className={`relative ${className || ''}`}>
+    <div ref={expandRef} className={className}>
       {expanded && (
         <div className={`absolute bottom-full left-0 right-0 z-50 mb-2 ${POPOVER} p-2.5`}>
           <div className="mb-2 flex items-center justify-between">

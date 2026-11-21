@@ -1,5 +1,5 @@
-"""Unit tests for video-gen-mcp (Omni Flash / Veo 3.1 generation, transitions,
-Runway Aleph 2.0 editing, Seedance premium transitions).
+"""Unit tests for video-gen-mcp (Omni Flash generation, Veo 3.1 through fal.ai,
+transitions, Runway Aleph 2.0 editing, Seedance premium transitions).
 
 The MCP code lives outside the proxy's import path; ``load_mcp_server``
 imports it by file location. HTTP is mocked — either by stubbing the module's
@@ -13,7 +13,10 @@ real-binary test that skips when the package is absent.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -24,6 +27,10 @@ from tests._paths import CUSTOM_MCPS, load_mcp_server
 MCP_DIR = CUSTOM_MCPS / "video-gen-mcp"
 
 ALL_KEYS = ("GOOGLE_AI_API_KEY", "RUNWAY_API_KEY", "FAL_API_KEY")
+VEO_REFUSAL = (
+    "Error: Veo runs only through fal.ai since Google shut it down on its own API. "
+    "Ask an admin to set FAL_API_KEY in the video-gen-mcp admin page, or use model omni-flash."
+)
 
 
 def _import_server_with_env(monkeypatch, **env):
@@ -140,18 +147,75 @@ class TestManifest:
         assert by_model["veo-3.1-fast"] == 0.15
         assert by_model["veo-3.1"] == 0.40
 
+    @pytest.mark.parametrize(("args", "amount"), [
+        ({"model": "omni-flash"}, 0.07 * 8),
+        ({"model": "omni-flash", "resolution": "1080p"}, 0.104 * 8),
+        ({"model": "omni-flash", "resolution": "4k"}, 0.209 * 8),
+        ({}, 0.07 * 8),
+        ({"resolution": "1080p"}, 0.104 * 8),
+        ({"resolution": "4k"}, 0.209 * 8),
+        ({"model": "veo-3.1-fast"}, 0.15 * 8),
+        ({"model": "veo-3.1-fast", "resolution": "1080p"}, 0.15 * 8),
+        ({"model": "veo-3.1-fast", "resolution": "4k"}, 0.35 * 8),
+        ({"model": "veo-3.1"}, 0.40 * 8),
+        ({"model": "veo-3.1", "resolution": "4k"}, 0.60 * 8),
+    ])
+    def test_generate_video_rows(self, manifest, args, amount):
+        # Google's Omni rate ($12 per million tokens at 5,792 tokens a second
+        # of 720p) and fal's Veo rates with audio on; the default is Omni.
+        from services.mcp import mcp_cost_engine
+        from services.mcp.mcp_registry import _parse_costs_block
+        block = _parse_costs_block(manifest["costs"], "video-gen-mcp")
+        hit = mcp_cost_engine.evaluate(
+            "video-gen-mcp", "generate_video", {"prompt": "p", "duration_seconds": 8, **args}, block)
+        assert hit is not None and hit.amount == pytest.approx(amount)
+
+    def test_identity_names_the_current_models(self, manifest):
+        assert manifest["version"] == "1.2.1"
+        assert "Veo 3.1 through fal.ai" in manifest["description"]
+        fal = next(f for f in manifest["instances"]["fields"] if f["key"] == "FAL_API_KEY")
+        assert fal["label"] == "fal.ai API Key (for Veo and Seedance)"
+
     def test_costs_catch_alls_cover_omitted_model(self, manifest):
         # An absent match key never matches, so each generation tool needs a
         # final catch-all rule (priced at its default model) or an omitted
         # `model` arg records no cost at all.
         rules = manifest["costs"]["rules"]
-        for tool, default_amount in (("generate_video", 0.10), ("generate_transition", 0.1814)):
+        for tool, default_amount in (("generate_video", 0.07), ("generate_transition", 0.1814)):
             tool_rules = [r for r in rules if r["tool"] == tool]
             assert tool_rules[-1].get("match", {}) == {}
             assert tool_rules[-1]["amount"] == default_amount
             # Catch-all last — first-match-wins would otherwise shadow the
             # per-model and resolution-only prices.
-            assert all(r["match"] for r in tool_rules[:-1])
+            assert all(r.get("match") or r.get("result_has") for r in tool_rules[:-1])
+
+    @pytest.mark.parametrize(("args", "answer", "amount"), [
+        ({"model": "omni-flash"}, "Generated 6s transition with Gemini Omni Flash.", 0.07 * 6),
+        ({}, "Generated 6s transition with Gemini Omni Flash.", 0.07 * 6),
+        ({}, "Generated 6s transition with Seedance 2.0.", 0.1814 * 6),
+        ({"model": "seedance"}, "Generated 6s transition with Seedance 2.0.", 0.1814 * 6),
+        ({"model": "veo-3.1-fast"}, "Generated 6s transition with Veo 3.1 Fast via fal.ai.", 0.15 * 6),
+        ({"model": "veo-3.1"}, "Generated 6s transition with Veo 3.1 via fal.ai.", 0.40 * 6),
+    ])
+    def test_transition_rows(self, manifest, args, answer, amount):
+        # A transition that names no model runs Seedance with the fal.ai key and
+        # Omni Flash without it, so its price follows the model the answer names.
+        from services.mcp import mcp_cost_engine
+        from services.mcp.mcp_registry import _parse_costs_block
+        block = _parse_costs_block(manifest["costs"], "video-gen-mcp")
+        hit = mcp_cost_engine.evaluate(
+            "video-gen-mcp", "generate_transition",
+            {"video_a_path": "a", "video_b_path": "b", "duration_seconds": 6, **args},
+            block, tool_result=answer)
+        assert hit is not None and hit.amount == pytest.approx(amount)
+
+    def test_the_listing_is_the_same_with_any_keys(self, monkeypatch, tmp_path):
+        bare = _import_server_with_env(monkeypatch, VIDEO_SAVE_DIR=str(tmp_path))
+        bare_tools = [t.model_dump() for t in asyncio.run(bare.list_tools())]
+        full = _import_server_with_env(
+            monkeypatch, VIDEO_SAVE_DIR=str(tmp_path),
+            GOOGLE_AI_API_KEY="g-test", RUNWAY_API_KEY="r-test", FAL_API_KEY="f-test")
+        assert [t.model_dump() for t in asyncio.run(full.list_tools())] == bare_tools
 
 
 # ───────────────────────────── _get_save_path ────────────────────────────────
@@ -225,12 +289,88 @@ class TestValidation:
         ))
         assert "must be an integer" in res.text
 
-    def test_generate_omni_rejects_high_resolution(self, mod):
+    @pytest.mark.parametrize("duration", [2, 16, 0])
+    def test_generate_omni_duration_range(self, mod, duration):
         (res,) = asyncio.run(mod._handle_generate(
-            {"prompt": "x", "duration_seconds": 8, "resolution": "4k",
-             "model": "omni-flash"}
+            {"prompt": "x", "duration_seconds": duration, "model": "omni-flash"}
         ))
-        assert "omni-flash generates 720p only" in res.text
+        assert res.text == (
+            f"Error: duration_seconds must be between 3 and 15 for omni-flash (got {duration})."
+        )
+
+    def test_generate_veo_without_fal_key_is_refused(self, monkeypatch, tmp_path):
+        mod = _import_server_with_env(monkeypatch, VIDEO_SAVE_DIR=str(tmp_path), GOOGLE_AI_API_KEY="g-test")
+        (res,) = asyncio.run(mod._handle_generate(
+            {"prompt": "x", "duration_seconds": 8, "model": "veo-3.1-fast"}
+        ))
+        # "Error" first: a refused call is never charged.
+        assert res.text.startswith("Error: Veo runs only through fal.ai")
+        assert "FAL_API_KEY" in res.text and "omni-flash" in res.text
+
+    def test_generate_veo_needs_no_google_key(self, monkeypatch, tmp_path):
+        mod = _import_server_with_env(monkeypatch, VIDEO_SAVE_DIR=str(tmp_path), FAL_API_KEY="f-test")
+        seen = {}
+
+        async def fake_fal(model, prompt, duration, aspect, resolution, path, image=None):
+            seen["model"] = model
+            Path(path).write_bytes(b"mp4")  # noqa: ASYNC240  # a test's own temporary files
+
+        monkeypatch.setattr(mod, "_fal_veo_generate", fake_fal)
+        _stub_player(monkeypatch, mod)
+        (res,) = asyncio.run(mod._handle_generate(
+            {"prompt": "x", "duration_seconds": 8, "model": "veo-3.1"}
+        ))
+        assert seen == {"model": "veo-3.1"}
+        assert "with Veo 3.1 via fal.ai" in res.text
+
+    def test_veo_is_always_listed_and_its_refusal_names_the_fal_key(self, monkeypatch, tmp_path):
+        # The saved tool listing is keyed by the environment before secrets, so
+        # a listing that hid Veo without the fal.ai key would stay hidden after
+        # an admin sets it. Veo is listed always, and a call without the key
+        # reaches the tool's own sentence through the argument check.
+        mod = _import_server_with_env(monkeypatch, VIDEO_SAVE_DIR=str(tmp_path), GOOGLE_AI_API_KEY="g-test")
+        tools = {t.name: t for t in asyncio.run(mod.list_tools())}
+        gen = tools["generate_video"].inputSchema["properties"]["model"]
+        assert gen["enum"] == ["omni-flash", "veo-3.1-fast", "veo-3.1"]
+        assert gen["default"] == "omni-flash"
+        transition = tools["generate_transition"].inputSchema["properties"]["model"]
+        assert transition["enum"] == ["seedance", "omni-flash", "veo-3.1-fast", "veo-3.1"]
+        # Its default hangs on the fal.ai key, so the listing names none.
+        assert "default" not in transition
+        out = asyncio.run(mod.call_tool("generate_video", {
+            "prompt": "x", "duration_seconds": 8, "model": "veo-3.1-fast"}))
+        assert out[0].text == VEO_REFUSAL
+        a, b = tmp_path / "a.mp4", tmp_path / "b.mp4"
+        a.write_bytes(b"A")
+        b.write_bytes(b"B")
+        out = asyncio.run(mod.call_tool("generate_transition", {
+            "video_a_path": str(a), "video_b_path": str(b), "duration_seconds": 8, "model": "veo-3.1"}))
+        assert out[0].text.startswith("Error: Veo transitions (fal.ai) not configured.")
+
+    def test_over_the_wire_an_agent_reads_the_fal_sentence(self, tmp_path):
+        # The engines reach the tool over stdio: list, then call, as they do.
+        import os
+        import sys
+
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        env = {"PATH": os.environ.get("PATH", ""), "VIDEO_SAVE_DIR": str(tmp_path),
+               "GOOGLE_AI_API_KEY": "g-test"}
+        params = StdioServerParameters(command=sys.executable, args=[str(MCP_DIR / "server.py")],
+                                       env=env, cwd=str(MCP_DIR))
+
+        async def run():
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    listed = await session.list_tools()
+                    called = await session.call_tool("generate_video", {
+                        "prompt": "x", "duration_seconds": 8, "model": "veo-3.1-fast"})
+                    return listed, called
+        listed, called = asyncio.run(run())
+        gen = next(t for t in listed.tools if t.name == "generate_video")
+        assert "veo-3.1-fast" in gen.inputSchema["properties"]["model"]["enum"]
+        assert called.content[0].text == VEO_REFUSAL
 
     def test_generate_missing_image_file(self, mod):
         (res,) = asyncio.run(mod._handle_generate(
@@ -272,6 +412,39 @@ class TestValidation:
         assert "FAL_API_KEY" in res.text
         assert "video-gen-mcp admin page" in res.text
 
+    @pytest.mark.parametrize(("duration", "ok"), [(2, False), (3, True), (10, True), (11, False)])
+    def test_transition_omni_duration_range(self, mod, monkeypatch, clips, duration, ok):
+        # Google: "First and last frame interpolation supports video durations
+        # from 3 to 10 seconds."
+        async def fake_omni(*a):
+            Path(a[-1]).write_bytes(b"BRIDGE")  # noqa: ASYNC240  # a test's own temporary files
+
+        monkeypatch.setattr(mod, "_omni_transition", fake_omni)
+        _stub_player(monkeypatch, mod)
+        a, b = clips
+        (res,) = asyncio.run(mod._handle_transition({
+            "video_a_path": a, "video_b_path": b, "duration_seconds": duration, "model": "omni-flash"}))
+        if ok:
+            assert res.text.startswith(f"Generated {duration}s transition with Gemini Omni Flash.")
+        else:
+            assert res.text == (f"Error: duration_seconds must be between 3 and 10 for omni-flash "
+                                f"(got {duration}).")
+
+    def test_transition_omni_without_google_key(self, monkeypatch, tmp_path, clips):
+        mod = _import_server_with_env(monkeypatch, VIDEO_SAVE_DIR=str(tmp_path), FAL_API_KEY="f-test")
+        a, b = clips
+        (res,) = asyncio.run(mod._handle_transition({
+            "video_a_path": a, "video_b_path": b, "duration_seconds": 6, "model": "omni-flash"}))
+        assert res.text.startswith("Error: Omni Flash transitions (Google AI) not configured.")
+        assert "GOOGLE_AI_API_KEY" in res.text
+
+    def test_transition_with_no_key_at_all_names_the_google_key(self, monkeypatch, tmp_path, clips):
+        mod = _import_server_with_env(monkeypatch, VIDEO_SAVE_DIR=str(tmp_path))
+        a, b = clips
+        (res,) = asyncio.run(mod._handle_transition({
+            "video_a_path": a, "video_b_path": b, "duration_seconds": 6}))
+        assert "GOOGLE_AI_API_KEY" in res.text
+
     def test_transition_seedance_combined_size_cap(self, mod, monkeypatch, clips):
         a, b = clips
         monkeypatch.setattr(mod, "SEEDANCE_MAX_COMBINED_BYTES", 1)
@@ -306,58 +479,54 @@ class TestValidation:
 
 
 class TestGeneration:
-    def test_default_model_is_veo_fast(self, mod, monkeypatch, tmp_path):
-        # Operator verdict 2026-07-19: Veo beats Omni Flash on visual quality —
-        # an omitted model must land on veo-3.1-fast.
+    def test_default_model_is_omni_flash(self, mod, monkeypatch, tmp_path):
+        # Google shut Veo down on its own API and names Gemini Omni Flash as
+        # its replacement there: an omitted model lands on omni-flash.
         calls = {}
 
-        async def fake_veo(model_key, prompt, duration, aspect_ratio, resolution,
-                           target_path, first_frame=None, last_frame=None):
-            calls["veo"] = (model_key, duration)
-            Path(target_path).write_bytes(b"MP4DATA")  # noqa: ASYNC240  # a test's own temporary files
-
-        monkeypatch.setattr(mod, "_veo_generate", fake_veo)
-        _stub_player(monkeypatch, mod)
-        (res,) = asyncio.run(mod._handle_generate({
-            "prompt": "a paper boat on a pond", "duration_seconds": 6,
-        }))
-        assert calls["veo"] == ("veo-3.1-fast", 6)
-        assert "Veo 3.1 Fast" in res.text
-
-    def test_omni_selected_explicitly_gets_duration_hint(self, mod, monkeypatch, tmp_path):
-        calls = {}
-
-        async def fake_omni(prompt, aspect_ratio, target_path, image=None):
-            calls["omni"] = (prompt, aspect_ratio, image)
+        async def fake_omni(prompt, aspect_ratio, duration, resolution, target_path, image=None):
+            calls["omni"] = (prompt, aspect_ratio, duration, resolution, image)
             Path(target_path).write_bytes(b"MP4DATA")  # noqa: ASYNC240  # a test's own temporary files
 
         monkeypatch.setattr(mod, "_omni_generate", fake_omni)
         player = _stub_player(monkeypatch, mod)
         (res,) = asyncio.run(mod._handle_generate({
             "prompt": "a paper boat on a pond", "duration_seconds": 6,
-            "model": "omni-flash",
         }))
-        prompt, aspect, image = calls["omni"]
-        assert prompt.startswith("a paper boat on a pond")
-        assert "about 6 seconds" in prompt  # Omni has no duration param — prompt-steered
-        assert aspect == "16:9"
-        assert image is None
+        # The duration is a parameter now: the prompt goes as written.
+        assert calls["omni"] == ("a paper boat on a pond", "16:9", 6, "720p", None)
         saved = player["played"][0]
         assert saved.startswith(str(tmp_path / "generated-assets" / "video_"))
         assert Path(saved).read_bytes() == b"MP4DATA"
-        assert "Gemini Omni Flash" in res.text
+        assert res.text.startswith("Generated 6s video with Gemini Omni Flash (720p, 16:9).")
         assert "Video player displayed to user." in res.text
 
-    def test_veo_image_to_video(self, mod, monkeypatch, tmp_path):
+    def test_omni_takes_high_resolutions_and_an_image(self, mod, monkeypatch, tmp_path):
         calls = {}
 
-        async def fake_veo(model_key, prompt, duration, aspect_ratio, resolution,
-                           target_path, first_frame=None, last_frame=None):
-            calls["veo"] = (model_key, prompt, duration, aspect_ratio, resolution,
-                            first_frame, last_frame)
+        async def fake_omni(prompt, aspect_ratio, duration, resolution, target_path, image=None):
+            calls["omni"] = (duration, resolution, image)
+            Path(target_path).write_bytes(b"MP4DATA")  # noqa: ASYNC240  # a test's own temporary files
+
+        monkeypatch.setattr(mod, "_omni_generate", fake_omni)
+        _stub_player(monkeypatch, mod)
+        img = tmp_path / "still.png"
+        img.write_bytes(b"PNGDATA")
+        (res,) = asyncio.run(mod._handle_generate({
+            "prompt": "x", "duration_seconds": 15, "model": "omni-flash",
+            "resolution": "4k", "image_path": str(img),
+        }))
+        assert calls["omni"] == (15, "4k", ("image/png", b"PNGDATA"))
+        assert "from image" in res.text
+
+    def test_veo_image_to_video_goes_through_fal(self, mod, monkeypatch, tmp_path):
+        calls = {}
+
+        async def fake_fal(model, prompt, duration, aspect_ratio, resolution, target_path, image=None):
+            calls["veo"] = (model, prompt, duration, aspect_ratio, resolution, image)
             Path(target_path).write_bytes(b"VEODATA")  # noqa: ASYNC240  # a test's own temporary files
 
-        monkeypatch.setattr(mod, "_veo_generate", fake_veo)
+        monkeypatch.setattr(mod, "_fal_veo_generate", fake_fal)
         _stub_player(monkeypatch, mod)
         img = tmp_path / "still.jpg"
         img.write_bytes(b"JPGDATA")
@@ -366,12 +535,10 @@ class TestGeneration:
             "model": "veo-3.1", "aspect_ratio": "9:16", "resolution": "1080p",
             "image_path": str(img), "save_path": "launch/hero.mp4",
         }))
-        model_key, prompt, duration, aspect, res_p, first, last = calls["veo"]
-        assert (model_key, duration, aspect, res_p) == ("veo-3.1", 8, "9:16", "1080p")
-        assert prompt == "camera pushes in"  # Veo takes duration as a parameter — no hint
-        assert first == ("image/jpeg", b"JPGDATA")
-        assert last is None
+        assert calls["veo"] == ("veo-3.1", "camera pushes in", 8, "9:16", "1080p",
+                                ("image/jpeg", b"JPGDATA"))
         assert f"Saved to: {tmp_path / 'launch' / 'hero.mp4'}" in res.text
+        assert "with Veo 3.1 via fal.ai" in res.text
         assert "from image" in res.text
 
     def test_transition_veo_routes_via_fal_when_key_present(self, mod, monkeypatch, clips):
@@ -398,53 +565,20 @@ class TestGeneration:
         assert "via fal.ai" in res.text
         assert "bridge clip only" in res.text
 
-    def test_transition_veo_falls_back_to_google_without_fal_key(
-        self, monkeypatch, tmp_path, clips,
-    ):
+    def test_transition_veo_without_fal_key_is_refused(self, monkeypatch, tmp_path, clips):
+        # Google's own Veo route is gone; a Google key alone runs no Veo.
         mod = _import_server_with_env(
             monkeypatch, VIDEO_SAVE_DIR=str(tmp_path), GOOGLE_AI_API_KEY="g-test",
-        )
-        a, b = clips
-        calls = {}
-
-        async def fake_extract(video_path, position):
-            calls.setdefault("extract", []).append((video_path, position))
-            return b"PNG" + position.encode()
-
-        async def fake_veo(model_key, prompt, duration, aspect_ratio, resolution,
-                           target_path, first_frame=None, last_frame=None):
-            calls["veo"] = (model_key, prompt, duration, aspect_ratio, resolution,
-                            first_frame, last_frame)
-            Path(target_path).write_bytes(b"BRIDGE")  # noqa: ASYNC240  # a test's own temporary files
-
-        monkeypatch.setattr(mod, "_extract_frame", fake_extract)
-        monkeypatch.setattr(mod, "_veo_generate", fake_veo)
-        _stub_player(monkeypatch, mod)
-        (res,) = asyncio.run(mod._handle_transition({
-            "video_a_path": a, "video_b_path": b, "duration_seconds": 4,
-            "model": "veo-3.1-fast", "aspect_ratio": "9:16",
-            "prompt": "morph through ink",
-        }))
-        assert calls["extract"] == [(a, "last"), (b, "first")]
-        model_key, prompt, duration, aspect, resolution, first, last = calls["veo"]
-        assert (model_key, duration, aspect, resolution) == ("veo-3.1-fast", 4, "9:16", "720p")
-        assert first == ("image/png", b"PNGlast")
-        assert last == ("image/png", b"PNGfirst")
-        assert "morph through ink" in prompt
-        assert "via fal.ai" not in res.text
-        assert "bridge clip only" in res.text
-        assert "video-tools" in res.text
-
-    def test_transition_veo_without_any_key(self, monkeypatch, tmp_path, clips):
-        mod = _import_server_with_env(
-            monkeypatch, VIDEO_SAVE_DIR=str(tmp_path), RUNWAY_API_KEY="r-test",
+            RUNWAY_API_KEY="r-test",
         )
         a, b = clips
         (res,) = asyncio.run(mod._handle_transition({
             "video_a_path": a, "video_b_path": b, "duration_seconds": 8,
             "model": "veo-3.1-fast",
         }))
-        assert "FAL_API_KEY or GOOGLE_AI_API_KEY" in res.text
+        assert res.text.startswith("Error: Veo transitions (fal.ai) not configured.")
+        assert "FAL_API_KEY" in res.text
+        assert "GOOGLE_AI_API_KEY" not in res.text
 
     def test_transition_seedance_passes_style_through(self, mod, monkeypatch, clips):
         a, b = clips
@@ -485,11 +619,10 @@ class TestGeneration:
         assert "Runway Aleph 2.0" in res.text
 
     def test_hook_failure_still_returns_saved_path(self, mod, monkeypatch):
-        async def fake_veo(model_key, prompt, duration, aspect_ratio, resolution,
-                           target_path, first_frame=None, last_frame=None):
+        async def fake_omni(prompt, aspect_ratio, duration, resolution, target_path, image=None):
             Path(target_path).write_bytes(b"MP4")  # noqa: ASYNC240  # a test's own temporary files
 
-        monkeypatch.setattr(mod, "_veo_generate", fake_veo)
+        monkeypatch.setattr(mod, "_omni_generate", fake_omni)
         _stub_player(monkeypatch, mod, ok=False)
         (res,) = asyncio.run(mod._handle_generate({"prompt": "x", "duration_seconds": 4}))
         assert "Saved to:" in res.text
@@ -510,10 +643,20 @@ class TestApiErrors:
         async def fail(*a, **kw):
             raise _http_error(401)
 
-        monkeypatch.setattr(mod, "_veo_generate", fail)
+        monkeypatch.setattr(mod, "_omni_generate", fail)
         (res,) = asyncio.run(mod._handle_generate({"prompt": "x", "duration_seconds": 4}))
         assert "rejected the request (401)" in res.text
         assert "GOOGLE_AI_API_KEY" in res.text
+
+    def test_veo_error_names_fal(self, mod, monkeypatch):
+        async def fail(*a, **kw):
+            raise _http_error(401)
+
+        monkeypatch.setattr(mod, "_fal_veo_generate", fail)
+        (res,) = asyncio.run(mod._handle_generate(
+            {"prompt": "x", "duration_seconds": 4, "model": "veo-3.1-fast"}))
+        assert res.text.startswith("Error: fal.ai rejected the request (401)")
+        assert "FAL_API_KEY" in res.text and "GOOGLE_AI_API_KEY" not in res.text
 
     def test_403_surfaces_provider_detail(self, mod, monkeypatch):
         # A 403 is not always a bad key — Google project-level denials carry
@@ -521,7 +664,7 @@ class TestApiErrors:
         async def fail(*a, **kw):
             raise _http_error(403, {"error": {"message": "Your project has been denied access."}})
 
-        monkeypatch.setattr(mod, "_veo_generate", fail)
+        monkeypatch.setattr(mod, "_omni_generate", fail)
         (res,) = asyncio.run(mod._handle_generate({"prompt": "x", "duration_seconds": 4}))
         assert "rejected the request (403)" in res.text
         assert "denied access" in res.text
@@ -550,11 +693,22 @@ class TestApiErrors:
         }))
         assert "FAL_API_KEY" in res.text
 
+    def test_an_omni_transition_error_names_the_google_key(self, mod, monkeypatch, clips):
+        a, b = clips
+
+        async def fail(*a_, **kw):
+            raise _http_error(401)
+
+        monkeypatch.setattr(mod, "_omni_transition", fail)
+        (res,) = asyncio.run(mod._handle_transition({
+            "video_a_path": a, "video_b_path": b, "duration_seconds": 6, "model": "omni-flash"}))
+        assert "GOOGLE_AI_API_KEY" in res.text and "FAL_API_KEY" not in res.text
+
     def test_no_file_written_on_api_error(self, mod, monkeypatch, tmp_path):
         async def fail(*a, **kw):
             raise _http_error(500)
 
-        monkeypatch.setattr(mod, "_veo_generate", fail)
+        monkeypatch.setattr(mod, "_omni_generate", fail)
         asyncio.run(mod._handle_generate({"prompt": "x", "duration_seconds": 4}))
         assets = tmp_path / "generated-assets"
         assert not assets.exists() or not any(assets.glob("*.mp4"))
@@ -574,89 +728,69 @@ def _client_factory(handler):
     return factory
 
 
-class TestVeoWire:
-    def test_submit_poll_download(self, mod, monkeypatch, tmp_path):
-        seen = {"polls": 0}
+def _fal_veo_handler(seen: dict, queue_url: str):
+    """fal's storage, queue and download, recording the upload and the submit."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        path = request.url.path
+        if path == "/storage/auth/token":
+            return httpx.Response(200, json={
+                "token": "tok", "token_type": "Bearer", "base_url": "https://cdn.fal.test",
+            })
+        if path == "/files/upload":
+            seen.setdefault("uploads", []).append(
+                (request.headers["Content-Type"], request.headers["X-Fal-File-Name"]))
+            return httpx.Response(200, json={"access_url": "https://cdn.fal.test/src"})
+        if url == queue_url:
+            assert request.headers["Authorization"] == "Key f-test"
+            seen["submit"] = json.loads(request.content)
+            return httpx.Response(200, json={
+                "request_id": "v1",
+                "status_url": "https://queue.fal.run/fal-ai/veo3.1/requests/v1/status",
+                "response_url": "https://queue.fal.run/fal-ai/veo3.1/requests/v1/response",
+            })
+        if path.endswith("/v1/status"):
+            return httpx.Response(200, json={"status": "COMPLETED"})
+        if path.endswith("/v1/response"):
+            return httpx.Response(200, json={"video": {"url": "https://cdn.fal.test/veo.mp4"}})
+        if path == "/veo.mp4":
+            return httpx.Response(200, content=b"VEOBYTES")
+        raise AssertionError(f"unexpected URL: {request.url}")
+    return handler
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            path = request.url.path
-            if path.endswith(":predictLongRunning"):
-                assert "veo-3.1-fast-generate-preview" in path
-                assert request.headers["x-goog-api-key"] == "g-test"
-                body = json.loads(request.content)
-                seen["body"] = body
-                return httpx.Response(200, json={"name": "models/veo/operations/op1"})
-            if path.endswith("/operations/op1"):
-                seen["polls"] += 1
-                return httpx.Response(200, json={
-                    "done": True,
-                    "response": {"generateVideoResponse": {"generatedSamples": [
-                        {"video": {"uri": "https://dl.test/video.mp4"}}
-                    ]}},
-                })
-            if path == "/video.mp4":
-                assert request.headers["x-goog-api-key"] == "g-test"
-                return httpx.Response(200, content=b"VIDEOBYTES")
-            raise AssertionError(f"unexpected URL: {request.url}")
 
-        monkeypatch.setattr(mod.httpx, "AsyncClient", _client_factory(handler))
+class TestFalVeoGenerationWire:
+    def test_text_to_video(self, mod, monkeypatch, tmp_path):
+        seen = {}
+        monkeypatch.setattr(mod.httpx, "AsyncClient", _client_factory(
+            _fal_veo_handler(seen, "https://queue.fal.run/fal-ai/veo3.1/fast")))
         target = tmp_path / "out.mp4"
-        asyncio.run(mod._veo_generate(
-            "veo-3.1-fast", "a pond", 8, "16:9", "1080p", str(target),
-        ))
-        assert target.read_bytes() == b"VIDEOBYTES"
-        assert not target.with_suffix(".mp4.part").exists()
-        body = seen["body"]
-        assert body["instances"] == [{"prompt": "a pond"}]
-        assert body["parameters"] == {
-            "aspectRatio": "16:9", "resolution": "1080p", "durationSeconds": 8,
+        asyncio.run(mod._fal_veo_generate("veo-3.1-fast", "a pond", 6, "9:16", "4k", str(target)))
+        assert target.read_bytes() == b"VEOBYTES"
+        assert "uploads" not in seen
+        assert seen["submit"] == {
+            "prompt": "a pond", "duration": "6s", "resolution": "4k", "aspect_ratio": "9:16",
+            "generate_audio": True, "auto_fix": False,
         }
 
-    def test_first_last_frame_uses_predict_image_shape(self, mod, monkeypatch, tmp_path):
-        # predictLongRunning takes bytesBase64Encoded image parts — the
-        # generateContent inlineData shape is rejected by the live API.
-        import base64 as b64
+    def test_image_to_video_uploads_the_image(self, mod, monkeypatch, tmp_path):
         seen = {}
+        monkeypatch.setattr(mod.httpx, "AsyncClient", _client_factory(
+            _fal_veo_handler(seen, "https://queue.fal.run/fal-ai/veo3.1/image-to-video")))
+        target = tmp_path / "out.mp4"
+        asyncio.run(mod._fal_veo_generate("veo-3.1", "push in", 8, "16:9", "1080p", str(target),
+                                          image=("image/jpeg", b"JPG")))
+        assert target.read_bytes() == b"VEOBYTES"
+        assert seen["uploads"] == [("image/jpeg", "source.jpg")]
+        assert seen["submit"]["image_url"] == "https://cdn.fal.test/src"
+        assert seen["submit"]["duration"] == "8s"
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            path = request.url.path
-            if path.endswith(":predictLongRunning"):
-                seen["instance"] = json.loads(request.content)["instances"][0]
-                return httpx.Response(200, json={"name": "models/veo/operations/op1"})
-            if path.endswith("/operations/op1"):
-                return httpx.Response(200, json={
-                    "done": True,
-                    "response": {"generateVideoResponse": {"generatedSamples": [
-                        {"video": {"uri": "https://dl.test/video.mp4"}}
-                    ]}},
-                })
-            return httpx.Response(200, content=b"VIDEOBYTES")
-
-        monkeypatch.setattr(mod.httpx, "AsyncClient", _client_factory(handler))
-        asyncio.run(mod._veo_generate(
-            "veo-3.1", "bridge", 6, "16:9", "720p", str(tmp_path / "o.mp4"),
-            first_frame=("image/png", b"AAA"), last_frame=("image/png", b"BBB"),
-        ))
-        inst = seen["instance"]
-        assert inst["image"] == {"mimeType": "image/png",
-                                "bytesBase64Encoded": b64.b64encode(b"AAA").decode()}
-        assert inst["lastFrame"] == {"mimeType": "image/png",
-                                     "bytesBase64Encoded": b64.b64encode(b"BBB").decode()}
-        assert "inlineData" not in json.dumps(inst)
-
-    def test_operation_error_raises(self, mod, monkeypatch, tmp_path):
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path.endswith(":predictLongRunning"):
-                return httpx.Response(200, json={"name": "models/veo/operations/op1"})
-            return httpx.Response(200, json={
-                "done": True, "error": {"message": "safety block"},
-            })
-
-        monkeypatch.setattr(mod.httpx, "AsyncClient", _client_factory(handler))
-        with pytest.raises(RuntimeError, match="safety block"):
-            asyncio.run(mod._veo_generate(
-                "veo-3.1", "x", 8, "16:9", "720p", str(tmp_path / "o.mp4"),
-            ))
+    def test_routes_cover_both_tiers_and_three_modes(self, mod):
+        for model, tier in (("veo-3.1", "fal-ai/veo3.1"), ("veo-3.1-fast", "fal-ai/veo3.1/fast")):
+            urls = mod.FAL_VEO_URLS[model]
+            assert urls["text"] == f"https://queue.fal.run/{tier}"
+            assert urls["image"] == f"https://queue.fal.run/{tier}/image-to-video"
+            assert urls["frames"] == f"https://queue.fal.run/{tier}/first-last-frame-to-video"
 
 
 class TestRunwayWire:
@@ -844,12 +978,6 @@ class TestFalWire:
         assert submit["generate_audio"] is True
         assert submit["prompt"].endswith("sweep over the bay")
 
-    def test_veo_flf_urls_cover_both_tiers(self, mod):
-        assert mod.FAL_VEO_FLF_URLS["veo-3.1"].endswith(
-            "/fal-ai/veo3.1/first-last-frame-to-video")
-        assert mod.FAL_VEO_FLF_URLS["veo-3.1-fast"].endswith(
-            "/fal-ai/veo3.1/fast/first-last-frame-to-video")
-
 
 class TestOmniWire:
     def test_inline_video_response(self, mod, monkeypatch, tmp_path):
@@ -866,15 +994,38 @@ class TestOmniWire:
 
         monkeypatch.setattr(mod.httpx, "AsyncClient", _client_factory(handler))
         target = tmp_path / "omni.mp4"
-        asyncio.run(mod._omni_generate("a pond", "16:9", str(target)))
+        asyncio.run(mod._omni_generate("a pond", "16:9", 12, "1080p", str(target)))
         assert target.read_bytes() == b"OMNIBYTES"
         body = seen["body"]
-        assert body["model"] == mod.OMNI_MODEL
+        assert body["model"] == "gemini-omni-1.2-flash"
         assert body["background"] is False and body["stream"] is False
         # URI delivery requires stored interactions (live-verified constraint).
         assert body["store"] is True
-        assert body["generation_config"] == {"video_config": {"task": "text_to_video"}}
-        assert body["response_format"]["type"] == "video"
+        # Google: set `task` only as a fallback; text alone carries none.
+        assert "generation_config" not in body
+        assert body["input"] == [{"type": "text", "text": "a pond"}]
+        assert body["response_format"] == {
+            "type": "video", "aspect_ratio": "16:9", "delivery": "uri",
+            "duration": "12s", "resolution": "1080p",
+        }
+
+    def test_an_image_pins_image_to_video(self, mod, monkeypatch, tmp_path):
+        import base64 as b64
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"steps": [{"content": [
+                {"mime_type": "video/mp4", "data": b64.b64encode(b"OMNIBYTES").decode()}
+            ]}]})
+
+        monkeypatch.setattr(mod.httpx, "AsyncClient", _client_factory(handler))
+        asyncio.run(mod._omni_generate("move", "9:16", 4, "720p", str(tmp_path / "o.mp4"),
+                                       image=("image/png", b"PNG")))
+        body = seen["body"]
+        assert body["generation_config"] == {"video_config": {"task": "image_to_video"}}
+        assert body["input"][1] == {"type": "image", "data": b64.b64encode(b"PNG").decode(),
+                                    "mime_type": "image/png"}
 
     def test_file_uri_response_polls_then_downloads(self, mod, monkeypatch, tmp_path):
         states = iter(["PROCESSING", "ACTIVE"])
@@ -896,7 +1047,7 @@ class TestOmniWire:
 
         monkeypatch.setattr(mod.httpx, "AsyncClient", _client_factory(handler))
         target = tmp_path / "omni.mp4"
-        asyncio.run(mod._omni_generate("a pond", "16:9", str(target)))
+        asyncio.run(mod._omni_generate("a pond", "16:9", 8, "720p", str(target)))
         assert target.read_bytes() == b"OMNIFILE"
 
 
@@ -962,3 +1113,179 @@ class TestPolling:
 
         with pytest.raises(RuntimeError, match="did not finish within"):
             asyncio.run(mod._poll_until(never_done, "test job"))
+
+
+# ───────────────────────────── loopback stand-in ─────────────────────────────
+# The whole handler over real HTTP against a stand-in on 127.0.0.1 that answers
+# like the vendors' documentation: Google's Interactions API with URI delivery
+# (`steps[].content[]` with `uri`, the file polled to ACTIVE, then downloaded)
+# and fal's queue (submit, status, response `{video: {url}}`, storage upload).
+
+
+class _VideoStandIn(BaseHTTPRequestHandler):
+    def log_message(self, *args):  # the test output stays quiet
+        pass
+
+    def _answer(self, status=200, body=None, raw=None):
+        out = raw if raw is not None else json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/octet-stream" if raw is not None else "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def _record(self, body=b""):
+        self.server.seen.append({"method": self.command, "path": self.path,
+                                 "headers": dict(self.headers), "body": body})
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._record(body)
+        base = self.server.base
+        if self.path == "/v1beta/interactions":
+            return self._answer(body={"steps": [{"type": "model_output", "content": [
+                {"type": "video", "mime_type": "video/mp4",
+                 "uri": f"{base}/v1beta/files/abc:download?alt=media"}]}],
+                "status": "completed", "model": "gemini-omni-1.2-flash", "object": "interaction"})
+        if self.path == "/storage/auth/token?storage_type=fal-cdn-v3":
+            return self._answer(body={"token": "t", "token_type": "Bearer", "base_url": base})
+        if self.path == "/files/upload":
+            return self._answer(body={"access_url": f"{base}/cdn/source"})
+        if self.path.startswith("/fal-ai/veo3.1"):
+            return self._answer(body={"request_id": "r1", "status_url": f"{base}/requests/r1/status",
+                                      "response_url": f"{base}/requests/r1"})
+        return self._answer(404, {"error": "not found"})
+
+    def do_GET(self):
+        self._record()
+        base = self.server.base
+        if self.path == "/v1beta/files/abc":
+            return self._answer(body={"name": "files/abc", "state": "ACTIVE"})
+        if self.path == "/v1beta/files/abc:download?alt=media":
+            return self._answer(raw=b"OMNI-MP4")
+        if self.path == "/requests/r1/status":
+            return self._answer(body={"status": "COMPLETED"})
+        if self.path == "/requests/r1":
+            return self._answer(body={"video": {"url": f"{base}/cdn/veo.mp4"}})
+        if self.path == "/cdn/veo.mp4":
+            return self._answer(raw=b"VEO-MP4")
+        return self._answer(404, {"error": "not found"})
+
+
+@pytest.fixture()
+def video_standin():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _VideoStandIn)
+    server.seen = []
+    server.base = f"http://127.0.0.1:{server.server_address[1]}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class TestLoopbackStandIn:
+    def test_the_default_call_is_omni_flash(self, mod, monkeypatch, tmp_path, video_standin):
+        monkeypatch.setattr(mod, "GOOGLE_BASE", video_standin.base)
+        monkeypatch.setattr(mod, "POLL_INTERVAL_SECONDS", 0.0)
+        _stub_player(monkeypatch, mod)
+        (res,) = asyncio.run(mod._handle_generate({"prompt": "a pond at dawn", "duration_seconds": 12,
+                                                   "resolution": "1080p", "aspect_ratio": "9:16"}))
+        assert res.text.startswith("Generated 12s video with Gemini Omni Flash (1080p, 9:16).")
+        submit = video_standin.seen[0]
+        assert (submit["method"], submit["path"]) == ("POST", "/v1beta/interactions")
+        assert submit["headers"]["x-goog-api-key"] == "g-test"
+        body = json.loads(submit["body"])
+        assert body["model"] == "gemini-omni-1.2-flash"
+        assert body["response_format"] == {"type": "video", "aspect_ratio": "9:16", "delivery": "uri",
+                                           "duration": "12s", "resolution": "1080p"}
+        saved = sorted((tmp_path / "generated-assets").glob("video_*.mp4"))
+        assert len(saved) == 1 and saved[0].read_bytes() == b"OMNI-MP4"
+
+    def _transition(self, mod, monkeypatch, video_standin, clips, **args):
+        monkeypatch.setattr(mod, "GOOGLE_BASE", video_standin.base)
+        monkeypatch.setattr(mod, "POLL_INTERVAL_SECONDS", 0.0)
+        _stub_player(monkeypatch, mod)
+
+        async def fake_extract(path, position):
+            return f"{Path(path).stem}-{position}".encode()
+
+        monkeypatch.setattr(mod, "_extract_frame", fake_extract)
+        a, b = clips
+        (res,) = asyncio.run(mod._handle_transition(
+            {"video_a_path": a, "video_b_path": b, "duration_seconds": 6, **args}))
+        return res
+
+    def test_a_transition_without_the_fal_key_runs_on_omni_flash(
+            self, monkeypatch, tmp_path, clips, video_standin):
+        mod = _import_server_with_env(monkeypatch, VIDEO_SAVE_DIR=str(tmp_path), GOOGLE_AI_API_KEY="g-test")
+        res = self._transition(mod, monkeypatch, video_standin, clips, aspect_ratio="9:16",
+                               prompt="through the mist")
+        assert res.text.startswith("Generated 6s transition with Gemini Omni Flash.")
+        submit = video_standin.seen[0]
+        assert (submit["method"], submit["path"]) == ("POST", "/v1beta/interactions")
+        assert submit["headers"]["x-goog-api-key"] == "g-test"
+        body = json.loads(submit["body"])
+        assert body["model"] == "gemini-omni-1.2-flash"
+        # Google: "Provide two images in the input list and describe the
+        # desired transition in your prompt": the first clip's last frame,
+        # the second clip's first frame, then the words. No `task`: none
+        # names interpolation, and Google says to set one only as a fallback.
+        first, last, words = body["input"]
+        assert first == {"type": "image", "mime_type": "image/png",
+                         "data": base64.b64encode(b"a-last").decode()}
+        assert last == {"type": "image", "mime_type": "image/png",
+                        "data": base64.b64encode(b"b-first").decode()}
+        assert words["type"] == "text" and words["text"].endswith(" through the mist")
+        assert "generation_config" not in body
+        assert body["response_format"] == {"type": "video", "aspect_ratio": "9:16", "delivery": "uri",
+                                           "duration": "6s", "resolution": "720p"}
+        saved = sorted((tmp_path / "generated-assets").glob("transition_*.mp4"))
+        assert len(saved) == 1 and saved[0].read_bytes() == b"OMNI-MP4"
+        # The answer carries the words the manifest's price for it reads.
+        manifest = json.loads((MCP_DIR / "manifest.json").read_text())
+        (row,) = [r for r in manifest["costs"]["rules"]
+                  if r["tool"] == "generate_transition" and r.get("result_has")]
+        assert row["result_has"] in res.text and row["amount"] == 0.07
+
+    def test_omni_flash_named_runs_on_it_with_the_fal_key_too(self, mod, monkeypatch, clips, video_standin):
+        res = self._transition(mod, monkeypatch, video_standin, clips, model="omni-flash")
+        assert res.text.startswith("Generated 6s transition with Gemini Omni Flash.")
+        assert [r["path"] for r in video_standin.seen][0] == "/v1beta/interactions"
+
+    def test_a_transition_with_the_fal_key_stays_on_seedance(self, mod, monkeypatch, clips, video_standin):
+        calls = {}
+
+        async def fake_seedance(video_a, video_b, style, duration, aspect_ratio, target_path):
+            calls["seed"] = duration
+            Path(target_path).write_bytes(b"SEED")  # noqa: ASYNC240  # a test's own temporary files
+
+        monkeypatch.setattr(mod, "_seedance_transition", fake_seedance)
+        res = self._transition(mod, monkeypatch, video_standin, clips)
+        assert calls == {"seed": 6} and video_standin.seen == []
+        assert res.text.startswith("Generated 6s transition with Seedance 2.0.")
+
+    def test_veo_fast_runs_through_fal(self, mod, monkeypatch, tmp_path, video_standin):
+        base = video_standin.base
+        monkeypatch.setattr(mod, "FAL_REST_BASE", base)
+        monkeypatch.setattr(mod, "FAL_VEO_URLS", {
+            m: {k: v.replace("https://queue.fal.run", base) for k, v in routes.items()}
+            for m, routes in mod.FAL_VEO_URLS.items()})
+        monkeypatch.setattr(mod, "POLL_INTERVAL_SECONDS", 0.0)
+        _stub_player(monkeypatch, mod)
+        img = tmp_path / "still.png"
+        img.write_bytes(b"PNG")
+        (res,) = asyncio.run(mod._handle_generate({"prompt": "push in", "duration_seconds": 6,
+                                                   "model": "veo-3.1-fast", "image_path": str(img)}))
+        assert res.text.startswith("Generated 6s video with Veo 3.1 Fast via fal.ai (720p, 16:9, from image).")
+        submit = next(r for r in video_standin.seen if r["path"].startswith("/fal-ai/"))
+        assert submit["path"] == "/fal-ai/veo3.1/fast/image-to-video"
+        assert submit["headers"]["Authorization"] == "Key f-test"
+        assert json.loads(submit["body"]) == {
+            "prompt": "push in", "duration": "6s", "resolution": "720p", "aspect_ratio": "16:9",
+            "generate_audio": True, "auto_fix": False, "image_url": f"{base}/cdn/source",
+        }
+        saved = sorted((tmp_path / "generated-assets").glob("video_*.mp4"))
+        assert len(saved) == 1 and saved[0].read_bytes() == b"VEO-MP4"

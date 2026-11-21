@@ -55,6 +55,11 @@ PROTECTED = [
     "/home/x/agents/pa/externals/phone/302101234567/.codex/config.toml",
     "/home/x/agents/pa/externals/phone/302101234567/.claude/pa-abc.json",
     "/home/x/agents/pa/externals/phone/_ephemeral/11111111-2222/.codex/config.toml",
+    # a Codex session's own files (its profile, its text and tools) and a
+    # thread's record
+    "/users/alice/.codex/0e9c-ab.config.toml",
+    "/workspace/.codex/0e9c-ab.session.json",
+    "/users/alice/.codex/01a1cb-t.text-sha256",
 ]
 
 NOT_PROTECTED = [
@@ -458,3 +463,62 @@ def test_protected_denial_write_side():
     assert _protected_path_denial("/users/alice/.claude/permission_gate.py", writing=True) != ""
     assert _protected_path_denial("/users/alice/.claude/permission_gate.py", writing=False) == ""
     assert _protected_path_denial("/workspace/.codex/hooks.json", writing=True) != ""
+
+
+# ---------------------------------------------------------------------------
+# A session's home (core/sandbox/session_home): its sign-in, account record
+# and settings are guarded like the state dir's own files
+# ---------------------------------------------------------------------------
+
+_SID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+
+def test_a_homes_files_are_guarded_for_reads_and_writes():
+    for scope in ("/workspace/.claude", "/users/alice/.claude", "/workspace/.codex"):
+        for name in (".credentials.json", ".claude.json", "settings.json", "history.jsonl"):
+            p = f"{scope}/own/{_SID}/{name}"
+            assert path_roles.is_protected_agent_config_path(p) is True, p
+            assert path_roles.is_protected_agent_config_path(p, writing=True) is True, p
+        home = f"{scope}/own/{_SID}"
+        assert path_roles.is_protected_agent_config_path(home, writing=True) is True
+        assert path_roles.is_protected_agent_config_path(f"{scope}/own", writing=True) is True
+
+
+def test_a_homes_links_keep_the_stores_rules_and_a_repos_own_folder_stays_open():
+    for p in (f"/workspace/.claude/own/{_SID}/projects/x/conv.jsonl",
+              f"/users/alice/workspace/repo/.claude/own/{_SID}/settings.json",
+              "/workspace/.claude/own/a.b/notes.txt"):
+        assert path_roles.is_protected_agent_config_path(p) is False, p
+
+
+def test_reading_a_homes_sign_in_is_refused_on_every_channel():
+    p = (_AGENTS_DIR / "personal-assistant" / "users" / "alice" / ".claude" / "own" / _SID
+         / ".credentials.json").resolve()
+    decision = _check_read_path(p, _admin_ctx())
+    assert decision.allowed is False
+    assert _protected_path_denial(f"/users/alice/.claude/own/{_SID}/.credentials.json", writing=False)
+    assert path_roles.command_references_protected_agent_config(
+        f"cat /workspace/.claude/own/{_SID}/.credentials.json") is True
+
+
+def test_a_homes_mods_are_guarded_as_the_stores_are():
+    """Claude Code reads its mods from ``$CLAUDE_CONFIG_DIR/dev-mods``, which
+    is a session's home when it runs from one: a write there is refused on
+    every channel, as under the store's own ``dev-mods``; the home's links
+    to the store's folders keep the store's rule."""
+    for scope in ("/workspace/.claude", "/users/alice/.claude", "/workspace/.codex"):
+        p = f"{scope}/own/{_SID}/dev-mods/abc/hooks/register.js"
+        assert path_roles.is_protected_agent_config_path(p, writing=True) is True, p
+        assert path_roles.is_protected_agent_config_path(p) is False, p
+        assert path_roles.is_protected_agent_config_path(f"{scope}/own/{_SID}/dev-mods", writing=True) is True
+        assert path_roles.is_protected_agent_config_path(f"{scope}/own/{_SID}/projects/x/c.jsonl",
+                                                         writing=True) is False
+    host = (_AGENTS_DIR / "personal-assistant" / "users" / "alice" / ".claude" / "own" / _SID
+            / "dev-mods" / "m.js").resolve()
+    for ctx in (_mgr_ctx(), _admin_ctx()):
+        assert _check_write_path(host, ctx).allowed is False
+    assert _protected_path_denial(f"/users/alice/.claude/own/{_SID}/dev-mods/m.js", writing=True) != ""
+    assert path_roles.command_references_protected_agent_config(
+        f"echo x > /workspace/.claude/own/{_SID}/dev-mods/m.js") is True
+    assert path_roles.is_protected_agent_config_path(
+        f"/users/alice/workspace/repo/.claude/own/{_SID}/dev-mods/m.js", writing=True) is False

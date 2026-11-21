@@ -10,7 +10,7 @@ Behavior is pinned by tests/session/test_ws_dashboard_*.
 import functools
 import json
 import logging
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import config
 from core.events import chat_writer, input_queue
@@ -84,6 +84,32 @@ class ServerNotificationController(_Host):
     # first. Annotations only (strings), no class attributes.
     _warmup_abort_chat: "str | None"
     _warmup_chat_id: "str | None"
+
+    def _shows_chat(self, chat_id: str | None) -> bool:
+        """Whether ``chat_id`` is the chat this socket shows: the one answer
+        every frame of a chat sent outside a pump's stream and every server
+        turn's viewed check read. A socket on no chat (the page's new-chat
+        view, ``_off_chat``) shows none."""
+        return bool(chat_id) and chat_id == self.chat_id
+
+    async def _item_chat(self, notification: dict) -> tuple[str, str | None]:
+        """The chat and session a server item belongs to: the item's own
+        chat, else the chat of its session. Never the chat this socket shows
+        by default: an item that names neither is no chat's here (logged
+        and dropped by the caller). The session falls back to the socket's
+        only when the item's chat is the one it shows."""
+        cid = notification.get("chat_id") or ""
+        sid = notification.get("session_id") or None
+        if not cid and sid:
+            from storage.pg import run_db
+            row = await run_db(task_store.get_chat_by_session, sid)
+            cid = (row or {}).get("id") or ""
+        if not cid:
+            logger.warning("WS dashboard: notify item type=%r names no chat: dropped",
+                           notification.get("type"))
+        elif not sid and self._shows_chat(cid):
+            sid = self.session_id
+        return cid, sid
 
     async def _handle_server_notification(self, notification: dict):
         """Process a server-initiated item from the notify queue.
@@ -180,7 +206,7 @@ class ServerNotificationController(_Host):
                 # ready goes out on its own (the session is aborted below;
                 # the delivery warms another).
                 input_queue.first_turn_not_run(kick_cid)
-                _k_layer = self.layer if kick_cid == self.chat_id else await self._resolve_layer_for_chat_async(kick_cid)
+                _k_layer = self.layer if self._shows_chat(kick_cid) else await self._resolve_layer_for_chat_async(kick_cid)
                 if _k_layer and kick_sid:
                     try:
                         await _k_layer.abort(kick_sid)
@@ -189,9 +215,9 @@ class ServerNotificationController(_Host):
                 return
             logger.info(
                 "WS dashboard: server kick drained for chat=%s "
-                "(viewed=%s)", kick_cid[:8], kick_cid == self.chat_id
+                "(viewed=%s)", kick_cid[:8], self._shows_chat(kick_cid)
             )
-            if kick_cid == self.chat_id:
+            if self._shows_chat(kick_cid):
                 await self._handle_chat({
                     "text": kick_text,
                     "images": kick_images,
@@ -219,10 +245,10 @@ class ServerNotificationController(_Host):
         if ntype == wire.NOTIFY_BG_NUDGE:
             count = notification["count"]
             # Originating chat/session from the notification (set by the bg
-            # monitor, stream_pump.py); fall back to the viewed chat only if
-            # absent (shouldn't happen — the monitor always carries them).
-            nudge_chat_id = notification.get("chat_id") or self.chat_id
-            nudge_sid = notification.get("session_id") or self.session_id
+            # monitor, stream_pump.py), never the viewed chat.
+            nudge_chat_id, nudge_sid = await self._item_chat(notification)
+            if not nudge_chat_id:
+                return
             # Composed by the SAME function as the monitor's direct paths —
             # the payload carries the finished-job labels so the model can
             # tell which agent completed.
@@ -230,17 +256,17 @@ class ServerNotificationController(_Host):
             labels = notification.get("labels") or []
             nudge = compose_agent_nudge(count, labels)
             # Save the system event on the ORIGINATING chat.
-            if nudge_chat_id:
-                task_store.add_chat_message(nudge_chat_id, "event", "",
+            task_store.add_chat_message(nudge_chat_id, "event", "",
                     event_type=wire.PERSISTED_BG_NUDGE,
                     event_data=json.dumps({"count": count, "labels": labels}))
             # Clear the bg-agent status bar — only if this socket is viewing the
             # originating chat (else it would clear the WRONG chat's badges; a
             # reattach reconstructs the state from live_state/chat_history).
-            if nudge_chat_id == self.chat_id:
-                await self._send({"type": wire.BG_AGENTS_COMPLETE, "count": count})
+            if self._shows_chat(nudge_chat_id):
+                await self._send({"type": wire.BG_AGENTS_COMPLETE, "count": count,
+                                  "chat_id": nudge_chat_id})
             # Drive the review turn on the originating chat (headless if unviewed).
-            nudge_layer = self.layer if nudge_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(cast("str", nudge_chat_id))
+            nudge_layer = self.layer if self._shows_chat(nudge_chat_id) else await self._resolve_layer_for_chat_async(nudge_chat_id)
             await self._run_server_turn_or_keep(
                 nudge,
                 target_session_id=nudge_sid,
@@ -254,22 +280,23 @@ class ServerNotificationController(_Host):
             # monitor in stream_pump.py). Drives the review turn AND clears the
             # badges — mirror of bg_nudge with command wording.
             count = notification["count"]
-            nudge_chat_id = notification.get("chat_id") or self.chat_id
-            nudge_sid = notification.get("session_id") or self.session_id
+            nudge_chat_id, nudge_sid = await self._item_chat(notification)
+            if not nudge_chat_id:
+                return
             from core.events.pump_bg_monitors import compose_command_nudge
             labels = notification.get("labels") or []
             nudge = compose_command_nudge(count, labels)
-            if nudge_chat_id:
-                task_store.add_chat_message(nudge_chat_id, "event", "",
+            task_store.add_chat_message(nudge_chat_id, "event", "",
                     event_type=wire.PERSISTED_BG_COMMAND_NUDGE,
                     event_data=json.dumps({"count": count, "labels": labels}))
             # Clear the bg-command badges on the viewed socket. The per-command
             # bg_command_done can't deliver post-turn (the turn's pump is gone —
             # app.py _push_to_pump needs an active pump), so this notify-queue
             # path is the reliable clear, exactly like bg_nudge → bg_agents_complete.
-            if nudge_chat_id == self.chat_id:
-                await self._send({"type": wire.BG_COMMANDS_COMPLETE, "count": count})
-            nudge_layer = self.layer if nudge_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(cast("str", nudge_chat_id))
+            if self._shows_chat(nudge_chat_id):
+                await self._send({"type": wire.BG_COMMANDS_COMPLETE, "count": count,
+                                  "chat_id": nudge_chat_id})
+            nudge_layer = self.layer if self._shows_chat(nudge_chat_id) else await self._resolve_layer_for_chat_async(nudge_chat_id)
             await self._run_server_turn_or_keep(
                 nudge,
                 target_session_id=nudge_sid,
@@ -286,10 +313,10 @@ class ServerNotificationController(_Host):
             # session is dead, and a DB reload already renders history blocks
             # inactive — only the live view needs the clears.
             dead_chat = notification.get("chat_id", "")
-            if dead_chat and dead_chat == self.chat_id:
-                await self._send({"type": wire.BG_AGENTS_COMPLETE, "count": 0})
-                await self._send({"type": wire.BG_COMMANDS_COMPLETE, "count": 0})
-                await self._send({"type": wire.FG_AGENTS_COMPLETE})
+            if self._shows_chat(dead_chat):
+                await self._send({"type": wire.BG_AGENTS_COMPLETE, "count": 0, "chat_id": dead_chat})
+                await self._send({"type": wire.BG_COMMANDS_COMPLETE, "count": 0, "chat_id": dead_chat})
+                await self._send({"type": wire.FG_AGENTS_COMPLETE, "chat_id": dead_chat})
                 logger.info(
                     "WS dashboard: cleared liveness badges for chat=%s "
                     "(session death: %s)",
@@ -303,42 +330,44 @@ class ServerNotificationController(_Host):
             # no socket (pty/persistent/one-shot/none). Forward verbatim to
             # the viewer of that chat; no persistence (the ladder already
             # persisted the event row), no server turn.
-            if notification.get("chat_id") == self.chat_id:
+            ui_chat = notification.get("chat_id") or ""
+            if self._shows_chat(ui_chat):
                 frame = notification.get("frame")
                 if isinstance(frame, dict) and frame:
-                    await self._send(frame)
+                    # Named for its chat, whatever the broadcaster left out.
+                    await self._send({**frame, "chat_id": ui_chat})
 
         elif ntype == wire.NOTIFY_TASK_RESULT_PROMPT:
             result_prompt = notification["result_prompt"]
-            # Delegating chat/session from the notification (scheduler.py now
-            # includes them); fall back to the viewed chat only if absent.
-            res_chat_id = notification.get("chat_id") or self.chat_id
-            res_sid = notification.get("session_id") or self.session_id
+            # Delegating chat/session from the notification (the ladder names
+            # them), never the viewed chat.
+            res_chat_id, res_sid = await self._item_chat(notification)
+            if not res_chat_id:
+                return
             # The event as the ladder would persist it (the status drives the
             # badge icon; user_interrupted marks a lane the user stopped).
             event = result_event_from_notify(notification)
             # Save the delegate_result event on the DELEGATING chat.
-            if res_chat_id:
-                task_store.add_chat_message(res_chat_id, "event", "",
-                    event_type=wire.DELEGATE_RESULT,
-                    event_data=json.dumps(event, default=str))
+            task_store.add_chat_message(res_chat_id, "event", "",
+                event_type=wire.DELEGATE_RESULT,
+                event_data=json.dumps(event, default=str))
             # Notify the frontend (delegate block status + result) — only when
             # this socket is viewing the delegating chat.
-            if res_chat_id == self.chat_id:
-                await self._send({"type": wire.DELEGATE_RESULT, **event})
+            if self._shows_chat(res_chat_id):
+                await self._send({"type": wire.DELEGATE_RESULT, **event, "chat_id": res_chat_id})
             # Drive the synthesis turn on the delegating chat (headless if unviewed).
-            res_layer = self.layer if res_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(cast("str", res_chat_id))
+            res_layer = self.layer if self._shows_chat(res_chat_id) else await self._resolve_layer_for_chat_async(res_chat_id)
             try:
                 turn_pump = await self._run_server_turn(
                     result_prompt,
                     target_session_id=res_sid,
-                    target_chat_id=cast("str", res_chat_id),
+                    target_chat_id=res_chat_id,
                     target_layer=res_layer,
                     cause=wire.CAUSE_DELEGATE_RESULT,
                 )
             except TurnDeferred:
                 turn_pump = None
-            if turn_pump is None and res_chat_id and result_prompt:
+            if turn_pump is None and result_prompt:
                 # No turn ran (dead target that couldn't warm, layer gone, its
                 # machine still reconnecting): the event row above is only a
                 # bubble. Park the prompt as a
@@ -361,8 +390,9 @@ class ServerNotificationController(_Host):
             # _fire_continuation). Mirror of task_result_prompt without the
             # delegate frames: persist the wake event on the ORIGINATING chat,
             # then drive the wake turn there (headless if unviewed).
-            wake_chat_id = notification.get("chat_id") or self.chat_id
-            wake_sid = notification.get("session_id") or self.session_id
+            wake_chat_id, wake_sid = await self._item_chat(notification)
+            if not wake_chat_id:
+                return
             wake_prompt = notification.get("prompt", "")
             if wake_chat_id:
                 task_store.add_chat_message(wake_chat_id, "event", "",
@@ -380,11 +410,11 @@ class ServerNotificationController(_Host):
                     "type": wire.SCHEDULE_WAKE, "chat_id": wake_chat_id,
                     "prompt": wake_prompt, "task_id": notification.get("task_id", ""),
                 }
-                if wake_chat_id == self.chat_id:
+                if self._shows_chat(wake_chat_id):
                     await self._send(wake_frame)
                 broadcast_chat_frame(wake_chat_id, wake_frame,
                                      skip=getattr(self, "notify_queue", None))
-            wake_layer = self.layer if wake_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(cast("str", wake_chat_id))
+            wake_layer = self.layer if self._shows_chat(wake_chat_id) else await self._resolve_layer_for_chat_async(wake_chat_id)
             await self._run_server_turn_or_keep(
                 wake_prompt,
                 target_session_id=wake_sid,
@@ -419,7 +449,7 @@ class ServerNotificationController(_Host):
         when the WS is gone (no socket to stream to, no main loop to attach).
         ``cause`` (``wire.SERVER_TURN_CAUSES``) rides ``server_turn_start``:
         the viewer draws a review's nudge line only for its own turn."""
-        is_viewed = target_chat_id == self.chat_id and not force_headless
+        is_viewed = self._shows_chat(target_chat_id) and not force_headless
         # The chat's claim covers this starter too: a send, a drain or a
         # queued delivery holding the chat for the turn it is starting, or a
         # pump driving it, means this prompt is the caller's to keep (a

@@ -1,0 +1,23 @@
+{
+ "assigned": [
+  "char-core"
+ ],
+ "named": [
+  "char-sse",
+  "char-nobody"
+ ],
+ "rows": [
+  "char-core",
+  "char-nobody",
+  "char-sse"
+ ],
+ "skills": [
+  {
+   "enabled": true,
+   "exclude_from": [
+    "task"
+   ],
+   "skill_id": "char-core-guide"
+  }
+ ]
+}

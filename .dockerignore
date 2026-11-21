@@ -7,6 +7,8 @@
 config.env
 **/.env
 proxy/config/fcm-service-account.json
+# The credential exit's authority (its private key) in a source checkout.
+credential-exit/
 
 # ── User data — comes from named volumes at runtime, never baked ──
 agents/
@@ -15,6 +17,9 @@ recover-bin/
 # backup.sh's run directories hold the env file (every secret) and the trees.
 backups/
 host-media-cache/
+
+# ── The test rig: it drives an install from outside, no image copies it ──
+rig/
 
 # ── Runtime state / caches ──
 proxy/sessions/

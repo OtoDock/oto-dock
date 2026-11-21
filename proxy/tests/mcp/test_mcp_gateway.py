@@ -318,3 +318,107 @@ def test_a_re_adoption_resolves_a_header_key_from_an_env_delivered_instance(monk
                              manifest="maps-inst", value_from="MAPS_KEY")}
     assert mcp_gateway.static_values_for("pa", "u-1", "user", creds) == {"maps": "inst-key"}
     assert seen["call"] == ("maps-inst", "pa")
+
+
+# ── an outside session's grant, judged by function name ──────────────────
+
+class TestJudgeOutside:
+    """``judge_outside``: every function for a Read and write pick, the
+    granted names alone otherwise, the plain methods through, everything
+    else refused, an unreadable body with it."""
+
+    GRANTS = (("crm", ("find", "list")), ("calls", None), ("bare", ()))
+
+    def _judge(self, mcp, body, method="POST", headers=()):
+        return mcp_gateway.judge_outside(self.GRANTS, mcp, method, body, headers)
+
+    def test_every_function_passes_whole(self):
+        assert self._judge("calls", b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"anything"}}') == ""
+        assert self._judge("calls", b"\x00junk") == ""
+
+    def test_a_granted_name_passes_and_another_is_refused(self):
+        call = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":{}}}'
+        assert self._judge("crm", call % b"find") == ""
+        assert "not open to outside people" in self._judge("crm", call % b"update")
+        assert "not open to outside people" in self._judge("crm", call % b"")
+        assert "not open to outside people" in self._judge("bare", call % b"find")
+        assert "not open to outside people" in self._judge("unattached", call % b"find")
+
+    def test_the_plain_methods_and_answers_pass(self):
+        for body in (b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+                     b'{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+                     b'{"jsonrpc":"2.0","method":"notifications/initialized"}',
+                     b'{"jsonrpc":"2.0","id":3,"result":{"ok":true}}'):
+            assert self._judge("crm", body) == "", body
+        batch = (b'[{"jsonrpc":"2.0","id":1,"method":"tools/list"},'
+                 b'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list"}}]')
+        assert self._judge("crm", batch) == ""
+
+    def test_the_other_methods_and_an_unreadable_body_are_refused(self):
+        for body in (b'{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"x"}}',
+                     b'{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"x"}}'):
+            assert self._judge("crm", body) == mcp_gateway.OUTSIDE_METHOD_REFUSED
+        for body in (b"{not json", b"[]", b"42", b'{"jsonrpc":"2.0","id":1,"method":7}', b"\xff"):
+            assert self._judge("crm", body) == mcp_gateway.OUTSIDE_UNREADABLE, body
+        assert self._judge("crm", b"{}", headers=[("content-encoding", "gzip")]) == mcp_gateway.OUTSIDE_UNREADABLE
+        batch = b'[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find"}},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"update"}}]'
+        assert "not open to outside people" in self._judge("crm", batch)
+
+    def test_a_bodiless_get_and_delete_pass_and_another_verb_is_refused(self):
+        assert self._judge("crm", b"", method="GET") == ""
+        assert self._judge("crm", b"", method="DELETE") == ""
+        assert self._judge("crm", b"", method="PUT") == mcp_gateway.OUTSIDE_METHOD_REFUSED
+        assert self._judge("crm", b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}', method="GET") \
+            == mcp_gateway.OUTSIDE_METHOD_REFUSED
+
+
+@pytest.mark.asyncio
+async def test_the_forward_judges_an_outside_session_by_its_grant(monkeypatch):
+    """``prepare_forward`` reads the session's registered context: a
+    function outside the grant is refused before the credential is resolved."""
+    from auth.path_policy import SecurityContext
+    from core.session import session_state
+    sid = str(uuid.uuid4())
+    session_state.register_session_state(sid, "auto", SecurityContext(
+        role="external", username="", agent="support", is_admin_agent=False, session_scope="agent",
+        principal="external", external_claim="phone:+1", outside_grants=(("crm", ("find",)),)))
+    cred = mcp_gateway.GatewayCredential(upstream="https://vendor.example.test", path="/mcp",
+                                         allowlist_key="crm", manifest="crm", value="k")
+    monkeypatch.setattr(mcp_gateway, "credential", lambda s, m: cred if (s, m) == (sid, "crm") else None)
+    try:
+        call = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s"}}'
+        out = await mcp_gateway.prepare_forward(sid, "crm", "POST", "/mcp", b"", [], call % b"update")
+        assert isinstance(out, mcp_gateway.Refusal) and out.reason == "outside_refused"
+        out = await mcp_gateway.prepare_forward(sid, "other", "POST", "/mcp", b"", [], call % b"find")
+        assert isinstance(out, mcp_gateway.Refusal) and out.reason == "no_credential"
+    finally:
+        session_state.cleanup_session_permission_state(sid)
+
+
+@pytest.mark.asyncio
+async def test_the_forward_judges_a_limited_server_by_function_for_every_session(monkeypatch):
+    """A chat's or a run's limit on a vendor-hosted tool holds at the gateway
+    as an outside pick does: the function left off is refused with the
+    limit's words, a granted one and an unlimited server go on."""
+    from auth.path_policy import SecurityContext
+    from core.session import session_state
+    sid = str(uuid.uuid4())
+    session_state.register_session_state(sid, "auto", SecurityContext(
+        role="manager", username="alice", agent="support", is_admin_agent=False, session_scope="user",
+        tool_limits=(("crm", ("find",)),)))
+    cred = mcp_gateway.GatewayCredential(upstream="https://vendor.example.test", path="/mcp",
+                                         allowlist_key="crm", manifest="crm", value="k")
+    monkeypatch.setattr(mcp_gateway, "credential", lambda s, m: cred if s == sid else None)
+    try:
+        call = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s"}}'
+        out = await mcp_gateway.prepare_forward(sid, "crm", "POST", "/mcp", b"", [], call % b"update")
+        assert isinstance(out, mcp_gateway.Refusal) and out.reason == "limit_refused"
+        assert out.detail == mcp_gateway.LIMIT_METHOD_REFUSED
+        # A granted function and an unlimited server pass the limit (the
+        # allowlist judges the host after it, as for every forward).
+        out = await mcp_gateway.prepare_forward(sid, "crm", "POST", "/mcp", b"", [], call % b"find")
+        assert out.reason == "host_not_allowed"
+        out = await mcp_gateway.prepare_forward(sid, "other", "POST", "/mcp", b"", [], call % b"update")
+        assert out.reason == "host_not_allowed"
+    finally:
+        session_state.cleanup_session_permission_state(sid)

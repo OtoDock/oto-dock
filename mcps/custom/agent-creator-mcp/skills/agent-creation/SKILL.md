@@ -34,8 +34,8 @@ wait for approval on their cards and its checks are offered.
 
 Write a new agent from a folder only when nothing in the catalog fits or
 the person declines what fits. An existing agent moves into a department
-through `propose_move` (an admin, or a creator who manages the agent,
-presses it). Propose a department or several agents only when the person
+through `propose_move` (an admin, or a creator who manages the agent and
+made the department or manages all its agents, presses it). Propose a department or several agents only when the person
 asks to automate a company function, a department or several projects
 with different people: an idea, a research task or one job gets one agent.
 
@@ -205,7 +205,9 @@ needs" says how. For an `apps/` app it lands in the new agent's workspace.
 For a `user-apps/` app it lands in each member's own workspace when their
 copy is approved. A template with such an app sets `"platform_min_version":
 "1.9.0"` in `agent.json`, since an older platform refuses the app. An
-export method floored at `contributor` needs the same.
+export method floored at `contributor` needs the same. An app with a button
+or a method floored `external` (open to outside people) sets
+`"platform_min_version": "2.0.0"`.
 
 **Consent is a person's, never yours.** A catalog install carries the
 installer's checkbox; `create_agent` carries none. So apps you ship land
@@ -288,6 +290,8 @@ Optional, and worth a deliberate choice:
 | `core_mcps` | Default `"all"`: the platform's core toolkit is added automatically on top of `mcps.json`. `"none"`: the agent gets only what `mcps.json` lists — for narrow single-purpose agents. |
 | `category` | `productivity` / `infrastructure` / `creative` / `research` / `customer-support` / `experimental`. |
 | `tags` | Lowercase, searchable. |
+| `summary` | What the agent does for a person, in one or two short sentences on one line, at most 200 characters. The store's card and the install dialog show it in place of the description. |
+| `highlights` | Up to six things it does, each `{"icon": "video", "text": "Full videos"}`: an icon name from the dashboard's icon set (`calendar`, `document`, `video`, `mic`, `mail` and the others of the after-update cards) and a few words, at most 60 characters. The catalog's lint refuses a name the set lacks. |
 
 Never pin an engine or model for the agent — the platform picks what is
 connected and the user can change it later (one task may pin its own:
@@ -344,6 +348,26 @@ notes — read it and distill a persona from it rather than pasting it in.
   (`"all"`) is right for almost every agent.
 - `skills` (optional) narrows which of that MCP's skills load. Omit it to get
   the defaults — right for almost every agent.
+- `limits` (optional, platform 2.0.0) narrows what the agent may use of an MCP,
+  by the MCP's canonical name: `"runs"` for the agent's own runs (its tasks, its
+  phone line), `"chats"` for everything a person runs (their chats, tasks and app
+  buttons), each `"read_only"` (the functions the maker labels as only reading)
+  or a list of function names. An MCP named here need not be required: the limit
+  waits until the tool is enabled. Never an `outside` limit: a template opens
+  nothing to outside people. Example, a mail tool that may read and draft but
+  never send:
+
+  ```json
+  {
+    "required": [],
+    "limits": {
+      "google-workspace": {
+        "runs": ["search_gmail_messages", "get_gmail_message_content", "draft_gmail_message"],
+        "chats": "read_only"
+      }
+    }
+  }
+  ```
 - MCPs the platform doesn't have yet are installed for you if you are an
   admin, or queued for an admin's approval if you are a creator. The new
   agent works either way; those particular tools appear after approval.
@@ -394,7 +418,7 @@ an older platform installs the task without these):
   `"viewer"` tells everyone who uses the agent, `"contributor"` everyone but
   viewers, `"manager"` managers only. Platform admins are always told. A task
   whose prompt reports to the whole team needs `"viewer"`.
-- `override_model` (a model id such as `claude-fable-5-1`) and `layer` (an
+- `override_model` (a model id such as `claude-fable-5-2`) and `layer` (an
   engine id such as `claude-code-cli`) — the one exception to "never pin a
   model": a task that needs a stronger or a cheaper model than the agent's
   own work (a cheap default agent with one judgement-heavy weekly brief).
@@ -406,6 +430,13 @@ an older platform installs the task without these):
   default) when that engine offers it, else on the first engine of the
   agent's own order that does, so name the `layer` when
   the same model is on two engines and the engine matters.
+- `permission_mode` (`dontAsk`, the default, or `autoReview`: the engine's
+  own reviewer checks a tool that needs approval, the choice for a task that
+  reads untrusted input such as mail or a CV) and `timeout_seconds` (how long
+  a run waits for work it left running in the background, 600 by default and
+  at most 7200; less than 600 changes nothing). An engine with no reviewer
+  runs the task on Don't Ask and the install reports it. A blueprint task
+  (`blueprint.json`) takes the same two fields.
   `list_building_blocks` lists this install's engines, which one an install
   picks and the model ids each takes. A pin the agent cannot run is dropped
   at install, the task runs with no model choice (on its person's own engine

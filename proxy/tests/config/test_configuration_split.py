@@ -75,6 +75,8 @@ KNOWN_FACADE_PATCHES: dict[str, tuple[str, dict[str, int]]] = {
         "the meeting context reads config.get_cli_model", {"get_cli_model": 1}),
     "proxy/tests/phone/test_phone_config_builder_identity.py": (
         "the phone config builder reads config.get_cli_model", {"get_cli_model": 1}),
+    "proxy/tests/phone/test_ws_phone_identity.py": (
+        "a call's chat row reads config.get_cli_model", {"get_cli_model": 1}),
     "proxy/tests/phone/test_ws_phone_turns.py": (
         "the phone socket reads config.get_cli_model", {"get_cli_model": 1}),
     "proxy/tests/remote/test_remote_local_endpoint_payload.py": (

@@ -420,17 +420,49 @@ def test_the_streams_share_one_speech_model_per_rate(monkeypatch):
     import audio.providers.vad.silero_model as silero
 
     class Counted(FakeModel):
-        def __init__(self, rate):
-            built.append(rate)
+        def __init__(self, *args, **kwargs):
+            built.append((args, kwargs))
             super().__init__([])
     monkeypatch.setattr(silero, "SileroModel", Counted)
     pcm = np.frombuffer(_audio(1.0), dtype=np.int16)
     SpeechCheck(RATE).seconds(pcm[:100], pcm)
     SpeechCheck(RATE).seconds(pcm[:100], pcm)
-    assert built == [RATE]
+    # One model for the rate, built with the rate alone: the model has one feed.
+    assert built == [((RATE,), {})]
 
 
-def test_the_speech_check_at_8_khz_runs_on_the_audio_upsampled():
+def test_the_shared_check_reads_each_window_with_the_audio_before_it_at_both_rates(monkeypatch):
+    """The real model, as the streams share it: a call's 8 kHz check and the
+    16 kHz one of dictation and voice conversations each get every window
+    with the audio before it."""
+    pytest.importorskip("onnxruntime")
+    monkeypatch.setattr(rl, "_FAILED", set())
+    monkeypatch.setattr(rl, "_MODELS", {})
+    for rate in (8000, 16000):
+        quiet = np.zeros(rate, dtype=np.int16)
+        assert SpeechCheck(rate).seconds(quiet[:0], quiet) == 0.0
+    assert rl._MODELS[8000].context_samples == 32
+    assert rl._MODELS[16000].context_samples == 64
+
+
+def test_a_stream_that_changes_rate_gets_a_check_at_its_new_rate(monkeypatch):
+    """Live voice builds its speech-to-text at the line's 8 kHz and starts
+    it at the microphone's 16 kHz: the reset must give its second listen a
+    check at 16 kHz, never the call's check it was built with."""
+    pytest.importorskip("onnxruntime")
+    monkeypatch.setattr(rl, "_FAILED", set())
+    monkeypatch.setattr(rl, "_MODELS", {})
+    turn = TurnRelisten(wide=True, transcribe=FakeBatch([]), norm=_norm, rate=8000, label="en")
+    assert turn._speech.rate == 8000
+    turn.reset(16000)
+    assert turn.ring.rate == 16000 and turn._speech.rate == 16000
+    quiet = np.zeros(16000, dtype=np.int16)
+    assert turn._speech.seconds(quiet[:0], quiet) == 0.0
+    assert turn._speech._model.sample_rate == 16000 and turn._speech._model.context_samples == 64
+    assert 8000 not in rl._MODELS                     # the call's check never ran
+
+
+def test_the_speech_check_at_8_khz_runs_at_the_audios_own_rate():
     rates = []
 
     def factory(rate):
@@ -442,8 +474,9 @@ def test_the_speech_check_at_8_khz_runs_on_the_audio_upsampled():
         coded[i:i + rate8 // 10] = 1000 + i // (rate8 // 10)
     check = SpeechCheck(rate8, model_factory=factory)
     assert check.usable
+    # The stand-in's window is 512 samples, 64 ms of a call's audio.
     assert check.seconds(coded[:0], coded) == pytest.approx(0.6, abs=0.07)
-    assert rates == [16000]
+    assert rates == [rate8]
 
 
 # ── A call's turn ───────────────────────────────────────────────────

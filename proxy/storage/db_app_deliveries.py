@@ -219,7 +219,8 @@ def extend_lease(delivery_id: str, lease_s: int) -> None:
 
 
 def mark_started(delivery_id: str, ran_on: str) -> None:
-    """Where the step runs (``local`` or a machine id) and when it started."""
+    """Where the step runs (a machine's id: a compute machine's for the
+    platform's place, ``app_steps.placement_for``) and when it started."""
     with get_conn() as conn:
         conn.execute(
             "UPDATE app_handler_deliveries SET ran_on=%s, started_at=%s WHERE id=%s",

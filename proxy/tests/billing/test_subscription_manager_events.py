@@ -412,20 +412,20 @@ def _service_create(monkeypatch, *, account_label: str):
         lambda name: SimpleNamespace(credentials=SimpleNamespace(webhooks=dict(_GH))))
     monkeypatch.setattr(
         credential_resolver, "pick_account",
-        lambda mcp, agent, **kw: credential_resolver.AccountRef(
-            label="bound", owner_sub="local:owner"))
+        lambda mcp, agent, account_choices=None, **kw: credential_resolver.AccountRef(
+            label="bound", owner_sub="local:owner")
+        if (account_choices or {}).get(mcp) == "bound" else None)
     return asyncio.run(subscription_manager.create_subscription(
         user_sub="local:co-manager", scope="service", agent="ag", mcp_name="github-mcp",
         account_label=account_label, vendor_target="o/r", selected_events=["nope"],
     ))
 
 
-def test_service_scope_refuses_a_label_other_than_the_bindings(monkeypatch):
+def test_service_scope_refuses_an_account_the_agents_set_does_not_hold(monkeypatch):
     with pytest.raises(subscription_manager.SubscriptionError) as ei:
         _service_create(monkeypatch, account_label="other")
     assert ei.value.status == 400
-    assert ei.value.detail == {"bound_account_label": "bound"}
-    assert "'bound'" in str(ei.value)
+    assert str(ei.value) == "other is not one of this agent's accounts for github-mcp."
 
 
 def test_service_scope_bound_label_passes_the_check(monkeypatch):
@@ -601,10 +601,10 @@ def test_delete_reports_whether_the_vendor_let_go(monkeypatch):
     monkeypatch.setattr(webhook_subscription_store, "get_subscription", lambda sid: row)
     monkeypatch.setattr(webhook_subscription_store, "delete_subscription", lambda sid: True)
 
-    async def ok(r):
+    async def ok(r, **kw):
         return None
 
-    async def boom(r):
+    async def boom(r, **kw):
         raise subscription_manager.VendorAPIError(
             "vendor 401: bad credentials", vendor_status=401, vendor_body="bad credentials")
 

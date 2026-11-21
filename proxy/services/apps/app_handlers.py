@@ -28,6 +28,7 @@ waits in the queue.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import time
@@ -48,6 +49,9 @@ RUN_STATUS_OF = {deliveries.DONE: run_status.COMPLETED, deliveries.DEAD: run_sta
 #: ``_precheck``'s hold reason — the delivery waits for the manifest's
 #: approval instead of dying; a reason word, not a delivery status.
 HOLD_UNAPPROVED = "unapproved"
+#: What a held delivery's row says while it waits, re-armed every
+#: ``UNAPPROVED_WAIT_S`` until the store's age limit ends it.
+WAITING_FOR_APPROVAL = "the app is waiting for approval"
 
 logger = logging.getLogger("otodock.apps")
 
@@ -75,11 +79,18 @@ MAX_STEPS_PER_APP = 4
 MAX_STEPS_PLATFORM = 8
 # (agent, event) → [(app id, handler)] for platform events, and
 # (target agent, target slug, event) → [(app id, handler, binding name)]
-# for cross-app events; rebuilt lazily from approved rows when marked dirty.
+# for cross-app events, keyed by the agent each binding reaches
+# (binding_target.agent_of); rebuilt lazily from approved rows when marked
+# dirty.
 _index: dict[tuple[str, str], list[tuple[str, str]]] = {}
 _app_event_index: dict[tuple[str, str, str], list[tuple[str, str, str]]] = {}
 _agents_with_events: set[str] = set()
-_index_dirty = True
+# The index is fresh while the generation it was built at is the current
+# one: a change marked during a build (a department's members changed in a
+# worker thread) is never lost to the build that started before it.
+_generations = itertools.count(1)
+_index_generation = next(_generations)
+_built_generation = 0
 _index_lock: asyncio.Lock | None = None
 _sweeps = 0
 
@@ -92,20 +103,25 @@ def _now_iso() -> str:
 
 
 def mark_dirty() -> None:
-    global _index_dirty
-    _index_dirty = True
+    global _index_generation
+    _index_generation = next(_generations)
+
+
+def _stale() -> bool:
+    return _built_generation != _index_generation
 
 
 def has_subscribers(agent: str) -> bool:
     """Cheap and conservative: True while the index is stale."""
-    return _index_dirty or agent in _agents_with_events
+    return _stale() or agent in _agents_with_events
 
 
 def _build_index() -> tuple[dict, dict, set]:
-    from services.apps import manifest as _mf
+    from services.apps import binding_target, manifest as _mf
     plat: dict[tuple[str, str], list[tuple[str, str]]] = {}
     cross: dict[tuple[str, str, str], list[tuple[str, str, str]]] = {}
     agents: set[str] = set()
+    snap = binding_target.snapshot()
     for row in task_store.list_apps_with_handlers():
         if not task_store.app_actions_approved(row):
             continue
@@ -116,8 +132,9 @@ def _build_index() -> tuple[dict, dict, set]:
                 if ev.startswith("app:"):
                     _, bname, name = ev.split(":", 2)
                     b = bindings.get(bname)
-                    if b:
-                        cross.setdefault((b.get("agent") or "", b.get("app") or "", name), []).append(
+                    reached = binding_target.agent_of(row, b, snap) if b else ""
+                    if b and reached:
+                        cross.setdefault((reached, b.get("app") or "", name), []).append(
                             (row["id"], handler, bname))
                 else:
                     plat.setdefault((agent, ev), []).append((row["id"], handler))
@@ -126,22 +143,23 @@ def _build_index() -> tuple[dict, dict, set]:
 
 
 async def _ensure_index() -> None:
-    global _index, _app_event_index, _agents_with_events, _index_dirty, _index_lock
-    if not _index_dirty:
+    global _index, _app_event_index, _agents_with_events, _built_generation, _index_lock
+    if not _stale():
         return
     if _index_lock is None:
         _index_lock = asyncio.Lock()
     async with _index_lock:
-        if not _index_dirty:
+        generation = _index_generation
+        if _built_generation == generation:
             return
         plat, cross, agents = await run_db(_build_index)
         _index, _app_event_index, _agents_with_events = plat, cross, agents
-        _index_dirty = False
+        _built_generation = generation
 
 
 async def cross_app_subscribers(target_agent: str, target_slug: str, event: str) -> list[tuple[str, str, str]]:
     """``(app id, handler, binding name)`` of every approved row whose
-    bindings name the emitter and whose handlers wake on its event (the
+    bindings reach the emitter and whose handlers wake on its event (the
     bindings route re-checks each edge before it enqueues)."""
     await _ensure_index()
     return list(_app_event_index.get((target_agent, target_slug, event), []))
@@ -218,7 +236,11 @@ async def _dispatch(users: list[str], agent: str, feed: str, event: str, delta: 
 async def fire_scheduled(task, trigger_type: str = "scheduled") -> str:
     """The runner's branch for ``task_type='app'``: a run row and a delivery,
     never a session. A row whose app is gone deletes itself; a hidden or
-    unapproved app is skipped (its wakes resume when it comes back)."""
+    unapproved app is skipped (its wakes resume when it comes back), and so
+    is an app whose waiting release brings the server the live one lacks:
+    a tick queued there would reach that server at the approval with every
+    tick of the wait. A trigger's wake and a platform event are held
+    instead (``_fire``): each carries an event that must not be lost."""
     from services.apps import manifest as _mf
     from services.scheduler import scheduler as _api
     row = await run_db(task_store.get_app, task.app_id or "")
@@ -230,6 +252,9 @@ async def fire_scheduled(task, trigger_type: str = "scheduled") -> str:
     if row.get("hidden") or not task_store.app_actions_approved(row):
         return ""
     if handler not in (_mf.parse_handlers(row).get("on_schedule") or {}):
+        return ""
+    from services.apps import releases
+    if await asyncio.to_thread(releases.pending_adds_server, row):
         return ""
     run_id = f"run-{uuid.uuid4().hex[:12]}"
     await asyncio.to_thread(
@@ -559,7 +584,7 @@ async def _fire(d: dict, *, as_step: bool = False) -> None:
     row = await run_db(task_store.get_app, d["app_id"])
     why = await asyncio.to_thread(_precheck, row, d)
     if why == HOLD_UNAPPROVED:
-        await _rearm(d, "the app is waiting for approval", UNAPPROVED_WAIT_S)
+        await _rearm(d, WAITING_FOR_APPROVAL, UNAPPROVED_WAIT_S)
         return
     if why:
         await _dead(d, why)
@@ -582,6 +607,13 @@ async def _fire(d: dict, *, as_step: bool = False) -> None:
         await _rearm(d, e.reason, max(5, int(e.retry_after)))
         return
     if inst.state == app_supervisor.STATIC:
+        # The release that brings the server waits for a person: its wakes
+        # wait with it, as an unapproved manifest's do (the trigger's, the
+        # schedule's and a platform event's alike).
+        from services.apps import releases
+        if await asyncio.to_thread(releases.pending_adds_server, row):
+            await _rearm(d, WAITING_FOR_APPROVAL, UNAPPROVED_WAIT_S)
+            return
         await _dead(d, "the app has no server")
         return
     body = json.dumps({
@@ -622,7 +654,7 @@ async def _fire(d: dict, *, as_step: bool = False) -> None:
 
 def wakes(row: dict, limit: int = 10) -> list[dict]:
     """The last wakes, newest first; a step's row carries its exit code and
-    where it ran (``local`` or a machine id)."""
+    where it ran (a machine's id, ``app_steps.placement_for``)."""
     return [{"id": w["id"], "handler": w["handler"], "event": w["event"], "status": w["status"],
              "attempts": int(w.get("attempts") or 0), "error": w.get("last_error") or "",
              "at": w.get("created_at") or "", "done_at": w.get("done_at") or "",

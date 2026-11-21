@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import shutil
+import posixpath
+import stat
 from pathlib import Path
 
 from core.sandbox import session_config_dir as scd
@@ -106,7 +106,21 @@ DISABLED_BUILTIN_PLUGINS = (
     # HTTP MCP server, with a claude-api skill. Both dark behind remote flags.
     "cc-plugin-easel@builtin",
     "cc-plugin-claude-platform@builtin",
+    # 2.1.322: the account-email check, on under these settings, refuses a
+    # shell command holding the signed-in email and a User-Agent without
+    # asking. The platform's gate judges commands; a refusal of its own ends
+    # an unattended run's call with no card to answer.
+    "cc-plugin-privacy@builtin",
 )
+
+# The events that carry a finished call's result to the forwarder, the card's
+# one source on a headless chat. Claude Code runs PostToolUse for a call that
+# succeeded and PostToolUseFailure for one that failed: a non-zero exit it
+# reads as an error, a command stopped by a signal (the memory guard's stop),
+# a missing file, an MCP error (probed on 2.1.312 and 2.1.325). A refused or
+# interrupted call runs neither. Satellite twin:
+# ``satellite/sessions/cli_session.py``, held equal by test_hook_files.
+TOOL_RESULT_EVENTS = ("PostToolUse", "PostToolUseFailure")
 
 
 def build_settings(sandbox_claude_dir: str) -> dict:
@@ -136,6 +150,9 @@ def build_settings(sandbox_claude_dir: str) -> dict:
     forwarder = f'{py} -I "{sandbox_claude_dir}/tool_result_forwarder.py"'
     subagent = f'{py} -I "{sandbox_claude_dir}/subagent_tracker.py"'
     stop = f'{py} -I "{sandbox_claude_dir}/stop_tracker.py"'
+    usage = f'{py} -I "{sandbox_claude_dir}/usage_report.py"'
+    start = f'{py} -I "{sandbox_claude_dir}/start_context.py"'
+    from core.session.start_context import HOOK_PARTS
 
     return {
         "sandbox": {
@@ -174,7 +191,7 @@ def build_settings(sandbox_claude_dir: str) -> dict:
         "enabledPlugins": {plugin: False for plugin in DISABLED_BUILTIN_PLUGINS},
         # Claude Code ≥ 2.1.275 syncs the skills and plugins enabled on the
         # signed-in claude.ai account into the session. Platform sessions run
-        # on pool accounts (CLAUDE_CODE_OAUTH_TOKEN): a pool owner's personal
+        # on pool accounts (a login file in the config dir): a pool owner's personal
         # skills must not reach every user's agent, and the platform is the
         # only skill source (the materialized .claude/skills/). Both off;
         # older CLIs ignore the keys (probed on 2.1.263). Satellite twin:
@@ -199,6 +216,16 @@ def build_settings(sandbox_claude_dir: str) -> dict:
         "permissions": {
             "deny": list(DISALLOWED_BUILTIN_TOOLS),
         },
+        # A terminal's status line command receives the account's windows
+        # after each answer; the script posts them as the session's report
+        # (hooks/usage_report.py) and draws nothing. A headless run never
+        # calls it, so the file is the same for both kinds. Satellite twin:
+        # satellite/sessions/cli_session.py::_write_cli_hooks.
+        "statusLine": {
+            "type": "command",
+            "command": usage,
+            "padding": 0,
+        },
         "hooks": {
             "PreToolUse": [{
                 "matcher": "",
@@ -214,14 +241,14 @@ def build_settings(sandbox_claude_dir: str) -> dict:
                     "onFailure": "block",
                 }],
             }],
-            "PostToolUse": [{
+            **{event: [{
                 "matcher": "",
                 "hooks": [{
                     "type": "command",
                     "command": forwarder,
                     "timeout": 10,
                 }],
-            }],
+            }] for event in TOOL_RESULT_EVENTS},
             # Deterministic, idle-safe subagent completion (fg + bg). Fires
             # when a subagent stops — drives the SubagentRegistry completion
             # gate without polling stdout. See hooks/subagent_tracker.py.
@@ -246,8 +273,51 @@ def build_settings(sandbox_claude_dir: str) -> dict:
                     "timeout": scd.STOP_HOOK_TIMEOUT_S,
                 }],
             }],
+            # A terminal's start: the start's riding part, asked of the
+            # proxy (core/session/start_context.py), one entry per part
+            # since Claude Code inlines a hook's context only up to 10,000
+            # characters. In a headless session the script answers only a
+            # compaction inside a turn (its first turn gets the start).
+            # Satellite twin: satellite/sessions/cli_session.py::_write_cli_hooks.
+            "SessionStart": [{
+                "matcher": "",
+                "hooks": [{"type": "command", "command": f"{start} {i} {HOOK_PARTS}", "timeout": 20}
+                          for i in range(1, HOOK_PARTS + 1)],
+            }],
         }
     }
+
+
+def _remove_cli_memory(agent_name: str, claude_dir: Path) -> None:
+    """Remove ``projects/<project>/memory`` of an engine folder beneath the
+    agent's real folder (``core.agent_folder``), never through a link below
+    it: the projects are the real folders of one listing, a ``memory``
+    folder goes with its tree and a link or a file at that name goes alone
+    (a link's target stays). A failure is logged and never stops the
+    start."""
+    from core.agent_folder import beneath_agent
+    from services.infra import safe_fs
+    try:
+        root, base = beneath_agent(claude_dir, agent_name)
+        rel = posixpath.join(base, "projects")
+        projects = []
+        for step in safe_fs.walk_beneath(root, rel):
+            projects = list(step.dirs)
+            break
+    except OSError:
+        return
+    for proj in projects:
+        target = f"{rel}/{proj}/memory"
+        try:
+            st = safe_fs.lstat_beneath(root, target)
+            if stat.S_ISDIR(st.st_mode):
+                safe_fs.rmtree_beneath(root, target, missing_ok=True)
+            else:
+                safe_fs.unlink_beneath(root, target, missing_ok=True)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            logger.debug("CLI memory folder %s/%s not removed", claude_dir, proj, exc_info=True)
 
 
 def ensure_persistent_claude_dir(
@@ -256,6 +326,8 @@ def ensure_persistent_claude_dir(
     username: str = "",
     scope: str = "user",
     external_home=None,
+    outside_picks=None,
+    kind_rule=None,
 ) -> Path:
     """Create or refresh the persistent ``.claude`` dir for a session and
     return its host path (``session_config_dir.scope_config_dir`` says
@@ -276,18 +348,10 @@ def ensure_persistent_claude_dir(
     # ``users/{u}/context/memory/``). Two coexisting memory systems confuses
     # the LLM (it doesn't know which is canonical) and persists facts the
     # platform never gates. Wipe each session start so otodock-memory is
-    # the only durable memory the agent sees. Matches the Codex pattern
-    # (``.codex/memories/`` wipe in ``close_codex_session``). Session
+    # the only durable memory the agent sees. Session
     # JSONLs (sibling files in ``projects/{id}/``) are left untouched —
     # only the ``memory/`` subdir is removed.
-    projects_dir = claude_dir / "projects"
-    if projects_dir.exists():
-        for proj in projects_dir.iterdir():
-            if not proj.is_dir():
-                continue
-            mem_dir = proj / "memory"
-            if mem_dir.exists():
-                shutil.rmtree(mem_dir, ignore_errors=True)
+    _remove_cli_memory(agent_name, claude_dir)
 
     settings = build_settings(sandbox_claude_dir)
     scd.write_if_changed(claude_dir / "settings.json",
@@ -298,9 +362,10 @@ def ensure_persistent_claude_dir(
     # skills problem must never block a session start). See
     # skills_materializer for the full protocol.
     from core.sandbox.skills_materializer import materialize_skills_for_sandbox
-    materialize_skills_for_sandbox(agent_name, claude_dir, username=username)
+    materialize_skills_for_sandbox(agent_name, claude_dir, username=username,
+                                   outside_picks=outside_picks, kind_rule=kind_rule)
 
-    os.chmod(claude_dir, 0o700)
+    scd.restrict_dir(agent_name, claude_dir)
 
     logger.debug(
         "Prepared .claude/ dir: %s "

@@ -274,3 +274,21 @@ def test_the_notice_route_is_the_admins_and_the_check_route_runs_a_check(fresh, 
     member = _client("member")
     assert member.get("/v1/admin/release-notice").status_code == 403
     assert member.post("/v1/admin/release-check").status_code == 403
+
+
+def test_a_custom_release_url_is_never_dialled_on_a_hosted_install(monkeypatch):
+    """A custom ``OTODOCK_RELEASE_CHECK_URL`` dials on an allow-all rule: on
+    a hosted install the check itself never runs."""
+    import asyncio
+
+    import config
+    from services.infra import release_check
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
+    monkeypatch.setattr(config, "RELEASE_CHECK_ENABLED", True)
+    assert release_check.disabled_reason()
+    monkeypatch.setattr(release_check, "_worker_task", None)
+    assert asyncio.run(_start(release_check)) is None
+
+
+async def _start(release_check):
+    return release_check.start_worker()

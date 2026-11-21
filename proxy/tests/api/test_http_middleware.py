@@ -135,6 +135,31 @@ def test_an_expired_cookie_on_a_large_body_is_a_sign_in_problem():
     assert status == 401 and handed == 0
 
 
+def test_a_tools_fetch_token_proves_a_credential_on_its_report_alone():
+    """A stand-in's report carries its program's answers (257 KB for
+    Google Workspace): its fetch token lifts the unauthenticated tier on
+    that route, never anywhere else."""
+    from core.credentials import mcp_broker
+    sid = str(uuid.uuid4())
+    mcp_broker.provision(sid, {"echo-mcp": mcp_broker.SecretBundle()})
+    fetch = [("authorization", f"Bearer {mcp_broker.mint_token(sid, 'echo-mcp')}")]
+    size = 4 * CHUNK
+    status, _, _ = _drive("POST", "/v1/hooks/tool-start", chunks=4, headers=fetch, declared=size)
+    assert status not in (401, 413)
+    for path in ("/v1/triggers", "/v1/hooks/tool-listing", "/v1/hooks/mcp-credentials",
+                 "/v1/hooks/tool-start/", "/v1/hooks/tool-start%3F"):
+        status, _, handed = _drive("POST", path, chunks=4, headers=fetch, declared=size)
+        assert (status, handed) == (401, 0), path
+    status, _, _ = _drive("POST", "/v1/hooks/tool-start", chunks=4, declared=size,
+                          headers=[("authorization", "Bearer not-a-token")])
+    assert status == 401
+    # A token copied out of a session that ended proves nothing: the tier
+    # trusts a live session (``mcp_broker.live_token``), as the routes do.
+    mcp_broker.purge_session(sid)
+    status, _, handed = _drive("POST", "/v1/hooks/tool-start", chunks=4, headers=fetch, declared=size)
+    assert (status, handed) == (401, 0)
+
+
 def test_a_small_unauthenticated_body_still_reaches_the_route():
     status, _, _ = _drive("POST", "/auth/forgot-password", chunks=0)
     assert status not in (401, 413)
@@ -197,6 +222,8 @@ def test_the_per_route_caps():
     assert middleware.body_cap("POST", "/v1/mcp-gateway/github/mcp") == (
         min(MAX_BODY_BYTES, backstop), True)
     assert middleware.body_cap("POST", "/wopi/files/abc/contents") == (backstop, True)
+    from services.mcp.tool_listing import MAX_LISTING_BYTES
+    assert middleware.body_cap("POST", "/v1/hooks/tool-start") == (4 * MAX_LISTING_BYTES, True)
     assert middleware.body_cap("POST", "/v1/webhooks/github/x")[1] is False
     assert middleware.body_cap("GET", "/v1/upload") == (config.MAX_JSON_BODY_BYTES, True)
     save = middleware.body_cap("PUT", "/v1/agents/a/files/workspace/notes.md")[0]
@@ -415,10 +442,16 @@ _PERIM_1_ROUTES = [
     ("PUT", "/v1/users/me/integrations/x/default-account"),
     ("PUT", "/v1/users/me/integrations/x/agent-binding"),
     ("DELETE", "/v1/users/me/integrations/x/agent-binding/y"),
+    ("PUT", "/v1/users/me/integrations/x/agent-accounts"),
+    ("DELETE", "/v1/users/me/integrations/x/agent-accounts/y?account_label=z"),
+    ("PUT", "/v1/users/me/integrations/x/agent-accounts/y/default"),
+    ("POST", "/v1/agents/x/reload-session"),
     ("GET", "/v1/users/me/integrations/x/repositories"),
     ("GET", "/v1/agents/x/mcps/y/service-account-options"),
-    ("PUT", "/v1/agents/x/mcps/y/service-binding"),
-    ("DELETE", "/v1/agents/x/mcps/y/service-binding"),
+    ("PUT", "/v1/agents/x/mcps/y/service-accounts"),
+    ("PUT", "/v1/agents/x/mcps/y/service-accounts/reach"),
+    ("PUT", "/v1/agents/x/mcps/y/service-accounts/default"),
+    ("DELETE", "/v1/agents/x/mcps/y/service-accounts?account_label=z"),
     ("GET", "/v1/admin/integrations"),
     ("PUT", "/v1/admin/integrations/infra/x"),
     ("DELETE", "/v1/admin/integrations/infra/x"),

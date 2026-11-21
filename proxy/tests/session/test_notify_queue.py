@@ -42,6 +42,17 @@ def test_progress_frames_coalesce_per_key():
     ]
 
 
+def test_a_machines_frame_replaces_the_queued_one_of_that_machine():
+    """A machine that flaps while a tab is slow leaves one frame per machine:
+    the page reads every place again whichever copy it gets."""
+    q = nm.NotifyQueue(bound=10)
+    for _ in range(3):
+        q.put_nowait({"type": wire.MACHINE_LINK, "machine_id": "m-1"})
+    q.put_nowait({"type": wire.MACHINE_LINK, "machine_id": "m-2"})
+    q.put_nowait({"type": wire.MACHINE_LINK, "machine_id": "m-1"})
+    assert [f["machine_id"] for f in q._queue] == ["m-1", "m-2"]
+
+
 def test_a_moves_progress_replaces_the_queued_one_of_its_chat():
     """A slow tab holds one progress frame per moving chat: the newest."""
     q = nm.NotifyQueue(bound=10)

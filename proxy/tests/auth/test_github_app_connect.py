@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 import config
 from auth.oauth_providers import github_app
 from auth.providers import UserContext, get_current_user
-from services.mcp import mcp_manifest_parse, mcp_registry
+from services.mcp import mcp_manifest_parse, mcp_manifest_store, mcp_registry
 from services.oauth import github_apps, oauth_account_store, oauth_engine
 from storage.identity import credential_store, oauth_app_kinds as kinds
 from storage.pg import get_conn
@@ -179,14 +179,14 @@ def rig(monkeypatch, tmp_path, person, pem):
     bundle = BUNDLE_PREFIX + uuid.uuid4().hex[:8]
     monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", DASH)
     monkeypatch.setattr(config, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     from auth import oauth_providers
     oauth_providers.clear_manifest_cache()
     path = tmp_path / MCP / "manifest.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(_manifest_data(bundle)))
     manifest = mcp_manifest_parse._parse_manifest(path)
-    mcp_registry._manifests[manifest.name] = manifest
+    mcp_manifest_store._manifests[manifest.name] = manifest
 
     fake = FakeGitHub()
     monkeypatch.setattr(github_app, "_client", fake.sync_client)
@@ -222,7 +222,8 @@ def rig(monkeypatch, tmp_path, person, pem):
     r = Rig()
     r.fake, r.client, r.sub, r.username, r.bundle, r.holder = fake, client, sub, username, bundle, holder
     r.token_dir = lambda: oauth_account_store.get_token_dir(username, provider_id=PROVIDER)
-    with patch("auth.oauth_providers.generic.httpx.AsyncClient", side_effect=fake.async_client):
+    with patch("auth.oauth_providers.generic._client",
+               side_effect=lambda timeout: fake.async_client(timeout=timeout)):
         yield r
     oauth_providers.clear_manifest_cache()
     credential_store.delete_infra_credentials(bundle)
@@ -586,7 +587,7 @@ class TestIntegrationsList:
         # the entry is read through the admin's view of every MCP.
         rig.holder["role"] = "admin"
         monkeypatch.setattr("storage.agents.agent_store.get_agent_slugs", lambda: ["a1"])
-        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda agent: list(mcp_registry._manifests.values()))
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps_all_placements", lambda agent: list(mcp_manifest_store._manifests.values()))
         resp = rig.client.get("/v1/users/me/integrations")
         assert resp.status_code == 200, resp.text
         entry = next(e for e in resp.json() if e["mcp_name"] == MCP)
@@ -849,7 +850,7 @@ class TestHostedConnect:
         monkeypatch.setattr("storage.database.get_user_agents", lambda sub: [])
         hosted.holder["role"] = "admin"
         monkeypatch.setattr("storage.agents.agent_store.get_agent_slugs", lambda: ["a1"])
-        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda agent: list(mcp_registry._manifests.values()))
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps_all_placements", lambda agent: list(mcp_manifest_store._manifests.values()))
 
         def offered():
             entry = next(e for e in hosted.client.get("/v1/users/me/integrations").json() if e["mcp_name"] == MCP)

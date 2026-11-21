@@ -96,6 +96,8 @@ class HostOS:
     display_server: str         # DISPLAY_* or "" (probed at connect)
     xdg_user_dirs: bool         # ~/.config/user-dirs.dirs names the well-known folders
     videos_folder: str          # Videos | Movies
+    memory_guard: bool = False  # the memory guard runs: the reading is measured here (Linux)
+    oom_score: bool = False     # /proc/self/oom_score_adj orders the kernel's last-resort kill
 
     @property
     def script_suffix(self) -> str:
@@ -110,7 +112,7 @@ def _table() -> dict:
         peercred=True, case_insensitive=False, conpty=False,
         locks_running_files=False, service_manager=SERVICE_SYSTEMD,
         powershell=False, tray=False, display_server="", xdg_user_dirs=True,
-        videos_folder="Videos",
+        videos_folder="Videos", memory_guard=True, oom_score=True,
     )
     darwin = HostOS(
         name=DARWIN, dirname=".oto-dock", exe_suffix="", venv_bin="bin",
@@ -657,8 +659,12 @@ def windows_schedule_oneshot(
         f"$t=New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds({int(delay_s)});"
         f"$a=New-ScheduledTaskAction -Execute {_ps_squote(execute)}"
         f" -Argument {_ps_squote(argument)};"
+        # With no settings Windows refuses the start on battery and never
+        # makes a missed one up: the main task's three settings.
+        "$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries"
+        " -DontStopIfGoingOnBatteries -StartWhenAvailable;"
         f"Register-ScheduledTask -TaskName {_ps_squote(task_name)}"
-        " -Trigger $t -Action $a -Force | Out-Null"
+        " -Trigger $t -Action $a -Settings $s -Force | Out-Null"
     )
     try:
         r = subprocess.run(
@@ -686,8 +692,9 @@ def relaunch_self() -> None:
       * Linux:   no-op. The systemd *user* unit's ``Restart=always``
                  respawns us the instant we exit.
       * macOS:   ``launchctl kickstart`` the per-user LaunchAgent.
-      * Windows: a logon Scheduled Task auto-restarts only on *failure*
-                 (non-zero exit), NOT on a clean ``exit(0)``, AND it runs the
+      * Windows: the logon Scheduled Task restarts neither a clean
+                 ``exit(0)`` nor a program that started and exited with an
+                 error, AND it runs the
                  daemon inside a kill-on-close Job Object — so a plain detached
                  child (``DETACHED_PROCESS`` is NOT breakaway) is killed the
                  instant we exit and the relaunch never fires. We instead
@@ -781,7 +788,7 @@ def ensure_windows_install_artifacts() -> None:
     #    inside a VISIBLE terminal window that killed it when closed (Win10's
     #    legacy conhost honors the hide, hence the machine split). A headless
     #    classic console shows no window under either terminal; conhost
-    #    propagates the child's exit code, preserving restart-on-failure.
+    #    passes the child's exit code on to the task's result.
     try:
         r = subprocess.run(
             ["schtasks", "/Query", "/TN", _WINDOWS_TASK_NAME, "/XML"],
@@ -889,19 +896,39 @@ _DEFAULT_CONFIG_PATH = otodock_dir() / "satellite.conf"
 # this on any change to the satellite<->proxy contract; a purely additive frame
 # an older proxy can safely ignore needs a bump only when the proxy must gate
 # behaviour on it (e.g. satellite_supports_pty). Per-change history is in git.
-SATELLITE_VERSION = "0.5.168"
+SATELLITE_VERSION = "0.5.197"
+SHARED_MCP_PIN_HASH = "de9087df4defcd6d7e8fa4ba48691f3c59489e30798cef8ae7adfbc53b1fc515"
+SHARED_SESSION_HOME_HASH = "9aea03e2ea3a037755556fd300e9f11c90f37f0982a67f1132558be08f2d36c5"
+SHARED_SESSION_TEXT_HASH = "1da6b167ee9aa057355d928c1482410b423f1110a0900286324995aee7e35f87"
+SHARED_OUTBOUND_URL_HASH = "4af1675a1aedb59270d82f115e375eb1a0b12e8984f728dba208c8dfd610b8be"
+SHARED_EXIT_AUTHORITY_HASH = "5752e2ea4f8eba4f0195c4d80f0c7064af6eec01b0b35de2bc3d6148960c006d"
+SHARED_EXIT_RELAY_HASH = "c8d87872160a401d8aa6d9bff451e65acc33e78c1dda55da5b6f2cde8a3ce40e"
+SHARED_HOST_RESOURCES_HASH = "a845ce9d3487477cdf08cabaaee6f7a14b89927792f5d723ef4b1535187b2d3b"
+SHARED_SANDBOX_NET_HASH = "de1c6df674edf8e849c03b3af5c4c1dfffd84217e1645a40abbb271f7ec50f00"
+SHARED_SANDBOX_RENDER_HASH = "4fa704d415aff2e634d2b2026b88dbe3a84a9bf6b95befa8cf218ee6d1ca4153"
 SHARED_LOOP_WATCHDOG_HASH = "3627e437d8e1d3c373c2a4f96a9f0cfe3978be4050850e56e71764f3358d2dc4"
 SHARED_LAYOUT_HASH = "2addd8b41902ccd73df4135667a276d215d83e635cc5d94587f764ba58d38ad9"
 SHARED_TERMINAL_QUERIES_HASH = "3cbc0e533e4aef2d4a532f7e97117bb30a1cdc4bfcf73bad82aee1385e95e0ac"
-SHARED_STDIO_INTERCEPTOR_HASH = "eaaa3facf03a7c2e5c9242e5234f3953fddafdaa680e582b6e2c795f38d50f0b"
+SHARED_STDIO_INTERCEPTOR_HASH = "d1695cca39afaed265daa9a5a8cdfd4837cfa095e473d865cac2991fbd527d36"
 SHARED_CODEX_APPROVALS_HASH = "44ec5c5b74db9887db72831c7f6b1c6f61c39c6f1f4bec44e852a1bf9ff8f661"
-SHARED_APP_SERVER_CLIENT_HASH = "d141cda0ed263bd6ab815d0346295dd87aefc21bfc4f6dff1409be91fd91d831"
-SHARED_MCP_INSTALLER_HASH = "f060f8d1e0742c0ef3cad1e167150f7f9b95370ffdd863d11a688149b2f95721"
+SHARED_APP_SERVER_CLIENT_HASH = "fd47d77ad68d1cb6fd9c3e1955401969c586a5f2b945c4a8f58c7e448f9f509b"
+SHARED_MCP_SYSTEM_DEPS_HASH = "a6de0494fcbd81b19397b9d9512156b2d63dfc65d4f102b13446ae0eac1051fe"
+SHARED_MCP_INSTALLER_HASH = "4575a3b3d0b50c67ef96d9c72676c0f8fe74695ad78bdddd3f393fcf98df89ff"
 
 
 def _default_cli_bins() -> dict[str, str]:
     """Every engine's binary hint defaults to the bare binary name (PATH)."""
     return {e.binary: e.binary for e in ENGINES.values()}
+
+
+#: The ``[satellite] kind`` word of a compute machine's configuration file.
+COMPUTE_KIND = "compute"
+#: The ``[satellite] files`` word of a compute machine on another host, which
+#: keeps its own copy of the folders.
+OWN_FILES = "own"
+#: The ``[satellite] tools`` word of the install's own compute machine, which
+#: builds and keeps the community tools in a folder of its own.
+OWN_TOOLS = "own"
 
 
 @dataclass
@@ -919,6 +946,24 @@ class SatelliteConfig:
     # DNS / VPN overlays) — without it the daemon refuses that transport
     # (transport/ws_client.assert_transport_secure).
     allow_insecure_transport: bool = False
+    # ``[satellite] kind = compute``: this process runs the platform's own
+    # sessions in the platform's sandbox, reading the platform's agents and
+    # tools folders itself (``sessions/sandbox_host.py``). It takes no files,
+    # no tools, no code and no uninstall from the link, and it writes
+    # nothing into the folders on its own.
+    compute: bool = False
+    # ``[satellite] files = own`` with ``kind = compute``: a compute machine
+    # on another host. Its folders are its own copy, which the platform syncs
+    # as it does a paired machine's: it takes files and tools from the link,
+    # and reports its sessions' changes. Its sessions still run in the
+    # platform's sandbox.
+    own_copy: bool = False
+    # ``[satellite] tools = own`` with ``kind = compute`` and no ``files = own``:
+    # the install's own compute machine keeps the community tools itself. Its
+    # ``mcps/community`` folder is its own (a volume of its own), it takes the
+    # tool frames from the link and builds each tool in its sandbox. The agents
+    # folder and every other tools folder stay the platform's.
+    own_tools: bool = False
 
     def bin_hint(self, binary: str) -> str:
         """The configured hint for ``binary`` (``claude`` / ``codex``), else
@@ -945,6 +990,8 @@ def load_config(path: Path | None = None) -> SatelliteConfig:
     sat = cp["satellite"]
     agents_str = sat.get("agents_dir") or ""
     mcps_str = sat.get("mcps_dir") or ""
+    compute = (sat.get("kind", fallback="") or "").strip().lower() == COMPUTE_KIND
+    own_copy = compute and (sat.get("files", fallback="") or "").strip().lower() == OWN_FILES
     return SatelliteConfig(
         machine_id=sat["machine_id"],
         machine_secret=sat["machine_secret"],
@@ -966,4 +1013,8 @@ def load_config(path: Path | None = None) -> SatelliteConfig:
         allow_insecure_transport=sat.getboolean(
             "allow_insecure_transport", fallback=False,
         ),
+        compute=compute,
+        own_copy=own_copy,
+        own_tools=(compute and not own_copy
+                   and (sat.get("tools", fallback="") or "").strip().lower() == OWN_TOOLS),
     )

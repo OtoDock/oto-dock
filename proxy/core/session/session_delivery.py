@@ -50,6 +50,8 @@ from dataclasses import dataclass
 
 import psycopg
 
+from core import drain, placement
+
 logger = logging.getLogger("otodock.session-delivery")
 
 # Injected delivery callables:
@@ -82,7 +84,7 @@ async def chat_layer(chat: dict):
     None when the row cannot be resolved (a target machine that is gone), so
     the caller takes its fallback instead of failing the delivery."""
     from auth.providers import acting_role_of
-    from core.session.session_manager import get_execution_layer
+    from core.session.session_manager import layer_for_chat
     from storage.pg import run_db
 
     agent = chat.get("agent", "") or ""
@@ -90,11 +92,7 @@ async def chat_layer(chat: dict):
     try:
         def _resolve():
             role = acting_role_of(owner, agent) if owner else "manager"
-            return get_execution_layer(
-                agent, execution_path=chat.get("execution_path", "") or "",
-                user_sub=owner or None, role=role,
-                execution_target=chat.get("execution_target") or "",
-            )
+            return layer_for_chat(agent, chat, user_sub=owner or None, role=role)
         return await run_db(_resolve)
     except (RuntimeError, ValueError, psycopg.Error):
         logger.warning(
@@ -140,7 +138,7 @@ async def deliver_prompt(
     session_id: str = "",
     agent: str = "",
     user_sub: str | None = None,
-    role: str = "manager",
+    role: str,
     notify_payload: dict | None = None,
     pump_event: dict | None = None,
     persist_event: Callable[[str], None] | None = None,
@@ -149,6 +147,7 @@ async def deliver_prompt(
     on_outcome: Callable[[DeliveryOutcome], Awaitable[None] | None] | None = None,
     allow_pty: bool = True,
     allow_ws: bool = True,
+    allow_live_turn: bool = True,
     hops: int = 0,
 ) -> DeliveryOutcome:
     """Deliver ``text`` to the chat's session over the best available path.
@@ -169,6 +168,14 @@ async def deliver_prompt(
     (``interactive_session._redeliver_pending``): a handed-back item must not
     ping-pong onto a successor PTY or into the dead-end WS handler, and
     ``hops`` caps the close→handback→close loop.
+
+    ``role`` has no default: a session a rung starts runs at the role its
+    caller names (``core/session/chat_rebuild.py`` is the caller of every
+    delivery that may start one).
+
+    ``allow_live_turn=False`` never steers into or queues on a turn already
+    streaming on the chat (rungs 3a and 3): a person's message sent with a
+    key is never folded into someone else's turn, and lands on "none".
     """
     from core.session.session_state import (
         _dashboard_notify_queues,
@@ -207,7 +214,7 @@ async def deliver_prompt(
     # Rung 1: a live interactive PTY owns this chat — queue for quiescence
     # injection. Chat-first lookup (newest-alive) is robust to session-id drift
     # across mode toggles / re-warms; the sid lookup covers chat-less callers.
-    if allow_pty:
+    if allow_pty and not drain.holding():
         from core.session import interactive_session
         isess = interactive_session.find_live_for_chat(target_chat_id) if target_chat_id else None
         if isess is None and session_id:
@@ -277,15 +284,19 @@ async def deliver_prompt(
     # failure keeps the old behavior.
     if notify_queue and session_id:
         try:
-            from core.session.session_manager import (
-                get_layer_by_path,
-                resolve_execution_path,
-            )
-            _ws_layer = get_layer_by_path(resolve_execution_path(
-                (chat or {}).get("agent", ""),
-                (chat or {}).get("execution_path", ""),
-            ))
-            if not await _ws_layer.is_session_alive(session_id):
+            # The layer that HOLDS the session answers: a chat on a machine
+            # is the remote layer's, which the engine's own layer never holds.
+            # One a machine holds elsewhere than the chat's place (a move whose
+            # close failed) takes the ladder: the handler runs on the chat's.
+            from core.remote.satellite_connection import get_connection_manager
+            from core.session.session_manager import live_session
+            live = live_session(session_id)
+            # A compute machine serves the platform's place: a session it
+            # holds agrees with the chat's pin ``local``.
+            elsewhere = (live is not None and bool(live.machine_id) and not placement.runs_on(
+                (chat or {}).get("execution_target") or placement.LOCAL, live.machine_id,
+                platform_machine=get_connection_manager().is_compute(live.machine_id)))
+            if live is None or elsewhere or not await live.layer.is_session_alive(session_id):
                 logger.info(
                     "deliver_prompt[%s]: session %s not "
                     "alive — skipping WS route, using the ladder", source, session_id[:8]
@@ -298,11 +309,11 @@ async def deliver_prompt(
                 source, session_id[:8], exc_info=True,
             )
 
-    if allow_ws and notify_queue and notify_payload is not None:
+    if allow_ws and notify_queue and notify_payload is not None and not drain.holding():
         if target_chat_id and pump_event:
             push_pump_event(target_chat_id, pump_event)
         notify_payload["session_id"] = session_id
-        notify_payload["chat_id"] = chat_id or None
+        notify_payload["chat_id"] = target_chat_id or None
         await notify_queue.put(notify_payload)
         logger.info(
             "deliver_prompt[%s]: routed via dashboard WS, session=%s",
@@ -327,7 +338,7 @@ async def deliver_prompt(
     # never owns that session, so it refused every remote steer) — and only
     # a pump whose kind takes a steer is asked (a meeting or phone turn keeps
     # the queue, like the dashboard's own steer branch).
-    if target_chat_id:
+    if target_chat_id and allow_live_turn:
         from core.events.stream_pump import _active_pumps
         from core.session import session_kind as _kind
         _pump = _active_pumps.get(target_chat_id)
@@ -354,7 +365,7 @@ async def deliver_prompt(
     # after the current turn (system=True: no user bubble). Only pumps whose
     # producer drains system_queue accept (pump.system_queue_consumer) — a
     # task/scheduler pump refuses instead of swallowing the prompt forever.
-    if target_chat_id and queue_pump_prompt(target_chat_id, text, system=True):
+    if allow_live_turn and target_chat_id and queue_pump_prompt(target_chat_id, text, system=True):
         if pump_event:
             push_pump_event(target_chat_id, pump_event)
         logger.info(
@@ -432,7 +443,7 @@ async def deliver_prompt(
                     "session/warmup holds chat=%s",
                     source, target_chat_id[:8] if target_chat_id else '-'
                 )
-                if allow_pty and target_chat_id:
+                if allow_pty and target_chat_id and not drain.holding():
                     retry = await _queue_on_pty_after_warmup(
                         target_chat_id, text, source,
                         agent=agent, user_sub=user_sub, role=role, hops=hops,

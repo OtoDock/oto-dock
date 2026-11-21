@@ -9,53 +9,47 @@
 #   bash upgrade.sh --to 1.7.0       # upgrade to one release
 #
 # What it does, in order (each step announces itself):
-#   1. Checks that this folder is a Docker install and that Docker and the
-#      Compose plugin work.
-#   2. Downloads the target release's docker-compose.yml and
-#      docker-compose.phone.yml to a temporary folder and checks them against
-#      this install's own .env. Nothing has changed yet, so a value the new
-#      files refuse (a host name in OTO_AUDIOSOCKET_PUBLIC_HOST, say) stops the
-#      upgrade here with the old stack still running. A phone publish address
-#      the files accept but this host does not hold draws a warning.
-#   3. Dumps the database to backups/upgrade-<time>/ (--no-db-backup skips it)
-#      and copies .env and the compose files next to the dump.
+#   1. Checks that this folder is a Docker install and that Docker and the Compose plugin work.
+#   2. Downloads the target release's docker-compose.yml and docker-compose.phone.yml to a temporary
+#      folder and checks them against this install's own .env. Nothing has changed yet, so a value
+#      the new files refuse (a host name in OTO_AUDIOSOCKET_PUBLIC_HOST, say) stops the upgrade here
+#      with the old stack still running. So does an override that mounts a shared folder or an engine
+#      for otodock-proxy only: chats run in otodock-compute. A phone publish address the files accept
+#      but this host does not hold draws a warning.
+#   3. Dumps the database to backups/upgrade-<time>/ (--no-db-backup skips it) and copies .env and
+#      the compose files next to the dump.
 #   4. Puts the new compose files in place and sets at most three lines in .env:
-#      OTODOCK_VERSION=<target>, COMPOSE_FILE when an override file or the
-#      phone overlay must be listed on it, and COLLABORA_SSL_TERMINATION when
-#      the target's Collabora reads it and it does not match the scheme of
-#      DASHBOARD_PUBLIC_URL (true for https; the script owns that line). No
-#      other line of .env is written; the names of the settings new in the
+#      OTODOCK_VERSION=<target>, COMPOSE_FILE when an override file or the phone overlay must be
+#      listed on it, COLLABORA_SSL_TERMINATION when the target's Collabora reads it and it does not
+#      match DASHBOARD_PUBLIC_URL's scheme (true for https). The names of the settings new in the
 #      release are printed for you to review in config.env.example.
-#   5. Pulls every image. When the target release keeps the recover bin (the
-#      deleted files the dashboard can restore for 7 days) on its own volume
-#      and the running server still holds it inside its container, copies it
-#      into that volume first, so the upgrade does not drop it. Then stops
-#      Collabora, whose open documents save to the server still running, runs
-#      docker compose up -d --remove-orphans and waits for the server to
-#      report healthy: up to OTODOCK_UPGRADE_WAIT_S seconds (300 by default;
-#      a release's first boot builds its tool environments and migrates the
-#      database, minutes on a small host).
+#   5. Pulls every image. When the target release keeps the recover bin (the deleted files the
+#      dashboard can restore for 7 days) on its own volume and the running server still holds it
+#      inside its container, copies it into that volume first, so the upgrade does not drop it. A
+#      server of 2.0.0 or later then waits for the chats and tasks that are running (up to
+#      OTODOCK_DRAIN_BOUND_S seconds, 600 by default) and holds what is new. An older one cannot
+#      wait: the script says so before anything changes. Then stops Collabora, whose open documents
+#      save to the server still running, runs docker compose up -d --remove-orphans and waits for
+#      the server to report healthy: up to OTODOCK_UPGRADE_WAIT_S seconds (300 by default; a
+#      release's first boot migrates the database, minutes on a small host).
 #
-# Two failure regimes. A step that fails BEFORE docker compose up (a download,
-# the file check, the pull) puts .env and the compose files back from the copy:
-# the old stack keeps running its old images and nothing was migrated. So does
-# a docker compose up that fails before anything of the new release ran (the
-# new containers could not be created, say): the old files go back, the old
-# release starts again, and the script says what failed. Once a container of
-# the new release has started, the database may already be migrated forward,
-# and the old compose files do not undo that: the script then leaves the new
-# files in place and prints the recovery (fix the cause and re-run, or go back
-# with the dump and restore.sh).
+# Two failure regimes. A step that fails BEFORE docker compose up (a download, the file check, the
+# pull) puts .env and the compose files back from the copy: the old stack keeps running its old
+# images and nothing was migrated. So does a docker compose up that fails before anything of the new
+# release ran (the new containers could not be created, say): the old files go back, the old release
+# starts again, and the script says what failed. Once a container of the new release has started,
+# the database may already be migrated forward, and the old compose files do not undo that: the
+# script then leaves the new files in place and prints the recovery (fix the cause and re-run, or go
+# back with the dump and restore.sh).
 #
-# OTODOCK_COMPOSE_PROJECT names the compose project, as for backup.sh and
-# restore.sh; unset, it is the one docker compose resolves for this folder
-# (otodock, the name docker-compose.yml gives it).
+# OTODOCK_COMPOSE_PROJECT names the compose project, as for backup.sh and restore.sh. Unset, it is the
+# one docker compose resolves for this folder (otodock by default), and it must hold the database.
 #
 # Testing a release before it is published (maintainers):
 #   bash upgrade.sh --to 1.7.0-rc1 --compose-dir <folder>
-# reads docker-compose.yml, docker-compose.phone.yml and, when present,
-# config.env.example from <folder> instead of the published release, and runs
-# images that are present locally even when the registry does not have them.
+# reads docker-compose.yml, docker-compose.phone.yml and, when present, config.env.example,
+# CHANGELOG.md and scripts/compose_mounts.py from <folder> instead of the published release, and
+# runs images that are present locally even when the registry does not have them.
 set -euo pipefail
 
 # The copies of .env and every dump hold secrets: keep them private.
@@ -64,6 +58,8 @@ umask 077
 REPO="OtoDock/oto-dock"
 RAW="https://raw.githubusercontent.com/${REPO}"
 DOCS="https://docs.otodock.io/administration/upgrading"
+# What the update waits for after the swap, in order (one drain covers both).
+ROLL=(otodock-proxy otodock-compute)
 
 say()  { echo "upgrade.sh: $*"; }
 warn() { echo "upgrade.sh: $*" >&2; }
@@ -191,10 +187,9 @@ api_at_least() { # api_at_least <v> <major> <minor>
         exit !((a[1] + 0 > M) || (a[1] + 0 == M && a[2] + 0 >= m)) }'
 }
 
-# .env rewritten with OTODOCK_VERSION=<version> (every line that sets it,
-# commented out or not, else one appended line) and, when a fourth argument is
-# given, COMPOSE_FILE=<value> (every active line, else one appended line).
-# Every other line is copied as it is.
+# .env rewritten with OTODOCK_VERSION=<version> (every line that sets it, commented out or not, else
+# one appended line) and, when a fourth argument is given, COMPOSE_FILE=<value> (every active line,
+# else one appended line). Every other line is copied as it is.
 rewrite_env() { # rewrite_env <in> <out> <version> [<COMPOSE_FILE value>]
     awk -v ver="$3" -v cf="${4-}" -v setcf="${4+1}" '
         /^[ \t]*#?[ \t]*(export[ \t]+)?OTODOCK_VERSION[ \t]*=/ { print "OTODOCK_VERSION=" ver; v = 1; next }
@@ -203,10 +198,9 @@ rewrite_env() { # rewrite_env <in> <out> <version> [<COMPOSE_FILE value>]
         END { if (!v) print "OTODOCK_VERSION=" ver; if (setcf && !c) print "COMPOSE_FILE=" cf }' "$1" > "$2"
 }
 
-# The platform's own container for a compose service of the project (the
-# compose file names it otodock), found by its compose labels, never by a
-# part of a name: a community MCP container's name is free text. -a includes a
-# stopped one. More than one match is refused, never guessed.
+# The platform's own container for a compose service of the project (the compose file names it
+# otodock), found by its compose labels, never by a part of a name: a community MCP container's name
+# is free text. -a includes a stopped one. More than one match is refused, never guessed.
 platform_container() { # platform_container <compose service> [-a]
     local ids
     ids="$(docker ps ${2:+"$2"} --filter "label=com.docker.compose.project=$PROJECT" \
@@ -218,9 +212,8 @@ platform_container() { # platform_container <compose service> [-a]
     printf '%s' "$ids"
 }
 
-# `docker compose` with a stand-in POSTGRES_PASSWORD when neither .env nor the
-# shell sets one: the compose files refuse to parse without it, and this is a
-# check of the files, not of the password.
+# `docker compose` with a stand-in POSTGRES_PASSWORD when neither .env nor the shell sets one: the
+# compose files refuse to parse without it, and this is a check of the files, not of the password.
 compose_check() {
     if [ -z "${POSTGRES_PASSWORD:-}" ] && [ -z "$(env_value POSTGRES_PASSWORD .env || true)" ]; then
         POSTGRES_PASSWORD=upgrade-check docker compose "$@"
@@ -229,21 +222,27 @@ compose_check() {
     fi
 }
 
-# The compose project: OTODOCK_COMPOSE_PROJECT, else the name docker compose
-# resolves for this folder (the file's, an override's, a COMPOSE_PROJECT_NAME
-# of the shell or .env), else otodock. Exported for the whole run, so every
-# docker compose call and every label lookup name the same project, the new
-# files' included.
+# The compose project: OTODOCK_COMPOSE_PROJECT, else the name compose resolves for this folder (the
+# file's, an override's, COMPOSE_PROJECT_NAME), else, when compose refuses the folder's files, the one
+# project of the containers started from it (as the shell or the disk names it). Never a guess, and
+# never a project with no OtoDock database while another has one: a stack under another name opens
+# the same named volumes beside the one that runs. Exported: every compose call names the same one.
+projects_with() { docker ps -a --filter "label=$1" --format '{{.Label "com.docker.compose.project"}}' | sort -u; }
+_held="$(projects_with com.docker.compose.service=otodock-postgres)"
+_dbs="${_held:+ These projects have an otodock-postgres service: $(paste -sd' ' <<<"$_held").}"
 if [ -n "${OTODOCK_COMPOSE_PROJECT:-}" ]; then
     PROJECT="$OTODOCK_COMPOSE_PROJECT"
 else
     PROJECT="$(compose_check config 2>/dev/null | sed -n "1{/^name:/{s/^name: *//;s/^[\"']//;s/[\"']\$//;p;};}" || true)"
-    PROJECT="${PROJECT:-otodock}"
+    [ -n "$PROJECT" ] || PROJECT="$(for _d in "$PWD" "$(pwd -P)"; do projects_with "com.docker.compose.project.working_dir=$_d"; done | sort -u | sed -n '1{$p;}')"
+    [ -n "$PROJECT" ] || fail "docker compose does not accept this folder's files, and the containers started from
+  this folder name no single project.$_dbs Run again with OTODOCK_COMPOSE_PROJECT=<the project of this install>."
 fi
+[ -z "$_held" ] || grep -qxF -- "$PROJECT" <<<"$_held" || fail "no container of the project $PROJECT is OtoDock's database.$_dbs
+  Run again with OTODOCK_COMPOSE_PROJECT=<the project of this install>. If none is, start this install's stack first."
 export COMPOSE_PROJECT_NAME="$PROJECT"
 
-# Does this host hold the IPv4 address $1? The wildcard and loopback always
-# bind; without a readable `ip` the answer is yes (nothing to warn about).
+# Does this host hold the IPv4 address $1? Wildcard and loopback always bind; no readable `ip`: yes.
 host_holds_ipv4() { # host_holds_ipv4 <address>
     local addrs
     case "$1" in 0.0.0.0|127.*) return 0 ;; esac
@@ -274,12 +273,11 @@ version_lt() { # version_lt <A> <B>
     return 1
 }
 
-# The running server container that still keeps the recover bin in its own
-# writable layer, when the target release mounts a volume there: printed, or
-# nothing when there is nothing to carry. The bin is safe to carry again
-# into a volume that already holds part of it (entry names are unique), so
-# only the server's own mount decides, never whether the volume exists (a
-# run stopped mid-copy, or an up that failed before the server, leaves one).
+# The running server container that still keeps the recover bin in its own writable layer, when the
+# target release mounts a volume there: printed, or nothing when there is nothing to carry. The bin
+# is safe to carry again into a volume that already holds part of it (entry names are unique), so
+# only the server's own mount decides, never whether the volume exists (a run stopped mid-copy, or
+# an up that failed before the server, leaves one).
 bin_to_carry() {
     local vols old mounts
     vols="$(compose_check "${CHECK_ARGS[@]}" config --volumes 2>/dev/null)" || return 0
@@ -290,18 +288,16 @@ bin_to_carry() {
     if printf '%s\n' "$mounts" | grep -qxF "$BIN_DIR"; then
         return 0
     fi
-    # Into a file first: the diff of a server container runs to tens of
-    # thousands of lines, and grep -q leaving the pipe early would fail the
-    # pipeline under pipefail.
+    # Into a file first: the diff of a server container runs to tens of thousands of lines, and grep
+    # -q leaving the pipe early would fail the pipeline under pipefail.
     docker diff "$old" > "$TMP/server.diff" 2>/dev/null || return 0
     grep -qxE "[AC] $BIN_DIR" "$TMP/server.diff" || return 0
     printf '%s' "$old"
 }
 
-# Copy the recover bin out of the old server container into the volume the
-# target release mounts, through the target's own one-shot init service
-# (root, no network), which owns it for the server afterwards. Never fatal:
-# the bin is a safety net, and the database and the agents do not depend on
+# Copy the recover bin out of the old server container into the volume the target release mounts,
+# through the target's own one-shot init service (root, no network), which owns it for the server
+# afterwards. Never fatal: the bin is a safety net, and the database and the agents do not depend on
 # it.
 carry_recover_bin() { # carry_recover_bin <old server container>
     local old="$1" need_k="" bytes free_k root
@@ -328,12 +324,109 @@ carry_recover_bin() { # carry_recover_bin <old server container>
     fi
 }
 
+# --- the wait for open work ---------------------------------------------------
+# A server of 2.0.0 or later waits for its open work, then holds what is new until it stops
+# (admin_cli.py drain); an older one has no such command. The bound: the shell's
+# OTODOCK_DRAIN_BOUND_S, else .env's, else 600 seconds.
+ADMIN_CLI=(/opt/otodock/proxy/venv/bin/python /opt/otodock/proxy/admin_cli.py)
+DRAINED=false
+DRAIN_BOUND="${OTODOCK_DRAIN_BOUND_S:-$(env_value OTODOCK_DRAIN_BOUND_S .env || true)}"
+if [[ "$DRAIN_BOUND" =~ ^[0-9]+$ ]]; then DRAIN_BOUND=$((10#$DRAIN_BOUND)); else DRAIN_BOUND=600; fi
+
+can_drain() { [ -n "$FROM" ] && ! version_lt "${FROM%%-rc*}" 2.0.0; }
+
+span() { # span <seconds>: "10 minutes", "90 seconds"
+    local n="$1" unit=second
+    if [ "$n" -ge 60 ] && [ $((n % 60)) -eq 0 ]; then n=$((n / 60)); unit=minute; fi
+    [ "$n" -eq 1 ] || unit="${unit}s"
+    printf '%s %s' "$n" "$unit"
+}
+
+# Said before anything changes, in the dry run too: at a terminal, ten seconds to stop.
+cannot_wait() {
+    say "This install runs ${FROM:-an older release}, which cannot wait for open work. Chats and tasks that are
+  running when the update starts are cut, and they do not continue by themselves. Run the update when nothing
+  is running. From 2.0 on an update waits for open work. After this update, Claude Code and Codex chats run in
+  a new container, otodock-compute."
+    if ! $DRY_RUN && [ -t 0 ] && [ -t 1 ]; then
+        say "Press Ctrl+C to stop now. The update goes on in 10 seconds."
+        sleep 10
+    fi
+}
+
+# The server waits for the open work of every service of ROLL and holds what is new, its lines
+# printed as this script's own. Never fatal: a server that does not answer is cut.
+drain_before_swap() {
+    local cid line
+    cid="$(platform_container otodock-proxy || true)"
+    if can_drain && [ -n "$cid" ]; then
+        say "waiting for open work, up to $(span "$DRAIN_BOUND"), before the swap"
+        DRAINED=true
+        if ! docker exec "$cid" "${ADMIN_CLI[@]}" drain --bound "$DRAIN_BOUND" 2>&1 \
+                | while IFS= read -r line; do say "$line"; done; then
+            case "${PIPESTATUS[0]}" in
+                3) warn "No server is running, so no work is open. The update goes on." ;;
+                2) warn "The running server is older than 2.0 and cannot wait. Open work is cut by the update." ;;
+                *) warn "The running server did not say it had finished, so the update does not wait. Open work is cut and continues after the update." ;;
+            esac
+        fi
+    fi
+    # Its log leaves with its container: the last lines stay with this run's files.
+    [ -z "$cid" ] || docker logs --tail 1000 "$cid" >"$SNAP/otodock-proxy.log" 2>&1 || true
+}
+
+# Calls the drain off when the old server goes on running. Quiet, never fatal.
+undo_drain() {
+    local cid
+    $DRAINED || return 0
+    cid="$(platform_container otodock-proxy 2>/dev/null || true)"
+    [ -z "$cid" ] || docker exec "$cid" "${ADMIN_CLI[@]}" resume >/dev/null 2>&1 || true
+}
+
+# The rest of ROLL, never fatal: until it signs in, chats, tasks and calls are refused.
+wait_for_compute() {
+    local cid line svc
+    cid="$(platform_container otodock-proxy || true)"
+    for svc in "${ROLL[@]:1}"; do
+        [ -n "$cid" ] && [ -n "$(platform_container "$svc" || true)" ] || continue
+        say "waiting for the compute machine to sign in"
+        docker exec "$cid" "${ADMIN_CLI[@]}" compute --wait "${OTODOCK_UPGRADE_WAIT_S:-300}" 2>&1 \
+            | while IFS= read -r line; do say "$line"; done \
+            || warn "It may still be preparing its tools. To see why, run docker compose logs $svc in $PWD."
+    done
+}
+
+# Chats run in otodock-compute: a shared folder or an engine an override mounts for otodock-proxy
+# only stops the update. A sandbox privilege it hands otodock-proxy is named. The target's compare
+# (compose_mounts.py, downloaded beside the compose files, else <image>'s own copy) reads the files
+# the upgraded stack loads, with <image>'s Python and no network. False: the compare did not run.
+check_shared_folders() { # check_shared_folders <image>
+    local found split extra msg src=(/opt/otodock/scripts/compose_mounts.py)
+    [ -n "$1" ] || return 1
+    [ ! -f "$NEW/compose_mounts.py" ] || src=(-c "$(cat "$NEW/compose_mounts.py")")
+    found="$(compose_check "${CHECK_ARGS[@]}" config --format json 2>/dev/null | docker run --rm -i --network none \
+        --entrypoint /opt/otodock/proxy/venv/bin/python "$1" "${src[@]}" 2>/dev/null)" || return 1
+    extra="$(printf '%s\n' "$found" | sed -n 's/^proxy: //p' | paste -sd, - | sed 's/,/, /g')"
+    [ -z "$extra" ] || warn "Your compose override sets $extra for otodock-proxy. The server needs none of it
+  now: chats run in otodock-compute. You can delete those lines. If you set an AppArmor profile there
+  for the chats, set OTODOCK_APPARMOR_PROFILE in .env instead: otodock-compute reads it."
+    split="$(printf '%s\n' "$found" | sed -n '/^\//p' | paste -sd, - | sed 's/,/, /g')"
+    [ -n "$split" ] || return 0
+    msg="Your compose override mounts $split for otodock-proxy only. Chats run in otodock-compute,
+  which must see the same folders. Add the same mounts under otodock-compute in your override,
+  then run the update again right away:
+      OTODOCK_COMPOSE_PROJECT=$PROJECT bash upgrade.sh --to $TARGET${COMPOSE_DIR:+ --compose-dir $COMPOSE_DIR}"
+    $HAD_COMPUTE || msg="$msg
+  Until then docker compose in this folder refuses the override, because ${FROM:-this release}
+  has no otodock-compute. The running containers are not affected."
+    if $DRY_RUN; then warn "$msg (the real run stops here)"; else fail "$msg"; fi
+}
+
 # --- cleanup and restore on exit ----------------------------------------------
-# STAGE: check (nothing changed yet) -> armed (config copied and verified, a
-# failure puts it back) -> up (docker compose up started: the database may be
-# migrated, so nothing is put back) -> finished. An up that fails before the
-# new server started goes up -> rollback (the old files back, the old release
-# starting) -> rolledback.
+# STAGE: check (nothing changed yet) -> armed (config copied and verified, a failure puts it back)
+# -> up (docker compose up started: the database may be migrated, so nothing is put back) ->
+# finished. An up that fails before the new server started goes up -> rollback (the old files back,
+# the old release starting) -> rolledback.
 STAGE=check
 TMP=""
 SNAP=""
@@ -376,14 +469,12 @@ restore_config() {
 
 # Docker's StartedAt for a container that never started.
 NEVER_STARTED=0001-01-01T00:00:00Z
-# Every container of the project right before docker compose up, one
-# "<id> <StartedAt>" line each.
+# Every container of the project right before docker compose up, one "<id> <StartedAt>" line each.
 BEFORE_UP=""
 # FROM came from the database's own record, newer than .env's release.
 FROM_RAISED=false
 
-# "<id> <StartedAt>" of every container of the project, -a; fails when one
-# cannot be read.
+# "<id> <StartedAt>" of every container of the project, -a; fails when one cannot be read.
 project_starts() {
     local ids id started
     ids="$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{.ID}}')" || return 1
@@ -394,10 +485,9 @@ project_starts() {
     done <<< "$ids"
 }
 
-# After a failed docker compose up: did anything of the project run during
-# it? A container that started anew may have changed the database (the
-# server migrates it, otodock-db-init converges its roles before the server
-# starts). A container that cannot be read counts as one that ran, so
+# After a failed docker compose up: did anything of the project run during it? A container that
+# started anew may have changed the database (the server migrates it, otodock-db-init converges its
+# roles before the server starts). A container that cannot be read counts as one that ran, so
 # nothing is undone on a guess.
 ran_since_up() {
     local now line
@@ -411,10 +501,9 @@ ran_since_up() {
     return 1
 }
 
-# What a failed docker compose up leaves behind: the containers it created
-# that never ran, removed (they hold nothing), and the old ones it renamed
-# <12 hex>_<name> on the way, their names given back when free. The old
-# release's up trips over both otherwise: Compose 2.26 removes the old
+# What a failed docker compose up leaves behind: the containers it created that never ran, removed
+# (they hold nothing), and the old ones it renamed <12 hex>_<name> on the way, their names given
+# back when free. The old release's up trips over both otherwise: Compose 2.26 removes the old
 # container, then stops on the name.
 clear_failed_up() {
     local rows id name state names
@@ -467,8 +556,8 @@ wait_for_server() {
     done
 }
 
-# docker compose up -d, waiting out a server that outlasts Compose's own wait
-# (see the up below): 0 once the server is healthy and every service is up.
+# docker compose up -d, waiting out a server that outlasts Compose's own wait (see the up below):
+# 0 once the server is healthy and every service is up.
 start_and_wait() { # start_and_wait [<run after a failed up>]
     local again=false proxy status
     if ! docker compose up -d --remove-orphans; then
@@ -507,15 +596,18 @@ roll_back() {
   putting ${FROM:-the old release} back"
     restore_config || exit 1
     clear_failed_up || { warn "could not clear what the failed start left (docker ps -a shows it)."; exit 1; }
+    compose_check config -q >/dev/null 2>&1 || exit 1 # an up of files compose refuses starts nothing: on_exit says why
     say "starting ${FROM:-the old release} again (docker compose up -d --remove-orphans)"
     start_and_wait || exit 1
     STAGE=rolledback
+    undo_drain
     warn "this install is back on ${FROM:-the old release}, with the files from $SNAP in place.
   Nothing was migrated. Fix the cause (the error above), then re-run
       bash upgrade.sh --to $TARGET"
     exit 1
 }
 
+refused() { compose_check config -q >/dev/null 2>&1 || printf "\n  docker compose refuses this folder's files now. If your override names otodock-compute, %s: %s has no such service." "$1" "${FROM:-the old release}"; }
 on_exit() {
     local rc=$? f
     set +e
@@ -526,14 +618,16 @@ on_exit() {
     case "$STAGE" in
         check)
             [ -n "$SNAP" ] && rmdir "$SNAP" 2>/dev/null
-            warn "stopped before changing anything: the running stack was not touched." ;;
+            warn "stopped before changing anything: the running stack was not touched.$(refused "run the update again, or take that part out to use docker compose until you do")" ;;
         armed)
+            undo_drain
             if restore_config; then
                 warn "stopped before docker compose up: .env and the compose files are back as
   they were (copies in $SNAP). The running stack was not touched and nothing
-  was migrated."
+  was migrated.$(refused "run the update again, or take that part out to use docker compose until you do")"
             fi ;;
         up)
+            undo_drain
             warn "the upgrade failed after docker compose up started (the error is above).
   The $TARGET files stay in place: the database may already be migrated to
   $TARGET, and the ${FROM:-old} compose files do not undo a migration.
@@ -554,7 +648,11 @@ on_exit() {
   from $SNAP back where they differ, remove the containers that
       docker ps -a --filter label=com.docker.compose.project=$PROJECT
   shows as Created, give any <12 hex>_<name> one its name back (docker rename),
-  then run docker compose up -d." ;;
+  then run docker compose up -d.$(refused "take that part out first")"
+            if $DRAINED; then
+                warn "An old server still running holds new work. It takes new work again by itself
+  within 15 minutes, or at once with: bash otodock-admin.sh resume"
+            fi ;;
     esac
     exit "$rc"
 }
@@ -569,6 +667,7 @@ if [ -z "$FROM" ]; then
 fi
 [[ "$FROM" =~ $VERSION_RE ]] || FROM=""
 FROM="${FROM#v}"
+HAD_COMPUTE=false; ! grep -q '^  otodock-compute:' docker-compose.yml || HAD_COMPUTE=true
 
 if [ -z "$TO" ]; then
     say "looking up the latest release"
@@ -584,11 +683,10 @@ if [ -n "$FROM" ] && version_lt "$TARGET" "$FROM"; then
   migrations only run forward. To go back, restore a backup taken on $TARGET."
 fi
 
-# The database records the release that last migrated it (schema_meta, since
-# 1.8.0): a row newer than the target is a downgrade whatever .env says, and
-# one newer than .env's version (a hand-edited .env, a restore) is the real
-# starting point for the notes. Read-only; absent on a 1.7.1 database or a
-# stopped stack.
+# The database records the release that last migrated it (schema_meta, since 1.8.0): a row newer
+# than the target is a downgrade whatever .env says, and one newer than .env's version (a
+# hand-edited .env, a restore) is the real starting point for the notes. Read-only; absent on a
+# 1.7.1 database or a stopped stack.
 DB_VERSION=""
 _pg="$(platform_container otodock-postgres || true)"
 if [ -n "$_pg" ]; then
@@ -608,6 +706,12 @@ if [ -n "$DB_VERSION" ]; then
         FROM="$DB_VERSION"
         FROM_RAISED=true
     fi
+fi
+# 2.0 and later update from 1.9.1 only: that is the one path a release is tested on. The step
+# to 1.9.1 itself stays open from any release, an unknown release goes on, and a candidate
+# counts as its release.
+if [ -n "$FROM" ] && ! version_lt "${TARGET%%-*}" 2.0.0 && version_lt "${FROM%%-*}" 1.9.1; then
+    fail "This install runs $FROM. Update it to 1.9.1 first with bash upgrade.sh --to 1.9.1, then run this again."
 fi
 if [ "$FROM" = "$TARGET" ]; then
     say "this install is set to $TARGET already: its compose files and .env lines
@@ -629,7 +733,7 @@ fetch() { # fetch <url> <dest>
 if [ -n "$COMPOSE_DIR" ]; then
     say "reading the $TARGET compose files from $COMPOSE_DIR (release candidate)"
     cp "$COMPOSE_DIR/docker-compose.yml" "$COMPOSE_DIR/docker-compose.phone.yml" "$NEW/"
-    for f in config.env.example CHANGELOG.md; do
+    for f in config.env.example CHANGELOG.md scripts/compose_mounts.py; do
         [ -f "$COMPOSE_DIR/$f" ] && cp "$COMPOSE_DIR/$f" "$NEW/"
     done
 else
@@ -640,14 +744,14 @@ else
     done
     fetch "$RAW/v$TARGET/config.env.example" "$NEW/config.env.example" 2>/dev/null || true
     fetch "$RAW/v$TARGET/CHANGELOG.md" "$NEW/CHANGELOG.md" 2>/dev/null || true
+    fetch "$RAW/v$TARGET/scripts/compose_mounts.py" "$NEW/compose_mounts.py" 2>/dev/null || true
 fi
 
-# The Upgrade notes of every release this upgrade crosses (FROM < X <= BOUND;
-# the bound's alone when FROM is unknown), from the target's CHANGELOG.md:
-# the entries under a "### Upgrade notes" heading and those whose bold lead
-# is "Upgrade note:". Printed before anything changes, in the dry run and
-# the real run. A release candidate is built from its release's commit, so
-# its changelog's section is the release's: the bound of X.Y.Z-rcN is X.Y.Z.
+# The Upgrade notes of every release this upgrade crosses (FROM < X <= BOUND; the bound's alone when
+# FROM is unknown), from the target's CHANGELOG.md: the entries under a "### Upgrade notes" heading
+# and those whose bold lead is "Upgrade note:". Printed before anything changes, in the dry run and
+# the real run. A release candidate is built from its release's commit, so its changelog's section
+# is the release's: the bound of X.Y.Z-rcN is X.Y.Z.
 NOTES_BOUND="${TARGET%%-rc*}"
 print_notes() {
     local notes
@@ -698,11 +802,10 @@ print_notes() {
 }
 
 # --- which compose files the upgraded stack loads -----------------------------
-# Compose loads docker-compose.override.yml by itself only while COMPOSE_FILE
-# is unset, so a set line lists it too. The list is built base first:
-# docker-compose.yml, then the phone overlay when it is in use, then the
-# override. Files are added by exact token (a leading ./ ignored), so a re-run
-# adds nothing twice; the order of the tokens already there is kept.
+# Compose loads docker-compose.override.yml by itself only while COMPOSE_FILE is unset, so a set
+# line lists it too. The list is built base first: docker-compose.yml, then the phone overlay when
+# it is in use, then the override. Files are added by exact token (a leading ./ ignored), so a
+# re-run adds nothing twice; the order of the tokens already there is kept.
 has_token() { # has_token <file> <token>...
     local want="${1#./}" t
     shift
@@ -772,11 +875,10 @@ if ! compose_check "${CHECK_ARGS[@]}" config -q; then
   'additional property subpath' message): OtoDock needs Docker Compose 2.26 or
   later. Update Docker, then re-run."
 fi
-# Collabora's proof key is mounted as one file of a volume (a subpath): Docker
-# Engine 26 (API 1.45) and Docker Compose 2.26 or later. An older engine, or a
-# Compose that parses the field but does not pass it on (2.25, moby#47687),
-# mounts the whole volume and Collabora runs without its key, every document
-# refused.
+# Collabora's proof key is mounted as one file of a volume (a subpath): Docker Engine 26 (API 1.45)
+# and Docker Compose 2.26 or later. An older engine, or a Compose that parses the field but does not
+# pass it on (2.25, moby#47687), mounts the whole volume and Collabora runs without its key, every
+# document refused.
 if grep -q 'subpath:' "$NEW/docker-compose.yml"; then
     _api="$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || true)"
     _cv="$(docker compose version --short 2>/dev/null || true)"
@@ -793,10 +895,9 @@ if grep -q 'subpath:' "$NEW/docker-compose.yml"; then
         if $DRY_RUN; then warn "$_msg (the real run stops here)"; else fail "$_msg"; fi
     fi
 fi
-# Collabora's ssl.termination: the target's compose file reads it from
-# COLLABORA_SSL_TERMINATION (Collabora 26.04 has no shell to derive it from
-# DASHBOARD_PUBLIC_URL at start, as the entrypoint before it did): true for an
-# https URL, else false, the file's default. This script owns the line.
+# Collabora's ssl.termination: the target's compose file reads it from COLLABORA_SSL_TERMINATION
+# (Collabora 26.04 has no shell to derive it from DASHBOARD_PUBLIC_URL at start, as the entrypoint
+# before it did): true for an https URL, else false, the file's default. This script owns the line.
 SSL_TERM=""
 if grep -q 'COLLABORA_SSL_TERMINATION' "$NEW/docker-compose.yml"; then
     case "$(env_value DASHBOARD_PUBLIC_URL .env 2>/dev/null || true)" in
@@ -813,10 +914,9 @@ if ! $PHONE; then
   before you turn it on, set OTO_PHONE_BIND=<this host's LAN IP> in .env."
     fi
 fi
-# The phone ports publish on OTO_PHONE_BIND, else on OTO_AUDIOSOCKET_PUBLIC_HOST.
-# A literal address there passes the file check even when this host does not
-# hold it, and the phone container then fails to start after the swap. A host
-# name is the file check's to refuse, never judged here.
+# The phone ports publish on OTO_PHONE_BIND, else on OTO_AUDIOSOCKET_PUBLIC_HOST. A literal address
+# there passes the file check even when this host does not hold it, and the phone container then
+# fails to start after the swap. A host name is the file check's to refuse, never judged here.
 if $PHONE && [ -z "$(env_value OTO_PHONE_BIND .env || true)" ]; then
     _pub="$(env_value OTO_AUDIOSOCKET_PUBLIC_HOST .env || true)"
     if [[ "$_pub" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && ! host_holds_ipv4 "$_pub"; then
@@ -826,17 +926,14 @@ if $PHONE && [ -z "$(env_value OTO_PHONE_BIND .env || true)" ]; then
     fi
 fi
 
-# Since 1.8.0 every yes/no key takes 1/true/yes/on and 0/false/no/off, and
-# another word stops the server at start, where older releases read it as
-# off. Two lists before anything changes, when the target is 1.8.0 or later:
-# the values the new server refuses (the dry run warns, the real run stops,
-# since the upgraded proxy would exit in a loop), and the values that flip
-# from off to on at this upgrade: the keys releases before 1.8.0 read as on
-# for the word "true" alone (TRUE_ONLY_KEYS: 1, yes and on were off there;
-# MCP_AUTO_INSTALL_SYSTEM_DEPS took 1 and yes, not on), so an operator who
-# wrote OTODOCK_CLOUD=1 for "off" learns it before the server reads it as on.
-# tests/config/test_config_keys.py keeps YESNO_KEYS equal to config.py's
-# _cfg_bool keys.
+# Since 1.8.0 every yes/no key takes 1/true/yes/on and 0/false/no/off, and another word stops the
+# server at start, where older releases read it as off. Two lists before anything changes, when the
+# target is 1.8.0 or later: the values the new server refuses (the dry run warns, the real run
+# stops, since the upgraded proxy would exit in a loop), and the values that flip from off to on at
+# this upgrade: the keys releases before 1.8.0 read as on for the word "true" alone (TRUE_ONLY_KEYS:
+# 1, yes and on were off there; MCP_AUTO_INSTALL_SYSTEM_DEPS took 1 and yes, not on), so an operator
+# who wrote OTODOCK_CLOUD=1 for "off" learns it before the server reads it as on.
+# tests/config/test_config_keys.py keeps YESNO_KEYS equal to config.py's _cfg_bool keys.
 YESNO_KEYS="OIDC_ENABLED OTODOCK_AIR_GAPPED OTODOCK_CLOUD DASHBOARD_ENABLED AUTH_PROVIDER_BYPASS
   OIDC_CONFIRM_FRESH_LOGIN OIDC_CONFIRM_REQUIRE_AUTH_TIME MCP_AUTO_INSTALL_SYSTEM_DEPS
   OTODOCK_MCP_BUILD_LOCAL OTODOCK_RELEASE_CHECK OTODOCK_ALLOW_NEWER_DATABASE COOKIE_SECURE
@@ -880,6 +977,12 @@ if [ -n "$_bad_yesno" ]; then
     if $DRY_RUN; then warn "$_msg (the real run stops here)"; else fail "$_msg"; fi
 fi
 
+# The folders, before anything changes: with the image of this install's server, running or
+# stopped. With no server container to read them with, after the pull, with the new image.
+SHARED_CHECKED=false
+_cid="$(platform_container otodock-proxy -a || true)"
+[ -z "$_cid" ] || ! check_shared_folders "$(docker inspect -f '{{.Image}}' "$_cid" 2>/dev/null || true)" || SHARED_CHECKED=true
+
 # Settings the target release documents that the old one did not and that
 # .env does not carry in any form. Only the names are printed; nothing is written.
 NEW_KEYS=""
@@ -913,6 +1016,7 @@ while [ -e "$SNAP" ]; do
 done
 
 print_notes
+can_drain || cannot_wait
 
 if $DRY_RUN; then
     say "dry run: nothing is changed. The upgrade would:"
@@ -938,9 +1042,13 @@ if $DRY_RUN; then
         echo "  - set COLLABORA_SSL_TERMINATION=$SSL_TERM in .env (the scheme of DASHBOARD_PUBLIC_URL)"
     fi
     echo "  - run docker compose pull"
+    $SHARED_CHECKED || [ ! -f "$NEW/compose_mounts.py" ] || echo "  - compare the folders of otodock-proxy and otodock-compute (after the pull: no server container to read them with now)"
     _old="$(bin_to_carry)"
     if [ -n "$_old" ]; then
         echo "  - copy the recover bin out of $_old into the $BIN_VOLUME volume"
+    fi
+    if can_drain && [ -n "$(platform_container otodock-proxy || true)" ]; then
+        echo "  - wait for open work, up to $(span "$DRAIN_BOUND"), before the swap"
     fi
     if [ -n "$(platform_container collabora || true)" ]; then
         echo "  - stop Collabora (its open documents save to the running server)"
@@ -955,9 +1063,11 @@ mkdir -p "$BACKUP_ROOT"
 mkdir "$SNAP"
 if $DB_BACKUP; then
     PG="$(platform_container otodock-postgres)" || exit 1
-    [ -n "$PG" ] || fail "no running otodock-postgres container found: start the stack
-  (docker compose up -d) and re-run, or pass --no-db-backup when you have a
-  fresh backup of your own."
+    # A stopped one starts by its id, also while compose refuses the folder's files.
+    _off="$(platform_container otodock-postgres -a || true)"
+    _start="stack (docker compose up -d)"; [ -z "$_off" ] || _start="database (docker start $_off)"
+    [ -n "$PG" ] || fail "no running otodock-postgres container found: start the $_start and re-run,
+  or pass --no-db-backup when you have a fresh backup of your own."
     DUMP="$SNAP/otodock-otodock-$TS.sql.gz"
     say "backing up the database to $DUMP"
     docker exec "$PG" pg_dump -U otodock --clean --if-exists otodock | gzip > "$DUMP.part"
@@ -973,10 +1083,9 @@ for f in "${CONFIG_FILES[@]}"; do
         cmp -s "$f" "$SNAP/$f" || fail "the copy of $f in $SNAP does not match it."
     fi
 done
-# The snapshot is a restore.sh run directory (the database and the env and
-# compose copies, never the trees: trees=none): its manifest carries the
-# release and the credential key fingerprints, so a rollback through
-# restore.sh gets the same checks.
+# The snapshot is a restore.sh run directory (the database and the env and compose copies, never the
+# trees: trees=none): its manifest carries the release and the credential key fingerprints, so a
+# rollback through restore.sh gets the same checks.
 if [ -n "$DUMP" ]; then
     _keys="$(docker exec "$PG" psql -U otodock -d otodock -tAc \
         "SELECT value FROM platform_settings WHERE key = 'credential_key_fingerprints'" 2>/dev/null | head -n1 || true)"
@@ -1041,31 +1150,36 @@ else
     docker compose pull
 fi
 
+$SHARED_CHECKED || check_shared_folders "$(compose_check config --images | grep -m1 'otodock-proxy:' || true)" || [ ! -f "$NEW/compose_mounts.py" ] \
+    || warn "the folders of your override could not be compared with otodock-compute's: compare them yourself."
 _old="$(bin_to_carry)"
 if [ -n "$_old" ]; then
     carry_recover_bin "$_old"
 fi
 
+drain_before_swap
+
 STAGE=up
-# Collabora saves its open documents as it stops: stopped here, those saves
-# reach the server still running, before a new one that may refuse an older
-# Collabora's unsigned calls starts.
+# Collabora saves its open documents as it stops: stopped here, those saves reach the server still
+# running, before a new one that may refuse an older Collabora's unsigned calls starts.
 if [ -n "$(platform_container collabora || true)" ]; then
     say "stopping Collabora first (its open documents save to the running server)"
     docker compose stop -t 30 collabora || warn "could not stop Collabora first: docker compose up replaces it"
 fi
 say "starting $TARGET (docker compose up -d --remove-orphans)"
-# Compose starts the services that depend on otodock-proxy only once it is
-# healthy, and stops waiting the moment Docker calls the container unhealthy.
-# A first boot can outlast that on a slow host while the proxy is still
-# starting, so only a proxy that is not running is a failure there: a running
-# one is waited for, and up runs once more after it for the services that
-# were waiting (start_and_wait). An up that fails before anything of the
-# new release ran is undone first (roll_back).
+# Compose starts the services that depend on otodock-proxy only once it is healthy and stops waiting
+# once Docker calls it unhealthy, which a slow first boot can outlast: a running proxy is waited
+# for, and up runs once more after it (start_and_wait). An up that fails before anything of the new
+# release ran is undone first (roll_back).
 BEFORE_UP="$(project_starts)" || BEFORE_UP="unreadable"
 WAIT_HINT="A large database can take longer to migrate: "
 start_and_wait roll_back_unless_ran || exit 1
 STAGE=finished
+# An up that recreated nothing (a run on the same version, its advice after a
+# failure) leaves the server that drained: it takes new work again (a new one
+# holds nothing). The update has finished before the compute machine's wait.
+undo_drain
+wait_for_compute
 
 echo
 say "done: this install runs $TARGET (was ${FROM:-unknown})."

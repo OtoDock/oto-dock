@@ -49,7 +49,7 @@ function AdvancedSection() {
   // toast and the field returns to the stored value.
   const numField = (domain: 'audio' | 'phone', key: string, label: string, info?: string, hint?: string) => (
     <SettingRow key={key} label={label} description={hint} info={info} htmlFor={`adv-${key}`} save={stateOf(key)}>
-      <Input id={`adv-${key}`} type="number" step="any" defaultValue={valueOf(domain, key)}
+      <Input id={`adv-${key}`} key={`${key}-${valueOf(domain, key)}`} type="number" step="any" defaultValue={valueOf(domain, key)}
         onBlur={e => {
           const input = e.target
           if (input.value === valueOf(domain, key)) return

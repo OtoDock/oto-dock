@@ -58,7 +58,9 @@ dashboard. You never install anything yourself.
   (`${platform.api_key}`, `${proxy_api_key}`): it is refused.
 - Secrets live in `credentials` (per user or shared) or `instances` (admin
   managed); the platform stores them encrypted and delivers them per
-  session. See `references/package-rules.md`.
+  session. See `references/package-rules.md`. A secret the tool sends in a
+  header toward fixed hosts can stay out of the session: declare it in
+  `credentials.exit` (`references/manifest.md`, "Credentials in short").
 
 ## Writing the server side
 
@@ -72,6 +74,9 @@ dashboard. You never install anything yourself.
   uses `url_template: "http://${docker_mcp_host}:${port}"`; ship a prebuilt
   `server.image` so the containerised deployment can pull it.
 - A tool that bills an upstream API declares its prices in `costs`.
+- A package that drives a program on the person's own computer, as the
+  Blender entry does, is an app connector. Read "App connectors" in
+  `references/manifest.md`.
 
 ## Updating a shipped package
 

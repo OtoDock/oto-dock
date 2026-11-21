@@ -1,35 +1,20 @@
-"""Session management endpoints -- models, helpers, health, plan files,
-and session control (mode/model/thinking/permission).
+"""Session management endpoints -- models, helpers, health, and a Direct
+LLM session's abort and close.
 
 Also exports `verify_api_key_async` and `verify_session_match_async` for use by the
 `api.hooks` pieces.
 """
 
-import asyncio
 import hmac
 import logging
-import os
-import stat
-from datetime import datetime
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel
 
 import config
 from auth.providers import UserContext, get_current_user, require_admin
-from core.execution_layer import PERMISSION_MODES, cli_mode, current_mode
-from core.layers.cli import (
-    abort_session,
-    close_persistent_session,
-    get_persistent_session,
-    interrupt_persistent_session,
-)
 from core.layers.direct import close_direct_session
 from core.session.session_state import get_pending_result
-from services.infra.path_confinement import PathOutsideRoot, resolve_under
 from storage.agents import agent_store
-from storage.pg import run_db
 
 logger = logging.getLogger("otodock")
 router = APIRouter()
@@ -44,10 +29,12 @@ router = APIRouter()
 from auth import token_holder
 
 
-def _bearer_payload(authorization: str | None) -> dict | None:
+def _bearer_payload(authorization: str | None, *, accept_callback: bool = False) -> dict | None:
     """The session token's payload, or None for the master key
     (service-to-service: Docker MCPs, the standalone scheduler, phone).
-    401 for anything else."""
+    401 for anything else. ``accept_callback``: a Docker tool's callback
+    token too (the five file callbacks, which the tool calls with the token
+    its session's config handed it)."""
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
     parts = authorization.split(" ", 1)
@@ -56,8 +43,10 @@ def _bearer_payload(authorization: str | None) -> dict | None:
     token = parts[1]
     if config.is_master_key(token):
         return None
-    from auth.session_token import validate_session_token
+    from auth.session_token import validate_callback_token, validate_session_token
     payload = validate_session_token(token)
+    if not payload and accept_callback:
+        payload = validate_callback_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return payload
@@ -71,13 +60,14 @@ async def verify_api_key_async(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def _session_payload(authorization: str | None, session_id: str) -> dict | None:
+def _session_payload(authorization: str | None, session_id: str, *,
+                     accept_callback: bool = False) -> dict | None:
     """The token's payload once its ``sid`` matches the caller-supplied
     session id, or None for the master key. An empty caller-supplied
     session id is refused (400), and so is a token with no ``sid`` (403):
     a token bound to session A must never pass against a blank or another
     session id. Every mint site sets a real sid."""
-    payload = _bearer_payload(authorization)
+    payload = _bearer_payload(authorization, accept_callback=accept_callback)
     if payload is None:
         return None
     if not session_id:
@@ -95,14 +85,16 @@ def _session_payload(authorization: str | None, session_id: str) -> dict | None:
     return payload
 
 
-async def verify_session_match_async(authorization: str | None, session_id: str) -> None:
+async def verify_session_match_async(authorization: str | None, session_id: str, *,
+                                     accept_callback: bool = False) -> None:
     """Validate the token, cross-check its embedded session_id against the
     caller-supplied one (a hook endpoint's body carries a session_id: an
     MCP or a satellite holding a token for session A must not request
     resources for session B) and judge its holder. The master API key
     bypasses the check (service-to-service: Docker MCPs on the platform,
-    the phone server, the standalone scheduler)."""
-    payload = _session_payload(authorization, session_id)
+    the phone server, the standalone scheduler). ``accept_callback``: the
+    five file callbacks take a Docker tool's callback token as well."""
+    payload = _session_payload(authorization, session_id, accept_callback=accept_callback)
     if payload is not None and not await token_holder.holder_ok(payload):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -112,17 +104,35 @@ async def verify_session_match_async(authorization: str | None, session_id: str)
 
 @router.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    # The public liveness: the Docker healthcheck reads the status code, the
-    # dashboard's stale-bundle check reads ``build`` (a page without a
-    # dashboard socket asks here when it returns to the foreground and
-    # reloads once if its own stamp differs; read per request, cached on the
-    # file's mtime/size, so a dashboard-only rebuild is seen without a
-    # restart). HEAD, for uptime probes, gets the GET's status and headers
-    # with no body (the server drops it). Nothing else: versions, pins and
-    # the loop's telemetry are an admin's to read (``/v1/admin/health``), not
-    # an anonymous caller's.
+    # The public liveness, 200 while the server answers: the Docker
+    # healthcheck reads the status code, the dashboard's stale-bundle check
+    # reads ``build`` (a page without a dashboard socket asks here when it
+    # returns to the foreground and reloads once if its own stamp differs;
+    # read per request, cached on the file's mtime/size, so a dashboard-only
+    # rebuild is seen without a restart). ``state``, ``ready`` and one word
+    # per part come from memory (``services/infra/health_parts.py``): this
+    # route never waits on the database. HEAD, for uptime probes, gets the
+    # GET's status and headers with no body (the server drops it). Nothing
+    # else: versions, pins, counts and the loop's telemetry are an admin's to
+    # read (``/v1/admin/health``), not an anonymous caller's.
+    from services.infra import health_parts
     from static_assets import dashboard_build_id
-    return {"status": "ok", "service": "otodock", "build": dashboard_build_id()}
+    return health_parts.answer(dashboard_build_id())
+
+
+@router.api_route("/health/ready", methods=["GET", "HEAD"])
+async def health_ready():
+    """The readiness probe: the same body, 200 while the server takes new
+    work (the database answers, a compute machine is signed in and nothing
+    holds), else 503. For a caller
+    that waits before it sends work; Docker's healthcheck reads ``/health``,
+    since a drained server is alive and not ready."""
+    from fastapi.responses import JSONResponse
+
+    from services.infra import health_parts
+    from static_assets import dashboard_build_id
+    body = health_parts.answer(dashboard_build_id())
+    return JSONResponse(body, status_code=200 if body["ready"] else 503)
 
 
 @router.get("/v1/admin/health")
@@ -130,8 +140,9 @@ async def admin_health(user: UserContext | None = Depends(get_current_user)):
     """The version payload (the admin footer, the fleet and version checks)
     and the loop's telemetry, for a platform admin."""
     require_admin(user)
-    from core import log_queue, loop_watchdog
+    from core import drain, log_queue, loop_watchdog
     from core.session.session_manager import get_all_layers
+    from services.infra import health_parts
     from storage import pg
     from ws.satellite import MIN_SATELLITE_VERSION
     return {
@@ -157,6 +168,11 @@ async def admin_health(user: UserContext | None = Depends(get_current_user)):
         "log": log_queue.stats(),
         "db": pg.pool_stats(),
         "fds": loop_watchdog.fd_stats(),
+        # The planned stop's state and what is working right now (the admin
+        # command's ``status`` reads the same block).
+        "work": drain.work(),
+        # The public health's parts and what stands behind them.
+        "parts": health_parts.detail(),
     }
 
 
@@ -194,311 +210,20 @@ async def get_session_pending(session_id: str, authorization: str | None = Heade
 
 @router.post("/v1/sessions/{session_id}/abort")
 async def abort_session_endpoint(session_id: str, authorization: str | None = Header(None)):
-    """Kill the current turn for a session (e.g. user pressed stop).
-
-    Kills the process but keeps the session entry so auto-resume works on
-    the next message. Falls back to killing direct/one-shot sessions.
-    """
+    """Stop a Direct LLM session the platform holds (its session is closed).
+    A session a machine runs is not found here: its Stop goes through its
+    chat."""
     await verify_session_match_async(authorization, session_id)
-    # Try interrupt (kill process, keep session) for persistent sessions
-    killed = await interrupt_persistent_session(session_id)
-    if not killed:
-        # Fall back: try direct session (close it), then one-shot (kill it)
-        killed = await close_direct_session(session_id)
-    if not killed:
-        killed = await abort_session(session_id)
+    killed = await close_direct_session(session_id)
     logger.info("Abort request: session=%s, killed=%s", session_id, killed)
     return {"status": "aborted" if killed else "not_found", "session_id": session_id}
 
 
 @router.delete("/v1/sessions/{session_id}")
 async def close_session_endpoint(session_id: str, authorization: str | None = Header(None)):
-    """Gracefully close a persistent session (e.g. phone hangup, chat closed)."""
+    """Close a Direct LLM session the platform holds. A session a machine
+    runs is not found here: its chat's close ends it."""
     await verify_session_match_async(authorization, session_id)
-    # Try direct session first, then CLI persistent session
     closed = await close_direct_session(session_id)
-    if not closed:
-        closed = await close_persistent_session(session_id)
     logger.info("Close session request: session=%s, closed=%s", session_id, closed)
     return {"status": "closed" if closed else "not_found", "session_id": session_id}
-
-
-# --- Session control endpoints (mode/model/thinking/permission) ---
-
-
-class ModeChangeRequest(BaseModel):
-    mode: str  # a PERMISSION_MODES word (a word from before 1.9 is mapped)
-
-
-@router.patch("/v1/sessions/{session_id}/mode")
-async def change_session_mode(
-    session_id: str, req: ModeChangeRequest, authorization: str | None = Header(None),
-):
-    """Change permission mode mid-session via the CLI control channel.
-
-    Only works for sessions started with use_native_permissions=True. The
-    mode is one of ``PERMISSION_MODES`` (``default`` and ``acceptEdits``,
-    the words before 1.9, are taken as Ask and Auto); the CLI is sent its
-    own word for it (``cli_mode``).
-    """
-    await verify_session_match_async(authorization, session_id)
-    mode = current_mode(req.mode)
-    if mode not in PERMISSION_MODES:
-        raise HTTPException(status_code=400, detail=f"Unknown mode {req.mode!r}")
-    session = await get_persistent_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if not session.use_native_permissions:
-        raise HTTPException(
-            status_code=400,
-            detail="Session doesn't use native permissions -- mode changes not supported",
-        )
-    async with session.lock:
-        result = await session.send_control_request("set_permission_mode", mode=cli_mode(mode))
-    if result.get("subtype") == "error":
-        raise HTTPException(status_code=400, detail=result.get("error", "Mode change failed"))
-    session.permission_mode = mode
-    logger.info("Session %s mode changed to %s", session_id, mode)
-    return {"status": "ok", "mode": mode}
-
-
-class ModelChangeRequest(BaseModel):
-    model: str  # e.g., "claude-sonnet-5-5", "claude-opus-5-5"
-
-
-@router.patch("/v1/sessions/{session_id}/model")
-async def change_session_model(
-    session_id: str, req: ModelChangeRequest, authorization: str | None = Header(None),
-):
-    """Change the LLM model mid-session via the CLI control channel."""
-    await verify_session_match_async(authorization, session_id)
-    session = await get_persistent_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    async with session.lock:
-        result = await session.send_control_request("set_model", model=req.model)
-    if result.get("subtype") == "error":
-        raise HTTPException(status_code=400, detail=result.get("error", "Model change failed"))
-    logger.info("Session %s model changed to %s", session_id, req.model)
-    return {"status": "ok", "model": req.model}
-
-
-class ThinkingRequest(BaseModel):
-    max_tokens: int | None = None  # null to disable extended thinking
-
-
-@router.patch("/v1/sessions/{session_id}/thinking")
-async def change_session_thinking(
-    session_id: str, req: ThinkingRequest, authorization: str | None = Header(None),
-):
-    """Set max thinking tokens mid-session via the CLI control channel."""
-    await verify_session_match_async(authorization, session_id)
-    session = await get_persistent_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    async with session.lock:
-        result = await session.send_control_request(
-            "set_max_thinking_tokens", max_thinking_tokens=req.max_tokens,
-        )
-    if result.get("subtype") == "error":
-        raise HTTPException(status_code=400, detail=result.get("error", "Thinking change failed"))
-    logger.info("Session %s thinking tokens set to %s", session_id, req.max_tokens)
-    return {"status": "ok", "max_tokens": req.max_tokens}
-
-
-class NativePermissionResponse(BaseModel):
-    request_id: str
-    approved: bool = True
-
-
-@router.post("/v1/sessions/{session_id}/native-permission")
-async def native_permission_response(
-    session_id: str,
-    req: NativePermissionResponse,
-    authorization: str | None = Header(None),
-):
-    """Answer a native CLI permission prompt (can_use_tool) from the dashboard.
-
-    The session's send_message() yields permission_prompt events when the CLI
-    requests tool approval. The dashboard renders an approval dialog and calls
-    this endpoint with the user's decision. The response is written directly
-    to stdin -- no lock needed since stdin writes are independent of stdout reads.
-    """
-    await verify_session_match_async(authorization, session_id)
-    session = await get_persistent_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    await session.send_control_response(req.request_id, req.approved)
-    return {"status": "ok"}
-
-
-# --- Plan file endpoints ---
-
-# A plan is a markdown document: a larger file in a plans folder is refused
-# (413) instead of read whole into the answer.
-PLAN_MAX_BYTES = 1024 * 1024
-
-
-class _PlanTooLarge(Exception):
-    pass
-
-
-def _get_plans_dir(session_id: str | None) -> Path | None:
-    """The plans folder of a local session: its persistent .claude/ dir's
-    ``plans`` (sandbox-aware), or a local Codex session's .codex/ dir's,
-    made yet or not; None for no session or a session with neither. No
-    filesystem call: the routes look in a worker thread. The proxy
-    account's own home belongs to no session and is never answered."""
-    if not session_id:
-        return None
-    from core.session.session_state import get_session_claude_dir
-    claude_dir = get_session_claude_dir(session_id)
-    if claude_dir:
-        return Path(claude_dir) / "plans"
-    # A local Codex session writes its plans under its own config dir
-    # (core/layers/codex/layer.queue_plan_review).
-    from core.layers.codex.session import _codex_sessions
-    codex = _codex_sessions.get(session_id)
-    return Path(codex.config_dir) / "plans" if codex is not None and codex.config_dir else None
-
-
-def _get_remote_session_info(session_id: str):
-    """Return RemoteSessionInfo if the session is running remotely, else None."""
-    try:
-        from core.session.session_manager import _get_remote_layer
-        layer = _get_remote_layer()
-        if layer is None:
-            return None
-        return layer._sessions.get(session_id)
-    except ImportError:
-        return None
-
-
-def _list_local_plans(plans_dir: Path) -> list[dict]:
-    """The regular ``*.md`` files of a plans folder, newest first. Runs in a
-    worker thread; an entry that goes away during the walk is skipped."""
-    try:
-        with os.scandir(plans_dir) as it:
-            entries = list(it)
-    except OSError:
-        return []
-    plans: list[dict] = []
-    for entry in entries:
-        if not entry.name.endswith(".md"):
-            continue
-        try:
-            st = entry.stat(follow_symlinks=False)
-        except OSError:
-            continue
-        if stat.S_ISREG(st.st_mode):
-            plans.append({"filename": entry.name, "modified": st.st_mtime, "size": st.st_size})
-    plans.sort(key=lambda p: p["modified"], reverse=True)
-    return plans
-
-
-def _read_local_plan(plans_dir: Path, filename: str) -> str | None:
-    """A plan file's text, read in a worker thread: None when the name is
-    not a regular ``.md`` file inside the folder, ``_PlanTooLarge`` past
-    ``PLAN_MAX_BYTES``."""
-    try:
-        path = resolve_under(plans_dir / filename, plans_dir)
-    except PathOutsideRoot:
-        return None
-    if path.suffix != ".md":
-        return None
-    cap = PLAN_MAX_BYTES
-    try:
-        with open(path, "rb") as fh:
-            st = os.fstat(fh.fileno())
-            if not stat.S_ISREG(st.st_mode):
-                return None
-            if st.st_size > cap:
-                raise _PlanTooLarge
-            data = fh.read(cap + 1)
-    except OSError:
-        return None
-    if len(data) > cap:
-        raise _PlanTooLarge
-    return data.decode("utf-8", errors="replace")
-
-
-def _reviewed_plans(session_id: str) -> list[dict]:
-    """The plans the session's chat reviewed (the rows the pump writes at
-    plan review, for a remote chat as for a local one), newest first, each
-    with its text, its byte size and its review time. One store job: run it
-    with ``run_db``. A remote machine's ``.claude/plans`` never syncs, so
-    these rows are the remote session's plans."""
-    from storage import database as task_store
-    chat = task_store.get_chat_by_session(session_id)
-    if not chat:
-        return []
-    plans = []
-    for row in task_store.get_chat_plans(chat["id"]):
-        content = row.get("content") or ""
-        try:
-            modified = datetime.fromisoformat(row.get("created_at") or "").timestamp()
-        except (TypeError, ValueError):
-            modified = 0.0
-        plans.append({"filename": row["filename"], "content": content,
-                      "modified": modified, "size": len(content.encode("utf-8")),
-                      "id": row["id"]})
-    plans.sort(key=lambda p: (p["modified"], p["id"]), reverse=True)
-    return plans
-
-
-@router.get("/v1/plans")
-async def list_plans(
-    authorization: str | None = Header(None),
-    session_id: str | None = None,
-):
-    """List the plan files of a session.
-
-    Session-bound: a session JWT must name (and match) the session whose
-    plans it lists. A remote session answers the plans its chat reviewed,
-    from the database; a local session's plans folder is listed in a worker
-    thread.
-    """
-    await verify_session_match_async(authorization, session_id or "")
-    if session_id and _get_remote_session_info(session_id) is not None:
-        rows = await run_db(_reviewed_plans, session_id)
-        return {"plans": [{"filename": r["filename"], "modified": r["modified"],
-                           "size": r["size"]} for r in rows]}
-    plans_dir = _get_plans_dir(session_id)
-    if plans_dir is None:
-        return {"plans": []}
-    return {"plans": await asyncio.to_thread(_list_local_plans, plans_dir)}
-
-
-@router.get("/v1/plans/{filename}")
-async def get_plan_file(
-    filename: str,
-    authorization: str | None = Header(None),
-    session_id: str | None = None,
-):
-    """Read a plan file.
-
-    Session-bound like the plan list (see ``list_plans``): a remote
-    session's plan is the reviewed row's text; a local plan is read in a
-    worker thread, and one past ``PLAN_MAX_BYTES`` answers 413.
-    """
-    await verify_session_match_async(authorization, session_id or "")
-    if ".." in filename or "/" in filename:
-        raise HTTPException(status_code=400, detail="Invalid filename")
-    if session_id and _get_remote_session_info(session_id) is not None:
-        for row in await run_db(_reviewed_plans, session_id):
-            if row["filename"] == filename:
-                return {"content": row["content"], "filename": filename}
-        raise HTTPException(status_code=404, detail="Plan not found")
-    plans_dir = _get_plans_dir(session_id)
-    if plans_dir is None:
-        raise HTTPException(status_code=404, detail="Plan not found")
-    try:
-        content = await asyncio.to_thread(_read_local_plan, plans_dir, filename)
-    except _PlanTooLarge:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Plan file larger than the {PLAN_MAX_BYTES} byte limit",
-        ) from None
-    if content is None:
-        raise HTTPException(status_code=404, detail="Plan not found")
-    return {"content": content, "filename": filename}

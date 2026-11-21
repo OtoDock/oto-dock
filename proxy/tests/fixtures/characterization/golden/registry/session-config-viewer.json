@@ -1,0 +1,410 @@
+{
+ "bash_env_keys": [],
+ "bundles": {
+  "char-admin-only": {},
+  "char-cfg-inst": {},
+  "char-core": {},
+  "char-default-off": {},
+  "char-env-inst": {
+   "env": {
+    "INST_HOST": "192.168.77.40",
+    "INST_KEY": "own-secret",
+    "INST_PORT": "8440"
+   }
+  },
+  "char-homelab": {
+   "env": {
+    "CHAR_HL_HOST": "192.168.77.13:8444",
+    "CHAR_HL_TOKEN": "hl-secret"
+   }
+  },
+  "char-hosted": {},
+  "char-hostself": {},
+  "char-http": {
+   "gateway": {
+    "allowlist_key": "",
+    "callbacks": true,
+    "header": "",
+    "kind": "container",
+    "manifest": "char-http",
+    "path": "/mcp/",
+    "prefix": "",
+    "proxy_local": true,
+    "upstream": "http://localhost:8932"
+   }
+  },
+  "char-keyed": {
+   "gateway": {
+    "allowlist_key": "char-keyed",
+    "header": "X-Char-Key",
+    "manifest": "char-keyed",
+    "path": "/mcp",
+    "prefix": "",
+    "upstream": "https://api.example.test",
+    "value": "char-keyed-secret",
+    "value_from": "CHAR_KEY"
+   }
+  },
+  "char-lookalike": {
+   "gateway": {
+    "allowlist_key": "",
+    "header": "",
+    "kind": "container",
+    "manifest": "char-lookalike",
+    "path": "/mcp/",
+    "prefix": "",
+    "proxy_local": true,
+    "upstream": "http://localhost:8932"
+   }
+  },
+  "char-loopback": {},
+  "char-no-external": {},
+  "char-no-many": {},
+  "char-no-meeting": {},
+  "char-no-phone": {},
+  "char-no-shared-chat": {},
+  "char-no-task": {},
+  "char-no-terminal": {},
+  "char-toggle-off": {},
+  "char-toggle-on": {},
+  "char-tools": {},
+  "delegation-mcp": {}
+ },
+ "excluded": {
+  "char-bearer": "Bearer Account is not connected. Connect your Bearer Account account in Settings > Integrations.",
+  "char-bearer-sidecar": "Bearer Sidecar is not connected. Connect your Bearer Sidecar account in Settings > Integrations.",
+  "char-browser": "Requires a remote machine (satellite)",
+  "char-cli-token": "its configuration names OTO_CLI_TOKEN, the session's command-line token, which no MCP server may hold",
+  "char-editors": "Char Editors is for the editor tier of this agent and above",
+  "char-gitish": "Git Account is not connected. Connect your Git Account account in Settings > Integrations.",
+  "char-infra-missing": "Infrastructure credentials not configured for Missing. Admin must set these in the Integrations page.",
+  "char-peruser": "Per User is not configured. Set up your credentials in Settings > Integrations.",
+  "char-satellite": "Requires a remote machine (satellite)",
+  "char-unapproved": "Char Unapproved: the host attacker.example.test is not approved for char-unapproved; an admin can approve it in Admin > Security"
+ },
+ "file": {
+  "mcpServers": {
+   "char-admin-only": {
+    "args": [
+     "<tmp>/mcps/custom/char-admin-only/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-admin-only/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Char Admin Only\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-cfg-inst": {
+    "args": [
+     "<tmp>/mcps/custom/char-cfg-inst/server.py",
+     "--config-file",
+     "<tmp>/sessions/user-mcp-configs/char-cfg-inst-char-reg.json",
+     "--verbose"
+    ],
+    "command": "<tmp>/mcps/custom/char-cfg-inst/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Config Instance\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-core": {
+    "args": [
+     "<tmp>/mcps/custom/char-core/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-core/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Core One\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-default-off": {
+    "args": [
+     "<tmp>/mcps/custom/char-default-off/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-default-off/venv/bin/python",
+    "env": {
+     "CHAR_TG_URL": "192.168.77.14",
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Default Off\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-env-inst": {
+    "args": [
+     "<tmp>/mcps/custom/char-env-inst/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-env-inst/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_STRIP_KEYS": "OTO_CLI_TOKEN",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":true,\"label\":\"Env Instance\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-homelab": {
+    "args": [
+     "<tmp>/mcps/custom/char-homelab/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-homelab/venv/bin/python",
+    "env": {
+     "CHAR_HL_URL": "http://192.168.77.10:9100/metrics",
+     "OTO_CLI_TOKEN": "",
+     "OTO_STRIP_KEYS": "OTO_CLI_TOKEN",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":true,\"label\":\"Char Homelab\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-hosted": {
+    "args": [
+     "<tmp>/mcps/custom/char-hosted/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-hosted/venv/bin/python",
+    "env": {
+     "OTODOCK_RELAY_ERROR": "OtoDock hosted relay not available yet. An admin can set up billing in Setup, OtoDock.",
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Hosted Relay\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-hostself": {
+    "args": [
+     "<tmp>/mcps/custom/char-hostself/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-hostself/venv/bin/python",
+    "env": {
+     "CHAR_HS_URL": "http://127.0.0.1:9200",
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Host Self\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-http": {
+    "headers": {
+     "Authorization": "Bearer OTO_SESSION_JWT"
+    },
+    "type": "http",
+    "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-http/mcp/"
+   },
+   "char-keyed": {
+    "headers": {
+     "Authorization": "Bearer OTO_SESSION_JWT"
+    },
+    "type": "http",
+    "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-keyed/mcp"
+   },
+   "char-lookalike": {
+    "headers": {
+     "Authorization": "Bearer OTO_SESSION_JWT"
+    },
+    "type": "http",
+    "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-lookalike/mcp/"
+   },
+   "char-loopback": {
+    "args": [
+     "<tmp>/mcps/custom/char-loopback/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-loopback/venv/bin/python",
+    "env": {
+     "CHAR_LB_URL": "http://localhost:9300",
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Loopback\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-no-external": {
+    "args": [
+     "<tmp>/mcps/custom/char-no-external/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-no-external/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"No external\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-no-many": {
+    "args": [
+     "<tmp>/mcps/custom/char-no-many/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-no-many/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"No Many\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-no-meeting": {
+    "args": [
+     "<tmp>/mcps/custom/char-no-meeting/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-no-meeting/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"No meeting\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-no-phone": {
+    "args": [
+     "<tmp>/mcps/custom/char-no-phone/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-no-phone/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"No phone\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-no-shared-chat": {
+    "args": [
+     "<tmp>/mcps/custom/char-no-shared-chat/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-no-shared-chat/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"No shared_chat\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-no-task": {
+    "args": [
+     "<tmp>/mcps/custom/char-no-task/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-no-task/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"No task\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-no-terminal": {
+    "args": [
+     "<tmp>/mcps/custom/char-no-terminal/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-no-terminal/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"No terminal\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-shared-docker": {
+    "type": "http",
+    "url": "http://192.168.77.80:8933/mcp/"
+   },
+   "char-sse": {
+    "type": "sse",
+    "url": "https://sse.example.test/sse"
+   },
+   "char-toggle-off": {
+    "args": [
+     "<tmp>/mcps/custom/char-toggle-off/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-toggle-off/venv/bin/python",
+    "env": {
+     "CHAR_TG_URL": "192.168.77.11",
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Toggle Off\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-toggle-on": {
+    "args": [
+     "<tmp>/mcps/custom/char-toggle-on/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-toggle-on/venv/bin/python",
+    "env": {
+     "CHAR_TG_URL": "192.168.77.12",
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Toggle On\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "char-tools": {
+    "args": [
+     "<tmp>/mcps/custom/char-tools/server.py",
+     "--mode",
+     "fast",
+     "char-reg",
+     "quote\"and\\back",
+     "line\nbreak"
+    ],
+    "command": "<tmp>/mcps/custom/char-tools/venv/bin/python",
+    "env": {
+     "CHAR_AGENT": "char-reg",
+     "CHAR_ASK": "",
+     "CHAR_CHAT": "chat-v",
+     "CHAR_DIR": "<tmp>/mcps/custom/char-tools/data",
+     "CHAR_LIMIT": "9",
+     "CHAR_MASTER": "${proxy_api_key}",
+     "CHAR_MODE": "fast",
+     "CHAR_OFF": "false",
+     "CHAR_ON": "true",
+     "CHAR_OWNER": "",
+     "CHAR_PROXY": "http://localhost:<port>",
+     "CHAR_REF": "http://192.168.77.10:9100/metrics",
+     "CHAR_ROOT": "<platform-root>/x",
+     "CHAR_SAVED": "saved",
+     "CHAR_SCOPE": "",
+     "CHAR_STATIC": "1",
+     "CHAR_USER": "",
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Char Tools\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   },
+   "delegation-mcp": {
+    "args": [
+     "<tmp>/mcps/custom/delegation-mcp/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/delegation-mcp/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": "",
+     "OTO_TOOL_STANDIN": "{\"account\":\"\",\"fetch\":false,\"label\":\"Delegation\",\"stamp\":\"1.0.0+0.0.0\",\"v\":1}"
+    },
+    "type": "stdio"
+   }
+  }
+ },
+ "flat_env": {},
+ "instance_files": {
+  "char-cfg-inst": [
+   {
+    "allowedLocalPaths": "/users/vic",
+    "host": "192.168.77.30",
+    "privateKey": "<tmp>/mcps/custom/char-cfg-inst/keys/id_char"
+   }
+  ]
+ },
+ "path": "<tmp>/sessions/user-mcp-configs/char-reg-b627c7172bac.json",
+ "server_order": [
+  "char-admin-only",
+  "char-cfg-inst",
+  "char-core",
+  "char-default-off",
+  "char-env-inst",
+  "char-homelab",
+  "char-hosted",
+  "char-hostself",
+  "char-http",
+  "char-keyed",
+  "char-lookalike",
+  "char-loopback",
+  "char-no-external",
+  "char-no-many",
+  "char-no-meeting",
+  "char-no-phone",
+  "char-no-shared-chat",
+  "char-no-task",
+  "char-no-terminal",
+  "char-shared-docker",
+  "char-sse",
+  "char-toggle-off",
+  "char-toggle-on",
+  "char-tools",
+  "delegation-mcp"
+ ]
+}

@@ -12,9 +12,10 @@ import contextlib
 import logging
 import time
 
+from audio.log_policy import log_transcript
 from audio.providers.tts.base import TTSProvider
 from audio.providers.vad.base import VadEvent, VadState
-from audio.providers.vad.silero import SileroVad
+from audio.providers.vad.silero import LOUDNESS_EDGES, SileroVad
 from audio.streaming.lang import base_lang
 
 import config
@@ -188,6 +189,8 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
         # The route's language is the call's unless the tracker reads the
         # caller's (pipeline/language.py; final after a few seconds of speech).
         self.state._language_locked = self._language_tracker is None
+        # A final no speech end drains still goes out (pipeline/turn.py).
+        self._watch_stt_finals()
 
     async def run(self) -> None:
         """Run the full call pipeline until hangup or timeout."""
@@ -575,6 +578,8 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             self.state._last_activity = time.monotonic()
             # The language tracker's events from the last frames, on the loop.
             self._language_poll()
+            # The caller's loudness, for words the VAD starts no speech on.
+            self._note_line_frame(payload)
             event = await self.vad.aprocess(payload)
 
             # Accumulate raw audio while speaking (for Smart Turn)
@@ -755,11 +760,9 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 # LLM busy — drain STT (keep alive) and queue speech
                 transcript = self.stt.drain_transcript()
                 if transcript and self._is_interim_fallback_dup(transcript):
-                    logger.info(
-                        "[%s] Drained final duplicates "
-                        "the interim-dispatched tail — dropped: %s",
-                        self.conn.peer_addr, transcript
-                    )
+                    log_transcript(
+                        logger, f"[{self.conn.peer_addr}] Drained final duplicates the "
+                        "interim-dispatched tail — dropped", transcript, event=True)
                     transcript = None
 
                 if transcript:
@@ -771,17 +774,15 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                     self._cancel_turn_timer()
                     # The turn is taken: the language streams move on.
                     self._note_turn_taken()
-                    logger.info(
-                        "[%s] Queuing speech "
-                        "(LLM busy): %s", self.conn.peer_addr, all_text
-                    )
+                    log_transcript(
+                        logger, f"[{self.conn.peer_addr}] Queuing speech (LLM busy)",
+                        all_text, event=True)
                     self.state._queued_speech.append(all_text)
                     self._interrupt_for_queued_speech()
                 elif transcript:
-                    logger.info(
-                        "[%s] Queuing speech "
-                        "(LLM busy): %s", self.conn.peer_addr, transcript
-                    )
+                    log_transcript(
+                        logger, f"[{self.conn.peer_addr}] Queuing speech (LLM busy)",
+                        transcript, event=True)
                     self._note_turn_taken()
                     self.state._queued_speech.append(transcript)
                     self._interrupt_for_queued_speech()
@@ -798,20 +799,16 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 # so connecting words aren't lost between segments)
                 transcript = self.stt.drain_transcript()
                 if transcript and self._is_interim_fallback_dup(transcript):
-                    logger.info(
-                        "[%s] Drained final duplicates "
-                        "the interim-dispatched tail — dropped: %s",
-                        self.conn.peer_addr, transcript
-                    )
+                    log_transcript(
+                        logger, f"[{self.conn.peer_addr}] Drained final duplicates the "
+                        "interim-dispatched tail — dropped", transcript, event=True)
                     transcript = None
 
                 if transcript:
                     self._append_turn_segment(transcript)
-                    logger.info(
-                        "[%s] Turn segment "
-                        "%s: %s",
-                        self.conn.peer_addr, len(self.state._turn_segments), transcript
-                    )
+                    log_transcript(
+                        logger, f"[{self.conn.peer_addr}] Turn segment {len(self.state._turn_segments)}",
+                        transcript, event=True)
                     # Got transcript — start/restart classification timer
                     joined = " ".join(self.state._turn_segments)
                     self._cancel_turn_timer()
@@ -973,6 +970,7 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
         relistened = float(getattr(self.stt, "relisten_seconds", 0.0) or 0.0)
         logger.info("[%s] call closed: %.1f s streamed, %.1f s listened again",
                     self.conn.peer_addr, float(streamed or 0.0), relistened)
+        self._log_detector_loudness()
 
         # The debug tap's file, written off the loop once the transport is
         # closed; a failure is logged and nothing else of the call is affected.
@@ -1007,6 +1005,30 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             streamed=float(streamed or 0.0), relistened=relistened, session_id=session_id))
         if reports:
             await asyncio.gather(*reports)
+
+    def _log_detector_loudness(self) -> None:
+        """One line at the call's end: the detector's windows by loudness,
+        all of them and those at or over its bar, while it listened and
+        while the agent spoke. Numbers only, never a word. The energy floor
+        and the sweep's loudness rule are tuned from what real lines carry,
+        and no other line holds it. Nothing for a call the detector never
+        heard, or for a VAD that counts none."""
+        by_loudness = getattr(self.vad, "by_loudness", None)
+        if by_loudness is None:
+            return
+        heard = by_loudness()
+        if not any(windows for bands in heard for windows, _ in bands):
+            return
+        edges = LOUDNESS_EDGES
+        labels = [f"under {edges[0]}", *(f"{low} to {high}" for low, high in zip(edges, edges[1:], strict=False)),
+                  f"above {edges[-1]}"]
+
+        def said(bands) -> str:
+            return ", ".join(f"{label} {windows}/{over}" for label, (windows, over) in zip(labels, bands, strict=True))
+
+        logger.info("[%s] The detector by loudness, windows/those over its bar. Listening: %s. "
+                    "While the agent spoke: %s",
+                    self.conn.peer_addr, said(heard.listening), said(heard.bargein))
 
     def _speech_usage_reports(self, *, streamed: float, relistened: float, session_id: str) -> list:
         """The speech usage reports of this call, coroutines for the teardown

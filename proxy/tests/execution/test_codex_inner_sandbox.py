@@ -6,10 +6,14 @@ there: one a new Codex release adds (``.aws`` from 0.160) breaks the first
 command of every chat. This test runs the real thing, so a Codex bump that
 protects a new folder fails here, not in the field.
 
+The platform's sandbox is the session's description rendered as a machine
+that holds the same folders renders it (``test_sandbox._rendered``).
+
 Skipped where it cannot run: no binary of the pinned version (set
 ``CODEX_BIN`` to the one to try), no bwrap, or a host whose sandbox or nested
-bwrap cannot start (the platform's own preflights say so on such a host).
+bwrap cannot start (a machine's own check says so on such a host).
 """
+import json
 import os
 import shutil
 import subprocess
@@ -18,7 +22,9 @@ from pathlib import Path
 import pytest
 
 import config as app_config
-from core.sandbox.sandbox import SandboxBuilder, SandboxConfig, cli_install_ro_binds
+from core.sandbox.sandbox import SandboxBuilder, SandboxConfig
+from core.sandbox.sandbox_render import cli_install_ro_binds
+from tests.execution.test_sandbox import _rendered
 
 
 def _pinned_codex() -> str | None:
@@ -71,18 +77,42 @@ def test_codex_runs_its_own_sandbox_in_the_user_folder(tmp_path):
     env = {"PATH": path, "LANG": "C.UTF-8",
            **builder.get_env_overrides(config_dir_name=".codex", config_env_var="CODEX_HOME")}
 
-    ready = _run(builder.build_command_prefix, ["true"], env)
+    def sandboxed(inner: list[str]) -> list[str]:
+        return _rendered(builder, inner)
+
+    ready = _run(sandboxed, ["true"], env)
     if ready.returncode != 0:
         pytest.skip(f"the platform sandbox cannot start here: {ready.stderr.strip()[-300:]}")
-    nested = _run(builder.build_command_prefix, ["bwrap", "--ro-bind", "/", "/", "true"], env)
+    nested = _run(sandboxed, ["bwrap", "--ro-bind", "/", "/", "true"], env)
     if nested.returncode != 0:
         pytest.skip(f"nested bwrap is denied here: {nested.stderr.strip()[-300:]}")
 
-    r = _run(builder.build_command_prefix,
-             [codex, "sandbox", "-c", "sandbox_mode=workspace-write", "ls", "-a"], env)
+    r = _run(sandboxed, [codex, "sandbox", "-c", "sandbox_mode=workspace-write", "ls", "-a"], env)
     out = r.stdout + r.stderr
     assert "Read-only file system" not in out, (
         "Codex's own sandbox needs a folder the read-only user root lacks: add it to the "
         f"pre-created list in core/sandbox/sandbox.py\n{out[-1500:]}")
     assert r.returncode == 0, out[-1500:]
     assert "workspace" in r.stdout.split()
+
+
+def test_a_keys_sign_in_file_is_the_one_codex_itself_writes(tmp_path):
+    """``api_key_auth_json`` against the pinned Codex's own ``login
+    --with-api-key``: a session on an OpenAI key gets the file the binary
+    writes, and the binary reads the product's file as a key sign-in. No
+    network: the login stores the key and checks nothing."""
+    codex = _pinned_codex()
+    if codex is None:
+        pytest.skip(f"no codex {app_config.PINNED_CODEX_VERSION} here (set CODEX_BIN)")
+    from core.layers.codex.helpers import api_key_auth_json
+    key = "sk-stand-in-not-a-key"
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "CODEX_HOME": str(tmp_path)}
+    login = subprocess.run([codex, "login", "--with-api-key"], input=key, capture_output=True,
+                           text=True, env=env, timeout=60)
+    assert login.returncode == 0, login.stderr
+    assert json.loads((tmp_path / "auth.json").read_text()) == api_key_auth_json(key)
+    (tmp_path / "auth.json").write_text(json.dumps(api_key_auth_json(key)))
+    status = subprocess.run([codex, "login", "status"], capture_output=True, text=True, env=env, timeout=60)
+    assert status.returncode == 0, status.stderr
+    assert "API key" in status.stdout + status.stderr
+

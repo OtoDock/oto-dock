@@ -1,0 +1,231 @@
+{
+ "attempts": {
+  "agents_machine_offline": [
+   {
+    "agent": "warm-spawn-refused",
+    "chat_id": "<id10>",
+    "execution_path": "claude-code-cli",
+    "execution_target": "m-admin",
+    "new_chat": false,
+    "type": "warmup_started"
+   },
+   {
+    "chat_id": "<id10>",
+    "error": "This agent's remote machine 'Rack-1' is currently offline. Please reconnect the remote machine or contact your admin.",
+    "reason": "session_error",
+    "type": "warmup_failed"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   }
+  ],
+  "ledger_denied": [
+   {
+    "agent": "warm-spawn-refused",
+    "chat_id": "<id6>",
+    "execution_path": "claude-code-cli",
+    "execution_target": "",
+    "new_chat": true,
+    "type": "warmup_started"
+   },
+   {
+    "chat_id": "<id6>",
+    "error": "The server is busy.",
+    "reason": "session_error",
+    "type": "warmup_failed"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   }
+  ],
+  "machine_deleted": [
+   {
+    "agent": "warm-spawn-refused",
+    "chat_id": "<id12>",
+    "execution_path": "claude-code-cli",
+    "execution_target": "m-gone",
+    "new_chat": false,
+    "type": "warmup_started"
+   },
+   {
+    "chat_id": "<id12>",
+    "error": "This chat's remote machine no longer exists — send again to continue with a fresh session on the agent's current target.",
+    "reason": "session_error",
+    "type": "warmup_failed"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   }
+  ],
+  "machine_dropped": [
+   {
+    "agent": "warm-spawn-refused",
+    "chat_id": "<id9>",
+    "execution_path": "claude-code-cli",
+    "execution_target": "",
+    "new_chat": true,
+    "type": "warmup_started"
+   },
+   {
+    "chat_id": "<id9>",
+    "error": "The computer this chat runs on stopped answering. Reconnect it, then try again.",
+    "reason": "target_unavailable",
+    "type": "warmup_failed"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   }
+  ],
+  "no_account": [
+   {
+    "agent": "warm-spawn-refused",
+    "chat_id": "<id7>",
+    "execution_path": "claude-code-cli",
+    "execution_target": "",
+    "new_chat": true,
+    "type": "warmup_started"
+   },
+   {
+    "chat_id": "<id7>",
+    "error": "No AI engine is connected here yet, so connect your own or ask an admin to add one.",
+    "reason": "no_pool",
+    "type": "warmup_failed"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   }
+  ],
+  "own_computer_offline": [
+   {
+    "agent": "warm-spawn-refused",
+    "chat_id": "<id11>",
+    "execution_path": "claude-code-cli",
+    "execution_target": "m-user",
+    "new_chat": false,
+    "type": "warmup_started"
+   },
+   {
+    "chat_id": "<id11>",
+    "error": "Your computer 'Office-PC' is offline. Reconnect it, or pick another place from the Runs on menu.",
+    "reason": "session_error",
+    "type": "warmup_failed"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   }
+  ],
+  "start_failed": [
+   {
+    "agent": "warm-spawn-refused",
+    "chat_id": "<id8>",
+    "execution_path": "claude-code-cli",
+    "execution_target": "",
+    "new_chat": true,
+    "type": "warmup_started"
+   },
+   {
+    "chat_id": "<id8>",
+    "error": "the CLI did not start",
+    "reason": "session_error",
+    "type": "warmup_failed"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   }
+  ]
+ },
+ "chats": [
+  {
+   "agent": "warm-spawn-refused",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "m-admin",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "<id1>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  },
+  {
+   "agent": "warm-spawn-refused",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "m-user",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "<id2>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  },
+  {
+   "agent": "warm-spawn-refused",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "m-gone",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "<id3>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [
+   "<id1>",
+   "<id2>",
+   "<id3>"
+  ],
+  "started": []
+ },
+ "slots": {
+  "acquired": [
+   [
+    "<id4>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "<id5>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": [
+   "<id4>",
+   "<id5>"
+  ]
+ }
+}

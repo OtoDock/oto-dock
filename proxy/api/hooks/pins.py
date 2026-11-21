@@ -66,19 +66,22 @@ class HookAppOpenRequest(HookAppSlugRequest):
     agent: str = ""
 
 
-def placement_identity(ctx) -> tuple[str, str | None]:
+def placement_identity(ctx, session_id: str) -> tuple[str, str | None]:
     """``(own role, person_sub)`` for a session's placement reads
-    (SHARING.md "Agents use a placed app"): the role is the person's row on
-    the session's agent (``viewer`` without one) when the session carries a
-    person, else the no-user word; ``person_sub`` names the person only
-    when the session mounts their scope (``mount_username``), so a
-    Shared-only chat and an agent-scope task see no person placement. The
+    (SHARING.md "Agents use a placed app"): the role is the row the session
+    ``session_id`` presents for its person (``session_row_role``) when the
+    session carries a person, else the no-user word; ``person_sub`` names the
+    person only when the session mounts their scope (``mount_username``), so
+    a Shared-only chat and an agent-scope task see no person placement. The
     app proxy's caller applies the same rule. Synchronous."""
     if not ctx.username:
         return roles.SERVICE, None
+    from auth.providers import session_row_role
     sub = task_store.get_user_sub_by_username(ctx.username) or ""
-    own = (roles.row_role(task_store.get_user_agent_roles(sub), ctx.agent) or roles.VIEWER) if sub else roles.VIEWER
-    return own, (sub if (ctx.mount_username and sub) else None)
+    if not sub:
+        return roles.VIEWER, None
+    own = session_row_role(sub, {"sid": session_id, "agent": ctx.agent})
+    return own, (sub if ctx.mount_username else None)
 
 
 class HookAppPushRequest(BaseModel):
@@ -538,7 +541,7 @@ async def hook_app_rollback(req: HookAppSlugRequest, authorization: str | None =
     if found_vis == "agent":
         _require_shared_pin_authority(ctx, "")
     from api.apps.apps import rollback_app_row
-    out = await rollback_app_row(row)
+    out = await rollback_app_row(row, by_person=False)
     logger.info("Hook app rollback: session=%s, slug=%s, "
                 "release=%s", req.session_id[:8], req.slug, out['release'])
     return {"status": "ok", "app_id": row["id"], **out}
@@ -850,7 +853,7 @@ async def hook_app_list(req: HookAppSlugRequest, authorization: str | None = Hea
 
     def _placed() -> list[dict]:
         from storage.sharing import share_store
-        own, person_sub = placement_identity(ctx)
+        own, person_sub = placement_identity(ctx, req.session_id)
         hide_sub = task_store.get_user_sub_by_username(ctx.username) if ctx.username else ""
         out = []
         for r in share_store.placements_for_agent(ctx.agent, person_sub, hide_sub=hide_sub or ""):

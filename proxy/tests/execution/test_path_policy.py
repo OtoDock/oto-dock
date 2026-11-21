@@ -778,12 +778,13 @@ class TestBashTierForDevTools:
         assert not d.allowed
         assert "platform admin role" in d.reason
 
-    def test_printenv_no_args_allowed(self):
-        """printenv with no args lists all env vars — read tier."""
+    def test_printenv_no_args_asks(self):
+        """printenv with no args lists every variable, the session's own
+        token among them: it asks (auth/path_shell_env.py)."""
         ctx = _ctx("manager", "alice")
         d = self._decision("printenv", ctx)
         assert d.allowed
-        assert d.permission_tier == "read"
+        assert d.permission_tier == "ask"
 
     def test_printenv_with_var_allowed(self):
         """printenv VAR is the canonical way to read a single env var."""

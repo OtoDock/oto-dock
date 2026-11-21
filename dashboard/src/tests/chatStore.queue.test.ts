@@ -1,9 +1,8 @@
 /**
  * The chat's queue in the store: chips keyed by the proxy's queue id (a
  * re-announce replaces in place, the index places a new one), the index as
- * the fallback for a 1.7.0 proxy, a clear by the listed ids, and the v3
- * migration that lifts older persisted chips (the first snapshot replaces
- * them).
+ * the fallback for a 1.7.0 proxy and a clear by the listed ids. The chips
+ * an earlier version stored are read in chatStore.windows.test.ts.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { useChatStore } from '@/store/chatStore'
@@ -46,16 +45,6 @@ describe('the chat queue in the store', () => {
       .toEqual({ text: 't', queueId: 'q', authorSub: 'u', files: [{ path: 'p', name: 'n' }] })
     expect(toQueuedMessage({ text: 'v2' })).toEqual({ text: 'v2' })
     expect(toQueuedMessage('v1')).toEqual({ text: 'v1' })
-  })
-
-  it('migrates a v2 store to v3 without ids', () => {
-    const persist = (useChatStore as unknown as { persist: { getOptions: () => {
-      version: number; migrate: (s: unknown, v: number) => unknown } } }).persist
-    const opts = persist.getOptions()
-    expect(opts.version).toBe(3)
-    const migrated = opts.migrate({ byChat: { c: { queuedMessages: ['old', { text: 'v2' }] } } }, 2) as {
-      byChat: Record<string, { queuedMessages: unknown[] }> }
-    expect(migrated.byChat.c.queuedMessages).toEqual([{ text: 'old' }, { text: 'v2' }])
   })
 
   it('removes and clears by id from whichever slice holds the chip', () => {

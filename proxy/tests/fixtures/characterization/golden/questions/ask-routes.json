@@ -1,0 +1,165 @@
+{
+ "between_turns": {
+  "answers": {
+   "q1": {
+    "answers": [
+     "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input again this turn."
+    ]
+   }
+  },
+  "pings": [
+   {
+    "body": "Waiting for your answer",
+    "chat_id": "chat-q-idle",
+    "title": "questions-agent needs your input",
+    "user_sub": "user-admin"
+   }
+  ],
+  "queued": [],
+  "rows": [
+   {
+    "content": "",
+    "event_data": {
+     "tool_input": {
+      "questions": [
+       {
+        "id": "q1",
+        "question": "Which one?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input",
+     "type": "question"
+    },
+    "event_type": "question",
+    "role": "event"
+   }
+  ],
+  "viewer": [
+   {
+    "chat_id": "chat-q-idle",
+    "frame": {
+     "chat_id": "chat-q-idle",
+     "tool_input": {
+      "questions": [
+       {
+        "id": "q1",
+        "question": "Which one?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input",
+     "type": "question"
+    },
+    "type": "chat_ui_frame"
+   }
+  ]
+ },
+ "live_pump": {
+  "answers": {
+   "q1": {
+    "answers": [
+     "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call AskUserQuestion again this turn."
+    ]
+   }
+  },
+  "pings": [],
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "id": "q1",
+       "question": "Which one?"
+      }
+     ]
+    },
+    "tool_name": "AskUserQuestion"
+   }
+  ],
+  "rows": [],
+  "viewer": []
+ },
+ "meeting_participant": {
+  "answers": {
+   "q1": {
+    "answers": [
+     "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call AskUserQuestion again this turn."
+    ]
+   }
+  },
+  "own_queue": [],
+  "pings": [
+   {
+    "body": "Waiting for your answer",
+    "chat_id": "chat-q-meeting",
+    "title": "questions-agent needs your input",
+    "user_sub": "user-admin"
+   }
+  ],
+  "pump_queue": [],
+  "rows": [
+   {
+    "content": "",
+    "event_data": {
+     "tool_input": {
+      "questions": [
+       {
+        "id": "q1",
+        "question": "Which one?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    "event_type": "question",
+    "role": "event"
+   }
+  ],
+  "viewer": [
+   {
+    "chat_id": "chat-q-meeting",
+    "frame": {
+     "chat_id": "chat-q-meeting",
+     "tool_input": {
+      "questions": [
+       {
+        "id": "q1",
+        "question": "Which one?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    "type": "chat_ui_frame"
+   }
+  ]
+ },
+ "unreadable_chat": {
+  "answers": {
+   "q1": {
+    "answers": [
+     "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input again this turn."
+    ]
+   }
+  },
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "id": "q1",
+       "question": "Which one?"
+      }
+     ]
+    },
+    "tool_name": "request_user_input"
+   }
+  ],
+  "viewer": []
+ }
+}

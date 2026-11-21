@@ -1,0 +1,128 @@
+{
+ "a dead session": {
+  "bound_session": "<uuid>",
+  "closed_on_layer": [
+   "sid-old"
+  ],
+  "frames": [
+   {
+    "mode": "dontAsk",
+    "model": "test-model",
+    "session_id": "<uuid>",
+    "type": "warmup_ready"
+   }
+  ],
+  "row": {
+   "execution_mode": "",
+   "permission_mode": "dontAsk",
+   "session_id": "<uuid>"
+  },
+  "slots_acquired": [
+   "<uuid>"
+  ],
+  "slots_released": [],
+  "started": [
+   {
+    "interactive": false,
+    "mode": "dontAsk",
+    "resume": false,
+    "session": "<uuid>"
+   }
+  ],
+  "terminal_closed": null
+ },
+ "a live session": {
+  "bound_session": "<uuid>",
+  "closed_on_layer": [
+   "sid-old"
+  ],
+  "frames": [
+   {
+    "mode": "dontAsk",
+    "model": "test-model",
+    "session_id": "<uuid>",
+    "type": "warmup_ready"
+   }
+  ],
+  "row": {
+   "execution_mode": "",
+   "permission_mode": "dontAsk",
+   "session_id": "<uuid>"
+  },
+  "slots_acquired": [
+   "<uuid>"
+  ],
+  "slots_released": [],
+  "started": [
+   {
+    "interactive": false,
+    "mode": "dontAsk",
+    "resume": false,
+    "session": "<uuid>"
+   }
+  ],
+  "terminal_closed": null
+ },
+ "no session": {
+  "bound_session": "<uuid>",
+  "closed_on_layer": [],
+  "frames": [
+   {
+    "mode": "dontAsk",
+    "model": "test-model",
+    "session_id": "<uuid>",
+    "type": "warmup_ready"
+   }
+  ],
+  "row": {
+   "execution_mode": "",
+   "permission_mode": "dontAsk",
+   "session_id": "<uuid>"
+  },
+  "slots_acquired": [
+   "<uuid>"
+  ],
+  "slots_released": [],
+  "started": [
+   {
+    "interactive": false,
+    "mode": "dontAsk",
+    "resume": false,
+    "session": "<uuid>"
+   }
+  ],
+  "terminal_closed": null
+ },
+ "the person's own live terminal": {
+  "bound_session": "<uuid>",
+  "closed_on_layer": [],
+  "frames": [
+   {
+    "mode": "dontAsk",
+    "model": "test-model",
+    "session_id": "<uuid>",
+    "type": "warmup_ready"
+   }
+  ],
+  "row": {
+   "execution_mode": "",
+   "permission_mode": "dontAsk",
+   "session_id": "<uuid>"
+  },
+  "slots_acquired": [
+   "<uuid>"
+  ],
+  "slots_released": [],
+  "started": [
+   {
+    "interactive": false,
+    "mode": "dontAsk",
+    "resume": false,
+    "session": "<uuid>"
+   }
+  ],
+  "terminal_closed": [
+   "implement-plan"
+  ]
+ }
+}

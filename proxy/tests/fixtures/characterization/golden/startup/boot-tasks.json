@@ -1,0 +1,125 @@
+{
+ "docker_bringup": {
+  "calls": [
+   "startup_docker_mcps"
+  ],
+  "logged": [
+   [
+    "ERROR",
+    "Docker MCP bring-up failed (non-fatal)"
+   ]
+  ]
+ },
+ "phone_token_refresh": {
+  "calls": [
+   "notify_phone_config_changed"
+  ],
+  "logged": [
+   [
+    "ERROR",
+    "phone classifier token refresh failed"
+   ]
+  ],
+  "sleeps": [
+   21600,
+   21600,
+   21600,
+   21600
+  ]
+ },
+ "relay_events": {
+  "calls": [
+   "sync_all",
+   "sync_all"
+  ],
+  "logged": [
+   [
+    "ERROR",
+    "Startup relay events registration failed (non-fatal)"
+   ]
+  ],
+  "sleeps": [
+   20,
+   20
+  ]
+ },
+ "what_the_last_process_left": {
+  "calls": [
+   "arm_queues",
+   "run_pending",
+   "settle_waiters",
+   "start_pending_runs",
+   "fire_held",
+   "redeliver_pending_wakes",
+   "fire_downtime",
+   "arm_queues",
+   "run_pending",
+   "settle_waiters",
+   "start_pending_runs",
+   "fire_held",
+   "redeliver_pending_wakes",
+   "fire_downtime",
+   "arm_queues",
+   "run_pending",
+   "settle_waiters",
+   "start_pending_runs",
+   "fire_held",
+   "redeliver_pending_wakes",
+   "fire_downtime"
+  ],
+  "logged": [
+   [
+    "INFO",
+    "Startup, the queued messages: 1"
+   ],
+   [
+    "ERROR",
+    "Startup, the runs that never started: failed (continuing)"
+   ],
+   [
+    "INFO",
+    "Startup wake redelivery: woke 2 chat(s)"
+   ],
+   [
+    "INFO",
+    "Startup: fired 3 task(s) that came due while the platform was down"
+   ],
+   [
+    "INFO",
+    "Startup, the queued messages: 1"
+   ],
+   [
+    "ERROR",
+    "Startup, the runs that never started: failed (continuing)"
+   ],
+   [
+    "INFO",
+    "Startup: fired 3 task(s) that came due while the platform was down"
+   ],
+   [
+    "INFO",
+    "Startup, the queued messages: 1"
+   ],
+   [
+    "ERROR",
+    "Startup, the runs that never started: failed (continuing)"
+   ],
+   [
+    "ERROR",
+    "Startup wake redelivery sweep failed"
+   ],
+   [
+    "INFO",
+    "Startup: fired 3 task(s) that came due while the platform was down"
+   ]
+  ],
+  "sleeps": [
+   10.0,
+   5.0,
+   10.0,
+   5.0,
+   10.0,
+   5.0
+  ]
+ }
+}

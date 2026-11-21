@@ -8,8 +8,8 @@
  * `'local'` or a machine id. An app's step target says where in two words
  * (`SITE`; the proxy spells a check input document's site with the same
  * pair, which the dashboard never reads). A machine row was paired by an
- * admin as platform infrastructure or by a person as their own
- * (`PAIRING_SCOPE`, `remote_machines.pairing_scope`).
+ * admin as platform infrastructure, by a person as their own, or is a
+ * compute machine nobody owns (`PAIRING_SCOPE`, `remote_machines.pairing_scope`).
  */
 
 /** The stored value of the platform sandbox. */
@@ -29,6 +29,10 @@ export function machineOf(target: string | null | undefined): string {
 export const SITE = { LOCAL: 'local', MACHINE: 'machine' } as const
 export type SiteKind = (typeof SITE)[keyof typeof SITE]
 
-/** How a machine was paired (`remote_machines.pairing_scope`). */
-export const PAIRING_SCOPE = { ADMIN: 'admin', USER: 'user' } as const
+/**
+ * How a machine row came to be (`remote_machines.pairing_scope`): paired by
+ * an admin, paired by a person as their own, or a compute machine the
+ * platform runs itself, which no person owns.
+ */
+export const PAIRING_SCOPE = { ADMIN: 'admin', USER: 'user', COMPUTE: 'compute' } as const
 export type PairingScope = (typeof PAIRING_SCOPE)[keyof typeof PAIRING_SCOPE]

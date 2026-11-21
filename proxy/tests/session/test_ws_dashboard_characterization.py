@@ -558,12 +558,15 @@ class TestWarmupStartedNewChatFlag:
         ("", False, "MACHINE_GONE"),
     ], ids=["its-first-message", "a-queued-message", "no-message"])
     def test_a_machine_that_drops_off_during_the_start_ends_with_a_plain_card(
-            self, temp_db, monkeypatch, text, queued, sentence):
+            self, temp_db, monkeypatch, caplog, text, queued, sentence):
         """A start whose computer froze: the connection layer raises
         "Satellite <id> not connected" when it drops the machine, and the
         card says what happened and what to do, never the machine's id; it
         names "your message" only when one rides the start (the warm-up's
-        own, or one queued while it warmed)."""
+        own, or one queued while it warmed). A machine that dropped off is
+        no fault of the start: no ERROR line, no traceback."""
+        import logging
+        caplog.set_level(logging.INFO)
         from core.events import input_queue
         from ws import dashboard_chat_text
         layer = FakeExecutionLayer()
@@ -593,6 +596,8 @@ class TestWarmupStartedNewChatFlag:
                 assert "790546a4" not in failed["error"]
                 ws.client_send({"type": "close"})
         run_ws_scenario(scenario)
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR and "warmup" in r.getMessage()]
+        assert any("the machine dropped off" in r.getMessage() for r in caplog.records)
 
     def test_unknown_chat_id_mints_a_new_chat(self, temp_db, monkeypatch):
         layer = FakeExecutionLayer()

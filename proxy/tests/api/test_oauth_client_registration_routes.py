@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 import config
 from api.mcp import credentials as credentials_api
 from auth.providers import UserContext, get_current_user
-from services.mcp import mcp_manifest_parse, mcp_registry
+from services.mcp import mcp_manifest_parse, mcp_manifest_store, mcp_registry
 from services.oauth import mcp_authorization as ma, oauth_account_store
 from storage.identity import credential_store, oauth_client_registrations as regs
 from storage.pg import get_conn
@@ -52,7 +52,7 @@ def rows():
 
 @pytest.fixture
 def registry(monkeypatch, tmp_path):
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     from auth import oauth_providers
     oauth_providers.clear_manifest_cache()
     ma.clear_caches()
@@ -62,7 +62,7 @@ def registry(monkeypatch, tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data))
         m = mcp_manifest_parse._parse_manifest(path)
-        mcp_registry._manifests[m.name] = m
+        mcp_manifest_store._manifests[m.name] = m
         return m
     yield install
     ma.clear_caches()
@@ -145,7 +145,7 @@ class TestIntegrationsReconnect:
             "token_url": f"{ISSUER}/token",
             "extra": {"flow": "mcp_authorization", "resource": RESOURCE}}))
         monkeypatch.setattr(credentials_api.task_store, "get_user_agents", lambda s: ["pa"])
-        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda agent: [m])
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps_all_placements", lambda agent: [m])
         me = UserContext(sub=sub, email=f"{username}@t.example", name="T", role="creator",
                          agents=["pa"], agent_roles={"pa": "manager"})
         resp = _client(me).get("/v1/users/me/integrations")
@@ -184,7 +184,7 @@ class TestIntegrationsReconnect:
             "extra": {"flow": "mcp_authorization", "resource": RESOURCE,
                       "refused_by": {MCP: {"at": "2026-11-03T10:00:00Z", "methods": ["tools/call"]}}}}))
         monkeypatch.setattr(credentials_api.task_store, "get_user_agents", lambda s: ["pa"])
-        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda agent: [m, m2])
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps_all_placements", lambda agent: [m, m2])
         me = UserContext(sub=sub, email=f"{username}@t.example", name="T", role="creator",
                          agents=["pa"], agent_roles={"pa": "manager"})
 
@@ -217,7 +217,7 @@ class TestIntegrationsReconnect:
         credential_store.update_account_meta(
             sub, MCP, "ws-1", lambda meta: {**meta, relay_notices.REMOVED_REASON: {"reason": "deauthorized", "at": 1}})
         monkeypatch.setattr(credentials_api.task_store, "get_user_agents", lambda s: ["pa"])
-        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda agent: [m])
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps_all_placements", lambda agent: [m])
         me = UserContext(sub=sub, email=f"{username}@t.example", name="T", role="creator",
                          agents=["pa"], agent_roles={"pa": "manager"})
         [entry] = [e for e in _client(me).get("/v1/users/me/integrations").json() if e["mcp_name"] == MCP]

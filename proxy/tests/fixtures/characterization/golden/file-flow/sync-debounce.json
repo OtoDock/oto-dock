@@ -1,0 +1,92 @@
+{
+ "a_new_loop_a_new_gate": {
+  "manifest": 1,
+  "reconnect": 4,
+  "the_same_on_a_loop": true
+ },
+ "gates": {
+  "manifest": 1,
+  "reconnect": 4,
+  "the_same_on_a_loop": true
+ },
+ "jitter": 2.5,
+ "jitter_bounds": [
+  [
+   0.0,
+   10.0
+  ]
+ ],
+ "steps": [
+  {
+   "hold": {
+    "m1": 0.0,
+    "m2": 0.0
+   },
+   "stamped": {},
+   "step": "no walk yet"
+  },
+  {
+   "hold": {
+    "m1": 30.0,
+    "m2": 0.0
+   },
+   "stamped": {
+    "m1": 1000.0
+   },
+   "step": "m1 completed"
+  },
+  {
+   "hold": {
+    "m1": 20.0,
+    "m2": 0.0
+   },
+   "stamped": {
+    "m1": 1000.0
+   },
+   "step": "ten seconds on"
+  },
+  {
+   "hold": {
+    "m1": 20.0,
+    "m2": 30.0
+   },
+   "stamped": {
+    "m1": 1000.0,
+    "m2": 1010.0
+   },
+   "step": "m2 completed"
+  },
+  {
+   "hold": {
+    "m1": 0.0,
+    "m2": 10.0
+   },
+   "stamped": {
+    "m1": 1000.0,
+    "m2": 1010.0
+   },
+   "step": "the window ends for m1"
+  },
+  {
+   "hold": {
+    "m1": 0.0,
+    "m2": 30.0
+   },
+   "stamped": {
+    "m2": 1030.0
+   },
+   "step": "a stamp drops those past the window"
+  },
+  {
+   "hold": {
+    "m1": 0.0,
+    "m2": 0.0
+   },
+   "stamped": {
+    "m2": 1030.0
+   },
+   "step": "all past it"
+  }
+ ],
+ "the_loops_differ": true
+}

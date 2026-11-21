@@ -29,6 +29,7 @@ import psycopg
 
 import config
 from auth import roles
+from core import drain
 from core.events import chat_writer, input_queue
 from core.events.common_events import TurnInput
 from core.events.stream_pump import _active_pumps, _pending_permissions
@@ -40,6 +41,7 @@ from core.session.session_state import (
     set_user_tz,
 )
 from services.cards.status import CARD_ANSWER_STAYS
+from services.engines import subscription_pool
 from services.notifications import notification_manager
 from services.remote import chat_move
 from storage import database as task_store
@@ -65,6 +67,14 @@ class StreamCtx(NamedTuple):
     pump: "ChatStreamPump"
     queue: asyncio.Queue
     chat_id: str
+
+
+def _persist_compact(chat_id: str, event_data: str, post_tokens: int | None) -> None:
+    """The separator block (a pump-shaped event row) and the gauge's pin."""
+    task_store.add_chat_message(chat_id, "event", "", event_type=wire.CONTEXT_COMPACT,
+                                event_data=event_data)
+    if post_tokens is not None:
+        task_store.update_chat(chat_id, context_used=post_tokens)
 
 
 def _question_answers_to_text(answers: dict) -> str:
@@ -137,7 +147,11 @@ class ClientMessageDispatcher(_Host):
             # the chat's queue behind the move, and the page opens the chat
             # again where it went.
             if msg.get("text") or msg.get("images") or msg.get("files"):
-                self.chat_id = cid
+                chat = await run_db(task_store.get_chat, cid)
+                if not chat:
+                    await self._send_error("Chat not found")
+                    return None
+                await self._onto_chat(chat)
                 await self._handle_chat({**msg, "type": wire.IN_CHAT})
             return None
         await self._handle_warmup(msg)
@@ -157,6 +171,13 @@ class ClientMessageDispatcher(_Host):
         # still finishing) → relaunch the monitor so the review nudge still
         # fires. Idempotent: a no-op if one is already running or none pending.
         self._ensure_bg_monitor()
+        return None
+
+    async def _on_leave_chat(self, msg: dict, *, stream: StreamCtx | None = None):
+        # The page shows its new-chat view: the socket shows no chat, so a
+        # result, a server turn or a frame of the chat it left is not this
+        # view's. Mid-turn the stream loop detaches first (MID_STREAM_DETACH).
+        self._off_chat()
         return None
 
     async def _on_implement_plan(self, msg: dict, *, stream: StreamCtx | None = None):
@@ -242,7 +263,8 @@ class ClientMessageDispatcher(_Host):
             # its first turn: never steered into it, never stopping it.
             queue_only = bool(msg.get("queue_only"))
             steered = False
-            if (not queue_only and self._steer_possible(pump)
+            lane = await self._pump_chat_is_lane(pump)
+            if (not queue_only and self._steer_possible(pump, item, lane=lane)
                     and not q.of(self.user_sub or "")):
                 # _steer_possible holds only with a session and a layer.
                 steered = bool(await cast("ExecutionLayer", self.layer).steer(
@@ -275,10 +297,12 @@ class ClientMessageDispatcher(_Host):
                 input_queue.announce_queued(queued, idx)
             if pump.is_done:
                 input_queue.arm(pump.chat_id)
-            elif status == input_queue.QUEUED and not queue_only:
+            elif status == input_queue.QUEUED and not queue_only and not drain.holding():
                 # Stop-and-send (Claude CLI headless): a graceful-only
                 # interrupt, so the producer's drain delivers this message as
-                # the next turn in seconds, not at the turn's end.
+                # the next turn in seconds, not at the turn's end. Never
+                # while the platform holds new work: the message would cut
+                # the turn and then wait for the platform anyway.
                 self._maybe_stop_and_send(pump)
             return None
         if self.streaming:
@@ -326,20 +350,38 @@ class ClientMessageDispatcher(_Host):
         if live is None or live.is_done:
             input_queue.arm(cid)
 
-    def _steer_possible(self, pump) -> bool:
+    @staticmethod
+    async def _pump_chat_is_lane(pump) -> bool:
+        """Whether the running turn's chat is a delegated lane's, steered by
+        role (``runs_for_nobody``): its row is read only for a session in a
+        word no person picks."""
+        from core.session.session_state import runs_for_nobody
+        if not runs_for_nobody(pump.session_id, pump.chat_id):
+            return False
+        return (await run_db(task_store.get_chat, pump.chat_id) or {}).get("origin") == "delegated"
+
+    def _steer_possible(self, pump, item=None, *, lane: bool = False) -> bool:
         """Whether a typed message may go INTO ``pump``'s running turn: an
         engine that steers, on a pump whose turns a person drives (a
-        dashboard turn or a task run). A parked permission card or question
-        is ``layer.steer``'s own refusal."""
+        dashboard turn or a task run). A steer carries text alone, so a
+        message with photos waits for the next turn on an engine that takes
+        them only with a turn. A parked permission card or question is
+        ``layer.steer``'s own refusal."""
         if not (self.session_id and self.layer):
             return False
         if getattr(pump, "source_type", session_kind.DASHBOARD.source_type) \
                 not in session_kind.STEERABLE_SOURCE_TYPES:
             return False
+        from core.session.session_state import runs_for_nobody
+        if runs_for_nobody(getattr(pump, "session_id", ""), getattr(pump, "chat_id", ""), lane=lane):
+            return False  # a wake's unattended turn: the message waits for its end
         try:
-            return bool(self.layer.capabilities_for(self.session_id).behaviour.supports_steer)
+            behaviour = self.layer.capabilities_for(self.session_id).behaviour
         except ValueError:
             return True
+        if item is not None and item.images and behaviour.attach_images_inline:
+            return False
+        return bool(behaviour.supports_steer)
 
     async def _on_cancel_queued(self, msg: dict, *, stream: StreamCtx | None = None):
         # By its queue id (a 1.7.0 client sends the index only). Its author
@@ -413,6 +455,10 @@ class ClientMessageDispatcher(_Host):
         # (the REST cancel route asks the same of its caller).
         if await self._deny_task_continue(stream.pump.chat_id if stream is not None else self.chat_id):
             return None
+        # Stop means stop: a continuation after a limit that waits for the
+        # chat does not run (the branches below read the chat's queue next).
+        await subscription_pool.stop_continuation(
+            (stream.pump.chat_id if stream is not None else self.chat_id) or "", self.user_sub or "")
         if stream is not None:
             pump = stream.pump
             logger.info("WS dashboard: abort via pump, session=%s", self.session_id)
@@ -630,6 +676,8 @@ class ClientMessageDispatcher(_Host):
                 a_frame.update(status="denied", reason=refusal)
             elif pump._meeting_agent or await run_db(task_store.get_active_meeting_for_chat, a_chat):
                 a_frame.update(status="unavailable", reason="meeting in progress")
+            elif drain.holding():
+                a_frame.update(status="unavailable", reason=wire.REASON_UPDATING)
             else:
                 interaction, a_err = _ai.validate_interaction(
                     a_chat, a_token,
@@ -674,6 +722,8 @@ class ClientMessageDispatcher(_Host):
                 ap_frame.update(status="denied", reason=refusal)
             elif pump._meeting_agent or await run_db(task_store.get_active_meeting_for_chat, ap_chat):
                 ap_frame.update(status="unavailable", reason="meeting in progress")
+            elif drain.holding():
+                ap_frame.update(status="unavailable", reason=wire.REASON_UPDATING)
             else:
                 interaction, ap_err = _ai.validate_app_action(
                     ap_chat, self.agent_name or "", self.user_sub or "",
@@ -681,7 +731,7 @@ class ClientMessageDispatcher(_Host):
                 )
                 if interaction is None:
                     ap_frame.update(status="denied", reason=ap_err)
-                elif not _ai.check_rate(ap_chat, f"app:{ap_id}"):
+                elif not _ai.check_app_press(ap_chat, self.user_sub or "", ap_id):
                     ap_frame.update(status="denied", reason="rate limited")
                 elif self._queue_interaction(pump, interaction, stream.chat_id):
                     ap_frame["status"] = "queued"
@@ -722,6 +772,19 @@ class ClientMessageDispatcher(_Host):
         # lands before the pty_attach handshake. get() returns None for a
         # headless session → no-op. write_input resets the idle timer.
         isess = interactive_session.get(self.session_id) if self.session_id else None
+        if isess is None and msg.get("composer") and self.session_id and self.chat_id:
+            # A whole message for a terminal that has ended (the idle reaper,
+            # an eviction for room, a crash) since this socket attached: the
+            # chat's live terminal takes it when there is one, else it is
+            # answered, never dropped without a word. The exit frame makes the
+            # page start the terminal again at the next send.
+            isess = interactive_session.find_live_for_chat(self.chat_id)
+        if isess is None and msg.get("composer") and self.session_id and self.chat_id:
+            await self._send({"type": wire.PTY_EXIT, "chat_id": self.chat_id,
+                              "session_id": self.session_id, "reason": "ended"})
+            await self._send_error(
+                "The terminal of this chat had stopped. Your message was not sent. Send it again.")
+            return None
         if isess is not None:
             if session_kind.is_task_chat_id(isess.chat_id) and not await self._may_drive_terminal(isess):
                 return None
@@ -937,8 +1000,9 @@ class ClientMessageDispatcher(_Host):
         engine/model/seed from the chat row, so the switch governs exactly
         those; gates = run not pending/running (``task_run_active`` — the
         run lifecycle is invisible to session probes), the continue tier
-        (``_task_continue_allowed``: agent-scope → editor+, user-scope →
-        creator/admin), and TASK-identity credentials (agent scope runs on
+        (``task_continue_refusal``: agent-scope → editor+, a manager for a
+        run that writes knowledge, user-scope → creator/admin), and
+        TASK-identity credentials (agent scope runs on
         the platform pool, not the viewer's subs). Phone chats stay denied
         (their pipeline resolves the engine from agent config every call).
         Chats targeted by an ACTIVE continuation task are denied — a rebind
@@ -977,15 +1041,10 @@ class ClientMessageDispatcher(_Host):
             return
         cid = chat["id"]
         agent = chat.get("agent") or ""
-        if session_kind.of_chat(chat) is session_kind.PHONE:
-            await _deny("Phone chats can't switch engines — their calls "
-                        "resolve the engine from the agent configuration.")
-            return
         role = await run_db(acting_role_of, self.user_sub, agent)
         is_task_chat = session_kind.is_task_chat_id(cid)
         task_run = None
         if is_task_chat:
-            from core.session.visibility import _task_continue_allowed
             from ws.dashboard import task_run_active_async
             if await task_run_active_async(cid):
                 await _deny("The task run is still active — switching "
@@ -993,14 +1052,27 @@ class ClientMessageDispatcher(_Host):
                             alive=True)
                 return
             task_run = await run_db(task_store.get_run, session_kind.run_id_of_chat(cid))
-            if task_run is not None:
-                if not _task_continue_allowed(
-                        task_run, effective_role=role, user_sub=self.user_sub):
-                    await _deny("Switching this task chat's engine needs the "
-                                "same access as continuing it (agent-scope: "
-                                "editor or above; user-scope: the creator).")
-                    return
-            elif _vis.is_task_chat_owner(chat.get("user_sub")):
+        if not is_task_chat or task_run is not None:
+            # The rule every door asks (a call only the call drives, a run's
+            # own rule, the shared space's editor tier); a task chat's
+            # refusal names what switching takes.
+            refusal = await run_db(_vis.drive_refusal, chat, self.user_sub or "", role)
+            if refusal and is_task_chat:
+                await _deny("Switching this task chat's engine needs the "
+                            "same access as continuing it. For an agent's "
+                            "task that is an editor or above, and a manager "
+                            "when the run can change the agent's knowledge. "
+                            "For a person's own task it is its creator.")
+                return
+            if refusal and session_kind.of_chat(chat) is session_kind.PHONE:
+                await _deny(refusal)
+                return
+            if refusal:
+                # Its own owner rule below is stricter than the rule's floor.
+                await _deny("Only the chat owner can switch its engine.")
+                return
+        if is_task_chat and task_run is None:
+            if _vis.is_task_chat_owner(chat.get("user_sub")):
                 # Run row aged out; the synthetic owner can't match any
                 # viewer — apply the agent-scope continue tier.
                 if not roles.can_edit(role):
@@ -1010,7 +1082,7 @@ class ClientMessageDispatcher(_Host):
             elif (chat.get("user_sub") != self.user_sub and not roles.is_admin(role)):
                 await _deny("Only the chat owner can switch its engine.")
                 return
-        elif chat.get("user_sub") != self.user_sub and not roles.is_admin(role):
+        elif not is_task_chat and chat.get("user_sub") != self.user_sub and not roles.is_admin(role):
             await _deny("Only the chat owner can switch its engine.")
             return
         # A chat wired as an active continuation target must keep its row
@@ -1047,32 +1119,27 @@ class ClientMessageDispatcher(_Host):
         if new_path not in _get_execution_paths(agent_rec):
             await _deny("That AI engine isn't enabled for this agent.")
             return
+        from core.config import spender
         if is_task_chat:
             # The follow-up turn rebuilds under the TASK identity, not the
-            # viewer: agent scope → platform pool only; user scope → the
-            # CREATOR's credentials. Checking the viewer here would both
-            # deny legitimate switches and green-light unusable ones.
-            _scope = ((task_run or {}).get("scope")
-                      or ("agent" if _vis.is_task_chat_owner(chat.get("user_sub"))
-                          else "user"))
-            if _scope == "agent":
+            # viewer, and spends what the run spends (``core/config/spender.py``):
+            # the shared subscriptions, or the person the run is paid by.
+            # Checking the viewer here would both deny legitimate switches
+            # and green-light unusable ones.
+            _payer = await asyncio.to_thread(spender.chat_spender, chat, None)
+            if not _payer.sub:
                 if not await asyncio.to_thread(
                         subscription_pool.layer_platform_configured, new_path):
                     await _deny("The platform pool has no credentials for "
                                 "that AI engine — an admin must connect one "
                                 "before agent-scope task chats can use it.")
                     return
-            else:
-                _creator = ((task_run or {}).get("created_by")
-                            or chat.get("user_sub") or "")
-                if not await asyncio.to_thread(
-                        subscription_pool.user_can_run, new_path, _creator):
-                    await _deny("The task's creator has no access to that "
-                                "AI engine — its follow-up turns run on "
-                                "their credentials.")
-                    return
+            elif not await asyncio.to_thread(spender.can_run, new_path, _payer.sub):
+                await _deny("The person this task runs for cannot use that "
+                            "AI engine. Its next turns run on their accounts.")
+                return
         elif not await asyncio.to_thread(
-                subscription_pool.user_can_run, new_path, self.user_sub):
+                spender.can_run, new_path, self.user_sub):
             await _deny("You don't have access to that AI engine — connect "
                         "it in your AI-engine settings first.")
             return
@@ -1103,8 +1170,8 @@ class ClientMessageDispatcher(_Host):
                 cid, reason="engine_switch")
         if old_sid:
             with contextlib.suppress(Exception):
-                from api.agents.chats import _close_chat_session
-                await _close_chat_session(chat)
+                from services.agents import chat_removal
+                await chat_removal.close_chat_session(chat)
             clear_session_liveness(old_sid, reason="engine_switch")
             _pending_permissions.pop(old_sid, None)
             from core.concurrency import release_chat_slot
@@ -1175,8 +1242,8 @@ class ClientMessageDispatcher(_Host):
         # engine (move_chat leaves this to the next resume; here the user
         # stays on the open chat and prompts immediately).
         with contextlib.suppress(Exception):
-            self.layer = get_execution_layer(
-                agent, execution_path=new_path, user_sub=self.user_sub,
+            self.layer = await run_db(
+                get_execution_layer, agent, execution_path=new_path, user_sub=self.user_sub,
                 role=role, execution_target=chat.get("execution_target") or "",
             )
         logger.info(
@@ -1218,24 +1285,26 @@ class ClientMessageDispatcher(_Host):
                               "message": "No active session — send a message "
                                          "first, then compact."})
             return
-        pump = _active_pumps.get(self.chat_id) if self.chat_id else None
+        # The socket may view another chat by the time the engine answers.
+        cid, sid, layer = self.chat_id, self.session_id, self.layer
+        pump = _active_pumps.get(cid) if cid else None
         if self.streaming or (pump and not pump.is_done):
             await self._send({"type": wire.ERROR,
                               "message": "Cannot compact while a turn is running."})
             return
         await self._send({"type": wire.CONTEXT_COMPACT, "phase": "started",
-                          "trigger": "manual", "chat_id": self.chat_id or ""})
+                          "trigger": "manual", "chat_id": cid or ""})
         result = None
         try:
-            async with self.layer.session_lock(self.session_id):
-                result = await self.layer.compact(self.session_id)
+            async with layer.session_lock(sid):
+                result = await layer.compact(sid)
         except Exception:
             logger.exception(
-                "WS dashboard: compaction failed, session=%s", self.session_id
+                "WS dashboard: compaction failed, session=%s", sid
             )
         if result is None:
             await self._send({"type": wire.CONTEXT_COMPACT, "phase": "failed",
-                              "chat_id": self.chat_id or ""})
+                              "chat_id": cid or ""})
             await self._send({"type": wire.ERROR,
                               "message": "Context compaction failed or is not "
                                          "supported by this engine."})
@@ -1243,16 +1312,19 @@ class ClientMessageDispatcher(_Host):
         post_tokens = result.get("post_tokens")
         evt = {"type": wire.CONTEXT_COMPACT, "phase": "completed",
                "trigger": "manual", "post_tokens": post_tokens}
-        if self.chat_id:
-            # Persist the separator block (pump-shaped event row) and pin the
-            # gauge so a reload shows the compacted size.
-            task_store.add_chat_message(self.chat_id, "event", "",
-                                        event_type=wire.CONTEXT_COMPACT,
-                                        event_data=_json.dumps(evt))
-            if post_tokens is not None:
-                task_store.update_chat(self.chat_id, context_used=post_tokens)
         # As after a compaction the pump sees: the engine just forgot what it
-        # had not saved, so the next message carries the memory reminder once.
+        # had not saved, so the next message carries the memory reminder once,
+        # and the start's riding part again (its first turn was summarised).
+        # Ahead of the write's hop: a prompt built during it takes the reminder.
         from services.memory import memory_nudge
-        memory_nudge.arm(self.session_id)
-        await self._send({**evt, "chat_id": self.chat_id or ""})
+        memory_nudge.arm(sid)
+        from core.session import start_context
+        start_context.reset(sid)
+        if cid:
+            # The chat's lane: only it orders the chat's rows, so a reload
+            # shows the separator where the compaction happened. The gauge's
+            # pin shows the compacted size.
+            await chat_writer.submit(
+                cid, functools.partial(_persist_compact, cid, _json.dumps(evt), post_tokens),
+                label="compact")
+        await self._send({**evt, "chat_id": cid or ""})

@@ -3,9 +3,11 @@ import { act, fireEvent, render } from '@testing-library/react'
 
 // The composer grows with its text to 10 rows while focused and shrinks to 4
 // when the focus leaves it. A press elsewhere shrinks it on the task after the
-// release (the click lands first), a press on the composer's own bar or into
-// an iframe keeps it open, a scroll (pointercancel) or a window blur changes
-// nothing, and every height write other than a focus change is instant.
+// release (the click lands first), a press on the composer's own bar keeps it
+// open, focus moving into a frame shrinks it once the press inside has had
+// time to land (on a touch screen at once), a scroll (pointercancel) or a
+// window blur changes nothing, and every height write other than a focus
+// change is instant.
 
 vi.mock('@/hooks/useSpeechSession', () => ({
   useSpeechSession: () => ({ available: false, status: 'idle', start: vi.fn(), stop: vi.fn(), toggle: vi.fn() }),
@@ -37,6 +39,7 @@ beforeEach(() => {
 afterEach(() => {
   delete (HTMLTextAreaElement.prototype as { scrollHeight?: number }).scrollHeight
   delete (window as { matchMedia?: unknown }).matchMedia
+  delete (document as { activeElement?: unknown }).activeElement
   vi.useRealTimers()
 })
 
@@ -84,6 +87,32 @@ function clickOrder(target: HTMLElement) {
 
 function focusBox(box: HTMLTextAreaElement) {
   act(() => box.focus())
+}
+
+/** A press or a tap inside a frame, as Chrome shows it to the page: the
+ * focused element blurs with no related target, the window blurs with the
+ * frame already active, and nothing else (no press, no focus event on the
+ * frame element). */
+function focusIntoFrame(from: HTMLElement, frame: HTMLElement) {
+  Object.defineProperty(document, 'activeElement', { configurable: true, get: () => frame })
+  act(() => {
+    fireEvent.blur(from)
+    fireEvent.focusOut(from)
+    fireEvent.blur(window)
+  })
+}
+
+function backFromFrame(box: HTMLTextAreaElement) {
+  delete (document as { activeElement?: unknown }).activeElement
+  focusBox(box)
+}
+
+const wait = (ms: number) => act(() => { vi.advanceTimersByTime(ms) })
+
+function touchScreen() {
+  window.matchMedia = vi.fn().mockImplementation((q: string) => ({
+    matches: q === '(pointer: coarse)', media: q, addEventListener: vi.fn(), removeEventListener: vi.fn(),
+  })) as unknown as typeof window.matchMedia
 }
 
 describe('ChatInput height', () => {
@@ -170,20 +199,58 @@ describe('ChatInput height', () => {
     expect(box.style.height).toBe(px(box, 10))
   })
 
-  it('focus going into an iframe keeps it open', () => {
+  it('a click into a frame (an app, an artifact, a document) shrinks it once the click has landed', () => {
     const { box, get } = page()
     focusBox(box)
-    fireEvent.blur(box, { relatedTarget: get('frame') })
-    fireEvent.focusIn(get('frame'))
+    focusIntoFrame(box, get('frame'))
+    wait(0)
+    expect(box.style.height).toBe(px(box, 10))
+    wait(498)
+    expect(box.style.height).toBe(px(box, 10))
+    wait(2)
+    expect(box.style.height).toBe(px(box, 4))
+    expect(box.value).toBe('a long draft')
+  })
+
+  it('on a touch screen a tap into a frame shrinks it at once (the focus moves after the release)', () => {
+    touchScreen()
+    const { box, get } = page()
+    focusBox(box)
+    focusIntoFrame(box, get('frame'))
+    flush()
+    expect(box.style.height).toBe(px(box, 4))
+  })
+
+  it('back in the box before the wait ends, it stays open', () => {
+    const { box, get } = page()
+    focusBox(box)
+    focusIntoFrame(box, get('frame'))
+    wait(200)
+    backFromFrame(box)
+    wait(1000)
+    expect(box.style.height).toBe(px(box, 10))
+  })
+
+  it('a control of the bar focused, then a click into a frame, shrinks it', () => {
+    const { box, get } = page()
+    focusBox(box)
+    act(() => get('picker').focus())
     flush()
     expect(box.style.height).toBe(px(box, 10))
+    focusIntoFrame(get('picker'), get('frame'))
+    wait(500)
+    expect(box.style.height).toBe(px(box, 4))
   })
 
   it('the window losing focus changes nothing', () => {
     const { box } = page()
     focusBox(box)
-    fireEvent.blur(box)
+    act(() => {
+      fireEvent.blur(box)
+      fireEvent.blur(window)
+    })
     flush()
+    wait(1000)
     expect(box.style.height).toBe(px(box, 10))
   })
 
@@ -258,19 +325,33 @@ describe('ChatInput height', () => {
     fireEvent.pointerUp(get('outside'))
     flush()
     expect(box.style.height).toBe(px(box, 10))
+    focusIntoFrame(box, get('frame'))
+    wait(1000)
+    expect(box.style.height).toBe(px(box, 10))
   })
 
   it('unmounting removes its listeners and drops a pending change', () => {
     const removeDoc = vi.spyOn(document, 'removeEventListener')
     const removeWin = vi.spyOn(window, 'removeEventListener')
-    const { box, unmount } = page()
+    const { box, get, unmount } = page()
     focusBox(box)
-    act(() => box.blur())
+    focusIntoFrame(box, get('frame'))
     unmount()
     expect(removeDoc).toHaveBeenCalledWith('pointerdown', expect.any(Function), true)
     expect(removeDoc).toHaveBeenCalledWith('focusin', expect.any(Function), true)
     expect(removeWin).toHaveBeenCalledWith('pointerup', expect.any(Function), true)
     expect(removeWin).toHaveBeenCalledWith('blur', expect.any(Function))
     expect(() => vi.runOnlyPendingTimers()).not.toThrow()
+  })
+})
+
+describe('the placeholder', () => {
+  it('reads its hint by default, and nothing when the page says the box is locked above it', () => {
+    const open = page({ placeholder: undefined })
+    expect(open.box.placeholder).toBe('Type a message...')
+    open.unmount()
+    const locked = page({ placeholder: '', disabled: true })
+    expect(locked.box.placeholder).toBe('')
+    expect(locked.box.disabled).toBe(true)
   })
 })

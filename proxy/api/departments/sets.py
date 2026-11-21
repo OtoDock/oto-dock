@@ -69,6 +69,16 @@ def _entry_view(registry: dict, entry: dict, u: UserContext) -> dict:
     return out
 
 
+def _choices(use: str) -> dict[str, str]:
+    """``template:choice`` pairs, comma separated, as a dict."""
+    out: dict[str, str] = {}
+    for pair in use.split(","):
+        template, _, choice = pair.partition(":")
+        if template.strip() and choice.strip():
+            out[template.strip()] = choice.strip()
+    return out
+
+
 @router.get("/v1/community/departments")
 async def list_department_sets(user: UserContext = Depends(get_current_user)) -> dict:
     """Every department set the catalog serves, with the departments this
@@ -83,20 +93,24 @@ async def list_department_sets(user: UserContext = Depends(get_current_user)) ->
 
 @router.get("/v1/community/departments/{slug}/preview")
 async def preview_department_set(
-    slug: str, department_name: str = "", new: str = "",
+    slug: str, department_name: str = "", use: str = "",
     user: UserContext = Depends(get_current_user),
 ) -> dict:
     """What installing the set would do for this person: each member
-    installed new or adopted (``new`` names templates to install new
-    instead of adopting, comma separated), the apps and checks the consent
-    covers, the library, the schedules, the name's problem if any, a job
-    already running."""
+    installed new or an agent the person has used, with the agents they may
+    choose from (``use``: the person's choices, ``template:new`` or
+    ``template:<agent slug>``, comma separated; a choice no member may take
+    is refused, 400), the apps and checks the consent covers, the library,
+    the schedules, the name's problem if any, a job already running."""
     u = require_creator_or_admin(user, detail=_CREATOR_DETAIL)
     registry = await _registry("GET /v1/community/departments/{slug}/preview")
     entry, dset = _set_or_404(registry, slug)
     name = (department_name or dset.name).strip()
-    choices = {t.strip(): installer.ACTION_NEW for t in new.split(",") if t.strip()}
-    plan = await asyncio.to_thread(installer.plan_members, dset, registry, u, choices, name)
+    choices = _choices(use)
+    try:
+        plan = await asyncio.to_thread(installer.plan_members, dset, registry, u, choices, name)
+    except installer.SetInstallRefused as exc:
+        raise HTTPException(exc.status, exc.detail) from exc
     members = []
     for row in plan:
         tpl = sets.template_entry(registry, row["template"]) or {}
@@ -124,8 +138,9 @@ class InstallSetBody(BaseModel):
     # The dialog's one checkbox: approve every member's apps and checks
     # with the signatures the registry carries.
     consent: bool = False
-    # Members to install new instead of adopting an installed agent.
-    new: list[str] = []
+    # Each member's choice: "new", or the slug of an agent the person may use
+    # (the preview's ``options``); a member left out takes the preselection.
+    use: dict[str, str] = {}
 
 
 @router.post("/v1/community/departments/{slug}/install", status_code=202)
@@ -140,7 +155,7 @@ async def install_department_set(
     name = (body.department_name or dset.name).strip()
     try:
         job = await installer.start(dset, registry, name, u, consent=body.consent,
-                                    choices={t: installer.ACTION_NEW for t in body.new})
+                                    choices={t.strip(): c.strip() for t, c in body.use.items()})
     except (installer.SetInstallRefused, assignment.AssignmentRefused) as exc:
         raise HTTPException(exc.status, exc.detail) from exc
     return {"job_id": job["id"], "job": job}

@@ -41,6 +41,8 @@ from auth import roles
 from auth.roles import OWNER_TIER
 from core.session import session_kind
 from core.session.session_kind import SHARED_CHAT_OWNER_PREFIX, TASK_CHAT_OWNER_PREFIX
+from services.phone import call_chats
+from services.scheduler import task_kinds
 
 if TYPE_CHECKING:
     from auth.providers import UserContext
@@ -244,6 +246,19 @@ def chat_history_owner(agent_name: str, user_sub: str) -> str:
     return user_sub
 
 
+def in_chat_history(chat: dict, user_sub: str) -> bool:
+    """Whether ``chat`` is a row of this person's chat history on its agent:
+    owned by :func:`chat_history_owner` and no task run's chat. What the chat
+    list's own query says (``storage/chat/db_chats.list_chats``), for a
+    caller holding one row. It grants no access: :func:`can_access_chat`
+    decides who may open a chat."""
+    if not user_sub or session_kind.of_chat(chat) is session_kind.TASK \
+            or session_kind.is_task_chat_id(chat.get("id")):
+        return False
+    owner = chat.get("user_sub") or ""
+    return owner == chat_history_owner(chat.get("agent") or "", user_sub)
+
+
 def resolve_visibility(
     agent_name: str,
     *,
@@ -352,52 +367,128 @@ def _run_for_chat(chat: dict) -> dict | None:
     return run
 
 
-def can_access_chat(u: UserContext, chat: dict) -> bool:
-    """May this user open this chat by id? The one rule the REST routes, the
-    dashboard's resume and every frame naming a chat share.
+#: A fact :func:`may_open_chat` reads from the store unless its caller
+#: already holds it (the fan-out reads each chat's once for every candidate).
+_UNREAD = object()
 
-    Owner-equality (per-user chats) OR admin OR — for a Shared-only agent's
-    synthetic-owner chat — any user assigned to the agent (a delegated worker
-    there, with an agent-scope run, only from the editor tier) OR — for a
-    task-run chat (synthetic ``task::`` owner) — the task listing's run rule:
-    agent-scoped runs from the editor tier (``sees_agent_automations``: what
-    the agent does on its own behalf), user-scoped runs only for their
-    creator. Without that branch the REST surface denies rows the
-    ``kind=tasks`` listing itself shows. A phone call's conversation opens
-    for the agent's managers, which is who the conversations list serves, on
-    a person's dashboard only: a manager's session token or API key reads no
-    call. The chat's OWNER decides, never the agent's current mode: a
-    per-user chat from before an agent turned Shared-only stays its owner's.
-    Mutations layer ``can_mutate_chat`` on top.
-    """
-    if u.is_admin:
+
+def may_open_chat(chat: dict, sub: str, role: str, *, admin: bool = False,
+                  run: object = _UNREAD, record: object = _UNREAD) -> bool:
+    """May a principal open this chat by id? The one rule, taking only the
+    acting person's sub ("" for none), their role on the chat's agent and
+    the admin flag, so a caller that holds no principal (the apps fan-out,
+    one candidate after another) asks the same question as a request does.
+
+    ``role`` is a member's row word (``acting_role``), ``roles.SERVICE`` for
+    the agent itself (a session with no person, on its own agent),
+    ``roles.EXTERNAL`` for an outside person, ``roles.NO_ACCESS`` for no
+    place on the agent. In order: an admin opens every chat; a conversation
+    of the agent's Conversations tab (the ``phone`` owner) opens to a
+    manager, and to an editor when its record's line is an editor's
+    (:func:`may_read_conversation`); a person's own chat to its owner; a
+    Shared-only agent's pool chat to its members, a delegated worker in it
+    with an agent-scope run only to the editor tier or the agent itself; a
+    task run's chat by its run (user scope: its creator; agent scope: the
+    editor tier or the agent itself). The chat's OWNER decides, never the
+    agent's current mode: a per-user chat from before an agent turned
+    Shared-only stays its owner's. Reads the run and the record from the
+    store unless ``run`` / ``record`` hand them in."""
+    if admin:
         return True
-    owner = chat.get("user_sub", "")
-    if session_kind.of_chat(chat) is session_kind.PHONE or is_phone_chat_owner(owner):
-        return not u.is_api_key and u.can_manage_agent(chat.get("agent", ""))
-    if owner == u.sub:
+    owner = chat.get("user_sub", "") or ""
+    if is_phone_chat_owner(owner):
+        return may_read_conversation(chat, role, record)
+    if sub and owner == sub:
         return True
-    agent = chat.get("agent", "")
+    member = role not in (roles.NO_ACCESS, roles.EXTERNAL)
+    # What the agent does on its own behalf: the editor tier, or the agent.
+    automations = roles.can_edit(role) or role == roles.SERVICE
     if is_shared_chat_owner(owner):
-        if not u.can_access_agent(agent):
+        if not member:
             return False
-        # The pool's human chats stay readable to its members; a delegated
-        # worker in it (an agent-scope run) is the agent's own work.
-        if u.sees_agent_automations(agent):
+        if automations:
             return True
-        run = _run_for_chat(chat)
-        return run is None or (run.get("scope") or SCOPE_AGENT) == SCOPE_USER
+        found = _run_for_chat(chat) if run is _UNREAD else cast("dict | None", run)
+        return found is None or (found.get("scope") or SCOPE_AGENT) == SCOPE_USER
     if is_task_chat_owner(owner) or session_kind.of_chat(chat) is session_kind.TASK:
-        run = _run_for_chat(chat)
-        if run is not None:
-            if (run.get("scope") or SCOPE_AGENT) == SCOPE_USER:
-                return run.get("created_by") == (u.acting_sub or "")
-            return u.can_access_agent(agent) and u.sees_agent_automations(agent)
+        found = _run_for_chat(chat) if run is _UNREAD else cast("dict | None", run)
+        if found is not None:
+            if (found.get("scope") or SCOPE_AGENT) == SCOPE_USER:
+                return bool(sub) and found.get("created_by") == sub
+            return member and automations
     return False
 
 
-def _task_continue_allowed(run: dict, *, effective_role: str, user_sub: str) -> bool:
-    """Whether a user may CONTINUE (drive a new session for) a task run.
+def chat_facts(chat: dict) -> tuple[dict | None, dict | None]:
+    """``(run, record)`` of ``chat`` as :func:`may_open_chat` reads them, for
+    a caller that asks the rule about one chat for many principals."""
+    if is_phone_chat_owner(chat.get("user_sub")):
+        from storage.chat import conversation_store
+        return None, conversation_store.get(chat.get("id", ""))
+    return _run_for_chat(chat), None
+
+
+def role_on(u: UserContext, agent: str) -> str:
+    """The role :func:`may_open_chat` takes for a request's principal on
+    ``agent``: an outside person's, none off the agent a session was minted
+    for (or that a person holds no row on), the agent itself for a session
+    with no person or the master key, else the acting role."""
+    if u.is_external:
+        return roles.EXTERNAL
+    if not u.can_access_agent(agent):
+        return roles.NO_ACCESS
+    if u.is_service or u.is_no_user_session:
+        return roles.SERVICE
+    return u.acting_role(agent)
+
+
+def can_access_chat(u: UserContext, chat: dict, *, run: object = _UNREAD) -> bool:
+    """May this user open this chat by id? The one rule the REST routes, the
+    dashboard's resume and every frame naming a chat share:
+    :func:`may_open_chat` for the request's principal. A session token or an
+    API key reads no call, an admin's neither (a model would read a caller's
+    words raw). Mutations layer ``can_mutate_chat`` on top. ``run`` hands in
+    the chat's run (or None) for a listing that resolved its rows' runs."""
+    if is_phone_chat_owner(chat.get("user_sub", "")) and u.is_api_key:
+        return False
+    agent = chat.get("agent", "") or ""
+    return may_open_chat(chat, u.acting_sub or "", role_on(u, agent), admin=u.is_admin, run=run)
+
+
+def may_read_conversation(chat: dict, role: str, record: object = _UNREAD) -> bool:
+    """Whether ``role`` reads a conversation of the Conversations tab: a
+    manager, an editor except a 1.9.1 call on a route tied to a person (the
+    ``person`` line, or a conversation with no record), which stays the
+    managers' as it was. Reads the record for an editor."""
+    if roles.can_manage(role):
+        return True
+    if not roles.can_edit(role):
+        return False
+    from storage.chat import conversation_store
+    found = conversation_store.get(chat.get("id", "")) if record is _UNREAD else record
+    return isinstance(found, dict) and found.get("line") in conversation_store.EDITOR_LINES
+
+
+def agent_work_audience(agent: str, *, fan_out: bool = False) -> list[str]:
+    """Who hears what ``agent`` does on its own behalf (its runs, a run
+    waiting on an answer, trigger fires, verdicts): the editor tier and
+    every admin, the people :func:`may_open_chat` lets open an agent-scope
+    run. From the notification manager's audience cache, callable from any
+    thread; ``fan_out`` for a caller on the loop that only delivers frames
+    (``notification_manager.agent_audience``)."""
+    from services.notifications.notification_manager import agent_audience
+    return sorted(set(agent_audience(agent, fan_out=fan_out, floor=roles.EDITOR)))
+
+
+#: What a person reads when a task run is not theirs to continue.
+TASK_CONTINUE_REFUSED = "Access denied"
+KNOWLEDGE_RUN_REFUSED = ("Only a manager of this agent can continue this run. "
+                         "It can change the agent's knowledge.")
+
+
+def task_continue_refusal(run: dict, *, effective_role: str, user_sub: str) -> str:
+    """Why a user may not CONTINUE (drive a session of) a task run, "" when
+    they may.
 
     A continued task is an interactive chat in the task's stored scope, so
     the gate matches the CREATE gate:
@@ -405,16 +496,126 @@ def _task_continue_allowed(run: dict, *, effective_role: str, user_sub: str) -> 
     - **Agent-scoped** task → editor+ on the agent (``can_edit_agent``: the
       same tier that may create agent-scope tasks). Continuing drives an
       agent-scope ``/workspace``-RW session, which a viewer must never do —
-      even the original creator, if since demoted to viewer.
+      even the original creator, if since demoted to viewer. A run whose
+      session writes the agent's knowledge (a manager's scheduled or
+      delegated run: ``task_config_builder.run_holds_knowledge_write``)
+      takes the manager tier: the write is the creator's, and whoever
+      drives the run steers it.
     - **User-scoped** task → the creator or a platform admin.
 
     ``effective_role`` is the live per-agent role from
     ``acting_role_of`` ("admin" for platform admins, which is why the
-    user-scope branch needs no separate admin check beyond it).
+    user-scope branch needs no separate admin check beyond it). A manager
+    is answered with no read; an editor's answer reads the store, so every
+    caller on the loop runs it in a worker thread.
 
     NOTE: this gates CONTINUING. Read-only VIEWING of an agent-scoped run
     (history load) follows the broader REST ``_check_run_access`` rule.
     """
     if (run.get("scope") or SCOPE_AGENT) == SCOPE_USER:
-        return run.get("created_by") == user_sub or roles.is_admin(effective_role)
-    return roles.can_edit(effective_role)
+        own = run.get("created_by") == user_sub or roles.is_admin(effective_role)
+        return "" if own else TASK_CONTINUE_REFUSED
+    if roles.can_manage(effective_role):
+        return ""
+    if not roles.can_edit(effective_role):
+        return TASK_CONTINUE_REFUSED
+    from core.config.task_config_builder import run_holds_knowledge_write
+    return KNOWLEDGE_RUN_REFUSED if run_holds_knowledge_write(run) else ""
+
+
+#: What a person reads when a chat is not theirs to drive.
+OUTSIDE_DRIVE_REFUSED = "Outside people cannot send into a chat."
+TASK_RUN_NOT_FOUND = "Task run not found"
+PHONE_CHAT_READ_ONLY = "This is a phone call's conversation. Only the call writes here."
+CALL_IN_PROGRESS = "A phone call is writing in this chat. You can write here when it ends."
+WRAPUP_RUN_REFUSED = ("This is the record of what the agent did after a call. "
+                      "Nobody continues it.")
+
+
+def drive_refusal(chat: dict, sub: str, role: str, *, admin: bool = False,
+                  session_id: str = "", service: bool = False) -> str:
+    """Why this principal may not DRIVE this chat (send a turn into it, steer
+    it, answer for it, move it), "" when it may. The one rule every door that
+    drives a chat asks, each door adding only its own extras (a lock, a
+    placement, a terminal); opening a chat to read is ``can_access_chat``.
+
+    ``sub`` is the acting person ("" for a session with no person), ``role``
+    their role on the chat's agent, ``admin`` a platform admin, ``service``
+    the platform's own caller. In order: an outside principal never drives;
+    the agent's conversation is the call's for good, and a chat a call writes
+    in now (a person's own, on a route tied to them) is the call's until it
+    ends (``services.phone.call_chats``); a chat's run row decides
+    (never the id's shape alone), a task's chat of the agent whose run is
+    gone is nobody's, and a wrap-up's run is nobody's; a principal with neither a
+    person nor a session is nobody and drives nothing; a session with no
+    person drives only the agent's own chats, never a person's own run, and
+    a run that writes the agent's knowledge only when its own session holds
+    that write; a person on a pool chat takes the editor floor its session
+    start applies; a run takes its continue rule; a person's own chat is
+    theirs or an admin's. Reads the store: off the loop.
+    """
+    if roles.is_external(role):
+        return OUTSIDE_DRIVE_REFUSED
+    owner = chat.get("user_sub") or ""
+    if is_phone_chat_owner(owner):
+        return PHONE_CHAT_READ_ONLY
+    if call_chats.holds(chat.get("id") or ""):
+        return CALL_IN_PROGRESS
+    run = _run_for_chat(chat)
+    if (run is None and session_kind.is_task_chat_id(chat.get("id") or "")
+            and is_synthetic_owner(owner)):
+        # Nothing says who may continue it; a person's own keeps its owner.
+        return TASK_RUN_NOT_FOUND
+    if run is not None and run.get("task_type") == task_kinds.RUN_WRAPUP:
+        return WRAPUP_RUN_REFUSED
+    if service:
+        return ""
+    if not sub:
+        if not session_id or not is_synthetic_owner(owner):
+            return TASK_CONTINUE_REFUSED
+        if run is None:
+            return ""
+        if (run.get("scope") or SCOPE_AGENT) == SCOPE_USER:
+            return TASK_CONTINUE_REFUSED
+        from core.config.task_config_builder import (
+            run_holds_knowledge_write,
+            session_holds_knowledge_write,
+        )
+        if run_holds_knowledge_write(run) and not session_holds_knowledge_write(session_id):
+            return KNOWLEDGE_RUN_REFUSED
+        return ""
+    if is_shared_chat_owner(owner):
+        from core.sandbox.session_config_dir import (
+            AgentStateRefused,
+            refuse_agent_state_below_editor,
+        )
+        agent = chat.get("agent") or ""
+        try:
+            refuse_agent_state_below_editor(SCOPE_AGENT, role, shared_only=is_shared_only(agent))
+        except AgentStateRefused as e:
+            return str(e)
+    if run is not None:
+        return task_continue_refusal(run, effective_role=role, user_sub=sub)
+    if is_synthetic_owner(owner) or owner == sub or admin or roles.is_admin(role):
+        return ""
+    return TASK_CONTINUE_REFUSED
+
+
+def runs_as_chat(chat: dict) -> bool:
+    """A chat whose turns a person's chat builds: a dashboard chat, or a chat
+    a call wrote in a person's own space (a Shared-only agent's shared chat
+    included) once no call holds it. The row's kind stays the record."""
+    kind = session_kind.of_chat(chat)
+    if kind is session_kind.DASHBOARD:
+        return True
+    return (kind is session_kind.PHONE and not is_phone_chat_owner(chat.get("user_sub") or "")
+            and not call_chats.holds(chat.get("id") or ""))
+
+
+def drive_refusal_for(u: UserContext, chat: dict) -> str:
+    """:func:`drive_refusal` for a request's principal: its acting person and
+    role on the chat's agent, its admin flag, its session."""
+    agent = chat.get("agent") or ""
+    return drive_refusal(
+        chat, u.acting_sub or "", u.acting_role(agent), admin=u.is_admin,
+        session_id=u.session_id or "", service=u.is_service)

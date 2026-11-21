@@ -76,10 +76,9 @@ class TestCapabilitiesFor:
         assert caps.name == "remote" and caps.supports_control_commands
         assert layer.capabilities_for("").name == "remote"
 
-    def test_a_local_layer_is_its_own_engine(self):
-        for path in ("claude-code-cli", "codex-cli", "direct-llm"):
-            lay = get_layer_by_path(path)
-            assert lay.capabilities_for("any") is lay.capabilities
+    def test_a_layer_that_holds_its_own_sessions_is_its_own_engine(self):
+        lay = get_layer_by_path("direct-llm")
+        assert lay.capabilities_for("any") is lay.capabilities
 
 
 # --- session_self_wakes: the engine's runtime fact, per session ---------------
@@ -95,15 +94,13 @@ class TestSelfWakes:
         assert await layer.session_self_wakes("unknown") is False
 
     @pytest.mark.asyncio
-    async def test_local_layers_read_their_flag_and_ownership(self):
-        cli = get_layer_by_path("claude-code-cli")
-        codex = get_layer_by_path("codex-cli")
-        with patch.object(type(cli), "owns_session", return_value=True):
-            assert await cli.session_self_wakes("s") is True
-        with patch.object(type(cli), "owns_session", return_value=False):
-            assert await cli.session_self_wakes("s") is False
-        with patch.object(type(codex), "owns_session", return_value=True):
-            assert await codex.session_self_wakes("s") is False
+    async def test_direct_llm_reads_its_own_flag_for_a_session_it_holds(self):
+        # The rule a layer inherits (its flag, for a session it holds) is
+        # pinned in ``contract/layer-declared``; Direct LLM declares no wake.
+        direct = get_layer_by_path("direct-llm")
+        assert direct.capabilities.runtime.self_wakes is False
+        with patch.object(type(direct), "owns_session", return_value=True):
+            assert await direct.session_self_wakes("s") is False
 
 
 # --- the remote interactive spawn (the phase-2 NameError) ---------------------
@@ -173,8 +170,8 @@ class TestConnectionManagerEngineReads:
 # warmup binds the chat to the session — a chat lookup at that instant finds
 # nothing (the released code did that, and every remote Codex chat since
 # 2026-09-17 lost its thread id; found on T1 in phase 4). So the marker only
-# records the handle on the session, and the adapter yields the local
-# layer's METADATA event on the first turn — the pump writes the column.
+# records the handle on the session, and the adapter yields the METADATA
+# event on the first turn — the pump writes the column.
 
 class TestResumeHandle:
     def test_the_marker_records_on_the_session_and_touches_no_table(self):
@@ -242,6 +239,7 @@ _CLAUDE_BLOB = {"claudeAiOauth": {"accessToken": "at", "refreshToken": "", "expi
                                   "scopes": [], "subscriptionType": "", "rateLimitTier": ""}}
 _CODEX_AUTH = {"auth_mode": "chatgpt", "tokens": {"id_token": "ID", "access_token": "NEW",
                                                    "refresh_token": "", "account_id": "A"}}
+_CODEX_KEY_AUTH = {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-openai"}
 _MCP_JSON = {"mcpServers": {
     "display": {"command": "/opt/otodock/mcps/custom/display-mcp/venv/bin/python",
                 "args": ["/opt/otodock/mcps/custom/display-mcp/server.py"],
@@ -260,7 +258,7 @@ _MCP_TOML = (
 def _snapshot_config(tmp_path: Path, **over) -> AgentConfig:
     base = dict(agent_name="test-agent", execution_target="machine-1",
                 system_prompt="You are a test agent.", model="claude-sonnet-5",
-                effort="high", permission_mode="default", client_type="dashboard",
+                effort="high", permission_mode="ask", client_type="dashboard",
                 extra_env={}, multi_value_envs={"OTO_ALLOWED_ROOTS": ":"},
                 credential_env={"OTO_ALLOWED_ROOTS": "/users/alice/workspace:/workspace"},
                 security_context=SimpleNamespace(mount_username="alice", username="alice",
@@ -279,7 +277,7 @@ def _snapshot_cases(tmp_path: Path) -> dict[str, tuple[str, AgentConfig]]:
     c = lambda **kw: _snapshot_config(tmp_path, **kw)
     return {
         "claude_oauth_dashboard": ("claude-code-cli", c(
-            extra_env={"_CLAUDE_CREDS_BLOB": json.dumps(_CLAUDE_BLOB)},
+            permission_mode="autoReview", extra_env={"_CLAUDE_CREDS_BLOB": json.dumps(_CLAUDE_BLOB)},
             mcp_config_path=str(mcp_json))),
         "claude_api_key_ultra_effort": ("claude-code-cli", c(
             extra_env={"ANTHROPIC_API_KEY": "sk-test"}, effort="ultra")),
@@ -289,12 +287,12 @@ def _snapshot_cases(tmp_path: Path) -> dict[str, tuple[str, AgentConfig]]:
             interactive=True, interactive_first_prompt="hello", use_native_permissions=True,
             work_cwd="/home/u/proj", term="xterm-kitty")),
         "codex_oauth_dashboard": ("codex-cli", c(
-            model="gpt-5.6-sol", effort="ultra",
+            model="gpt-5.6-sol", effort="ultra", permission_mode="autoReview",
             extra_env={"_CODEX_AUTH_JSON": json.dumps(_CODEX_AUTH)},
             mcp_config_path=str(mcp_toml))),
         "codex_task_hooks_floor": ("codex-cli", c(
             model="gpt-5.6-sol", effort="high", client_type="task",
-            permission_mode="acceptEdits", extra_env={"CODEX_API_KEY": "sk-openai"})),
+            permission_mode="autoReview", extra_env={"_CODEX_AUTH_JSON": json.dumps(_CODEX_KEY_AUTH)})),
         "codex_local_endpoint_ollama": ("codex-cli", c(
             model="qwen3.6-35b-a3b", effort="medium",
             extra_env={"_CODEX_ENDPOINT_URL": "http://127.0.0.1:11434/v1",
@@ -305,30 +303,14 @@ def _snapshot_cases(tmp_path: Path) -> dict[str, tuple[str, AgentConfig]]:
         "codex_judge_full_fs": ("codex-cli", c(
             model="gpt-5.6-sol", effort="high", permission_mode="judge",
             security_context=judge_ctx)),
-        # A 0.5.156 satellite, the current words (``_sat156``: _snapshot_layer).
-        "claude_auto_review_sat156": ("claude-code-cli", c(
-            permission_mode="autoReview", extra_env={"_CLAUDE_CREDS_BLOB": json.dumps(_CLAUDE_BLOB)},
-            mcp_config_path=str(mcp_json))),
-        "claude_ask_interactive_sat156": ("claude-code-cli", c(
-            permission_mode="ask", interactive=True, interactive_first_prompt="hello",
-            use_native_permissions=True)),
-        "codex_auto_review_sat156": ("codex-cli", c(
-            model="gpt-5.6-sol", effort="high", permission_mode="autoReview",
-            extra_env={"_CODEX_AUTH_JSON": json.dumps(_CODEX_AUTH)}, mcp_config_path=str(mcp_toml))),
     }
 
 
-def _snapshot_layer(version: str = "0.5.123") -> RemoteExecutionLayer:
+def _snapshot_layer() -> RemoteExecutionLayer:
     lay = RemoteExecutionLayer(MagicMock())
-    cm = lay._cm
-    cm.satellite_supports_local_model_provider.return_value = True
-    cm.satellite_supports_local_model_catalog.return_value = True
-    cm.satellite_supports_codex_hooks_floor.return_value = True
-    cm.satellite_supports_hook_parity.return_value = True
-    cm.satellite_supports_checks.return_value = True
-    cm.satellite_supports_codex_attended_floor.return_value = version != "0.5.123"
-    cm.satellite_version.return_value = version
-    cm.satellite_name.return_value = "drill-sat"
+    lay._cm.satellite_version.return_value = "0.5.171"
+    # 0.5.171 runs no start hook: its terminal's riding part is in its text.
+    lay._cm.satellite_takes_start_context.return_value = False
     return lay
 
 
@@ -342,27 +324,58 @@ def _comparable(payload: dict) -> dict:
 
 @pytest.mark.asyncio
 async def test_start_payloads_match_the_pre_adapter_snapshot(tmp_path):
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_manifest_store
     expected = json.loads((_FIXTURES / "remote_start_payloads.json").read_text())
     cases = _snapshot_cases(tmp_path)
     assert set(cases) == set(expected)
     machine = {"capabilities": json.dumps({"local_tunnel_port": 18400, "os": "linux"}),
                "pairing_scope": "admin"}
-    with patch.dict(mcp_registry._manifests, clear=True), \
+    with patch.dict(mcp_manifest_store._manifests, clear=True), \
          patch("storage.remote_store.get_remote_machine", return_value=machine), \
          patch("auth.session_token.create_session_token", return_value="JWT"), \
          patch("storage.database.get_user_sub_by_username", return_value="sub-alice"), \
          patch("core.remote.remote_start_payload._load_hook_scripts",
                return_value={"permission_gate.py": "#gate"}):
         for name, (path, cfg) in cases.items():
-            layer = _snapshot_layer("0.5.156" if name.endswith("_sat156") else "0.5.123")
-            plan = await layer._build_start_payload("sess-1", cfg, path)
+            plan = await _snapshot_layer()._build_start_payload("sess-1", cfg, path)
             assert _comparable(plan.payload) == _comparable(expected[name]), name
             # The plan's own answers.
             file_keys = {"credentials_json", "auth_json"}
             assert plan.credential_file_delivered == bool(file_keys & set(plan.payload)), name
             assert plan.start_timeout_s == (
                 180.0 if "local_model_provider" in plan.payload else 60.0), name
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_gets_the_starts_data_by_its_hook_or_in_its_text(tmp_path, monkeypatch):
+    """A satellite that runs the start hook is asked for its entries on
+    every start (its settings file is the scope's); a terminal on one that
+    cannot gets the start's riding part in its text."""
+    from core.session import start_context
+    monkeypatch.setattr(start_context, "inline_block", lambda sid: "\n\nRIDING-PART")
+    cfg = _snapshot_config(tmp_path, extra_env={"_CLAUDE_CREDS_BLOB": json.dumps(_CLAUDE_BLOB)})
+    machine = {"capabilities": json.dumps({"local_tunnel_port": 18400, "os": "linux"}),
+               "pairing_scope": "admin"}
+    with patch("storage.remote_store.get_remote_machine", return_value=machine), \
+         patch("auth.session_token.create_session_token", return_value="JWT"), \
+         patch("storage.database.get_user_sub_by_username", return_value="sub-alice"):
+        new = _snapshot_layer()
+        new._cm.satellite_takes_start_context.return_value = True
+        cfg.interactive = True
+        plan = await new._build_start_payload("sess-1", cfg, "claude-code-cli")
+        assert plan.payload["start_context_parts"] == start_context.HOOK_PARTS
+        assert "RIDING-PART" not in plan.payload["system_prompt"]
+        cfg.interactive = False
+        plan = await new._build_start_payload("sess-1", cfg, "claude-code-cli")
+        assert plan.payload["start_context_parts"] == start_context.HOOK_PARTS
+        old = _snapshot_layer()
+        cfg.interactive = True
+        plan = await old._build_start_payload("sess-1", cfg, "claude-code-cli")
+        assert "start_context_parts" not in plan.payload
+        assert plan.payload["system_prompt"].endswith("RIDING-PART")
+        cfg.interactive = False
+        plan = await old._build_start_payload("sess-1", cfg, "claude-code-cli")
+        assert "RIDING-PART" not in plan.payload["system_prompt"]
 
 
 @pytest.mark.asyncio
@@ -435,36 +448,48 @@ class TestControlFrames:
         assert (info.model, info.mode) == ("claude-opus-5", "plan")
 
     @pytest.mark.asyncio
+    async def test_claude_gets_its_own_word_for_a_queued_mode_change(self):
+        """A change queued during a turn carries the platform's word: Claude
+        Code is sent its own (Auto is its auto mode, Ask its default) and
+        the session's record keeps the platform's."""
+        layer, info = self._layer_with("claude-code-cli")
+        kept = []
+        for mode in ("autoReview", "ask", "plan"):
+            await layer.send_control_request("s-1", "set_permission_mode", mode=mode)
+            kept.append(info.mode)
+        await layer.send_control_request("s-1", "set_model", model="m")
+        frames = [c.args[1] for c in layer._cm.send_fire_and_forget.call_args_list]
+        assert [(f["subtype"], f["kwargs"]) for f in frames] == [
+            ("set_permission_mode", {"mode": "auto"}), ("set_permission_mode", {"mode": "default"}),
+            ("set_permission_mode", {"mode": "plan"}), ("set_model", {"model": "m"})]
+        assert kept == ["autoReview", "ask", "plan"] and info.model == "m"
+
+    @pytest.mark.asyncio
     async def test_codex_sends_the_model_and_the_sandbox_mode(self):
         # The live defect: the remote layer sent NOTHING for a Codex model
         # change while the satellite's CodexSession has honoured set_model as
-        # a per-turn override in every release.
-        # A 0.5.143 satellite also gets the platform mode (its approval
-        # policy follows it); an older one the sandbox alone.
+        # a per-turn override in every release. The mode travels with the
+        # platform mode (the approval policy follows it).
         from core.layers.codex.helpers import permission_to_sandbox
-        for supported in (True, False):
-            layer, info = self._layer_with("codex-cli")
-            layer._cm.satellite_supports_codex_attended_floor.return_value = supported
-            await layer.change_model("s-1", "gpt-5.6-sol")
-            await layer.change_mode("s-1", "plan")
-            frames = [c.args[1] for c in layer._cm.send_fire_and_forget.call_args_list]
-            mode_kwargs = {"sandbox_mode": permission_to_sandbox("plan", allow_full_fs=True)}
-            if supported:
-                mode_kwargs["permission_mode"] = "plan"
-            assert frames == [
-                {"type": "control_request", "session_id": "s-1", "subtype": "set_model",
-                 "kwargs": {"model": "gpt-5.6-sol"}},
-                {"type": "control_request", "session_id": "s-1", "subtype": "set_permission_mode",
-                 "kwargs": mode_kwargs},
-            ]
-            assert (info.model, info.mode) == ("gpt-5.6-sol", "plan")
+        layer, info = self._layer_with("codex-cli")
+        await layer.change_model("s-1", "gpt-5.6-sol")
+        await layer.change_mode("s-1", "plan")
+        frames = [c.args[1] for c in layer._cm.send_fire_and_forget.call_args_list]
+        assert frames == [
+            {"type": "control_request", "session_id": "s-1", "subtype": "set_model",
+             "kwargs": {"model": "gpt-5.6-sol"}},
+            {"type": "control_request", "session_id": "s-1", "subtype": "set_permission_mode",
+             "kwargs": {"sandbox_mode": permission_to_sandbox("plan", allow_full_fs=True),
+                        "permission_mode": "plan"}},
+        ]
+        assert (info.model, info.mode) == ("gpt-5.6-sol", "plan")
 
     @pytest.mark.asyncio
-    async def test_a_codex_start_never_freezes_the_plan_mode(self, tmp_path):
-        """A satellite (0.5.123+) plans iff a shipped ``permission_mode`` says
-        plan, else iff the live sandbox is read-only; a mode change carries
-        the sandbox alone. A chat started in plan (or default) must ship no
-        mode, or Implement kept Codex planning; a judge ships its own."""
+    async def test_a_codex_start_ships_its_live_mode(self, tmp_path):
+        """The satellite plans and picks its approval policy by the shipped
+        ``permission_mode``, and every mode change carries it again
+        (``control_request``), so a chat started in plan leaves plan at
+        Implement. A judge ships its own."""
         machine = {"capabilities": json.dumps({"local_tunnel_port": 18400, "os": "linux"}),
                    "pairing_scope": "admin"}
         judge_ctx = SimpleNamespace(mount_username="", username="", role="admin", read_only=True,
@@ -473,13 +498,13 @@ class TestControlFrames:
         with patch("storage.remote_store.get_remote_machine", return_value=machine), \
              patch("auth.session_token.create_session_token", return_value="JWT"), \
              patch("storage.database.get_user_sub_by_username", return_value="sub-alice"):
-            for mode in ("plan", "default", "acceptEdits", "judge"):
+            for mode in ("plan", "ask", "autoReview", "judge"):
                 over = {"security_context": judge_ctx} if mode == "judge" else {}
                 cfg = _snapshot_config(tmp_path, model="gpt-6-sol", permission_mode=mode, **over)
                 plan = await _snapshot_layer()._build_start_payload("sess-1", cfg, "codex-cli")
                 shipped[mode] = (plan.payload["permission_mode"], plan.payload["sandbox_mode"])
-        assert shipped == {"plan": ("", "read-only"), "default": ("", "workspace-write"),
-                           "acceptEdits": ("", "workspace-write"), "judge": ("judge", "read-only")}
+        assert shipped == {"plan": ("plan", "read-only"), "ask": ("ask", "workspace-write"),
+                           "autoReview": ("autoReview", "workspace-write"), "judge": ("judge", "read-only")}
 
     @pytest.mark.asyncio
     async def test_a_queued_control_request_keeps_the_session_record_in_step(self):
@@ -514,12 +539,11 @@ class TestSatelliteEngines:
         cm._connections["m-1"] = conn
         return cm
 
-    def test_absent_and_malformed_read_as_the_legacy_pair(self):
-        pair = frozenset({"claude-code-cli", "codex-cli"})
-        assert self._cm({}).satellite_engines("m-1") == pair
-        assert self._cm({"engines": "codex-cli"}).satellite_engines("m-1") == pair
-        assert self._cm({"engines": []}).satellite_engines("m-1") == pair
-        assert self._cm({"engines": [42, ""]}).satellite_engines("m-1") == pair
+    def test_absent_and_malformed_read_as_no_engine(self):
+        assert self._cm({}).satellite_engines("m-1") == frozenset()
+        assert self._cm({"engines": "codex-cli"}).satellite_engines("m-1") == frozenset()
+        assert self._cm({"engines": []}).satellite_engines("m-1") == frozenset()
+        assert self._cm({"engines": [42, ""]}).satellite_engines("m-1") == frozenset()
         assert SatelliteConnectionManager().satellite_engines("nope") == frozenset()
 
     def test_a_list_is_the_set_bounded(self):

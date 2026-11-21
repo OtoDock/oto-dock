@@ -74,7 +74,7 @@ export default function EngineSwitchBanner({ chatId, pending, busy, error, onCon
       <div
         role="status"
         data-testid="engine-switch-banner"
-        className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-card border border-status-info-border bg-status-info-bg text-status-info-fg"
+        className="w-full px-3 py-2 text-xs rounded-card border border-status-info-border bg-status-info-bg text-status-info-fg"
       >
         <div className="flex items-center gap-2">
           <span className="min-w-0">

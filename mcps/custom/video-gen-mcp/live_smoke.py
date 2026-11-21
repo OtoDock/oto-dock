@@ -8,11 +8,12 @@ section is skipped when its key is absent:
         VIDEO_SAVE_DIR=/tmp/video-gen-smoke \
         venv/bin/python live_smoke.py
 
-Google section: one ~4s omni-flash generation, then a 4s veo-3.1-fast
-transition between two locally-synthesized test clips (also exercises the
-bundled-ffmpeg frame extraction). Runway section: one aleph2 edit of a test
-clip. fal section: one 4s seedance transition. Approximate cost with all keys
-set: ~$3-4. Any 'Error:' output means a key or an API integration is broken.
+Google section: one 4s omni-flash generation. Runway section: one aleph2
+edit of a test clip. fal section: one 4s veo-3.1-fast generation, a 4s
+veo-3.1-fast transition between two locally-synthesized test clips (also
+exercises the bundled-ffmpeg frame extraction) and one 4s seedance transition.
+Approximate cost with all keys set: ~$3-4. Any 'Error:' output means a key or
+an API integration is broken.
 """
 
 import asyncio
@@ -56,17 +57,8 @@ async def main() -> int:
         })
         print(gen[0].text)
         results.append(gen)
-
-        trans = await server._handle_transition({
-            "video_a_path": clip_a,
-            "video_b_path": clip_b,
-            "duration_seconds": 4,
-            "model": "veo-3.1-fast",
-        })
-        print(trans[0].text)
-        results.append(trans)
     else:
-        print("GOOGLE_AI_API_KEY not set — skipping omni-flash + Veo transition")
+        print("GOOGLE_AI_API_KEY not set — skipping omni-flash")
 
     if os.environ.get("RUNWAY_API_KEY"):
         edit = await server._handle_edit({
@@ -79,6 +71,23 @@ async def main() -> int:
         print("RUNWAY_API_KEY not set — skipping aleph2 edit")
 
     if os.environ.get("FAL_API_KEY"):
+        veo = await server._handle_generate({
+            "prompt": "A paper boat drifting across a calm pond at sunrise, gentle ripples, birdsong.",
+            "model": "veo-3.1-fast",
+            "duration_seconds": 4,
+        })
+        print(veo[0].text)
+        results.append(veo)
+
+        trans = await server._handle_transition({
+            "video_a_path": clip_a,
+            "video_b_path": clip_b,
+            "duration_seconds": 4,
+            "model": "veo-3.1-fast",
+        })
+        print(trans[0].text)
+        results.append(trans)
+
         seed = await server._handle_transition({
             "video_a_path": clip_a,
             "video_b_path": clip_b,
@@ -88,7 +97,7 @@ async def main() -> int:
         print(seed[0].text)
         results.append(seed)
     else:
-        print("FAL_API_KEY not set — skipping seedance transition")
+        print("FAL_API_KEY not set — skipping Veo and seedance")
 
     if not results:
         print("No keys set — nothing was tested", file=sys.stderr)

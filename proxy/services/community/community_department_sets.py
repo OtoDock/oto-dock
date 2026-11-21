@@ -61,6 +61,8 @@ class SetSchedule:
 
 @dataclass
 class SetBinding:
+    """A binding the set names: read for the catalog's proof (both ends
+    are members). The platform reads a member's app's own binding."""
     from_member: str
     app: str
     to_member: str
@@ -247,11 +249,14 @@ def consent_preview(entry: dict[str, Any]) -> tuple[list[dict], list[dict]]:
             continue
         visibility = str(a.get("visibility") or "agent")
         bp = a.get("blueprint_json") if isinstance(a.get("blueprint_json"), dict) else None
-        row = template_app_seeder.preview_shape(a["app_json"], visibility, bp)
+        # An entry the registry wrote before it named a server says nothing.
+        has_server = a.get("has_server") is True
+        row = template_app_seeder.preview_shape(a["app_json"], visibility, bp, has_server=has_server)
         row["slug"] = str(a.get("slug") or "")
         apps.append({
             "slug": row["slug"], "title": row["title"] or row["slug"], "visibility": visibility,
             "sig": str(a.get("sig") or ""), "owner_approval": bool(a.get("owner_approval")),
+            "adds_server": has_server,
             "description": str(a.get("description") or ""),
             "picture_url": str(a.get("picture_url") or ""),
             "row": row,

@@ -1,0 +1,11 @@
+{
+ "char-cfg-inst": {},
+ "char-env-inst": {
+  "INST_HOST": "192.168.77.40",
+  "INST_KEY": "own-secret",
+  "INST_PORT": "8440"
+ },
+ "char-hosted": {},
+ "char-no-instance": {},
+ "char-tools": {}
+}

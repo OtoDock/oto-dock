@@ -21,13 +21,21 @@ from typing import TYPE_CHECKING, cast
 import psycopg
 
 import config
-from core import placement
+from core import drain, placement
 from core.background import spawn
 from core.events import turn_ending
 from core.execution_layer import ResumeVerdict
 from core.session import session_kind
 from core.session.resume_probe import RESUME_PROBE_BUDGET_BACKGROUND_S, settle_resume
-from services.scheduler import delivery, interactive, lanes, runner, shared, task_kinds
+from services.scheduler import (
+    delivery,
+    interactive,
+    lanes,
+    run_recovery,
+    runner,
+    shared,
+    task_kinds,
+)
 from storage import database as task_store
 from storage.automation import run_status
 from storage.chat import meeting_status
@@ -35,8 +43,17 @@ from storage.chat import meeting_status
 if TYPE_CHECKING:
     from core.events.stream_pump import ChatStreamPump
     from core.execution_layer import AgentConfig, ExecutionLayer
+    from services.remote.remote_status import ChatPlace
 
 logger = logging.getLogger("otodock.scheduler")
+
+
+class LeftForReopen(Exception):
+    """The platform's stop or the run's machine cut the run's turn: the run
+    is left as it is, no verdict and no delivery, for the boot or the
+    continue pass to reopen (``run_recovery.reopen_run``). Also a run whose
+    round had not opened when a planned stop began to hold new work: it is
+    left ``pending`` for ``run_recovery.start_pending_runs``."""
 
 
 class TaskRun:
@@ -48,7 +65,17 @@ class TaskRun:
 
     def __init__(self, run_id: str, session_id: str, task: shared.TaskDefinition, prompt: str,
                  trigger_type: str, trigger_source: str | None, attempt: int,
-                 trigger_payload: dict | None, _ident, _slot_target: str) -> None:
+                 trigger_payload: dict | None, _ident, _slot_target: str, *,
+                 reopened: dict | None = None) -> None:
+        # The run row of a run the platform cut, started again under its id
+        # as a continue round on its own session: the first start's time and
+        # output cursor stand, so the result holds the whole round, and the
+        # prompt (the platform's words) lands as a wake row.
+        self.reopened = reopened
+        # Where the run's chat keeps its engine record
+        # (``remote_status.chat_place``), read at the round's open.
+        self.chat_place: ChatPlace | None = None
+        self.wake_text = prompt
         self.run_id = run_id
         self.session_id = session_id
         self.task = task
@@ -111,8 +138,13 @@ class TaskRun:
         # after it continued the lane (the report flag reads it).
         self.turn_end_cursor = 0
         # The run's start: a reused worker chat's verdicts before it belong
-        # to earlier runs.
-        self.run_started_at = shared.now_iso()
+        # to earlier runs. Stamped when the round opens (``_open_round``): a
+        # round that waited at the lane gate starts after the turn it waited
+        # behind. A reopened run keeps its first start.
+        self.run_started_at = (reopened or {}).get("started_at") or shared.now_iso()
+        # The round opened: the run is ``running`` and its cursor is taken.
+        # Before that nothing of the lane is this run's to collect.
+        self.round_opened = False
         # The run owes its report from here (lanes.report_pending): the keys
         # are taken now, since the body may move to another session id.
         self.report_keys = (self.chat_id, self.session_id)
@@ -127,8 +159,17 @@ class TaskRun:
         self.first_prompt_in_argv = False
         self.stamp_first_prompt = False
         self.engine_prompt = prompt
+        # The run's own prompt and the current round's nudge: a round that
+        # cannot resume runs the prompt again with the nudge after it.
+        self.run_prompt = prompt
+        self.round_nudge = ""
+        # The run's one round after a usage limit (``_limit_round``).
+        self.limit_rounds = 0
         self.task_total_cost = 0
         self.engine_ending = None
+        # A terminal's typed ending, for a run with no pump (its own terminal,
+        # a borrowed one): ``interactive.terminal_ending``.
+        self.terminal_ending = None
         self.limit_line: str | None = None
         self.run_error: str | None = None
         self.background_pending = 0
@@ -136,14 +177,10 @@ class TaskRun:
     async def admitted(self) -> None:
         """The run from its running stamp to its delivered result."""
         from core.events import chat_writer
-        from storage.pg import run_db
-        # The running stamp sits INSIDE the handlers' reach: a cancel
-        # during its thread hop is this body's to stamp, not the frame's.
-        await run_db(
-            task_store.update_run, self.run_id,
-            status=run_status.RUNNING,
-            started_at=self.run_started_at,
-        )
+        # The run stays ``pending`` until its round opens (the running stamp
+        # is ``_open_round``'s last write, inside the handlers' reach): a
+        # follow-up that waits at the lane gate is a run that has not
+        # started, which a restart starts again.
         await self._open_round()
         if self.borrowed is not None:
             # 2-6, borrowed: the follow-up goes INTO the terminal (steered
@@ -152,16 +189,26 @@ class TaskRun:
             # the turn, so the collection and delivery below stand. The
             # prompt's row is written from the injection, after what the
             # terminal produced before it read the prompt.
+            # A terminal at its limit ends the round at once: the run reads
+            # what refused it before it asks.
+            held = self.borrowed.limit_ending()
             self.prompt_row_id = await interactive._run_borrowed_terminal_turn(
                 self.borrowed, self.prompt, persist_row=self._prompt_row_job)
+            self.terminal_ending = held or interactive.terminal_ending(self.borrowed)
         else:
             await self._spawn_and_drive()
+            # A cut is no verdict: read before the rounds and the meeting
+            # wait below, which the reopen does not wait for.
+            self._leave_if_cut()
+            await self._limit_round()
+            await self._switch_rounds()
 
         completed_meeting_id = await self._await_meeting()
         self.turn_done = True
         self.turn_end_cursor = await chat_writer.submit(
             self.chat_id, functools.partial(task_store.get_last_chat_message_id, self.chat_id),
             label="turn_end")
+        self._leave_if_cut()
         await self._read_verdict(completed_meeting_id)
         await self._stamp_end()
         self._notify_end()
@@ -181,6 +228,123 @@ class TaskRun:
         if self.borrowed is None:
             await interactive._close_interactive_task_session(self.session_id)
 
+    def _leave_if_cut(self) -> None:
+        """A turn the platform's stop cut, or one its machine cut (it came
+        back without the session, and the continue pass takes the turn), is
+        no verdict of the run."""
+        if self.pump is not None and (self.pump.cut_by_platform or self.pump.cut_by_machine):
+            raise LeftForReopen(self.run_id)
+
+    def _turn_ended_clean(self) -> bool:
+        """The turn returned on its own: no engine error, no typed ending,
+        not cut by the platform, not stopped by a person (a terminal's turn
+        is never a round's)."""
+        pump = self.pump
+        return (pump is not None and not pump.cut_by_platform and pump.last_ending is None
+                and not pump.last_error and not getattr(pump, "stopped", False))
+
+    async def _switch_rounds(self) -> None:
+        """The rounds the run's own account switch asked for
+        (``chat_reload.take_task_round``): after a turn that ended clean and
+        did not end on a usage-limit notice, each closes the session and
+        resumes it on the account, in the same chat, under the chain bound;
+        the run's cursor stays the first round's, so its one result covers
+        every round."""
+        from services.remote import chat_reload
+        from storage.pg import run_db
+        rounds = 0
+        while (pending := chat_reload.take_task_round(self.session_id)) is not None:
+            if not self._turn_ended_clean() or rounds >= chat_reload.CHAIN_MAX:
+                logger.info("Task %s: its account switch is kept for its next start, the "
+                            "turn did not end clean or the chain is full", self.run_id)
+                return
+            text = await run_db(lanes._collect_task_output, self.chat_id, self.output_cursor)
+            if lanes._limit_notice(text):
+                logger.info("Task %s: its account switch is kept for its next start, the "
+                            "turn ended on a usage limit", self.run_id)
+                return
+            rounds += 1
+            await self._next_round(*pending)
+
+    async def _limit_round(self) -> None:
+        """A turn a usage limit cut, which another account can take on (the
+        pump asked ``pool_limits.limit_continues`` and showed no card): one
+        next round of the run, on the account the new start picks (the limit
+        rests the old one), with the platform's words. The run is not failed
+        or reported for it. One per run: a limit in that round fails it as
+        before, and so does a run past its chain bound."""
+        from services.remote import chat_reload
+        from storage import remote_store
+        from storage.pg import run_db
+        pump = self.pump
+        if pump is None or not getattr(pump, "limit_continues", False) or self.limit_rounds:
+            return
+        stopped = chat_reload._bound(
+            self.chat_id, await run_db(remote_store.reloads_since_person, self.chat_id), run=True)
+        if stopped:
+            pump.limit_continues = False
+            logger.info("Task %s: no round after its limit: %s", self.run_id, stopped)
+            await self._limit_card(pump)
+            return
+        self.limit_rounds = 1
+        logger.info("Task %s: a usage limit cut its turn, it continues on another account", self.run_id)
+        await chat_reload.note_limit_round(self.chat_id)
+        await self._round_on(chat_reload.LIMIT_NUDGE)
+
+    async def _limit_card(self, pump) -> None:
+        """The limit's card in the run's chat, which the pump left out when it
+        expected a round on another account."""
+        from core.events import chat_writer
+        from core.events.stream_pump import turn_ended_block
+        from ws import wire_events as wire
+        ending = getattr(pump, "last_ending", None)
+        if ending is None:
+            return
+        await chat_writer.submit(self.chat_id, functools.partial(
+            task_store.add_chat_message, self.chat_id, "event", "", event_type=wire.SYSTEM,
+            event_data=json.dumps(turn_ended_block(ending))), label="limit_card")
+
+    async def _next_round(self, reason: str, said: list[str]) -> None:
+        """One round of the run's own: the chat told, the session closed as
+        a model change closes it (``lanes._close_for_model_change``) and
+        the conversation resumed with the platform's nudge, where the first
+        round ran, the config built again (the choices read anew)."""
+        from services.remote import chat_reload
+        await chat_reload.note_round(self.chat_id, reason, said)
+        await self._round_on(chat_reload.resume_nudge(reason, said))
+
+    async def _round_on(self, nudge: str) -> None:
+        """The next round's start with ``nudge`` (``_next_round``,
+        ``_limit_round``)."""
+        from services.remote import remote_status
+        from storage.pg import run_db
+        row = await run_db(task_store.get_chat, self.chat_id) or {}
+        # Where round one left the record: this round resumes it there.
+        self.chat_place = remote_status.chat_place(row)
+        self.round_nudge = nudge
+        self.prompt = self.engine_prompt = self.round_nudge
+        self.task = self.task.model_copy(update={
+            "continue_session": self.session_id, "respawn_for_model": True,
+            "target_machine": row.get("execution_target") or self.task.target_machine,
+        })
+        self.reused_warm = False
+        self.lane_reaped = False
+        self.first_prompt_in_argv = False
+        self.stamp_first_prompt = False
+        self.session_started = False
+        await self._spawn_and_drive()
+
+    def _leave_if_held(self) -> None:
+        """A planned stop holds new work: a run whose round has not opened
+        starts nothing. It is left ``pending``, and the boot or the drain's
+        resume starts it (``run_recovery.start_pending_runs``), as a fire
+        the hold met at its launch (``runner._execute_task``; a check's
+        judge run passes there too). A reopened run is a round already
+        open: it goes on."""
+        if (self.reopened is None and not self.round_opened and drain.holding()
+                and not task_kinds.of(self.task).judge):
+            raise LeftForReopen(self.run_id)
+
     async def _open_round(self) -> None:
         """Step 1: the chat row (a worker chat's, or the backstop), the
         lane's live terminal when the round drives it, the abort flags and
@@ -188,6 +352,7 @@ class TaskRun:
         from core.events import chat_writer
         from core.session import session_state as _state
         from storage.pg import run_db
+        self._leave_if_held()
         # 1. Persist the chat row + the user's prompt FIRST — BEFORE the slow
         #    spawn (config build / start_session / offline-target hard-fail) — so
         #    a pre-turn failure still shows the prompt and is visible in
@@ -199,11 +364,21 @@ class TaskRun:
             # user deleted the chat between spawn and fire.
             if not await run_db(task_store.get_chat, self.chat_id):
                 raise RuntimeError("The worker chat for this run no longer exists")
+            from core.config.task_config_builder import continues_in_chat
+            from services.remote import chat_move
+            moving = chat_move.moving_sentence(self.chat_id)
+            if moving and continues_in_chat(self.task):
+                # Its session is on its way: the round would resume the
+                # copy the move leaves behind.
+                raise RuntimeError(f"{moving} Continue it when the move ends.")
             # BEFORE the output cursor below: a reap flushes the prior
             # round's blocks, and those rows must not be collected as
             # this run's output. Healthy live turns are WAITED out, not
             # reaped (a reap cancels the user's in-flight turn).
             self.lane_reaped = await lanes._settle_prior_lane(self.chat_id, self.run_id)
+            # The gate may have waited through the start of a planned stop:
+            # a follow-up released then opens no round.
+            self._leave_if_held()
             # A live interactive terminal on the lane IS the lane: the
             # round drives it instead of spawning a second CLI on its
             # session (a `--resume` beside a live TUI dual-writes the
@@ -273,12 +448,33 @@ class TaskRun:
             )
             return task_store.get_last_chat_message_id(self.chat_id)
 
+        # Read before this round names its own session on the row: a fresh
+        # run's chat has no record, a worker's next round the last round's.
+        await self._read_chat_place()
         self.output_cursor = await chat_writer.submit(self.chat_id, _start_round, label="run_start")
+        if self.reopened is not None:
+            self.output_cursor = await run_db(
+                run_recovery.start_cursor, self.reopened, self.chat_id)
         # The prompt's row lands after the config build below (fast relative
         # to start_session, so it still precedes the slow spawn), or from the
         # injection hook of a borrowed terminal.
-        # chat_id on the run immediately so the dashboard can load it while running.
-        await run_db(task_store.update_run, self.run_id, chat_id=self.chat_id, session_id=self.session_id)
+        # The round opens here: the run is running from now, with its chat
+        # and its session on its row in the same write (a run with no session
+        # on its row never started anything).
+        if self.reopened is None:
+            self.run_started_at = shared.now_iso()
+        await run_db(task_store.update_run, self.run_id, status=run_status.RUNNING,
+                     started_at=self.run_started_at, chat_id=self.chat_id,
+                     session_id=self.session_id)
+        self.round_opened = True
+        # Open work for a planned stop from here (``startup_drain._runs``).
+        shared._open_rounds.add(self.run_id)
+
+    async def _read_chat_place(self) -> None:
+        """Where the run's chat keeps its engine record, for the build."""
+        from services.remote import remote_status
+        from storage.pg import run_db
+        self.chat_place = remote_status.chat_place(await run_db(task_store.get_chat, self.chat_id))
 
     async def _spawn_and_drive(self) -> None:
         """Steps 2 to 6 for a round that spawns: the config, the layer, a
@@ -305,12 +501,41 @@ class TaskRun:
         # delegated worker's row the same): the builder takes them so the
         # session runs where the row says.
         row = await run_db(task_store.get_chat, self.chat_id) or {}
+        from services.remote import remote_status
+        from storage import remote_store
+        place = self.chat_place or remote_status.ChatPlace("", False)
         self.agent_cfg = await build_task_agent_config(
             self.task.agent, self.task, self.session_id,
             trigger_payload=self.trigger_payload,
             execution_path=row.get("execution_path") or "",
             model=row.get("model") or "",
+            prefer=place.machine or placement.machine_of(self._slot_target),
+            stay_shared=place.shared,
+            stay_on=place.stays,
         )
+        _ctx = getattr(self.agent_cfg, "security_context", None)
+        built = placement.compute_of(getattr(_ctx, "placement", None) if _ctx is not None else None)
+        # The run's chat stays where its engine record will live: a worker's
+        # next round resumes there (the builder sets no chat id on a
+        # headless run, so the start does not record it).
+        await run_db(remote_store.set_chat_compute_machine, self.chat_id,
+                     str(built.machine_id) if built is not None and built.own_copy else "")
+        # The runner's guess and the build parted (a compute machine signed
+        # in or left between them, another one took the run): the slot moves
+        # to the box the run lands on (the slot's own exit releases it,
+        # idempotent). A run on a paired machine keeps the slot its machine
+        # holds, and a run of the platform's place with no compute machine
+        # never gets here: its build was refused.
+        where, parted = "", False
+        if built is not None:
+            where, parted = str(built.machine_id), not placement.runs_on(self._slot_target, str(built.machine_id))
+        if parted:
+            from core import concurrency
+            concurrency.release(self.session_id)
+            await concurrency.acquire(self.session_id, "task", target=where,
+                                      execution_path=self.agent_cfg.execution_path, blocking=True,
+                                      mcp_config_path=self.agent_cfg.mcp_config_path or "",
+                                      ring_key=self.task.created_by or "")
 
         # Hard-fail if the resolved target is the offline sentinel from
         # the resolver. Without this, agent-level remote targets silently
@@ -318,7 +543,6 @@ class TaskRun:
         # masks misconfigurations and produces wrong results (different
         # MCPs, different filesystem). Mirrors ws/dashboard.py warmup.
         from core.config.config_builder import release_config_seat
-        from storage import remote_store
         if placement.is_offline_sentinel(self.agent_cfg.execution_target):
             # Every branch below raises — the build's seat goes back now,
             # once: the except's release is skipped for it.
@@ -336,10 +560,21 @@ class TaskRun:
                 )
             machine_label = machine.get("name") or offline_machine_id[:8]
             is_admin_target = placement.machine_is_admin_paired(machine)
-            from core.config.task_config_builder import worker_machine_owner
-            if not is_admin_target and await run_db(worker_machine_owner, self.task):
-                # A chat worker on its delegator's own computer: it waits for
-                # it, the chat keeps its place.
+            from services.remote import machine_away
+            if machine_away.held_out(offline_machine_id):
+                # Its version keeps it out, or it is still in its update: no
+                # session runs there until it is done.
+                raise machine_away.MachineAway(machine_away.away_sentence(offline_machine_id, machine_label, ""))
+            from core.config import task_config_builder as tcb
+            if getattr(self.agent_cfg, "fallback_reason", None) == tcb.FALLBACK_CONTINUE_REFUSED:
+                # Its run may not use the machine its session lives on now: a
+                # fresh session elsewhere would leave the work's memory behind.
+                raise RuntimeError(tcb.continue_refused(machine_label))
+            if tcb.continues_in_chat(self.task) or (
+                    not is_admin_target and await run_db(tcb.worker_machine_owner, self.task)):
+                # A continue of a chat's session, or a chat worker on its
+                # delegator's own computer: it waits for its machine, the
+                # chat keeps its place.
                 raise RuntimeError(
                     f"{machine_label} is offline, so this work cannot run there now. "
                     f"Reconnect it, then continue the work."
@@ -366,12 +601,15 @@ class TaskRun:
         # on their own computer (``placement_sub``), whose session there
         # carries none of the agent's secrets.
         cfg = cast("AgentConfig", self.agent_cfg)
+        _ctx = getattr(cfg, "security_context", None)
+        _built = placement.compute_of(getattr(_ctx, "placement", None) if _ctx is not None else None)
         self.layer = get_execution_layer(
             self.task.agent,
             execution_path=cfg.execution_path,
             user_sub=self._ident.creds_user_sub or cfg.placement_sub or None,
             role=self._ident.role,
             execution_target=cfg.execution_target,
+            **({"placement_built": _built} if _built else {}),
         )
 
         # Pin the task chat to the target it actually runs on
@@ -456,13 +694,20 @@ class TaskRun:
 
             self.output_cursor = await chat_writer.submit(
                 self.chat_id, _reclear, label="run_reclear")
-        if self.task.respawn_for_model:
-            # The continue changed the worker's model: the live
+        # Another person continued the lane: they pay for this round, so a
+        # live session on the first person's account goes too, as for a
+        # model change; never while a limit's continuation holds the chat.
+        from services.remote import chat_reload
+        payer_moved = (not self.task.respawn_for_model and not chat_reload.waiting(self.chat_id)
+                       and await run_db(lanes.serves_another_payer, self.session_id, self.task))
+        if self.task.respawn_for_model or payer_moved:
+            # The continue changed the worker's model (or payer): the live
             # session runs the old one, so it goes (under its
             # layer's session lock) and the round resumes the
-            # conversation on agent_cfg.model — never warm.
+            # conversation on agent_cfg's model and account — never warm.
             await lanes._close_for_model_change(
                 self.session_id, self.run_id, slot_target=self._slot_target,
+                reason="payer-change" if payer_moved else "model-change",
             )
         elif not self.lane_reaped:
             self.reused_warm = await lanes._try_reuse_warm_session(
@@ -480,6 +725,11 @@ class TaskRun:
             # by the round that spawned it — only this round's seat
             # (and its acquire-window claim) goes back.
             release_config_seat(self.session_id, self.agent_cfg, keep_binding=True)
+            # The build may have named another machine (the recorded one's
+            # tunnel read down): the turn rides the warm session, so the
+            # chat records where that one runs.
+            from core.session.session_manager import record_chat_place
+            await run_db(record_chat_place, self.chat_id, self.session_id)
         else:
             # Resumability pre-check (same gate as dashboard warmups
             # and the one-shot delivery): a blind --resume on a
@@ -515,6 +765,12 @@ class TaskRun:
             if verdict is ResumeVerdict.RESUMABLE:
                 cast("AgentConfig", self.agent_cfg).resume = True
             else:
+                if self.reopened is not None:
+                    # Nothing of the cut round is there to continue: the
+                    # run's own prompt runs from the start.
+                    self.prompt = self.reopened.get("prompt_text") or self.prompt
+                elif self.round_nudge:
+                    self.prompt = f"{self.run_prompt}\n\n{self.round_nudge}"
                 old_sid = self.session_id
                 self.session_id = str(uuid.uuid4())
                 _state._sessions[self.session_id] = _state._sessions.pop(
@@ -571,8 +827,8 @@ class TaskRun:
             # round arriving now waits for this round and its close
             # instead of borrowing the terminal being spawned.
             self.terminal_hold = await interactive.hold_terminal(self.chat_id)
-            # The interactive session is keyed to the run chat (the codex/cli
-            # layers pass chat_id=config.chat_id to interactive_session.register).
+            # The interactive session is keyed to the run chat (the remote
+            # start passes chat_id=config.chat_id to its registration).
             # task_config_builder doesn't set it (the headless pump gets chat_id
             # directly), so set it here — without it the transcript tailer
             # short-circuits on an empty chat_id and the completion watcher never
@@ -604,6 +860,13 @@ class TaskRun:
         came from. An interactive run's terminal journals the same text and
         the tailer skips it (the note made where the prompt is typed)."""
         from core.events import chat_writer
+        if self.reopened is not None:
+            from services.scheduler import continue_pass
+            return chat_writer.submit(
+                self.chat_id, functools.partial(continue_pass.write_wake_row, self.chat_id,
+                                                self.wake_text),
+                label="continue_wake",
+            )
         meta = lanes.prompt_row_meta(self.task.on_complete_agent, self.task.agent)
         return chat_writer.submit(
             self.chat_id,
@@ -664,6 +927,8 @@ class TaskRun:
             await interactive._run_interactive_task(
                 self.session_id, self.chat_id, self.engine_prompt, self.first_prompt_in_argv,
             )
+            from core.session import interactive_session
+            self.terminal_ending = interactive.terminal_ending(interactive_session.get(self.session_id))
         else:
             # 5. Create event queue + launch producer
             event_queue: asyncio.Queue = asyncio.Queue()
@@ -685,15 +950,27 @@ class TaskRun:
             # 6. Create pump, register in _active_pumps, and run to completion.
             # Registration allows dashboard WS to attach for live streaming.
             perm_queue = get_permission_queue(self.session_id)
+            # The usage goes to whoever pays (``core/config/spender.py``, the
+            # person the build bound the seat to): a person's own task on a
+            # Shared-only agent is the agent's. No await before the pump is
+            # registered: the producer already runs.
+            from core.config import spender
+            payer = spender.Spender(getattr(self.agent_cfg, "subscription_user_sub", "") or None, "run")
             self.pump = ChatStreamPump(
                 chat_id=self.chat_id,
                 session_id=self.session_id,
                 producer=producer,
                 event_queue=event_queue,
                 perm_queue=perm_queue,
-                scope=self.task.scope,
+                scope=spender.bucket(payer, self.task.scope),
                 source_type=session_kind.TASK.source_type,
             )
+            # The turn's open-turn row names the run, so a turn the platform
+            # cuts is this run's to reopen.
+            self.pump.run_id = self.run_id
+            # After its one round on another account, a limit fails the run
+            # with its card, as before.
+            self.pump.limit_round_taken = bool(self.limit_rounds)
             _active_pumps[self.chat_id] = self.pump
             self.pump.start()
             # Run to completion under the stall watchdog (reaps a wedged
@@ -787,7 +1064,8 @@ class TaskRun:
         # queued message met the process the abort ended): the run reads
         # as interrupted, never as failed, and the ending only reaches the
         # delegating agent's callback as its note.
-        self.ending = getattr(self.pump, "last_ending", None)
+        self.ending = (getattr(self.pump, "last_ending", None) if self.pump is not None
+                       else self.terminal_ending)
         self.engine_ending = (self.ending if self.ending is not None
                          and self.ending.reason != turn_ending.STOPPED else None)
         if (self.ending is not None and self.engine_ending is None
@@ -959,20 +1237,24 @@ class TaskRun:
         """A shutdown that leaves a re-adoptable remote turn running:
         True when the cancel is re-raised with the run left as it is."""
         self.user_stop = self.run_id in shared._user_cancelled_runs
-        self.platform_reason = shared._platform_interrupts.pop(self.run_id, None)
+        # Read, not taken: the mark stays until the frame retires
+        # (``runner._retire``), so a second cancel while the run ends finds it.
+        self.platform_reason = shared._platform_interrupts.get(self.run_id)
         # Graceful shutdown of a re-adoptable remote turn: LEAVE the run
         # running and DON'T close the satellite session — the CLI keeps
         # working, and after restart defer_orphaned_runs parks it +
         # sessions_alive re-adopts it (Mode C). Suppress the pump's
         # durable flush so the recovery replay doesn't duplicate content.
-        from services.scheduler import run_recovery
-        if (shared._shutting_down and not self.user_stop and self.platform_reason is None
-                and run_recovery.is_recovery_eligible(self.chat_id)):
-            from core.events.stream_pump import suppress_recovery_flush
-            suppress_recovery_flush(self.chat_id)
+        if shared._shutting_down and not self.user_stop and self.platform_reason is None:
+            # (a follow-up still at the lane gate has no turn of its own:
+            # the chat's pump is another turn's)
+            if self.round_opened and run_recovery.is_recovery_eligible(self.chat_id):
+                # The machine keeps the turn: nothing of it is written here.
+                from core.events.stream_pump import suppress_recovery_flush
+                suppress_recovery_flush(self.chat_id)
             logger.info(
-                "Shutdown: leaving recoverable run %s running "
-                "for satellite re-adopt (chat=%s)", self.run_id, self.chat_id
+                "Shutdown: leaving run %s running for the restart (chat=%s)",
+                self.run_id, self.chat_id
             )
             return True
         return False
@@ -999,8 +1281,8 @@ class TaskRun:
             await runner._end_run(
                 self.run_id, run_status.FAILED,
                 error_message=self.platform_reason or (
-                    "Proxy shutting down" if shared._shutting_down
-                    else "Interrupted by platform"
+                    "Stopped when the platform stopped" if shared._shutting_down
+                    else "Stopped by the platform"
                 ),
                 completed_at=shared.now_iso(),
                 duration_ms=int((time.monotonic() - self.start) * 1000),
@@ -1032,16 +1314,13 @@ class TaskRun:
                     self.task, run_status.USER_INTERRUPTED,
                     f'⚠ Delegated task "{self.task.name}" was stopped by the user '
                     f'before it finished.',
-                    worker_chat_id=self.chat_id, output_cursor=self.output_cursor,
-                    prompt_row_id=self.prompt_row_id, prompt_text=self.prompt,
-                    run_started_at=self.run_started_at,
-                    run_id=self.run_id,
+                    run_id=self.run_id, **self._lane_of_round(),
                 )
             else:
                 await delivery._deliver_task_result(
                     self.task, run_status.CANCELLED,
                     f'⚠ Delegated task "{self.task.name}" was canceled before it finished.',
-                    run_id=self.run_id,
+                    run_id=self.run_id, lane_chat_id=self.chat_id,
                 )
 
     async def failed(self, e: Exception) -> None:
@@ -1052,7 +1331,11 @@ class TaskRun:
         # killed the CLI deliberately — report user_interrupted, don't retry,
         # don't page anyone about a "failure".
         self.user_stop = isinstance(e, interactive._InteractiveSessionDied) and e.had_viewer
-        logger.exception("Task failed: run=%s, task=%s: %s", self.run_id, self.task.id, e)
+        if isinstance(e, placement.PlacementRefused):
+            # No machine could take the run: a refusal with its sentence, no crash.
+            logger.warning("Task refused: run=%s, task=%s: %s", self.run_id, self.task.id, e)
+        else:
+            logger.exception("Task failed: run=%s, task=%s: %s", self.run_id, self.task.id, e)
         if self.row_ended:
             logger.info(
                 "Task %s: failure after the run ended — the verdict stands", self.run_id
@@ -1100,20 +1383,25 @@ class TaskRun:
             # delegating agent sees the failure (not an empty bubble) and
             # doesn't re-delegate. Delegate-only via _deliver_task_result's
             # on_complete gate; harmless for plain tasks.
-            collected = lanes._collect_task_output(self.chat_id, self.output_cursor)
+            # A round that never opened wrote nothing: the lane's rows are
+            # other rounds'.
+            collected = (lanes._collect_task_output(self.chat_id, self.output_cursor)
+                         if self.round_opened else "")
             if collected and not self.turn_done and not self.turn_end_cursor:
                 with contextlib.suppress(Exception):
                     self.turn_end_cursor = await run_db(task_store.get_last_chat_message_id, self.chat_id)
+            # The lane gate ended it before its round opened: nothing ran,
+            # so nothing failed.
             fail_output = collected or (
                 f'⚠ Delegated task "{self.task.name}" was stopped by the user.'
-                if self.user_stop else f'⚠ Delegated task "{self.task.name}" failed: {e}'
+                if self.user_stop
+                else f'⚠ Delegated task "{self.task.name}" was not started: {e}'
+                if isinstance(e, lanes.LaneNotStarted)
+                else f'⚠ Delegated task "{self.task.name}" failed: {e}'
             )
             await delivery._deliver_task_result(
                 self.task, run_status.USER_INTERRUPTED if self.user_stop else run_status.FAILED, fail_output,
-                worker_chat_id=self.chat_id, output_cursor=self.output_cursor,
-                prompt_row_id=self.prompt_row_id, prompt_text=self.prompt,
-                run_started_at=self.run_started_at,
-                run_id=self.run_id,
+                run_id=self.run_id, **self._lane_of_round(),
                 # The turn died half way after writing something: what it
                 # wrote is not its report.
                 cut_short=(turn_ending.EXITED
@@ -1156,6 +1444,16 @@ class TaskRun:
                 trigger_payload=self.trigger_payload,
             )
 
+    def _lane_of_round(self) -> dict:
+        """How a result of this run names its lane: with the lane's
+        collection once the round opened (its cursor is taken), by its chat
+        alone before that (``delivery._deliver_task_result``)."""
+        if not self.round_opened:
+            return {"lane_chat_id": self.chat_id}
+        return {"worker_chat_id": self.chat_id, "output_cursor": self.output_cursor,
+                "prompt_row_id": self.prompt_row_id, "prompt_text": self.prompt,
+                "run_started_at": self.run_started_at}
+
     def release(self) -> None:
         """The ``finally``: the session's index entry, the terminal hold, the
         report window."""
@@ -1176,6 +1474,8 @@ class TaskRun:
             _state._save_sessions()
         if self.terminal_hold is not None:
             self.terminal_hold.release()
+        from services.remote import chat_reload
+        chat_reload.drop_task_round(self.session_id)
         lanes.release_report(*self.report_keys)
         # The one-time task's row is the frame's to retire (_run_task):
         # this finally never runs for a run cancelled before admission.

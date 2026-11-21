@@ -1,0 +1,182 @@
+{
+ "a dashboard-kind resume": {
+  "asked": [
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "build_agent_prompt",
+    "kwargs": {
+     "client_type": "dashboard",
+     "dynamic_contexts": null,
+     "excluded_mcps": {
+      "char-files": "why"
+     },
+     "execution_path": "codex-cli",
+     "mount_shared": true,
+     "placement": {},
+     "role": "editor",
+     "session_id": "",
+     "shared_chat": true,
+     "tool_limits": null,
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     {
+      "agent": "char-agent",
+      "config_visible": false,
+      "is_admin_agent": false,
+      "role": "editor",
+      "username": "vic"
+     }
+    ],
+    "call": "build_permission_context",
+    "kwargs": {
+     "assigned_mcp_names": [
+      "phone-mcp"
+     ],
+     "execution_path": "codex-cli"
+    }
+   }
+  ],
+  "prompt": "PROMPT\n\nPERMISSIONS"
+ },
+ "a person's headless wake": {
+  "asked": [
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "build_agent_prompt",
+    "kwargs": {
+     "client_type": "task",
+     "dynamic_contexts": [
+      "CTX"
+     ],
+     "excluded_mcps": null,
+     "execution_path": "claude-code-cli",
+     "mount_shared": true,
+     "placement": {},
+     "role": "editor",
+     "session_id": "",
+     "shared_chat": true,
+     "tool_limits": null,
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     {
+      "agent": "char-agent",
+      "config_visible": false,
+      "is_admin_agent": false,
+      "role": "editor",
+      "username": "vic"
+     }
+    ],
+    "call": "build_permission_context",
+    "kwargs": {
+     "assigned_mcp_names": [
+      "char-files",
+      "phone-mcp"
+     ],
+     "execution_path": "claude-code-cli"
+    }
+   }
+  ],
+  "prompt": "PROMPT\n\nPERMISSIONS"
+ },
+ "a shared-only chat": {
+  "asked": [
+   {
+    "args": [
+     "char-shared"
+    ],
+    "call": "build_agent_prompt",
+    "kwargs": {
+     "client_type": "task",
+     "dynamic_contexts": null,
+     "excluded_mcps": null,
+     "execution_path": "claude-code-cli",
+     "mount_shared": true,
+     "placement": {},
+     "role": "editor",
+     "session_id": "",
+     "shared_chat": true,
+     "tool_limits": null,
+     "username": ""
+    }
+   },
+   {
+    "args": [
+     {
+      "agent": "char-shared",
+      "available_scopes": [
+       "agent"
+      ],
+      "config_visible": false,
+      "is_admin_agent": false,
+      "role": "editor",
+      "session_scope": "agent",
+      "username": "max"
+     }
+    ],
+    "call": "build_permission_context",
+    "kwargs": {
+     "assigned_mcp_names": [
+      "char-files",
+      "phone-mcp"
+     ],
+     "execution_path": "claude-code-cli"
+    }
+   }
+  ],
+  "prompt": "PROMPT\n\nPERMISSIONS"
+ },
+ "nobody, at the manager role": {
+  "asked": [
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "build_agent_prompt",
+    "kwargs": {
+     "client_type": "task",
+     "dynamic_contexts": null,
+     "excluded_mcps": null,
+     "execution_path": "",
+     "mount_shared": true,
+     "placement": {},
+     "role": "manager",
+     "session_id": "",
+     "shared_chat": true,
+     "tool_limits": null,
+     "username": ""
+    }
+   },
+   {
+    "args": [
+     {
+      "agent": "char-agent",
+      "config_visible": false,
+      "is_admin_agent": false,
+      "role": "manager",
+      "session_scope": "agent",
+      "username": ""
+     }
+    ],
+    "call": "build_permission_context",
+    "kwargs": {
+     "assigned_mcp_names": [
+      "char-files",
+      "phone-mcp"
+     ],
+     "execution_path": ""
+    }
+   }
+  ],
+  "prompt": "PROMPT\n\nPERMISSIONS"
+ }
+}

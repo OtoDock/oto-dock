@@ -18,7 +18,8 @@ from fastapi import HTTPException
 import config
 from services.community import community_installer as ci
 from services.community.community_installer import _apply_extracted_files
-from services.mcp import mcp_registry
+from services.mcp import mcp_manifest_store, mcp_registry
+from tests._compute import builds
 
 
 def _mk(root: Path, files: dict[str, str]) -> Path:
@@ -147,7 +148,7 @@ def mcps_dir(tmp_path, monkeypatch):
     root = tmp_path / "opt" / "mcps"
     (root / "community").mkdir(parents=True)
     monkeypatch.setattr(config, "MCPS_DIR", root)
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     return root
 
 
@@ -168,7 +169,7 @@ def _package_install(monkeypatch, ok: bool):
     async def _install(mcp_dir, runtime, source, **kw):
         return ci.mcp_installer.InstallResult(ok=ok, log="" if ok else "npm failed",
                                               version_hash="h", resolved_version="1.0.0")
-    monkeypatch.setattr(ci.mcp_installer, "install_mcp", _install)
+    builds(monkeypatch, install=_install)
 
 
 @pytest.mark.asyncio
@@ -208,7 +209,7 @@ async def test_the_folder_of_a_registered_mcp_is_never_taken(mcps_dir, tmp_path,
     folder = mcps_dir / "community" / "node-mcp"
     (mcps_dir / "community" / "renamed-mcp").rename(folder)
     (folder / "manifest.json").unlink()
-    mcp_registry._manifests["renamed-mcp"].mcp_dir = folder
+    mcp_manifest_store._manifests["renamed-mcp"].mcp_dir = folder
     with pytest.raises(HTTPException) as ei:
         await ci.install_from_extracted_folder(_incoming(tmp_path, "node-mcp", "b"))
     assert ei.value.status_code == 409

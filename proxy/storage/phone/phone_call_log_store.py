@@ -106,6 +106,46 @@ def count_older_than(cutoff_iso: str | None) -> int:
         return int(row["n"])
 
 
+# The rows that name one outside person: either label form of their id, or
+# their number under any other label (a label is younger than some calls, a
+# restart before the phone service's report leaves it empty, and the agent's
+# own line names none). A call on a route tied to a person is that person's.
+_CALLER_ROWS = (
+    "agent = %s AND (identity IN (%s, %s) OR ("
+    "(ltrim(from_number, '+') = %s OR ltrim(to_number, '+') = %s) AND identity NOT LIKE 'user:%%'))"
+)
+
+
+def _caller_args(agent: str, external_id: str) -> tuple:
+    number = external_id.lstrip("+")
+    return (agent, f"caller:{external_id}", f"caller-pin:{external_id}", number, number)
+
+
+def delete_for_caller(agent: str, external_id: str) -> int:
+    """The call-log rows that name one outside person of the agent: a
+    forgotten person leaves none."""
+    if not external_id:
+        return 0
+    with get_conn() as conn:
+        n = conn.execute(f"DELETE FROM phone_call_log WHERE {_CALLER_ROWS}",
+                         _caller_args(agent, external_id)).rowcount
+        conn.commit()
+        return n
+
+
+def rows_for_caller(agent: str, external_id: str) -> list[dict]:
+    """The call-log rows that name one outside person (their export)."""
+    if not external_id:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT direction, from_number, to_number, outcome, started_at, ended_at, "
+            f"duration_s, identity FROM phone_call_log WHERE {_CALLER_ROWS} ORDER BY started_at",
+            _caller_args(agent, external_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def delete_all() -> int:
     """Forget every call-log row; returns the count."""
     with get_conn() as conn:

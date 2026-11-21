@@ -88,15 +88,11 @@ def test_oauth_git_entries_are_bash_not_secret(monkeypatch):
     )
     monkeypatch.setattr(
         credential_resolver, "_resolve_oauth_mcp",
-        lambda *a, **k: {"GIT_CONFIG_COUNT": "2", "WS_DIR": "/virt"},
-    )
-    monkeypatch.setattr(
-        mcp_registry, "get_credentials_dirs",
-        lambda mcp: [("WS_DIR", "sub")],   # WS_DIR is a credentials_dir PATH
+        lambda *a, **k: {"GIT_CONFIG_COUNT": "2"},
     )
 
     result = credential_resolver.resolve_credentials("agent", "user-1")
 
-    assert result.env_by_mcp == {"gh": {"GIT_CONFIG_COUNT": "2", "WS_DIR": "/virt"}}
-    assert result.bash_env_keys == {"GIT_CONFIG_COUNT"}   # the git entries (oauth_env - paths)
+    assert result.env_by_mcp == {"gh": {"GIT_CONFIG_COUNT": "2"}}
+    assert result.bash_env_keys == {"GIT_CONFIG_COUNT"}   # the git entries
     assert result.secret_keys == set()                    # OAuth contributes NO pure secrets

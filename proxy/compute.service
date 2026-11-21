@@ -1,0 +1,87 @@
+# Template unit for a bare-metal install's compute machine: the platform's
+# Claude Code and Codex sessions run under it, each in the platform's own
+# sandbox. `scripts/dev-setup.sh --service` generates and enables it with your
+# checkout's paths and user, beside otodock-proxy.service; edit by hand only if
+# you manage the units yourself.
+#
+# On bare metal the boundary is the platform's own OS user, as for the proxy:
+# the compute machine shares the agents folder with the proxy, and the engines
+# write files there that only that user can read. The walls below keep what it
+# does not need out of its reach; they harden it, they are not a second user.
+# With this unit the proxy makes itself not dumpable at its start: it writes no
+# core dump, and to inspect it use sudo (sudo py-spy dump --pid <pid>).
+# The paths below are the layout dev-setup.sh writes with the data folders
+# inside the checkout (PLATFORM_DATA_DIR unset). With PLATFORM_DATA_DIR set,
+# dev-setup.sh writes the agents folder and the data folders' walls from it;
+# a unit edited by hand moves them the same way. Make host-media-cache and
+# backups (0700) before the first start: a folder made after the unit started
+# is not walled until its next start.
+[Unit]
+Description=OtoDock compute machine: the platform's own sessions
+After=network.target otodock-proxy.service
+
+[Service]
+Type=simple
+# --- Edit these for your installation ---
+User=otodock
+Group=otodock
+# Its own home: its sign-in, its state and its log, never a personal
+# satellite's ~/.oto-dock of the same user. The second folder holds the
+# community tools it builds (see BindPaths below).
+StateDirectory=otodock-compute otodock-compute/tools
+Environment="HOME=/var/lib/otodock-compute"
+Environment="OTODOCK_COMPUTE_LINK_DIR=/opt/otodock/compute-link"
+Environment="OTODOCK_COMPUTE_PLATFORM_URL=http://127.0.0.1:8400"
+Environment="OTODOCK_COMPUTE_AGENTS_DIR=/opt/otodock/agents"
+Environment="OTODOCK_COMPUTE_MCPS_DIR=/opt/otodock/mcps"
+ExecStart=/opt/otodock/satellite/venv/bin/python /opt/otodock/proxy/compute_start.py
+# The walls: the system read-only, the home folders hidden, a /tmp of its own;
+# the agents folder and its state writable, the code and the bundled tools
+# read-only; the platform's secrets, its sessions folder, the recover bin, the
+# SSH keys, the credential exit's signing key, the media pulled from people's
+# own computers, the backups, the phone's own settings, the quota helper,
+# sudo and the Docker socket out of reach. A wall on a single file holds
+# until that file is replaced (an editor that saves a new file, a checkout, a
+# package upgrade): the unit's next start walls the new one. The walls on
+# folders hold. After you edit config.env or an .env file, start the compute
+# unit again too.
+# The community tools are its own: the tools folder of its state directory is
+# bound over mcps/community alone, never over mcps, which holds the bundled
+# tools and their interpreters. It builds and keeps them there, and the proxy
+# keeps their sources in the checkout's own mcps/community.
+# A Python or the engines under a home folder (uv's Pythons, an npm prefix of
+# your own) are hidden too: add them to BindReadOnlyPaths, the prefix's bin
+# to PATH (dev-setup.sh does both).
+# No NoNewPrivileges: the sandbox's launch regains its capabilities inside its
+# own user namespace at an exec, which that forbids (bwrap then fails "setting
+# up uid map"); bwrap sets it on every session itself.
+ProtectSystem=strict
+ProtectHome=tmpfs
+PrivateTmp=yes
+BindReadOnlyPaths=/opt/otodock
+BindPaths=/opt/otodock/agents
+BindPaths=/var/lib/otodock-compute/tools:/opt/otodock/mcps/community
+InaccessiblePaths=/opt/otodock/sessions /opt/otodock/config.env -/opt/otodock/proxy/sessions
+InaccessiblePaths=-/opt/otodock/recover-bin -/opt/otodock/upload-staging -/opt/otodock/preview-snapshots
+InaccessiblePaths=-/opt/otodock/mcps/custom/ssh-hosts/keys -/run/docker.sock -/run/user
+InaccessiblePaths=-/opt/otodock/credential-exit -/opt/otodock/host-media-cache -/opt/otodock/backups
+InaccessiblePaths=-/opt/otodock/.env -/opt/otodock/phone/.env -/opt/otodock/proxy/scripts/oto-quota -/usr/bin/sudo
+# A stop ends its link first, then each session: the platform continues their
+# turns at its return.
+KillMode=mixed
+TimeoutStopSec=120
+# Above the proxy, below its own sessions (the satellite raises them to 500):
+# under memory pressure the kernel takes a session before the control plane.
+OOMScoreAdjust=250
+# -----------------------------------------
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536:524288
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=otodock-compute
+
+[Install]
+WantedBy=multi-user.target

@@ -30,6 +30,7 @@ from auth.providers import (
     require_user,
 )
 from services.community import community_catalog, community_installer
+from services.infra import archive_read
 
 logger = logging.getLogger("otodock.community-api")
 router = APIRouter(dependencies=[Depends(require_user)])
@@ -58,6 +59,8 @@ def _install_failure(exc: Exception) -> str:
     install raised an error of its own (the traceback is in the log)."""
     if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
         return _DISK_FULL
+    if isinstance(exc, archive_read.ArchiveTooLarge):
+        return f"The community list could not be read. {exc}"
     return _INSTALL_STOPPED
 
 
@@ -238,6 +241,10 @@ async def _run_catalog_install(name: str, admin_sub: str) -> None:
             "Installed community MCP %s v%s (status=%s)",
             result.get("name"), result.get("version"), result.get("status"),
         )
+        # A reinstall may have changed the tools' labels: listed again for the
+        # Outside people picks (a first install has no agent to list through).
+        from services.mcp import tool_listing
+        tool_listing.schedule_after_install(name)
     except HTTPException as exc:
         msg = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
         await catalog_install_registry.fail(name, msg)
@@ -825,6 +832,12 @@ async def list_community_agents(
             )["update_available"],
         } for slug in a.get("installed_as") or []]
         augmented.append(a)
+    # Each tool a card lists by the name a person reads.
+    labels = await community_agents_catalog.mcp_labels(sorted({
+        m["name"] for a in augmented for m in a.get("required_mcps") or [] if isinstance(m, dict) and m.get("name")}))
+    for a in augmented:
+        a["required_mcps"] = [{**m, "label": labels.get(str(m.get("name")), m.get("name"))} if isinstance(m, dict) else m
+                              for m in a.get("required_mcps") or []]
     return {
         "registry_version": registry.get("registry_version"),
         "updated_at": registry.get("updated_at"),
@@ -842,6 +855,9 @@ class ApplyTemplateUpdateBody(BaseModel):
     from_version: str
     approve_apps: dict[str, str] | None = None
     approve_checks: dict[str, str] | None = None
+    # The apps whose server the dialog showed: only for those does the
+    # consent let a server reach a copy that runs none.
+    approve_servers: list[str] | None = None
 
 
 class TakeNewVersionBody(BaseModel):
@@ -887,7 +903,8 @@ async def apply_template_update(
     from services.community import community_agent_updater
     return await community_agent_updater.apply(
         agent_slug, u.sub, u.role, from_version=body.from_version,
-        app_consent=body.approve_apps, check_consent=body.approve_checks)
+        app_consent=body.approve_apps, check_consent=body.approve_checks,
+        server_consent=body.approve_servers)
 
 
 @router.get("/v1/agents/{agent_slug}/update-template/status")
@@ -1111,6 +1128,7 @@ class InstallFromCommunityBody(BaseModel):
     # signature the caller saw per app and check they approve.
     approve_apps: dict[str, str] | None = None
     approve_checks: dict[str, str] | None = None
+    approve_servers: list[str] | None = None  # the apps whose server the dialog showed
     # The offer taken (department_set_installer.place_from_set): the set's slug and the
     # department's name; the new agent and the person's standalone agents
     # of the set are placed after the install.
@@ -1151,6 +1169,7 @@ async def install_from_community(
             app_consent=body.approve_apps,
             check_consent=body.approve_checks,
             consent_by=u.sub if (body.approve_apps or body.approve_checks) else "",
+            server_consent=body.approve_servers,
         )
     except HTTPException:
         raise

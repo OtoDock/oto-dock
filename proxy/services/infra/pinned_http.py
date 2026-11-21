@@ -49,6 +49,27 @@ address beside its private one); the other two refuse the whole answer. A
 refusal is logged where it happens, with the host and the address: every
 caller maps a connect error to a generic answer.
 
+A fifth, ``admin_host``, is for a host an admin or a manifest chose that is
+not a credential gateway's vendor (a manifest's sign-in URLs, the sign-in
+provider, a remote MCP dialled directly, the mail server, the PBX, a model
+server): ``model_server``'s rule. On a hosted install (``OTODOCK_CLOUD``)
+the customer has no network of their own beside the install: there
+``control_plane`` and ``admin_host`` refuse every address that is not
+publicly routable, and every checked transport pins its dial even where the
+environment names a proxy (``proxied`` is False), so no setting reaches a
+private address. ``model_server`` (the operator's own Collabora) and
+``private_network`` (the phone daemon) keep their rules: the operator chose
+those hosts.
+
+A sixth, ``docker_tool``, is for a Docker tool's own container, dialled by
+its service name (the satellite tunnel, the credential gateway's sidecar
+pool, Direct LLM, the builder, the browser's context close, file-tools'
+render probe and render). It refuses nothing on a self-hosted
+install, and on a hosted one every address outside the install's own Docker
+networks for its tools (``on_tool_network``): a name is the only thing a
+tenant chooses there, and one that resolves elsewhere (a numeric form
+``getaddrinfo`` reads as an address, a DNS search domain) never connects.
+
 A redirect, where a caller follows one (the agents catalog's tarball), is
 judged at its own dial. Unix sockets are refused.
 """
@@ -69,6 +90,7 @@ import httpx
 # skipped exactly when the plain client would go through the proxy.
 from httpx._utils import URLPattern, get_environment_proxies
 
+import config
 from services.infra.outbound_url import ip_blocked, ipv4_inside
 
 logger = logging.getLogger(__name__)
@@ -94,7 +116,10 @@ def control_plane(address: str) -> bool:
     judged as its IPv4 (``ipv4_inside``), and a string ``ipaddress`` cannot
     read (``getaddrinfo`` never
     yields one, and a zone id parses as link-local). A LAN address passes:
-    the admin's allowlist decides those."""
+    the admin's allowlist decides those. On a hosted install, every address
+    that is not publicly routable (``public_only``)."""
+    if config.OTODOCK_CLOUD:
+        return public_only(address)
     try:
         ip = ipv4_inside(ipaddress.ip_address(address))
     except ValueError:
@@ -133,14 +158,91 @@ def private_network(address: str) -> bool:
     return ip.is_global
 
 
+def admin_host(address: str) -> bool:
+    """A host an admin or a manifest chose: ``model_server``'s rule (this
+    machine and the LAN pass, link-local, the metadata addresses, multicast
+    and reserved refused); on a hosted install ``public_only``."""
+    if config.OTODOCK_CLOUD:
+        return public_only(address)
+    return model_server(address)
+
+
+def subnet_setting(key: str, default: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    """A subnet config key as a network; an invalid value falls back to the
+    default, which is then refused as well."""
+    value = config._cfg(key, default)
+    try:
+        return ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        logger.warning("%s=%r is not a network; refusing the default %s", key, value, default)
+        return ipaddress.ip_network(default)
+
+
+def on_tool_network(address: str, *, internal: bool) -> bool:
+    """The address is on the install's own Docker network for its tools
+    (``OTODOCK_NETWORK_SUBNET``) or, with ``internal``, on the document plane
+    the platform's file tools sit on (``OTODOCK_INTERNAL_SUBNET``); an
+    IPv4-mapped form judged as its IPv4."""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return False
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    nets = [subnet_setting("OTODOCK_NETWORK_SUBNET", "10.200.0.0/24")]
+    if internal:
+        nets.append(subnet_setting("OTODOCK_INTERNAL_SUBNET", "10.204.0.0/24"))
+    return any(ip in net for net in nets)
+
+
+def docker_tool(address: str) -> bool:
+    """A Docker tool's own container: nothing refused on a self-hosted
+    install; on a hosted one, every address outside the tools' network and
+    the document plane. One rule for every tool, since the tunnel's and the
+    gateway's pools are shared: the document plane holds only platform
+    services, whose names no tool may claim
+    (``compose_rewrite._RESERVED_PLATFORM_NAMES``)."""
+    if not config.OTODOCK_CLOUD:
+        return False
+    return not on_tool_network(address, internal=True)
+
+
+def tool_policy() -> Policy | None:
+    """The policy a Docker tool's dial takes: ``docker_tool`` on a hosted
+    install; None elsewhere (the caller keeps its plain client)."""
+    return docker_tool if config.OTODOCK_CLOUD else None
+
+
+def tool_transport(**kwargs) -> dict:
+    """The keyword a plain ``httpx.AsyncClient`` for Docker tools takes: the
+    checked transport on ``docker_tool`` on a hosted install (``limits``
+    moved onto it, the only place a custom transport reads them), nothing
+    elsewhere, so a self-hosted dial stays as it was."""
+    if not config.OTODOCK_CLOUD:
+        return kwargs
+    limits = kwargs.pop("limits", None)
+    extra = {"limits": limits} if limits is not None else {}
+    return {**kwargs, "transport": CheckedTransport(docker_tool, **extra)}
+
+
 # The policies whose dial drops a refused answer and connects to the rest.
-_FILTERING: frozenset[Policy] = frozenset({model_server, private_network})
+_FILTERING: frozenset[Policy] = frozenset({model_server, private_network, admin_host})
+
+
+def _filters(policy: Policy) -> bool:
+    """``admin_host`` filters as ``model_server`` does, and refuses the whole
+    answer as ``public_only`` does on a hosted install."""
+    if policy is admin_host and config.OTODOCK_CLOUD:
+        return False
+    return policy in _FILTERING
 
 
 def proxied(url: str) -> bool:
     """Whether a plain ``httpx`` client sends ``url`` through the
     environment's proxy (``HTTP(S)_PROXY`` / ``ALL_PROXY`` less ``NO_PROXY``,
-    matched the way httpx mounts them)."""
+    matched the way httpx mounts them). Never on a hosted install: there
+    the checked transport resolves and pins every dial itself."""
+    if config.OTODOCK_CLOUD:
+        return False
     try:
         target = httpx.URL(url)
     except httpx.InvalidURL:
@@ -178,7 +280,7 @@ def checked_addresses(host: str, port: int, policy: Policy) -> list[str]:
     for info in _getaddrinfo(host, port):
         addr = str(info[4][0])
         if policy(addr):
-            if policy in _FILTERING:
+            if _filters(policy):
                 refused = refused or addr
                 continue
             logger.warning("outbound: the host %r resolves to %s, an address this call may not reach",
@@ -273,6 +375,29 @@ def checked_client(url: str, policy: Policy = public_only, **kwargs) -> httpx.As
     return httpx.AsyncClient(transport=CheckedTransport(policy, verify=verify, limits=limits), **kwargs)
 
 
+def sdk_client(url: str, policy: Policy = admin_host) -> httpx.AsyncClient:
+    """The ``http_client`` for an LLM SDK dialling ``url`` (a local model
+    endpoint, the relay): checked at the dial, with the SDKs' own time
+    bounds, pool and redirects."""
+    return checked_client(url, policy, timeout=httpx.Timeout(600.0, connect=10.0),
+                          limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+                          follow_redirects=True)
+
+
+def mcp_client_factory(policy: Policy):
+    """The MCP SDK's ``httpx_client_factory`` for a remote MCP the platform
+    dials itself: the SDK's own time bounds (30 s, 300 s to read a stream),
+    every dial checked on ``policy``."""
+    def factory(headers=None, timeout=None, auth=None) -> httpx.AsyncClient:
+        kwargs: dict[str, typing.Any] = {"timeout": timeout or httpx.Timeout(30.0, read=300.0)}
+        if headers is not None:
+            kwargs["headers"] = headers
+        if auth is not None:
+            kwargs["auth"] = auth
+        return checked_pool(policy, **kwargs)
+    return factory
+
+
 def checked_pool(policy: Policy = public_only, **kwargs) -> httpx.AsyncClient:
     """An ``httpx.AsyncClient`` for any number of hosts: every URL the
     environment proxies (``HTTP(S)_PROXY`` / ``ALL_PROXY`` less
@@ -287,7 +412,7 @@ def checked_pool(policy: Policy = public_only, **kwargs) -> httpx.AsyncClient:
     mounts: dict[str, httpx.AsyncBaseTransport | None] = {
         pattern: (httpx.AsyncHTTPTransport(proxy=proxy, verify=verify, limits=proxy_limits)
                   if proxy else None)
-        for pattern, proxy in get_environment_proxies().items()
+        for pattern, proxy in ({} if config.OTODOCK_CLOUD else get_environment_proxies()).items()
     }
     return httpx.AsyncClient(
         transport=CheckedTransport(policy, verify=verify, limits=limits), mounts=mounts, **kwargs)

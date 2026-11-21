@@ -61,6 +61,70 @@ async def test_reconcile_classifies_and_acts():
 
 
 @pytest.mark.asyncio
+async def test_an_exit_of_an_earlier_open_never_ends_the_pty_started_again(monkeypatch):
+    """The machine reports an exit after its own teardown and keeps its
+    terminals by session id: every open carries a token, the exit names it,
+    and the exit of the PTY closed under an id never reaches the one started
+    again under that id. A handle taken back (no token) takes the id's exit."""
+    from core.remote import remote_pty
+
+    monkeypatch.setattr(remote_pty.RemotePtyProcess, "_send_ff", lambda self, msg: None)
+    exits = []
+    old = remote_pty.RemotePtyProcess(
+        machine_id="mr", session_id="s1", rows=24, cols=80, on_output=lambda d: None,
+        on_exit=lambda c: exits.append(("old", c)), scrollback_limit=1000, open_token="tok-old")
+    old.close()
+    new = remote_pty.RemotePtyProcess(
+        machine_id="mr", session_id="s1", rows=24, cols=80, on_output=lambda d: None,
+        on_exit=lambda c: exits.append(("new", c)), scrollback_limit=1000, open_token="tok-new")
+    try:
+        remote_pty.feed_exit("mr", "s1", 0, "tok-old")      # the closed PTY's exit, late
+        assert exits == [("old", None)] and not new.closed
+        remote_pty.feed_exit("mr", "s1", 3, "tok-new")      # the new PTY's own exit
+        assert exits == [("old", None), ("new", 3)] and new.closed
+        assert ("mr", "s1") not in remote_pty._remote_ptys
+        taken = remote_pty.adopt_remote_pty(machine_id="mr", session_id="s2", rows=24, cols=80,
+                                            on_output=lambda d: None, on_exit=lambda c: exits.append(("taken", c)))
+        assert taken.open_token == ""
+        remote_pty.feed_exit("mr", "s2", 0, "tok-any")      # a taken-back PTY has no token of its own
+        assert exits[-1] == ("taken", 0)
+        ended = remote_pty.RemotePtyProcess(
+            machine_id="mr", session_id="s3", rows=24, cols=80, on_output=lambda d: None,
+            on_exit=lambda c: exits.append(("memory", c, ended.exit_reason)), scrollback_limit=1000,
+            open_token="tok-3")
+        remote_pty.feed_exit("mr", "s3", -9, "tok-3", reason="memory")   # the guard ended its engine
+        assert exits[-1] == ("memory", -9, "memory")
+    finally:
+        remote_pty._remote_ptys.pop(("mr", "s1"), None)
+        remote_pty._remote_ptys.pop(("mr", "s2"), None)
+
+
+@pytest.mark.asyncio
+async def test_the_open_and_the_close_name_the_token(monkeypatch):
+    from core.remote import remote_pty, satellite_connection
+    sent = []
+
+    class _CM:
+        async def send_command(self, machine_id, msg, timeout):
+            sent.append(msg)
+            return {"pid": 7, "open_token": msg["open_token"]}
+
+        async def send_fire_and_forget(self, machine_id, msg):
+            sent.append(msg)
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", _CM)
+    try:
+        rp = await remote_pty.spawn_remote_pty(
+            machine_id="mt", session_id="s1", agent_slug="a", execution_path="claude-code-cli",
+            config_payload={}, rows=24, cols=80, on_output=lambda d: None)
+        assert len(rp.open_token) == 16 and sent[0]["open_token"] == rp.open_token
+        rp.close()
+        await asyncio.sleep(0)
+        assert sent[-1] == {"type": "pty_close", "session_id": "s1", "open_token": rp.open_token}
+    finally:
+        remote_pty._remote_ptys.pop(("mt", "s1"), None)
+
+
+@pytest.mark.asyncio
 async def test_machine_pty_queries():
     from core.remote import remote_pty
 
@@ -126,8 +190,9 @@ async def test_reconcile_ptys_exits_dead_and_closes_orphan():
 
 @pytest.mark.asyncio
 async def test_expire_pty_grace_terminates():
-    """When the window lapses with no reconnect, the held PTYs are torn down
-    (today's immediate behavior, just delayed)."""
+    """When the window lapses with no reconnect, the held PTYs wait for the
+    machine (2.0): nothing is torn down, the viewer keeps its banner, the
+    reaper spares them, and the machine's report decides them at its return."""
     from core.remote import remote_pty, satellite_connection as sc
     from core.remote.satellite_connection import SatelliteConnectionManager
 
@@ -140,11 +205,14 @@ async def test_expire_pty_grace_terminates():
         cm._pty_grace_timers["m5"] = asyncio.create_task(cm._expire_pty_grace("m5"))
         assert cm.is_pty_in_grace("m5")
         await asyncio.sleep(0.06)
+        assert exits == []                                   # nothing torn down
+        assert cm.is_pty_in_grace("m5")                      # it waits for the machine
+        assert "m5" not in cm._pty_grace_timers and remote_pty.is_machine_away("m5")
+        assert ("m5", "s5") in remote_pty._remote_ptys
     finally:
         sc._GRACE_WINDOW_S = orig
-    assert exits == [None]                                   # torn down on expiry
-    assert not cm.is_pty_in_grace("m5")                      # timer popped
-    assert ("m5", "s5") not in remote_pty._remote_ptys
+        remote_pty._away_since.clear()
+        remote_pty._remote_ptys.pop(("m5", "s5"), None)
 
 
 if __name__ == "__main__":

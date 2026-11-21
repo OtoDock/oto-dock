@@ -8,18 +8,19 @@ import asyncio
 import pytest
 
 import startup
+import startup_sweeps
 
 
 @pytest.fixture(autouse=True)
 def _clean():
-    startup._sweeps_running.clear()
+    startup_sweeps._sweeps_running.clear()
     yield
-    startup._sweeps_running.clear()
+    startup_sweeps._sweeps_running.clear()
 
 
 @pytest.mark.asyncio
 async def test_items_run_at_once_under_the_bound_and_a_failure_is_isolated(monkeypatch):
-    monkeypatch.setattr(startup, "_SWEEP_CONCURRENCY", 3)
+    monkeypatch.setattr(startup_sweeps, "_SWEEP_CONCURRENCY", 3)
     running = 0
     peak = 0
     done: list[str] = []

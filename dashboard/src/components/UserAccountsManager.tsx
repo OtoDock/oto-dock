@@ -11,8 +11,9 @@ import {
   useSetIntegration,
   useDeleteIntegration,
   useSetDefaultAccount,
-  useSetAccountAgentBinding,
-  useRemoveAccountAgentBinding,
+  useAddAgentAccount,
+  useRemoveAgentAccount,
+  useSetAgentDefaultAccount,
 } from '../api/credentials'
 import { AccountsManager } from './accounts/AccountsManager'
 import type { AccountsOps } from './accounts/types'
@@ -26,8 +27,9 @@ export function UserAccountsManager({ integration }: Props) {
     setIntegration: useSetIntegration(),
     deleteIntegration: useDeleteIntegration(),
     setDefault: useSetDefaultAccount(),
-    setBinding: useSetAccountAgentBinding(),
-    removeBinding: useRemoveAccountAgentBinding(),
+    addAgentAccount: useAddAgentAccount(),
+    removeAgentAccount: useRemoveAgentAccount(),
+    setAgentDefault: useSetAgentDefaultAccount(),
   }
   return <AccountsManager integration={integration} ops={ops} />
 }

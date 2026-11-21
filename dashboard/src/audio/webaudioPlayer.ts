@@ -1,9 +1,12 @@
 import { debugLog } from '../lib/debug/log'
+import { holdPlaybackSession } from './playbackSession'
 // Gapless PCM playback over the Web Audio API — schedule raw 16-bit signed LE
 // mono chunks back-to-back as they arrive, for low time-to-first-audio. Shared
 // by the one-shot platform-TTS replay (SoundIcon) and the streaming voice-mode
 // sink. Whole int16 samples are carried across chunk boundaries (an odd trailing
-// byte joins the next chunk).
+// byte joins the next chunk). Every player holds the playback session
+// (playbackSession.ts) from its start to its stop. A short sound file
+// (playClip, a notification's chime) holds none.
 
 type ACtor = typeof AudioContext
 
@@ -44,7 +47,16 @@ export function createPcmPlayer(
 ): PcmPlayer {
   const AC = audioContextCtor()
   if (!AC) throw new Error('Web Audio not available')
-  const ctx = new AC()
+  // Before the context opens, so WebKit picks the session for its first
+  // sound: on an iPhone that is "playback", which the silent switch leaves on.
+  const releaseSession = holdPlaybackSession()
+  let ctx: AudioContext
+  try {
+    ctx = new AC()
+  } catch (e) {
+    releaseSession()
+    throw e
+  }
   // A fresh AudioContext can start "suspended"; the user gesture that began
   // playback (icon/toggle click) is what unlocks it.
   void ctx.resume().catch(() => {})
@@ -152,6 +164,7 @@ export function createPcmPlayer(
       for (const s of live) { try { s.stop() } catch { /* already stopped */ } }
       live.clear()
       try { ctx.close() } catch { /* ignore */ }
+      releaseSession()
     },
 
     getLevel() {
@@ -176,5 +189,39 @@ export function createPcmPlayer(
         await Promise.all(ended)
       }
     },
+  }
+}
+
+/** Play one short sound file through Web Audio at ``volume``, holding no
+ * playback session. On an iPhone or an iPad WebKit plays Web Audio alone in
+ * the "ambient" session, which the Ring/Silent switch mutes and which mixes
+ * with other apps' sound. The context opens for the sound and closes at its
+ * end. Resolves once the sound ended, or at once when it cannot play. */
+export async function playClip(url: string, volume: number): Promise<void> {
+  const AC = audioContextCtor()
+  if (!AC) return
+  let ctx: AudioContext | null = null
+  try {
+    const res = await fetch(url)
+    if (!res.ok) return
+    const bytes = await res.arrayBuffer()
+    ctx = new AC()
+    void ctx.resume().catch(() => {})
+    const buffer = await ctx.decodeAudioData(bytes)
+    const gain = ctx.createGain()
+    gain.gain.value = volume
+    gain.connect(ctx.destination)
+    const source = ctx.createBufferSource()
+    source.buffer = buffer
+    source.connect(gain)
+    await new Promise<void>(resolve => {
+      source.onended = () => resolve()
+      // A context the page may not start yet never ends its sound: the
+      // sound's own length and a second bound the wait.
+      setTimeout(resolve, (buffer.duration + 1) * 1000)
+      source.start()
+    })
+  } catch { /* the chime is not heard */ } finally {
+    try { ctx?.close() } catch { /* ignore */ }
   }
 }

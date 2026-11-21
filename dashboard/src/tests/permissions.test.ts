@@ -15,7 +15,7 @@ const user = (role: User['role'], agent_roles: User['agent_roles'] = {}): User =
 
 describe('lib/permissions', () => {
   it('spells the members, the tiers and the ranks once', () => {
-    expect(Object.values(ROLE).sort()).toEqual([...PLATFORM_ROLES, ...AGENT_ROLES].sort())
+    expect(Object.values(ROLE).sort()).toEqual([...PLATFORM_ROLES, ...AGENT_ROLES, ROLE.EXTERNAL].sort())
     expect(EFFECTIVE_ROLES).toEqual(['viewer', 'contributor', 'editor', 'manager', 'admin'])
     expect(PLATFORM_BY_RANK).toEqual(['member', 'creator', 'admin'])
     expect(OWNER_TIER).toEqual(['manager', 'admin'])
@@ -72,6 +72,15 @@ describe('lib/permissions', () => {
     expect(meetsFloor({ min_role: 'manager' }, 'admin')).toBe(true)
     expect(meetsFloor({ min_role: 'editor' }, undefined)).toBe(false)
     expect(meetsFloor({ min_role: 'owner' }, 'admin')).toBe(false) // an unknown floor is unreachable
+    // An outside person ranks below every floor; the words outside the table keep 0.
+    expect(rank(ROLE.EXTERNAL)).toBe(-1)
+    expect(meetsFloor({}, ROLE.EXTERNAL)).toBe(false)
+    expect(meetsFloor({ min_role: '' }, ROLE.EXTERNAL)).toBe(false)
+    // The floor that opens a button or a method to outside people: everyone clears it.
+    for (const role of [ROLE.EXTERNAL, 'none', undefined, ROLE.VIEWER, ROLE.MANAGER, ROLE.ADMIN]) {
+      expect(meetsFloor({ min_role: ROLE.EXTERNAL }, role)).toBe(true)
+    }
+    expect(rank('none')).toBe(0)
   })
 
   it('wears one badge palette and one label per role', () => {

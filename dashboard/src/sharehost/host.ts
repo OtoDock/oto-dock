@@ -6,6 +6,8 @@
 // frames; a link opens only the hosts its manifest declares (APPS.md
 // "External links"). A link is a viewer of one page.
 
+import { pacedWaitMs, sendPaced } from '../lib/sendPaced'
+
 export interface ShareConfig {
   token: string
   share_id: string
@@ -213,7 +215,7 @@ export function classify(d: HostMessage | null | undefined): Reply {
     case 'app_actions': {
       const raw = Array.isArray(d.calls) ? d.calls : []
       const calls: ActionCall[] = []
-      for (const c of raw.slice(0, 16)) {
+      for (const c of raw.slice(0, 32)) {
         const call = c as Partial<ActionCall>
         calls.push({
           call_id: typeof call.call_id === 'string' ? call.call_id.slice(0, 64) : '',
@@ -250,15 +252,21 @@ export function classify(d: HostMessage | null | undefined): Reply {
   }
 }
 
+/** One call's answer; `retry_after_ms` when the platform paced it and a
+ * host may send it again. */
+export interface Settled { status: string; reason?: string; result?: string; run_id?: string; code?: number; retry_after_ms?: number }
+
 /** The per-call results a batch response must resolve to: one line per call
  * from the server, and a `denied` for any call the server never answered. */
-export function settleBatch(calls: ActionCall[], lines: string[]): Record<string, { status: string; reason?: string; result?: string; run_id?: string }> {
-  const out: Record<string, { status: string; reason?: string; result?: string; run_id?: string }> = {}
+export function settleBatch(calls: ActionCall[], lines: string[]): Record<string, Settled> {
+  const out: Record<string, Settled> = {}
   for (const line of lines) {
     if (!line.trim()) continue
     try {
-      const r = JSON.parse(line) as { call_id?: string; status?: string; reason?: string; result?: string; run_id?: string }
-      if (typeof r.call_id === 'string') out[r.call_id] = { status: r.status || 'denied', reason: r.reason, result: r.result, run_id: r.run_id }
+      const r = JSON.parse(line) as Settled & { call_id?: string }
+      if (typeof r.call_id === 'string') {
+        out[r.call_id] = { status: r.status || 'denied', reason: r.reason, result: r.result, run_id: r.run_id, code: r.code, retry_after_ms: r.retry_after_ms }
+      }
     } catch { /* a torn line: the call settles as denied below */ }
   }
   for (const c of calls) {
@@ -267,10 +275,45 @@ export function settleBatch(calls: ActionCall[], lines: string[]): Record<string
   return out
 }
 
+/** A page's calls as one batch through `send` (the page's pace and fetch),
+ * each settled. A call whose refusal names a wait (every call of a batch
+ * refused whole, a tool call inside its gap) goes once more after it, as in
+ * the dashboard (`sendPaced`); a refusal that names none is kept. */
+export async function sendLinkBatch(calls: ActionCall[], send: (calls: ActionCall[]) => Promise<Response>): Promise<Record<string, Settled>> {
+  const settled: Record<string, Settled> = {}
+  let pending = calls
+  const once = async (): Promise<Record<string, Settled>> => {
+    let got: Record<string, Settled>
+    try {
+      const res = await send(pending)
+      if (res.status === 429) {
+        const { wait, detail } = await pacedWaitMs(res)
+        got = Object.fromEntries(pending.map((k) => [k.call_id, { status: 'denied', reason: detail, code: 429, retry_after_ms: wait }]))
+      } else {
+        const lines = res.ok ? (await res.text()).split('\n')
+          : pending.map((k) => JSON.stringify({ call_id: k.call_id, status: 'denied', reason: res.status === 401 ? 'password required' : 'not available on shared links' }))
+        got = settleBatch(pending, lines)
+      }
+    } catch {
+      got = Object.fromEntries(pending.map((k) => [k.call_id, { status: 'denied', reason: 'network error' }]))
+    }
+    return Object.assign(settled, got)
+  }
+  await sendPaced(once, (got) => {
+    pending = pending.filter((k) => Number(got[k.call_id]?.retry_after_ms) > 0)
+    return Math.max(0, ...pending.map((k) => Number(got[k.call_id].retry_after_ms)))
+  })
+  return settled
+}
+
 /** The frame-facing result for one call, in the shape the runtime turns into
- * `otodock:action-result` (mcp_tool) or an action ack (fire_task). */
+ * `otodock:action-result` (mcp_tool) or an action ack (fire_task). A tool
+ * button that ran answers `done`, a task `ok`, as the dashboard's frame reads them. */
+// A call's statuses that mean it ran (these are answers to a call, not frame names).
+const RAN = new Set(['ok', 'sent', 'done'])
+
 export function resultMessage(call: ActionCall, r: { status: string; reason?: string; result?: string }): Record<string, unknown> {
-  const ok = r.status === 'ok' || r.status === 'sent'
+  const ok = RAN.has(r.status)
   return {
     source: 'otodock-host', type: 'action_result', id: call.id, call_id: call.call_id,
     ok, result: ok ? (r.result || '') : (r.reason || r.status),

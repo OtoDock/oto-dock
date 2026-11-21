@@ -9,7 +9,6 @@ Run: cd proxy && python -m pytest tests/storage/test_persona_migration.py -v
 
 from __future__ import annotations
 
-import subprocess
 import sys
 
 from tests._paths import PROXY_DIR
@@ -34,11 +33,8 @@ def _mk_agent(slug: str):
 
 
 def _config_git_log(config_dir) -> str:
-    out = subprocess.run(
-        ["git", "log", "--oneline"], cwd=config_dir,
-        capture_output=True, text=True,
-    )
-    return out.stdout
+    from services.infra import git_writer
+    return "\n".join(row["subject"] for row in git_writer.log(config_dir))
 
 
 class TestMigratePersonaFilenames:
@@ -108,3 +104,16 @@ class TestReaderNamePreference:
     def test_reader_missing_persona_returns_empty(self, temp_db):
         _mk_agent("read-none")
         assert prompts._read_agent_files("read-none") == []
+
+
+class TestMigratePersonaFollowsNoLink:
+    def test_a_config_folder_replaced_by_a_link_is_left_as_it_is(self, temp_db, tmp_path):
+        agent = _mk_agent("mig-link")
+        stand_in = tmp_path / "stand-in"
+        stand_in.mkdir()
+        (stand_in / "prompt.md").write_text("elsewhere")
+        import shutil
+        shutil.rmtree(agent / "config")
+        (agent / "config").symlink_to(stand_in)
+        assert agent_provisioning.migrate_persona_filenames() == 0
+        assert sorted(p.name for p in stand_in.iterdir()) == ["prompt.md"]

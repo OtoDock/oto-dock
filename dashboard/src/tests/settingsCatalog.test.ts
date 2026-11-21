@@ -10,9 +10,15 @@ import { describe, expect, it } from 'vitest'
 import { AREA, CATALOG, CATALOG_ROLE, KIND, SETTINGS_CATALOG_VERSION, entriesOf, findEntry } from '@/components/settings/catalog'
 import { ROLE } from '@/lib/permissions'
 
-const MECHANISM = /\b(carve|floor|hook|broker|probe|egress|daemon|endpoint|handler|payload|regex|mutex|socket|stdout|stderr|cgroup|namespace|userns|asyncio|coroutine|mixin|adapter|tombstone|manifest|runtime|sentinel|heuristic|idempotent|pool)s?\b/i
+/** The writing rules every repository shares: the long word list and the
+ *  screens' sentence cap (scripts/prose/rules.json). */
+const WRITING = JSON.parse(readFileSync(join(REPO, 'scripts', 'prose', 'rules.json'), 'utf8')) as {
+  sentence: { screen: number }
+  words: { plain: string[], inside: string[] }
+}
+const MECHANISM = new RegExp(`\\b(${[...new Set([...WRITING.words.plain, ...WRITING.words.inside])].join('|')})s?\\b`, 'i')
 const DASH = /[–—]|(^|\s)-(\s|$)/
-const MAX_WORDS = 20
+const MAX_WORDS = WRITING.sentence.screen
 
 function sentences(text: string): string[] {
   return text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean)

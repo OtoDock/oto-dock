@@ -1,0 +1,162 @@
+{
+ "headless/claude-code-cli/AskUserQuestion": {
+  "decision": {
+   "decision": "deny",
+   "reason": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call AskUserQuestion again this turn."
+  },
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "id": "q",
+       "question": "Which?"
+      }
+     ]
+    },
+    "tool_name": "AskUserQuestion"
+   }
+  ]
+ },
+ "headless/codex-cli/request_user_input": {
+  "decision": {
+   "decision": "deny",
+   "reason": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input again this turn."
+  },
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "id": "q",
+       "question": "Which?"
+      }
+     ]
+    },
+    "tool_name": "request_user_input"
+   }
+  ]
+ },
+ "headless/codex-cli/request_user_input_async": {
+  "decision": {
+   "decision": "deny",
+   "reason": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input_async again this turn."
+  },
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "id": "q",
+       "question": "Which?"
+      }
+     ]
+    },
+    "tool_name": "request_user_input_async"
+   }
+  ]
+ },
+ "headless/no-engine/AskUserQuestion": {
+  "decision": {
+   "decision": "deny",
+   "reason": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call AskUserQuestion again this turn."
+  },
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "id": "q",
+       "question": "Which?"
+      }
+     ]
+    },
+    "tool_name": "AskUserQuestion"
+   }
+  ]
+ },
+ "no-context": {
+  "decision": {
+   "decision": "deny",
+   "reason": "Session is no longer active. Send a new message to continue."
+  },
+  "queued": []
+ },
+ "terminal/claude-code-cli/AskUserQuestion/dashboard": {
+  "decision": {
+   "decision": "allow"
+  },
+  "parked": [
+   [
+    "AskUserQuestion",
+    null
+   ]
+  ],
+  "queued": []
+ },
+ "terminal/claude-code-cli/AskUserQuestion/task": {
+  "decision": {
+   "decision": "deny",
+   "reason": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call AskUserQuestion again this turn."
+  },
+  "parked": [],
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "id": "q",
+       "question": "Which?"
+      }
+     ]
+    },
+    "tool_name": "AskUserQuestion"
+   }
+  ]
+ },
+ "terminal/codex-cli/request_user_input/dashboard": {
+  "decision": {
+   "decision": "allow"
+  },
+  "parked": [
+   [
+    "request_user_input",
+    null
+   ]
+  ],
+  "queued": []
+ },
+ "terminal/codex-cli/request_user_input_async/dashboard": {
+  "decision": {
+   "decision": "allow"
+  },
+  "parked": [],
+  "queued": []
+ },
+ "terminal/codex-cli/request_user_input_async/task": {
+  "decision": {
+   "decision": "deny",
+   "reason": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input_async again this turn."
+  },
+  "parked": [],
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "id": "q",
+       "question": "Which?"
+      }
+     ]
+    },
+    "tool_name": "request_user_input_async"
+   }
+  ]
+ }
+}

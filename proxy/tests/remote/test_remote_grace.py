@@ -78,7 +78,11 @@ async def test_register_readopts_held_session_and_events_flow():
 
 
 @pytest.mark.asyncio
-async def test_grace_expiry_terminates_with_durable_marker():
+async def test_the_windows_end_keeps_the_held_sessions_waiting():
+    """The reconnect window ends only the waiting (2.0): the queues stay held
+    for the machine's return, nothing is put on them, and a reconnect still
+    re-adopts them. Ending them with the lost marker is a separate step (a
+    machine removed)."""
     from core.remote import satellite_connection as sc
     from core.remote.satellite_connection import SatelliteConnectionManager
 
@@ -94,15 +98,16 @@ async def test_grace_expiry_terminates_with_durable_marker():
     finally:
         sc._GRACE_WINDOW_S = orig
 
-    # Terminal injected: error (durable marker) then the DONE sentinel.
+    assert q.empty()
+    assert "m" in cm._grace_sessions and "m" not in cm._grace_timers
+    assert cm.is_session_in_grace("m", "s")
+    assert cm.is_session_stream_attached("m", "s")
+    cm._last_drop_at["m"] -= 1000.0
+    assert not cm.machine_dropped_recently("m")   # away past the window, honestly
+    assert cm.end_held_sessions("m") == 1
     err = q.get_nowait()
-    assert err["type"] == "error"
-    assert err.get("durable_marker") is True
-    assert "incomplete" in err["message"].lower()
-    queued = q.get_nowait()
-    assert queued is None
-    # Grace state cleared on expiry.
-    assert "m" not in cm._grace_sessions
+    assert err["type"] == "error" and err.get("durable_marker") is True
+    assert q.get_nowait() is None
     assert not cm.is_session_in_grace("m", "s")
 
 
@@ -221,6 +226,31 @@ class TestPumpDurableMarker:
         assert err == [{"pump_type": sp.wire.PUMP_ERROR, "message": ending.line(),
                         "reason": "limit", "resets_at": "2026-10-01T15:00:00+00:00"}]
         assert pump.last_ending == ending
+        assert "say" not in err[0], "a limit has no line of its own for a caller"
+
+    @pytest.mark.asyncio
+    async def test_an_engine_the_memory_guard_stopped_carries_what_a_caller_hears(self, monkeypatch):
+        """The machine's memory guard ended the engine: the chat reads the
+        card, and the frame also carries the one sentence a caller on the
+        phone hears, which names nothing of the platform."""
+        from core.events import turn_ending
+        saved: list = []
+        sp, eq, pump = self._mk_pump("chat-m", "sess-m", saved, monkeypatch)
+        frames: list = []
+
+        async def forward(item):
+            frames.append(item)
+
+        monkeypatch.setattr(pump, "_forward", forward)
+        ending = turn_ending.TurnEnding(reason=turn_ending.EXITED, detail=turn_ending.MEMORY)
+        await eq.put(sp.CommonEvent(type=sp.ERROR, data={
+            "message": ending.line(), "ending": ending.as_dict()}))
+        await pump._run()
+        [err] = [f for f in frames if f.get("pump_type") == sp.wire.PUMP_ERROR]
+        assert err["message"] == ending.line() and err["reason"] == "exited"
+        assert err["say"] == "Sorry, I had to stop for a moment. Could you say that again?"
+        for word in ("memory", "engine", "machine", "compute", "OtoDock"):
+            assert word not in err["say"]
 
 
 class TestWaitSessionReconnect:
@@ -295,11 +325,6 @@ class TestWaitSessionReconnect:
         self._reconnect_after(cm, 0.1)
 
         assert await layer.wait_session_reconnect("s", timeout=5) is False
-
-    @pytest.mark.asyncio
-    async def test_a_local_layer_never_waits(self):
-        from core.layers.cli.layer import CLIExecutionLayer
-        assert await CLIExecutionLayer().wait_session_reconnect("s") is False
 
 
 def test_the_session_records_on_one_machine():

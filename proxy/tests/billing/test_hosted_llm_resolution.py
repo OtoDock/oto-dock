@@ -11,6 +11,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests._pool_store import set_pool_store
+
 
 def _relay_sub(provider: str = "anthropic", **o) -> dict:
     s = {"id": f"relay-{provider}", "layer": "direct-llm", "provider": provider,
@@ -34,7 +36,7 @@ def registry_store(monkeypatch):
     m.get_credential_data.return_value = {}
     m.list_personal.return_value = []          # no personal sub unless a test sets one
     m.list_platform_pool.return_value = []     # tests populate the platform pool
-    monkeypatch.setattr("services.engines.subscription_pool.subscription_store", m)
+    set_pool_store(monkeypatch, m)
     monkeypatch.setattr("config.OTODOCK_RELAY_BASE", "https://api.otodock.io")
     from services.engines import subscription_pool
     subscription_pool._session_subscriptions.clear()
@@ -84,7 +86,7 @@ def _direct_builtins() -> list[str]:
 @pytest.mark.parametrize("model", _direct_builtins())
 def test_every_direct_builtin_resolves_to_its_relay_route(registry_store, monkeypatch, model):
     # The registry's own provider for each Direct LLM builtin (GPT-6.1 Terra
-    # and Sol on OpenAI's route, Qwen 3.8 on Groq's): the hosted relay prices
+    # and 6.2 Sol on OpenAI's route, Qwen 3.8 on Groq's): the hosted relay prices
     # per model, so each one needs its relay row before a release lists it.
     import config
     from services.engines import subscription_pool
@@ -101,7 +103,7 @@ def test_every_direct_builtin_resolves_to_its_relay_route(registry_store, monkey
 def test_the_direct_builtins_are_exactly_the_relay_priced_set():
     # a swap edits this set together with the relay's rows and the Direct LLM catalog table
     assert set(_direct_builtins()) == {
-        "claude-sonnet-5-5", "claude-haiku-5-5", "gpt-6.1-sol", "gpt-6.1-terra",
+        "claude-sonnet-5-5", "claude-haiku-5-5", "gpt-6.2-sol", "gpt-6.1-terra",
         "gpt-6-luna", "qwen/qwen3.8-27b", "openai/gpt-oss-120b",
     }
 

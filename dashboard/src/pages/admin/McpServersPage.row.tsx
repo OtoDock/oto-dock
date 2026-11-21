@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useEnableMcp, useDisableMcp, useSetMcpConfig, useSetMcpToolFilter, useSetHostedServiceMode, useSetNetworkAccess, useDockerAction, useDeleteMcp, useStartMcpUpdate, UPDATE_JOB_END, ASSIGNMENT_PLATFORM, useAcceptMcpSource, useDismissMcpSourceChange, isUpdateOffer, automaticUpdateNote, McpServer, McpUpdateInfo, McpUpdateJob, McpUpdateFinished, McpSourceChange, McpSourceEnd } from '../../api/mcps'
+import { useEnableMcp, useDisableMcp, useSetMcpConfig, useSetMcpToolFilter, useSetHostedServiceMode, useSetNetworkAccess, useSetKeepRunning, useDockerAction, useDeleteMcp, useStartMcpUpdate, UPDATE_JOB_END, ASSIGNMENT_PLATFORM, useAcceptMcpSource, useDismissMcpSourceChange, isUpdateOffer, automaticUpdateNote, McpServer, McpUpdateInfo, McpUpdateJob, McpUpdateFinished, McpSourceChange, McpSourceEnd } from '../../api/mcps'
 import { INPUT_MULTILINE_SECRET, isGitHubApp } from '../../lib/kinds/oauthApp'
 import { useAgents } from '../../api/agents'
 import { useSetInfraCredentials, useCredentialSchema } from '../../api/credentials'
@@ -34,6 +34,9 @@ const DOCKER_STATUS: Record<DockerStatus, { label: string; color: string }> = {
   error: { label: 'Error', color: 'text-status-danger-fg' },
   unknown: { label: 'Unknown', color: 'text-tertiary' },
   not_checked: { label: '...', color: 'text-tertiary' },
+  // Asleep until its next use: normal, not a fault.
+  sleeping: { label: 'Sleeping', color: 'text-tertiary' },
+  did_not_start: { label: 'Did not start', color: 'text-status-danger-fg' },
 }
 
 function InstanceManagerWrapper({ mcpName, apiKeyRelay }: { mcpName: string; apiKeyRelay?: ApiKeyRelayInfo }) {
@@ -328,6 +331,7 @@ export function McpRow({ mcp, updateInfo, job, finished, autoUpdateEnabled = tru
   const saveInfraCreds = useSetInfraCredentials()
   const setHostedMode = useSetHostedServiceMode()
   const setNetworkAccess = useSetNetworkAccess()
+  const setKeepRunning = useSetKeepRunning()
   const { authConfig } = useAuth()
   const deleteMcp = useDeleteMcp()
   const startUpdate = useStartMcpUpdate()
@@ -700,7 +704,8 @@ export function McpRow({ mcp, updateInfo, job, finished, autoUpdateEnabled = tru
                     </Button>
                     <Button variant="danger" size="xs"
                       onClick={() => dockerAction.mutate({ name: mcp.name, action: 'stop' })}
-                      disabled={dockerAction.isPending || updating || mcp.docker_status === DOCKER.STOPPED}
+                      disabled={dockerAction.isPending || updating || mcp.docker_status === DOCKER.STOPPED
+                        || mcp.docker_status === DOCKER.SLEEPING || mcp.docker_status === DOCKER.DID_NOT_START}
                     >
                       Stop
                     </Button>
@@ -713,6 +718,38 @@ export function McpRow({ mcp, updateInfo, job, finished, autoUpdateEnabled = tru
                   </div>
                   {dockerAction.error && (
                     <p className="text-2xs text-status-danger-fg mt-2">{dockerAction.error.message}</p>
+                  )}
+                  {mcp.docker_status === DOCKER.SLEEPING && (
+                    <p className="text-2xs text-secondary leading-snug mt-2">It starts at its next use.</p>
+                  )}
+                  {!!mcp.docker_working_minutes && mcp.docker_status === DOCKER.RUNNING && (
+                    <p className="text-2xs text-secondary leading-snug mt-2" data-testid="docker-working">
+                      It is working on a job, so it stays awake for up to {mcp.docker_working_minutes} more
+                      minute{mcp.docker_working_minutes === 1 ? '' : 's'}.
+                    </p>
+                  )}
+                  {mcp.docker_status === DOCKER.DID_NOT_START && (
+                    <p className="text-2xs text-status-danger-fg leading-snug mt-2">
+                      It did not start at its last use.{mcp.docker_wake_error ? ` ${mcp.docker_wake_error}` : ''}
+                    </p>
+                  )}
+                  {/* No tool is kept running on hosted OtoDock: every one sleeps there. */}
+                  {!mcp.docker_always_on && !authConfig?.cloud && (
+                    <div className="flex items-center gap-2 mt-3">
+                      <Switch
+                        aria-label={`Keep ${mcp.label} running`}
+                        checked={!!mcp.docker_keep_running}
+                        disabled={setKeepRunning.isPending}
+                        onChange={(keep) => {
+                          void run('keep_running', () => setKeepRunning.mutateAsync({ name: mcp.name, keep }), { failTitle: 'Keep running was not saved' })
+                        }}
+                      />
+                      <span className="text-xs text-primary">Keep running</span>
+                      <SaveState state={stateOf('keep_running')} />
+                    </div>
+                  )}
+                  {!mcp.docker_always_on && !authConfig?.cloud && (
+                    <p className="text-2xs text-secondary leading-snug mt-1">Uses memory all the time.</p>
                   )}
                 </div>
               )}
@@ -746,45 +783,51 @@ export function McpRow({ mcp, updateInfo, job, finished, autoUpdateEnabled = tru
                 </div>
               )}
 
-              {/* Internal-network access (homelab MCPs declaring network_targets).
-                  When on, the agent sandbox carves egress to exactly this MCP's
-                  configured target host — nothing else on the LAN. Unavailable
-                  on hosted OtoDock (no operator network). */}
-              {mcp.has_network_targets && (
-                <div className={`${CARD_BORDERED} p-3`}>
-                  <p className="text-2xs font-semibold text-tertiary uppercase tracking-wide mb-2">Internal network access</p>
-                  {authConfig?.cloud ? (
-                    <p className="text-xs text-secondary leading-snug">
-                      Not available on OtoDock Cloud. This MCP can only reach
-                      public addresses.
-                    </p>
-                  ) : (
-                    <>
-                      <div className="relative flex items-start gap-2">
-                        <input
-                          id={`network-access-${mcp.name}`}
-                          type="checkbox"
-                          checked={mcp.network_access ?? true}
-                          disabled={setNetworkAccess.isPending}
-                          onChange={(e) => {
-                            const enabled = e.target.checked
-                            void run('network', () => setNetworkAccess.mutateAsync({ name: mcp.name, enabled }), { failTitle: 'The network access setting was not saved' })
-                          }}
-                          className="mt-0.5 accent-action cursor-pointer"
-                        />
-                        <div className="text-xs text-primary">
-                          <label htmlFor={`network-access-${mcp.name}`} className="cursor-pointer after:absolute after:inset-0">Allow this MCP to reach its configured address on your network</label>
-                          <span className="relative z-10">
-                            <InfoTip label="Allow this MCP to reach its configured address on your network">Agents are cut off from your network by default.</InfoTip>
-                          </span>
-                          <SaveState state={stateOf('network')} />
-                        </div>
+              {/* Internal-network access: a homelab MCP's configured target
+                  (network_targets, carved into the agent's sandbox) or the
+                  platform browser's own exit (network_exit, its container's
+                  local network). Absent on hosted OtoDock, where the server
+                  refuses it and reads it as off. */}
+              {(mcp.has_network_targets || mcp.has_network_exit) && !authConfig?.cloud && (() => {
+                const browser = !!mcp.has_network_exit
+                const label = browser
+                  ? 'Let the browser open pages on your local network'
+                  : 'Allow this MCP to reach its configured address on your network'
+                return (
+                  <div className={`${CARD_BORDERED} p-3`}>
+                    <p className="text-2xs font-semibold text-tertiary uppercase tracking-wide mb-2">{browser ? 'Local network' : 'Internal network access'}</p>
+                    <div className="relative flex items-start gap-2">
+                      <input
+                        id={`network-access-${mcp.name}`}
+                        type="checkbox"
+                        checked={mcp.network_access ?? !browser}
+                        disabled={setNetworkAccess.isPending}
+                        onChange={(e) => {
+                          const enabled = e.target.checked
+                          void run('network', () => setNetworkAccess.mutateAsync({ name: mcp.name, enabled }), { failTitle: 'The network access setting was not saved' })
+                        }}
+                        className="mt-0.5 accent-action cursor-pointer"
+                      />
+                      <div className="text-xs text-primary">
+                        <label htmlFor={`network-access-${mcp.name}`} className="cursor-pointer after:absolute after:inset-0">{label}</label>
+                        <span className="relative z-10">
+                          <InfoTip label={label}>
+                            {browser
+                              ? 'Turned on, the browser reaches what this server reaches.'
+                              : 'Agents that run on the platform cannot reach local addresses by default. Tick this to let this tool reach its address. Its agents then run on the platform\'s own compute machine.'}
+                          </InfoTip>
+                        </span>
+                        <SaveState state={stateOf('network')} />
                       </div>
-                      <p className="text-2xs text-secondary leading-snug mt-1.5">This opens a path to the host you set above, and nothing else.</p>
-                    </>
-                  )}
-                </div>
-              )}
+                    </div>
+                    <p className="text-2xs text-secondary leading-snug mt-1.5">
+                      {browser
+                        ? 'Changing this restarts the browser. Callers and outside people lose it while it is on.'
+                        : 'This opens a path to the host you set below, and nothing else.'}
+                    </p>
+                  </div>
+                )
+              })()}
 
               {/* Tool Filter: a per-MCP runtime tool restriction, shown only
                   when the manifest declares `tool_filter`. */}

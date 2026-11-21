@@ -324,7 +324,7 @@ def test_a_shared_app_takes_an_editor_or_a_manager(agent_tree):
 # ── the launch ──────────────────────────────────────────────────────────────
 
 
-def test_env_values_reach_live_only(agent_tree, tmp_path, monkeypatch):
+def test_env_values_reach_live_only(agent_tree, tmp_path, placed, monkeypatch):
     """The ``env`` values reach the live instance only; a
     preview (unapproved code an editor or a session can start at once) and a
     check start with none, whatever is passed."""
@@ -336,27 +336,20 @@ def test_env_values_reach_live_only(agent_tree, tmp_path, monkeypatch):
     db_app_secrets.set_value(row["id"], "STRIPE_SECRET_KEY", KEY_VALUE, "alice-sub")
     # Only the env secrets reach a launch; a sends_to value never does.
     assert app_secrets.env_values(row) == {"SMTP_PASSWORD": PW_VALUE}
-    # The launcher: the env it builds per instance kind.
-    seen: dict[str, dict] = {}
-
-    def fake_build_env(r, token, pub, *, port=3000, preview=False, secrets=None):
-        seen[("preview" if preview else "live")] = dict(secrets or {})
-        return {"PATH": "/bin"}
-
-    async def fake_exec(*argv, **kw):
-        raise app_sandbox.AppStartError("not really")
-
-    monkeypatch.setattr(app_sandbox, "build_env", fake_build_env)
-    monkeypatch.setattr(app_sandbox, "build_command", lambda *a, **k: ["true"])
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    # The launch: the env the machine is sent per instance kind.
+    placed.answer = lambda msg: RuntimeError("Satellite command error: not really")
+    tree = agent_tree / "launch"
+    tree.mkdir()
     for name in ("live", "preview", "check"):
         inst = app_supervisor.Instance(row_id=row["id"], name=name, row=row,
-                                       release_dir=tmp_path, data_dir=tmp_path, entry="server/index.ts")
+                                       release_dir=tree, data_dir=tree, entry="server/index.ts")
         with pytest.raises(app_sandbox.AppStartError):
             asyncio.run(app_supervisor._launch(inst, preview=name == "preview", allow_hosts=[],
                                                secrets={"SMTP_PASSWORD": PW_VALUE}))
-        kind = "preview" if name == "preview" else "live"
-        assert seen.pop(kind) == ({"SMTP_PASSWORD": PW_VALUE} if name == "live" else {}), name
+        env = placed.of("app_server_start")[-1]["env"]
+        assert placed.of("app_server_start")[-1]["instance"] == name
+        assert env.get("SMTP_PASSWORD") == (PW_VALUE if name == "live" else None), name
+        assert ("OTODOCK_PREVIEW" in env) == (name == "preview")
     # start() hands the preview nothing either, and a required value that is
     # not set keeps the live server down but never the preview.
     launched: dict[str, dict] = {}
@@ -368,26 +361,25 @@ def test_env_values_reach_live_only(agent_tree, tmp_path, monkeypatch):
     monkeypatch.setattr(app_supervisor, "_launch", fake_launch)
     row = _approve(row)
     db_app_secrets.set_value(row["id"], "STRIPE_WEBHOOK_SECRET", "whsec-test-value", "alice-sub")
-    (tmp_path / "server").mkdir(exist_ok=True)
-    (tmp_path / "server" / "index.ts").write_text("export {}")
+    # The release and the data folders sit in the agent's folder, where the
+    # start makes its folders.
+    release = agent_tree / "start-release"
+    (release / "server").mkdir(parents=True, exist_ok=True)
+    (release / "server" / "index.ts").write_text("export {}")
     for name in ("live", "preview"):
         with pytest.raises(app_sandbox.AppStartError):
-            asyncio.run(app_supervisor.start(row, name, release_dir=tmp_path, data_dir=tmp_path / name))
+            asyncio.run(app_supervisor.start(row, name, release_dir=release, data_dir=agent_tree / "data" / name))
         app_supervisor._instances.clear()
     assert launched == {"live": {"SMTP_PASSWORD": PW_VALUE}, "preview": {}}
     db_app_secrets.delete_value(row["id"], "STRIPE_WEBHOOK_SECRET")
     with pytest.raises(app_supervisor.AppUnavailable) as e:
-        asyncio.run(app_supervisor.start(row, "live", release_dir=tmp_path, data_dir=tmp_path / "l2"))
+        asyncio.run(app_supervisor.start(row, "live", release_dir=release, data_dir=agent_tree / "data" / "l2"))
     assert e.value.state == "secrets"
     with pytest.raises(app_sandbox.AppStartError):
-        asyncio.run(app_supervisor.start(row, "preview", release_dir=tmp_path, data_dir=tmp_path / "p2"))
+        asyncio.run(app_supervisor.start(row, "preview", release_dir=release, data_dir=agent_tree / "data" / "p2"))
 
 
-def test_a_missing_required_value_keeps_the_server_down(agent_tree, tmp_path, monkeypatch):
-    fake_bun = tmp_path / "bun"
-    fake_bun.write_text("#!/bin/sh\n")
-    fake_bun.chmod(0o755)
-    monkeypatch.setattr(config, "BUN_BIN", str(fake_bun))
+def test_a_missing_required_value_keeps_the_server_down(agent_tree, placed, healthy):
     row = _approve(_row(secrets=SECRETS[1:2], egress=EGRESS))
     src = _write(agent_tree / row["rel_path"], {"app.json": "{}", "client/index.html": "<p>x</p>",
                                                 "server/index.ts": "export {}"})
@@ -396,11 +388,17 @@ def test_a_missing_required_value_keeps_the_server_down(agent_tree, tmp_path, mo
     with pytest.raises(app_supervisor.AppUnavailable) as e:
         asyncio.run(app_supervisor.start(row))
     assert e.value.state == "secrets" and "STRIPE_WEBHOOK_SECRET" in e.value.reason
-    # A check instance needs no value: the refusal never fires for it (the
-    # launch itself fails here because the fake Bun exits at once).
-    with pytest.raises(app_sandbox.AppStartError):
-        asyncio.run(app_supervisor.start(row, "check", release_dir=src, data_dir=tmp_path / "d",
-                                         allow_hosts=[]))
+    assert not placed.sent
+    # A check instance needs no value: the refusal never fires for it, and
+    # the machine starts it.
+    scratch = releases.scratch_data_dir(row)
+
+    async def check() -> None:
+        inst = await app_supervisor.start(row, "check", release_dir=src, data_dir=scratch, allow_hosts=[])
+        assert inst.state == "up" and placed.of("app_server_start")[0]["instance"] == "check"
+        await app_supervisor.stop_all()
+
+    asyncio.run(check())
 
 
 def test_the_pump_scrubs_every_value_the_child_was_handed(agent_tree, tmp_path):
@@ -584,3 +582,27 @@ def test_the_egress_route_refuses_a_host_that_answers_with_a_private_address(age
     assert client.post(f"/v1/apps/{row['id']}/egress/other.example.test/x",
                        headers={"Authorization": f"Bearer {inst.token}"}).status_code == 404
     assert len(seen) == 1
+
+
+def test_the_egress_route_never_calls_the_installs_own_public_name(agent_tree, monkeypatch):
+    """An app's server reaches the platform through its own routes with its
+    own token. The install's public name as an approved egress host is
+    refused at the call, before anything is resolved or sent."""
+    row = _approve(_row(secrets=SECRETS, egress=[*EGRESS, "agents.example.test"]))
+    inst = app_supervisor.Instance(row_id=row["id"], name="live", row=row,
+                                   release_dir=agent_tree, data_dir=agent_tree, host_port=1,
+                                   state="up", entry="server/index.ts")
+    inst.token = app_tokens.mint(row["id"], app_tokens.PURPOSE_LAUNCH, {"sub": f"app:{row['id']}"}, 3600)
+    app_supervisor._instances[(row["id"], "live")] = inst
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://Agents.Example.test:8443/")
+    resolved: list[str] = []
+    monkeypatch.setattr(app_egress, "validate_outbound_url", lambda url, **kw: resolved.append(url))
+    app_egress._client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, stream=httpx.ByteStream(b"ok"))))
+    own = client.get(f"/v1/apps/{row['id']}/egress/agents.example.test/v1/admin/users",
+                     headers={"Authorization": f"Bearer {inst.token}"})
+    assert own.status_code == 403 and "this install" in own.text and resolved == []
+    # Another approved host still goes out.
+    assert client.get(f"/v1/apps/{row['id']}/egress/api.example.test/x",
+                      headers={"Authorization": f"Bearer {inst.token}"}).status_code == 200
+    assert resolved == ["https://api.example.test/"]

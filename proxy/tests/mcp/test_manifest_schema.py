@@ -111,6 +111,38 @@ def test_tool_timeout_sec_is_whole_seconds_within_an_hour_and_asks_for_no_floor(
         assert mf.platform_floor(data, SCHEMA) == ("1.0.0", [])
 
 
+@pytest.mark.parametrize("value, ok", [
+    ("/busy", True), ("/v1/jobs.busy", True),
+    ("busy", False), ("/busy?x=1", False), ("http://h/busy", False), (1, False),
+])
+def test_busy_endpoint_is_a_path_and_asks_for_no_floor(value, ok):
+    """A catalog entry that declares it still reaches 1.9.1, which ignores it."""
+    data = _base(server={**_base()["server"], "busy_endpoint": value})
+    assert (mf.schema_errors(data, SCHEMA) == []) is ok
+    if ok:
+        assert mf.platform_floor(data, SCHEMA) == ("1.0.0", [])
+
+
+@pytest.mark.parametrize("raw, parsed", [
+    (None, ""), ("", ""), ("/busy", "/busy"), ("/a/../b", ""), ("busy", ""), (7, ""),
+])
+def test_busy_endpoint_parses_or_is_dropped(raw, parsed):
+    from services.mcp.mcp_manifest_blocks import _busy_endpoint
+    assert _busy_endpoint({} if raw is None else {"busy_endpoint": raw}, "t") == parsed
+
+
+@pytest.mark.parametrize("value, ok", [
+    ("first_call", True), ("with_chat", True), ("eager", False), (True, False),
+])
+def test_starts_takes_its_two_words_and_asks_for_no_floor(value, ok):
+    data = _base(server={**_base()["server"], "starts": value})
+    assert (mf.schema_errors(data, SCHEMA) == []) is ok
+    if ok:
+        # An older platform starts every program with the chat, which is
+        # what "with_chat" asks and what "first_call" falls back to.
+        assert mf.platform_floor(data, SCHEMA) == ("1.0.0", [])
+
+
 def test_unknown_keys_are_allowed_and_ask_for_no_floor():
     data = _base(some_future_field={"x": 1}, server={**_base()["server"], "future": True})
     data["$schema"] = SCHEMA["$id"]
@@ -130,7 +162,8 @@ def _properties(node, out: set) -> set:
 
 
 def test_every_field_the_parser_reads_is_described():
-    source = (PROXY_DIR / "services" / "mcp" / "mcp_manifest_parse.py").read_text(encoding="utf-8")
+    source = "".join((PROXY_DIR / "services" / "mcp" / name).read_text(encoding="utf-8")
+                     for name in ("mcp_manifest_parse.py", "mcp_manifest_blocks.py"))
     read = set(re.findall(r'data\.get\("([a-z_]+)"', source)) | set(re.findall(r'data\["([a-z_]+)"\]', source))
     assert read, "the parser's reads were not found"
     assert read - _properties(SCHEMA, set()) == set()

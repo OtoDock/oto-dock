@@ -26,6 +26,7 @@ import { SaveState } from '../ui/SettingsControls'
 import { useSaveState } from '../../hooks/useSaveState'
 import Button from '../ui/Button'
 import { DIALOG_PANEL } from '../ui/classes'
+import { copyOrSay } from '../../lib/copyText'
 
 /**
  * The share popover (SHARING.md): who an app is shared with and how to add
@@ -256,7 +257,10 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
   // read-only).
   const myRole = isAdmin(user) ? ROLE.ADMIN : app.scope === PERSONAL_SCOPE ? ROLE.MANAGER : actingRole(user, target.agent ?? '')
   const capChoices = isChat ? [] : CAPS_ASCENDING.filter((r) => rank(r) <= rank(myRole))
-  const platformActions = (app.actions ?? []).filter((a) => a.type === 'mcp_tool' || a.type === 'fire_task')
+  // A link's visitors are external identities: only a tool or task button
+  // the app opens to them works on a link.
+  const toolButtons = (app.actions ?? []).filter((a) => a.type === 'mcp_tool' || a.type === 'fire_task')
+  const platformActions = toolButtons.filter((a) => a.min_role === ROLE.EXTERNAL)
 
   // Where the identity-provider round trip comes back to: an app's own page
   // opens this popover from the URL; a chat's page does not, so the person
@@ -376,11 +380,10 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
   const failed = (e: unknown) => setError(e instanceof Error ? e.message : 'The change did not go through')
 
   const copy = async (text: string, what: string) => {
-    try {
-      await navigator.clipboard.writeText(text)
+    if (await copyOrSay(text)) {
       setCopied(what)
       setTimeout(() => setCopied(''), 1500)
-    } catch { /* clipboard unavailable: the text is selectable */ }
+    }
   }
 
   const shareRow = (s: Share) => {
@@ -614,6 +617,11 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                 {hasSteps && (
                   <p className="text-2xs text-status-warning-fg" data-testid="share-steps-note">
                     This app runs scripts on its own. Whatever a visitor of the link sends is data to those scripts, never instructions.
+                  </p>
+                )}
+                {toolButtons.length > 0 && platformActions.length === 0 && (
+                  <p className="text-2xs text-tertiary" data-testid="share-no-link-buttons">
+                    Its buttons do not work on a link. A button works there only when the app opens it to external identities.
                   </p>
                 )}
                 {platformActions.length > 0 && (

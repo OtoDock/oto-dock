@@ -13,6 +13,7 @@ agent-scope), and the verbatim fire (no page-controlled prompt_override).
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from unittest.mock import patch
 
@@ -814,13 +815,16 @@ def test_htmlless_pin_reads_the_file_through_from_the_satellite(agent_tree):
 
     pulls: list[str] = []
 
-    async def _pull(machine_id, ref, dest_path, *, agent_slug="", timeout=180.0):
+    async def _pull(machine_id, ref, dest_path, *, agent_slug="", timeout=180.0, hash_out=None):
         pulls.append(ref.value)
-        Path(dest_path).write_text("<p>v2 edited on the satellite</p>")  # noqa: ASYNC240  # a test's own temporary files
+        data = b"<p>v2 edited on the satellite</p>"
+        Path(dest_path).write_bytes(data)  # noqa: ASYNC240  # a test's own temporary files
+        if hash_out is not None:   # the real pull hands back the committed bytes' hash
+            hash_out.update(hash="sha256:" + hashlib.sha256(data).hexdigest(), size=len(data))
         return True
 
     cm = MagicMock()
-    cm.satellite_supports_file_stat.return_value = False
+    cm.stat_file = AsyncMock(return_value=None)
     cm.pull_file_to_path = AsyncMock(side_effect=_pull)
     cm.get_connected_machines.return_value = []
     with patch.object(remote_file_flow, "_get_remote_session_info", return_value=_Info()), \
@@ -962,7 +966,7 @@ def test_mcp_tool_exec_endpoint(agent_tree, fake_mcps, monkeypatch):
                    "actions": [_mcp_action()]}).json()["app_id"]
     calls = []
 
-    async def fake_exec(row, action, merged):
+    async def fake_exec(row, action, merged, reach=None):
         calls.append(merged)
         return {"status": "done", "result": "out"}
 
@@ -996,13 +1000,39 @@ def test_mcp_tool_exec_endpoint(agent_tree, fake_mcps, monkeypatch):
     assert calls[-1] == {"text": "b", "flag": True}
 
 
+def test_a_press_that_chooses_runs_at_the_pressers_reach(agent_tree, fake_mcps, monkeypatch):
+    """As whom a press acts: a viewer's own text runs in the agent
+    scope at the viewer's role; a press that chooses nothing, and a manager's
+    choice, run as the app. The executor is told which, and no caller can
+    leave it out."""
+    from auth.path_policy import PRESS_MEMBER
+    from services.apps import headless_exec as hx
+    reaches = []
+
+    async def fake_exec(row, action, merged, *, reach):
+        reaches.append(reach)
+        return {"status": "done", "result": "out"}
+
+    monkeypatch.setattr("services.apps.headless_exec.execute_app_tool", fake_exec)
+    app_id = _pin({"slug": "r", "html": "<p>x</p>",
+                   "actions": [_mcp_action(), _mcp_action(id="plain", args_schema=None)]},
+                  sid=SID_SHARED).json()["app_id"]
+    _approve(app_id)
+    assert client.post(f"/v1/apps/{app_id}/actions/run", json={"args": {"text": "a"}}).status_code == 200
+    task_store.upsert_user("vic-sub", "vic@test.com", "Vic", "member")
+    _as(_user(sub="vic-sub", agent_roles={AGENT: "viewer"}))
+    assert client.post(f"/v1/apps/{app_id}/actions/run", json={"args": {"text": "b"}}).status_code == 200
+    assert client.post(f"/v1/apps/{app_id}/actions/plain", json={}).status_code == 200
+    assert reaches == [hx.FULL, (PRESS_MEMBER, "viewer"), hx.FULL]
+
+
 def test_mcp_tool_exec_recheck_and_list_flags(agent_tree, fake_mcps, monkeypatch):
     app_id = _pin({"slug": "s", "html": "<p>x</p>",
                    "actions": [_mcp_action(fixed_args={})]},
                   sid=SID_SHARED).json()["app_id"]
     _approve(app_id)
 
-    async def boom(row, action, merged):  # reaching the executor would be the bug
+    async def boom(row, action, merged, reach=None):  # reaching the executor would be the bug
         raise AssertionError("must not run")
 
     monkeypatch.setattr("services.apps.headless_exec.execute_app_tool", boom)
@@ -1088,7 +1118,7 @@ def test_fire_task_args_from_a_link_visitor_are_fenced(agent_tree, monkeypatch):
         conn.commit()
     app_id = _pin({"slug": "q", "html": "<p>x</p>", "actions": [
         {"id": "go", "label": "Go", "type": "fire_task", "task_id": trig,
-         "min_role": "viewer",
+         "min_role": "external",
          "args_schema": {"type": "object",
                          "properties": {"month": {"type": "string", "maxLength": 20}},
                          "required": ["month"]}},
@@ -1317,7 +1347,11 @@ def test_batch_shape_validation(agent_tree):
     app_id = _pin({"slug": "b", "html": "<p>x</p>"}).json()["app_id"]
     assert _batch(app_id, [])[0] == 400
     assert _batch(app_id, [{"call_id": str(i), "action_id": "x"}
-                           for i in range(17)])[0] == 400
+                           for i in range(33)])[0] == 400
+    assert _batch(app_id, [{"call_id": str(i), "action_id": "x"}
+                           for i in range(32)])[0] == 200
+    from api.apps import apps as apps_api
+    apps_api._fire_rate.clear()
     assert _batch(app_id, [{"call_id": "a", "action_id": "x"},
                            {"call_id": "a", "action_id": "y"}])[0] == 400
     assert _batch(app_id, [{"call_id": "", "action_id": "x"}])[0] == 400
@@ -1337,7 +1371,7 @@ def test_batch_streams_one_line_per_call_with_per_entry_refusals(
         _mcp_action(),
     ]}, sid=SID_SHARED).json()["app_id"]
 
-    async def fake_exec(row, action, merged):
+    async def fake_exec(row, action, merged, reach=None):
         return {"status": "done", "result": f"out:{merged['text']}"}
 
     async def fake_trigger(task_def, **kw):
@@ -1383,6 +1417,63 @@ def test_batch_streams_one_line_per_call_with_per_entry_refusals(
                             "args": {"text": "c"}}])[0] == 429
 
 
+def test_a_paced_press_and_a_paced_batch_say_how_long_to_wait(agent_tree, fake_mcps, monkeypatch):
+    """The two gaps a press meets: one batch a second for a person on an
+    app, whatever its buttons, and one second between two identical tool
+    calls. Each refusal names the rest of its gap, so the host sends the
+    call again then."""
+    app_id = _pin({"slug": "b", "html": "<p>x</p>", "actions": [_mcp_action()]},
+                  sid=SID_SHARED).json()["app_id"]
+    _approve(app_id)
+
+    async def fake_exec(row, action, merged, reach=None):
+        return {"status": "done", "result": "ok"}
+
+    monkeypatch.setattr("services.apps.headless_exec.execute_app_tool", fake_exec)
+    from api.apps import apps as apps_api
+    apps_api._fire_rate.clear()
+    call = {"call_id": "a", "action_id": "run", "args": {"text": "same"}}
+    assert _batch(app_id, [call])[0] == 200
+    # Another batch inside the second, another button: refused whole.
+    r = client.post(f"/v1/apps/{app_id}/actions/batch",
+                    json={"calls": [{"call_id": "b", "action_id": "run", "args": {"text": "other"}}]})
+    assert r.status_code == 429 and r.headers["retry-after"] == "1"
+    assert r.json()["detail"] == "Too fast — try again in a moment"
+    assert 0 < r.json()["retry_after_ms"] <= 1000
+    # The same tool call inside its second, in a batch that passes.
+    apps_api._fire_rate.pop((app_id, "\x00batch", "alice-sub"))
+    code, lines = _batch(app_id, [call, {"call_id": "c", "action_id": "run", "args": {"text": "other"}}])
+    by_id = {line["call_id"]: line for line in lines}
+    assert code == 200 and by_id["c"]["status"] == "done"
+    assert by_id["a"]["status"] == "denied" and by_id["a"]["code"] == 429
+    assert 0 < by_id["a"]["retry_after_ms"] <= 1000
+    # The single route says it in its header.
+    r = client.post(f"/v1/apps/{app_id}/actions/run", json={"args": {"text": "other"}})
+    assert r.status_code == 429 and r.headers["retry-after"] == "1"
+
+
+def test_a_task_pressed_twice_inside_its_gap_names_no_wait(agent_tree, fake_mcps, monkeypatch):
+    """A task's gap is the guard against a double press: its refusal line
+    names no wait, so no host sends it again (a run costs an agent turn)."""
+    trig = _mk_task("trigger", scope="agent", created_by="alice-sub")
+    app_id = _pin({"slug": "b", "html": "<p>x</p>", "actions": [
+        {"id": "go", "label": "Go", "type": "fire_task", "task_id": trig}, _mcp_action(),
+    ]}, sid=SID_SHARED).json()["app_id"]
+    _approve(app_id)
+
+    async def fake_trigger(task_def, **kw):
+        return "run-1"
+
+    from services.scheduler import scheduler
+    monkeypatch.setattr(scheduler, "trigger_task_now", fake_trigger)
+    from api.apps import apps as apps_api
+    apps_api._fire_rate.clear()
+    assert _batch(app_id, [{"call_id": "a", "action_id": "go"}])[1][0]["status"] == "ok"
+    apps_api._fire_rate.pop((app_id, "\x00batch", "alice-sub"))
+    code, lines = _batch(app_id, [{"call_id": "b", "action_id": "go"}])
+    assert code == 200 and lines[0]["code"] == 429 and "retry_after_ms" not in lines[0]
+
+
 def test_batch_entries_run_concurrently(agent_tree, fake_mcps, monkeypatch):
     app_id = _pin({"slug": "b", "html": "<p>x</p>", "actions": [_mcp_action()]},
                   sid=SID_SHARED).json()["app_id"]
@@ -1392,7 +1483,7 @@ def test_batch_entries_run_concurrently(agent_tree, fake_mcps, monkeypatch):
     import asyncio as _aio
     gate = {"started": 0}
 
-    async def slow_exec(row, action, merged):
+    async def slow_exec(row, action, merged, reach=None):
         gate["started"] += 1
         # Both entries must have started before either finishes.
         for _ in range(50):
@@ -1418,7 +1509,7 @@ def test_a_batch_entry_that_raises_is_its_own_line(agent_tree, fake_mcps, monkey
     from api.apps import apps as apps_api
     apps_api._fire_rate.clear()
 
-    async def flaky_exec(row, action, merged):
+    async def flaky_exec(row, action, merged, reach=None):
         if merged["text"] == "boom":
             raise RuntimeError("tool manager fell over")
         return {"status": "done", "result": merged["text"]}
@@ -1437,7 +1528,7 @@ def test_a_batch_entry_that_raises_is_its_own_line(agent_tree, fake_mcps, monkey
 def test_warm_endpoint(agent_tree, fake_mcps, monkeypatch):
     warmed = []
 
-    async def fake_warm(row):
+    async def fake_warm(row, reach=None):
         warmed.append(row["id"])
         return True
 
@@ -1482,7 +1573,7 @@ def test_warm_endpoint_on_a_freshly_booted_host(agent_tree, fake_mcps, monkeypat
     from api.apps import apps as apps_api
     monkeypatch.setattr(apps_api, "time", SimpleNamespace(monotonic=lambda: 12.0))
 
-    async def fake_warm(row):
+    async def fake_warm(row, reach=None):
         return True
 
     monkeypatch.setattr("services.apps.headless_exec.warm", fake_warm)

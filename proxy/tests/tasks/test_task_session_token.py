@@ -16,6 +16,8 @@ from types import SimpleNamespace
 import pytest
 import tomllib
 
+from services.mcp import mcp_manifest_store
+from tests._compute import serve
 from tests.fixtures.loop_builder_rig import AGENT, SHARED, install, run
 
 CREATOR = "user-viewer"   # an editor on AGENT, a viewer on SHARED (the rig)
@@ -24,6 +26,8 @@ CREATOR = "user-viewer"   # an editor on AGENT, a viewer on SHARED (the rig)
 @pytest.fixture
 def rig(temp_db, monkeypatch, tmp_path):
     rec = install(monkeypatch, tmp_path)
+    # A run of the platform's place is built on the compute machine that serves.
+    serve(monkeypatch)
     from services.mcp import mcp_registry
     from storage.billing import subscription_store
     subscription_store.add_model("codex-cli", "gpt-char-1", "Char", provider="openai", tier=2)
@@ -114,18 +118,18 @@ def test_a_run_with_no_person_gets_a_token_naming_nobody(rig, scope, created_by,
 
 
 def test_the_codex_daemon_its_hooks_and_its_shell_name_the_creator(rig):
-    """The headless daemon env (the layer lays ``credential_env`` over it)
-    and the shell's command-line token name the creator: before, the daemon
-    started with no working dir and minted a token naming nobody."""
+    """The headless daemon env (the spawn plan lays ``credential_env`` over
+    it) and the shell's command-line token name the creator: the env's own
+    mint has no username and would name nobody."""
+    import config as app_config
     from auth.session_token import validate_cli_token
-    from core.layers.codex.session import CodexAppServerSession
+    from core.layers.codex.env import daemon_env
     sid = "tok-daemon"
     cfg = _build("user", CREATOR, sid)
     extra = dict(cfg.extra_env)
     extra.update(cfg.credential_env)
-    sess = CodexAppServerSession(sid, AGENT, cfg.model, "workspace-write", "", "/tmp/codex",
-                                 extra_env=extra, user_role=cfg.security_context.role)
-    env = sess._build_env()
+    env = daemon_env(sid, AGENT, username="", user_role=cfg.security_context.role,
+                     codex_bin=app_config.CODEX_BIN, extra_env=extra)
     assert _claims(env["PROXY_API_KEY"])["user_sub"] == CREATOR
     cli = validate_cli_token(env["OTO_CLI_TOKEN"])
     assert cli is not None and cli["user_sub"] == CREATOR and cli["sid"] == sid
@@ -151,12 +155,14 @@ def test_the_claude_task_process_env_carries_the_builders_token(rig, mount_user)
 
 @pytest.mark.parametrize("scope,person", [("user", CREATOR), ("agent", "")])
 def test_the_docker_mcp_bearer_follows_the_builders_person(rig, scope, person):
-    from auth.session_token import SESSION_JWT_SENTINEL_BEARER, swap_session_jwt_bearer
+    from auth.session_token import CALLBACK_JWT_SENTINEL_BEARER, swap_session_jwt_bearer
     sid = f"tok-bearer-{scope}"
     _build(scope, CREATOR, sid)
-    bearer = swap_session_jwt_bearer(SESSION_JWT_SENTINEL_BEARER, sid, AGENT)
+    bearer = swap_session_jwt_bearer(CALLBACK_JWT_SENTINEL_BEARER, sid, AGENT)
     assert bearer is not None
-    assert _claims(bearer.removeprefix("Bearer "))["user_sub"] == person
+    from auth.session_token import validate_callback_token
+    claims = validate_callback_token(bearer.removeprefix("Bearer "))
+    assert claims is not None and claims["user_sub"] == person
 
 
 def test_the_builders_token_is_the_sessions_floor(rig):
@@ -223,13 +229,12 @@ def test_a_built_task_started_on_a_machine_names_the_builders_person(rig, scope,
     from unittest.mock import patch
 
     from auth.session_token import validate_session_token
-    from services.mcp import mcp_registry
     from tests.remote.test_remote_engine_contract import _snapshot_layer
     sid = f"tok-machine-{scope}"
     cfg = dataclasses.replace(_build(scope, CREATOR, sid), execution_target="machine-1")
     machine = {"capabilities": json.dumps({"local_tunnel_port": 18400, "os": "linux"}),
                "pairing_scope": "admin"}
-    with patch.dict(mcp_registry._manifests, clear=True), \
+    with patch.dict(mcp_manifest_store._manifests, clear=True), \
          patch("storage.remote_store.get_remote_machine", return_value=machine), \
          patch("storage.database.get_user_sub_by_username", return_value="sub-elsewhere"), \
          patch("core.remote.remote_start_payload._load_hook_scripts", return_value={}):
@@ -287,12 +292,19 @@ def test_a_chat_worker_on_its_delegators_computer_runs_as_that_person(on_the_cre
 
 def test_a_delegator_who_lost_the_tier_is_no_machine_owner(on_the_creators_computer):
     """Below the editor tier (or gone from the agent) the delegator names no
-    computer: the run is the agent's, refused there by the start guard."""
+    computer, and the lane that runs as the agent on their accounts is
+    refused: it never moves to the subscriptions shared with agents
+    (``core/config/spender.py``)."""
+    from core.config import task_config_builder as tcb
+    from services.engines import subscription_pool
+    from services.scheduler import task_kinds
     from storage.identity import db_users
     db_users.set_user_agent_role(CREATOR, AGENT, "contributor")
-    cfg = _worker("tok-worker-demoted")
-    assert _claims(cfg.credential_env["PROXY_API_KEY"])["user_sub"] == ""
-    assert cfg.placement_sub == "" and cfg.security_context.role == "manager"
+    assert tcb.worker_machine_owner(SimpleNamespace(
+        task_type=task_kinds.DELEGATE, target_chat_id="chat-x", created_by=CREATOR, agent=AGENT)) is None
+    with pytest.raises(subscription_pool.NoSubscriptionError) as e:
+        _worker("tok-worker-demoted")
+    assert "cannot run work on" in str(e.value)
 
 
 def test_the_same_worker_on_the_platform_keeps_the_agents_identity(rig):

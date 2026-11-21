@@ -4,15 +4,15 @@
 #
 # Ubuntu 24.04+ ships kernel.apparmor_restrict_unprivileged_userns=1: an
 # unprivileged process may only create user namespaces when its AppArmor
-# profile explicitly grants `userns`. The containerised OtoDock proxy needs
+# profile explicitly grants `userns`. OtoDock's compute container needs
 # that capability for the agent sandbox (every session runs in a rootless
-# bwrap+pasta namespace), so on such hosts the proxy boot preflight
-# hard-fails until the host allows it.
+# bwrap+pasta namespace), so on such hosts it runs no session until the
+# host allows it.
 #
 # This script installs the SCOPED fix: the `otodock_userns` AppArmor profile
 # (embedded below — the same flags=(unconfined) + `userns,` shape Docker's own
 # docs prescribe for rootlesskit on Ubuntu 24.04) into /etc/apparmor.d/ and
-# loads it. The proxy container then runs under
+# loads it. The compute container then runs under
 # `security_opt: apparmor=otodock_userns` — scripts/compose.sh selects it
 # automatically once installed; standalone `docker compose` users set
 # OTODOCK_APPARMOR_PROFILE=otodock_userns in .env. The system-wide restriction
@@ -58,13 +58,13 @@ if ! command -v apparmor_parser >/dev/null 2>&1; then
 fi
 
 # The scoped profile: named (no attachment path — it is only ever attached to
-# the proxy container via security_opt), unconfined semantics (the stack
+# a compute container via security_opt), unconfined semantics (the stack
 # already requires that for bwrap's mount propagation) plus the userns grant.
 cat > "$PROFILE_DST" <<'EOF'
-# OtoDock — scoped AppArmor userns grant for the containerised proxy.
+# OtoDock — scoped AppArmor userns grant for the compute container.
 #
 # Grants unprivileged user-namespace creation (the capability the agent
-# sandbox is built on) to the OtoDock proxy container ONLY, attached via
+# sandbox is built on) to OtoDock's compute containers ONLY, attached via
 # `security_opt: apparmor=otodock_userns`. Keeps the container's AppArmor
 # mediation unconfined — the same semantics the stack already requires —
 # while the system-wide kernel.apparmor_restrict_unprivileged_userns=1

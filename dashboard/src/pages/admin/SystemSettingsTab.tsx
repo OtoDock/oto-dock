@@ -17,7 +17,6 @@ import { useSaveState, type SaveStateApi, type SaveStatus } from '../../hooks/us
 import InfoTip from '../../components/ui/InfoTip'
 import OffboardedArchivesCard from './OffboardedArchivesCard'
 import NotebookSettingsCard from './NotebookSettingsCard'
-import MobileAppsCard from './MobileAppsCard'
 import { formatBytes, relativeTime, TIMEZONE_OPTIONS, MCP_STATUS_LABEL } from './PlatformPage.format'
 import { apiJson, withMessage } from '../../lib/http/apiJson'
 import { useDialogs } from '../../components/ui/dialogs'
@@ -31,13 +30,22 @@ import { BADGE_BASE, BADGE_TONE, CARD } from '../../components/ui/classes'
 // ---------------------------------------------------------------------------
 
 function StorageRetentionCard({
-  enabled, days, onEnabledChange, onDaysChange, onSaveDays, stateOf,
+  enabled, days, onEnabledChange, onDaysChange, onSaveDays,
+  workingEnabled, workingDays, onWorkingEnabledChange, onWorkingDaysChange, onSaveWorkingDays,
+  chatRowsDays, forcedKeys, stateOf,
 }: {
   enabled: boolean
   days: string
   onEnabledChange: (v: boolean) => void
   onDaysChange: (v: string) => void
   onSaveDays: () => void
+  workingEnabled: boolean
+  workingDays: string
+  onWorkingEnabledChange: (v: boolean) => void
+  onWorkingDaysChange: (v: string) => void
+  onSaveWorkingDays: () => void
+  chatRowsDays: string
+  forcedKeys: string[]
   stateOf: (key: string) => SaveStatus
 }) {
   const qc = useQueryClient()
@@ -54,7 +62,8 @@ function StorageRetentionCard({
       }).catch(withMessage('Request failed'))
       const freed = (d.bytes_freed || 0) + (d.orphan_bytes || 0)
         + (d.codex_junk_bytes || 0) + (d.tarball_bytes || 0) + (d.offboarded_bytes || 0)
-        + (d.remote_bytes_freed || 0)
+        + (d.remote_bytes_freed || 0) + (d.working_files_bytes || 0) + (d.history_bytes_freed || 0)
+      const workingFiles = (d.working_uploads_binned || 0) + (d.working_screenshots_deleted || 0)
       const reached = (d.remote_machines ?? []).filter((m) => m.reached).length
       setResultOk(true)
       setResult(
@@ -63,6 +72,9 @@ function StorageRetentionCard({
         + `${d.codex_junk_files ?? 0} junk files`
         + `${reached ? ` · ${d.remote_session_files_deleted ?? 0} session files on ${reached} machine${reached === 1 ? '' : 's'}` : ''}`
         + `${d.offboarded_deleted ? ` · ${d.offboarded_deleted} archives of removed people` : ''}`
+        + `${workingFiles ? ` · ${workingFiles} old uploads and screenshots` : ''}`
+        + `${d.history_chats_deleted ? ` · ${d.history_chats_deleted} old chats` : ''}`
+        + `${d.working_files_grace_until ? ` · Old uploads wait until ${new Date(d.working_files_grace_until).toLocaleDateString()}` : ''}`
         + `${d.errors ? ` · ${d.errors} errors` : ''}`,
       )
       if (!dryRun) {
@@ -108,6 +120,7 @@ function StorageRetentionCard({
           type="checkbox"
           checked={enabled}
           onChange={(e) => onEnabledChange(e.target.checked)}
+          disabled={forcedKeys.includes('session_retention_enabled')}
           className="h-4 w-4 accent-action"
         />
       </SettingRow>
@@ -125,10 +138,55 @@ function StorageRetentionCard({
           onChange={(e) => onDaysChange(e.target.value)}
           onBlur={onSaveDays}
           min={7}
-          disabled={!enabled}
+          disabled={!enabled || forcedKeys.includes('session_retention_days')}
           className="max-w-20 text-right"
         />
       </SettingRow>
+
+      <SettingRow save={stateOf('working_files_retention_enabled')}
+        label="Clean up old uploads"
+        htmlFor="working-files-enabled"
+        description="Old uploads go to the Recover bin, then for good."
+        info={<>
+          An upload goes to the Recover bin for 7 days after the period below. Its copy on a paired
+          computer goes too. Browser screenshots go after 30 days. Nothing else in a workspace is
+          touched. After an update, this cleanup waits 30 days before it starts.
+        </>}
+      >
+        <input
+          id="working-files-enabled"
+          type="checkbox"
+          checked={workingEnabled}
+          disabled={forcedKeys.includes('working_files_retention_enabled')}
+          onChange={(e) => onWorkingEnabledChange(e.target.checked)}
+          className="h-4 w-4 accent-action"
+        />
+      </SettingRow>
+
+      <SettingRow save={stateOf('working_files_retention_days')}
+        label="Days to keep uploads"
+        htmlFor="working-files-days"
+        description="From 7 to 3650."
+        info="A file left untouched for longer than this is removed in the daily cleanup."
+      >
+        <Input
+          id="working-files-days"
+          type="number"
+          value={workingDays}
+          onChange={(e) => onWorkingDaysChange(e.target.value)}
+          onBlur={onSaveWorkingDays}
+          min={7}
+          max={3650}
+          disabled={!workingEnabled || forcedKeys.includes('working_files_retention_days')}
+          className="max-w-20 text-right"
+        />
+      </SettingRow>
+
+      {chatRowsDays && (
+        <p className="text-sm text-secondary">
+          Chats left untouched for {chatRowsDays} days are deleted for good on this server.
+        </p>
+      )}
 
       <div>
         <p className="text-sm font-medium text-primary mb-2">Disk usage</p>
@@ -289,6 +347,12 @@ interface RetentionRun {
   codex_junk_files?: number
   offboarded_deleted?: number
   remote_session_files_deleted?: number
+  working_uploads_binned?: number
+  working_screenshots_deleted?: number
+  working_files_bytes?: number
+  working_files_grace_until?: string
+  history_chats_deleted?: number
+  history_bytes_freed?: number
   /** One row per machine asked; `reached` is false when it did not answer. */
   remote_machines?: Array<{
     machine_id: string
@@ -611,6 +675,8 @@ export default function SystemSettingsTab() {
   const [interactiveCli, setInteractiveCli] = useState(false)
   const [retentionEnabled, setRetentionEnabled] = useState(true)
   const [retentionDays, setRetentionDays] = useState('180')
+  const [workingEnabled, setWorkingEnabled] = useState(true)
+  const [workingDays, setWorkingDays] = useState('180')
   const [archiveEnabled, setArchiveEnabled] = useState(true)
   const [archiveDays, setArchiveDays] = useState('180')
   const [mcpAutoUpdate, setMcpAutoUpdate] = useState(true)
@@ -623,7 +689,9 @@ export default function SystemSettingsTab() {
   })
 
   // The saved settings fill the form when they arrive or change (in render).
-  const [filledFrom, setFilledFrom] = useState(data)
+  // The guard starts empty: settings already loaded when the tab mounts fill
+  // it on the first render, never leaving the form's defaults to be saved.
+  const [filledFrom, setFilledFrom] = useState<typeof data>(undefined)
   if (data && filledFrom !== data) {
     setFilledFrom(data)
     {
@@ -637,6 +705,8 @@ export default function SystemSettingsTab() {
       setInteractiveCli(data.interactive_cli_enabled === true)
       setRetentionEnabled(data.session_retention_enabled !== false)
       setRetentionDays(data.session_retention_days || '180')
+      setWorkingEnabled(data.working_files_retention_enabled !== false)
+      setWorkingDays(data.working_files_retention_days || '180')
       setArchiveEnabled(data.offboarded_retention_enabled !== false)
       setArchiveDays(data.offboarded_retention_days || '180')
       setMcpAutoUpdate(data.mcp_auto_update_enabled !== false)
@@ -666,6 +736,12 @@ export default function SystemSettingsTab() {
   const saveArchiveDays = () => {
     if (archiveDays === data?.offboarded_retention_days) return
     void run('offboarded_retention_days', () => saveMutation.mutateAsync({ offboarded_retention_days: archiveDays }),
+      { failTitle: 'The days to keep were not saved' })
+  }
+
+  const saveWorkingDays = () => {
+    if (workingDays === data?.working_files_retention_days) return
+    void run('working_files_retention_days', () => saveMutation.mutateAsync({ working_files_retention_days: workingDays }),
       { failTitle: 'The days to keep were not saved' })
   }
 
@@ -958,8 +1034,6 @@ export default function SystemSettingsTab() {
 
       <NotebookSettingsCard />
 
-      <MobileAppsCard />
-
       {/* Storage & Retention — hidden on the OtoDock cloud (operator owns disk
           policy: retention is forced ON at the default window server-side). */}
       {!data?.cloud && (
@@ -969,6 +1043,13 @@ export default function SystemSettingsTab() {
           onEnabledChange={(v) => { setRetentionEnabled(v); save('session_retention_enabled', v, back((d) => setRetentionEnabled(d.session_retention_enabled !== false))) }}
           onDaysChange={setRetentionDays}
           onSaveDays={() => { if (retentionDays !== data?.session_retention_days) save('session_retention_days', retentionDays) }}
+          workingEnabled={workingEnabled}
+          workingDays={workingDays}
+          onWorkingEnabledChange={(v) => { setWorkingEnabled(v); save('working_files_retention_enabled', v, back((d) => setWorkingEnabled(d.working_files_retention_enabled !== false))) }}
+          onWorkingDaysChange={setWorkingDays}
+          onSaveWorkingDays={saveWorkingDays}
+          chatRowsDays={data?.chat_rows_retention_days || ''}
+          forcedKeys={data?.forced_keys || []}
           stateOf={stateOf}
         />
       )}

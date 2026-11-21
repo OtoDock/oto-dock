@@ -105,6 +105,12 @@ describe('a chip waiting for its machine', () => {
       "A teammate's terminal is open on this chat. Your message goes out when it closes.")
   })
 
+  it('says the message goes out when the platform is back from its update', () => {
+    renderWaiting(QUEUE_WAITING.UPDATING)
+    expect(screen.getByTestId('queued-waiting').textContent).toBe(
+      'OtoDock is updating. Your message goes out when it is back.')
+  })
+
   it('says nothing more once the machine is back', () => {
     renderWaiting(undefined)
     expect(screen.getByText('later')).toBeTruthy()

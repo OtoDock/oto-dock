@@ -266,7 +266,7 @@ async def list_tools() -> list[Tool]:
                             "row's scope. An agent trigger (e.g. one that wakes a "
                             "shared app) needs a subscription created FOR THE AGENT: "
                             "the user does that in Agent Settings → MCPs → the MCP → "
-                            "Subscribe to events for this agent (or Connected "
+                            "one of its accounts → Subscribe to events (or Connected "
                             "Accounts → Subscribe as: the agent). A personal "
                             "subscription can never be linked to an agent trigger. "
                             "IMPORTANT: before creating a vendor-subscribed trigger, "

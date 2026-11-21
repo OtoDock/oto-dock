@@ -14,6 +14,7 @@ Run: cd proxy && python -m pytest tests/agents/test_knowledge_libraries.py -v
 import asyncio
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -524,6 +525,174 @@ class TestProjector:
         spec.loader.exec_module(importlib.util.module_from_spec(spec))
         assert calls == []
 
+    # ── a link planted on the way: no removal follows it (safe_fs) ─────────
+
+    @staticmethod
+    def _victim(*files):
+        """A folder of another agent, inside the test's own tree, holding
+        ``files``: what a planted link points at."""
+        victim = config.get_agent_dir(OTHER) / "workspace" / "victim"
+        for rel in files:
+            (victim / rel).parent.mkdir(parents=True, exist_ok=True)
+            (victim / rel).write_text("keep")
+        return victim
+
+    def test_an_explicit_delete_never_follows_a_link_above_the_source(self, kl_env, quiet_fanout):
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        victim = self._victim("brand.md")
+        docs = config.get_agent_dir(SRC) / "knowledge" / "docs"
+        shutil.rmtree(docs)
+        docs.symlink_to(victim)
+        assert _run(library_projector.propagate_mirror_delete(CON_B, SRC, "docs/brand.md")) is False
+        assert (victim / "brand.md").read_text() == "keep"
+
+    def test_a_source_delete_never_follows_a_link_above_a_mirror(self, kl_env, quiet_fanout):
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        victim = self._victim("brand.md")
+        docs = _mirror(CON_A) / "docs"
+        shutil.rmtree(docs)
+        docs.symlink_to(victim)
+        (config.get_agent_dir(SRC) / "knowledge" / "docs" / "brand.md").unlink()
+        _run(library_projector.propagate_source_write(SRC, "docs/brand.md", deleted=True))
+        assert (victim / "brand.md").read_text() == "keep"
+
+    def test_a_linked_mirror_root_is_skipped_never_emptied_through(self, kl_env, quiet_fanout, caplog):
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        victim = self._victim("stray.md", "index.md")
+        mirror = _mirror(CON_A)
+        shutil.rmtree(mirror)
+        mirror.symlink_to(victim)
+        with caplog.at_level("WARNING"):
+            _run(library_projector.reconcile_source(SRC))
+        assert any("library walk refused" in r.getMessage() for r in caplog.records)
+        assert (victim / "stray.md").read_text() == "keep"
+        assert (victim / "index.md").read_text() == "keep"
+        # The other consumer is still served.
+        assert (_mirror(CON_B) / "index.md").read_text() == "index v1"
+
+    def test_a_mirror_file_swapped_for_a_link_is_healed_to_a_plain_file(self, kl_env, quiet_fanout):
+        # A link at a mirror name is not the mirror's copy, even when it
+        # points at a file of the same size and time: it is replaced.
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        mirror = _mirror(CON_A) / "index.md"
+        twin = self._victim("index.md") / "index.md"
+        shutil.copy2(mirror, twin)
+        mirror.unlink()
+        mirror.symlink_to(twin)
+        _run(library_projector.reconcile_source(SRC))
+        assert not mirror.is_symlink() and mirror.read_text() == "index v1"
+
+    def test_a_link_at_a_source_name_moves_nothing(self, kl_env, quiet_fanout):
+        # The source's knowledge writer put a link where a library file was:
+        # the mirrors keep their copies, nothing is read through it.
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        src = config.get_agent_dir(SRC) / "knowledge" / "index.md"
+        src.unlink()
+        src.symlink_to(self._victim("other.md") / "other.md")
+        _run(library_projector.propagate_source_write(SRC, "index.md"))
+        _run(library_projector.reconcile_source(SRC))
+        assert (_mirror(CON_A) / "index.md").read_text() == "index v1"
+        assert (_mirror(CON_B) / "index.md").read_text() == "index v1"
+
+    def test_a_linked_source_folder_keeps_every_mirror_copy(self, kl_env, quiet_fanout):
+        # A source folder the walk cannot take is not "every file deleted".
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        knowledge = config.get_agent_dir(SRC) / "knowledge"
+        aside = config.get_agent_dir(SRC) / "knowledge-aside"
+        knowledge.rename(aside)
+        knowledge.symlink_to(self._victim("unrelated.md"))
+        _run(library_projector.reconcile_source(SRC))
+        assert (_mirror(CON_A) / "index.md").read_text() == "index v1"
+        assert (_mirror(CON_B) / "docs" / "brand.md").read_text() == "brand v1"
+
+    def test_a_folder_swapped_after_the_look_is_never_removed_through(self, kl_env, quiet_fanout, monkeypatch):
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        victim = self._victim("brand.md")
+        docs = _mirror(CON_A) / "docs"
+        real = library_projector._lstat
+
+        def _look_then_swap(path):
+            st = real(path)
+            if path.parent == docs and not docs.is_symlink():
+                shutil.rmtree(docs)
+                docs.symlink_to(victim)
+            return st
+
+        monkeypatch.setattr(library_projector, "_lstat", _look_then_swap)
+        (config.get_agent_dir(SRC) / "knowledge" / "docs" / "brand.md").unlink()
+        _run(library_projector.propagate_source_write(SRC, "docs/brand.md", deleted=True))
+        assert (victim / "brand.md").read_text() == "keep"
+
+    def test_a_source_name_reused_as_a_folder_reaches_every_mirror(self, kl_env, quiet_fanout):
+        # A folder at a name is a name reused, not a planted link: the stale
+        # copies go and the folder's files arrive, as before the lane.
+        from services.knowledge import library_projector
+        k = config.get_agent_dir(SRC) / "knowledge"
+        (k / "notes").write_text("notes v1")
+        _run(library_projector.reconcile_source(SRC))
+        assert (_mirror(CON_A) / "notes").read_text() == "notes v1"
+        (k / "notes").unlink()
+        (k / "notes").mkdir()
+        (k / "notes" / "a.md").write_text("a v1")
+        _run(library_projector.reconcile_source(SRC))
+        for consumer in (CON_A, CON_B):
+            assert (_mirror(consumer) / "notes" / "a.md").read_text() == "a v1"
+
+    def test_a_writable_mirror_name_reused_as_a_folder_reaches_the_source(self, kl_env, quiet_fanout):
+        from services.knowledge import library_projector
+        k = config.get_agent_dir(SRC) / "knowledge"
+        (k / "notes").write_text("notes v1")
+        _run(library_projector.reconcile_source(SRC))
+        mirror = _mirror(CON_B)
+        (mirror / "notes").unlink()
+        (mirror / "notes").mkdir()
+        (mirror / "notes" / "b.md").write_text("b v1")
+        _run(library_projector.reconcile_source(SRC))
+        assert (k / "notes" / "b.md").read_text() == "b v1"
+        assert (_mirror(CON_A) / "notes" / "b.md").read_text() == "b v1"
+
+    def test_a_walk_that_cannot_be_made_answers_none_never_empty(self, kl_env, quiet_fanout):
+        # Held twice (the pair sync's own rule too): the walk's rule alone.
+        from services.knowledge import library_projector
+        mirror = _mirror(CON_A)
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(mirror, ignore_errors=True)
+        mirror.symlink_to(self._victim("x.md"))
+        assert library_projector._walk_rel(mirror) is None
+        assert library_projector._walk_rel(mirror.parent / "never-made") == {}
+
+    def test_a_source_folder_turned_into_a_file_drops_the_copies_beneath(self, kl_env, quiet_fanout):
+        # A file on the way at the source reads as "the file is gone": the
+        # mirrors' copies beneath that name go, as before the lane.
+        from services.knowledge import library_projector
+        k = config.get_agent_dir(SRC) / "knowledge"
+        (k / "notes").mkdir()
+        (k / "notes" / "b.md").write_text("b v1")
+        _run(library_projector.reconcile_source(SRC))
+        assert (_mirror(CON_A) / "notes" / "b.md").read_text() == "b v1"
+        shutil.rmtree(k / "notes")
+        (k / "notes").write_text("notes as a file")
+        _run(library_projector.reconcile_source(SRC))
+        for consumer in (CON_A, CON_B):
+            assert not (_mirror(consumer) / "notes" / "b.md").exists()
+
+    def test_a_teardown_never_follows_a_linked_mirror(self, kl_env, quiet_fanout):
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        victim = self._victim("docs/brand.md")
+        mirror = _mirror(CON_A)
+        shutil.rmtree(mirror)
+        mirror.symlink_to(victim)
+        _run(library_projector.detach_teardown(SRC, CON_A, "docs"))
+        assert (victim / "docs" / "brand.md").read_text() == "keep"
+
     def test_detach_and_teardown(self, kl_env, quiet_fanout):
         from services.knowledge import library_projector
         _run(library_projector.reconcile_source(SRC))
@@ -531,6 +700,116 @@ class TestProjector:
         assert not _mirror(CON_A).exists()
         _run(library_projector.teardown_source(SRC))
         assert not _mirror(CON_B).exists()
+
+    # An agent's folder may itself be a link the install's operator made
+    # (core/agent_folder.py): a library reaches it through that one link and
+    # through none below it.
+
+    @pytest.fixture
+    def link_agent(self, tmp_path):
+        """Move an agent's folder outside the stand-in agents folder, a link
+        at its name. The links go at the end: the next test's agents folder
+        holds none."""
+        made: list[Path] = []
+
+        def _link(slug: str) -> Path:
+            d = config.get_agent_dir(slug)
+            real = tmp_path / "disk2" / slug
+            real.parent.mkdir(exist_ok=True)
+            d.rename(real)
+            d.symlink_to(real)
+            made.append(d)
+            return real
+        yield _link
+        for d in made:
+            d.unlink(missing_ok=True)
+
+    def test_a_linked_source_agents_library_reaches_every_mirror(self, kl_env, quiet_fanout, link_agent):
+        from services.knowledge import library_projector
+        real = link_agent(SRC)
+        _run(library_projector.reconcile_source(SRC))
+        assert (_mirror(CON_A) / "docs" / "brand.md").read_text() == "brand v1"
+        (real / "knowledge" / "docs" / "brand.md").unlink()
+        _run(library_projector.propagate_source_write(SRC, "docs/brand.md", deleted=True))
+        assert not (_mirror(CON_A) / "docs" / "brand.md").exists()
+        # A file gone from the source between two passes leaves every mirror.
+        (real / "knowledge" / "index.md").unlink()
+        _run(library_projector.reconcile_source(SRC))
+        assert not (_mirror(CON_A) / "index.md").exists()
+
+    def test_a_delete_in_a_writable_mirror_reaches_a_linked_source_agent(self, kl_env, quiet_fanout,
+                                                                         link_agent):
+        from services.knowledge import library_projector
+        real = link_agent(SRC)
+        _run(library_projector.reconcile_source(SRC))
+        assert _run(library_projector.propagate_mirror_delete(CON_B, SRC, "docs/brand.md")) is True
+        assert not (real / "knowledge" / "docs" / "brand.md").exists()
+        assert not (_mirror(CON_A) / "docs" / "brand.md").exists()
+
+    def test_a_linked_consumer_agents_mirror_is_kept_and_torn_down(self, kl_env, quiet_fanout, link_agent):
+        from services.knowledge import library_projector
+        real = link_agent(CON_A)
+        _run(library_projector.reconcile_source(SRC))
+        mirror = real / _mirror(CON_A).relative_to(config.get_agent_dir(CON_A))
+        assert (mirror / "docs" / "brand.md").read_text() == "brand v1"
+        (config.get_agent_dir(SRC) / "knowledge" / "docs" / "brand.md").unlink()
+        _run(library_projector.propagate_source_write(SRC, "docs/brand.md", deleted=True))
+        assert not (mirror / "docs" / "brand.md").exists()
+        _run(library_projector.detach_teardown(SRC, CON_A))
+        assert not (mirror / "index.md").exists()
+
+    def test_a_link_below_a_linked_agents_folder_is_still_skipped(self, kl_env, quiet_fanout, link_agent,
+                                                                  caplog):
+        from services.knowledge import library_projector
+        real = link_agent(CON_A)
+        _run(library_projector.reconcile_source(SRC))
+        victim = self._victim("stray.md", "index.md")
+        mirror = real / _mirror(CON_A).relative_to(config.get_agent_dir(CON_A))
+        shutil.rmtree(mirror, ignore_errors=True)
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        mirror.symlink_to(victim)
+        with caplog.at_level("WARNING"):
+            _run(library_projector.reconcile_source(SRC))
+        assert any("library walk refused" in r.getMessage() for r in caplog.records)
+        assert (victim / "stray.md").read_text() == "keep"
+        assert (victim / "index.md").read_text() == "keep"
+
+
+
+    # An agent's own folder that is not there (a link whose target is away, as
+    # a disk that is not mounted, or a plain folder gone) is "could not look",
+    # never an emptied library: nothing is removed on either side.
+
+    def test_a_linked_writable_consumer_away_keeps_the_source(self, kl_env, quiet_fanout, link_agent):
+        from services.knowledge import library_projector
+        real = link_agent(CON_B)
+        _run(library_projector.reconcile_source(SRC))
+        assert (real / "knowledge" / "shared" / SRC / "docs" / "brand.md").read_text() == "brand v1"
+        real.rename(real.with_name(real.name + ".away"))
+        _run(library_projector.reconcile_source(SRC))
+        k = config.get_agent_dir(SRC) / "knowledge"
+        assert (k / "index.md").exists() and (k / "docs" / "brand.md").exists()
+        assert (_mirror(CON_A) / "index.md").exists()
+
+    def test_a_linked_source_away_keeps_every_mirror(self, kl_env, quiet_fanout, link_agent, caplog):
+        from services.knowledge import library_projector
+        real = link_agent(SRC)
+        _run(library_projector.reconcile_source(SRC))
+        assert (_mirror(CON_A) / "docs" / "brand.md").read_text() == "brand v1"
+        real.rename(real.with_name(real.name + ".away"))
+        with caplog.at_level("WARNING"):
+            _run(library_projector.reconcile_source(SRC))
+        assert any("library walk refused" in r.getMessage() for r in caplog.records)
+        assert (_mirror(CON_A) / "docs" / "brand.md").exists()
+        assert (_mirror(CON_B) / "docs" / "brand.md").exists()
+
+    def test_a_plain_writable_consumer_folder_gone_keeps_the_source(self, kl_env, quiet_fanout, tmp_path):
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        config.get_agent_dir(CON_B).rename(tmp_path / "con-b-away")
+        _run(library_projector.reconcile_source(SRC))
+        k = config.get_agent_dir(SRC) / "knowledge"
+        assert (k / "index.md").exists() and (k / "docs" / "brand.md").exists()
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -579,6 +858,35 @@ class TestSyncGates:
         )
         act = next(a for a in plan.actions
                    if a.rel_path == f"knowledge/shared/{SRC}/a.md")
+        assert act.op == "push"
+        assert act.capture_side == "satellite"
+        assert act.capture_reason == "conflict"
+
+    @staticmethod
+    def _mirror_merge(machine_copy: str):
+        from core.remote.file_sync import FileEntry, diff_manifests
+        rel = f"knowledge/shared/{SRC}/a.md"
+        ro_prefix = {f"knowledge/shared/{SRC}/"}
+        plan = diff_manifests(
+            [FileEntry(rel, "h-new", 300.0, 10)],
+            [{"path": rel, "hash": machine_copy, "mtime": 200.0, "size": 12}],
+            base={rel: ("h-old", 100.0)},
+            push_only_dirs=set(ro_prefix) | {"config/"},
+            scrub_dirs=ro_prefix, target_username=None, target_role="manager",
+            session_username="alice",
+        )
+        return next(a for a in plan.actions if a.rel_path == rel)
+
+    def test_merge_push_only_keeps_an_old_mirror_copy_out_of_the_bin(self, temp_db):
+        # The machine still holds the copy it last converged on: the library
+        # moved on while it was away. Nobody changed it there.
+        act = self._mirror_merge("h-old")
+        assert act.op == "push"
+        assert act.capture_side is None
+        assert act.capture_reason is None
+
+    def test_merge_push_only_keeps_a_mirror_copy_changed_on_the_machine(self, temp_db):
+        act = self._mirror_merge("h-edited")
         assert act.op == "push"
         assert act.capture_side == "satellite"
         assert act.capture_reason == "conflict"
@@ -673,6 +981,17 @@ class TestFilesApiGate:
 # ───────────────────────────────────────────────────────────────────────────
 
 
+
+def _table_args(builder) -> list[str]:
+    """The role mount table as the bind arguments a machine renders from
+    it, entry for entry and in its order (the render's own tests pin that
+    it does: ``tests/execution/test_direct_files.py``)."""
+    args: list[str] = []
+    for m in builder.workspace_mount_table():
+        args += ["--bind" if m.rw else "--ro-bind", m.host, m.sandbox]
+    return args
+
+
 class TestSandboxMounts:
     def _args(self, **kw):
         from pathlib import Path
@@ -690,7 +1009,7 @@ class TestSandboxMounts:
             mount_shared=kw.get("mount_shared", True),
             knowledge_libraries=kw.get("libs", []),
         )
-        return SandboxBuilder(cfg)._workspace_mounts()
+        return _table_args(SandboxBuilder(cfg))
 
     def test_ro_attachment_gets_nested_robind(self, kl_env):
         args = self._args(libs=[(SRC, "", False)])
@@ -756,7 +1075,7 @@ class TestKnowledgeRwGateCoherence:
             knowledge_rw=knowledge_rw,
             knowledge_libraries=list(libs),
         )
-        return SandboxBuilder(cfg)._workspace_mounts()
+        return _table_args(SandboxBuilder(cfg))
 
     def _svc_ctx(self, *, knowledge_rw, libs=()):
         from auth.path_policy import SecurityContext
@@ -1342,6 +1661,14 @@ class TestSubdirLibraries:
         # The sibling marketing library is untouched.
         assert (mir_b / "marketing" / "plan.md").exists()
 
+    def test_a_subdir_teardown_stops_at_the_mirrors_own_folder(self, kl_subdir_env, quiet_fanout):
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        assert (_mirror(CON_A) / "marketing" / "plan.md").exists()
+        _run(library_projector.detach_teardown(SRC, CON_A, "marketing"))
+        assert not _mirror(CON_A).exists()
+        assert (config.get_agent_dir(CON_A) / "knowledge" / "shared").is_dir()
+
     def test_mirror_stray_outside_subtrees_is_swept(self, kl_subdir_env,
                                                     quiet_fanout):
         from services.knowledge import library_projector
@@ -1396,7 +1723,7 @@ class TestSubdirLibraries:
             host_claude_dir=Path("/tmp/claude-test"),
             knowledge_libraries=[(SRC, "marketing", False)],
         )
-        args = SandboxBuilder(cfg)._workspace_mounts()
+        args = _table_args(SandboxBuilder(cfg))
         pairs = list(zip(args, args[1:], args[2:], strict=False))
         mirror_sub = str(config.get_agent_dir(CON_A) / "knowledge" / "shared"
                          / SRC / "marketing")
@@ -1637,12 +1964,43 @@ class TestPathConfinement:
                 library_projector.mirror_dir(bad, SRC)
 
     def test_bulletin_file_is_none_when_symlinked_out(self, kl_subdir_env, tmp_path):
-        from api.agents.knowledge_libraries import _bulletin_file, _has_bulletin
+        from api.agents.knowledge_libraries import _has_bulletin
         k = config.get_agent_dir(SRC) / "knowledge"
         outside = tmp_path / "outside"
         outside.mkdir()
         (outside / "Marketing.md").write_text("leak")
         shutil.rmtree(k / "marketing" / "bulletin", ignore_errors=True)
         os.symlink(outside, k / "marketing" / "bulletin")
-        assert _bulletin_file(SRC, "marketing", "Marketing") is None
         assert _has_bulletin(SRC, "marketing", "Marketing") is False
+
+
+def test_a_bulletin_is_renamed_beneath_the_agents_folder_with_no_link_followed(tmp_path, monkeypatch):
+    """Re-sharing under a new name moves the bulletin beneath the source's
+    real folder; a bulletin folder replaced by a link carries nothing, and
+    a name already taken is the 409."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    import config as app_config
+    from api.agents import knowledge_libraries as kl
+    agents = tmp_path / "agents"
+    bulletin = agents / "src" / "knowledge" / "bulletin"
+    bulletin.mkdir(parents=True)
+    (bulletin / "Old.md").write_text("notes")
+    monkeypatch.setattr(app_config, "AGENTS_DIR", agents)
+    monkeypatch.setattr(kl, "_wopi_locked", lambda agent, rel: False)
+    assert kl._rename_bulletin_for("src", "", "Old", "New") == ("bulletin/Old.md", "bulletin/New.md")
+    assert (bulletin / "New.md").read_text() == "notes" and not (bulletin / "Old.md").exists()
+    (bulletin / "Taken.md").write_text("other")
+    with _pytest.raises(HTTPException) as e:
+        kl._rename_bulletin_for("src", "", "New", "Taken")
+    assert e.value.status_code == 409
+    # The bulletin folder replaced by a link to another folder of the same
+    # knowledge tree: nothing is moved through it.
+    stand_in = agents / "src" / "knowledge" / "notes"
+    stand_in.mkdir()
+    (stand_in / "New.md").write_text("elsewhere")
+    bulletin.rename(tmp_path / "aside")
+    bulletin.symlink_to(stand_in)
+    assert kl._rename_bulletin_for("src", "", "New", "Newer") is None
+    assert sorted(p.name for p in stand_in.iterdir()) == ["New.md"]

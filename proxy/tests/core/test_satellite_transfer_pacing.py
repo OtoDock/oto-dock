@@ -28,6 +28,8 @@ import pytest
 import uvicorn
 import websockets
 
+from core.remote import satellite_file_verbs
+
 RATE = 256 * 1024          # bytes per second, server to client
 SIZE = 1024 * 1024         # the pushed file
 STATE: dict = {}
@@ -168,8 +170,11 @@ async def _satellite(port: int) -> dict:
                         assert msg["hash"] == "sha256:" + hashlib.sha256(out["partial"]).hexdigest()
                         out["committed"] = out["partial"]
                 if msg.get("command_id"):
-                    await ws.send(json.dumps({"type": "ack", "command_id": msg["command_id"],
-                                              "status": "ok", "error": ""}))
+                    ack = {"type": "ack", "command_id": msg["command_id"], "status": "ok", "error": ""}
+                    if msg.get("hash"):
+                        # A satellite reports the file it committed on the last frame's ok.
+                        ack.update(size=len(out["committed"] or b""), mtime_ns=1)
+                    await ws.send(json.dumps(ack))
                 if out["committed"] is not None:
                     return out
         except websockets.ConnectionClosed as e:
@@ -180,9 +185,9 @@ async def _satellite(port: int) -> dict:
 @pytest.mark.slow
 def test_a_push_on_a_slow_uplink_keeps_the_keepalive_and_commits(server, monkeypatch):
     import config
-    from core.remote import file_sync, satellite_file_transfer as sft
+    from core.remote import file_sync
     monkeypatch.setattr(config, "BULK_CREDIT_BYTES", 128 * 1024, raising=False)
-    monkeypatch.setattr(sft, "PUSH_SLOW_CHUNK_BYTES", 32 * 1024)
+    monkeypatch.setattr(satellite_file_verbs, "PUSH_SLOW_CHUNK_BYTES", 32 * 1024)
     monkeypatch.setattr(file_sync, "MAX_CHUNK_SIZE", 64 * 1024)
     STATE.clear()
     STATE["data"] = os.urandom(SIZE)

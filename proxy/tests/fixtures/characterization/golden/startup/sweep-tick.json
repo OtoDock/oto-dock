@@ -1,0 +1,39 @@
+{
+ "logged": [
+  [
+   "ERROR",
+   "char-tick b failed"
+  ],
+  [
+   "ERROR",
+   "char-tick f failed"
+  ]
+ ],
+ "no_items": [],
+ "order": [
+  "start a",
+  "start b",
+  "start c",
+  "start d",
+  "end a",
+  "end b",
+  "end c",
+  "end d",
+  "start e",
+  "start f",
+  "start g",
+  "end e",
+  "end f",
+  "end g"
+ ],
+ "peak": 4,
+ "ran": [
+  "char-tick a",
+  "char-tick b",
+  "char-tick c",
+  "char-tick d",
+  "char-tick e",
+  "char-tick f",
+  "char-tick g"
+ ]
+}

@@ -51,8 +51,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import config
-from core import layout
+from core import agent_folder, layout
 from services.infra import safe_fs
 from services.infra.path_confinement import (
     PathOutsideRoot,
@@ -67,17 +66,25 @@ from services.memory.memory_index import (  # the callers read these through thi
     has_date,
     iter_topic_files,
     scope_total_bytes,
+    topic_stats,
 )
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
+# The memory folder's name under the agent's knowledge tree and under a
+# person's context tree: the one place that spells it.
+MEMORY_DIRNAME = "memory"
+
 LOCK_FILENAME = ".memlock"  # hidden: excluded from listings, never committed
 
 # Caps — curation pressure replaces any offline consolidator.
 TOPIC_SOFT_WARN_BYTES = 16 * 1024     # tool result appends an imperative warning
 TOPIC_HARD_CAP_BYTES = 64 * 1024      # a growing write rejected
+# The most of one topic a command reads: far past every write cap, a bound on
+# what a file dropped into a memory folder by hand can cost.
+TOPIC_OPEN_CAP_BYTES = 4 * 1024 * 1024
 SCOPE_TOTAL_CAP_BYTES = 512 * 1024    # a growing write rejected
 MAX_TOPICS_PER_SCOPE = 100            # create rejected
 
@@ -163,11 +170,11 @@ def scope_root(agent_dir: Path, scope: str, username: str | None = None) -> Path
     would leave the agent tree is refused (ValueError, like the other
     contract violations here)."""
     if scope == "agent":
-        return join_under(agent_dir, layout.KNOWLEDGE, "memory")
+        return join_under(agent_dir, layout.KNOWLEDGE, MEMORY_DIRNAME)
     if scope == "user":
         if not username:
             raise ValueError("username required for user-scope memory")
-        return join_under(agent_dir, layout.USERS, username, layout.CONTEXT, "memory")
+        return join_under(agent_dir, layout.USERS, username, layout.CONTEXT, MEMORY_DIRNAME)
     raise ValueError(f"unknown scope: {scope!r}")
 
 
@@ -268,25 +275,63 @@ def validate_rel(rel: str, *, mutating: bool = False, require_ext: bool = False)
 
 
 def _resolve_strict(root: Path, rel: str) -> Path:
-    """Resolve ``root/rel`` and verify the result stays under ``root``
-    (symlink-escape proof). The root itself may not exist yet."""
-    base = root.resolve()
+    """``root/rel`` as joined, never resolved (``validate_rel`` already
+    refused a dot or hidden segment). Every read, write and removal then
+    opens that literal path beneath the agent's folder with no link
+    followed, the scope root included: a person's own sessions write their
+    ``context/`` and an owner's write ``knowledge/``, so a link there is
+    planted, never honest."""
     target = (root / rel) if rel else root
-    resolved = target.resolve()
-    if resolved != base and base not in resolved.parents:
+    _beneath(target)
+    return target
+
+
+def _kind(path: Path) -> str:
+    """``"file"``, ``"dir"``, ``"missing"`` or ``"other"`` (a link, a pipe,
+    anything else at the name, or a link on the way), looked at with no
+    link followed."""
+    return safe_fs.kind_beneath(*_beneath(path)).kind
+
+
+def _read_text(path: Path, rel: str) -> str:
+    """A topic's text, read with no link followed."""
+    try:
+        data = safe_fs.read_bytes_beneath(*_beneath(path), max_size=TOPIC_OPEN_CAP_BYTES)
+    except safe_fs.FileTooLarge:
+        raise MemoryOpError(
+            f"Error: {rel} is larger than {TOPIC_OPEN_CAP_BYTES // (1024 * 1024)} MB. "
+            "Split it outside memory first."
+        ) from None
+    except OSError:
         raise MemoryOpError(
             f"The path {rel} does not exist. Please provide a valid path."
-        )
-    return resolved
+        ) from None
+    return data.decode("utf-8", errors="replace")
 
 
-def _agents_rel(path: Path) -> str:
-    """The rel of a scope-root path or a resolved answer beneath
-    ``config.AGENTS_DIR``, the root every memory write opens: a memory root
-    outside the agents tree is refused (every real scope root, an agent's,
-    a person's or an external caller's, sits under it)."""
+def files_below(folder: Path) -> list[str]:
+    """Every regular file below ``folder``, as rels to it, walked with no
+    link listed or entered."""
+    out: list[str] = []
     try:
-        return safe_fs.rel_under(path, config.AGENTS_DIR)
+        base, top = _beneath(folder)
+        for step in safe_fs.walk_beneath(base, top):
+            rel_dir = step.rel[len(top):].lstrip("/")
+            out += [f"{rel_dir}/{n}" if rel_dir else n for n in step.files]
+    except OSError:
+        return []
+    return sorted(out)
+
+
+def _beneath(path: Path) -> tuple[Path, str]:
+    """The root and the rel every memory read, write and removal opens: the
+    agent's real folder and the path's parts below it
+    (``core/agent_folder.py``: an agent's folder may be the operator's
+    link, nothing below it is followed). A memory root in no agent's folder
+    is refused (every real scope root, an agent's, a person's or an
+    external caller's, sits in its agent's folder)."""
+    try:
+        return agent_folder.beneath_agent(path)
     except OSError:
         raise MemoryOpError(
             "Error: the memory scope is outside the agents tree."
@@ -324,10 +369,10 @@ class _scope_lock:
     def __enter__(self):
         self._tlock.acquire()
         try:
-            root_rel = _agents_rel(self.root)
-            safe_fs.mkdirs_beneath(config.AGENTS_DIR, root_rel)
+            base, root_rel = _beneath(self.root)
+            safe_fs.mkdirs_beneath(base, root_rel)
             self._fd = safe_fs.open_beneath(
-                config.AGENTS_DIR, f"{root_rel}/{LOCK_FILENAME}", os.O_RDWR | os.O_CREAT, 0o644,
+                base, f"{root_rel}/{LOCK_FILENAME}", os.O_RDWR | os.O_CREAT, 0o644,
             )
         except BaseException:
             self._tlock.release()
@@ -346,13 +391,21 @@ class _scope_lock:
 
 def _atomic_write(path: Path, content: str) -> None:
     """Replace ``path`` (a resolved answer under a scope root) with
-    ``content`` beneath the agents root: a ``.partial`` temp created in the
+    ``content`` beneath the agent's folder: a ``.partial`` temp created in the
     parent's handle, fsynced, renamed onto the name with no component
     followed; readers see old or new, never partial. The dotted temp is
     hidden from the listings and never staged."""
     safe_fs.atomic_write_beneath(
-        config.AGENTS_DIR, _agents_rel(path), content.encode("utf-8"), mkdirs=True, fsync=True,
+        *_beneath(path), content.encode("utf-8"), mkdirs=True, fsync=True,
     )
+
+
+def _rename(src: Path, dst: Path) -> None:
+    """Move ``src`` to ``dst`` in one scope (one agent's folder), no
+    component followed."""
+    base, src_rel = _beneath(src)
+    _base, dst_rel = _beneath(dst)
+    safe_fs.rename_beneath(base, src_rel, dst_rel, mkdirs=True)
 
 
 def _sanitize(text: str) -> str:
@@ -373,21 +426,26 @@ def regenerate_index(root: Path) -> Path | None:
     content-unchanged shortcut — otherwise a future-dated topic file (clock
     skew, copied files) would read as permanently stale and re-heal on every
     prompt injection."""
-    if not root.is_dir():
+    if _kind(root) != "dir":
         return None
     index_path = root / INDEX_FILENAME
     new = build_index_content(root)
     wrote: Path | None = index_path
-    with contextlib.suppress(OSError):
-        if index_path.exists() and index_path.read_text(encoding="utf-8") == new:
+    with contextlib.suppress(OSError, MemoryOpError):
+        if _kind(index_path) == "file" and _read_text(index_path, INDEX_FILENAME) == new:
             wrote = None
     if wrote:
         _atomic_write(index_path, new)
-    topics = iter_topic_files(root)
-    if topics and index_path.exists():
-        newest = max(p.stat().st_mtime for p in topics)
-        if index_path.stat().st_mtime < newest:
-            os.utime(index_path, (newest, newest))
+    topics = topic_stats(root)
+    if topics:
+        newest = max(st.st_mtime for _p, st in topics)
+        with contextlib.suppress(OSError):
+            fd = safe_fs.open_beneath(*_beneath(index_path), os.O_RDONLY)
+            try:
+                if os.fstat(fd).st_mtime < newest:
+                    os.utime(fd, (newest, newest))
+            finally:
+                os.close(fd)
     return wrote
 
 
@@ -396,22 +454,20 @@ def index_is_stale(root: Path) -> bool:
     i.e. a human hand-edited files directly — or when an older builder
     wrote the index (its header carries the version). Cheap: stat calls
     and one line."""
-    if not root.is_dir():
+    if _kind(root) != "dir":
         return False
-    topics = iter_topic_files(root)
+    topics = topic_stats(root)
     if not topics:
         return False
     index_path = root / INDEX_FILENAME
-    if not index_path.exists():
-        return True
     try:
-        with open(index_path, encoding="utf-8", errors="replace") as f:
-            if f.readline() != INDEX_HEADER:
+        with safe_fs.open_file_for_read(*_beneath(index_path)) as f:
+            index_mtime = os.fstat(f.fileno()).st_mtime
+            if f.readline().decode("utf-8", errors="replace") != INDEX_HEADER:
                 return True
     except OSError:
         return True
-    index_mtime = index_path.stat().st_mtime
-    return any(p.stat().st_mtime > index_mtime for p in topics)
+    return any(st.st_mtime > index_mtime for _p, st in topics)
 
 
 def heal_index_if_stale(root: Path) -> bool:
@@ -439,22 +495,29 @@ def _human_size(n: int) -> str:
 def _list_dir(root: Path, base: Path, prefix: str, depth: int, lines: list[str]) -> None:
     if depth > _VIEW_DIR_DEPTH:
         return
+    walk = None
     try:
-        entries = sorted(base.iterdir(), key=lambda p: (p.is_file(), p.name))
-    except OSError:
-        return
-    for e in entries:
-        if e.name.startswith("."):
-            continue
-        if e.is_dir():
-            lines.append(f"{prefix}{e.name}/")
-            _list_dir(root, e, prefix + "  ", depth + 1, lines)
-        else:
+        walk = safe_fs.walk_beneath(*_beneath(base))
+        step = next(walk)
+        dirs = [d for d in step.dirs if not d.startswith(".")]
+        sizes: dict[str, str] = {}
+        for name in step.files:
+            if name.startswith("."):
+                continue
             try:
-                size = _human_size(e.stat().st_size)
+                sizes[name] = _human_size(os.stat(name, dir_fd=step.dirfd, follow_symlinks=False).st_size)
             except OSError:
-                size = "?"
-            lines.append(f"{prefix}{e.name}\t{size}")
+                sizes[name] = "?"
+    except (OSError, StopIteration):
+        return
+    finally:
+        if walk is not None:
+            walk.close()
+    for name in dirs:
+        lines.append(f"{prefix}{name}/")
+        _list_dir(root, base / name, prefix + "  ", depth + 1, lines)
+    for name, size in sizes.items():
+        lines.append(f"{prefix}{name}\t{size}")
 
 
 def view_root(scopes: dict[str, Path]) -> OpResult:
@@ -469,22 +532,23 @@ def view_root(scopes: dict[str, Path]) -> OpResult:
 
 def op_view(root: Path, rel: str, view_range: list[int] | None = None) -> OpResult:
     resolved = _resolve_strict(root, rel)
-    if rel == "" or resolved.is_dir():
-        if not resolved.is_dir():
+    kind = _kind(resolved)
+    if rel == "" or kind == "dir":
+        if kind != "dir":
             raise MemoryOpError(
                 f"The path {rel or '/'} does not exist. Please provide a valid path."
             )
         lines = [f"Directory: {rel or '.'}"]
         _list_dir(root, resolved, "  ", 1, lines)
         return OpResult(output="\n".join(lines))
-    if not resolved.is_file():
+    if kind != "file":
         raise MemoryOpError(
             f"The path {rel} does not exist. Please provide a valid path."
         )
     if resolved.name == INDEX_FILENAME and index_is_stale(root):
         with _scope_lock(root):
             regenerate_index(root)
-    text = resolved.read_text(encoding="utf-8", errors="replace")
+    text = _read_text(resolved, rel)
     all_lines = text.splitlines()
     start, end = 1, len(all_lines)
     if view_range:
@@ -541,7 +605,7 @@ def _check_caps_for_write(
             "rule or a pointer, not a log. Write the detail to a file outside "
             "memory and keep one line here."
         )
-    topics = iter_topic_files(root)
+    topics = iter_topic_files(root) if creating else []
     if creating and len(topics) + 1 > MAX_TOPICS_PER_SCOPE:
         raise MemoryCapError(
             f"Error: this scope already has {len(topics)} topic files "
@@ -549,8 +613,7 @@ def _check_caps_for_write(
             "before creating new ones."
         )
     if growing:
-        existing = root / rel
-        on_disk = existing.stat().st_size if existing.exists() else 0
+        on_disk = next((st.st_size for p, st in topic_stats(root) if p == root / rel), 0)
         total_after = scope_total_bytes(root) - on_disk + new_bytes
         if total_after > SCOPE_TOTAL_CAP_BYTES:
             raise MemoryCapError(
@@ -581,7 +644,7 @@ def op_create(root: Path, rel: str, file_text: str, *, caps: Caps | None = None)
     content = _sanitize(file_text or "")
     with _scope_lock(root):
         target = _resolve_strict(root, rel)
-        if target.exists():
+        if _kind(target) != "missing":
             raise MemoryOpError(f"Error: File {rel} already exists")
         warnings, over = _check_caps_for_write(
             root, rel, len(content.encode("utf-8")), creating=True,
@@ -604,11 +667,7 @@ def op_str_replace(
         raise MemoryOpError("Error: `old_str` must be non-empty")
     with _scope_lock(root):
         target = _resolve_strict(root, rel)
-        if not target.is_file():
-            raise MemoryOpError(
-                f"The path {rel} does not exist. Please provide a valid path."
-            )
-        text = target.read_text(encoding="utf-8", errors="replace")
+        text = _read_text(target, rel)
         count = text.count(old_str)
         if count == 0:
             raise MemoryOpError(
@@ -670,11 +729,7 @@ def op_insert(
         raise MemoryOpError("Error: `insert_text` must be non-empty")
     with _scope_lock(root):
         target = _resolve_strict(root, rel)
-        if not target.is_file():
-            raise MemoryOpError(
-                f"The path {rel} does not exist. Please provide a valid path."
-            )
-        text = _sanitize(target.read_text(encoding="utf-8", errors="replace"))
+        text = _sanitize(_read_text(target, rel))
         lines = text.splitlines()
         if not isinstance(insert_line, int) or insert_line < 0 or insert_line > len(lines):
             raise MemoryOpError(
@@ -709,15 +764,13 @@ def op_delete(root: Path, rel: str) -> OpResult:
     with _scope_lock(root):
         target = _resolve_strict(root, rel)
         deleted: list[str] = []
-        if target.is_file():
+        kind = _kind(target)
+        if kind == "file":
             deleted = [rel]
-            safe_fs.unlink_beneath(config.AGENTS_DIR, _agents_rel(target))
-        elif target.is_dir():
-            deleted = [
-                (Path(rel) / f.relative_to(target)).as_posix()
-                for f in target.rglob("*") if f.is_file() and not f.is_symlink()
-            ]
-            safe_fs.rmtree_beneath(config.AGENTS_DIR, _agents_rel(target))
+            safe_fs.unlink_beneath(*_beneath(target))
+        elif kind == "dir":
+            deleted = [f"{rel}/{f}" for f in files_below(target)]
+            safe_fs.rmtree_beneath(*_beneath(target))
         else:
             raise MemoryOpError(
                 f"The path {rel} does not exist. Please provide a valid path."
@@ -735,34 +788,28 @@ def op_rename(root: Path, old_rel: str, new_rel: str) -> OpResult:
     with _scope_lock(root):
         src = _resolve_strict(root, old_rel)
         dst = _resolve_strict(root, new_rel)
-        if not src.exists():
+        src_kind = _kind(src)
+        if src_kind not in ("file", "dir"):
             raise MemoryOpError(
                 f"The path {old_rel} does not exist. Please provide a valid path."
             )
-        if dst.exists():
+        if _kind(dst) != "missing":
             raise MemoryOpError(
                 f"Error: The destination {new_rel} already exists"
             )
-        if src.is_file() and dst.suffix.lower() not in ALLOWED_EXTENSIONS:
+        if src_kind == "file" and dst.suffix.lower() not in ALLOWED_EXTENSIONS:
             raise MemoryOpError(
                 f"Error: {dst.name} has an unsupported extension. Memory "
                 "files must be .md or .txt"
             )
-        if src.is_dir():
+        if src_kind == "dir":
             # Enumerate per-file so git + fan-out + tombstones stay per-path.
-            moved = [
-                f.relative_to(src).as_posix()
-                for f in src.rglob("*") if f.is_file() and not f.is_symlink()
-            ]
-            safe_fs.rename_beneath(
-                config.AGENTS_DIR, _agents_rel(src), _agents_rel(dst), mkdirs=True,
-            )
+            moved = files_below(src)
+            _rename(src, dst)
             changed = [(Path(new_rel) / m).as_posix() for m in moved]
             deleted = [(Path(old_rel) / m).as_posix() for m in moved]
         else:
-            safe_fs.rename_beneath(
-                config.AGENTS_DIR, _agents_rel(src), _agents_rel(dst), mkdirs=True,
-            )
+            _rename(src, dst)
             changed = [new_rel]
             deleted = [old_rel]
         if regenerate_index(root):
@@ -787,23 +834,24 @@ def op_promote(
     """
     with _scope_lock(src_root), _scope_lock(dst_root):
         src = _resolve_strict(src_root, rel)
-        if src.is_dir():
+        src_kind = _kind(src)
+        if src_kind == "dir":
             raise MemoryOpError(
                 f"Error: {rel} is a folder. Promote one topic file at a time."
             )
-        if not src.is_file():
+        if src_kind != "file":
             raise MemoryOpError(
                 f"The path {rel} does not exist. Please provide a valid path."
             )
         dst = _resolve_strict(dst_root, dst_rel)
-        if dst.exists():
+        if _kind(dst) != "missing":
             raise MemoryOpError(f"Error: The destination {dst_rel} already exists")
         if dst.suffix.lower() not in ALLOWED_EXTENSIONS:
             raise MemoryOpError(
                 f"Error: {dst.name} has an unsupported extension. Memory "
                 "files must be .md or .txt"
             )
-        content = _sanitize(src.read_text(encoding="utf-8", errors="replace"))
+        content = _sanitize(_read_text(src, rel))
         warnings, over = _check_caps_for_write(
             dst_root, dst_rel, len(content.encode("utf-8")), creating=True,
             caps=caps or Caps(),
@@ -812,10 +860,10 @@ def op_promote(
         try:
             # A source that vanished meanwhile (a hand delete) is gone
             # either way: the copy is the move's result.
-            safe_fs.unlink_beneath(config.AGENTS_DIR, _agents_rel(src), missing_ok=True)
+            safe_fs.unlink_beneath(*_beneath(src), missing_ok=True)
         except OSError as exc:
             try:
-                safe_fs.unlink_beneath(config.AGENTS_DIR, _agents_rel(dst))
+                safe_fs.unlink_beneath(*_beneath(dst))
             except OSError:
                 logger.warning(
                     "memory promote: %s stayed in both scopes (%s, %s)",

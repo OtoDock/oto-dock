@@ -290,13 +290,13 @@ class PumpEventHandlers(_Host):
                 t["summary"] = summary
                 t["tool_input"] = tool_input
                 break
-        # Capture plan filename from file-writing tools. Normalize
-        # separators first: a Windows-satellite session reports the
-        # host-absolute path with backslashes (C:\Users\...\.claude\plans\x.md).
+        # The plan's file name from a write of this session's plan file, in
+        # its scope's plans folder or its own home's (``plan_file_name``).
         if tool_roles.role_of(name) == tool_roles.WRITE:
-            fp = (ed.get("file_path", "") or "").replace("\\", "/")
-            if ("/.claude/plans/" in fp or "/.codex/plans/" in fp) and fp.endswith(".md"):
-                self._plan_filename = fp.rsplit("/", 1)[-1]
+            from core.sandbox.session_config_dir import plan_file_name
+            plan = plan_file_name(ed.get("file_path", "") or "", self.session_id)
+            if plan:
+                self._plan_filename = plan
 
     async def _on_tool_result(self, ed: dict, live: dict | None) -> None:
         tool_id = ed.get("tool_id") or ed.get("name", "")
@@ -412,6 +412,7 @@ class PumpEventHandlers(_Host):
                     mcp_name, plain_tool, costs_block = found
                     hit = mcp_cost_engine.evaluate(
                         mcp_name, plain_tool, tool_evt.get("tool_input"), costs_block,
+                        tool_result=tool_evt.get("tool_result"),
                     )
                     if hit is not None and hit.amount > 0:
                         self._total_cost_delta += hit.amount
@@ -688,7 +689,8 @@ class PumpEventHandlers(_Host):
             if live:
                 live["meeting_agent"] = None
                 live["meeting_participants"] = []
-        elif subtype in (wire.SUBTYPE_MEETING_TURN_END, wire.SUBTYPE_MEETING_CONCLUDED, wire.SUBTYPE_MEETING_AGENT_FAILED):
+        elif subtype in (wire.SUBTYPE_MEETING_TURN_END, wire.SUBTYPE_MEETING_CONCLUDED,
+                         wire.SUBTYPE_MEETING_AGENT_FAILED, wire.SUBTYPE_MEETING_AGENT_STOPPED):
             if subtype in (wire.SUBTYPE_MEETING_TURN_END, wire.SUBTYPE_MEETING_CONCLUDED):
                 self._meeting_agent = None
             evt = {"type": wire.SYSTEM, **ed}

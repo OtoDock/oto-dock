@@ -13,6 +13,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests._pool_store import set_pool_store
+
 
 def _oauth_sub(**o) -> dict:
     s = {"id": "oauth-openai", "layer": "codex-cli", "provider": "openai",
@@ -44,14 +46,14 @@ def store(monkeypatch):
         "local-compat": {"endpoint_url": "http://192.168.1.8:8080/v1", "api_key": "llama-key"},
     }[sid]
     m.get_subscription_consumption.return_value = 0.0
-    monkeypatch.setattr("services.engines.subscription_pool.subscription_store", m)
+    set_pool_store(monkeypatch, m)
     monkeypatch.setattr("config.get_model_provider", lambda model, layer="": {
         "gpt-5.6-sol": "openai",
         "qwen3.6-35b-a3b": "openai_compatible",
     }[model])
-    from services.engines import subscription_pool
+    from services.engines import pool_tokens, subscription_pool
     monkeypatch.setattr(
-        subscription_pool, "_resolve_oauth_access_token",
+        pool_tokens, "_resolve_oauth_access_token",
         lambda sub, oauth: ("tok", 4102444800000),
     )
     subscription_pool._session_subscriptions.clear()

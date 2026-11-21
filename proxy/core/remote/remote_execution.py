@@ -24,17 +24,19 @@ through ``_adapter(info)``. Nothing in this package names an engine.
 """
 
 import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 
-from core import placement
+from core import file_commit, placement
 from core.execution_layer import ExecutionLayer, LayerCapabilities
 from core.permission_modes import AUTO_REVIEW_MODE
 from core.remote.satellite_connection import SatelliteConnectionManager
 from core.remote.tunnel_state import session_port_moved
+from core.session import key_rows, session_closing
 from core.session.session_state import (
-    cleanup_session_permission_state,
     clear_starting,
+    forget_session,
     get_session_mode,
     mark_closing,
     resolve_permission,
@@ -63,7 +65,6 @@ from core.remote.remote_resume import RemoteResumeMixin
 from core.remote.remote_session_info import RemoteSessionInfo
 from core.remote.remote_session_start import (  # noqa: F401
     RemoteSessionStartMixin,
-    _collect_session_files,
     _machine_sync_role,
 )
 from core.remote.remote_start_payload import RemoteStartPayloadMixin
@@ -95,6 +96,7 @@ class RemoteExecutionLayer(
     def __init__(self, connection_manager: SatelliteConnectionManager):
         self._cm = connection_manager
         self._sessions: dict[str, RemoteSessionInfo] = {}
+        connection_manager.set_line_listener(self._line_arrived)
         # Session ids a start is spawning now: a connect report naming one
         # (the satellite's previous process of that id) leaves it to the start.
         self._spawning: set[str] = set()
@@ -151,6 +153,24 @@ class RemoteExecutionLayer(
         info = self._sessions.pop(session_id, None)
         if not info:
             return
+        # A start of this id waits for the lines below: they clear by id.
+        with session_closing.closing(session_id):
+            await self._close_popped(session_id, info)
+
+    async def _close_popped(self, session_id: str, info: RemoteSessionInfo) -> None:
+        """The close of a record already taken out of the registry. Whatever
+        fails on the way, the seat and the slot go back."""
+        try:
+            await self._close_steps(session_id, info)
+        finally:
+            from services.engines.subscription_pool import release_subscription
+            release_subscription(session_id)
+            from core.concurrency import release_chat_slot
+            release_chat_slot(session_id)
+
+    async def _close_steps(self, session_id: str, info: RemoteSessionInfo) -> None:
+        await self.release_prompt_before_close(session_id, info)
+        key_rows.forget_session(session_id)
         mark_closing(session_id)
         clear_starting(session_id)
         info.alive = False
@@ -171,7 +191,17 @@ class RemoteExecutionLayer(
         # debit_reported_session).
         self._cm.debit_reported_session(info.machine_id)
         self._cm.remove_session_queue(info.machine_id, session_id)
-        cleanup_session_permission_state(session_id)
+        # The context's removal is on disk before the close goes on: a crash
+        # after the close never lets this machine's report take it back.
+        await forget_session(session_id)
+        if info.prompt_file:
+            # The compute session's own prompt file: another session of the
+            # folder keeps its own. Removed beneath its root, never by path.
+            from core.layers.cli.spawn import remove_prompt_file
+            with contextlib.suppress(OSError):
+                await file_commit.run_in("session-homes", remove_prompt_file, info.prompt_file)
+        from core.sandbox.session_config_dir import close_session_home
+        await file_commit.run_in("session-homes", close_session_home, session_id)
 
         # Purge the remote-file-flow cache for this session (per-session dir
         # under AGENTS_DIR/.remote-host-cache/). Must come AFTER _sessions.pop so
@@ -194,12 +224,6 @@ class RemoteExecutionLayer(
                 )
         except Exception as e:  # noqa: BLE001  # output cleanup must not skip the subscription and slot release
             logger.warning("mcp_output_relocation cleanup failed: %s", e)
-
-        # Release subscription + concurrency slot
-        from services.engines.subscription_pool import release_subscription
-        release_subscription(session_id)
-        from core.concurrency import release_chat_slot
-        release_chat_slot(session_id)
 
     async def respond_permission(
         self, session_id: str, request_id: str, approved: bool,
@@ -231,9 +255,8 @@ class RemoteExecutionLayer(
     async def answer_engine_prompt(
         self, session_id: str, request_id: str, approved: bool, tool_input: dict,
     ) -> None:
-        """The satellite writes the answer into the CLI's stdin. ``response``
-        carries it in the shape the CLI parses for a satellite that writes it
-        as given; an older one builds its own from ``approved``."""
+        """The satellite writes the answer into the CLI's stdin as given:
+        ``response`` carries it in the shape the CLI parses."""
         info = self._sessions.get(session_id)
         if info is None:
             return
@@ -355,6 +378,12 @@ class RemoteExecutionLayer(
         gates, the token-confinement check, the lane wedge sweep)."""
         return list(self._sessions)
 
+    def machine_of_session(self, session_id: str) -> str:
+        """The machine a held session is on, ``""`` for an id this layer does
+        not hold: one key read, safe from a worker thread."""
+        info = self._sessions.get(session_id)
+        return getattr(info, "machine_id", "") or "" if info is not None else ""
+
     def session_ids_on(self, machine_id: str) -> list[str]:
         """The session records this layer holds on one machine."""
         return [sid for sid, info in self._sessions.items() if info.machine_id == machine_id]
@@ -363,6 +392,11 @@ class RemoteExecutionLayer(
         return self._sessions.get(session_id)
 
     async def is_session_alive(self, session_id: str) -> bool:
+        return self.holds_alive(session_id)
+
+    def holds_alive(self, session_id: str) -> bool:
+        """``is_session_alive`` without an await, for admission's check of a
+        start on a paired machine (``core/concurrency_paired.live``)."""
         info = self._sessions.get(session_id)
         if not info:
             return False
@@ -397,7 +431,7 @@ class RemoteExecutionLayer(
             logger.info(
                 "Remote session %s: started on %s's old local link port %d; "
                 "closed, it resumes at its next message",
-                sid[:8], machine_id[:8], info.tunnel_port,
+                sid[:8], placement.log_id(machine_id), info.tunnel_port,
             )
             await self.close_session(sid)
 
@@ -413,14 +447,13 @@ class RemoteExecutionLayer(
     async def steer(self, session_id: str, text: str) -> bool:
         """Mid-turn steering for a REMOTE headless session — the engine's
         satellite frame (``RemoteEngineAdapter.steer``: Codex's
-        ``codex_steer`` since satellite 0.5.98, Claude's ``steer_turn`` since
-        0.5.128, each refused before the send on an older satellite). False
-        takes the caller's queue fallback; the accept is strict
-        (exactly-once)."""
+        ``codex_steer``, Claude's ``steer_turn``). False takes the caller's
+        queue fallback; the accept is strict (exactly-once)."""
         info = self._sessions.get(session_id)
         if not info or not text:
             return False
-        return await self._adapter(info).steer(info, self._cm, text)
+        from core.session.start_context import fence_turn
+        return await self._adapter(info).steer(info, self._cm, fence_turn(text))
 
     async def compact(self, session_id: str) -> dict | None:
         """Manual context compaction for a REMOTE headless session — the

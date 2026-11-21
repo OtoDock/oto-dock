@@ -171,13 +171,13 @@ def test_valid_name_follows_the_installer_rule():
     assert not community_icons.valid_name("")
 
 
-def test_installed_icon_path(tmp_path, monkeypatch):
+def test_installed_icon(tmp_path, monkeypatch):
     from services.mcp import mcp_registry
     monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: SimpleNamespace(mcp_dir=tmp_path) if name == "x" else None)
-    assert community_icons.installed_icon_path("x") is None
+    assert community_icons.installed_icon("x") is None
     (tmp_path / "icon.png").write_bytes(PNG)
-    assert community_icons.installed_icon_path("x") == tmp_path / "icon.png"
-    assert community_icons.installed_icon_path("other") is None
+    assert community_icons.installed_icon("x") == PNG
+    assert community_icons.installed_icon("other") is None
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +295,7 @@ def _client(user: UserContext | None) -> TestClient:
 
 @pytest.fixture
 def no_installed(monkeypatch):
-    monkeypatch.setattr(community_icons, "installed_icon_path", lambda name: None)
+    monkeypatch.setattr(community_icons, "installed_icon", lambda name: None)
 
 
 def test_route_requires_a_dashboard_session(no_installed):
@@ -313,7 +313,7 @@ def test_route_rejects_a_bad_name(no_installed):
 
 def test_route_serves_the_installed_file(tmp_path, monkeypatch):
     (tmp_path / "icon.png").write_bytes(PNG)
-    monkeypatch.setattr(community_icons, "installed_icon_path", lambda name: tmp_path / "icon.png")
+    monkeypatch.setattr(community_icons, "installed_icon", lambda name: PNG)
     catalog = AsyncMock(return_value=None)
     monkeypatch.setattr(community_icons, "catalog_icon", catalog)
     r = _client(_user("member", agent_roles={"a": "manager"})).get("/v1/mcps/memory-mcp/icon.png")
@@ -328,7 +328,7 @@ def test_route_refuses_a_plain_member(tmp_path, monkeypatch):
     # No surface shows a member an MCP row; the answer would only tell them
     # which MCPs are installed.
     (tmp_path / "icon.png").write_bytes(PNG)
-    monkeypatch.setattr(community_icons, "installed_icon_path", lambda name: tmp_path / "icon.png")
+    monkeypatch.setattr(community_icons, "installed_icon", lambda name: PNG)
     r = _client(_user("member", agent_roles={"a": "editor"})).get("/v1/mcps/memory-mcp/icon.png")
     assert r.status_code == 403
 
@@ -341,15 +341,15 @@ def test_installed_icon_is_checked_like_the_catalogs(tmp_path, monkeypatch):
                         lambda name: SimpleNamespace(mcp_dir=str(tmp_path)))
     icon = tmp_path / "icon.png"
     icon.write_bytes(PNG)
-    assert community_icons.installed_icon_path("x-mcp") == icon
+    assert community_icons.installed_icon("x-mcp") == PNG
     icon.write_bytes(b"<svg onload=alert(1)>")
-    assert community_icons.installed_icon_path("x-mcp") is None
+    assert community_icons.installed_icon("x-mcp") is None
     icon.write_bytes(_png(64, 64))
-    assert community_icons.installed_icon_path("x-mcp") is None
+    assert community_icons.installed_icon("x-mcp") is None
     icon.write_bytes(PNG + b"\0" * community_icons.ICON_MAX_BYTES)
-    assert community_icons.installed_icon_path("x-mcp") is None
+    assert community_icons.installed_icon("x-mcp") is None
     icon.unlink()
-    assert community_icons.installed_icon_path("x-mcp") is None
+    assert community_icons.installed_icon("x-mcp") is None
 
 
 def test_route_serves_the_catalog_icon_to_creators_and_admins(no_installed, monkeypatch):
@@ -574,3 +574,15 @@ def test_every_bundled_mcp_ships_a_clean_icon():
         # No text or time chunk: the export's leak scan skips binaries, so a
         # PNG must never carry a generator path.
         assert not {b"tEXt", b"iTXt", b"zTXt", b"tIME"} & set(types), folder.name
+
+
+def test_an_installed_icon_reached_through_a_link_is_no_icon(tmp_path, monkeypatch):
+    """The icon is read once beneath the tool's folder with no link followed
+    and served from those bytes: an icon.png that is a link is no icon."""
+    from services.mcp import mcp_registry
+    tool = tmp_path / "tool"
+    tool.mkdir()
+    monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: SimpleNamespace(mcp_dir=str(tool)))
+    (tmp_path / "elsewhere.png").write_bytes(PNG)
+    (tool / "icon.png").symlink_to(tmp_path / "elsewhere.png")
+    assert community_icons.installed_icon("x-mcp") is None

@@ -1,0 +1,223 @@
+{
+ "chats": [
+  {
+   "agent": "warm-send-fresh",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "autoReview",
+   "rows": [
+    [
+     "user",
+     "are you there"
+    ],
+    [
+     "event",
+     ""
+    ],
+    [
+     "assistant",
+     "Hello there!"
+    ]
+   ],
+   "session_id": "<id3>",
+   "title": "are you there",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  {
+   "agent": "warm-send-fresh",
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "",
+   "new_chat": true,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "fallback_reason": null,
+   "interactive": false,
+   "mode": "autoReview",
+   "model": "test-model",
+   "offline_machine_name": "",
+   "session_id": "<id2>",
+   "type": "warmup_ready"
+  },
+  {
+   "agent": "warm-send-fresh",
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "new_chat": false,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "fallback_reason": null,
+   "interactive": false,
+   "mode": "autoReview",
+   "model": "test-model",
+   "offline_machine_name": "",
+   "session_id": "<id3>",
+   "type": "warmup_ready"
+  },
+  {
+   "chat_id": "<id1>",
+   "title": "are you there",
+   "type": "title_updated"
+  },
+  {
+   "chat_id": "<id1>",
+   "message": "The previous session could not be resumed — this chat continued with a fresh session. The conversation was restored from history; the previous session's working files may no longer be available.",
+   "subtype": "session_reseeded",
+   "type": "system"
+  },
+  {
+   "chat_id": "<id1>",
+   "status": "streaming",
+   "type": "chat_status"
+  },
+  {
+   "active_agents": [],
+   "active_commands": [],
+   "active_delegates": [],
+   "active_tools": [],
+   "chat_id": "<id1>",
+   "goal": null,
+   "live_blocks": [],
+   "meeting_agent": null,
+   "meeting_participants": [],
+   "pending_permission": null,
+   "session_id": "<id3>",
+   "started_at": "<volatile>",
+   "streaming": true,
+   "thinking_active": false,
+   "thinking_text": "",
+   "thinking_tokens": 0,
+   "todos": [],
+   "type": "live_state",
+   "workflows": {}
+  },
+  {
+   "chat_id": "<id1>",
+   "content": "Hello there!",
+   "type": "text"
+  },
+  {
+   "chat_id": "<id1>",
+   "type": "done"
+  },
+  {
+   "chat_id": "<id1>",
+   "status": "ready",
+   "type": "chat_status"
+  },
+  {
+   "body": "Response ready",
+   "chat_id": "<id1>",
+   "title": "WS Dash Test finished",
+   "type": "turn_complete"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  }
+ ],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [
+   [
+    "<id3>",
+    "are you there",
+    {
+     "inject_time": true
+    }
+   ]
+  ],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [
+   "<id2>"
+  ],
+  "reconnect_waits": [
+   "<id2>",
+   "<id2>"
+  ],
+  "started": [
+   {
+    "agent": "warm-send-fresh",
+    "chat_id": "<id1>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "autoReview",
+    "model": "test-model",
+    "resume": false,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id2>",
+    "user_sub": "user-admin",
+    "username": "admin"
+   },
+   {
+    "agent": "warm-send-fresh",
+    "chat_id": "<id1>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "autoReview",
+    "model": "test-model",
+    "resume": false,
+    "resume_handle": null,
+    "role": "admin",
+    "session_id": "<id3>",
+    "user_sub": "user-admin",
+    "username": "admin"
+   }
+  ]
+ },
+ "slots": {
+  "acquired": [
+   [
+    "<id2>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "<id3>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": [
+   "<id2>"
+  ]
+ }
+}

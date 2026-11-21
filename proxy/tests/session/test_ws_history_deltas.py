@@ -122,12 +122,18 @@ class TestDeltas:
                 ws.client_send({"type": "resume_chat", "chat_id": a})
                 full = await _until(ws, "chat_history")
                 assert [m["id"] for m in full["messages"]] == [r1, r2, r3]
-                r4 = task_store.add_chat_message(b, "assistant", "b2")
+                # The cost word covers the sibling runs the view carries.
+                assert full["restore"]["cost"] == {"billed": True, "fees": 0}
+                fee = json.dumps({"type": "mcp_cost", "cost_usd": 0.2, "cost_billed": True})
+                r4 = task_store.add_chat_message(b, "event", "", event_type="mcp_cost", event_data=fee)
                 r5 = task_store.add_chat_message(a, "user", "a3", author_sub="user-admin")
                 ws.client_send({"type": "resume_chat", "chat_id": a, "delta": True})
                 delta = await _until(ws, "chat_history_delta")
                 assert [m["id"] for m in delta["messages"]] == [r4, r5]
                 assert delta["since_id"] == min(r2, r3)
+                assert delta["restore"]["cost"] == {"billed": True, "fees": 0.2}
+                ws.client_send({"type": "resume_chat", "chat_id": a})
+                assert (await _until(ws, "chat_history"))["restore"]["cost"]["fees"] == 0.2
                 ws.client_send({"type": "close"})
         run_ws_scenario(scenario)
 
@@ -291,6 +297,7 @@ class TestRunningBackground:
                 assert frame["running"] == {
                     "agents": [{"id": "tuA1", "description": "long reader"}],
                     "commands": [{"id": "tuB1", "description": "wait"}],
+                    "delegates": [],
                 }
                 # A delta resume carries the list too.
                 ws.client_send({"type": "client_info", "platform": "web", "history_deltas": True})
@@ -307,6 +314,94 @@ class TestRunningBackground:
         finally:
             session_state._subagent_registries.pop("s-running-1", None)
             bg_command_state._bg_command_registries.pop("s-running-1", None)
+
+    def test_the_history_names_the_delegations_still_working_for_the_chat(self, temp_db, monkeypatch):
+        # A delegation whose spawn row is older than the page: the task store
+        # names it while its run is live, a terminal's caller included, and
+        # not once the run ends.
+        stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+        slug = make_test_agent()
+        cid = "chat-running-2"
+        task_store.create_chat(cid, "user-admin", slug, "auto", model="test-model",
+                               execution_path="claude-code-cli")
+        task_store.add_chat_message(cid, "user", "go", author_sub="user-admin")
+        task_store.create_dynamic_task(
+            "dyn-lane1", slug, "long lane", "p", "cli", "delegate", None, None, None, 3600,
+            "user-admin", on_complete_chat_id=cid)
+        task_store.create_run("run-lane1", "dyn-lane1", slug, "manual", None, "p",
+                              task_type="delegate", scope="user", created_by="user-admin")
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                frame = await _until(ws, "chat_history")
+                assert frame["running"] == {
+                    "agents": [], "commands": [],
+                    "delegates": [{"id": "dyn-lane1", "description": "long lane", "agent": slug}],
+                }
+                task_store.update_run("run-lane1", status="completed")
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                assert "running" not in await _until(ws, "chat_history")
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+
+    def test_the_warmup_history_names_them_too(self, temp_db, monkeypatch):
+        # A chat's session starting up answers a resume with its own history
+        # frame: an existing chat warms up too (a cold send, a lane's result
+        # waking its caller, a move, the re-warm after the terminal switch),
+        # and a reload then must not lose the badges of the other lanes.
+        from core.session import warmup_registry
+        stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+        slug = make_test_agent()
+        cid = "chat-running-3"
+        task_store.create_chat(cid, "user-admin", slug, "auto", model="test-model",
+                               execution_path="claude-code-cli")
+        task_store.add_chat_message(cid, "user", "go", author_sub="user-admin")
+        task_store.create_dynamic_task(
+            "dyn-lane3", slug, "second lane", "p", "cli", "delegate", None, None, None, 3600,
+            "user-admin", on_complete_chat_id=cid)
+        task_store.create_run("run-lane3", "dyn-lane3", slug, "manual", None, "p",
+                              task_type="delegate", scope="user", created_by="user-admin")
+        monkeypatch.setitem(warmup_registry._inflight, cid,
+                            warmup_registry.InflightWarmup(chat_id=cid, user_sub="user-admin", agent=slug))
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                frame = await _until(ws, "chat_history")
+                assert frame["process_alive"] is True  # the warm-up's own frame
+                assert frame["running"]["delegates"] == [
+                    {"id": "dyn-lane3", "description": "second lane", "agent": slug}]
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+
+
+def test_every_history_frame_takes_the_running_list_from_one_place():
+    # Each function that builds a chat_history or chat_history_delta frame
+    # adds the running list through background_frames.running_fields: a
+    # sender without it empties the page's badges for the work older than
+    # its rows.
+    import ast
+    from pathlib import Path
+    root = Path(resume.__file__).parent.parent
+    senders, missing = [], []
+    for path in sorted(p for d in ("ws", "core", "services", "api") for p in (root / d).rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.AsyncFunctionDef | ast.FunctionDef):
+                continue
+            names = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+            if not names & {"CHAT_HISTORY", "CHAT_HISTORY_DELTA"} or path.name == "wire_events.py":
+                continue
+            senders.append(f"{path.name}:{fn.name}")
+            calls = {n.func.id for n in ast.walk(fn)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            if "running_fields" not in calls:
+                missing.append(f"{path.name}:{fn.name}")
+    assert len(senders) >= 3, senders
+    assert missing == [], f"history frames built without running_fields: {missing}"
 
 
 class _LingeringPump:

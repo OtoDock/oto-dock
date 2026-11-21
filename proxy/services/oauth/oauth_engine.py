@@ -374,6 +374,18 @@ class ExchangeResult:
     installations_listed: int | None = None
 
 
+def _exchange_inputs(mcp_name: str, manifest) -> tuple[bool, dict[str, str]]:
+    """The exchange's store reads, one ``run_db`` job: whether the relay hosts
+    this connect and, when it does not, the admin's app credentials."""
+    from services.billing import relay_client
+    from storage.identity import credential_store
+
+    if relay_client.hosted_oauth_active(mcp_name, manifest):
+        return True, {}
+    app_cred_name = manifest.credentials.oauth.get("app_credential", "")
+    return False, credential_store.get_infra_credentials(app_cred_name) if app_cred_name else {}
+
+
 async def do_oauth_exchange(
     *, code: str, state_token: str, iss: str = "", callback_provider: str = "",
 ) -> ExchangeResult:
@@ -407,7 +419,7 @@ async def do_oauth_exchange(
     from auth.oauth_providers import get_provider
     from services.billing import relay_client
     from services.mcp import mcp_registry
-    from storage.identity import credential_store
+    from storage.pg import run_db
 
     provider = get_provider(state.provider_id)
 
@@ -422,7 +434,8 @@ async def do_oauth_exchange(
             state, code=code, iss=iss, provider=provider, manifest=manifest,
         )
 
-    if relay_client.hosted_oauth_active(state.mcp_name, manifest):
+    hosted, creds = await run_db(_exchange_inputs, state.mcp_name, manifest)
+    if hosted:
         # HOSTED: the relay performed the code→token exchange with OtoDock's
         # client_secret and returns only the user's own tokens. No OtoDock
         # secret ever touches this install — client_id/client_secret/token_url
@@ -454,7 +467,6 @@ async def do_oauth_exchange(
         # kind the START chose (an admin switching kinds mid-flow does not
         # change a running exchange), else the bundle's active kind.
         app_cred_name = manifest.credentials.oauth.get("app_credential", "")
-        creds = credential_store.get_infra_credentials(app_cred_name) if app_cred_name else {}
         app_kind = state.app_kind or oauth_app_kinds.active_kind(manifest.credentials.oauth, creds)
         client_id, client_secret = _resolve_app_credentials(
             manifest.credentials.oauth, creds, app_kind,

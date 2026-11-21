@@ -12,22 +12,26 @@ creator's quota bucket; outside the files API, the sync and the
 blueprints), so the copy serves after the chat's own files and media
 tokens are gone, and ``chat.json`` maps each token to its copy. Every
 artifact is located through its media token, never by guessing a folder.
-Synchronous helpers, called off the loop.
+Every read, write and removal of the copy opens beneath the agent's real
+folder (``core/agent_folder``: the operator's link at the agent's folder is
+followed once) with no link followed below it. Synchronous helpers, called
+off the loop.
 """
 
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import logging
 import mimetypes
+import os
 import re
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
 import config
-from core import layout
+from core import agent_folder, layout
 from core.events import artifact_events
 from core.events.common_events import ROW_ASSISTANT
 from services.infra import safe_fs
@@ -56,6 +60,8 @@ TOOL_EVENTS = frozenset({wire.PERSISTED_TOOL, wire.THINKING, wire.TASK_SPAWN, wi
 # read them with.
 CARD_EVENTS = frozenset({wire.SETTINGS_CARD, wire.ACTION_CARD, wire.LIST_CARD})
 _INERT_INLINE = ("audio/", "video/", "image/")
+# The snapshot's two folders of copies: artifact pages, and every other file.
+_COPY_FOLDERS = frozenset({"ui", "media"})
 
 # Credentials a tool call may have printed (an env dump carries the
 # session's PROXY_API_KEY, a JWT acting as the chat's owner): a shared
@@ -75,23 +81,26 @@ class SnapshotTooLarge(Exception):
     """The chat's files exceed what one snapshot may hold."""
 
 
-def bucket_root(agent_dir: Path, username: str) -> Path:
-    return agent_dir / SNAPSHOT_DIRNAME / layout.USERS / username
-
-
 def snapshot_ref(agent: str, username: str, share_id: str) -> str:
     """The value stored on the share row: ``<agent>/shares/users/<u>/<id>``
     (the agent is part of it, so the copy is found after the chat is gone)."""
     return f"{agent}/{SNAPSHOT_DIRNAME}/{layout.USERS}/{username}/{share_id}"
 
 
-def snapshot_path(share: dict) -> Path | None:
-    """The snapshot's folder from the share row's ``snapshot_ref``, joined
-    below the agents dir — an empty, absolute or traversing value is None."""
+def _place(share: dict) -> tuple[Path, str]:
+    """The agent's real folder and the snapshot's rel below it, from the
+    share row's ``snapshot_ref``: exactly ``<agent>/shares/users/<u>/<id>``,
+    the id the share's own. Anything else raises ``UnsafePathError``."""
+    ref = share.get("snapshot_ref") or ""
     try:
-        return join_under(config.AGENTS_DIR, share.get("snapshot_ref") or "")
+        join_under(config.AGENTS_DIR, ref)
     except PathOutsideRoot:
-        return None
+        raise safe_fs.UnsafePathError(errno.EINVAL, "not a snapshot of this share", ref) from None
+    parts = ref.split("/")
+    if (len(parts) != 5 or not config.is_safe_agent_name(parts[0]) or parts[1] != SNAPSHOT_DIRNAME
+            or parts[2] != layout.USERS or parts[4] != (share.get("id") or "")):
+        raise safe_fs.UnsafePathError(errno.EINVAL, "not a snapshot of this share", ref)
+    return agent_folder.agent_root(parts[0]), "/".join(parts[1:])
 
 
 def _token_of_media_url(url: str) -> str:
@@ -102,14 +111,16 @@ def _token_of_media_url(url: str) -> str:
 
 
 class _Copier:
-    """Writes the snapshot's copies beneath the agents root: every source is
-    the file its media token names, opened with no symlink followed (the
-    token was checked at mint on a file the agent keeps writing under), and
-    every destination is written through ``safe_fs`` so a name planted in
-    the snapshot folder is replaced, never written through."""
+    """Writes the snapshot's copies beneath a handle on the snapshot's own
+    folder (``root_fd``), so the whole copy lands in that one folder: every
+    source is the file its media token names, opened with no symlink
+    followed (the token was checked at mint on a file the agent keeps
+    writing under), and every destination is written through ``safe_fs`` so
+    a name planted in the snapshot folder is replaced, never written
+    through."""
 
-    def __init__(self, agent: str, username: str, share_id: str) -> None:
-        self.root_rel = snapshot_ref(agent, username, share_id)
+    def __init__(self, root_fd: int) -> None:
+        self.root_fd = root_fd
         self.total = 0
         self.files: dict[str, str] = {}
 
@@ -138,7 +149,7 @@ class _Copier:
         rel = f"{sub}/{token}{suffix}"
         try:
             copied = safe_fs.copy_file_beneath(
-                root, src_rel, config.AGENTS_DIR, f"{self.root_rel}/{rel}",
+                root, src_rel, self.root_fd, rel,
                 max_size=MAX_SNAPSHOT_BYTES - self.total, mkdirs=True,
             )
         except safe_fs.FileTooLarge as err:
@@ -155,9 +166,7 @@ class _Copier:
         self._account(len(data))
         suffix = mimetypes.guess_extension(mime or "") or ".bin"
         rel = f"media/{key}{suffix}"
-        safe_fs.atomic_write_beneath(
-            config.AGENTS_DIR, f"{self.root_rel}/{rel}", data, mkdirs=True, fsync=False,
-        )
+        safe_fs.atomic_write_beneath(self.root_fd, rel, data, mkdirs=True, fsync=False)
         self.files[key] = rel
 
 
@@ -267,94 +276,112 @@ def build(chat: dict, share_id: str, creator_username: str, *, include_tools: bo
     """Write the snapshot and return its ``snapshot_ref``. Raises
     SnapshotTooLarge past the byte cap (the caller undoes the share)."""
     agent = chat["agent"]
-    agent_dir = config.get_agent_dir(agent)
-    root = bucket_root(agent_dir, creator_username) / share_id
-    if root.exists():
-        shutil.rmtree(root, ignore_errors=True)
-    root.mkdir(parents=True, exist_ok=True)
-    copier = _Copier(agent, creator_username, share_id)
+    ref = snapshot_ref(agent, creator_username, share_id)
+    root, rel = _place({"snapshot_ref": ref, "id": share_id})
+    safe_fs.rmtree_beneath(root, rel, missing_ok=True)
+    safe_fs.mkdirs_beneath(root, rel)
+    try:
+        with safe_fs.open_root(root, rel) as root_fd:
+            _write(chat, root_fd, include_tools)
+    except SnapshotTooLarge:
+        safe_fs.rmtree_beneath(root, rel, missing_ok=True)
+        raise
+    return ref
+
+
+def _write(chat: dict, root_fd: int, include_tools: bool) -> None:
+    """The copies and ``chat.json``, beneath the snapshot folder's handle."""
+    agent = chat["agent"]
+    copier = _Copier(root_fd)
     counter = [0]
     messages: list[dict] = []
-    try:
-        for row in task_store.get_chat_messages(chat["id"], limit=5000):
-            role = row.get("role") or ""
-            et = row.get("event_type") or ""
-            if role in ("user", "assistant") and not et:
-                # A person's photos and files are counted, never copied: the
-                # copy holds what the chat displayed, not the person's uploads.
-                photos, files = _attachment_counts(row)
-                if not (row.get("content") or "").strip() and not photos and not files:
-                    continue
-                message = {"role": role, "content": row.get("content") or "",
-                           "created_at": row.get("created_at") or "",
-                           "author_sub": row.get("author_sub") or ""}
-                if role == ROW_ASSISTANT:
-                    message["id"] = row.get("id")
-                if photos or files:
-                    message["attachments"] = {"photos": photos, "files": files}
-                messages.append(message)
-            elif role == "event":
-                if et in ARTIFACT_EVENTS:
-                    block = _snapshot_block(row, copier, counter)
-                    if block:
-                        messages.append(block)
-                elif et in CARD_EVENTS:
-                    messages.append(_card_block(row))
-                elif include_tools and et in TOOL_EVENTS:
-                    copied = _event_message(row, redact_tokens(row.get("event_data") or ""))
-                    if et != wire.THINKING:
-                        copied["id"] = row.get("id")
-                    messages.append(copied)
-        doc = {
-            "version": 1,
-            "chat_id": chat["id"],
-            "title": chat.get("title") or "",
-            "agent": agent,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "include_tools": bool(include_tools),
-            "messages": messages,
-            "files": copier.files,
-        }
-        text = json.dumps(doc, ensure_ascii=False).encode("utf-8")
-        copier._account(len(text))
-        safe_fs.atomic_write_beneath(
-            config.AGENTS_DIR, f"{copier.root_rel}/chat.json", text, fsync=False,
-        )
-    except SnapshotTooLarge:
-        shutil.rmtree(root, ignore_errors=True)
-        raise
-    return snapshot_ref(agent, creator_username, share_id)
+    for row in task_store.get_chat_messages(chat["id"], limit=5000):
+        role = row.get("role") or ""
+        et = row.get("event_type") or ""
+        if role in ("user", "assistant") and not et:
+            # A person's photos and files are counted, never copied: the
+            # copy holds what the chat displayed, not the person's uploads.
+            photos, files = _attachment_counts(row)
+            if not (row.get("content") or "").strip() and not photos and not files:
+                continue
+            message = {"role": role, "content": row.get("content") or "",
+                       "created_at": row.get("created_at") or "",
+                       "author_sub": row.get("author_sub") or ""}
+            if role == ROW_ASSISTANT:
+                message["id"] = row.get("id")
+            if photos or files:
+                message["attachments"] = {"photos": photos, "files": files}
+            messages.append(message)
+        elif role == "event":
+            if et in ARTIFACT_EVENTS:
+                block = _snapshot_block(row, copier, counter)
+                if block:
+                    messages.append(block)
+            elif et in CARD_EVENTS:
+                messages.append(_card_block(row))
+            elif include_tools and et in TOOL_EVENTS:
+                copied = _event_message(row, redact_tokens(row.get("event_data") or ""))
+                if et != wire.THINKING:
+                    copied["id"] = row.get("id")
+                messages.append(copied)
+    doc = {
+        "version": 1,
+        "chat_id": chat["id"],
+        "title": chat.get("title") or "",
+        "agent": agent,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "include_tools": bool(include_tools),
+        "messages": messages,
+        "files": copier.files,
+    }
+    text = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+    copier._account(len(text))
+    safe_fs.atomic_write_beneath(root_fd, "chat.json", text, fsync=False)
 
 
 def load(share: dict) -> dict | None:
-    root = snapshot_path(share)
-    if root is None:
-        return None
-    path = root / "chat.json"
-    if not path.is_file():
-        return None
     try:
-        doc = json.loads(path.read_text("utf-8"))
+        root, rel = _place(share)
+        doc = json.loads(safe_fs.read_bytes_beneath(root, f"{rel}/chat.json", max_size=MAX_SNAPSHOT_BYTES))
     except (OSError, ValueError):
         return None
     return doc if isinstance(doc, dict) else None
 
 
-def file_path(share: dict, token: str) -> Path | None:
-    """The copy a token names inside this snapshot, or None. The map, not
-    the token, decides the path, and the result must stay under the
-    snapshot directory."""
-    root = snapshot_path(share)
-    doc = load(share)
-    if root is None or not doc:
+def _entry(share: dict, token: str) -> tuple[Path, str]:
+    """The root and rel of the copy a token names inside this snapshot. The
+    map, not the token, decides the path: ``ui/<name>`` or ``media/<name>``.
+    A token with no copy raises ``FileNotFoundError``."""
+    doc = load(share) or {}
+    files = doc.get("files")
+    entry = files.get(token or "") if isinstance(files, dict) else None
+    if not isinstance(entry, str) or entry.count("/") != 1 or entry.split("/", 1)[0] not in _COPY_FOLDERS:
+        raise FileNotFoundError(errno.ENOENT, "no copy for this token", token)
+    root, rel = _place(share)
+    return root, f"{rel}/{entry}"
+
+
+def open_file(share: dict, token: str) -> tuple[int, os.stat_result, str] | None:
+    """``(fd, stat, name)`` of the copy a token names, opened with no link
+    followed (a regular file only), or None. The caller serves from the
+    descriptor and closes it."""
+    try:
+        root, rel = _entry(share, token)
+        fd, st = safe_fs.open_regular_for_read(root, rel)
+    except OSError:
         return None
-    rel = (doc.get("files") or {}).get(token or "")
-    if not isinstance(rel, str) or not rel:
+    return fd, st, rel.rsplit("/", 1)[-1]
+
+
+def read_page(share: dict, token: str) -> str | None:
+    """The text of the artifact page a token names, read with no link
+    followed, or None."""
+    try:
+        root, rel = _entry(share, token)
+        data = safe_fs.read_bytes_beneath(root, rel, max_size=MAX_SNAPSHOT_BYTES)
+    except OSError:
         return None
-    path = (root / rel).resolve()
-    if not path.is_relative_to(root.resolve()) or not path.is_file():
-        return None
-    return path
+    return data.decode("utf-8", "replace")
 
 
 def inline_ok(mime: str) -> bool:
@@ -363,9 +390,30 @@ def inline_ok(mime: str) -> bool:
 
 
 def remove(share: dict) -> None:
-    root = snapshot_path(share)
-    if root is not None and root.is_dir():
-        shutil.rmtree(root, ignore_errors=True)
+    if not share.get("snapshot_ref"):
+        return  # the row holds no reference, and what its build left is the orphan sweep's
+    try:
+        root, rel = _place(share)
+        safe_fs.rmtree_beneath(root, rel, missing_ok=True)
+    except OSError:
+        logger.warning("share snapshot not removed: %s", share.get("snapshot_ref") or "", exc_info=True)
+
+
+def _bucket_folders(root: Path, rel: str) -> list[str]:
+    """The real folders directly in ``rel`` beneath ``root``: a link is never
+    listed or entered, a missing folder holds none, a refused one holds none
+    with one WARNING."""
+    try:
+        walk = safe_fs.walk_beneath(root, rel)
+        try:
+            return list(next(walk).dirs)
+        finally:
+            walk.close()
+    except (FileNotFoundError, StopIteration):
+        return []
+    except OSError:
+        logger.warning("share snapshots not listed: %s/%s", root, rel, exc_info=True)
+        return []
 
 
 def remove_user_snapshots(username: str) -> int:
@@ -377,10 +425,16 @@ def remove_user_snapshots(username: str) -> int:
     if not agents_dir.is_dir():
         return 0
     for agent_dir in agent_dirs(agents_dir):
-        root = bucket_root(agent_dir, username)
-        if root.is_dir():
-            shutil.rmtree(root, ignore_errors=True)
-            n += 1
+        root = agent_folder.agent_root(agent_dir.name)
+        rel = f"{SNAPSHOT_DIRNAME}/{layout.USERS}/{username}"
+        try:
+            safe_fs.rmtree_beneath(root, rel)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            logger.warning("share snapshots of %s not removed in %s", username, agent_dir.name, exc_info=True)
+            continue
+        n += 1
     return n
 
 
@@ -390,15 +444,17 @@ def sweep_orphans(live_ids: set[str]) -> int:
     agents_dir = Path(config.AGENTS_DIR)
     if not agents_dir.is_dir():
         return 0
+    users = f"{SNAPSHOT_DIRNAME}/{layout.USERS}"
     for agent_dir in agent_dirs(agents_dir):
-        users = agent_dir / SNAPSHOT_DIRNAME / layout.USERS
-        if not users.is_dir():
-            continue
-        for bucket in users.iterdir():
-            if not bucket.is_dir():
-                continue
-            for d in bucket.iterdir():
-                if d.is_dir() and d.name not in live_ids:
-                    shutil.rmtree(d, ignore_errors=True)
-                    n += 1
+        root = agent_folder.agent_root(agent_dir.name)
+        for bucket in _bucket_folders(root, users):
+            for name in _bucket_folders(root, f"{users}/{bucket}"):
+                if name in live_ids:
+                    continue
+                try:
+                    safe_fs.rmtree_beneath(root, f"{users}/{bucket}/{name}")
+                except OSError:
+                    logger.warning("orphan share snapshot not removed: %s", name, exc_info=True)
+                    continue
+                n += 1
     return n

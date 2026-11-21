@@ -159,23 +159,25 @@ def _task(**kw):
 
 
 def test_the_task_kinds_and_their_facts():
-    assert task_kinds.TASK_KINDS == {"scheduled", "one_time", "trigger", "continuation", "app", "delegate", "check"}
-    assert task_kinds.RUN_KIND_NAMES == {"scheduled", "one-time", "trigger", "delegate", "app", "check"}
+    assert task_kinds.TASK_KINDS == {"scheduled", "one_time", "trigger", "continuation", "app", "delegate",
+                                     "check", "wrapup"}
+    assert task_kinds.RUN_KIND_NAMES == {"scheduled", "one-time", "trigger", "delegate", "app", "check",
+                                         "wrapup"}
     assert task_kinds.TRIGGER_KINDS == {"scheduled", "manual", "trigger", "check", "app_handler", "app_action"}
     k = task_kinds.KINDS
-    assert not k["trigger"].clocked and all(v.clocked for n, v in k.items() if n != "trigger")
+    assert {n for n, v in k.items() if not v.clocked} == {"trigger", "wrapup"}
     assert {n for n, v in k.items() if v.unscheduled} == {"one_time", "trigger"}
     assert k["continuation"].fires == task_kinds.WAKE and k["continuation"].run_kind is None
     assert k["app"].fires == task_kinds.HANDLER
     assert {n for n, v in k.items() if v.fires == task_kinds.SESSION} == {
-        "scheduled", "one_time", "trigger", "delegate", "check"}
-    assert k["check"].judge and not any(v.judge for n, v in k.items() if n != "check")
+        "scheduled", "one_time", "trigger", "delegate", "check", "wrapup"}
+    assert {n for n, v in k.items() if v.judge} == {"check", "wrapup"}
     assert k["delegate"].worker and not any(v.worker for n, v in k.items() if n != "delegate")
     assert {n for n, v in k.items() if v.knowledge_rw} == {"scheduled", "one_time", "trigger", "delegate"}
     assert {n for n, v in k.items() if v.button_target} == {"scheduled", "trigger"}
     assert {n: v.run_kind for n, v in k.items()} == {
         "scheduled": "scheduled", "one_time": "one-time", "trigger": "trigger", "continuation": None,
-        "app": "app", "delegate": "delegate", "check": "check"}
+        "app": "app", "delegate": "delegate", "check": "check", "wrapup": "wrapup"}
     assert {v.run_kind for v in k.values() if v.run_kind} == task_kinds.RUN_KIND_NAMES
     assert task_kinds.of_word("nonsense") is None and task_kinds.of_word(None) is None
     assert task_kinds.of(_task(task_type="delegate")).worker
@@ -231,7 +233,8 @@ def test_the_knowledge_write_opt_in_answers_what_it_always_answered():
     # continued chat never opted in (the run column spells ``one-time``; a
     # trigger run read ``one-time`` before the classifier was fixed).
     assert {n: v.knowledge_rw for n, v in task_kinds.RUN_KINDS.items()} == {
-        "scheduled": True, "one-time": False, "trigger": False, "delegate": True, "app": False, "check": False}
+        "scheduled": True, "one-time": False, "trigger": False, "delegate": True, "app": False, "check": False,
+        "wrapup": False}
     for word, expected in (("scheduled", True), ("delegate", True), ("one-time", False), ("trigger", False),
                            ("one_time", False), ("app", False), ("check", False), ("", False), (None, False)):
         assert task_config_builder.run_allows_knowledge_rw(word) is expected, word

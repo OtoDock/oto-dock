@@ -279,3 +279,21 @@ async def test_a_wipe_ends_the_session_and_the_body_cap_refuses(rig, monkeypatch
 
 def test_the_token_hash_is_sha256_of_the_bearer():
     assert gw.token_hash_of("abc") == hashlib.sha256(b"abc").hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_an_exit_value_is_never_reached_through_the_gateway(rig):
+    """The credential exit's values sit in the same table, keyed by their
+    placeholder under the session's token hash. The gateway's path is not a
+    second door to them: only the exit, which admits the session by its own
+    secret and judges each request, adds them."""
+    ws, tunnel, port, vendor = rig
+    placeholder = "oto-exit-" + "a" * 32
+    _push(tunnel.gateway.table, vendor, mcp=placeholder, upstream=f"http://127.0.0.1:{vendor.port}")
+    auth = {"Authorization": f"Bearer {BEARER}"}
+    async with aiohttp.ClientSession() as s:
+        async with s.post(f"http://127.0.0.1:{port}/v1/mcp-gateway/{placeholder}/", json=RPC, headers=auth) as r:
+            assert r.status == 200
+            doc = await r.json()
+            assert doc["id"] == 7 and "No credential has reached this machine" in doc["error"]["message"]
+    assert vendor.requests == []

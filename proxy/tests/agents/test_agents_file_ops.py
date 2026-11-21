@@ -11,10 +11,12 @@ endpoints against `tmp_path`-backed agent dirs. Covers:
 
 import os
 from io import BytesIO
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+from services.remote import workspace_fanout
 
 
 def _make_app(tmp_path, monkeypatch, *, role: str = "manager", username: str = "alice"):
@@ -552,12 +554,14 @@ def _patch_remote(monkeypatch, machine_ids=("m1",)):
     send_fire_and_forget can be asserted. The dashboard push helpers now delegate
     to ``workspace_fanout`` (isolation-aware), which calls these same cm methods
     with the same PathRef / delete-envelope shape, so the assertions are unchanged."""
-    from services.remote import workspace_fanout
     monkeypatch.setattr(
         workspace_fanout, "fanout_targets",
         lambda agent_slug, rel_path, *, exclude_machine_id=None: list(machine_ids),
     )
     cm = AsyncMock()
+    cm.is_connected = MagicMock(return_value=True)
+    cm.get_connection = MagicMock(return_value=object())
+    cm.get_connected_machines = MagicMock(return_value=[])
     pushed: dict[str, bytes] = {}
 
     async def _push(mid, ref, source, **kw):
@@ -577,13 +581,16 @@ def test_move_pushes_new_file_and_deletes_old_on_remote(tmp_path, monkeypatch):
     (agent_dir / "workspace" / "dest").mkdir()
     (agent_dir / "workspace" / "src" / "f.md").write_text("payload")
     fake_cm = _patch_remote(monkeypatch)
-    client = TestClient(app)
 
-    with patch("core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
+    # The pushes run on the machine's lane after the route answers: one client
+    # keeps that loop alive until they ended.
+    with TestClient(app) as client, patch(
+            "core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
         resp = client.post(
             "/v1/agents/test-agent/move",
             json={"src_paths": ["workspace/src/f.md"], "dest_dir": "workspace/dest"},
         )
+        assert client.portal.call(workspace_fanout.drain_fan_outs)
     assert resp.status_code == 200, resp.text
 
     # New file pushed to the satellite.
@@ -607,13 +614,14 @@ def test_copy_dir_pushes_every_file_on_remote(tmp_path, monkeypatch):
     (agent_dir / "workspace" / "src" / "top.md").write_text("top")
     (agent_dir / "workspace" / "src" / "sub" / "nested.md").write_text("nested")
     fake_cm = _patch_remote(monkeypatch)
-    client = TestClient(app)
 
-    with patch("core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
+    with TestClient(app) as client, patch(
+            "core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
         resp = client.post(
             "/v1/agents/test-agent/copy",
             json={"src_paths": ["workspace/src"], "dest_dir": "workspace/dest"},
         )
+        assert client.portal.call(workspace_fanout.drain_fan_outs)
     assert resp.status_code == 200, resp.text
 
     # Every file in the copied tree is pushed (recursively).
@@ -1868,6 +1876,31 @@ def test_write_through_a_swapped_agent_folder_is_refused(tmp_path, monkeypatch):
     )
     assert resp.status_code == 403
     _victim_untouched(victim)
+
+
+def test_a_write_judged_at_the_agents_own_folder_is_refused(tmp_path, monkeypatch):
+    """The agent's own folder is no file. A write whose judged place is that
+    folder is refused as the delete route refuses it, before anything is
+    written, and the folder stands as it was: a plain folder, and one the
+    operator made a link."""
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="admin")
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "kept.md").write_text("kept")
+    (agent_dir / "workspace" / "home").symlink_to("..")
+    client = TestClient(app)
+    resp = client.put("/v1/agents/test-agent/files/workspace/home", json={"content": "NEW"})
+    assert resp.status_code == 403 and "agent root" in resp.json()["detail"].lower(), resp.text
+    assert agent_dir.is_dir() and (agent_dir / "workspace" / "kept.md").read_text() == "kept"
+    # A file beside it is written as ever.
+    resp = client.put("/v1/agents/test-agent/files/workspace/new.md", json={"content": "NEW"})
+    assert resp.status_code == 200 and (agent_dir / "workspace" / "new.md").read_text() == "NEW", resp.text
+    real = tmp_path / "disk2" / "test-agent"
+    real.parent.mkdir()
+    agent_dir.rename(real)
+    agent_dir.symlink_to(real)
+    resp = client.put("/v1/agents/test-agent/files/workspace/home", json={"content": "NEW"})
+    assert resp.status_code == 403 and "agent root" in resp.json()["detail"].lower(), resp.text
+    assert agent_dir.is_symlink() and (real / "workspace" / "kept.md").read_text() == "kept"
 
 
 def test_move_source_that_is_a_link_into_another_scope_is_refused(tmp_path, monkeypatch):

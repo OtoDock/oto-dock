@@ -157,6 +157,8 @@ dependencies {
 }
 
 apply from: 'capacitor.build.gradle'
+// What the shrunk release build must still hold (checkReleaseFullscreen).
+apply from: 'release-checks.gradle'
 
 try {
     def servicesJSON = file('google-services.json')

@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from services.community import skills_installer as si
-from services.mcp import mcp_registry
+from services.mcp import mcp_manifest_store, mcp_registry
 
 
 def _pkg(tmp_path, name="pdf-skills", *, category="skill", runtime="none",
@@ -121,7 +121,7 @@ async def test_install_lands_scrubbed_in_skills_dir(temp_db, tmp_path, monkeypat
     import config as app_config
     monkeypatch.setattr(app_config, "MCPS_DIR", tmp_path / "mcps")
     root = _pkg(tmp_path)
-    with patch.object(mcp_registry, "scan_manifests"):
+    with patch.object(mcp_manifest_store, "scan_manifests"):
         result = await si.install_skill_package_from_extracted(root)
     assert result["status"] == "installed" and result["kind"] == "skill"
     installed = tmp_path / "mcps/skills/pdf-skills/skills/pdf-processing/SKILL.md"
@@ -143,7 +143,7 @@ async def test_the_install_rescans_under_the_registrys_lock(temp_db, tmp_path, m
         return {}
 
     monkeypatch.setattr(mcp_registry, "rescan", _rescan)
-    with patch.object(mcp_registry, "scan_manifests", side_effect=AssertionError("a bare scan")):
+    with patch.object(mcp_manifest_store, "scan_manifests", side_effect=AssertionError("a bare scan")):
         result = await si.install_skill_package_from_extracted(_pkg(tmp_path))
     assert result["status"] == "installed" and rescans == ["locked rescan"]
 
@@ -161,7 +161,7 @@ async def test_a_failed_install_over_a_leftover_folder_restores_it(temp_db, tmp_
     (leftover / "skills" / "old.md").write_text("old skill")
     root = _pkg(tmp_path / "upload")
     with patch.object(mcp_registry, "get_manifest", return_value=None), \
-         patch.object(mcp_registry, "scan_manifests", side_effect=[RuntimeError("scan"), None]):
+         patch.object(mcp_manifest_store, "scan_manifests", side_effect=[RuntimeError("scan"), None]):
         with pytest.raises(RuntimeError):
             await si.install_skill_package_from_extracted(root)
     assert (leftover / "notes.md").read_text() == "old"
@@ -188,7 +188,7 @@ async def test_a_failure_inside_the_file_step_restores_the_folder(temp_db, tmp_p
 
     monkeypatch.setattr(ci.shutil, "copy2", _copy_fails)
     with patch.object(mcp_registry, "get_manifest", return_value=None), \
-         patch.object(mcp_registry, "scan_manifests"):
+         patch.object(mcp_manifest_store, "scan_manifests"):
         with pytest.raises(OSError):
             await si.install_skill_package_from_extracted(root)
     assert (leftover / "notes.md").read_text() == "old"
@@ -305,7 +305,7 @@ async def test_bare_skill_folder_synthesizes_package(temp_db, tmp_path, monkeypa
     (bare / "SKILL.md").write_text(
         "---\nname: my-cool-skill\ndescription: Does cool things.\n"
         "metadata:\n  version: \"2.1\"\nallowed-tools: Bash(*)\n---\n\nBody.\n")
-    with patch.object(mcp_registry, "scan_manifests"):
+    with patch.object(mcp_manifest_store, "scan_manifests"):
         result = await si.install_bare_skill_folder(bare)
     assert result["status"] == "installed"
     assert result["name"] == "my-cool-skill"      # frontmatter, not folder name
@@ -332,7 +332,7 @@ async def test_bare_skill_folder_reads_a_marked_skill_file(temp_db, tmp_path, mo
     (bare / "SKILL.md").write_text(
         "﻿---\nname: marked-skill\ndescription: Marked.\n"
         "allowed-tools: Bash(*)\n---\n\nBody.\n")
-    with patch.object(mcp_registry, "scan_manifests"):
+    with patch.object(mcp_manifest_store, "scan_manifests"):
         result = await si.install_bare_skill_folder(bare)
     assert result["name"] == "marked-skill"
     text = (tmp_path / "mcps/skills/marked-skill/skills/marked-skill/SKILL.md").read_text()
@@ -377,7 +377,7 @@ async def test_bare_skill_folder_holds_only_name_and_description_to_the_schema(t
     bare = tmp_path / "up3" / "folder"
     bare.mkdir(parents=True)
     (bare / "SKILL.md").write_text("---\nname: numbered\ndescription: Fine.\nlicense: 2.0\n---\n\nBody.\n")
-    with patch.object(mcp_registry, "scan_manifests"):
+    with patch.object(mcp_manifest_store, "scan_manifests"):
         assert (await si.install_bare_skill_folder(bare))["name"] == "numbered"
     for text, needle in (("No fence here.\n", "has no front matter"),
                          ("---\nname: [x\n---\nBody\n", "front matter is not valid YAML"),

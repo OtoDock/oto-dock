@@ -191,9 +191,7 @@
   }
  ],
  "snapshots": [],
- "throttles": [
-  "API Error: 429 rate_limit_error: rate limit reached"
- ],
+ "throttles": [],
  "titles": [
   [
    "u-person",

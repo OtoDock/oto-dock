@@ -15,12 +15,19 @@ from pydantic import BaseModel, ConfigDict, Field
 
 import config
 from api._guards import require_manager
+from api.mcp import mcp_containers as _containers
 from auth import roles
 from auth.providers import UserContext, get_current_user, require_admin, require_user
 from core import host_os
 from services.community import community_icons
 from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
-from services.mcp import docker_manager, mcp_manifest_types as _mt, mcp_registry
+from services.mcp import (
+    docker_manager,
+    mcp_egress,
+    mcp_manifest_types as _mt,
+    mcp_registry,
+    mcp_session_filter,
+)
 from storage.mcp import mcp_store
 
 logger = logging.getLogger("otodock.mcp-api")
@@ -40,7 +47,7 @@ def _icon_flags(manifests, *, catalog: bool) -> dict[str, bool]:
     for m in manifests:
         if not community_icons.valid_name(m.name):
             out[m.name] = False
-        elif community_icons.installed_icon_path(m.name) is not None:
+        elif community_icons.installed_icon(m.name) is not None:
             out[m.name] = True
         else:
             out[m.name] = (catalog and m.category == "community"
@@ -110,6 +117,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
     docker_unmanaged: set[str] = set()
     docker_statuses: dict[str, str] = {}
     docker_stale: set[str] = set()
+    keep_running = await asyncio.to_thread(mcp_store.get_keep_running)
     for name, m in manifests.items():
         if not _mt.is_container(m.server):
             continue
@@ -118,7 +126,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
             continue
         if states.get(name, False):
             status, images = await asyncio.to_thread(docker_manager.container_state, m)
-            docker_statuses[name] = status
+            docker_statuses[name] = _containers.status_word(m, status)
             if status in docker_manager.PRESENT and docker_manager.image_stale(m, images):
                 docker_stale.add(name)
 
@@ -192,10 +200,10 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
         # Default from the manifest; admin override in _network_access.
         if m.network_targets:
             entry["has_network_targets"] = True
-            _na = config_vals.get("_network_access")
-            entry["network_access"] = (
-                m.network_access_default if _na is None else (_na == "true")
-            )
+            entry["network_access"] = mcp_egress.network_access_of(m, config_vals)
+        if m.network_exit:
+            entry["has_network_exit"] = True
+            entry["network_access"] = mcp_egress.network_access_of(m, config_vals)
 
         # Credential fields + configured status (for inline credential editing)
         if cred and cred_type == "infra":
@@ -262,6 +270,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
                 entry["docker_managed"] = False
             else:
                 entry["docker_status"] = docker_statuses.get(name, docker_manager.NOT_CHECKED)
+                entry.update(_containers.row_facts(m, keep_running))
                 # The container still serves the image an update replaced (its
                 # recreate did not happen): a Restart switches it.
                 entry["docker_image_stale"] = name in docker_stale
@@ -307,6 +316,8 @@ async def enable_mcp(name: str, user: UserContext = Depends(get_current_user)):
     # Its relay subscriptions receive again: the relay forwards their kinds.
     from services.webhooks import relay_events
     relay_events.sync_providers_of_mcp_soon(name)
+    from services.remote import tools_ahead
+    tools_ahead.after_tool_change(name, update=False)  # the machines that may use it
 
     # Auto-start Docker container if applicable. Surface the result so the
     # admin UI can show a toast — previously this swallowed failures with a
@@ -446,9 +457,17 @@ async def set_mcp_config(
     name: str, req: McpConfigRequest, user: UserContext = Depends(get_current_user)
 ):
     require_admin(user)
-    if not mcp_registry.get_manifest(name):
+    manifest = mcp_registry.get_manifest(name)
+    if not manifest:
         raise HTTPException(404, f"MCP '{name}' not found")
-    await asyncio.to_thread(mcp_store.set_mcp_config_values, name, req.values)
+    values = dict(req.values)
+    access = values.pop("_network_access", None)
+    if access is not None:
+        if access not in ("true", "false"):
+            raise HTTPException(400, "_network_access must be \"true\" or \"false\".")
+        await _apply_network_access(manifest, access == "true")
+    if values:
+        await asyncio.to_thread(mcp_store.set_mcp_config_values, name, values)
     return {"status": "saved", "name": name}
 
 
@@ -494,10 +513,13 @@ async def set_network_access(
     name: str, body: NetworkAccessRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    """Toggle internal-network access for an MCP that declares network_targets.
+    """Toggle internal-network access for an MCP that declares
+    ``network_targets`` or ``network_exit``.
 
     When on, the agent sandbox carves egress to the MCP's configured target
-    host(s). Rejects MCPs that declare no ``network_targets`` (the
+    host(s); for a ``network_exit`` container (the platform browser) its own
+    local network opens, and the container is recreated so the change holds
+    (the pages it had open end). Rejects MCPs that declare neither (the
     toggle would have no effect — fail loud, like the tool-filter endpoint).
     Unavailable on hosted OtoDock (no operator LAN).
     """
@@ -505,18 +527,56 @@ async def set_network_access(
     manifest = mcp_registry.get_manifest(name)
     if manifest is None:
         raise HTTPException(404, f"MCP '{name}' not found")
-    if not manifest.network_targets:
+    restarted = await _apply_network_access(manifest, body.enabled)
+    return {"status": "ok", "name": name, "network_access": body.enabled,
+            "restarted": restarted}
+
+
+async def _apply_network_access(manifest, enabled: bool) -> bool:
+    """The one path that stores ``_network_access`` (this route and the
+    generic config route both): refused for an MCP that declares neither
+    field and on hosted OtoDock. For the browser (``network_exit``) the
+    store, the in-memory exit set and the recreate run under the MCP's
+    install lock, so a second change meets the 409 instead of racing its
+    compose run. Answers whether the container was recreated."""
+    name = manifest.name
+    if not (manifest.network_targets or manifest.network_exit):
         raise HTTPException(
             400, f"MCP '{name}' declares no network_targets — internal-network "
             f"access does not apply to it.")
     if config.OTODOCK_CLOUD:
         raise HTTPException(
             400, "Internal-network access is unavailable on hosted OtoDock.")
-    await asyncio.to_thread(
-        mcp_store.set_mcp_config_value, name, "_network_access",
-        "true" if body.enabled else "false",
-    )
-    return {"status": "ok", "name": name, "network_access": body.enabled}
+    value = "true" if enabled else "false"
+    if not manifest.network_exit:
+        await asyncio.to_thread(mcp_store.set_mcp_config_value, name, "_network_access", value)
+        return False
+    from core.credentials import catalog_install_registry
+    _wait_for_changes(name)
+    # No await between the check and the lock: the check sees every holder.
+    async with catalog_install_registry.lock_for(name):
+        await asyncio.to_thread(mcp_store.set_mcp_config_value, name, "_network_access", value)
+        mcp_session_filter.note_open_exit(name, enabled)
+        return await _recreate_if_running(manifest)
+
+
+async def _recreate_if_running(manifest) -> bool:
+    """A running container picks up its new network exit by being
+    recreated from the regenerated compose; a stopped one at its next
+    start. Up is the test (still starting, or failing its health check,
+    counts), not enabled: a disabled MCP's container left up keeps its old
+    exit, and enabling it later recreates nothing.
+    Best effort: a failure is logged, the setting stands."""
+    if not _mt.is_container(manifest.server):
+        return False
+    try:
+        if await asyncio.to_thread(docker_manager.get_container_status, manifest) not in docker_manager.PRESENT:
+            return False
+        return bool(await asyncio.to_thread(
+            docker_manager.start_container, manifest, force_recreate=True))
+    except Exception:  # the approval is stored either way
+        logger.exception("Could not recreate %s after its network access changed", manifest.name)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -558,9 +618,13 @@ async def docker_stop(name: str, user: UserContext = Depends(get_current_user)):
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
     _wait_for_changes(name)
-    ok = await asyncio.to_thread(docker_manager.stop_container, m)
-    if not ok:
+    # Asleep until its next use: a call wakes it (turning the MCP off
+    # removes its container).
+    from services.containers import door, lifecycle, state
+    if not await asyncio.to_thread(lifecycle.sleep_container, m):
         raise HTTPException(500, "Failed to stop container")
+    state.of(name).asleep = True
+    door.forget_tool(name)
     return {"status": "stopped", "name": name}
 
 
@@ -667,8 +731,8 @@ async def get_agent_mcps(
             "icon": icon_flags.get(m.name, False),
             "assignment_mode": m.assignment_mode,
             "credential_type": cred.get("type", "none") if cred else "none",
-            # Lets the UI render the service-account binding dropdown only
-            # where it applies — probing the options endpoint for every row
+            # Lets the UI render the agent's accounts only where they apply:
+            # probing the options endpoint for every row
             # painted a 400 per non-capable MCP in the console.
             "has_service_account": bool(cred.get("has_service_account")) if cred else False,
             "enabled": authorized and m.name in enabled_set,
@@ -751,6 +815,14 @@ async def set_agent_mcps(
                 )
 
     await asyncio.to_thread(mcp_store.set_manager_enabled_mcps, name, effective_mcps)
+    # A server enabled on the agent is listed in the background, so its
+    # labels are known when a manager picks it for outside people.
+    from services.mcp import tool_listing
+    from services.remote import tools_ahead
+    for mcp_name in sorted(newly_enabled - skill_pkg_names):
+        tool_listing.schedule(name, mcp_name)
+    if newly_enabled - skill_pkg_names or prior - set(effective_mcps):
+        tools_ahead.after_enable(name)  # its machines install it now, or drop its failure
 
     # Auto-create skill rows for newly enabled MCPs (idempotent — preserves prior
     # state if a skill was customized then disabled then re-enabled).
@@ -800,9 +872,11 @@ async def get_agent_ssh_hosts(
 
     Backs the ssh-hosts MCP's ``list_ssh_hosts`` tool — the queryable twin of
     the SSH Hosts prompt block (static context fades in long sessions).
-    Returns key NAMES only; key material never leaves the materializer /
-    session-file-broker path. ``target_os`` gates the ControlMaster mux
-    options in ``command`` (no unix-socket mux on Windows).
+    Returns key NAMES only: no private key leaves the platform, which signs
+    every login (``ssh_signer``). ``target_os`` gates the ControlMaster mux
+    options in ``command`` (no unix-socket mux on Windows) and the program a
+    Windows machine runs (``$OTO_SSH``) and the ``note`` the tool prints
+    for it.
 
     Auth: the agent's OWN session JWT (the tool path) at the editor tier,
     the tier that holds the keys and the prompt block: the session's live
@@ -822,17 +896,18 @@ async def get_agent_ssh_hosts(
     if not any(m.name == "ssh-hosts" for m in agent_mcps):
         raise HTTPException(403, "ssh-hosts is not enabled for this agent")
 
-    from services.mcp.dynamic_context import format_ssh_host_command
+    from services.mcp.dynamic_context import PIPE_AGENT_NOTE, format_ssh_host_command
 
     row = host_os.of(target_os)
     mux = bool(row is not None and row.posix)
+    pipe_agent = bool(row is not None and not row.posix)
     instances = await asyncio.to_thread(
         mcp_store.get_mcp_instances_for_agent, "ssh-hosts", name,
     )
     hosts = []
     for inst in instances:
         fv = inst.get("field_values", {}) or {}
-        command = format_ssh_host_command(fv, mux=mux)
+        command = format_ssh_host_command(fv, mux=mux, pipe_agent=pipe_agent)
         if command is None:
             continue
         host = (fv.get("host") or "").strip()
@@ -844,6 +919,8 @@ async def get_agent_ssh_hosts(
             "key_name": (fv.get("key_name") or "").strip(),
             "command": command,
         })
+    if pipe_agent:
+        return {"hosts": hosts, "note": PIPE_AGENT_NOTE}
     return {"hosts": hosts}
 
 
@@ -1128,9 +1205,6 @@ async def _refresh_container_after_instance_change(name: str) -> bool:
     manifest = mcp_registry.get_manifest(name)
     if not manifest or not _mt.is_container(manifest.server):
         return False
-    from core.config import deployment
-    if deployment.current_mode() == deployment.EXTERNAL_POOL:
-        return False
     state = await asyncio.to_thread(mcp_store.get_mcp_state, name)
     if not (state and state.get("enabled")):
         return False
@@ -1192,6 +1266,8 @@ async def create_mcp_instance(
     retried = await _retry_install_failed_for_instance(
         name, req.agents, req.assigned_to_all, user.sub,
     )
+    from services.remote import tools_ahead
+    tools_ahead.after_tool_change(name, update=False)  # an instance makes it reachable
     return {
         "status": "created", "id": instance_id,
         "retried_request_ids": retried, "container_refreshed": refreshed,
@@ -1279,6 +1355,8 @@ async def update_mcp_instance(
     retried = await _retry_install_failed_for_instance(
         name, req.agents, req.assigned_to_all, user.sub,
     )
+    from services.remote import tools_ahead
+    tools_ahead.after_tool_change(name, update=False)  # an instance makes it reachable
     return {
         "status": "updated", "id": instance_id,
         "retried_request_ids": retried, "container_refreshed": refreshed,
@@ -1373,18 +1451,11 @@ async def _delete_mcp_locked(name: str) -> dict:
     from storage.mcp import mcp_update_state_store
     await asyncio.to_thread(mcp_update_state_store.delete_mcp_rows, name)
 
-    # Self-host (T1/T2): tear the Docker container + its named volumes down
-    # before removing the folder — otherwise a delete orphans a running
-    # container and its data volumes (the compose file lives in the folder we
-    # are about to rmtree, so this must happen first). On cloud (external-pool)
-    # there is no per-install container — the MCP is just a connection to the
-    # OtoDock-owned central pool — so we skip teardown and the DB-config removal
-    # above is the whole delete.
-    from core.config import deployment
-    if (
-        _mt.is_container(manifest.server)
-        and deployment.current_mode() != deployment.EXTERNAL_POOL
-    ):
+    # Tear the Docker container + its named volumes down before removing the
+    # folder — otherwise a delete orphans a running container and its data
+    # volumes (the compose file lives in the folder we are about to rmtree, so
+    # this must happen first).
+    if _mt.is_container(manifest.server):
         await asyncio.to_thread(docker_manager.remove_container, manifest)
 
     # Remove folder
@@ -1394,6 +1465,8 @@ async def _delete_mcp_locked(name: str) -> dict:
 
     # Re-scan manifests (a worker thread, under the registry's rescan lock)
     await mcp_registry.rescan()
+    from services.remote import tools_ahead
+    tools_ahead.after_uninstall()  # the compute machine's own copy goes too
     # Its hosted accounts went with the credentials: the relay endpoint of
     # each provider it named and the install used is registered again, off
     # when nothing is left. A provider nothing used is never registered.
@@ -1633,8 +1706,16 @@ async def install_mcp(
             uploaded_name = None
         if isinstance(uploaded_name, str) and uploaded_name:
             async with catalog_install_registry.lock_for(uploaded_name):
-                return await community_installer.install_from_extracted_folder(mcp_root)
-        return await community_installer.install_from_extracted_folder(mcp_root)
+                result = await community_installer.install_from_extracted_folder(mcp_root)
+        else:
+            result = await community_installer.install_from_extracted_folder(mcp_root)
+        # A tool replaced in place may carry new labels: listed again for the
+        # Outside people picks (the route, not the installer, since the
+        # source switch restarts a container after its install; a first
+        # install has no agent to list through and lists nothing).
+        from services.mcp import tool_listing
+        tool_listing.schedule_after_install(str(result.get("name") or uploaded_name or ""))
+        return result
 
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

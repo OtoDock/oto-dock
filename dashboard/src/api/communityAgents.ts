@@ -6,7 +6,7 @@
  * endpoints. Used by `CommunityAgentsBrowser` + `AgentInstallModal`.
  */
 
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import type { PinnedApp } from './apps'
 import { useAuth } from '../contexts/AuthContext'
@@ -17,6 +17,12 @@ export interface CommunityAgentRegistryEntry {
   slug: string
   display_name: string
   description: string
+  /** What the agent does for a person, in one or two short sentences, and
+   * up to six highlights, each an icon of the release set and a few words.
+   * Absent on an older registry or a template that has none: the
+   * description stands in. */
+  summary?: string
+  highlights?: TemplateHighlight[]
   long_description_url: string
   color: string
   version: string
@@ -28,7 +34,8 @@ export interface CommunityAgentRegistryEntry {
   icon_url: string | null
   readme_url: string
   manifest_url: string
-  required_mcps: { name: string; min_version?: string | null; skills?: string[] }[]
+  /** `label`: the name a person reads, added by the proxy's list route. */
+  required_mcps: { name: string; label?: string; min_version?: string | null; skills?: string[] }[]
   has_triggers: boolean
   has_tasks: boolean
   has_notifications: boolean
@@ -42,7 +49,9 @@ export interface CommunityAgentRegistryEntry {
   has_checks?: boolean
   /** The apps the template brings, each with one line and a picture when
    * the catalog has one (served through the proxy). Absent on an older proxy. */
-  apps?: { slug: string; title: string; visibility: 'agent' | 'user'; description?: string; picture_url?: string }[]
+  apps?: { slug: string; title: string; visibility: 'agent' | 'user'; description?: string; picture_url?: string; has_server?: boolean }[]
+  /** The checks the template ships, as the catalog lists them. */
+  checks?: { name: string; description: string; mandatory?: boolean }[]
   platform_min_version: string | null
   deprecated: boolean
   deprecation_note: string | null
@@ -51,6 +60,11 @@ export interface CommunityAgentRegistryEntry {
   /** Since 1.7: each installed agent with its version and whether the
    * catalog is newer (the card's Update button). */
   installed?: InstalledRef[]
+}
+
+export interface TemplateHighlight {
+  icon: string
+  text: string
 }
 
 export interface InstalledRef {
@@ -88,8 +102,8 @@ export interface TemplateUpdateReport {
   task_pins_dropped?: string[]
 }
 
-/** The heading over the tasks whose model choice the agent cannot run. */
-export const TASK_PINS_HEADING = 'Model choices left out'
+/** The heading over the tasks whose model or mode the agent cannot run. */
+export const TASK_PINS_HEADING = 'Task choices left out'
 
 /** An install's or an update's dropped task pins as sentences to show; an
  * older proxy sends none. */
@@ -128,6 +142,9 @@ export interface PreviewApp {
   sig: string
   owner_approval: boolean
   row: PinnedApp
+  /** The app brings a server: a new app with one, or one whose installed
+   * version had none. The dialog says so beside what the app may do. */
+  adds_server?: boolean
   blueprint_tasks: { slug: string; description: string; prompt: string }[]
   // The triggers the seed creates with each copy (one per member for a
   // personal app, the agent's for a shared one), aimed at its handlers.
@@ -177,9 +194,14 @@ export interface InstallPreview {
   suggested_slug: string | null
   required_mcps: {
     name: string
+    /** The name a person reads: the installed MCP's, else the community list's. */
+    label: string
+    /** Every agent has it: the dialogs list it after the agent's own tools. */
+    core: boolean
     installed: boolean
     request_type: 'install' | 'access' | null
     blocked: boolean
+    /** False for an admin's install from the community list: the install adds it. */
     needs_request: boolean
     reason: string
   }[]
@@ -201,6 +223,11 @@ export interface CommunityDepartmentSet {
   slug: string
   name: string
   description: string
+  /** What the department does, in one or two short sentences. Absent on an
+   * older registry or a set that has none: the description stands in. */
+  summary?: string
+  /** What the department does for a person, as a template's highlights. */
+  highlights?: { icon: string; text: string }[]
   version: string
   color: string
   category: string
@@ -229,15 +256,33 @@ export interface SetPreviewMember {
   version: string
   platform_compat_ok: boolean
   in_catalog: boolean
-  placed: string[]
-  standalone: string[]
-  action: 'new' | 'adopt'
+  /** `new`: installed under `slug`. `adopt`: an agent used as it is (on its
+   * own, or `kept` in the department of this name). `move`: an agent taken
+   * from a department made by hand (`moves_from`). */
+  action: 'new' | 'adopt' | 'move'
   slug: string
+  /** The department of this name holds this member's agent already: no choice. */
+  kept: boolean
+  /** The agents the person may use for this member (the dialog's choice); empty: no line. */
+  options: SetMemberOption[]
+  /** The member's choice: `new`, or one option's slug. */
+  choice: string
+  moves_from?: { id: string; name: string }
   apps: PreviewApp[]
   checks: PreviewCheck[]
   required_mcps: InstallPreview['required_mcps']
   blocked_mcps: string[]
 }
+
+export interface SetMemberOption {
+  slug: string
+  display_name: string
+  /** The department it sits in now, made by hand; '' on its own. */
+  department: string
+}
+
+/** A member's choice to install a new agent (the proxy's USE_NEW). */
+export const USE_NEW = 'new'
 
 export interface SetPreview {
   set_slug: string
@@ -264,6 +309,8 @@ export interface SetInstallJob {
   status: SetInstallStatus
   members: { template: string; level: string; display_name: string; slug: string; action: string; status: string; detail: string }[]
   lines: string[]
+  /** The places in `lines` of those that say something was not done: never folded. */
+  not_done: number[]
   started_at: string
   ended_at: string | null
 }
@@ -271,33 +318,41 @@ export interface SetInstallJob {
 export function useCommunitySets(enabled: boolean = true) {
   return useQuery<{ departments: CommunityDepartmentSet[] }>({
     queryKey: ['community-departments'],
-    queryFn: () => apiJson<{ departments: CommunityDepartmentSet[] }>('/v1/community/departments', {}, 'Could not load the department sets'),
+    queryFn: () => apiJson<{ departments: CommunityDepartmentSet[] }>('/v1/community/departments', {}, 'Could not load the departments'),
     enabled,
     staleTime: 30_000,
     retry: false,
   })
 }
 
-export function useSetPreview(slug: string | null, departmentName: string, fresh: string[]) {
+/** `template:choice` pairs, comma separated, in a stable order. */
+function choicesParam(use: Record<string, string>): string {
+  return Object.keys(use).sort().map((t) => `${t}:${use[t]}`).join(',')
+}
+
+export function useSetPreview(slug: string | null, departmentName: string, use: Record<string, string>) {
+  const chosen = choicesParam(use)
   return useQuery<SetPreview>({
-    queryKey: ['community-department-preview', slug, departmentName, fresh.join(',')],
+    queryKey: ['community-department-preview', slug, departmentName, chosen],
     queryFn: () => {
       const params = new URLSearchParams()
       if (departmentName) params.set('department_name', departmentName)
-      if (fresh.length) params.set('new', fresh.join(','))
+      if (chosen) params.set('use', chosen)
       const qs = params.toString()
       return apiJson<SetPreview>(`/v1/community/departments/${slug}/preview${qs ? `?${qs}` : ''}`, {}, 'Could not read the set')
     },
     enabled: !!slug,
     staleTime: 5_000,
     retry: false,
+    // A changed choice keeps the dialog's rows while the new plan loads.
+    placeholderData: keepPreviousData,
   })
 }
 
 export function useInstallDepartmentSet() {
   const qc = useQueryClient()
   return useMutation<{ job_id: string; job: SetInstallJob }, Error,
-    { slug: string; department_name: string; consent: boolean; new: string[] }>({
+    { slug: string; department_name: string; consent: boolean; use: Record<string, string> }>({
     mutationFn: ({ slug, ...body }) =>
       apiJson<{ job_id: string; job: SetInstallJob }>(`/v1/community/departments/${slug}/install`, { method: 'POST', json: body }, 'Could not start the install'),
     onSuccess: () => {
@@ -379,7 +434,10 @@ export function useApplyTemplateUpdate() {
   return useMutation<
     { job_id: string; to_version: string },
     Error,
-    { agent_slug: string; from_version: string; approve_apps?: Record<string, string>; approve_checks?: Record<string, string> }
+    {
+      agent_slug: string; from_version: string; approve_apps?: Record<string, string>
+      approve_checks?: Record<string, string>; approve_servers?: string[]
+    }
   >({
     mutationFn: ({ agent_slug, ...body }) =>
       apiJson<{ job_id: string; to_version: string }>(`/v1/agents/${agent_slug}/update-template`, {
@@ -459,6 +517,8 @@ export function useInstallCommunityAgent() {
       /** The dialog's consent: the signature seen per app / check approved. */
       approve_apps?: Record<string, string>
       approve_checks?: Record<string, string>
+      /** The apps whose server the dialog showed. */
+      approve_servers?: string[]
       /** The offer taken: the set's slug and the department's name. */
       department_set?: { slug: string; name: string }
     }

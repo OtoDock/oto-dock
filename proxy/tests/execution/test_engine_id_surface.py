@@ -82,9 +82,6 @@ KNOWN_ENGINE_ID_SITES: dict[str, tuple[str, dict[str, int]]] = {
         "DEFAULT_EXECUTION_PATH, the one constant every no-opinion caller reads, and the agents "
         "column's DDL default beside it — DDL cannot read a constant; a test pins the two equal",
         {"claude-code-cli": 2}),
-    "proxy/core/remote/satellite_connection.py": (
-        "_LEGACY_SATELLITE_ENGINES — what every satellite before 0.5.124 ran, a wire fact",
-        {"claude-code-cli": 1, "codex-cli": 1}),
     "proxy/api/auth/claude_oauth.py": (
         "the vendor route's `layer` default is its own engine; a same-vendor engine passes `layer`",
         {"claude-code-cli": 2}),
@@ -92,13 +89,7 @@ KNOWN_ENGINE_ID_SITES: dict[str, tuple[str, dict[str, int]]] = {
         "the vendor route's `layer` default; the device-code login is performed by the Codex CLI itself",
         {"codex-cli": 2}),
     "proxy/core/concurrency.py": (
-        "the capacity evictor's source → engine map beside its private-pool scan (roadmap: an accessor)",
-        {"claude-code-cli": 1, "codex-cli": 1, "direct-llm": 1}),
-    "proxy/core/config/config_builder.py": (
-        "Direct LLM's provider-switch scope rides its private _USER_SUB env entry (not a no-op move)",
-        {"direct-llm": 2}),
-    "proxy/core/config/phone_config_builder.py": (
-        "the same _USER_SUB stamp on the phone path",
+        "the capacity evictor's source → engine map for the one engine that holds sessions in the proxy",
         {"direct-llm": 1}),
     "proxy/services/phone/phone_config.py": (
         "the phone turn classifier calls a provider API through the API engine's pool keys (and its relay path)",

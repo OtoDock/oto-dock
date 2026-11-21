@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect, useRef, useCallback, type JSX, useLayoutEffect } from 'react'
 import {
-  Chat, TaskChat, useDeleteChat, useRenameChat,
+  Chat, TaskChat, useDeleteChat, useRenameChat, useSetChatPinned, PINNED_VIEW,
   useSearchChats, type ListPaging, SNIPPET_MARK_START, SNIPPET_MARK_END,
 } from '../../api/chats'
 import { useChatSlice } from '../../store/chatStore'
@@ -19,6 +19,7 @@ import { isSharedChatOwner } from '../../lib/visibility'
 import { CHAT_PHASE, isLiveChatPhase } from '../../lib/status/chat'
 import { isLiveRunStatus } from '../../lib/status/run'
 import { unreadRowClass } from '../../lib/chat/unreadRow'
+import { PIN_MARK_AT, type PinMarkAt } from '../../lib/chat/pinMark'
 import AlertDialog from '../ui/AlertDialog'
 
 // Small status indicator next to a chat row title — warm/fail only. The live
@@ -47,10 +48,41 @@ function ChatStatusDot({ chatId }: { chatId: string }) {
   return null
 }
 
+/** A pushpin, drawn on the stroke: the row's mark, the menu's item, the
+    toggle. */
+function PinGlyph({ className }: { className: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M9 3h6M10 3v6l-3 4h10l-3-4V3M12 13v8" />
+    </svg>
+  )
+}
+
+function PinMark({ onFill, at }: { onFill: boolean; at: PinMarkAt }) {
+  return (
+    <span
+      title="Pinned"
+      aria-label="Pinned"
+      data-testid="pin-mark"
+      className={`inline-flex shrink-0 ${at === 'title' ? 'mr-1' : 'ml-1 align-[-1px]'} ${
+        onFill ? 'text-action-fg' : 'text-tertiary'}`}
+    >
+      <PinGlyph className="w-3 h-3" />
+    </span>
+  )
+}
+
 interface Props {
   chats: Chat[]
   /** The chat list's older pages (the page's `useChats`). */
   chatPaging?: ListPaging
+  /** The pinned view's rows and paging (the page's `usePinnedChatList`),
+      and whether it is on: the history shows this person's pinned chats. */
+  pinnedChats?: Chat[]
+  pinnedPaging?: ListPaging
+  pinnedView?: boolean
+  onPinnedViewChange?: (on: boolean) => void
   /** The task view's rows and paging: the page owns the one task-list query
       (its poll pauses with the rename and the duplex session). */
   taskChats?: TaskChat[]
@@ -277,7 +309,7 @@ function SnippetLine({ text, tone, onFill }: { text: string; tone: string; onFil
 // stays constant while the background pulses/fades so the row keeps a crisp
 // edge. A ring, not a border: the left border is the delegation edge.
 function ChatRow({ chat, active, title, plainTitle, snippet, onClick, onDelete, onMoveChat,
-                   onRename, onShare, canDelete, edit }: {
+                   onRename, onShare, onTogglePin, canDelete, edit }: {
   chat: Chat
   active: boolean
   title: string | JSX.Element
@@ -292,11 +324,14 @@ function ChatRow({ chat, active, title, plainTitle, snippet, onClick, onDelete, 
   onRename?: () => void
   /** Present → a "Share" row (server-flag gated at the call site). */
   onShare?: () => void
+  /** Present → a "Pin chat" or "Unpin chat" row (`can_pin` / `pinned`). */
+  onTogglePin?: () => void
   canDelete: boolean
   edit: RowEdit | null
 }) {
   const slice = useChatSlice(chat.id)
   const streaming = slice?.status === CHAT_PHASE.STREAMING
+  const pinned = !!chat.pinned
   const unread = slice?.unread !== undefined ? slice.unread : chat.unread
   let stateClass = 'text-secondary hover:bg-surface-hover'
   let stateTitle: string | undefined
@@ -344,17 +379,22 @@ function ChatRow({ chat, active, title, plainTitle, snippet, onClick, onDelete, 
                   className="inline-block w-1.5 h-1.5 rounded-full bg-action mr-1.5 shrink-0"
                 />
               )}
+              {pinned && PIN_MARK_AT === 'title' && <PinMark onFill={active} at="title" />}
               <Tooltip text={plainTitle} onlyWhenClipped className="truncate">{title}</Tooltip>
             </p>
             {snippet && <SnippetLine text={snippet} onFill={active} tone={active ? 'text-action-fg' : 'text-secondary'} />}
-            <p className={`text-3xs mt-[2px] ${active ? 'text-action-fg' : 'text-tertiary'}`}>{timeAgo(chat.updated_at)}</p>
+            <p className={`text-3xs mt-[2px] ${active ? 'text-action-fg' : 'text-tertiary'}`}>
+              {timeAgo(chat.updated_at)}
+              {pinned && PIN_MARK_AT === 'time' && <PinMark onFill={active} at="time" />}
+            </p>
           </>
         )}
       </div>
-      {!edit && (onRename || onShare || canDelete) && (
+      {!edit && (onRename || onShare || onTogglePin || canDelete) && (
         <ChatItemMenu
           chatId={chat.id} onDelete={onDelete} onBrand={active} isOpen={active}
-          onMoveChat={onMoveChat} onRename={onRename} onShare={onShare} canDelete={canDelete}
+          onMoveChat={onMoveChat} onRename={onRename} onShare={onShare}
+          onTogglePin={onTogglePin} pinned={pinned} canDelete={canDelete}
           fullTitle={plainTitle}
         />
       )}
@@ -458,8 +498,8 @@ function TaskRow({ chat, active, title, plainTitle, subtitle, snippet, onClick, 
 // `isOpen`: this row is the OPEN chat — the move_chat op acts on the
 // connection's open chat, so only then is the target-mismatch row actionable.
 function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
-                        onMoveChat, onRename, onShare, canDelete = true,
-                        taskKind = false, fullTitle }: {
+                        onMoveChat, onRename, onShare, onTogglePin, pinned = false,
+                        canDelete = true, taskKind = false, fullTitle }: {
   chatId: string
   onDelete: (id: string) => void
   onBrand?: boolean
@@ -469,6 +509,10 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
   onRename?: () => void
   /** Present → a "Share" row: the chat as a read-only snapshot (SHARING.md). */
   onShare?: () => void
+  /** Present → "Pin chat", or "Unpin chat" for a `pinned` row: this
+      person's own mark, nobody else sees it. */
+  onTogglePin?: () => void
+  pinned?: boolean
   /** False hides the Delete row (e.g. an editor on another user's task run). */
   canDelete?: boolean
   /** Task-history wording for the delete confirmation. */
@@ -602,6 +646,16 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
                 Runs on {mismatch.pinnedLabel}
               </div>
             ))}
+            {onTogglePin && (
+              <button
+                onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onTogglePin() }}
+                data-testid="pin-toggle-item"
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-secondary hover:bg-surface-hover transition-colors"
+              >
+                <PinGlyph className="w-3.5 h-3.5" />
+                {pinned ? 'Unpin chat' : 'Pin chat'}
+              </button>
+            )}
             {onRename && (
               <button
                 onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onRename() }}
@@ -676,11 +730,15 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
 const OLDER_MARGIN_PX = 400
 
 export default function ChatHistory({
-  chats, chatPaging, taskChats, taskPaging, activeChatId, agentName, onSelect, onNew, onNavigate,
+  chats, chatPaging, pinnedChats, pinnedPaging, pinnedView = false, onPinnedViewChange,
+  taskChats, taskPaging, activeChatId, agentName, onSelect, onNew, onNavigate,
   tasksMode = false, onTasksModeChange, onMoveChat, onRenameEditingChange,
 }: Props) {
   const deleteChat = useDeleteChat()
   const renameChat = useRenameChat()
+  const setChatPinned = useSetChatPinned()
+  // The pinned view is the chat history's: the task view shows its own list.
+  const pinnedOn = pinnedView && !tasksMode
   const [searchInput, setSearchInput] = useState('')
   const debouncedQuery = useDebounce(searchInput, 300)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -699,7 +757,7 @@ export default function ChatHistory({
   // Search follows the mode: chat search over the history owner's chats,
   // task search over the agent's task-run chats (run-permission gated).
   const { data: searchResults, isFetching: isSearching } =
-    useSearchChats(agentName, debouncedQuery, tasksMode ? 'tasks' : 'chats')
+    useSearchChats(agentName, debouncedQuery, tasksMode ? 'tasks' : pinnedOn ? PINNED_VIEW : 'chats')
 
   // The tasks toggle pulses purple while this agent has a task generating and
   // the toggle is off — the task rows aren't visible to carry the pulse.
@@ -712,7 +770,11 @@ export default function ChatHistory({
 
   // Use search results when searching, otherwise use the mode's list
   const isSearchActive = debouncedQuery.trim().length > 0
-  const modeChats: Chat[] = tasksMode ? (taskChats ?? []) : chats
+  const modeChats: Chat[] = tasksMode ? (taskChats ?? []) : pinnedOn ? (pinnedChats ?? []) : chats
+  // Pins came with this server: the toggle shows once a row says so, and
+  // the history's rows stay loaded while the view is on.
+  const pinsServed = chats.some((c) => c.can_pin !== undefined)
+  const shownIds = useMemo(() => new Set((pinnedChats ?? []).map((c) => c.id)), [pinnedChats])
   const displayChats = isSearchActive && searchResults ? searchResults : modeChats
   const groups = useMemo(() => groupChats(displayChats), [displayChats])
 
@@ -723,7 +785,7 @@ export default function ChatHistory({
   // it waits for the press (no loop of failing requests).
   const listRef = useRef<HTMLDivElement>(null)
   const sentinelRef = useRef<HTMLDivElement>(null)
-  const paging = tasksMode ? taskPaging : chatPaging
+  const paging = tasksMode ? taskPaging : pinnedOn ? pinnedPaging : chatPaging
   const pageable = !isSearchActive && !!paging?.hasMore
   const observable = typeof IntersectionObserver !== 'undefined'
   const rowCount = modeChats.length
@@ -774,6 +836,13 @@ export default function ChatHistory({
     setEditing({ id: chat.id, initial })
   }, [tasksMode])
 
+  const togglePin = useCallback((chat: Chat) => {
+    setChatPinned.mutate({ chatId: chat.id, pinned: !chat.pinned }, {
+      onError: (e: unknown) => surfaceError((e as Error)?.message
+        || (chat.pinned ? 'Could not unpin the chat.' : 'Could not pin the chat.')),
+    })
+  }, [setChatPinned, surfaceError])
+
   const cancelRename = useCallback(() => setEditing(null), [])
   const commitRename = useCallback((value: string) => {
     if (!editing) return
@@ -815,7 +884,7 @@ export default function ChatHistory({
             type="text"
             value={searchInput}
             onChange={(e) => setSearchInput(e.target.value)}
-            placeholder={tasksMode ? 'Search tasks...' : 'Search chats...'}
+            placeholder={tasksMode ? 'Search tasks...' : pinnedOn ? 'Search pinned chats...' : 'Search chats...'}
             className="w-full pl-8 pr-7 py-1.5 text-xs rounded-control border border-strong bg-surface-card
                        text-primary placeholder:text-tertiary
                        focus:outline-hidden focus:ring-1 focus:ring-focus-ring/40 focus:border-action
@@ -860,6 +929,7 @@ export default function ChatHistory({
         onSelect={(cid) => { onSelect(cid); closeMobileDrawer(onNavigate) }}
         onNavigate={onNavigate}
         tasksMode={tasksMode}
+        shownIds={pinnedOn ? shownIds : undefined}
       />
 
       {/* Mode title row — labels the list below it; the toggle mirrors the
@@ -867,8 +937,27 @@ export default function ChatHistory({
           pulsing while the agent has active tasks and the task view is off). */}
       <div className="flex items-center justify-between px-3 pt-2 pb-1">
         <p className="text-xs font-semibold text-secondary">
-          {tasksMode ? 'Task history' : 'Chat history'}
+          {tasksMode ? 'Task history' : pinnedOn ? 'Pinned chats' : 'Chat history'}
         </p>
+        <div className="flex items-center gap-1.5">
+        {/* The pinned view's toggle: the chat history only, in the neutral
+            colours (purple is the task view's own). */}
+        {onPinnedViewChange && !tasksMode && pinsServed && (
+          <button
+            onClick={() => onPinnedViewChange(!pinnedView)}
+            title={pinnedView ? 'Show all chats' : 'Show pinned chats'}
+            aria-label={pinnedView ? 'Show all chats' : 'Show pinned chats'}
+            aria-pressed={pinnedView}
+            data-testid="pinned-toggle"
+            className={`w-7 h-7 rounded-control border flex items-center justify-center transition-colors cursor-pointer ${
+              pinnedView
+                ? 'bg-action border-action text-action-fg hover:bg-action-hover'
+                : 'bg-surface-card border-strong text-secondary hover:bg-surface-hover'
+            }`}
+          >
+            <PinGlyph className="w-4 h-4" />
+          </button>
+        )}
         {onTasksModeChange && (
           <button
             onClick={() => onTasksModeChange(!tasksMode)}
@@ -890,6 +979,7 @@ export default function ChatHistory({
             </svg>
           </button>
         )}
+        </div>
       </div>
 
       {/* Chat list */}
@@ -961,6 +1051,7 @@ export default function ChatHistory({
                     kind: 'chat', id: chat.id, title: chat.title || 'New Chat',
                     scope: isSharedChatOwner(chat.user_sub) ? 'shared' : 'personal',
                   }) : undefined}
+                  onTogglePin={chat.can_pin || chat.pinned ? () => togglePin(chat) : undefined}
                   canDelete={canDelete}
                   edit={edit}
                 />
@@ -987,7 +1078,7 @@ export default function ChatHistory({
         {/* Empty state */}
         {!isSearchActive && modeChats.length === 0 && (
           <p className="text-xs text-tertiary text-center py-4">
-            {tasksMode ? 'No task runs yet' : 'No chats yet'}
+            {tasksMode ? 'No task runs yet' : pinnedOn ? 'No pinned chats' : 'No chats yet'}
           </p>
         )}
       </div>

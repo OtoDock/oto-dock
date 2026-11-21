@@ -20,6 +20,7 @@ import { Input, Select } from '../../components/ui/Field'
 import { CARD } from '../../components/ui/classes'
 import { useDialogs } from '../../components/ui/dialogs'
 import AllowMcpHosts from '../../components/admin/AllowMcpHosts'
+import ApiKeysCard from './ApiKeysCard'
 
 // The `source` of a row an admin added (or one an older version seeded).
 const ROW_SOURCE_ADMIN = 'admin'
@@ -193,7 +194,9 @@ export default function SecurityTab() {
   const [testing, setTesting] = useState(false)
 
   // The saved settings fill the form when they arrive or change (in render).
-  const [filledFrom, setFilledFrom] = useState(data)
+  // The guard starts empty: settings already loaded when the tab mounts fill
+  // it on the first render, never leaving the form's defaults to be saved.
+  const [filledFrom, setFilledFrom] = useState<typeof data>(undefined)
   if (data && filledFrom !== data) {
     setFilledFrom(data)
     {
@@ -320,7 +323,7 @@ export default function SecurityTab() {
           <div>
             <p className="text-xs text-secondary mb-1"><label>Minimum Strength</label><SaveState state={stateOf('password_min_score')} /></p>
             <Select value={pwMinScore} onChange={e => setPwMinScore(e.target.value)}
-              onBlur={() => save('password_min_score', pwMinScore, () => setPwMinScore(data?.password_min_score || '3'))}>
+              onBlur={() => { if (pwMinScore !== (data?.password_min_score || '3')) save('password_min_score', pwMinScore, () => setPwMinScore(data?.password_min_score || '3')) }}>
               <option value="0">Very weak (0): no restriction</option>
               <option value="1">Weak (1): basic</option>
               <option value="2">Fair (2): moderate</option>
@@ -332,7 +335,7 @@ export default function SecurityTab() {
             <p className="text-xs text-secondary mb-1"><label>Minimum Length</label><SaveState state={stateOf('password_min_length')} /></p>
             <Input type="number" value={pwMinLength} min={4} max={128}
               onChange={e => setPwMinLength(e.target.value)}
-              onBlur={() => save('password_min_length', pwMinLength)}
+              onBlur={() => { if (pwMinLength !== (data?.password_min_length || '8')) save('password_min_length', pwMinLength) }}
               className="text-right" />
           </div>
         </div>
@@ -451,7 +454,7 @@ export default function SecurityTab() {
                 <div>
                   <p className="text-xs text-secondary mb-1"><label>Site Key</label><SaveState state={stateOf('turnstile_site_key')} /></p>
                   <Input type="text" value={turnstileSiteKey} onChange={e => setTurnstileSiteKey(e.target.value)}
-                    onBlur={() => save('turnstile_site_key', turnstileSiteKey)}
+                    onBlur={() => { if (turnstileSiteKey !== (data?.turnstile_site_key || '')) save('turnstile_site_key', turnstileSiteKey) }}
                     placeholder="0x4AAA..." />
                 </div>
                 <div>
@@ -473,6 +476,8 @@ export default function SecurityTab() {
           token. Sits OUTSIDE the cloud-managed guard above: it's a security
           control that matters on both self-hosted and cloud installs. */}
       <BearerAllowlistSection />
+
+      <ApiKeysCard />
 
       {/* Network restriction is now per-user only (Users page → local-only
           toggle). The platform-wide LAN knob was removed. */}

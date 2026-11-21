@@ -19,6 +19,7 @@ memberships change.
 import asyncio
 import hashlib
 import logging
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
@@ -410,6 +411,16 @@ async def _create_external(req: ShareCreateRequest, u: UserContext, request: Req
         target = _share_target(u, req.target_kind, req.target_id)
         if req.target_kind == "chat":
             _check_chat_share_cap(u)
+        else:
+            # A link's visitors are outside people: an app that reads a
+            # folder they may not see makes no link (the folder rule).
+            from services.mcp import outside_picks
+            folder = outside_picks.link_refusal(target)
+            if folder:
+                raise HTTPException(status_code=400, detail=(
+                    f"Visitors of a link are external identities, so this app cannot be shared by link while "
+                    f"it reads {folder}. Move what visitors may read into a knowledge folder added in "
+                    f"{outside_picks.CARD_PLACE}."))
         return target
 
     plain = ""
@@ -1044,25 +1055,36 @@ async def read_snapshot_media(share_id: str, token: str,
                               user: UserContext | None = Depends(get_current_user)):
     """A snapshot's image, clip or file; inert types inline, the rest as a
     download (the ``/v1/media`` rule)."""
-    import mimetypes
-
-    from fastapi.responses import FileResponse
-
     from services.sharing import chat_snapshot
     u = require_auth(user)
 
     def _load():
         share = _load_snapshot_share(u, share_id)
-        return chat_snapshot.file_path(share, token)
+        return chat_snapshot.open_file(share, token)
 
-    path = await asyncio.to_thread(_load)
-    if path is None:
+    found = await asyncio.to_thread(_load)
+    if found is None:
         raise HTTPException(status_code=404, detail="media not found")
-    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    headers = {"X-Content-Type-Options": "nosniff"}
-    if chat_snapshot.inline_ok(mime):
-        return FileResponse(path, media_type=mime, headers=headers)
-    return FileResponse(path, media_type=mime, filename=path.name, headers=headers)
+    return snapshot_file_response(*found)
+
+
+def snapshot_file_response(fd: int, st, name: str):
+    """A snapshot copy served from the descriptor it was opened as: inert
+    types inline, the rest as a download (the ``/v1/media`` rule). The
+    response owns ``fd``; a failure before it exists closes it."""
+    import mimetypes
+
+    from api.media.media import FdFileResponse
+    from services.sharing import chat_snapshot
+    try:
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        headers = {"X-Content-Type-Options": "nosniff"}
+        if chat_snapshot.inline_ok(mime):
+            return FdFileResponse(fd, st, media_type=mime, headers=headers)
+        return FdFileResponse(fd, st, media_type=mime, filename=name, headers=headers)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 @router.get("/v1/sharing/settings")

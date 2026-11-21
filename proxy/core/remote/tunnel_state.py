@@ -16,6 +16,12 @@ import time
 from urllib.parse import urlsplit
 
 logger = logging.getLogger("otodock.remote.tunnel")
+#: Why a machine's credential exit does not answer: its packages still
+#: installing after an update (``EXIT_INSTALLING``, the one reason a session
+#: start waits on), a package missing, its port refused, a SOCKS proxy it
+#: cannot speak; "" while it answers.
+EXIT_INSTALLING = "installing"
+EXIT_WHY = frozenset({"", EXIT_INSTALLING, "packages", "bind", "socks"})
 
 _ERROR_MAX = 200
 
@@ -55,12 +61,36 @@ def read(src: dict) -> dict:
     if isinstance(error, str):
         out["last_tunnel_error"] = "".join(
             ch if ch.isprintable() else " " for ch in error)[:_ERROR_MAX]
+    # The credential exit's listener (satellite 0.5.175): its port, and
+    # whether it answers.
+    exit_port = valid_port(src.get("exit_port"))
+    if exit_port:
+        out["exit_port"] = exit_port
+    exit_ok = src.get("exit_ok")
+    if isinstance(exit_ok, bool):
+        out["exit_ok"] = exit_ok
+    # Why it does not answer ("" while it does), and whether it reaches the
+    # world through an outgoing proxy of its machine.
+    exit_why = src.get("exit_why")
+    if isinstance(exit_why, str) and exit_why in EXIT_WHY:
+        out["exit_why"] = exit_why
+    exit_upstream = src.get("exit_upstream")
+    if isinstance(exit_upstream, bool):
+        out["exit_upstream"] = exit_upstream
     return out
 
 
 def seed(conn, capabilities: dict) -> None:
-    """A fresh connection's state from its auth capabilities."""
+    """A fresh connection's state from its auth capabilities, whose exit
+    fields are kept only as a heartbeat would take them (the live report and
+    the row's snapshot read these capabilities)."""
     fields = read(capabilities)
+    if isinstance(capabilities, dict):
+        for key in ("exit_why", "exit_upstream"):
+            if key in fields:
+                capabilities[key] = fields[key]
+            else:
+                capabilities.pop(key, None)
     conn.tunnel_ok = fields.get("tunnel_ok", True)
     conn.tunnel_rebinds = fields.get("tunnel_rebinds", 0)
     conn.tunnel_error = fields.get("last_tunnel_error", "")
@@ -124,6 +154,17 @@ def apply(conn, msg: dict) -> bool:
         conn.tunnel_ok = ok
     conn.tunnel_error = error
 
+    # The exit's listener: a new port or a flip of its answer reaches the
+    # capabilities, where the next session build reads them.
+    for key in ("exit_port", "exit_ok", "exit_why", "exit_upstream"):
+        if key in fields and conn.capabilities.get(key) != fields[key]:
+            conn.capabilities[key] = fields[key]
+            changed = True
+            if key == "exit_ok":
+                logger.info("Satellite %s: its credential exit %s", mid,
+                            "answers again" if fields[key] else "stopped answering; new sessions there "
+                            "leave out the tools that need a key until it does")
+
     if changed:
         for key in ("tunnel_ok", "tunnel_rebinds", "last_tunnel_error"):
             if key in fields:
@@ -132,7 +173,15 @@ def apply(conn, msg: dict) -> bool:
 
 
 def payload_port(payload: dict) -> int:
-    """The tunnel port a start payload's ``PROXY_URL`` names (0 when none)."""
+    """The tunnel port a start payload names (0 when none): its own
+    ``tunnel_port`` (a compute session, whose ``PROXY_URL`` is the proxy
+    port the sandbox splices onto the link), else its ``PROXY_URL``'s."""
+    try:
+        named = valid_port(int((payload or {}).get("tunnel_port") or 0))
+    except (TypeError, ValueError):
+        named = 0
+    if named:
+        return named
     url = ((payload or {}).get("env") or {}).get("PROXY_URL") or ""
     try:
         return valid_port(urlsplit(url).port)

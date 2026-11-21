@@ -152,7 +152,7 @@ def test_list_tasks_tags_the_tier_and_labels_trigger_rows(monkeypatch):
         return {"tasks": [dict(_TASK), dict(_TASK, id="dyn-t", task_type="trigger", schedule="",
                                            triggers=None, effective_model_source="agent default",
                                            override_model="", effective_model_tier=1,
-                                           tier_label="frontier", effective_model="claude-fable-5-1"),
+                                           tier_label="frontier", effective_model="claude-fable-5-2"),
                           dict(_TASK, id="app-1", name="Kanban: republish", task_type="app",
                                schedule="0 6 * * 1-5")]}
 
@@ -160,7 +160,7 @@ def test_list_tasks_tags_the_tier_and_labels_trigger_rows(monkeypatch):
     text = _call(mod, "list_tasks", {})
     assert "runs on: claude-opus-5-5 [pinned, tier 2 strong]" in text
     assert "[trigger] dyn-t — Daily briefing (briefer, on trigger, active" in text
-    assert "runs on: claude-fable-5-1 [agent default, tier 1 frontier]" in text
+    assert "runs on: claude-fable-5-2 [agent default, tier 1 frontier]" in text
     # An app handler row runs no LLM turn: no model claim on it.
     app_line = next(line for line in text.splitlines() if "app-1" in line)
     assert "runs on" not in app_line and "0 6 * * 1-5" in app_line
@@ -216,3 +216,46 @@ def test_history_says_where_each_run_ran(monkeypatch):
     assert lines[2].endswith("ran on: 4f1c2e9a")
     # A run that has not started names no place.
     assert "ran on" not in lines[3]
+
+
+def test_a_row_that_will_not_fire_and_a_skipped_wake_say_so(monkeypatch):
+    """The list and the read never call a row active that can no longer fire,
+    and a recurring wake's skips in a row are named where the agent reads."""
+    mod = _mod()
+    dead = {**_TASK, "id": "dyn-dead0001", "task_type": "continuation", "schedule": "",
+            "delay_seconds": 2280, "next_run_time": None, "will_not_fire": True, "wake_skips": 0}
+    skipped = {**_TASK, "id": "dyn-skip0001", "task_type": "continuation", "wake_skips": 9,
+               "will_not_fire": False}
+    plain = {**_TASK, "will_not_fire": False, "wake_skips": 0}
+    rows = {r["id"]: r for r in (dead, skipped, plain)}
+
+    async def _get(path, params=None):
+        if path == "/v1/tasks":
+            return {"tasks": [dead, skipped, plain]}
+        return dict(rows[path.rsplit("/", 1)[1]])
+
+    monkeypatch.setattr(mod, "_get", _get)
+    listing = _call(mod, "list_tasks", {}).splitlines()
+    dead_at = next(i for i, ln in enumerate(listing) if "dyn-dead0001" in ln)
+    assert ", will not fire, next: —" in listing[dead_at]
+    assert listing[dead_at + 1].strip() == (
+        "Its time has passed and nothing will run it. Run it now, or delete it.")
+    skip_at = next(i for i, ln in enumerate(listing) if "dyn-skip0001" in ln)
+    assert ", active, next:" in listing[skip_at]
+    assert listing[skip_at + 1].strip() == (
+        "Its wake was skipped 9 times in a row. The chat has not taken the previous wake yet.")
+    plain_at = next(i for i, ln in enumerate(listing) if "dyn-abc12345" in ln)
+    assert plain_at == len(listing) - 1 and ", active, next:" in listing[plain_at]
+
+    text = _call(mod, "get_task", {"task_id": "dyn-dead0001"})
+    assert "Status: will not fire   Next run: —" in text
+    assert "Its time has passed and nothing will run it. Run it now, or delete it." in text
+    text = _call(mod, "get_task", {"task_id": "dyn-skip0001"})
+    assert "Status: active" in text and "skipped 9 times in a row" in text
+    text = _call(mod, "get_task", {"task_id": "dyn-abc12345"})
+    assert "Status: active" in text and "skipped" not in text and "will not fire" not in text
+    rows["dyn-skip0001"] = {**skipped, "wake_skips": 1}
+    assert "Its wake was skipped 1 time in a row." in _call(mod, "get_task", {"task_id": "dyn-skip0001"})
+    # A paused row is paused first, whatever else its row says.
+    rows["dyn-abc12345"] = {**plain, "enabled": False, "will_not_fire": False}
+    assert "Status: paused   Next run:" in _call(mod, "get_task", {"task_id": "dyn-abc12345"})

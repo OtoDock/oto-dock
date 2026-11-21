@@ -19,6 +19,8 @@ from unittest.mock import patch
 
 import pytest
 
+from services.mcp import mcp_manifest_store
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -63,9 +65,8 @@ def _make_manifest(name, category="custom", skills=None, tmp_path=None):
 
 
 def _patch_manifests(monkeypatch, manifests: dict):
-    from services.mcp import mcp_registry
     from storage.mcp import mcp_store
-    monkeypatch.setattr(mcp_registry, "_manifests", manifests)
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", manifests)
     for name in manifests:
         mcp_store.set_mcp_enabled(name, True)
 
@@ -129,12 +130,12 @@ def test_get_mcps_excludes_skill_packages(wired):
 
 
 def test_prompt_catalog_excludes_skill_packages(wired, monkeypatch, tmp_path):
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_agent_skills, mcp_registry
     manifests = [
         _make_manifest("tts-mcp"),
         _make_manifest("pdf-skills", category="skill"),
     ]
-    with patch.object(mcp_registry, "get_agent_mcps", return_value=manifests):
+    with patch.object(mcp_agent_skills, "get_agent_mcps", return_value=manifests):
         text = mcp_registry.build_available_mcps_section("alice-agent")
     assert "tts-mcp" in text
     assert "pdf-skills" not in text
@@ -157,14 +158,23 @@ def test_put_rejects_skill_packages_in_payload(wired):
     assert r.json()["detail"]["skill_packages"] == ["pdf-skills"]
 
 
-def test_put_preserves_assigned_skill_packages(wired):
+def test_put_preserves_assigned_skill_packages(wired, monkeypatch):
+    from services.mcp import tool_listing
     from storage.mcp import mcp_store
+    scheduled: list[tuple[str, str]] = []
+    monkeypatch.setattr(tool_listing, "schedule", lambda agent, mcp: scheduled.append((agent, mcp)))
     mcp_store.add_agent_mcp("alice-agent", "pdf-skills")
     r = wired.put("/v1/agents/alice-agent/mcps", json={"mcps": ["tts-mcp"]})
     assert r.status_code == 200
     assert set(r.json()["mcps"]) == {"tts-mcp", "pdf-skills"}
     assert set(mcp_store.get_manager_enabled_mcps("alice-agent")) == {
         "tts-mcp", "pdf-skills"}
+    # The server newly enabled is listed for the Outside people picks; a
+    # skill package has no server to list.
+    assert scheduled == [("alice-agent", "tts-mcp")]
+    scheduled.clear()
+    r = wired.put("/v1/agents/alice-agent/mcps", json={"mcps": ["tts-mcp"]})
+    assert r.status_code == 200 and scheduled == []
 
 
 # ── Skills tab endpoint ────────────────────────────────────────────────
@@ -219,7 +229,7 @@ def test_scan_first_wins_on_name_collision(temp_db, tmp_path, monkeypatch):
     import json as _json
 
     import config as app_config
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_manifest_store, mcp_registry
 
     for cat in ("custom", "skills"):
         d = tmp_path / cat / "clash"
@@ -231,13 +241,13 @@ def test_scan_first_wins_on_name_collision(temp_db, tmp_path, monkeypatch):
             "server": {"runtime": "none", "transport": "none"},
         }))
     monkeypatch.setattr(app_config, "MCPS_DIR", tmp_path)
-    saved = mcp_registry._manifests
+    saved = mcp_manifest_store._manifests
     try:
-        mcp_registry.scan_manifests()
+        mcp_manifest_store.scan_manifests()
         m = mcp_registry.get_manifest("clash")
         assert m.label == "From custom"      # custom scans before skills
     finally:
-        mcp_registry._manifests = saved
+        mcp_manifest_store._manifests = saved
 
 
 def test_create_request_kind_roundtrip(temp_db):
@@ -254,7 +264,7 @@ def test_delete_skill_package_removes_folder_and_rows(wired, monkeypatch):
     """DELETE /v1/admin/mcps/{name} accepts category=skill and unwires it:
     folder gone, agent_mcps assignment gone, agent_skills rows gone (skill
     ids are BARE — the old '{mcp}/%' LIKE cleanup matched nothing)."""
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_manifest_store, mcp_registry
     from storage.mcp import mcp_store
     from storage.pg import get_conn
 
@@ -267,7 +277,7 @@ def test_delete_skill_package_removes_folder_and_rows(wired, monkeypatch):
 
     pkg_dir = mcp_registry.get_manifest("pdf-skills").mcp_dir
     assert pkg_dir.exists()
-    monkeypatch.setattr(mcp_registry, "scan_manifests", lambda: None)
+    monkeypatch.setattr(mcp_manifest_store, "scan_manifests", lambda: None)
 
     r = wired.delete("/v1/admin/mcps/pdf-skills")
     assert r.status_code == 200
@@ -283,8 +293,7 @@ def test_delete_skill_package_removes_folder_and_rows(wired, monkeypatch):
 
 
 def test_delete_custom_mcp_still_rejected(wired, monkeypatch):
-    from services.mcp import mcp_registry
-    monkeypatch.setattr(mcp_registry, "scan_manifests", lambda: None)
+    monkeypatch.setattr(mcp_manifest_store, "scan_manifests", lambda: None)
     r = wired.delete("/v1/admin/mcps/tts-mcp")
     assert r.status_code == 400
 
@@ -292,7 +301,6 @@ def test_delete_custom_mcp_still_rejected(wired, monkeypatch):
 def test_delete_rescans_off_the_loop(wired, monkeypatch):
     import asyncio
 
-    from services.mcp import mcp_registry
     scans = []
 
     def _scan():
@@ -303,7 +311,7 @@ def test_delete_rescans_off_the_loop(wired, monkeypatch):
             return None
         raise AssertionError("scan_manifests ran on the event loop")
 
-    monkeypatch.setattr(mcp_registry, "scan_manifests", _scan)
+    monkeypatch.setattr(mcp_manifest_store, "scan_manifests", _scan)
     r = wired.delete("/v1/admin/mcps/pdf-skills")
     assert r.status_code == 200
     assert scans == ["worker"]

@@ -1,0 +1,143 @@
+{
+ "already at the target": {
+  "effective": 65536,
+  "logged": [
+   [
+    "INFO",
+    "Open-file limit: 65536 (hard 65536)"
+   ]
+  ],
+  "set": []
+ },
+ "already unlimited": {
+  "effective": -1,
+  "logged": [
+   [
+    "INFO",
+    "Open-file limit: -1 (hard -1)"
+   ]
+  ],
+  "set": []
+ },
+ "another target": {
+  "effective": 2048,
+  "logged": [
+   [
+    "WARNING",
+    "Open-file limit is 2048 (hard 524288): below 8192, the proxy runs out of descriptors well before 100 sessions. Raise LimitNOFILE (systemd) or ulimits.nofile (compose)."
+   ]
+  ],
+  "set": [
+   [
+    2048,
+    524288
+   ]
+  ]
+ },
+ "below the warning at the hard limit": {
+  "effective": 8191,
+  "logged": [
+   [
+    "WARNING",
+    "Open-file limit is 8191 (hard 8191): below 8192, the proxy runs out of descriptors well before 100 sessions. Raise LimitNOFILE (systemd) or ulimits.nofile (compose)."
+   ]
+  ],
+  "set": []
+ },
+ "never lowered": {
+  "effective": 100000,
+  "logged": [
+   [
+    "INFO",
+    "Open-file limit: 100000 (hard 200000)"
+   ]
+  ],
+  "set": []
+ },
+ "no rlimits on this platform": {
+  "effective": null
+ },
+ "raised to a low hard limit, warned": {
+  "effective": 4096,
+  "logged": [
+   [
+    "WARNING",
+    "Open-file limit is 4096 (hard 4096): below 8192, the proxy runs out of descriptors well before 100 sessions. Raise LimitNOFILE (systemd) or ulimits.nofile (compose)."
+   ]
+  ],
+  "set": [
+   [
+    4096,
+    4096
+   ]
+  ]
+ },
+ "raised to the target": {
+  "effective": 65536,
+  "logged": [
+   [
+    "INFO",
+    "Open-file limit: 65536 (hard 524288)"
+   ]
+  ],
+  "set": [
+   [
+    65536,
+    524288
+   ]
+  ]
+ },
+ "raised under an unlimited hard": {
+  "effective": 65536,
+  "logged": [
+   [
+    "INFO",
+    "Open-file limit: 65536 (hard -1)"
+   ]
+  ],
+  "set": [
+   [
+    65536,
+    -1
+   ]
+  ]
+ },
+ "the kernel refuses (OSError)": {
+  "effective": 9000,
+  "logged": [
+   [
+    "WARNING",
+    "Could not raise the open-file limit from 9000: no"
+   ],
+   [
+    "INFO",
+    "Open-file limit: 9000 (hard 70000)"
+   ]
+  ],
+  "set": []
+ },
+ "the kernel refuses (ValueError)": {
+  "effective": 1024,
+  "logged": [
+   [
+    "WARNING",
+    "Could not raise the open-file limit from 1024: no"
+   ],
+   [
+    "WARNING",
+    "Open-file limit is 1024 (hard 4096): below 8192, the proxy runs out of descriptors well before 100 sessions. Raise LimitNOFILE (systemd) or ulimits.nofile (compose)."
+   ]
+  ],
+  "set": []
+ },
+ "the warning's own line": {
+  "effective": 8192,
+  "logged": [
+   [
+    "INFO",
+    "Open-file limit: 8192 (hard 8192)"
+   ]
+  ],
+  "set": []
+ }
+}

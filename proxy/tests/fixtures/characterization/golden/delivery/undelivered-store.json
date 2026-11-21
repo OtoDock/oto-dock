@@ -1,0 +1,61 @@
+{
+ "answers": {
+  "a live terminal takes it": true,
+  "a terminal that refuses": true,
+  "an empty wake": false,
+  "as a person": true,
+  "no person, by its creator": true,
+  "no such chat": false,
+  "nothing to store": false
+ },
+ "noted_for_the_pump_end": [
+  "c-live",
+  "c-refused",
+  "c-store"
+ ],
+ "queued": [
+  {
+   "chat_id": "c-live",
+   "note": true,
+   "source": "delegate_result_replay",
+   "text": "FIVE"
+  },
+  {
+   "chat_id": "c-refused",
+   "note": true,
+   "source": "delegate_result_replay",
+   "text": "SIX"
+  }
+ ],
+ "stored": {
+  "c-live": [],
+  "c-refused": [
+   {
+    "by": "",
+    "person": "user-viewer",
+    "prompt": "SIX",
+    "role": "editor"
+   }
+  ],
+  "c-store": [
+   {
+    "by": "",
+    "person": "user-viewer",
+    "prompt": "ONE",
+    "role": "editor"
+   },
+   {
+    "by": "",
+    "person": "user-viewer",
+    "prompt": "TWO",
+    "role": "editor"
+   },
+   {
+    "by": "user-manager",
+    "person": "",
+    "prompt": "THREE",
+    "role": "viewer"
+   }
+  ]
+ }
+}

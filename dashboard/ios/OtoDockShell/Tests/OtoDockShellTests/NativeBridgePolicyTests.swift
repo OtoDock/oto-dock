@@ -279,6 +279,11 @@ final class NativeBridgePolicyTests: XCTestCase {
 
     func testOnlyAPlainHttpsAddressOpensTheBrowser() {
         XCTAssertEqual("https://auth.example.com/authorize?x=1", P.authBrowserUrl("https://auth.example.com/authorize?x=1"))
+        let signIn = "https://auth.example.com/application/o/authorize/?redirect_uri=otodock%3A%2F%2Fauth%2Fcallback&state=a%2Bb"
+        XCTAssertEqual(signIn, P.authBrowserUrl(signIn), "an escape the server wrote is kept, never escaped again")
+        XCTAssertEqual("https://auth.example.com/a%7Cb?q=100%25&x=%C3%A9&y=%25zz",
+                       P.authBrowserUrl("https://auth.example.com/a|b?q=100%&x=\u{E9}&y=%zz"),
+                       "a character outside the set, a lone percent and a broken escape are encoded once")
         XCTAssertNil(P.authBrowserUrl("http://auth.example.com/"))
         XCTAssertNil(P.authBrowserUrl("https://user@auth.example.com/"))
         XCTAssertNil(P.authBrowserUrl("https://auth.example.com\\@x.example/"))

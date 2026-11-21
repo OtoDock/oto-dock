@@ -4,6 +4,8 @@
 hand-over, and the machine cascade's settlements."""
 
 import asyncio
+import contextlib
+import json
 import uuid
 
 import pytest
@@ -19,7 +21,6 @@ def _user(sub, role="member", name=None):
 
 
 def _machine(mid, name, *, scope="user", owner="u-ann", engines=None):
-    import json
 
     from storage.pg import get_conn
     caps = json.dumps({"engines": engines} if engines else {})
@@ -59,7 +60,6 @@ def online(monkeypatch):
     from core.remote import satellite_connection as sc
     cm = sc.get_connection_manager()
     monkeypatch.setattr(cm, "satellite_engines", lambda mid: frozenset())
-    monkeypatch.setattr(cm, "satellite_supports_session_move", lambda mid: mid in up)
     monkeypatch.setattr(cm, "is_connected", lambda mid: mid in up)
     return up
 
@@ -333,94 +333,58 @@ def test_a_failed_transfer_falls_back_to_the_summary_at_the_chosen_place(temp_db
     assert frames[-1]["ok"] and frames[-1]["memory"] == move_schema.MEMORY_SUMMARY
 
 
-def _old(monkeypatch, online, *old):
-    """Machines online whose satellite cannot move the files (0.5.156)."""
-    from core.remote import satellite_connection as sc
-    monkeypatch.setattr(sc.get_connection_manager(), "satellite_supports_session_move",
-                        lambda mid: mid in online and mid not in old)
-
-
-def test_the_chips_answer_says_which_places_move_the_files(temp_db, online, monkeypatch):
-    """Each place says whether a move with it carries the session files: the
-    platform always, a machine whose satellite moves them, never an older
-    one. The current place says so too when the person is not offered it."""
-    from storage import database as db
-    _user("u-ann"); _user("u-bob")
-    _machine("m-new", "Ann laptop", owner="u-ann")
-    _machine("m-old", "Ann desktop", owner="u-ann")
-    _machine("m-bob", "Bob laptop", owner="u-bob")
-    online.update({"m-new", "m-old", "m-bob"})
-    _old(monkeypatch, online, "m-old", "m-bob")
-    slug = _agent()
-    view = chat_move.targets_view(db.get_chat(_chat(slug, "u-ann")), _asker("u-ann", "manager"))
-    by = {t["target"]: t for t in view["targets"]}
-    assert by[placement.LOCAL]["moves_files"] is True
-    assert by["m-new"]["moves_files"] is True and by["m-old"]["moves_files"] is False
-    # A chat of Ann's on Bob's computer: the current place is not offered.
-    cur = chat_move.targets_view(db.get_chat(_chat(slug, "u-ann", pin="m-bob")),
-                                 _asker("u-ann", "manager"))
-    here = next(t for t in cur["targets"] if t["is_current"])
-    assert here["target"] == "m-bob" and here["moves_files"] is False
-
-
-def test_a_move_to_an_older_satellite_promises_and_gets_a_summary(temp_db, online, monkeypatch):
-    """The answer says what the move will carry, and the card names only the
-    place whose satellite could not take the files, never the platform."""
-    from storage import database as db, remote_store
+def test_the_agents_move_from_a_machine_promises_the_files(temp_db, online, monkeypatch):
+    """The tool's answer says the chat continues there with its files."""
     _user("u-ann")
     _machine("m-ann", "Ann laptop", owner="u-ann")
     online.add("m-ann")
-    _old(monkeypatch, online, "m-ann")
-    slug = _agent()
-    cid = _chat(slug, "u-ann", sid=str(uuid.uuid4()))
-    files = _FakeFiles(monkeypatch)
-    frames = _frames(monkeypatch)
-
-    async def go():
-        res = await chat_move.request_move(cid, "m-ann", asker=_asker("u-ann", "manager"))
-        assert res["memory"] == move_schema.MEMORY_SUMMARY
-        await _settled(cid)
-    asyncio.run(go())
-    move = remote_store.latest_chat_move(cid)
-    assert move["memory"] == move_schema.MEMORY_SUMMARY and move["why"] == move_schema.WHY_OLD_TARGET
-    assert files.calls == [] and db.get_chat(cid)["execution_target"] == "m-ann"
-    assert frames[-1]["ok"] and frames[-1]["message"] == (
-        "This chat moved from the OtoDock platform to Ann laptop. Ann laptop runs an older "
-        "satellite, so it continues from a summary of the conversation.")
-
-
-def test_the_agents_move_promises_a_summary_from_an_older_satellite(temp_db, online,
-                                                                     monkeypatch):
-    """The tool's answer ("continues there from a summary") follows the
-    satellite of the place the chat leaves too."""
-    _user("u-ann")
-    _machine("m-ann", "Ann laptop", owner="u-ann")
-    online.add("m-ann")
-    _old(monkeypatch, online, "m-ann")
     slug = _agent()
     cid = _chat(slug, "u-ann", pin="m-ann", sid=str(uuid.uuid4()))
 
-    async def _wait(chat_id, target, asker, blocked=None, *, resume=False):
+    async def _wait(chat_id, target, asker, blocked=None, *, resume=False, **kw):
         pass
     monkeypatch.setattr(chat_move, "_wait_and_move", _wait)
-    res = asyncio.run(chat_move.schedule_after_turn(cid, "default",
-                                                    asker=_asker("u-ann", "manager")))
-    assert res["memory"] == move_schema.MEMORY_SUMMARY
-    _old(monkeypatch, online)
     res = asyncio.run(chat_move.schedule_after_turn(cid, "default",
                                                     asker=_asker("u-ann", "manager")))
     assert res["memory"] == move_schema.MEMORY_FILES
 
 
-def test_the_older_side_is_named(temp_db, online, monkeypatch):
-    online.update({"m-1", "m-2"})
-    _old(monkeypatch, online, "m-1")
-    assert chat_move._old_satellite("m-1", "local") == move_schema.WHY_OLD_SOURCE
-    assert chat_move._old_satellite("local", "m-1") == move_schema.WHY_OLD_TARGET
-    assert chat_move._old_satellite("m-2", "m-1") == move_schema.WHY_OLD_TARGET
-    assert chat_move._old_satellite("local", "m-2") == ""
-    _old(monkeypatch, online, "m-1", "m-2")
-    assert chat_move._old_satellite("m-1", "m-2") == move_schema.WHY_OLD_SATELLITE
+def test_no_move_starts_while_new_work_is_held(temp_db, online, monkeypatch):
+    """A copy started now is cut by the stop."""
+    from core import drain
+    _user("u-ann")
+    _machine("m-ann", "Ann laptop", owner="u-ann")
+    online.add("m-ann")
+    cid = _chat(_agent(), "u-ann", sid=str(uuid.uuid4()))
+    monkeypatch.setattr(drain, "_state", drain.HELD)
+    with pytest.raises(chat_move.MoveRefused, match="OtoDock is updating"):
+        asyncio.run(chat_move.request_move(cid, "m-ann", asker=_asker("u-ann", "manager")))
+    from storage import database as db
+    assert db.get_chat(cid)["execution_target"] != "m-ann"
+
+
+def test_the_agents_move_that_comes_due_under_a_hold_waits(temp_db, online, monkeypatch):
+    """Its row stays for the boot to settle, and nothing starts until the hold ends."""
+    from core import drain
+    _user("u-ann")
+    _machine("m-ann", "Ann laptop", owner="u-ann")
+    online.add("m-ann")
+    cid = _chat(_agent(), "u-ann", sid=str(uuid.uuid4()))
+    started: list[int] = []
+    holds = {"left": 2}
+
+    def _holding():
+        holds["left"] -= 1
+        return holds["left"] >= 0
+
+    async def _start(*a, **kw):
+        started.append(holds["left"])
+    monkeypatch.setattr(drain, "holding", _holding)
+    monkeypatch.setattr(chat_move, "TURN_POLL_S", 0.0)
+    monkeypatch.setattr(chat_move, "_start", _start)
+    _stand(cid, _asker("u-ann", "manager"))
+    asyncio.run(chat_move._wait_and_move(cid, "m-ann", _asker("u-ann", "manager")))
+    assert len(started) == 1 and started[0] < 0
 
 
 def test_a_target_that_drops_mid_copy_leaves_the_chat_where_it_was(temp_db, online, monkeypatch):
@@ -876,21 +840,6 @@ def test_the_summary_card_opens_its_sentence_plainly():
         "drill-sat", "Ann laptop", move_schema.WHY_NO_FILES, source="m-1", target="m-2") == (
         "This chat moved from drill-sat to Ann laptop. The previous session left no file to "
         "take, so it continues from a summary of the conversation.")
-    assert chat_move.summary_notice(
-        "drill-sat", "OtoDock platform", move_schema.WHY_OLD_SOURCE, source="m-1",
-        target="local") == ("This chat moved from drill-sat to the OtoDock platform. drill-sat "
-                            "runs an older satellite, so it continues from a summary of the "
-                            "conversation.")
-    assert chat_move.summary_notice(
-        "OtoDock platform", "drill-sat", move_schema.WHY_OLD_TARGET, source="local",
-        target="m-1") == ("This chat moved from the OtoDock platform to drill-sat. drill-sat "
-                          "runs an older satellite, so it continues from a summary of the "
-                          "conversation.")
-    assert chat_move.summary_notice(
-        "drill-sat", "Ann laptop", move_schema.WHY_OLD_SATELLITE, source="m-1",
-        target="m-2") == ("This chat moved from drill-sat to Ann laptop. drill-sat and Ann "
-                          "laptop run an older satellite, so it continues from a summary of "
-                          "the conversation.")
     assert chat_move.DIRECT_LOCAL == "Direct LLM chats run on the OtoDock platform."
 
 
@@ -918,7 +867,10 @@ def test_the_builder_names_where_a_refused_chat_is(temp_db):
 # -- the routes ----------------------------------------------------------------------
 
 def _user_ctx(sub, role="member", agents=(), **kw):
+    """A principal as the resolver builds it: its rows read from the store."""
     from auth.providers import UserContext
+    from storage import database as db
+    kw.setdefault("agent_roles", db.get_user_agent_roles(sub))
     return UserContext(sub=sub, email=f"{sub}@t.io", name=sub, role=role, agents=list(agents), **kw)
 
 
@@ -989,7 +941,7 @@ def test_the_agent_tool_lists_and_schedules_for_its_own_chat(temp_db, online, mo
     monkeypatch.setattr(db, "get_chat_by_session", lambda s: db.get_chat(cid) if s == sid else None)
     started = []
 
-    async def _wait(chat_id, target, asker, blocked=None, *, resume=False):
+    async def _wait(chat_id, target, asker, blocked=None, *, resume=False, **kw):
         started.append((chat_id, target, resume))
     monkeypatch.setattr(chat_move, "_wait_and_move", _wait)
     me = _user_ctx("u-ann", agents=[slug], session_id=sid, agent=slug, is_api_key=True)
@@ -1024,7 +976,7 @@ def test_an_agent_scope_tasks_chat_moves_itself_as_the_task(temp_db, online, mon
     monkeypatch.setattr(db, "get_chat_by_session", lambda s: db.get_chat(cid) if s == sid else None)
     started = []
 
-    async def _wait(chat_id, target, asker, blocked=None, *, resume=False):
+    async def _wait(chat_id, target, asker, blocked=None, *, resume=False, **kw):
         started.append((chat_id, target, asker.sub, resume))
     monkeypatch.setattr(chat_move, "_wait_and_move", _wait)
     me = _user_ctx(f"session:{sid}", agents=[slug], session_id=sid, agent=slug, is_api_key=True)
@@ -1064,7 +1016,7 @@ def test_a_user_scope_tasks_chat_moves_itself_as_its_creator(temp_db, online, mo
     monkeypatch.setattr(db, "get_chat_by_session", lambda s: db.get_chat(cid) if s == sid else None)
     started = []
 
-    async def _wait(chat_id, target, asker, blocked=None, *, resume=False):
+    async def _wait(chat_id, target, asker, blocked=None, *, resume=False, **kw):
         started.append((chat_id, target, asker.sub, asker.platform_admin, resume))
     monkeypatch.setattr(chat_move, "_wait_and_move", _wait)
     sub = "u-adm" if token_names_the_creator else f"session:{sid}"
@@ -1111,6 +1063,34 @@ def test_an_agent_scope_tasks_own_move_is_offered_only_the_agents_places(temp_db
     assert getattr(e.value, "detail", "") == chat_move.CANT_THERE
 
 
+
+def test_a_managers_run_whose_session_writes_knowledge_moves_its_own_chat(temp_db, online, monkeypatch):
+    """A manager's agent-scope run whose session holds the knowledge write
+    moves its own chat: the move asks the rule with the run's own session,
+    which holds that write. Asked with no session, the rule refuses it."""
+    from api.remote import chat_placement as routes
+    from core.config import task_config_builder
+    from core.session import session_kind
+    from storage import database as db
+    slug = _agent()
+    run_id = str(uuid.uuid4())
+    db.create_run(run_id, _task_row(slug, scope="agent", owner=slug), slug, "manual", None, "go",
+                  scope="agent", created_by="u-admin")
+    cid = session_kind.task_chat_id(run_id)
+    sid = str(uuid.uuid4())
+    db.create_chat(cid, f"task::{slug}", slug, "auto", execution_path="claude-code-cli")
+    db.update_chat(cid, execution_target="local", session_id=sid)
+    db.update_run(run_id, status="completed", session_id=sid)
+    monkeypatch.setattr(db, "get_chat_by_session", lambda s: db.get_chat(cid) if s == sid else None)
+    monkeypatch.setattr(task_config_builder, "run_holds_knowledge_write", lambda run: True)
+    monkeypatch.setattr(task_config_builder, "session_holds_knowledge_write", lambda s: s == sid)
+    me = _user_ctx(f"session:{sid}", agents=[slug], session_id=sid, agent=slug, is_api_key=True)
+    listed = asyncio.run(routes.agent_move(routes.AgentMoveRequest(), user=me))
+    assert listed["refusal"] != chat_move.NOT_MOVER, listed["refusal"]
+    asker = chat_move.task_asker(db.get_chat(cid), "")
+    assert chat_move.may_drive(db.get_chat(cid), asker) is False
+
+
 # -- the resume after the agent's own move -----------------------------------------
 
 def _resumes(monkeypatch):
@@ -1126,7 +1106,18 @@ def _resumes(monkeypatch):
     return asked
 
 
+def _stand(cid, asker):
+    """The asker's role on the chat's agent, stored: the agent's move reads
+    the person's standing again when it fires."""
+    from storage import database as db
+    from storage.identity import db_users
+    if asker.sub and not asker.platform_admin:
+        db_users.add_user_agent(asker.sub, db.get_chat(cid)["agent"], asker.role, "u-admin")
+
+
 def _tool_move(cid, target, asker, *, resume=True):
+    _stand(cid, asker)
+
     async def go():
         await chat_move._wait_and_move(cid, target, asker, resume=resume)
         await _settled(cid)
@@ -1152,7 +1143,7 @@ def test_the_agents_own_move_continues_on_the_new_place_by_itself(temp_db, onlin
     assert call["user_sub"] == "u-ann" and call["allow_ws"] is False and call["allow_pty"] is False
     one = call["oneshot_fn"].keywords
     assert one == {"permission_mode": "autoReview", "client_type": "dashboard",
-                   "fresh_without_session": True}
+                   "build": "chat", "fresh_without_session": True, "driven_by": "move_resume"}
     # The wake row the transcript shows, at the head of the resumed turn (the
     # ladder writes it on the chat's lane, on the loop).
     async def persist():
@@ -1234,7 +1225,7 @@ def test_the_agents_later_move_replaces_its_earlier_one(temp_db, online, monkeyp
     cid = _chat(_agent(), "u-ann", sid=str(uuid.uuid4()))
     waiting = []
 
-    async def _wait(chat_id, target, asker, blocked=None, *, resume=False):
+    async def _wait(chat_id, target, asker, blocked=None, *, resume=False, **kw):
         waiting.append(target)
         await asyncio.Event().wait()
     monkeypatch.setattr(chat_move, "_wait_and_move", _wait)
@@ -1398,7 +1389,9 @@ def _waiting_move(monkeypatch, online):
     _user("u-ann")
     _machine("m-ann", "Ann laptop", owner="u-ann")
     online.add("m-ann")
-    return started, _chat(_agent(), "u-ann", sid=str(uuid.uuid4()))
+    cid = _chat(_agent(), "u-ann", sid=str(uuid.uuid4()))
+    _stand(cid, _asker("u-ann", "manager"))
+    return started, cid
 
 
 def test_the_agents_move_waits_for_a_turn_its_claim_does_not_show(temp_db, online, monkeypatch):
@@ -1413,6 +1406,121 @@ def test_the_agents_move_waits_for_a_turn_its_claim_does_not_show(temp_db, onlin
     monkeypatch.setattr(chat_move, "open_turn", _open)
     asyncio.run(chat_move._wait_and_move(cid, "m-ann", _asker("u-ann", "manager"), resume=True))
     assert started == [True] and open_turns["left"] == 0
+
+
+def test_a_waiter_cancelled_while_it_holds_the_claim_gives_it_back(temp_db, online, monkeypatch):
+    """The agent's later move cancels the earlier waiter, which may hold the
+    chat's claim across its reads: the claim goes back, or the chat's queued
+    messages and every later waiter stay stuck."""
+    import threading
+
+    from core.events import input_queue
+    from storage.chat import cut_records
+    _started, cid = _waiting_move(monkeypatch, online)
+    reading, finish = threading.Event(), threading.Event()
+
+    def _open(chat):
+        reading.set()
+        finish.wait(10)
+        return False
+    monkeypatch.setattr(chat_move, "open_turn", _open)
+    held = {"by_the_pass": False}
+    real_unsettled = cut_records.unsettled_of
+    monkeypatch.setattr(cut_records, "unsettled_of",
+                        lambda chat_id: {"id": 0} if held["by_the_pass"] else real_unsettled(chat_id))
+    ann = _asker("u-ann", "manager")
+
+    async def go():
+        chat_move._arm(cid, "m-ann", ann, None, 60.0)
+        first = chat_move._waiters[cid]
+        assert await asyncio.to_thread(reading.wait, 10)
+        assert input_queue.is_claimed(cid)            # the read runs under the claim
+        held["by_the_pass"] = True                    # the later waiter takes no claim
+        chat_move._arm(cid, "m-ann", ann, None, 60.0)
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+        finish.set()
+        claimed = input_queue.is_claimed(cid)
+        second = chat_move._waiters[cid]
+        second.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await second
+        return claimed
+    try:
+        assert asyncio.run(go()) is False
+    finally:
+        finish.set()
+
+
+async def _a_move_waits_then_the_stop_cuts_it(cid) -> None:
+    """The graceful shutdown: the stop is noted first, then the tracked tasks
+    are cancelled while the store is still open."""
+    from core import background, drain
+    await chat_move.schedule_after_turn(cid, "m-ann", asker=_asker("u-ann", "manager"))
+    await asyncio.sleep(0.05)
+    drain.note_stopping()
+    await background.cancel_all(grace=0.0, timeout=1.0)
+    await asyncio.sleep(0.05)
+
+
+def test_a_clean_stop_leaves_the_row_and_the_next_boot_arms_the_move_again(temp_db, online,
+                                                                          monkeypatch):
+    """The chat's session lives on (no turn was cut): the boot arms the move
+    again with what is left of its wait, and it moves when the turn ends."""
+    from core import drain
+    from services.scheduler import continue_pass
+    from storage.chat import pending_rebuilds
+    started, cid = _waiting_move(monkeypatch, online)
+    turn = {"open": True}
+    monkeypatch.setattr(chat_move, "open_turn", lambda chat: turn["open"])
+
+    async def go():
+        await _a_move_waits_then_the_stop_cuts_it(cid)
+        [row] = pending_rebuilds.listed()
+        assert (row["chat_id"], row["what"], row["target"]) == (cid, pending_rebuilds.MOVE, "m-ann")
+        drain.reset_for_tests()
+        await continue_pass.settle_waiters()
+        [again] = pending_rebuilds.listed()
+        assert again["target"] == "m-ann" and 0 < pending_rebuilds.seconds_left(again) <= 1800
+        await asyncio.sleep(0.05)
+        assert started == []
+        turn["open"] = False
+        await asyncio.wait_for(chat_move._waiters[cid], 5)
+    asyncio.run(go())
+    assert started == [True] and pending_rebuilds.listed() == []
+
+
+def test_a_move_that_ended_during_the_stop_takes_its_row(temp_db, online, monkeypatch):
+    """Inside the shutdown's grace a waiter can still finish: a row left then
+    would tell the next boot's chat it did not move."""
+    from core import drain
+    from storage.chat import pending_rebuilds
+    _, cid = _waiting_move(monkeypatch, online)
+
+    async def _wait(chat_id, target, asker, blocked=None, *, resume=False, **kw):
+        drain.note_stopping()
+    monkeypatch.setattr(chat_move, "_wait_and_move", _wait)
+
+    async def go():
+        await chat_move.schedule_after_turn(cid, "m-ann", asker=_asker("u-ann", "manager"))
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert pending_rebuilds.listed() == []
+
+
+def test_a_cancel_of_a_move_that_is_not_the_stop_takes_its_row(temp_db, online, monkeypatch):
+    from storage.chat import pending_rebuilds
+    _, cid = _waiting_move(monkeypatch, online)
+    monkeypatch.setattr(chat_move, "open_turn", lambda chat: True)
+
+    async def go():
+        await chat_move.schedule_after_turn(cid, "m-ann", asker=_asker("u-ann", "manager"))
+        await asyncio.sleep(0.05)
+        assert len(pending_rebuilds.listed()) == 1
+        chat_move._waiters[cid].cancel()
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert pending_rebuilds.listed() == []
 
 
 def test_the_agents_move_of_a_terminal_chat_waits_for_its_turn_to_end(temp_db, online,
@@ -1468,14 +1576,19 @@ def test_a_move_never_borrows_a_persons_warmup(temp_db, online):
 # -- delegated work stays where it runs ---------------------------------------------
 
 def _task_row(agent, *, continue_session=None, owner="u-ann", scope="user"):
+    """A recurring task that continues ``continue_session``: one that can
+    still fire (a row a run left behind does not count)."""
     from storage import database as db
     tid = str(uuid.uuid4())
-    db.create_dynamic_task(tid, agent, "lane", "go", "default", "one-time", None, None, None,
-                           600, owner, continue_session=continue_session, scope=scope)
+    db.create_dynamic_task(tid, agent, "lane", "go", "default", "scheduled", "0 9 * * *", None,
+                           None, 600, owner, continue_session=continue_session, scope=scope)
     return tid
 
 
-def test_a_chat_delegated_work_continues_is_refused(temp_db, online):
+def test_a_chat_a_task_can_still_continue_is_refused(temp_db, online):
+    """A recurring task resumes the session where it runs; a delegated
+    worker's own move is refused, its person's is not
+    (``test_chat_move_continue.py`` has the lane's rules)."""
     from storage import database as db
     _user("u-ann")
     _machine("m-ann", "Ann laptop", owner="u-ann")
@@ -1487,12 +1600,15 @@ def test_a_chat_delegated_work_continues_is_refused(temp_db, online):
     continued = _chat(slug, "u-ann", sid=sid)
     _task_row(slug, continue_session=sid)
     me = _asker("u-ann", "manager")
-    for cid in (worker, continued):
-        with pytest.raises(chat_move.MoveRefused, match=chat_move.CONTINUES_WORK):
-            chat_move._validate(db.get_chat(cid), "m-ann", me, expect_from=None,
-                                check_turn=False)
-        view = chat_move.targets_view(db.get_chat(cid), me)
-        assert view["refusal"] == chat_move.CONTINUES_WORK and not view["can_move"]
+    with pytest.raises(chat_move.MoveRefused, match=chat_move.CONTINUES_WORK):
+        chat_move._validate(db.get_chat(continued), "m-ann", me, expect_from=None,
+                            check_turn=False)
+    view = chat_move.targets_view(db.get_chat(continued), me)
+    assert view["refusal"] == chat_move.CONTINUES_WORK and not view["can_move"]
+    chat_move._validate(db.get_chat(worker), "m-ann", me, expect_from=None, check_turn=False)
+    with pytest.raises(chat_move.MoveRefused, match=chat_move.CONTINUES_WORK):
+        chat_move._validate(db.get_chat(worker), "m-ann", me, expect_from=None,
+                            check_turn=False, own_move=True)
 
 
 def _proved(monkeypatch, size=99):
@@ -1813,6 +1929,16 @@ def test_a_chat_with_no_session_expects_a_summary():
         {"execution_target": "local", "session_id": "s"}) == move_schema.MEMORY_FILES
 
 
+def test_a_chat_whose_record_is_on_another_server_moves_on_a_summary():
+    # Its engine record is in that compute machine's own copy, which no move
+    # copies: the chip promises a summary, and a lane (which resumes by id
+    # and never reads one) stays where it runs.
+    on_rack = {"execution_target": "local", "session_id": "s", "compute_machine": "rack-2"}
+    assert chat_move._expected_memory(on_rack) == move_schema.MEMORY_SUMMARY
+    assert chat_move._lane_without_memory(on_rack) == ""
+    assert chat_move._lane_without_memory({**on_rack, "parent_chat_id": "p-1"}) == chat_move.CONTINUES_WORK
+
+
 # -- who sees which places, role by role ---------------------------------------------
 
 def _set_default(slug, mid):
@@ -1921,3 +2047,147 @@ def test_the_task_dialog_reads_the_places_of_the_tasks_run_person(temp_db, onlin
     with pytest.raises(HTTPException) as e:          # another person's user-scope task
         asyncio.run(routes.agent_run_targets(slug, task_id=mine, user=bob))
     assert e.value.status_code == 404
+
+
+def test_neither_a_move_nor_a_tasks_machine_may_name_a_compute_machine(temp_db, online):
+    """The places offered never hold a compute machine, even for an admin who
+    names it by id or by name: a move answers with the plain refusal, a task
+    or a delegation lists the places that would do."""
+    from storage import remote_store
+    _user("u-ann")
+    made = remote_store.create_remote_machine(machine_id="c-compute", name="Compute one", registered_by=None,
+                                              pairing_scope=placement.PAIRING_COMPUTE)
+    online.add(made["id"])
+    slug = _agent()
+    cid = _chat(slug, "u-ann")
+    admin = _asker("u-ann", "manager", admin=True)
+    from storage import database as db
+    chat = db.get_chat(cid)
+    for wanted in (made["id"], "Compute one"):
+        with pytest.raises(chat_move.MoveRefused) as refused:
+            chat_move._validate(chat, wanted, admin, expect_from=None, check_turn=False)
+        assert str(refused.value) == chat_move.CANT_THERE
+        machine, why = chat_targets.resolve_work_machine(
+            slug, wanted, person=chat_targets.RunPerson("u-ann", "manager"), admin_asker=True)
+        assert machine == "" and "is not a machine this work can run on" in why
+
+
+class _RemoteHolder:
+    """The real remote layer holding one session on one machine, its machine's
+    link and grace answered by the real connection manager's methods."""
+
+    @staticmethod
+    def install(monkeypatch, online, sid, machine, *, linked=True, grace=False):
+        from core.remote import satellite_connection as sc
+        from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
+        from core.session import session_manager
+        cm = sc.get_connection_manager()
+        layer = RemoteExecutionLayer(cm)
+        layer._sessions[sid] = RemoteSessionInfo(session_id=sid, machine_id=machine, agent_name="a",
+                                                 execution_path="claude-code-cli", event_queue=None)
+        monkeypatch.setattr(session_manager, "_remote_layer", layer)
+        monkeypatch.setattr(cm, "is_session_in_grace", lambda mid, s: grace and mid == machine and s == sid)
+        if linked:
+            online.add(machine)
+
+
+def _pinned_to_anns_computer(sid):
+    from core.session.visibility import shared_chat_owner
+    from storage import database as db
+    _user("u-ann", name="Ann"); _user("u-bob")
+    _machine("m-ann", "Ann laptop", owner="u-ann")
+    slug = _agent(default_scope="agent", collaborative=False)
+    return db.get_chat(_chat(slug, shared_chat_owner(slug), pin="m-ann", sid=sid))
+
+
+ANNS_LOCK = "This chat is running on Ann's computer."
+
+
+def test_a_session_the_platform_holds_behind_a_computers_pin_locks_nobody(temp_db, online, monkeypatch):
+    """A session the platform holds itself behind the pin is not running on
+    that computer, so the others are not sent away from the chat."""
+    from types import SimpleNamespace
+
+    from core.layers.direct import session as direct_session
+    from core.session import session_manager
+    chat = _pinned_to_anns_computer("s-here")
+    monkeypatch.setattr(session_manager, "_remote_layer", None)
+    monkeypatch.setitem(direct_session._direct_sessions, "s-here", SimpleNamespace(mcp_manager=None))
+    assert session_manager.live_session("s-here") is not None
+    assert chat_move.lock_sentence(chat, "u-bob") == ""
+
+
+@pytest.mark.parametrize("on, linked, grace, sentence", [
+    ("m-ann", True, False, ANNS_LOCK),     # there, and its machine answers
+    ("m-ann", False, True, ANNS_LOCK),     # there, coming back within its grace
+    ("m-ann", False, False, ""),           # there, and its machine is away
+    ("m-other", True, False, ""),          # a machine's, but not the one the chat is on
+    ("m-other", False, True, ""),
+])
+def test_the_lock_reads_a_session_on_the_chats_own_machine(temp_db, online, monkeypatch, on, linked, grace, sentence):
+    chat = _pinned_to_anns_computer("s-far")
+    _RemoteHolder.install(monkeypatch, online, "s-far", on, linked=linked, grace=grace)
+    assert chat_move.lock_sentence(chat, "u-bob") == sentence
+
+
+def test_a_compute_machine_locks_nobody_even_naming_who_registered_it(temp_db, online, monkeypatch):
+    from core.session.visibility import shared_chat_owner
+    from storage import database as db
+    _user("u-ann", name="Ann"); _user("u-bob")
+    _machine("c-1", "Compute one", scope="compute", owner="u-ann")
+    slug = _agent(default_scope="agent", collaborative=False)
+    chat = db.get_chat(_chat(slug, shared_chat_owner(slug), pin="c-1", sid="s-c"))
+    _RemoteHolder.install(monkeypatch, online, "s-c", "c-1")
+    assert chat_move.lock_sentence(chat, "u-bob") == ""
+
+
+def test_the_hand_over_names_a_compute_machine_as_one(temp_db, online):
+    """No person's computer: never "This chat runs on 's computer"."""
+    from storage import database as db, remote_store
+    _user("u-ann", name="Ann")
+    made = remote_store.create_remote_machine(machine_id="c-2", name="Compute two", registered_by=None,
+                                              pairing_scope=placement.PAIRING_COMPUTE)
+    slug = _agent()
+    chat = db.get_chat(_chat(slug, "u-ann", pin=made["id"]))
+    said = chat_move._handover_refusal(chat, _asker("u-ann", "manager"))
+    assert said == "This chat is on Compute two, a compute machine. Move it from the Runs on menu."
+
+
+def test_no_session_held_locks_nobody(temp_db, online, monkeypatch):
+    from core.session import session_manager
+    chat = _pinned_to_anns_computer("s-gone")
+    monkeypatch.setattr(session_manager, "_remote_layer", None)
+    assert chat_move.lock_sentence(chat, "u-bob") == ""
+
+
+@pytest.mark.parametrize("asker,build", [("u-bob", "chat"), ("u-ann", "wake"), ("", "wake")])
+def test_a_typists_move_of_a_lanes_chat_resumes_their_own_turn(temp_db, monkeypatch, asker, build):
+    """A lane spawned with no session has no parent chat, so its agent may
+    move it. When a typist's own turn asked for the move (u-bob in u-ann's
+    lane), the resume continues that turn as theirs and is theirs to pay;
+    the lane's own person, or its round with no person, stays a wake."""
+    from core.session import chat_rebuild
+    from core.session.visibility import shared_chat_owner
+    from services.scheduler import task_kinds
+    from storage import database as db
+    from storage.agents import agent_store
+    agent_store.create_agent("mv-shared", "Shared", default_scope="agent", collaborative=False)
+    for sub in ("u-ann", "u-bob"):
+        _user(sub)
+        db.add_user_agent(sub, "mv-shared", "editor", sub)
+    cid = str(uuid.uuid4())
+    db.create_chat(cid, shared_chat_owner("mv-shared"), "mv-shared", "auto", origin="delegated")
+    db.create_run("r-mv", "task-x", "mv-shared", "manual", None, "go", task_kinds.DELEGATE, "agent", "u-ann",
+                  spender_sub="u-ann")
+    db.update_run("r-mv", chat_id=cid, started_at="2026-11-13T06:00:00")
+    monkeypatch.setattr(chat_move, "_waiting_message_goes_first", lambda chat: False)
+    monkeypatch.setattr(chat_move, "_turn_holds_chat", lambda chat_id: False)
+    seen = {}
+
+    async def _rebuild(chat_id, text, **kw):
+        seen.update(kw)
+    monkeypatch.setattr(chat_rebuild, "rebuild_and_resume", _rebuild)
+    job = chat_move._Job("mv-1", cid, "Ann laptop", "m-ann")
+    asyncio.run(chat_move._deliver_resume(db.get_chat(cid), job, _asker(asker, "editor")))
+    assert (seen["build"], seen["person"] or "") == (build, asker)
+    assert chat_rebuild.nobody_typed(seen["source"], seen["build"]) is (build == "wake")

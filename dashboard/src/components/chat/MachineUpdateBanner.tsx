@@ -41,7 +41,7 @@ export default function MachineUpdateBanner({ machineId }: Props) {
   if (slice.status === 'updating') {
     const elapsed = Math.max(0, Math.floor((now - slice.startedAt) / 1000))
     return (
-      <div className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-card border border-status-warning-border bg-status-warning-bg text-status-warning-fg">
+      <div className="w-full px-3 py-2 text-xs rounded-card border border-status-warning-border bg-status-warning-bg text-status-warning-fg">
         <div className="flex items-center gap-2">
           <span className="inline-block w-2 h-2 rounded-full bg-status-warning-solid animate-pulse" />
           <span className="truncate">
@@ -58,7 +58,7 @@ export default function MachineUpdateBanner({ machineId }: Props) {
 
   if (slice.status === 'updated') {
     return (
-      <div className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-card border border-status-success-border bg-status-success-bg text-status-success-fg">
+      <div className="w-full px-3 py-2 text-xs rounded-card border border-status-success-border bg-status-success-bg text-status-success-fg">
         <div className="flex items-center gap-2">
           <span className="inline-block w-2 h-2 rounded-full bg-status-success-solid" />
           <span>
@@ -73,7 +73,7 @@ export default function MachineUpdateBanner({ machineId }: Props) {
 
   // failed
   return (
-    <div className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-card border border-status-danger-border bg-status-danger-bg text-status-danger-fg">
+    <div className="w-full px-3 py-2 text-xs rounded-card border border-status-danger-border bg-status-danger-bg text-status-danger-fg">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
           <span className="inline-block w-2 h-2 rounded-full bg-status-danger-solid shrink-0" />

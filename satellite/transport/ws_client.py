@@ -7,6 +7,7 @@ keepalive, and clock-jump detection (laptop sleep/wake recovery).
 
 import asyncio
 import contextlib
+import functools
 import ipaddress
 import json
 import logging
@@ -20,15 +21,21 @@ from urllib.parse import urlparse
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State
 
 from .. import config
 from .._vendored import layout
 from ..background import spawn
 from ..config import otodock_dir
+from ..engines import DEFAULT_REPLAYS
+from ..sessions import credential_exit, memory_guard, start_slots
+from . import compute_link
 from .lifecycle_update import (
     _finalize_post_update_state,
     _self_uninstall_and_exit,
     _self_update_and_restart,
+    claim_update,
+    release_update,
 )
 
 if TYPE_CHECKING:
@@ -192,6 +199,13 @@ _PRECONNECT_CHECK_S = 8.0
 # can themselves prolong an outage (nginx 502s while the proxy is overwhelmed).
 _RECONNECT_BACKOFF_BASE = 1.0
 _RECONNECT_BACKOFF_CAP = 30.0
+# The wait goes back to its base only after a link that held this long (above
+# the 50 to 70 s either side needs to notice a link that died silently). A
+# link that drops sooner after its sign-in keeps doubling the wait, capped
+# lower than a refused or failed connect is: a machine whose link keeps
+# dropping reconnects every few seconds, not every second.
+_STABLE_LINK_S = 120.0
+_RECONNECT_BACKOFF_SIGNED_IN_CAP = 10.0
 
 # Send queue capacity. Same as previous _send_buffer cap.
 _SEND_QUEUE_SIZE = 10_000
@@ -283,6 +297,15 @@ class _InsecureUninstallRefused(Exception):
 # The platform frames whose work runs as a task of its own: the session
 # manager's method that does it (the task is named after it) and whether the
 # method takes the client.
+# What a compute machine never acts on is its file mode's
+# (``transport/compute_link.py``); a gateway frame is the exit's to judge.
+
+# The answer frame of a refused request the platform waits on by its
+# ``request_id`` (``_refuse_on_compute``), by the request's type.
+_REQUEST_ANSWERS: dict[str, str] = {
+    "file_pull": "file_content", "request_manifest": "file_manifest",
+}
+
 _SPAWNED_FRAMES: dict[str, tuple[str, bool]] = {
     "start_session": ("start_session", True),
     "send_message": ("send_message", True),
@@ -296,6 +319,7 @@ _SPAWNED_FRAMES: dict[str, tuple[str, bool]] = {
     "pty_input": ("pty_input", False),
     "pty_resize": ("pty_resize", False),
     "pty_close": ("pty_close", False),
+    "transcript_ack": ("transcript_ack", False),
     # Server-prompt injection into an otodock-attached CLI's
     # stdin (the delegation-delivery PTY rung); always answers
     # with a pty_inject_result frame.
@@ -304,6 +328,8 @@ _SPAWNED_FRAMES: dict[str, tuple[str, bool]] = {
     # `otodock` terminal but keep the PTY alive.
     "pty_local_detach": ("evict_local_conn", True),
     "stop_turn": ("stop_turn", False),
+    # Direct LLM's tool processes on a compute machine (tool_relay.py).
+    "tool_open": ("tool_open", True), "tool_in": ("tool_in", True), "tool_close": ("tool_close", True),
     # Native-permission answer from proxy → CLI stdin
     "control_response": ("control_response", False),
     "control_request": ("control_request", False),
@@ -338,7 +364,20 @@ _SPAWNED_FRAMES: dict[str, tuple[str, bool]] = {
     # An app step (proxy APPS.md "Steps", 0.5.122): its own
     # task, so a long script never blocks the loop.
     "step_run": ("step_run", True),
+    "app_server_start": ("app_server_start", True),
+    "app_server_stop": ("app_server_stop", True),
+    "app_server_sweep": ("app_server_sweep", True),
 }
+
+
+async def _apply_update(msg: dict) -> None:
+    """The update ``claim_update`` took for ``msg``, released when the apply
+    comes back without the exit it ends in (a failed extract, a failed venv),
+    so a later push can apply."""
+    try:
+        await _self_update_and_restart(msg)
+    finally:
+        release_update()
 
 
 class SatelliteWSClient:
@@ -352,6 +391,11 @@ class SatelliteWSClient:
 
     def __init__(self, config: "SatelliteConfig", session_manager: "SessionManager"):
         self.config = config
+        # Compute mode (``SatelliteConfig.compute``): the platform's sessions in
+        # the platform's sandbox, no code, files, tools or leases from the link.
+        self._compute = bool(getattr(config, "compute", False))
+        # Not 0 when the link ended for the process to end with it.
+        self.exit_code = 0
         self.sm = session_manager
         self._ws = None
         self._send_queue: asyncio.Queue = asyncio.Queue(maxsize=_SEND_QUEUE_SIZE)
@@ -384,6 +428,23 @@ class SatelliteWSClient:
         # Optional status sink (the Windows tray). Set via
         # set_status_callback; None = headless, _set_status is a no-op.
         self._status_cb = None  # Callable[[str], None] | None
+        # This sign-in's id, from the platform's answer (0.5.170): repeated
+        # in both alive frames so the platform never reads a pair queued at
+        # an earlier sign-in as this one's. "" from an older platform.
+        self._report_id = ""
+        # Until when the platform said it would be away (``platform_stopping``,
+        # monotonic), None when it said nothing. Cleared at each sign-in.
+        self.platform_back_by: float | None = None
+        self._fingerprint_task: asyncio.Task | None = None
+
+    def platform_hold_s(self) -> int:
+        """Seconds left of the time the platform said it would be away, 0
+        when it said nothing or the time is over."""
+        back_by = self.platform_back_by
+        if back_by is None:
+            return 0
+        left = back_by - time.monotonic()
+        return int(left) + 1 if left > 0 else 0
 
     def set_status_callback(self, cb) -> None:
         """Register a sink for status transitions (the tray's set_status).
@@ -467,6 +528,7 @@ class SatelliteWSClient:
                 backoff = _RECONNECT_BACKOFF_BASE
             writer_task: asyncio.Task | None = None
             heartbeat_task: asyncio.Task | None = None
+            signed_in_at: float | None = None
             # The local link is checked (and healed) before the socket opens,
             # so the auth capabilities carry a port that answers and the
             # check never eats into the platform's auth window.
@@ -497,10 +559,11 @@ class SatelliteWSClient:
                     # us (otherwise queued messages would race the auth frame).
                     await self._authenticate()
                     logger.info("Authenticated with platform")
-                    # The backoff resets only once the platform accepted us:
-                    # a refused auth (4001, a 1013 the platform could not
-                    # check this machine now) keeps doubling to the cap.
-                    backoff = _RECONNECT_BACKOFF_BASE
+                    # A sign-in alone does not reset the backoff: a link that
+                    # signs in and drops again keeps doubling it (below). A
+                    # refused auth (4001, a 1013 the platform could not check
+                    # this machine now) keeps doubling to the cap.
+                    signed_in_at = time.monotonic()
                     self._set_status("connected")
 
                     # Start writer + heartbeat tasks.
@@ -518,12 +581,24 @@ class SatelliteWSClient:
             except _InsecureUninstallRefused:
                 await asyncio.sleep(_INSECURE_RECONNECT_WAIT_S)
                 continue
+            except compute_link.ComputeSignInRefused as refused:
+                self.exit_code = compute_link.ended(self.config, refused)
+                return
             except ConnectionClosed as e:
                 logger.warning("WS connection closed: %d %s", e.code, e.reason)
                 # Close code 4006 (machine_deleted) → run the uninstall script +
                 # exit instead of looping forever.
                 if e.code == 4006:
-                    if getattr(self, "_insecure_link", False):
+                    if self._compute:
+                        # No mark here: the close comes before the platform's
+                        # delete commits, and a delete that fails leaves this
+                        # sign-in good. A removed machine's next sign-in is
+                        # refused and marked then.
+                        logger.error("compute mode: the platform no longer has this machine: ending, so "
+                                     "its start reads the sign-in the platform wrote again")
+                        self.exit_code = compute_link.COMPUTE_REREAD_EXIT
+                        return
+                    if self._takes_no_code:
                         self._log_insecure_refusal("the 4006 close")
                         await asyncio.sleep(_INSECURE_RECONNECT_WAIT_S)
                         continue
@@ -570,17 +645,23 @@ class SatelliteWSClient:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
                 # Fail any in-flight tunneled HTTP streams so subprocess
-                # hooks return 502 immediately instead of waiting for the
-                # 7-day permission timeout.
+                # hooks are answered at once instead of waiting for the
+                # 7-day permission timeout: 503 for a request that never
+                # left (its frames go), 502 for one that did.
                 # A running app step has nobody to report to: kill its tree
                 # (the proxy marks the delivery dead when the link drops).
                 try:
                     self.sm.kill_steps("the link to the platform dropped")
                 except Exception:
                     logger.exception("kill_steps failed")
+                try:
+                    self.sm.tool_relay.close_all("the link to the platform dropped")
+                except Exception:
+                    logger.exception("closing the relayed tools failed")
                 if self.tunnel is not None:
                     try:
-                        self.tunnel.fail_all_streams("tunnel-disconnected")
+                        self.tunnel.fail_all_streams(
+                            "tunnel-disconnected", unsent=self.drop_unsent_requests())
                     except Exception:
                         logger.exception("fail_all_streams failed")
                 # Purge the PTY mirror lane (after the writer is torn down so
@@ -623,10 +704,20 @@ class SatelliteWSClient:
             if self._paused:
                 continue
 
+            # A link that held is a fresh start. One that signed in and
+            # dropped sooner waits at most the signed-in cap.
+            ceiling = backoff
+            if signed_in_at is not None:
+                if time.monotonic() - signed_in_at >= _STABLE_LINK_S:
+                    backoff = _RECONNECT_BACKOFF_BASE
+                # The climb stops here too: a refused connect right after a
+                # short link must not wait out the whole reconnect window.
+                backoff = min(backoff, _RECONNECT_BACKOFF_SIGNED_IN_CAP)
+                ceiling = backoff
             # Jittered sleep: 50–100% of the current backoff ceiling. The
             # jitter de-synchronizes a fleet's reconnects after a shared
             # proxy outage; the low cap keeps recovery snappy.
-            delay = backoff * (0.5 + random.random() * 0.5)
+            delay = ceiling * (0.5 + random.random() * 0.5)
             logger.info("Reconnecting in %.0fs...", delay)
             self._set_status("reconnecting")
             await asyncio.sleep(delay)
@@ -650,7 +741,9 @@ class SatelliteWSClient:
             logger.warning("tunnel: the local link check (%s) failed", trigger, exc_info=True)
 
     def _heartbeat_frame(self) -> dict:
+        memory = memory_guard.frame_fields(self._compute)
         return {
+            **memory,
             "type": "heartbeat",
             "load": _get_system_load(),
             # All live agent sessions: headless (-p/codex) + interactive PTY
@@ -662,6 +755,7 @@ class SatelliteWSClient:
             # The local link's state (0.5.168): ``tunnel_ok``,
             # ``local_tunnel_port``, ``tunnel_rebinds``, ``last_tunnel_error``.
             **(self.tunnel.state() if self.tunnel is not None else {}),
+            **credential_exit.state(),
         }
 
     async def heartbeat_now(self) -> None:
@@ -791,23 +885,40 @@ class SatelliteWSClient:
     def drop_bulk(self, matches) -> int:
         """Drop the queued bulk frames ``matches(frame)`` picks (a pull the
         platform gave up on), keeping the others in order."""
+        return self._drop_from(self._bulk_send_queue, matches)
+
+    @staticmethod
+    def _drop_from(lane: asyncio.Queue, matches) -> int:
+        """Drop the frames of ``lane`` that ``matches(frame)`` picks, keeping
+        the others in order. Nothing awaits in between, so no producer and no
+        writer sees the lane half emptied."""
         kept, dropped = [], 0
         while True:
             try:
-                frame = self._bulk_send_queue.get_nowait()
+                frame = lane.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            if matches(frame):
+            if isinstance(frame, dict) and matches(frame):
                 dropped += 1
             else:
                 kept.append(frame)
         for frame in kept:
-            self._bulk_send_queue.put_nowait(frame)
+            lane.put_nowait(frame)
         return dropped
 
     def _lanes_empty(self) -> bool:
         return (self._send_queue.empty() and self._pty_send_queue.empty()
                 and self._bulk_send_queue.empty())
+
+    def _link_open(self) -> bool:
+        """The socket still takes a frame. A send on one that is closing
+        writes nothing and waits for the connection to be lost (websockets),
+        and the connect loop then cancels the writer with the frame it took:
+        gone, with no error. Checked before a frame is taken, with no await
+        until the send, which writes at once on an open socket. An object
+        with no ``state`` counts as open."""
+        ws = self._ws
+        return ws is not None and getattr(ws, "state", State.OPEN) is State.OPEN
 
     async def _writer_loop(self) -> None:
         """Single coroutine that owns ws.send(), draining THREE lanes
@@ -823,11 +934,14 @@ class SatelliteWSClient:
 
         On send failure: requeue to the SAME lane (slight reorder accepted over
         loss) then exit — the outer connect_forever loop reconnects and a fresh
-        writer drains the persisted lanes.
+        writer drains the persisted lanes. Once the socket is closing it takes
+        no frame at all (``_link_open``).
         """
         pty_run = 0
         try:
             while True:
+                if not self._link_open():
+                    return
                 # Control-first: prefer a ready control frame, else one pty frame
                 # (or a bulk one after a run of them), else one bulk frame, else
                 # sleep until a producer signals via _send_wakeup.
@@ -880,20 +994,100 @@ class SatelliteWSClient:
         except asyncio.CancelledError:
             return
 
+    @property
+    def _takes_no_code(self) -> bool:
+        """This link takes no code and no uninstall: it is plaintext with
+        ``allow_insecure_transport``, or this process is a compute machine
+        (its code is its image's, its removal the operator's)."""
+        return bool(getattr(self, "_insecure_link", False)) or bool(self._compute)
+
     def _log_insecure_refusal(self, what: str) -> None:
-        """Said once per kind: the frame a plaintext link cannot carry."""
+        """Said once per kind: the frame this link cannot carry, with the
+        reason it cannot."""
         seen = getattr(self, "_insecure_refusals", None)
         if seen is None:
             seen = self._insecure_refusals = set()
         if what in seen:
             return
         seen.add(what)
+        if self._compute and not getattr(self, "_insecure_link", False):
+            logger.warning(
+                "%s ignored: a compute machine takes no code and no uninstall from "
+                "the platform. Update or remove it where it was started.", what,
+            )
+            return
         logger.error(
             "SECURITY: %s refused: this satellite's link is plaintext with "
             "allow_insecure_transport, so no code and no uninstall is taken from it. "
             "Update or remove it by hand: re-run the installer, or uninstall.sh.",
             what,
         )
+
+    async def _refuse_on_compute(self, msg_type: str, msg: dict) -> None:
+        """A frame a compute machine never acts on: it reads the platform's
+        folders itself, so no file, tool, login file or session move
+        reaches it, and no lease is held here. Answered as an error when the
+        platform waits for an answer."""
+        logger.warning("%s refused: a compute machine takes no files, tools or leases "
+                       "from the platform", msg_type)
+        why = "a compute machine takes no files, tools or leases from the platform"
+        cid = msg.get("command_id")
+        if cid:
+            await self.enqueue_send({"type": "ack", "command_id": cid, "status": "error", "error": why})
+        rid = msg.get("request_id")
+        if rid and msg_type in _REQUEST_ANSWERS:
+            # A request the platform waits on by its own id (a pull, a
+            # manifest page): its answer frame with the error, so the wait
+            # ends now and not at its stall.
+            await self.enqueue_send({"type": _REQUEST_ANSWERS[msg_type], "request_id": rid,
+                                     "path": str(msg.get("path") or ""), "error": why})
+
+    def _note_replays_turns_of(self, resp: dict) -> None:
+        """The engines whose live sessions the report lists with their turn
+        (the platform replays them); a platform that names none replays the
+        table's default (``engines.DEFAULT_REPLAYS``), as every platform
+        before 2.0 did."""
+        replays = resp.get("replays_turns_of")
+        self.sm.replays_turns_of = (
+            frozenset(x for x in replays if isinstance(x, str))
+            if isinstance(replays, list) else DEFAULT_REPLAYS)
+
+    async def _send_terminals_again(self, ptys: dict, platform_acks: bool) -> None:
+        """Each terminal's lines past the platform's last ack go again, and
+        those of a terminal the platform acked nothing of yet when the new
+        link's platform says it acks (``transcript_acks``). A terminal that
+        rewinds drops its own lines still queued from before the sign-in.
+        A terminal whose read fails is passed over: it never ends the sign-in."""
+        for sid, session in list(ptys.items()):
+            send_again = getattr(session, "send_again", None)
+            if send_again is None:
+                continue
+            try:
+                await send_again(platform_acks, functools.partial(self._drop_queued_lines, sid))
+            except Exception:  # noqa: BLE001  # one terminal's read must not refuse the machine's sign-in
+                logger.warning("PTY %s: its lines could not be sent again at the sign-in",
+                               sid[:8], exc_info=True)
+
+    def drop_unsent_requests(self) -> set[str]:
+        """The tunneled requests still on the control lane at a drop never
+        reached the platform: their frames go (a chunk follows its request
+        on the lane), and their ids come back for ``fail_all_streams``. The
+        next link then never carries a hook call its caller was answered
+        for and may have sent again."""
+        unsent: set[str] = set()
+
+        def never_left(frame: dict) -> bool:
+            if frame.get("type") == "http_request":
+                unsent.add(str(frame.get("stream_id") or ""))
+                return True
+            return frame.get("type") == "http_request_chunk" and frame.get("stream_id") in unsent
+
+        self._drop_from(self._send_queue, never_left)
+        return unsent
+
+    def _drop_queued_lines(self, session_id: str) -> int:
+        return self._drop_from(self._send_queue, lambda frame: (
+            frame.get("type") == "transcript_lines" and frame.get("session_id") == session_id))
 
     async def _authenticate(self) -> None:
         """Send auth message directly, wait for auth_result (5s timeout)."""
@@ -903,6 +1097,12 @@ class SatelliteWSClient:
             caps.update(self.tunnel.state())
         if getattr(self, "_insecure_link", False):
             caps["insecure_transport"] = True
+        if self._compute:
+            # The claims the platform admits a compute row by (and refuses a
+            # paired row with), and its memory, so the first session after
+            # the sign-in is admitted on a report.
+            caps.update(compute_link.claims(self.config))
+        caps.update(memory_guard.frame_fields(self._compute))
         auth_msg = {
             "type": "auth",
             "machine_id": self.config.machine_id,
@@ -922,9 +1122,15 @@ class SatelliteWSClient:
         # loop hasn't started yet at this point, so without handling
         # update_required during auth the connection would hard-fail.
         if resp.get("type") == "update_required":
-            if getattr(self, "_insecure_link", False):
+            if self._takes_no_code:
                 self._log_insecure_refusal("update_required")
-                raise ConnectionError("update refused on a plaintext link")
+                raise ConnectionError(
+                    "update refused on a plaintext link" if getattr(self, "_insecure_link", False)
+                    else "update refused on a compute machine's link")
+            refused = claim_update(resp)
+            if refused:
+                logger.info("Update to %s not applied: %s", resp.get("target_version", "?"), refused)
+                raise ConnectionError(f"update not applied: {refused}")
             logger.info(
                 "Received update_required during auth %s → %s — applying",
                 resp.get("previous_version", "?"),
@@ -933,12 +1139,15 @@ class SatelliteWSClient:
             # Run synchronously: the os.replace + systemctl restart need
             # to complete before we hand back control. If extract fails,
             # _self_update_and_restart logs + returns; outer loop reconnects.
-            await _self_update_and_restart(resp)
+            await _apply_update(resp)
             # If _self_update_and_restart didn't sys.exit (extract or
             # hash check failed), raise so the outer loop reconnects
             # and the proxy can retry the push next time.
             raise ConnectionError("update_required handler returned without restart")
         if resp.get("status") != "ok":
+            refused = compute_link.refusal(self.config, resp) if self._compute else None
+            if refused is not None:
+                raise refused
             # Server-driven self-uninstall: when the platform rejects auth
             # with action="uninstall" (machine deleted from dashboard /
             # user-settings), run the uninstaller + exit instead of looping
@@ -948,7 +1157,7 @@ class SatelliteWSClient:
             # ConnectionError previously short-circuited before code 4006
             # was observed.
             if resp.get("action") == "uninstall":
-                if getattr(self, "_insecure_link", False):
+                if self._takes_no_code:
                     self._log_insecure_refusal("uninstall")
                     raise _InsecureUninstallRefused()
                 logger.warning(
@@ -962,15 +1171,34 @@ class SatelliteWSClient:
             raise ConnectionError(f"Auth rejected: {resp}")
         self._authenticated = True
         self._link_down_since = None
+        self.platform_back_by = None
+        self._report_id = str(resp.get("report_id") or "")
+        named = {"report_id": self._report_id} if self._report_id else {}
+        self._note_replays_turns_of(resp)
+        memory_guard.set_policy(resp.get("memory_policy"))
+        start_slots.set_bound(resp.get("session_starts"))
+        # The platform's outgoing proxy for this machine's credential exit
+        # (the install's own compute machine alone gets one), in memory.
+        from ..sessions import credential_exit
+        credential_exit.set_platform_egress(resp.get("egress_proxy"), compute=self._compute)
 
         # Report our live interactive PTY session ids so the proxy can
         # reconcile on reconnect — re-adopt survivors, exit the dead, reap orphans.
         # Always sent (empty on a fresh connect). Queued now; the writer task
         # (started after auth) drains it AFTER any output buffered during the drop.
+        # Each terminal's open (``open_token``): a platform that takes one back
+        # closes it and hears its exit by that open alone.
+        ptys = self.sm.pty_sessions
         await self.enqueue_send({
             "type": "pty_alive",
-            "session_ids": list(self.sm.pty_sessions.keys()),
+            "session_ids": list(ptys.keys()),
+            "open_tokens": {sid: s.open_token for sid, s in ptys.items()
+                            if getattr(s, "open_token", "")},
+            **named,
         })
+        # The lines a terminal sent past the platform's last ack go again,
+        # after the report (the platform takes the terminal back first).
+        await self._send_terminals_again(ptys, resp.get("transcript_acks") is True)
 
         # Headless twin of pty_alive: live CLI sessions + their in-flight
         # turn state, so a RESTARTED proxy can re-adopt running turns
@@ -979,7 +1207,7 @@ class SatelliteWSClient:
         from ..sessions import alive_report
         frame = alive_report.sessions_alive_frame(self.sm)
         if frame is not None:
-            await self.enqueue_send(frame)
+            await self.enqueue_send({**frame, **named})
 
         # Cache the satellite-host policy locally so
         # we can re-validate satellite_host file writes/reads in
@@ -1096,6 +1324,7 @@ class SatelliteWSClient:
         "http_response": "_frame_http_response",
         "http_response_chunk": "_frame_http_response",
         "pong": "_frame_pong",
+        "platform_stopping": "_frame_platform_stopping",
     }
 
     async def _dispatch_frame(self, msg_type, msg: dict) -> None:
@@ -1103,6 +1332,10 @@ class SatelliteWSClient:
         answered here. A type that is not a string is unknown, as no frame
         type ever equals it."""
         if isinstance(msg_type, str):
+            if self._compute and (compute_link.refuses(self.config, msg_type)
+                                  or not credential_exit.takes_gateway_frame(msg_type, msg)):
+                await self._refuse_on_compute(msg_type, msg)
+                return
             spawned = _SPAWNED_FRAMES.get(msg_type)
             if spawned is not None:
                 method, with_client = spawned
@@ -1181,7 +1414,7 @@ class SatelliteWSClient:
             })
 
     async def _frame_uninstall(self, msg: dict) -> None:
-        if getattr(self, "_insecure_link", False):
+        if self._takes_no_code:
             # Code and the end of the install never come over a
             # plaintext link: refused, said once.
             self._log_insecure_refusal("uninstall")
@@ -1193,7 +1426,7 @@ class SatelliteWSClient:
         spawn(_self_uninstall_and_exit(), name="uninstall", owner="link")
 
     async def _frame_update_required(self, msg: dict) -> None:
-        if getattr(self, "_insecure_link", False):
+        if self._takes_no_code:
             self._log_insecure_refusal("update_required")
             return
         # Auto-update: platform pushed a fresh
@@ -1201,6 +1434,14 @@ class SatelliteWSClient:
         # via systemd, the new code reconnects on the new
         # version. WS close 4007 is sent right after this
         # message by the proxy.
+        refused = claim_update(msg)
+        if refused:
+            # The version running here, or a second push while one applies
+            # (an older platform, a script, a replayed frame): read, so
+            # answered, and dropped.
+            logger.info("Update to %s not applied: %s", msg.get("target_version", "?"), refused)
+            await self._acknowledge_update(msg)
+            return
         logger.info(
             "Received update_required %s → %s — applying",
             msg.get("previous_version", "?"),
@@ -1209,8 +1450,12 @@ class SatelliteWSClient:
         # Say the push arrived before applying it (the update
         # task blocks this loop while it unpacks, then exits):
         # the proxy counts a rollback only for a delivered push.
-        await self._acknowledge_update(msg)
-        spawn(_self_update_and_restart(msg), name="update", owner="link")
+        try:
+            await self._acknowledge_update(msg)
+        except BaseException:
+            release_update()
+            raise
+        spawn(_apply_update(msg), name="update", owner="link")
 
     async def _frame_local_session_reply(self, msg: dict) -> None:
         # otodock-CLI: response to our local_session_open / _list request.
@@ -1227,6 +1472,17 @@ class SatelliteWSClient:
 
     async def _frame_pong(self, msg: dict) -> None:
         """The heartbeat's answer: nothing to do."""
+
+    async def _frame_platform_stopping(self, msg: dict) -> None:
+        """The platform is about to stop and says for how long at most
+        (0.5.170): the local link then tells a held call how long to hold
+        (``hold_s`` on its 502 and 503). 0 takes an earlier frame back.
+        Anything but an integer from 0 to 3600 is ignored."""
+        raw = msg.get("back_within_s")
+        if isinstance(raw, bool) or not isinstance(raw, int) or not 0 <= raw <= 3600:
+            return
+        self.platform_back_by = time.monotonic() + raw if raw else None
+        logger.info("The platform says it stops for up to %d s", raw)
 
     async def _heartbeat_loop(self) -> None:
         """Send heartbeat every 20s with system load info.
@@ -1263,25 +1519,6 @@ class SatelliteWSClient:
                 return
             last_tick = now
             last_sleep_clock = now_sleep_clock
-            # Recompute per-agent STAT fingerprints at most every
-            # _FINGERPRINT_INTERVAL — off-thread so a large tree never blocks the
-            # loop; the cached value rides intervening heartbeats. The proxy gates
-            # its idle-sync sweep on these. Best-effort.
-            if now - last_fp_compute >= _FINGERPRINT_INTERVAL:
-                try:
-                    self._agent_fingerprints = await asyncio.to_thread(
-                        self.sm.compute_agent_fingerprints
-                    )
-                    last_fp_compute = now
-                except Exception:  # noqa: BLE001  # the heartbeat loop's fingerprint step: a raise stops heartbeats
-                    logger.debug("fingerprint compute failed", exc_info=True)
-                try:
-                    await asyncio.to_thread(
-                        _sweep_satellite_screenshots,
-                        self.sm.config.agents_dir, _SCREENSHOTS_KEEP,
-                    )
-                except Exception:  # noqa: BLE001  # the heartbeat loop's screenshot sweep: a raise stops heartbeats
-                    logger.debug("screenshots sweep failed", exc_info=True)
             # The local link answers, or is healed, before its state rides
             # the frame (a tunnel listener can die inside a living process).
             await self._check_tunnel("the heartbeat")
@@ -1289,3 +1526,30 @@ class SatelliteWSClient:
                 await self.enqueue_send(self._heartbeat_frame())
             except Exception:
                 logger.exception("heartbeat enqueue failed")
+            # The per-agent STAT fingerprints (the proxy gates its idle-sync
+            # sweep on them) and the screenshot sweep run after the frame, at
+            # most every _FINGERPRINT_INTERVAL, in a task of their own: a
+            # large tree's walk never makes a heartbeat late. The cached
+            # value rides the heartbeats in between. Best-effort.
+            running = self._fingerprint_task
+            if self._compute:
+                continue  # the folders are the platform's: nothing to fingerprint or sweep
+            if now - last_fp_compute >= _FINGERPRINT_INTERVAL and (running is None or running.done()):
+                last_fp_compute = now
+                self._fingerprint_task = spawn(self._refresh_fingerprints(),
+                                               name="fingerprints", owner="link")
+
+    async def _refresh_fingerprints(self) -> None:
+        try:
+            self._agent_fingerprints = await asyncio.to_thread(
+                self.sm.compute_agent_fingerprints
+            )
+        except Exception:  # noqa: BLE001  # the fingerprint step is best effort: the cached value stands
+            logger.debug("fingerprint compute failed", exc_info=True)
+        try:
+            await asyncio.to_thread(
+                _sweep_satellite_screenshots,
+                self.sm.config.agents_dir, _SCREENSHOTS_KEEP,
+            )
+        except Exception:  # noqa: BLE001  # the screenshot sweep is best effort
+            logger.debug("screenshots sweep failed", exc_info=True)

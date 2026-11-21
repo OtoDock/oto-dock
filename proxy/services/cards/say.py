@@ -31,7 +31,8 @@ async def check(chat: dict[str, Any], u) -> None:
     """The gates a composer send takes, before the click is claimed: the
     chat is not being deleted, the person may still open it, somebody is at
     the keyboard (the chat's session, as at the draw), and in the agent's
-    shared space the person holds the edit tier. A refusal queues nothing
+    person may drive it (``visibility.drive_refusal``: the agent's shared
+    space takes the edit tier, a run its own rule). A refusal queues nothing
     and spends no click."""
     from core.events import input_queue
     from core.session import visibility
@@ -42,10 +43,15 @@ async def check(chat: dict[str, Any], u) -> None:
         raise SayRefused(403, st.NO_PERSON)
     if not await asyncio.to_thread(visibility.can_access_chat, u, chat):
         raise SayRefused(403, st.CHAT_NOT_OPEN)
-    agent = str(chat.get("agent") or "")
-    if (visibility.is_shared_chat_owner(chat.get("user_sub")) and not u.is_admin
-            and not roles.can_edit(u.effective_role(agent))):
-        raise SayRefused(403, st.SHARED_NEEDS_EDITOR)
+    refusal = await asyncio.to_thread(visibility.drive_refusal_for, u, chat)
+    if refusal:
+        # The rule's verdict, in the card's own words for a person below the
+        # editor tier in the agent's shared chats.
+        role = u.acting_role(str(chat.get("agent") or ""))
+        if (visibility.is_shared_chat_owner(chat.get("user_sub")) and not roles.is_external(role)
+                and not roles.can_edit(role)):
+            refusal = st.SHARED_NEEDS_EDITOR
+        raise SayRefused(403, refusal)
     q = await input_queue.loaded(chat["id"])
     if len(q.items) >= input_queue.CAP:
         raise SayRefused(409, st.TOO_MANY_QUEUED)

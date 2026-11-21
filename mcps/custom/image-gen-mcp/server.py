@@ -1,4 +1,4 @@
-"""Image Generation MCP Server — AI image generation via Nano Banana Pro and GPT Image 1.5.
+"""Image Generation MCP Server — AI image generation via Nano Banana Pro and GPT Image 2.6.
 
 Stdio transport. Generates images from text prompts, saves full-res to disk,
 pushes resized preview inline to dashboard. Cost is now declared in the
@@ -10,6 +10,7 @@ import asyncio
 import base64
 import contextlib
 import io
+import json
 import logging
 import os
 import uuid
@@ -69,27 +70,49 @@ def _vendor_available(byo_key: str) -> bool:
     return _hosted() or bool(byo_key)
 
 
-def _vendor_request_args(vendor: str, path: str) -> tuple[str, dict, dict]:
-    """Build (url, headers, params) for a POST to ``vendor`` + ``path``.
+def _vendor_request_args(vendor: str, path: str) -> tuple[str, dict]:
+    """Build (url, headers) for a POST to ``vendor`` + ``path``.
 
     Hosted: route through the OtoDock relay — ``{OTODOCK_RELAY_BASE}/{vendor}{path}``
     with a per-user Bearer token; the relay injects the real vendor key, meters the
-    call, and proxies. BYO: hit the vendor directly with the configured key (Gemini
-    via ``?key=``, OpenAI via ``Authorization: Bearer``). The hosted branch is
-    identical for every vendor — only the BYO auth differs. ``OTODOCK_RELAY_BASE``
-    already includes the manifest ``relay_path`` (``/v1/relay``)."""
+    call, and proxies. BYO: hit the vendor directly with the configured key, each in
+    a header of its own (Gemini ``x-goog-api-key``, OpenAI ``Authorization: Bearer``),
+    never in the address: where the credential exit carries the key, the tool holds a
+    placeholder the exit fills in that header alone. The hosted branch is identical for every
+    vendor — only the BYO auth differs. ``OTODOCK_RELAY_BASE`` already includes the
+    manifest ``relay_path`` (``/v1/relay``)."""
     headers: dict = {}
-    params: dict = {}
     if _hosted():
         base = os.environ["OTODOCK_RELAY_BASE"].rstrip("/")
         headers["Authorization"] = f"Bearer {os.environ['OTODOCK_RELAY_TOKEN']}"
-        return f"{base}/{vendor}{path}", headers, params
+        return f"{base}/{vendor}{path}", headers
     base = _VENDOR_BASE[vendor]
     if vendor == "google-ai":
-        params["key"] = GOOGLE_AI_API_KEY
+        headers["x-goog-api-key"] = GOOGLE_AI_API_KEY
     elif vendor == "openai-image":
         headers["Authorization"] = f"Bearer {OPENAI_IMAGE_API_KEY}"
-    return f"{base}{path}", headers, params
+    return f"{base}{path}", headers
+
+
+def _api_error_message(model: str, e: httpx.HTTPStatusError) -> str:
+    """A refusal with the answer's own words beside its status: the relay's names
+    what it refused (``{"detail": "model_not_allowed", "model": …}``), a vendor's
+    its reason."""
+    status = e.response.status_code
+    try:
+        detail = json.dumps(e.response.json())[:300]
+    except ValueError:
+        detail = e.response.text[:300]
+    if _hosted():
+        who, key = "The OtoDock relay", ""
+    elif model == "gpt-image":
+        who, key = "OpenAI", "OPENAI_IMAGE_API_KEY"
+    else:
+        who, key = "Google AI", "GOOGLE_AI_API_KEY"
+    if status in (401, 403) and key:
+        return (f"{who} rejected the request ({status}). Check {key} in the image-gen-mcp "
+                f"admin page, and that the account behind it has access. Detail: {detail}")
+    return f"{who} answered {status}: {detail}"
 
 
 def _unavailable_msg(provider_label: str, key_name: str) -> str:
@@ -144,7 +167,9 @@ async def list_tools() -> list[Tool]:
                 "The image is saved to disk and displayed to the user in the chat.\n\n"
                 "Default model: Nano Banana Pro (Google) — best for photorealism, "
                 "product shots, text in images.\n"
-                "Use model='gpt-image' for text-heavy images, iterative editing, or creative work.\n\n"
+                "Use model='gpt-image' (GPT Image 2.6) for text-heavy images, iterative editing, "
+                "or creative work. Its standard quality runs Flare, made for fast iteration; "
+                "high runs Sunburst, made for detailed work.\n\n"
                 "By default the image is saved under the workspace's `generated-assets/` "
                 "subfolder with an auto-generated filename. Pass `save_path` (relative or "
                 "absolute under the workspace) to save into a specific subfolder."
@@ -232,7 +257,8 @@ async def list_tools() -> list[Tool]:
                         "default": "standard",
                         "description": (
                             "GPT Image only: 'high' for sharper, more detailed edits "
-                            "(higher cost); 'standard' (medium) is the default."
+                            "(higher cost); 'standard' (medium) is the default. "
+                            "GPT Image edits run on GPT Image 2.6 Sunburst."
                         ),
                     },
                     "mask_path": {
@@ -324,7 +350,7 @@ async def _push_image_preview(image_bytes: bytes, mime: str, caption: str) -> bo
         img = Image.open(io.BytesIO(image_bytes))
         if max(img.size) > MAX_PREVIEW_DIM:
             img.thumbnail((MAX_PREVIEW_DIM, MAX_PREVIEW_DIM), Image.LANCZOS)
-        # JPEG can't encode an alpha channel; gpt-image-1 returns transparent PNGs.
+        # JPEG can't encode an alpha channel; GPT Image can return transparent PNGs.
         # Flatten onto white before encoding.
         if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
             rgba = img.convert("RGBA")
@@ -465,18 +491,34 @@ def _get_save_path(save_path: str | None, ext: str = "png") -> str:
     return full
 
 
+# A button pressed by someone who may only read the workspace, or who reaches
+# no folder of the agent, runs this tool over a read only workspace or none.
+SAVE_REFUSED = "This session cannot save files here, so nothing was made."
+
+
+def _save_refusal() -> str | None:
+    """Asked before any paid call: the sentence when the workspace every save
+    is anchored under takes no write (read only, or not there), else None.
+    The vendor is never paid for a file that cannot be kept. An unset
+    ``IMAGE_SAVE_DIR`` is left to ``_get_save_path``'s own error."""
+    if IMAGE_SAVE_DIR and not os.access(IMAGE_SAVE_DIR, os.W_OK):
+        return SAVE_REFUSED
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Provider: Nano Banana Pro (Google AI)
 # ---------------------------------------------------------------------------
 
-_GEMINI_IMAGE_MODEL = "gemini-3-pro-image-preview"
+_GEMINI_IMAGE_MODEL = "gemini-3-pro-image"
 
 
 async def _generate_nano_banana(prompt: str, aspect_ratio: str, quality: str, num_images: int) -> list[bytes]:
     """Generate images using Nano Banana Pro (Google Gemini image generation).
 
     Calls the Gemini REST ``generateContent`` endpoint directly via httpx so the
-    request routes through the OtoDock relay in hosted mode (else BYO ``?key=``)."""
+    request routes through the OtoDock relay in hosted mode (else BYO, the key in
+    ``x-goog-api-key``)."""
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -484,13 +526,13 @@ async def _generate_nano_banana(prompt: str, aspect_ratio: str, quality: str, nu
             "imageConfig": {"aspectRatio": aspect_ratio},
         },
     }
-    url, headers, params = _vendor_request_args(
+    url, headers = _vendor_request_args(
         "google-ai", f"/v1beta/models/{_GEMINI_IMAGE_MODEL}:generateContent",
     )
     images: list[bytes] = []
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         for _ in range(num_images):
-            resp = await client.post(url, params=params, headers=headers, json=body)
+            resp = await client.post(url, headers=headers, json=body)
             resp.raise_for_status()
             img = _extract_gemini_image(resp.json())
             if img:
@@ -518,11 +560,11 @@ async def _edit_nano_banana(image_path: str, prompt: str) -> bytes:
         ]}],
         "generationConfig": {"responseModalities": ["IMAGE"]},
     }
-    url, headers, params = _vendor_request_args(
+    url, headers = _vendor_request_args(
         "google-ai", f"/v1beta/models/{_GEMINI_IMAGE_MODEL}:generateContent",
     )
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(url, params=params, headers=headers, json=body)
+        resp = await client.post(url, headers=headers, json=body)
         resp.raise_for_status()
         img = _extract_gemini_image(resp.json())
     if img is None:
@@ -531,20 +573,39 @@ async def _edit_nano_banana(image_path: str, prompt: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Provider: GPT Image 1.5 (OpenAI)
+# Provider: GPT Image 2.6 (OpenAI)
 # ---------------------------------------------------------------------------
+
+# OpenAI positions the two: Sunburst "for detailed visual work" and "where editing
+# precision matters most", Flare "for fast iteration". So `high` and every edit
+# take Sunburst, `standard` takes Flare.
+_OPENAI_IMAGE_MODELS = {"standard": "gpt-image-2.6-flare", "high": "gpt-image-2.6-sunburst"}
+_OPENAI_EDIT_MODEL = "gpt-image-2.6-sunburst"
+_OPENAI_LABELS = {
+    "gpt-image-2.6-flare": "GPT Image 2.6 Flare",
+    "gpt-image-2.6-sunburst": "GPT Image 2.6 Sunburst",
+}
+
+
+def _openai_model(quality: str) -> str:
+    return _OPENAI_IMAGE_MODELS["high" if quality == "high" else "standard"]
+
+
+def _model_label(model: str, openai_model: str) -> str:
+    return "Nano Banana Pro" if model == "nano-banana" else _OPENAI_LABELS[openai_model]
+
 
 async def _generate_openai(prompt: str, aspect_ratio: str, quality: str, num_images: int) -> list[bytes]:
     """Generate images using OpenAI GPT Image (REST /v1/images/generations via httpx)."""
     size = OPENAI_SIZE_MAP.get(aspect_ratio, "1024x1024")
     q = "high" if quality == "high" else "medium"
     body = {
-        "model": "gpt-image-1", "prompt": prompt,
+        "model": _openai_model(quality), "prompt": prompt,
         "n": num_images, "size": size, "quality": q,
     }
-    url, headers, params = _vendor_request_args("openai-image", "/v1/images/generations")
+    url, headers = _vendor_request_args("openai-image", "/v1/images/generations")
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(url, params=params, headers=headers, json=body)
+        resp = await client.post(url, headers=headers, json=body)
         resp.raise_for_status()
         data = resp.json()
     images = [
@@ -562,13 +623,13 @@ async def _edit_openai(image_path: str, prompt: str, mask_path: str | None,
 
     Multipart passes through the relay intact (the relay forwards the raw body +
     Content-Type and injects the vendor key)."""
-    url, headers, params = _vendor_request_args("openai-image", "/v1/images/edits")
+    url, headers = _vendor_request_args("openai-image", "/v1/images/edits")
     # Send an explicit quality + size so the hosted relay prices the edit
     # deterministically (its variant matrix) instead of the safe-high fallback.
     # 'high' → sharper/pricier; anything else → 'medium' (the default). Mirrors
     # _generate_openai's quality mapping.
     q = "high" if quality == "high" else "medium"
-    form = {"model": "gpt-image-1", "prompt": prompt, "n": "1",
+    form = {"model": _OPENAI_EDIT_MODEL, "prompt": prompt, "n": "1",
             "size": "1024x1024", "quality": q}
     # Handles enter the stack as they open, so a failure between open and
     # send can't leak them past the with.
@@ -582,7 +643,7 @@ async def _edit_openai(image_path: str, prompt: str, mask_path: str | None,
                              stack.enter_context(open(mask_path, "rb")))  # noqa: ASYNC230  # httpx reads the open file as it uploads it
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             resp = await client.post(
-                url, params=params, headers=headers, data=form, files=files,
+                url, headers=headers, data=form, files=files,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -613,13 +674,16 @@ async def _handle_generate(args: dict) -> list[TextContent]:
     else:
         full_prompt = prompt
 
-    model_label = "Nano Banana Pro" if model == "nano-banana" else "GPT Image 1.5"
+    model_label = _model_label(model, _openai_model(quality))
 
     # Check provider availability (hosted relay supplies the key, else BYO).
     if model == "nano-banana" and not _vendor_available(GOOGLE_AI_API_KEY):
         return [TextContent(type="text", text=_unavailable_msg("Google AI (Nano Banana)", "GOOGLE_AI_API_KEY"))]
     if model == "gpt-image" and not _vendor_available(OPENAI_IMAGE_API_KEY):
         return [TextContent(type="text", text=_unavailable_msg("OpenAI Image", "OPENAI_IMAGE_API_KEY"))]
+    refused = _save_refusal()
+    if refused:
+        return [TextContent(type="text", text=refused)]
 
     # Show skeleton placeholder
     await _push_generating(prompt, model)
@@ -670,6 +734,10 @@ async def _handle_generate(args: dict) -> list[TextContent]:
             ),
         )]
 
+    except httpx.HTTPStatusError as e:
+        await _push_failed()
+        logger.warning("Image generation refused: %s", e)
+        return [TextContent(type="text", text=f"Error generating image: {_api_error_message(model, e)}")]
     except Exception as e:
         await _push_failed()
         logger.exception("Image generation failed: %s", e)
@@ -689,12 +757,15 @@ async def _handle_edit(args: dict) -> list[TextContent]:
     save_path = args.get("save_path")
     quality = args.get("quality", "standard")
 
-    model_label = "Nano Banana Pro" if model == "nano-banana" else "GPT Image 1.5"
+    model_label = _model_label(model, _OPENAI_EDIT_MODEL)
 
     if model == "nano-banana" and not _vendor_available(GOOGLE_AI_API_KEY):
         return [TextContent(type="text", text=_unavailable_msg("Google AI (Nano Banana)", "GOOGLE_AI_API_KEY"))]
     if model == "gpt-image" and not _vendor_available(OPENAI_IMAGE_API_KEY):
         return [TextContent(type="text", text=_unavailable_msg("OpenAI Image", "OPENAI_IMAGE_API_KEY"))]
+    refused = _save_refusal()
+    if refused:
+        return [TextContent(type="text", text=refused)]
 
     await _push_generating(prompt, model)
 
@@ -722,6 +793,10 @@ async def _handle_edit(args: dict) -> list[TextContent]:
             text=f"Edited image with {model_label}. Displayed to user. Saved to: {path}",
         )]
 
+    except httpx.HTTPStatusError as e:
+        await _push_failed()
+        logger.warning("Image edit refused: %s", e)
+        return [TextContent(type="text", text=f"Error editing image: {_api_error_message(model, e)}")]
     except Exception as e:
         await _push_failed()
         logger.exception("Image edit failed: %s", e)

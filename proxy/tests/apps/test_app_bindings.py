@@ -30,7 +30,7 @@ from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
 from core.session import session_state
-from services.apps import app_handlers, app_supervisor, app_tokens, releases
+from services.apps import app_handlers, app_supervisor, app_tokens, call_rate, releases
 from storage import database as task_store, db_app_deliveries as deliveries
 from storage.agents import agent_store
 from storage.pg import get_conn
@@ -89,7 +89,7 @@ def _clean(monkeypatch):
     app_bindings._inflight.clear()
     app_handlers._drains.clear()
     app_handlers.mark_dirty()
-    monkeypatch.setattr(app_proxy, "PLATFORM_RATE", 1000.0)
+    monkeypatch.setattr(call_rate, "RESERVE", 1000.0)
     yield
     app.dependency_overrides.pop(get_current_user, None)
     app_supervisor._instances.clear()
@@ -624,3 +624,251 @@ def test_one_slug_pattern_matched_whole():
     assert slugs.APP_SLUG_RE.fullmatch("home-panel")
     assert not slugs.APP_SLUG_RE.fullmatch("home-panel\n")
     assert not slugs.APP_SLUG_RE.fullmatch("-x") and not slugs.APP_SLUG_RE.fullmatch("a" * 41)
+
+
+# ── a department's apps read its own members ───────────────────────────────
+
+LEDGER = [{"name": "ledger", "agent": "clerk", "app": "ledger"}]
+LEDGER_EXPORTS = {"methods": {"summary": {"description": "the figures"},
+                              "secret": {"description": "editors only", "min_role": "editor"}},
+                  "snapshots": {"board": {"description": "the board"}},
+                  "events": {"entry-added": {"description": "an entry"}}}
+
+
+def _department(name: str, members: dict[str, str], *, record: bool = True) -> dict:
+    """A department of two levels holding ``members`` (template → slug), the
+    head on top and the rest below, wired down and across: recorded the way
+    a set install records it, or made by hand (``record`` False)."""
+    from services.departments import edge_compiler
+    from storage.agents import db_departments
+    for template, slug in members.items():
+        if agent_store.get_agent(slug) is None:
+            agent_store.create_agent(slug, slug.title(), created_by="alice-sub", community_template=template,
+                                     community_template_version="1.0.0")
+        (config.AGENTS_DIR / slug / "workspace").mkdir(parents=True, exist_ok=True)
+    dept = db_departments.create_department(
+        name, "alice-sub", mode="down_across", reach="adjacent", level_names=["Head", "Team"],
+        community_set="office" if record else "", community_set_version="0.1.0" if record else "")
+    levels = {lv["name"]: lv["id"] for lv in dept["levels"]}
+    placements = [(slug, levels["Head" if template == "head" else "Team"]) for template, slug in members.items()]
+    db_departments.place_members(dept["id"], placements, dict(members) if record else None)
+    edge_compiler.recompile()
+    return dept
+
+
+def _reached(caller: dict, method: str = "summary", headers: dict | None = None):
+    """One call over the caller's ``ledger`` binding: the answer and the
+    claim the broker minted for the app that took it."""
+    inst = app_supervisor.get(caller["id"]) or _install(caller)
+    r = client.get(f"/v1/apps/{caller['id']}/bindings/ledger/{method}",
+                   headers={"Authorization": f"Bearer {inst.token}", **(headers or {})})
+    return r, (_Target.seen[-1]["headers"]["x-otodock-caller"] if r.status_code == 200 else "")
+
+
+def _took(claim: str, row: dict) -> bool:
+    """The claim was minted for ``row``: that app took the call."""
+    return bool(claim) and app_tokens.verify(claim, row["id"], app_tokens.PURPOSE_CALLER) is not None
+
+
+def _two_departments(target_server: int) -> dict:
+    d1 = _department("Lady G", {"head": "head", "clerk": "clerk"})
+    d2 = _department("Lady H", {"head": "head-2", "clerk": "clerk-2"})
+    out = {"d1": d1, "d2": d2}
+    for suffix, head, clerk in (("1", "head", "clerk"), ("2", "head-2", "clerk-2")):
+        out[f"board{suffix}"] = _row(head, "board", bindings=LEDGER)
+        out[f"ledger{suffix}"] = _row(clerk, "ledger", exports=LEDGER_EXPORTS)
+        _install(out[f"ledger{suffix}"], port=target_server)
+    return out
+
+
+def test_each_department_reads_its_own_member_over_the_broker_and_the_snapshot(agent_tree, target_server):
+    o = _two_departments(target_server)
+    for n in ("1", "2"):
+        r, took = _reached(o[f"board{n}"])
+        assert r.status_code == 200, r.text
+        assert _took(took, o[f"ledger{n}"]), n
+        (releases.app_data_dir(o[f"ledger{n}"]) / "exports").mkdir(parents=True, exist_ok=True)
+        (releases.app_data_dir(o[f"ledger{n}"]) / "exports" / "board.json").write_text(json.dumps({"boat": n}))
+    for n in ("1", "2"):
+        inst = app_supervisor.get(o[f"board{n}"]["id"])
+        r = client.get(f"/v1/apps/{o[f'board{n}']['id']}/bindings/ledger/snapshot/board",
+                       headers={"Authorization": f"Bearer {inst.token}"})
+        assert r.status_code == 200 and r.json() == {"boat": n}, r.text
+        assert r.headers["x-otodock-snapshot-of"] == o[f"ledger{n}"]["id"]
+    from services.apps import binding_target
+    assert binding_target.following(o["board2"]) == ["ledger"]
+
+
+def test_two_departments_never_read_each_other_even_over_a_manual_edge(agent_tree, target_server):
+    o = _two_departments(target_server)
+    # A person wires the second head to the first department's member by hand.
+    agent_store.set_delegation_targets("head-2", ["clerk"])
+    r, took = _reached(o["board2"])
+    assert r.status_code == 200 and _took(took, o["ledger2"])
+    # The recorded member leaves its department: the place reads nothing, and
+    # the binding never falls back to the agent its manifest names literally.
+    agent_store.update_agent("clerk-2", department_id="", department_level_id="")
+    r, _ = _reached(o["board2"])
+    assert r.status_code == 404
+    # Another agent of the template placed there (a placement the rule let
+    # through) fills the empty place, and is read: inside the department.
+    agent_store.create_agent("clerk-x", "Clerk X", created_by="alice-sub", community_template="clerk")
+    (config.AGENTS_DIR / "clerk-x" / "workspace").mkdir(parents=True, exist_ok=True)
+    team = next(lv["id"] for lv in o["d2"]["levels"] if lv["name"] == "Team")
+    agent_store.update_agent("clerk-x", department_id=o["d2"]["id"], department_level_id=team)
+    clerk_x = _row("clerk-x", "ledger", exports=LEDGER_EXPORTS)
+    _install(clerk_x, port=target_server)
+    from services.departments import edge_compiler
+    edge_compiler.recompile()
+    r, took = _reached(o["board2"])
+    assert r.status_code == 200 and _took(took, clerk_x)
+    # The agent that left comes back: the place is taken, it is not read.
+    agent_store.update_agent("clerk-2", department_id=o["d2"]["id"], department_level_id=team)
+    edge_compiler.recompile()
+    r, took = _reached(o["board2"])
+    assert r.status_code == 200 and _took(took, clerk_x)
+    # The first department still reads its own.
+    r, took = _reached(o["board1"])
+    assert r.status_code == 200 and _took(took, o["ledger1"])
+
+
+def test_a_standalone_agent_and_a_hand_made_department_read_the_agent_named(agent_tree, target_server):
+    _department("By hand", {"head": "head", "clerk": "clerk"}, record=False)
+    board = _row("head", "board", bindings=LEDGER)
+    ledger = _row("clerk", "ledger", exports=LEDGER_EXPORTS)
+    _install(ledger, port=target_server)
+    r, took = _reached(board)
+    assert r.status_code == 200 and _took(took, ledger)
+    from services.apps import binding_target
+    assert binding_target.following(board) == []
+    # A standalone copy of the template gains no reach: its binding names
+    # the agent, and without an edge to it there is nothing.
+    agent_store.create_agent("solo", "Solo", created_by="alice-sub", community_template="head")
+    (config.AGENTS_DIR / "solo" / "workspace").mkdir(parents=True, exist_ok=True)
+    solo = _row("solo", "board", bindings=LEDGER)
+    r, _ = _reached(solo)
+    assert r.status_code == 404
+    agent_store.set_delegation_targets("solo", ["clerk"])
+    r, took = _reached(solo)
+    assert r.status_code == 200 and _took(took, ledger)
+
+
+def test_the_recorded_new_copy_is_read_while_the_old_copy_stays_placed(agent_tree, target_server):
+    from services.departments import edge_compiler
+    from storage.agents import db_departments
+    o = _two_departments(target_server)
+    agent_store.create_agent("clerk-3", "Clerk 3", created_by="alice-sub", community_template="clerk")
+    (config.AGENTS_DIR / "clerk-3" / "workspace").mkdir(parents=True, exist_ok=True)
+    new = _row("clerk-3", "ledger", exports=LEDGER_EXPORTS)
+    _install(new, port=target_server)
+    team = next(lv["id"] for lv in o["d1"]["levels"] if lv["name"] == "Team")
+    db_departments.place_members(o["d1"]["id"], [("clerk-3", team)], {"head": "head", "clerk": "clerk-3"})
+    edge_compiler.recompile()
+    assert agent_store.get_agent("clerk")["department_id"] == o["d1"]["id"]
+    r, took = _reached(o["board1"])
+    assert r.status_code == 200 and _took(took, new)
+
+
+def test_a_freed_slug_is_read_only_once_placed_and_another_template_never(agent_tree, target_server):
+    from services.departments import edge_compiler
+    from storage.agents import db_departments
+    o = _two_departments(target_server)
+    agent_store.delete_agent("clerk-2")
+    assert db_departments.set_member(o["d2"]["id"], "clerk") == ""
+    # A new agent takes the freed slug: the empty place does not name it.
+    agent_store.create_agent("clerk-2", "Clerk 2", created_by="alice-sub", community_template="clerk")
+    (config.AGENTS_DIR / "clerk-2" / "workspace").mkdir(parents=True, exist_ok=True)
+    fresh = _row("clerk-2", "ledger", exports=LEDGER_EXPORTS)
+    _install(fresh, port=target_server)
+    r, _ = _reached(o["board2"])
+    assert r.status_code == 404
+    # Placed in the department, it fills the empty place and is read.
+    team = next(lv["id"] for lv in o["d2"]["levels"] if lv["name"] == "Team")
+    agent_store.update_agent("clerk-2", department_id=o["d2"]["id"], department_level_id=team)
+    edge_compiler.recompile()
+    r, took = _reached(o["board2"])
+    assert r.status_code == 200 and _took(took, fresh)
+    # A recorded agent of another template is not read under this name.
+    agent_store.create_agent("odd", "Odd", created_by="alice-sub", community_template="scribe")
+    (config.AGENTS_DIR / "odd" / "workspace").mkdir(parents=True, exist_ok=True)
+    db_departments.place_members(o["d2"]["id"], [("odd", team)], {"head": "head-2", "clerk": "odd"})
+    _install(_row("odd", "ledger", exports=LEDGER_EXPORTS), port=target_server)
+    edge_compiler.recompile()
+    r, _ = _reached(o["board2"])
+    assert r.status_code == 404
+
+
+def test_the_member_reached_still_passes_the_gate(agent_tree, target_server):
+    from services.departments import edge_compiler
+    from storage.agents import db_departments
+    o = _two_departments(target_server)
+    viewer = _viewer_claim(o["board2"]["id"])
+    # The floor is judged on the member reached, and the refusal names the
+    # binding, never that agent.
+    r, _ = _reached(o["board2"], "secret", {"X-OtoDock-Viewer": viewer})
+    assert r.status_code == 403 and "binding ledger" in r.text and "clerk-2" not in r.text
+    task_store.add_user_agent("alice-sub", "clerk-2", "editor", "test")
+    r, took = _reached(o["board2"], "secret", {"X-OtoDock-Viewer": viewer})
+    assert r.status_code == 200 and _took(took, o["ledger2"])
+    # An unapproved member app, then a department that wires nothing.
+    task_store.clear_app_approval(o["ledger2"]["id"])
+    r, _ = _reached(o["board2"])
+    assert r.status_code == 404
+    fresh = task_store.get_app(o["ledger2"]["id"])
+    task_store.approve_app_actions(fresh["id"], task_store.manifest_sig(fresh), "alice-sub")
+    db_departments.update_department(o["d2"]["id"], mode="off")
+    edge_compiler.recompile()
+    r, _ = _reached(o["board2"])
+    assert r.status_code == 404
+
+
+def test_a_personal_caller_is_judged_on_the_member_reached(agent_tree, target_server):
+    o = _two_departments(target_server)
+    # A row on the agent the manifest names, none on the member reached:
+    # nothing, never the named agent.
+    for agent in ("head-2", "clerk"):
+        task_store.add_user_agent("alice-sub", agent, "viewer", "test")
+    (config.AGENTS_DIR / "head-2" / "users" / "alice" / "workspace").mkdir(parents=True, exist_ok=True)
+    mine = _row("head-2", "mine", bindings=LEDGER, username="alice", owner="alice-sub")
+    r, _ = _reached(mine)
+    assert r.status_code == 404
+    task_store.add_user_agent("alice-sub", "clerk-2", "viewer", "test")
+    r, took = _reached(mine)
+    assert r.status_code == 200 and _took(took, o["ledger2"])
+    claim = app_tokens.verify(_Target.seen[-1]["headers"]["x-otodock-caller"], o["ledger2"]["id"],
+                              app_tokens.PURPOSE_CALLER)
+    assert claim["principal"] == "membership" and claim["sub"] == "alice-sub"
+
+
+def test_an_event_reaches_only_its_own_department_and_a_stale_index_delivers_nothing(agent_tree, monkeypatch):
+    monkeypatch.setattr(app_handlers, "schedule_drain", lambda app_id: None)
+    _department("Lady G", {"head": "head", "clerk": "clerk"})
+    _department("Lady H", {"head": "head-2", "clerk": "clerk-2"})
+    on = {"on_event": {"refresh": ["app:ledger:entry-added"]}}
+    board1 = _row("head", "board", bindings=LEDGER, handlers=on)
+    board2 = _row("head-2", "board", bindings=LEDGER, handlers=on)
+    ledger2 = _row("clerk-2", "ledger", exports=LEDGER_EXPORTS)
+    hdr = {"Authorization": f"Bearer {_install(ledger2).token}"}
+    r = client.post(f"/v1/apps/{ledger2['id']}/events", json={"name": "entry-added"}, headers=hdr)
+    assert r.status_code == 200 and r.json()["delivered"] == 1, r.text
+    assert len(deliveries.recent(board2["id"])) == 1 and deliveries.recent(board1["id"]) == []
+    # The member leaves while the index still lists the subscriber: the
+    # subscriber's binding is read again at the emit and nothing goes out.
+    agent_store.update_agent("clerk-2", department_id="", department_level_id="")
+    r = client.post(f"/v1/apps/{ledger2['id']}/events", json={"name": "entry-added"}, headers=hdr)
+    assert r.status_code == 200 and r.json()["delivered"] == 0
+    assert len(deliveries.recent(board2["id"])) == 1
+
+
+def test_the_app_list_says_which_bindings_read_inside_the_department(agent_tree, target_server):
+    o = _two_departments(target_server)
+    task_store.add_user_agent("alice-sub", "head-2", "manager", "test")
+    _as(_user(agent_roles={AGENT_A: "manager", "head-2": "manager"}))
+    rows = {a["slug"]: a for a in client.get("/v1/apps", params={"agent": "head-2"}).json()["apps"]}
+    assert rows["board"]["bindings_follow"] == ["ledger"]
+    # The declaration stays as declared beside it.
+    assert rows["board"]["bindings"] == LEDGER
+    _row(AGENT_A, "plain", bindings=CRM)
+    rows = {a["slug"]: a for a in client.get("/v1/apps", params={"agent": AGENT_A}).json()["apps"]}
+    assert rows["plain"]["bindings_follow"] == [] and o["d2"]["id"]
+

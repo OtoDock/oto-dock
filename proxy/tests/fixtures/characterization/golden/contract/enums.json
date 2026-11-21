@@ -1,0 +1,48 @@
+{
+ "MachineReach": {
+  "AWAY": "away",
+  "AWAY_RECENT": "away_recent",
+  "CONNECTED": "connected",
+  "LOCAL": "local"
+ },
+ "ResumeVerdict": {
+  "FRESH": "fresh",
+  "RESUMABLE": "resumable",
+  "UNKNOWN": "unknown"
+ },
+ "reach_bad_value": {
+  "raised": "ValueError",
+  "text": "'nope' is not a valid MachineReach"
+ },
+ "reach_truth": {
+  "AWAY": true,
+  "AWAY_RECENT": true,
+  "CONNECTED": true,
+  "LOCAL": true
+ },
+ "resume_bad_value": {
+  "raised": "ValueError",
+  "text": "'nope' is not a valid ResumeVerdict"
+ },
+ "resume_by_value": "ResumeVerdict.UNKNOWN",
+ "resume_compare": true,
+ "resume_if": {
+  "raised": "TypeError",
+  "text": "a ResumeVerdict is compared to its members, never read as a bool"
+ },
+ "resume_is_not_str": false,
+ "resume_truth": {
+  "FRESH": {
+   "raised": "TypeError",
+   "text": "a ResumeVerdict is compared to its members, never read as a bool"
+  },
+  "RESUMABLE": {
+   "raised": "TypeError",
+   "text": "a ResumeVerdict is compared to its members, never read as a bool"
+  },
+  "UNKNOWN": {
+   "raised": "TypeError",
+   "text": "a ResumeVerdict is compared to its members, never read as a bool"
+  }
+ }
+}

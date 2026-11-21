@@ -23,12 +23,12 @@ from fastapi import Query, WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 
 import config
-from adapters.phone import is_outbound
+from adapters.phone import INBOUND, OUTBOUND, is_outbound
 from core.config.phone_config_builder import (
     build_phone_agent_config,
     resolve_phone_execution_target,
 )
-from core.events import common_events as _ce
+from core.events import common_events as _ce, turn_ending
 from core.events.common_events import (
     ERROR,
     PRODUCER_DONE,
@@ -36,12 +36,16 @@ from core.events.common_events import (
 )
 from core.events.stream_pump import ChatStreamPump, _active_pumps
 from core.execution_layer import AgentConfig, ExecutionLayer, ResumeVerdict
+from core.sandbox.sandbox import own_engine_home
 from core.session import external_identity, session_kind
 from core.session.resume_probe import RESUME_PROBE_BUDGET_INLINE_S, settle_resume
-from core.session.session_manager import get_execution_layer
-from core.session.visibility import PHONE_CHAT_OWNER
-from services.phone import call_control
+from core.session.session_manager import get_execution_layer, live_session
+from core.session.visibility import PHONE_CHAT_OWNER, is_phone_chat_owner
+from services.phone import call_chats, call_control
 from services.phone.phone_identity import (
+    IDENTITY_MODE_AGENT,
+    IDENTITY_MODE_SHARED,
+    IDENTITY_MODE_USER,
     RouteIdentity,
     pop_call_identity,  # noqa: F401 — re-exported for the handler + tests
     remember_call_identity,
@@ -51,7 +55,7 @@ from storage import database as task_store
 from storage.agents.schema import DEFAULT_EXECUTION_PATH
 from storage.automation import trigger_store
 from storage.phone import phone_route_store
-from ws import phone_attach, wire_events as wire
+from ws import chat_phase, phone_attach, wire_events as wire
 
 logger = logging.getLogger("otodock")
 
@@ -60,11 +64,62 @@ logger = logging.getLogger("otodock")
 _CLAIM_WAIT_S = 5.0
 
 
+def _call_chat_owner(identity: RouteIdentity | None, agent: str) -> str:
+    """Who owns a call's chat: a route tied to a person makes the call that
+    person's own chat (their history on the agent, the shared one on a
+    Shared-only agent); every other call is a conversation of the agent's
+    Conversations tab (the ``phone`` owner)."""
+    if identity is not None and identity.mode == IDENTITY_MODE_USER and identity.user:
+        from core.session.visibility import chat_history_owner
+        return chat_history_owner(agent, identity.user.get("sub") or "")
+    return PHONE_CHAT_OWNER
+
+
+def _conversation_line(identity: RouteIdentity | None) -> str:
+    """The line a conversation of the Conversations tab came on."""
+    from storage.chat import conversation_store
+    mode = identity.mode if identity is not None else IDENTITY_MODE_SHARED
+    if mode == IDENTITY_MODE_AGENT:
+        return conversation_store.LINE_AGENT
+    if mode == IDENTITY_MODE_SHARED:
+        return conversation_store.LINE_SHARED
+    return conversation_store.LINE_CALLER
+
+
+def _create_call_chat(chat_id: str, agent: str, identity: RouteIdentity | None, *,
+                      execution_path: str, session_id: str, identity_id: str,
+                      call_type: str) -> dict:
+    """The call's chat row, linked to its session and its outside person, and
+    the conversation's record when the call is the agent's conversation. One
+    store job (a worker thread)."""
+    from core.permission_modes import UNATTENDED_MODE
+    from core.session.chat_rebuild import new_chat_mode
+    from storage.chat import conversation_store
+    owner = _call_chat_owner(identity, agent)
+    # The call's own session runs unattended from its config. A person's chat
+    # is theirs after the call, so it is stored as a new chat of theirs.
+    mode = (UNATTENDED_MODE if owner == PHONE_CHAT_OWNER
+            else new_chat_mode(agent, owner, identity.user_role if identity else ""))
+    row = task_store.create_chat(
+        chat_id, owner, agent, mode,
+        model=config.get_cli_model(agent),
+        execution_path=execution_path,
+        source_type=session_kind.PHONE.source_type,
+    )
+    task_store.update_chat(chat_id, session_id=session_id, external_identity_id=identity_id)
+    if owner == PHONE_CHAT_OWNER:
+        conversation_store.create(
+            chat_id, agent, line=_conversation_line(identity),
+            direction=OUTBOUND if is_outbound(call_type) else INBOUND, identity_id=identity_id)
+    return row
+
+
 def _validated_reuse_sid(existing_sid, agent_name: str) -> str:
     """A pre-warmed session id the daemon asks to reuse is honoured ONLY when
-    it is a UUID that names a phone chat of THIS agent — the daemon holds the
-    master key, but it must not be able to attach a call to an arbitrary live
-    session (a dashboard chat, another agent's call)."""
+    it is a UUID that names a phone-owned chat of THIS agent — the daemon
+    holds the master key, but it must not be able to attach a call to an
+    arbitrary live session (a dashboard chat, another agent's call, a
+    person's own call)."""
     if not existing_sid:
         return ""
     try:
@@ -73,21 +128,55 @@ def _validated_reuse_sid(existing_sid, agent_name: str) -> str:
         logger.warning("WS warmup: ignoring non-UUID session_id in reuse request")
         return ""
     chat = task_store.get_chat_by_session(sid)
-    if not chat or session_kind.of_chat(chat) is not session_kind.PHONE or chat.get("agent") != agent_name:
+    if (not chat or session_kind.of_chat(chat) is not session_kind.PHONE or chat.get("agent") != agent_name
+            or not is_phone_chat_owner(chat.get("user_sub"))):
         logger.warning(
             "WS warmup: ignoring reuse of session %s — not a phone chat of agent %s",
             sid[:8], agent_name,
         )
         return ""
+    # A conversation whose wrap-up began is over: no call speaks into it again.
+    from storage.chat import conversation_store
+    record = conversation_store.get(chat.get("id") or "")
+    if record is not None and record.get("wrapup"):
+        logger.warning("WS warmup: ignoring reuse of session %s — its call has ended", sid[:8])
+        return ""
     return sid
 
 
+def _touch_identity(identity: RouteIdentity | None, agent_name: str) -> str:
+    """The row of the outside person this call is with (a durable id and a
+    tree), touched at warmup: its id for the chat row, "" for a user's
+    call, a withheld id or a line that keeps no callers."""
+    ext = identity.external if identity is not None else None
+    if ext is None or ext.ephemeral or not ext.has_tree or not ext.id:
+        return ""
+    from storage.identity import external_identity_store
+    return external_identity_store.touch(agent_name, ext.channel, ext.id, ext.slug, verified=ext.verified)
+
+
 def _external_home_for(identity: RouteIdentity | None, agent_name: str) -> str:
-    """Host path of the call's caller tree ("" when the identity has none)."""
+    """Host path of the call's durable caller tree ("" when the identity
+    has none; a scratch home is the built context's, ``_home_of``)."""
     if identity is None or identity.external is None or not identity.external.has_tree:
         return ""
     home = external_identity.external_home(config.get_agent_dir(agent_name), identity.external)
     return str(home) if home is not None else ""
+
+
+def _home_of(session_id: str | None, fallback: str = "") -> str:
+    """The home of a session's registered context (the durable tree, or
+    the scratch one the builder made), else ``fallback``."""
+    from core.session.session_state import get_session_security
+    ctx = get_session_security(session_id) if session_id else None
+    return external_identity.external_home_of(ctx) or fallback
+
+
+def _ephemeral_home_of(session_id: str | None, fallback: str = "") -> str:
+    """The home to prune at the session's end: a withheld number's tree or
+    a scratch home, never a durable one."""
+    home = _home_of(session_id, fallback)
+    return home if external_identity.is_ephemeral_home(home) else ""
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +238,13 @@ def _pump_item_to_phone_ws(item: dict, turn_id: int) -> dict | None:
         return {"type": wire.DONE, "turn": turn_id, "data": {}}
 
     elif pump_type == wire.PUMP_ERROR:
-        return {"type": wire.ERROR, "turn": turn_id, "data": {
-            "message": item.get("message", "Unknown error"),
-        }}
+        data = {"message": item.get("message", "Unknown error")}
+        if item.get("say"):
+            # What the caller hears for this ending (``TurnEnding.spoken``):
+            # a phone service that knows the field says it, an older one
+            # ignores it and says its own apology.
+            data["say"] = item["say"]
+        return {"type": wire.ERROR, "turn": turn_id, "data": data}
 
     return None
 
@@ -238,7 +331,14 @@ class _PhoneCall:
         self.websocket = websocket
         self.session_id: str | None = None
         self.chat_id: str | None = None
-        self.layer: ExecutionLayer | None = None  # resolved on warmup
+        # The chat this call writes in, its session and its owner, while it
+        # holds it (services/phone/call_chats.py), and the earlier ones a
+        # second warm-up's new chat did not let go of.
+        self.held: tuple[str, str, str] = ("", "", "")
+        self.earlier_held: list[tuple[str, str, str]] = []
+        self.layer: ExecutionLayer | None = None  # the holder of the call's own session
+        # The box the call's slot names (unknown for a reused pre-warm).
+        self.slot_box: str | None = None
         self.model_name: str = "personal-assistant"
         self.first_turn = True
         # Set by a graceful abort; the NEXT turn's dispatch carries the duplex-
@@ -250,7 +350,6 @@ class _PhoneCall:
         # history) — a heal-rebuild without it just resolves ${trigger.*} empty.
         self.call_type: str = "inbound"
         self.phone_context_override: str = ""
-        self.phone_mode = False
         # The daemon understands ``call_control`` frames (its warmup says so):
         # the session carries the call tools instead of the markers alone.
         self.call_tools = False
@@ -263,6 +362,9 @@ class _PhoneCall:
         # A call that runs inside the caller's own chat (ws/phone_attach.py):
         # the socket borrows the chat's session instead of warming one.
         self.attach: phone_attach.CallAttach | None = None
+        # Why the call could not start, "" for one that did or never tried:
+        # a turn sent anyway ends with what the caller hears (``_refuse_start``).
+        self.refused = ""
 
         # Turns stream from tasks so the handler's receive loop stays responsive to
         # "abort" (barge-in) and follow-up "chat" while a turn is in flight.
@@ -318,7 +420,7 @@ class _PhoneCall:
             # The user row and the first title land on the chat's writer
             # lane, off the loop, before the turn runs (its rows follow them).
             from core.events import chat_writer
-            await chat_writer.submit(
+            row_id = await chat_writer.submit(
                 cast("str", self.chat_id),
                 functools.partial(task_store.add_chat_message, cast("str", self.chat_id), "user", prompt),
                 label="phone_user_row",
@@ -333,7 +435,24 @@ class _PhoneCall:
                 )
                 self.first_turn = False
 
-            prompt = await self._heal_dead_process(prompt)
+            try:
+                prompt = await self._heal_dead_process(prompt, row_id)
+            except Exception as e:
+                from core import placement as _placement
+                refused = isinstance(e, _placement.PlacementRefused)
+                if not (refused or not self.phone_started):
+                    raise   # a call that ran and stumbles: the turn's own error below
+                # The call's engine cannot be started: it never ran (the
+                # warm-up's start failed and this turn tried again), or no
+                # place can take it now. The caller hears the one sentence;
+                # the reason is the phone service's log line.
+                if refused:
+                    logger.info("phone turn %s: the call's session was not started: %s", turn_id, e)
+                else:
+                    logger.exception("phone turn %s: the call's session did not start: %s", turn_id, e)
+                await self.send({"type": wire.ERROR, "turn": turn_id,
+                                 "data": {"message": str(e), "say": turn_ending.SPOKEN_REFUSED}})
+                return
 
             # Interruption note for layers that can't rewrite their own
             # history (an engine that rebuilds it from the DB gets the precise
@@ -439,10 +558,38 @@ class _PhoneCall:
             queue.release(claim)
             self.turn_producers.pop(turn_id, None)
 
-    async def _heal_dead_process(self, prompt: str) -> str:
+    def _layer_for(self, cfg, target: str) -> ExecutionLayer:
+        """The layer a built call runs on: the remote one for the compute
+        placement its config carries (the builder decided it, once), else the
+        layer of ``target``. Never picked before the build: a layer chosen
+        from the target alone is the proxy's own for every call of the
+        platform's place."""
+        from core import placement as _placement
+        built = _placement.compute_of(getattr(getattr(cfg, "security_context", None), "placement", None))
+        return get_execution_layer(self.model_name, execution_target=target, placement_built=built)
+
+    def _slot_terms(self, cfg, target: str | None) -> dict:
+        """What a call's slot is asked for, at its warm-up and at a heal: a
+        unit of the box its session lands on, of its own kind (never evicted
+        and outside the per-person cap); a user-mode route's call is owned by
+        its tied user for the count, and a Direct-LLM call reserves for its
+        stdio MCPs."""
+        from core import placement as _placement
+        built = _placement.compute_of(getattr(getattr(cfg, "security_context", None), "placement", None))
+        identity = self.route_identity
+        return {
+            "kind": "phone",
+            "target": _placement.admission_target(target, built),
+            "execution_path": cfg.execution_path,
+            "user_sub": ((identity.user or {}).get("sub") or None) if identity is not None else None,
+            "mcp_config_path": cfg.mcp_config_path or "",
+        }
+
+    async def _heal_dead_process(self, prompt: str, row_id: int = 0) -> str:
         """Respawn a dead engine process under the same session id before the
         turn runs; returns the prompt, re-seeded with the transcript digest
-        when the history could not be resumed."""
+        when the history could not be resumed. ``row_id`` is this turn's own
+        row, which an engine that rebuilds from the rows leaves out."""
         # Dead-process heal (the dashboard turn chokepoint's twin, cf.
         # ws/headless_resume.py): a hard abort (soft-interrupt watchdog
         # escalation) or a satellite-side death between turns leaves the
@@ -450,20 +597,27 @@ class _PhoneCall:
         # SAME session id with the phone's own config shape (phone
         # prompt + call-scoped MCP set — never the chat-row/dashboard
         # rebuild), resuming the on-disk history when it survives. Fail
-        # toward ALIVE on probe uncertainty; a satellite inside its
-        # reconnect grace window is "reconnecting", not dead. Direct-llm
-        # never process-dies (is_session_process_dead is always False).
+        # toward ALIVE on probe uncertainty. A session whose machine is in
+        # its reconnect grace is waited for first, as a chat's turn is, and
+        # one still away reads reconnecting, not dead: its turn fails at
+        # the link and nothing is rebuilt in its place. Direct LLM has no
+        # process of its own: it reads dead when its tools on a compute
+        # machine were lost.
         # Probe + respawn hold the session lock so overlapping turns
         # (abandoned-turn drain) can't double-heal; the producer takes
         # the same lock again afterwards, sequentially — never nested.
         # Called from run_turn: the call is warmed.
-        async with cast("ExecutionLayer", self.layer).session_lock(cast("str", self.session_id)):
+        sid = cast("str", self.session_id)
+        async with cast("ExecutionLayer", self.layer).session_lock(sid):
             try:
-                _grace = getattr(self.layer, "is_session_grace_held", None)
+                live = live_session(sid)
+                if live is not None and live.grace:
+                    await live.layer.wait_session_reconnect(sid)
+                    live = live_session(sid)
                 proc_dead = (
-                    not (_grace is not None and _grace(self.session_id))
-                    and (await cast("ExecutionLayer", self.layer).is_session_process_dead(cast("str", self.session_id))
-                         or not await cast("ExecutionLayer", self.layer).is_session_alive(cast("str", self.session_id)))
+                    not (live is not None and live.grace)
+                    and (await cast("ExecutionLayer", self.layer).is_session_process_dead(sid)
+                         or not await cast("ExecutionLayer", self.layer).is_session_alive(sid))
                 )
             except Exception:  # noqa: BLE001  # a failed liveness probe reads as a live process
                 proc_dead = False
@@ -477,7 +631,8 @@ class _PhoneCall:
                 # with nothing mutated (the call's cannot-continue path).
                 verdict = await settle_resume(
                     cast("ExecutionLayer", self.layer), cast("str", self.session_id), agent_name=self.model_name, username="",
-                    external_home=_external_home_for(self.route_identity, self.model_name),
+                    external_home=_home_of(self.session_id,
+                                           _external_home_for(self.route_identity, self.model_name)),
                     budget_s=RESUME_PROBE_BUDGET_INLINE_S,
                 )
                 if verdict is ResumeVerdict.UNKNOWN:
@@ -488,7 +643,6 @@ class _PhoneCall:
                     agent_name=self.model_name,
                     call_type=self.call_type,
                     phone_context_override=self.phone_context_override,
-                    phone_mode=self.phone_mode,
                     trigger_payload=self.trigger_payload,
                     route_identity=self.route_identity,
                     session_id=cast("str", self.session_id),
@@ -496,17 +650,38 @@ class _PhoneCall:
                     transfer_targets=self.transfer_targets,
                 )
                 heal_cfg.resume = can_resume
+                rebuilds = (not can_resume and cast("ExecutionLayer", self.layer)
+                            .capabilities_for(cast("str", self.session_id)).behaviour.rebuilds_history_from_db)
+                if rebuilds:
+                    # This engine holds the call in memory only: it comes back
+                    # from the chat's rows, less this turn's own.
+                    heal_cfg.chat_id = self.chat_id or ""
+                    if row_id:
+                        heal_cfg.extra_env["_RESUME_SKIP_ROW"] = str(row_id)
+                terms = self._slot_terms(heal_cfg, heal_cfg.execution_target)
                 try:
-                    await cast("ExecutionLayer", self.layer).start_session(cast("str", self.session_id), heal_cfg)
+                    # Where the rebuilt config says: the compute machine came
+                    # or went since the warm-up, and the session follows it.
+                    heal_layer = self._layer_for(heal_cfg, heal_cfg.execution_target)
+                    await heal_layer.start_session(cast("str", self.session_id), heal_cfg)
                 except Exception:
                     # The build's seat (and the dead session's stale
                     # binding under this id) would otherwise stay counted.
                     from core.config.config_builder import release_config_seat
                     release_config_seat(cast("str", self.session_id), heal_cfg)
                     raise
-                if (not can_resume
-                        and not cast("ExecutionLayer", self.layer).capabilities_for(cast("str", self.session_id))
-                        .behaviour.rebuilds_history_from_db):
+                moved = heal_layer is not self.layer or terms["target"] != self.slot_box
+                self.layer = heal_layer
+                if rebuilds or moved:
+                    # The reaper may have released the slot, and the session
+                    # may have landed on another box than it names: asked now
+                    # that the session's own record is the rebuilt one. A
+                    # refusal leaves the live call as it was reserved, it
+                    # never ends it.
+                    from core.concurrency import rehome_slot
+                    if await rehome_slot(cast("str", self.session_id), **terms):
+                        self.slot_box = terms["target"]
+                if not can_resume and not rebuilds:
                     # History unrecoverable — seed the fresh session with
                     # the DB-transcript digest so the call keeps context.
                     from core.session.history_seed import (
@@ -518,6 +693,49 @@ class _PhoneCall:
                         cast("str", self.chat_id), prompt)
         return prompt
 
+    def _hold_chat(self, row: dict) -> None:
+        """The call writes in its chat from now on: nobody else does until it
+        ends (``visibility.drive_refusal``). A second chat on the same socket
+        (a second warm-up that could not take the first session back) keeps
+        the first held: every hold is let go in the teardown, after the close
+        of every session the socket started."""
+        held = (self.chat_id or "", self.session_id or "", (row or {}).get("user_sub") or "")
+        if self.held[0] and self.held[:2] != held[:2]:
+            self.earlier_held.append(self.held)
+        self.held = held
+        call_chats.hold(held[0], held[1])
+
+    def _own_sessions(self) -> list[str]:
+        """Every session this socket started, the current one first."""
+        sids = [self.session_id or "", *(h[1] for h in (self.held, *self.earlier_held))]
+        return list(dict.fromkeys(s for s in sids if s))
+
+    async def _close_own_sessions(self, sids: list[str]) -> None:
+        """The close of every session this socket started: the current one on
+        its own layer, an earlier one on the layer that holds it."""
+        for sid in sids:
+            live = live_session(sid) if sid != self.session_id else None
+            layer = self.layer if sid == self.session_id else (live.layer if live else None)
+            if layer is None:
+                continue
+            try:
+                await layer.close_session(sid)
+                logger.info("WS session cleaned up: %s", sid)
+            except Exception as e:  # noqa: BLE001  # the call's session cleanup at the socket's end
+                logger.error("WS session cleanup failed: %s", e)
+
+    def _release_chats(self) -> None:
+        """The call ended and its sessions are closed: a person's own chat is
+        theirs again. Its pages hear the chat's ready status, on which a page
+        that shows the call's lock asks for the chat again and opens."""
+        holds = [h for h in (*self.earlier_held, self.held) if h[0]]
+        self.held, self.earlier_held = ("", "", ""), []
+        for chat_id, session_id, owner in holds:
+            call_chats.release(chat_id, session_id)
+            if owner and not is_phone_chat_owner(owner):
+                from services.notifications import notification_manager
+                notification_manager.broadcast_chat_status(owner, chat_id, chat_phase.READY, self.model_name)
+
     async def on_warmup(self, msg: dict) -> None:
         """The daemon's warmup: an attach grant, a pre-warmed session reused,
         or a fresh session built, started and answered with ``warmup_ready``
@@ -527,11 +745,16 @@ class _PhoneCall:
         if not self.model_name:
             await self.send({"type": wire.ERROR, "data": {"message": "Agent name required in warmup 'model' field"}})
             return
+        from core import drain
+        self.refused = ""
+        if drain.holding():
+            # No call starts while the platform holds new work for an update.
+            await self._refuse_start(drain.refusal("OtoDock is updating. Call again in a few minutes."))
+            return
         llm_mode = msg.get("llm_mode", "proxy")  # echoed back for phone server compat
         if msg.get("attach_grant"):
             await self._warmup_attach(msg, llm_mode)
             return
-        self.phone_mode = msg.get("phone_mode", False)
         self.call_type = msg.get("call_type", "inbound")
         self.phone_context_override = msg.get("phone_context_override", "")
         existing_sid = msg.get("session_id")  # pre-warmed session to reuse
@@ -570,7 +793,11 @@ class _PhoneCall:
                 pin_verified, t_warm, llm_mode,
             )
         except Exception as e:
-            logger.exception("WS warmup failed: %s", e)
+            from core import placement as _placement
+            if isinstance(e, _placement.NoComputeMachine):
+                logger.info("WS warmup refused: no compute machine serves the call")
+            else:
+                logger.exception("WS warmup failed: %s", e)
             await self._warmup_failed(e)
 
     async def _warmup_attach(self, msg: dict, llm_mode: str) -> None:
@@ -581,7 +808,7 @@ class _PhoneCall:
         if self.attach is None or self.attach.ended:
             result = await phone_attach.begin(msg, self.send, self.close)
             if isinstance(result, str):
-                await self.send({"type": wire.ERROR, "data": {"message": result}})
+                await self._refuse_start(result)
                 return
             self.attach = result
             self.session_id, self.chat_id = self.attach.session_id, self.attach.chat_id
@@ -594,9 +821,10 @@ class _PhoneCall:
         self, msg: dict, phone_route_id: str, existing_sid: str | None,
         caller_phone: str, pin_verified: bool,
     ) -> tuple[dict | None, str, str, str]:
-        """The route, the transfer targets, the reuse id, the identity, the
-        target and the layer; returns the route, the reuse and fresh ids and
-        the target the paths after it read."""
+        """The route, the transfer targets, the reuse id, the identity and
+        the target; returns the route, the reuse and fresh ids and the target
+        the paths after it read. The layer is the holder of a reused session,
+        else the one the fresh session's own config names."""
         # Identity FIRST (services/phone/phone_identity.py): the
         # route decides who the caller is, which decides the role,
         # the target and the layer. A reuse request is honoured
@@ -616,9 +844,11 @@ class _PhoneCall:
             t for t in ((route or {}).get("transfer_targets") or [])
             if isinstance(t, dict)
         ] if can_transfer else []
-        reuse_sid = await asyncio.to_thread(
-            _validated_reuse_sid, existing_sid, self.model_name,
-        )
+        # A second warm-up naming the session this socket's call writes with
+        # (an outbound call's live pipeline after its pre-warm) is the same
+        # call: its session is taken back, never a second one built.
+        reuse_sid = (self.held[1] if existing_sid and existing_sid == self.held[1]
+                     else await asyncio.to_thread(_validated_reuse_sid, existing_sid, self.model_name))
         fresh_sid = str(uuid.uuid4())
         self.route_identity = await asyncio.to_thread(
             resolve_route_identity, route, agent=self.model_name,
@@ -631,30 +861,28 @@ class _PhoneCall:
         else:
             _target_role, _target_sub = self.route_identity.role, None
         # Resolve the target up front (shared helper → same result
-        # as build_phone_agent_config) so the layer matches where
-        # the (pre-warmed or new) session actually runs.
+        # as build_phone_agent_config): the slot and the layer read it
+        # beside the placement the build carries.
         phone_target = await asyncio.to_thread(
             resolve_phone_execution_target, self.model_name,
             role=_target_role, user_sub=_target_sub,
-        )
-        self.layer = get_execution_layer(
-            self.model_name, execution_target=phone_target,
         )
         return route, reuse_sid, fresh_sid, phone_target
 
     async def _warmup_reuse(self, reuse_sid: str, t_warm: float, llm_mode: str) -> bool:
         """The pre-warmed session the daemon named, when it is still alive: True
         when the warmup was answered on it (the fresh path never runs after it)."""
-        # Reuse pre-warmed session if provided and still alive
-        # (_warmup_prepare set the layer and the identity before this runs).
-        if reuse_sid and await cast("ExecutionLayer", self.layer).is_session_alive(reuse_sid):
+        # Reuse pre-warmed session if provided and still alive: asked of
+        # the layer that holds it, wherever its warm-up placed it
+        # (_warmup_prepare set the identity before this runs).
+        live = live_session(reuse_sid) if reuse_sid else None
+        if live is not None and await live.layer.is_session_alive(reuse_sid):
+            self.layer = live.layer
             self.session_id = reuse_sid
-            self.ephemeral_home = (
-                _external_home_for(self.route_identity, self.model_name)
-                if (ext := cast("RouteIdentity", self.route_identity).external) is not None
-                and ext.ephemeral else ""
-            )
+            self.ephemeral_home = _ephemeral_home_of(
+                reuse_sid, _external_home_for(self.route_identity, self.model_name))
             remember_call_identity(self.session_id, cast("RouteIdentity", self.route_identity).label)
+            _ident_id = await asyncio.to_thread(_touch_identity, self.route_identity, self.model_name)
             # Recover this session's chat_id — the reused connection
             # needs it for chat turns (this branch runs on a NEW ws
             # connection after a daemon reconnect, so chat_id is
@@ -665,6 +893,7 @@ class _PhoneCall:
             )
             if prior:
                 self.chat_id = prior["id"]
+                self._hold_chat(prior)
                 self.first_turn = False
             else:
                 # Link missing (shouldn't happen now that warmup
@@ -674,7 +903,7 @@ class _PhoneCall:
                 _cfg = await build_phone_agent_config(
                     agent_name=self.model_name, call_type=self.call_type,
                     phone_context_override=self.phone_context_override,
-                    phone_mode=self.phone_mode, trigger_payload=None,
+                    trigger_payload=None,
                     route_identity=self.route_identity, session_id=self.session_id,
                     call_tools=self.call_tools, transfer_targets=self.transfer_targets,
                 )
@@ -685,13 +914,11 @@ class _PhoneCall:
                 release_config_seat(self.session_id, _cfg, keep_binding=True)
                 self.chat_id = str(uuid.uuid4())
                 self.first_turn = True
-                _row = task_store.create_chat(
-                    self.chat_id, PHONE_CHAT_OWNER, self.model_name, "auto",
-                    model=config.get_cli_model(self.model_name),
+                _row = await asyncio.to_thread(
+                    _create_call_chat, self.chat_id, self.model_name, self.route_identity,
                     execution_path=_cfg.execution_path or DEFAULT_EXECUTION_PATH,
-                    source_type=session_kind.PHONE.source_type,
-                )
-                task_store.update_chat(self.chat_id, session_id=self.session_id)
+                    session_id=self.session_id, identity_id=_ident_id, call_type=self.call_type)
+                self._hold_chat(_row)
                 from services.apps import catalog as _catalog
                 _catalog.announce_new_chat(_row)
             logger.info(
@@ -746,46 +973,38 @@ class _PhoneCall:
         self.chat_id = str(uuid.uuid4())
         self.first_turn = True
 
-        # _warmup_prepare set the layer and the identity before this runs.
+        # _warmup_prepare set the identity before this runs.
         self.agent_cfg = await build_phone_agent_config(
             agent_name=self.model_name,
             call_type=self.call_type,
             phone_context_override=self.phone_context_override,
-            phone_mode=self.phone_mode,
             trigger_payload=self.trigger_payload,
             route_identity=self.route_identity,
             session_id=self.session_id,
             call_tools=self.call_tools,
             transfer_targets=self.transfer_targets,
         )
-        self.ephemeral_home = (
-            _external_home_for(self.route_identity, self.model_name)
-            if (ext := cast("RouteIdentity", self.route_identity).external) is not None
-            and ext.ephemeral else ""
-        )
+        # The layer of the session this config builds, read off the config:
+        # a compute machine's for a placement there, the target's otherwise.
+        layer = self._layer_for(self.agent_cfg, phone_target)
+        self.ephemeral_home = _ephemeral_home_of(
+            None, external_identity.external_home_of(getattr(self.agent_cfg, "security_context", None))
+            or _external_home_for(self.route_identity, self.model_name)
+            # The agent's own line: its scratch engine home (the config dir's).
+            or own_engine_home(getattr(self.agent_cfg, "security_context", None),
+                               getattr(self.agent_cfg, "sandbox_host_claude_dir", "")))
 
         # Check concurrency limit before spawning session. Phone can
         # run on a remote satellite (phone_target) — pass it so a
         # remote call doesn't consume a local-G slot (its satellite
-        # enforces). Local calls take a unit of the local ceiling,
-        # of their own kind: never evicted and outside the
-        # per-person cap; a user-mode route's call is owned by its
-        # tied user for the count, and a Direct-LLM call reserves
-        # for its stdio MCPs.
+        # enforces).
         from core.concurrency import acquire_chat_slot
         from core.config.config_builder import release_config_seat
-        adm = await acquire_chat_slot(
-            self.session_id, kind="phone", target=phone_target,
-            execution_path=self.agent_cfg.execution_path,
-            user_sub=(cast("RouteIdentity", self.route_identity).user or {}).get("sub") or None,
-            mcp_config_path=self.agent_cfg.mcp_config_path or "",
-        )
+        terms = self._slot_terms(self.agent_cfg, phone_target)
+        adm = await acquire_chat_slot(self.session_id, **terms)
         if not adm:
             release_config_seat(self.session_id, self.agent_cfg)
-            await self.send({
-                "type": wire.ERROR,
-                "data": {"message": adm.user_message},
-            })
+            await self._refuse_start(adm.user_message)
             return
 
         if self.call_tools:
@@ -793,34 +1012,33 @@ class _PhoneCall:
             # come as soon as the first turn runs.
             call_control.bind(self.session_id, self.send,
                               ask_back=is_outbound(self.call_type))
-        await cast("ExecutionLayer", self.layer).start_session(self.session_id, self.agent_cfg)
+        self.slot_box = terms["target"]
+        self.layer = layer
+        await layer.start_session(self.session_id, self.agent_cfg)
         self.phone_started = True
         remember_call_identity(self.session_id, cast("RouteIdentity", self.route_identity).label)
+        _ident_id = await asyncio.to_thread(_touch_identity, self.route_identity, self.model_name)
         # A read-only call is activity too (the retention sweep
         # keys on the tree's newest mtime).
         _home = _external_home_for(self.route_identity, self.model_name)
         if _home:
-            with contextlib.suppress(OSError):
-                Path(_home).touch()  # noqa: ASYNC240  # one utime per call start, before the session's chat link
+            await asyncio.to_thread(external_identity.touch_home, _home)
 
-        # Create chat row for persistence. ``"phone"`` is the
-        # sentinel owner (a call has no real user) + the source_type
-        # discriminator.
+        # Create chat row for persistence: the phone kind, the ``phone``
+        # owner for the agent's conversations, a person's own for a route
+        # tied to them; linked session→chat so a later reconnect that reuses
+        # this pre-warmed session can recover its chat_id (the reuse branch
+        # above resolves session_id but not chat_id — without this the
+        # reconnected connection's chat turns 404 with "No session — send
+        # warmup first").
         execution_path = self.agent_cfg.execution_path or DEFAULT_EXECUTION_PATH
-        _row = task_store.create_chat(
-            self.chat_id, PHONE_CHAT_OWNER, self.model_name, "auto",
-            model=config.get_cli_model(self.model_name),
-            execution_path=execution_path,
-            source_type=session_kind.PHONE.source_type,
-        )
+        _row = await asyncio.to_thread(
+            _create_call_chat, self.chat_id, self.model_name, self.route_identity,
+            execution_path=execution_path, session_id=self.session_id,
+            identity_id=_ident_id, call_type=self.call_type)
+        self._hold_chat(_row)
         from services.apps import catalog as _catalog
         _catalog.announce_new_chat(_row)
-        # Link session→chat so a later reconnect that reuses this
-        # pre-warmed session can recover its chat_id (the reuse
-        # branch above resolves session_id but not chat_id — without
-        # this the reconnected connection's chat turns 404 with
-        # "No session — send warmup first").
-        task_store.update_chat(self.chat_id, session_id=self.session_id)
 
         logger.info(
             "WS warmup: session=%s, chat=%s, "
@@ -851,10 +1069,19 @@ class _PhoneCall:
             # Built, then the spawn failed before binding (the build
             # runs after the id is set).
             release_config_seat(cast("str", self.session_id), self.agent_cfg)
-        await self.send({
-            "type": wire.ERROR,
-            "data": {"message": f"Warmup failed: {e}"},
-        })
+        from core import placement as _placement
+        # A refused place is a sentence for a person (no compute machine
+        # connected, a machine the caller may not use): sent as it is.
+        await self._refuse_start(str(e) if isinstance(e, _placement.PlacementRefused) else f"Warmup failed: {e}")
+
+    async def _refuse_start(self, reason: str | None) -> None:
+        """The call did not start. The phone service gets the platform's
+        ``reason`` (it logs it) and, in ``say``, the one sentence the caller
+        hears for any of them. The reason is kept: a turn the service sends
+        anyway ends with the same sentence (``on_chat``)."""
+        self.refused = reason or "The call could not start."
+        await self.send({"type": wire.ERROR,
+                         "data": {"message": self.refused, "say": turn_ending.SPOKEN_REFUSED}})
 
     async def on_chat(self, msg: dict) -> None:
         """A caller's utterance: one turn as a task (an attach hands it to the
@@ -871,10 +1098,14 @@ class _PhoneCall:
             await phone_attach.utterance(self.attach, msg)
             return
         if not self.session_id or not self.layer or not self.chat_id:
-            await self.send({
-                "type": wire.ERROR,
-                "data": {"message": "No session — send warmup first"},
-            })
+            # A frame of the turn itself: the phone service reads a turn's
+            # frames only, so an answer with no turn would leave the caller
+            # in silence. After a refused start it carries what the caller
+            # hears; the reason is for the service's log.
+            data = {"message": self.refused or "No session — send warmup first"}
+            if self.refused:
+                data["say"] = turn_ending.SPOKEN_REFUSED
+            await self.send({"type": wire.ERROR, "turn": int(msg.get("turn") or 0), "data": data})
             return
 
         turn_id = int(msg.get("turn") or 0)
@@ -935,8 +1166,8 @@ class _PhoneCall:
 
     async def teardown(self) -> None:
         """The socket's end: the turns stopped and awaited, the attach ended or
-        the tools unbound, the session closed and its slot released, an
-        ephemeral caller tree pruned."""
+        the tools unbound, every session it started closed, then its chats let
+        go and the slots released, an ephemeral caller tree pruned."""
         # Stop in-flight turns before tearing the session down, and wait for
         # them — close_session must not race a producer mid-send_message.
         for producer in list(self.turn_producers.values()):
@@ -951,20 +1182,41 @@ class _PhoneCall:
             # The chat keeps its session; the call's pump finishes its notes.
             phone_attach.end(self.attach)
         elif self.session_id:
-            call_control.unbind(self.session_id, self.send)
-        # Cleanup session on disconnect
-        if self.session_id and self.layer:
+            for sid in self._own_sessions():
+                call_control.unbind(sid, self.send)
+        # Cleanup session on disconnect: the call's own sessions, never the
+        # chat's an attach borrowed. A warm-up that failed before it had a
+        # layer still gives back its slot and its caller's scratch tree.
+        if self.session_id and self.attach is None:
+            own = self._own_sessions()
             try:
-                await self.layer.close_session(self.session_id)
-                logger.info("WS session cleaned up: %s", self.session_id)
-            except Exception as e:  # noqa: BLE001  # the call's session cleanup at the socket's end
-                logger.error("WS session cleanup failed: %s", e)
+                await self._close_own_sessions(own)
+            finally:
+                # After the closes, so nobody writes into a call's session.
+                self._release_chats()
             from core.concurrency import release_chat_slot
-            release_chat_slot(self.session_id)
+            for sid in own:
+                release_chat_slot(sid)
             # A caller with no durable identity leaves nothing behind.
             if self.ephemeral_home:
-                if external_identity.prune_ephemeral(Path(self.ephemeral_home)):
+                pruned = await asyncio.to_thread(external_identity.prune_ephemeral, Path(self.ephemeral_home))
+                if pruned:
                     logger.info("WS session %s: ephemeral caller tree pruned", self.session_id[:8])
+        if self.chat_id and self.attach is None and self.session_id:
+            # The wrap-up after the conversation reads the call's rows, so
+            # it starts once they are written; it needs neither the session
+            # nor the caller's scratch tree.
+            from core.background import spawn
+            spawn(_wrap_up(self.chat_id), name=self.chat_id[:8], owner="phone")
+
+
+async def _wrap_up(chat_id: str) -> None:
+    """The call's rows written, its wrap-up (``services/phone/wrapup.py``):
+    nothing for a person's own call."""
+    from core.events import chat_writer
+    from services.phone import wrapup
+    await chat_writer.drain(chat_id, timeout=30)
+    await wrapup.after_call(chat_id)
 
 
 # One method per frame the daemon sends; the close frame and an unknown

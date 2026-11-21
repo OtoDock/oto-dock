@@ -4,12 +4,13 @@ The registry lives in this process only: port, pid, launch token, activity,
 open bridged sockets and backoff per ``(row id, instance)``, where the
 instance is ``LIVE`` (the release the row serves), ``PREVIEW`` (the
 working tree copied for the owner or an editor, with its own data) or
-``CHECK`` (a copy a check or a render runs on scratch data). The
-proxy's death kills every child (pasta dies with the proxy, bwrap with
-pasta), so the table is legitimately empty at boot.
+``CHECK`` (a copy a check or a render runs on scratch data). Every
+server runs on a compute machine (``app_compute``). A new proxy process
+starts with an empty table, and each machine's sign-in closes what another
+process started.
 
 Rules: wake on demand, only for an approved manifest; stdout and stderr in
-one pipe the supervisor owns, written to ``app.log`` in the release
+one stream the supervisor owns, written to ``app.log`` in the release
 directory (outside the app's mounts) and rotated here; health is any HTTP
 answer below 500 to ``GET /_health`` within 20 s; idle stop after ten
 minutes without a request or an open bridged socket; a crash restarts with
@@ -26,8 +27,8 @@ import contextlib
 import http.cookiejar
 import logging
 import os
-import signal
 import socket
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,7 +37,9 @@ from typing import cast
 import httpx
 
 from auth import roles
-from services.apps import app_sandbox, app_tokens, releases
+from core import agent_folder, background
+from services.apps import app_compute, app_sandbox, app_tokens, releases
+from services.infra import safe_fs
 from services.scripts.runner import scrub
 from storage import database as task_store
 
@@ -53,7 +56,6 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_TAIL_LINES = 200
 # The pipe reader's line limit (asyncio's default is 64 KB).
 PIPE_LINE_LIMIT = 1024 * 1024
-BIND_RETRIES = 3
 # Marks in the last log lines that classify an exit as the bucket being
 # full rather than a bug.
 QUOTA_MARKS = ("EDQUOT", "Disk quota exceeded", "SQLITE_FULL", "database or disk is full")
@@ -107,9 +109,12 @@ class Instance:
     release_dir: Path
     data_dir: Path
     host_port: int = 0
+    # Where the server answers: the compute machine's address on the network
+    # only the proxy shares with it.
+    address: str = "127.0.0.1"
     token: str = ""
     entry: str = ""
-    proc: asyncio.subprocess.Process | None = None
+    proc: app_compute.RemoteProcess | None = None
     state: str = STOPPED          # STATES minus the two holds (AppUnavailable carries those)
     started_at: float = 0.0
     last_activity: float = field(default_factory=time.monotonic)
@@ -135,7 +140,10 @@ class Instance:
 
     @property
     def base_url(self) -> str:
-        return f"http://127.0.0.1:{self.host_port}"
+        return f"http://{self.address}:{self.host_port}"
+
+    def ws_url(self, path: str) -> str:
+        return f"ws://{self.address}:{self.host_port}/{path}"
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -164,12 +172,6 @@ def get(row_id: str, name: str = LIVE) -> Instance | None:
 
 def instances() -> list[Instance]:
     return list(_instances.values())
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _allow_hosts(row: dict) -> list[str]:
@@ -202,22 +204,53 @@ async def _write_log(inst: Instance, line: str) -> None:
     await append_log(inst.row, line)
 
 
+#: The apps whose log could not be written, warned of once each.
+_log_refused: set[str] = set()
+
+
+def _clear_odd_name(root: Path, rel: str) -> None:
+    """A link or a special file at a log's name removed (a link goes, its
+    target stays): only the server writes there, and the log must go on."""
+    try:
+        st = safe_fs.lstat_beneath(root, rel)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(st.st_mode) and not stat.S_ISDIR(st.st_mode):
+        safe_fs.unlink_beneath(root, rel, missing_ok=True)
+        logger.warning("App log: removed a %s planted at %s", "link" if stat.S_ISLNK(st.st_mode) else "special file",
+                       rel)
+
+
 async def append_log(row: dict, line: str) -> None:
     """One line into the app's log (``app.log``, rotated at 5 MB): the
-    server's pump and a step's trailer (APPS.md "Steps") share it."""
+    server's pump and a step's trailer (APPS.md "Steps") share it. Written
+    beneath the agent's real folder with no link followed and never waiting
+    on a pipe. A log that cannot be written loses the line, with one WARNING
+    per app, and the pump goes on."""
     path = releases.log_path(row)
 
     def _sync() -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        root, rel = agent_folder.beneath_agent(path, row["agent"])
+        folder, _, name = rel.rpartition("/")
+        rotated = f"{folder}/{name}.1"
+        safe_fs.mkdirs_beneath(root, folder)
+        for each in (rel, rotated):
+            _clear_odd_name(root, each)
         try:
-            if path.is_file() and path.stat().st_size >= LOG_MAX_BYTES:
-                os.replace(path, path.with_suffix(".log.1"))
+            if safe_fs.lstat_beneath(root, rel).st_size >= LOG_MAX_BYTES:
+                safe_fs.rename_beneath(root, rel, rotated, replace=True)
         except OSError:
             pass
-        with path.open("a", encoding="utf-8", errors="replace") as fh:
+        fd = safe_fs.open_beneath(root, rel, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666)
+        with os.fdopen(fd, "a", encoding="utf-8", errors="replace") as fh:
             fh.write(line)
 
-    await asyncio.to_thread(_sync)
+    try:
+        await asyncio.to_thread(_sync)
+    except OSError:
+        if row["id"] not in _log_refused:
+            _log_refused.add(row["id"])
+            logger.warning("App %s: its log could not be written", row.get("slug"), exc_info=True)
 
 
 # What the network launcher prints on every start when the host has no
@@ -331,7 +364,7 @@ async def _notify_crash(inst: Instance) -> None:
 
 async def _health(inst: Instance) -> bool:
     deadline = time.monotonic() + HEALTH_TIMEOUT_S
-    async with httpx.AsyncClient(timeout=1.5) as client:
+    async with httpx.AsyncClient(timeout=1.5, trust_env=False) as client:
         while time.monotonic() < deadline:
             proc = inst.proc
             if proc is None or proc.returncode is not None:
@@ -351,57 +384,31 @@ async def _health(inst: Instance) -> bool:
 
 async def _launch(inst: Instance, *, preview: bool, allow_hosts: list[str] | None = None,
                   secrets: dict[str, str] | None = None) -> None:
-    """Spawn the child on a fresh host port (a pasta bind failure within a
-    second retries with another port) and pump its pipe. ``allow_hosts``
-    overrides the row's approved egress (the render of an unapproved
-    manifest runs with none); ``secrets`` are the app's ``env`` secrets,
-    merged for the live instance only: a preview or a check runs code
-    nobody approved and never receives a value (APPS.md "Secrets")."""
+    """Start the server on the compute machine that serves the platform's
+    place and pump its output. With none the start is refused: the platform
+    starts no app server itself. ``allow_hosts`` overrides the row's
+    approved egress (the render of an unapproved manifest runs with none);
+    ``secrets`` are the app's ``env`` secrets, merged for the live instance
+    only: a preview or a check runs code nobody approved and never receives
+    a value (APPS.md "Secrets")."""
     row = inst.row
     allow = allow_hosts if allow_hosts is not None else await asyncio.to_thread(_allow_hosts, row)
     if inst.name != LIVE:
         secrets = None
-    last = ""
-    for _attempt in range(BIND_RETRIES):
-        inst.host_port = _free_port()
-        argv = app_sandbox.build_command(row, inst.release_dir, inst.data_dir,
-                                         inst.host_port, inst.entry, allow)
-        env = app_sandbox.build_env(row, inst.token, app_tokens.public_key_b64(row["id"]),
-                                    preview=preview, secrets=secrets)
-        inst.proc = await asyncio.create_subprocess_exec(
-            *argv, env=env, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True, limit=PIPE_LINE_LIMIT,
-        )
-        inst._tail = []
-        inst._pump = asyncio.create_task(_pump(inst))
-        await asyncio.sleep(1.0)
-        if inst.proc.returncode is None:
-            return
-        # The reason the agent reads: the last lines that say something (a
-        # runtime's blank line and version banner would crowd out the error).
-        said = [ln for ln in inst._tail[-12:] if ln.strip() and not ln.strip().startswith("Bun v")]
-        last = "\n".join(said[-4:])
-        if "bind" not in last.lower() and "address" not in last.lower():
-            break
-        logger.info("App %s: port %d was taken at launch, retrying", row.get("slug"),
-                    inst.host_port)
-    raise app_sandbox.AppStartError(last or "the server exited at once")
+    machine = app_compute.place()
+    if machine is None:
+        raise app_sandbox.AppStartError(app_compute.NOT_CONNECTED)
+    proc = app_compute.RemoteProcess(machine["id"], inst)
+    # Before the frame: early output is kept, and a start the caller gives
+    # up on has a handle to stop.
+    inst.proc = proc
+    inst._tail = []
+    inst._pump = asyncio.create_task(_pump(inst))
+    await app_compute.launch(inst, proc, preview=preview, allow_hosts=allow, secrets_env=secrets)
 
 
-async def _kill(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is not None:
-        return
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=DRAIN_S)
-        except asyncio.TimeoutError:
-            os.killpg(pgid, signal.SIGKILL)
-            await proc.wait()
-    except ProcessLookupError:
-        pass
+async def _kill(proc: app_compute.RemoteProcess) -> None:
+    await proc.end(DRAIN_S)
 
 
 async def start(row: dict, name: str = LIVE, *, release_dir: Path | None = None,
@@ -435,6 +442,13 @@ async def start(row: dict, name: str = LIVE, *, release_dir: Path | None = None,
                 raise AppUnavailable("waiting for a secret to be set: " + ", ".join(missing),
                                      30, state=SECRETS)
             secrets = await asyncio.to_thread(app_secrets.env_values, row)
+        # Before the launch's try, where a raise would be booked as a crash.
+        if name == LIVE and release_dir is None and app_compute.awaited():
+            raise AppUnavailable("the app is starting again", 2, state=STARTING)
+        if name == LIVE and release_dir is None and app_compute.place() is None:
+            # No compute machine: nothing starts the server now, and the
+            # page asks again when one is back.
+            raise AppUnavailable(app_compute.NOT_CONNECTED, 30, state=STARTING)
         if existing and existing.state == BACKOFF and release_dir is None \
                 and time.monotonic() < existing.next_start_at:
             raise AppUnavailable(existing.last_error or "starting soon",
@@ -446,6 +460,12 @@ async def start(row: dict, name: str = LIVE, *, release_dir: Path | None = None,
                 release_dir = releases.live_release_dir(row)
             if release_dir is None:
                 raise app_sandbox.AppStartError("the app has no release to run")
+        # A preview of code that brings a server the live release has not
+        # reaches no outside host before a person approves that server
+        # (``releases.adds_server``), at this start and at every restart.
+        if name == PREVIEW and allow_hosts is None and await asyncio.to_thread(
+                releases.adds_server, row, release_dir):
+            allow_hosts = []
         if data_dir is None:
             data_dir = (release_dir / "data") if name == PREVIEW else releases.app_data_dir(row)
         entry = app_sandbox.server_entry(release_dir)
@@ -460,11 +480,14 @@ async def start(row: dict, name: str = LIVE, *, release_dir: Path | None = None,
                 await stop(row["id"], name)
             _instances[key] = inst
             return inst
-        await asyncio.to_thread(data_dir.mkdir, parents=True, exist_ok=True)
+        try:
+            await asyncio.to_thread(_make_folder, data_dir)
+        except OSError as exc:
+            raise app_sandbox.AppStartError("the app's data folder could not be made") from exc
         # The data mount point must exist under the read-only /app (a
         # release carries one; a working tree run by the smoke may not).
         with contextlib.suppress(OSError):
-            await asyncio.to_thread((release_dir / "data").mkdir, exist_ok=True)
+            await asyncio.to_thread(_make_folder, release_dir / "data")
         inst.token = app_tokens.mint(row["id"], app_tokens.PURPOSE_LAUNCH,
                                      {"sub": f"app:{row['id']}", "instance": name},
                                      app_tokens.LAUNCH_TTL_S)
@@ -482,9 +505,8 @@ async def start(row: dict, name: str = LIVE, *, release_dir: Path | None = None,
         except asyncio.CancelledError:
             # The caller gave up (a check's budget, a request that went
             # away): nothing may keep running unregistered, holding a port.
-            if inst.proc is not None and inst.proc.returncode is None:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.killpg(os.getpgid(inst.proc.pid), signal.SIGKILL)
+            if inst.proc is not None:
+                background.spawn(inst.proc.end(DRAIN_S), name="app-server-stop", owner="apps")
             if inst._pump is not None:
                 inst._pump.cancel()
             inst.state = STOPPED
@@ -511,8 +533,8 @@ async def start(row: dict, name: str = LIVE, *, release_dir: Path | None = None,
         _instances[key] = inst
         if old is not None and old is not inst and old.proc is not None:
             await _drain_and_stop(old)
-        logger.info("App %s (%s) up on 127.0.0.1:%d (pid %s, release %s)", row.get("slug"),
-                    name, inst.host_port, inst.proc.pid if inst.proc else "-",
+        logger.info("App %s (%s) up on %s:%d (pid %s, release %s)", row.get("slug"),
+                    name, inst.address, inst.host_port, inst.proc.pid if inst.proc else "-",
                     inst.release_dir.name)
         return inst
 
@@ -570,6 +592,11 @@ async def ensure_up(row: dict, name: str = LIVE) -> Instance:
         raise AppUnavailable(str(e), max(1, int(wait) + 1)) from e
 
 
+def unreachable(inst: Instance) -> None:
+    """A dial of ``inst`` failed (the proxied routes, the socket bridge)."""
+    app_compute.unreachable(inst)
+
+
 def touch(row_id: str, name: str = LIVE) -> None:
     inst = _instances.get((row_id, name))
     if inst is not None:
@@ -602,13 +629,40 @@ def status(row_id: str) -> dict:
     return out
 
 
+def _log_window(root: Path, rel: str) -> list[str]:
+    """The lines of one half of the log, read beneath the agent's real
+    folder with no link followed: at most its last ``2 * LOG_MAX_BYTES``
+    (an honest half is under 5 MB and a line, so it is read whole), a first
+    line the window cut dropped."""
+    fd, st = safe_fs.open_regular_for_read(root, rel)
+    try:
+        start = max(0, st.st_size - 2 * LOG_MAX_BYTES)
+        data = b"".join(safe_fs.iter_fd(fd, start, st.st_size - start))
+    finally:
+        os.close(fd)
+    text = data.decode("utf-8", "replace")
+    if start:
+        text = text.partition("\n")[2]
+    return text.splitlines()
+
+
+def _make_folder(path: Path) -> None:
+    """``path`` and its missing parents made beneath the agent's real folder
+    with no link followed; a folder in no agent's folder is refused."""
+    safe_fs.mkdirs_beneath(*agent_folder.beneath_agent(path))
+
+
 def read_log_tail(row: dict, lines: int = LOG_TAIL_LINES) -> str:
     """The last ``lines`` of the app's log (both rotation halves)."""
     path = releases.log_path(row)
     out: list[str] = []
-    for p in (path.with_suffix(".log.1"), path):
+    try:
+        root, rel = agent_folder.beneath_agent(path, row["agent"])
+    except OSError:
+        return ""
+    for each in (f"{rel}.1", rel):
         try:
-            out.extend(p.read_text("utf-8", "replace").splitlines())
+            out.extend(_log_window(root, each))
         except OSError:
             continue
     return "\n".join(out[-max(1, min(lines, 2000)):])
@@ -618,18 +672,18 @@ async def smoke(row: dict, tree_dir: Path) -> dict:
     """``check_app``'s smoke: start the working tree's server on a scratch
     port with a scratch data directory, wait for health, stop. Never touches
     the live database."""
-    import tempfile
     entry = app_sandbox.server_entry(tree_dir)
     if not entry:
         return {"ok": True, "server": "none"}
-    with tempfile.TemporaryDirectory(prefix="otodock-app-check-") as scratch:
+    scratch = await asyncio.to_thread(releases.scratch_data_dir, row)
+    try:
         key = (row["id"], CHECK)
         # The declared hosts open only once a person approved the manifest
         # (the rendered check's rule); a smoke of an unapproved manifest
         # runs with none.
         allow: list[str] | None = None if task_store.app_actions_approved(row) else []
         try:
-            inst = await start(row, CHECK, release_dir=tree_dir, data_dir=Path(scratch),
+            inst = await start(row, CHECK, release_dir=tree_dir, data_dir=scratch,
                                allow_hosts=allow)
         except (app_sandbox.AppStartError, AppUnavailable) as e:
             failed = _instances.pop(key, None)
@@ -638,6 +692,8 @@ async def smoke(row: dict, tree_dir: Path) -> dict:
         tail = "\n".join(inst._tail[-20:])
         await stop(row["id"], CHECK)
         return {"ok": True, "server": "up", "log": tail}
+    finally:
+        await asyncio.to_thread(releases.remove_tree, scratch)
 
 
 async def sweep_once() -> None:
@@ -694,15 +750,18 @@ async def stop_all() -> None:
 
 
 UPSTREAM_TIMEOUT_S = 30.0
+# A compute machine that went away answers nothing rather than refusing: a
+# dial must not spend a request's whole timeout finding that out.
+REMOTE_CONNECT_S = 3.0
 
 
 _client: httpx.AsyncClient | None = None
 
 
 class _NoCookieJar(http.cookiejar.CookieJar):
-    """A jar that keeps nothing: every app server lives on the same
-    loopback host, so a jar would replay one app's ``Set-Cookie`` to every
-    other app."""
+    """A jar that keeps nothing: every app server of a compute machine
+    answers on that machine's one address, so a jar would replay one app's
+    ``Set-Cookie`` to every other app."""
 
     def extract_cookies(self, response, request) -> None:
         return None
@@ -714,7 +773,7 @@ class _NoCookieJar(http.cookiejar.CookieJar):
 def _http() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_S, follow_redirects=False)
+        _client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_S, follow_redirects=False, trust_env=False)
         _client.cookies.jar = _NoCookieJar()
     return _client
 
@@ -727,6 +786,11 @@ async def forward(inst: Instance, method: str, path: str,
     the proxied routes, the handler fire (``services/apps/app_handlers.py``)
     and the bindings broker."""
     client = _http()
+    bound = httpx.Timeout(timeout, connect=REMOTE_CONNECT_S)
     req = client.build_request(method, f"{inst.base_url}{path}", headers=headers,
-                               content=body, timeout=timeout)
-    return await client.send(req, stream=True)
+                               content=body, timeout=bound)
+    try:
+        return await client.send(req, stream=True)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        app_compute.unreachable(inst)
+        raise

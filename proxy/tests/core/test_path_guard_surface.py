@@ -60,13 +60,17 @@ KNOWN_DOTDOT_SITES: dict[str, tuple[str, int]] = {
     "proxy/api/apps/app_proxy.py": ("the app's Location: header — a response, not a request path", 1),
     "proxy/api/media/collabora_proxy.py": ("the editor relay's path, judged decoded: its WOPISrc segment "
                                            "is an encoded URL, a %2F has_traversal refuses", 1),
-    "proxy/api/sessions/sessions.py": ("a plan FILENAME: one segment, no dot name", 1),
     "proxy/auth/path_policy.py": ("the candidate-order heuristic of a relative tool path, never a verdict", 1),
     "proxy/config.py": ("the agent-name rule; get_agent_dir is its barrier form", 1),
-    "proxy/core/layers/direct/files.py": ("a glob PATTERN; every hit is re-confined with resolve() + is_relative_to", 1),
+    "proxy/core/layers/direct/file_program.py": ("a glob PATTERN and a skill's NAME, inside a session's sandbox, "
+                                                 "which imports no helper: the walk enters no link", 2),
+    "proxy/core/layers/direct/files.py": ("a glob PATTERN, checked to word the refusal; the file program checks it "
+                                          "again inside the sandbox, where the walk enters no link", 1),
     "proxy/core/remote/file_sync.py": ("sync-rule NAMES (a twin of the satellite's, the gate pins it)", 1),
+    "proxy/core/sandbox/sandbox_render.py": ("a description's bind REL, judged by the render a machine runs, "
+                                             "which imports no helper (vendored)", 1),
     "proxy/core/sandbox/session_config_dir.py": ("an ssh key NAME must be a bare basename", 1),
-    "proxy/services/mcp/mcp_manifest_parse.py": ("a JSONPath expression's recursive descent, not a path", 1),
+    "proxy/services/mcp/mcp_manifest_blocks.py": ("a JSONPath expression's recursive descent, not a path", 1),
     "proxy/services/mcp/mcp_output_relocation.py": ("a basename scraped from a tool's output text", 1),
     "proxy/services/path_policy_v2.py": ("the UX reject of a relative '..' tool path (frozen)", 1),
     "proxy/services/webhooks/vendor_http.py": ("a vendor URL's path value; it never names a file", 1),

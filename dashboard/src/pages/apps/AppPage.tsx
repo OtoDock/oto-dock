@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { rollbackNoticeText, useApp, useHideAppForMe, usePurgeApp, useRollbackApp, useSendToSource, useStopFollowing, useUnpinApp, type PinnedApp } from '../../api/apps'
+import { rollbackNoticeText, useApp, useHideAppForMe, usePurgeApp, useRollbackApp, useSendToSource, useStopFollowing, useUnpinApp, type AppPromptAction, type PinnedApp } from '../../api/apps'
 import { useAuth } from '../../contexts/AuthContext'
 import { isAdmin } from '../../lib/permissions'
 import { appKind } from '../../lib/kinds/app'
@@ -134,9 +134,9 @@ export default function AppPage() {
     navigate(home)
   }
   const onSendPrompt = useCallback(
-    async (row: PinnedApp, action: { id: string; label: string; prompt: string }, args: unknown) => {
+    async (row: PinnedApp, action: AppPromptAction, args: unknown) => {
       if (!app) return { status: 'unavailable', reason: 'not available in this view' }
-      navigate(`/chat/${app.agent}`, { state: { pendingAppAction: { app: row, action, args } } })
+      navigate(`/chat/${app.agent}`, { state: { pendingAppAction: { app: row, action, args, key: `${Date.now()}` } } })
       return { status: 'sent' }
     },
     [app, navigate],

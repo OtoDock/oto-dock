@@ -1,10 +1,8 @@
 """LLM backend factory for the phone pipeline.
 
-Creates the appropriate LLM client based on the PhoneRoute.
-
-Both modes use ProxyClient — the proxy handles everything:
-- proxy mode: CLI subprocess with MCP servers
-- direct mode: Anthropic API with MCP servers (lower latency)
+Creates the call's client for a PhoneRoute: one ProxyClient, whatever the
+route's ``llm_mode`` says. The proxy runs the agent's engine and its tools,
+and only echoes ``llm_mode`` back (``proxy/ws/phone.py``).
 """
 
 import logging
@@ -29,8 +27,8 @@ async def create_llm_backend(
 ) -> ProxyClient:
     """Create the LLM backend for a phone route.
 
-    Both proxy and direct modes go through ProxyClient. The proxy
-    handles MCP tools, message history, and Anthropic API calls.
+    Both modes go through ProxyClient. The proxy runs the agent's engine
+    with its tools and keeps the history.
 
     ``phone_route_id`` is sourced from ``route.id`` directly so callers
     don't have to plumb it separately. Works for both inbound and outbound.

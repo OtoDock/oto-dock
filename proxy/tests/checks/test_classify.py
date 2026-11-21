@@ -119,6 +119,72 @@ def test_a_local_write_inside_a_checkout_is_in_a_git_place(tmp_path, monkeypatch
     assert cs.condition_matches({"places": ["git"]}, out)
 
 
+def _git_build(root, monkeypatch, *paths):
+    import asyncio
+
+    import config
+    from auth.path_policy import SecurityContext
+    from core.session import session_events as se
+    from services.checks import changed_set as cs
+    monkeypatch.setattr(config, "AGENTS_DIR", root)
+    monkeypatch.setattr("auth.path_policy._AGENTS_DIR", root.resolve())
+    sec = SecurityContext(role="manager", username="alice", agent="git-agent", is_admin_agent=False)
+    target = cs.Target(session_id="s", kind="chats", agent="git-agent", chat={"id": "c"},
+                       username="alice", security=sec, placement=sec.placement)
+    recs = [se.ToolRecord(tool_name="Write", paths=paths)]
+    return asyncio.run(cs.build(target, recs, check_name="c", round_no=1, request="", result=""))
+
+
+def test_a_folder_linked_elsewhere_is_never_a_checkout(tmp_path, monkeypatch):
+    root = tmp_path / "agents"
+    ws = root / "git-agent" / "users" / "alice" / "workspace"
+    ws.mkdir(parents=True)
+    repo = root / "elsewhere-repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (ws / "linked").symlink_to(repo)
+    out = _git_build(root, monkeypatch, "/users/alice/workspace/linked/x.py")
+    assert out["places"]["git_roots"] == []
+
+
+def test_a_checkout_in_an_agent_whose_folder_is_a_link_is_found(tmp_path, monkeypatch):
+    """The operator may move an agent's folder and leave a link in its place:
+    the walk probes beneath the real folder, and a folder linked elsewhere
+    below it is still never a checkout."""
+    root = tmp_path / "agents"
+    root.mkdir()
+    real = tmp_path / "disk2" / "git-agent"
+    ws = real / "users" / "alice" / "workspace"
+    (ws / "repo" / ".git").mkdir(parents=True)
+    (ws / "repo" / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (root / "git-agent").symlink_to(real)
+    out = _git_build(root, monkeypatch, "/users/alice/workspace/repo/x.py")
+    assert out["places"]["git_roots"] == ["users/alice/workspace/repo"]
+    other = tmp_path / "elsewhere-repo"
+    (other / ".git").mkdir(parents=True)
+    (other / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (ws / "linked").symlink_to(other)
+    out = _git_build(root, monkeypatch, "/users/alice/workspace/linked/x.py")
+    assert out["places"]["git_roots"] == []
+
+
+def test_a_checkout_above_the_agents_folder_is_never_reported(tmp_path, monkeypatch):
+    # The install's path reached through a link: the walk still stops at the
+    # agent's own folder.
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    real = tmp_path / "real-agents"
+    (real / "git-agent" / "users" / "alice" / "workspace").mkdir(parents=True)
+    (tmp_path / "agents").symlink_to(real)
+    out = _git_build(tmp_path / "agents", monkeypatch, "/users/alice/workspace/notes.md")
+    assert out["places"]["git_roots"] == []
+    repo = real / "git-agent" / "users" / "alice" / "workspace" / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    out = _git_build(tmp_path / "agents", monkeypatch, "/users/alice/workspace/repo/x.py")
+    assert out["places"]["git_roots"] == ["users/alice/workspace/repo"]
+
+
 def test_a_persons_patterns_never_backtrack():
     # condition.commands, globs and a schema section's patterns run through
     # RE2: the patterns that took seconds to minutes under Python's engine

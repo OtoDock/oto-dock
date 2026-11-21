@@ -99,6 +99,7 @@ def _members_by_department() -> dict[str, list[dict]]:
 
 
 def _serialize(u: UserContext, dept: dict, members: list[dict]) -> dict:
+    refusal = assignment.place_refusal(u, dept, [m["name"] for m in members])
     return {
         "id": dept["id"],
         "name": dept["name"],
@@ -111,6 +112,11 @@ def _serialize(u: UserContext, dept: dict, members: list[dict]) -> dict:
             {**m, "accessible": u.can_access_agent(m["name"])} for m in members
         ],
         "can_edit": _can_edit_department(u, dept),
+        # Whether this person may place an agent in it (the placement rule's
+        # one owner), and its sentence when not: the dashboard offers only
+        # these and never spells the rule.
+        "can_place": not refusal,
+        "place_refusal": refusal,
     }
 
 
@@ -124,14 +130,8 @@ async def list_departments(user: UserContext | None = Depends(get_current_user))
     out = []
     for dept in depts:
         dept_members = members.get(dept["id"], [])
-        if not u.is_admin:
-            is_member = any(
-                u.can_access_agent(m["name"]) for m in dept_members
-            )
-            created_it = bool(dept.get("created_by_sub")) and \
-                dept["created_by_sub"] == (u.acting_sub or "")
-            if not is_member and not created_it:
-                continue
+        if not assignment.can_see_department(u, dept, (m["name"] for m in dept_members)):
+            continue
         out.append(_serialize(u, dept, dept_members))
     return {"departments": out}
 

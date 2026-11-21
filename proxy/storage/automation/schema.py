@@ -35,7 +35,12 @@ def init_tasks(conn) -> None:
             scope TEXT DEFAULT 'agent',
             created_by TEXT,
             execution_target TEXT NOT NULL DEFAULT 'local',
-            background_pending INTEGER NOT NULL DEFAULT 0
+            background_pending INTEGER NOT NULL DEFAULT 0,
+            -- Whose AI accounts the run spends, copied from its task
+            -- (core/config/spender.py): '' the subscriptions shared with
+            -- agents, NULL a row written before the column. Existing DBs:
+            -- migrate_automation.
+            spender_sub TEXT
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON task_runs(status)")
@@ -160,7 +165,13 @@ def init_tasks(conn) -> None:
             -- per-agent role an agent-scope task's notifications reach;
             -- admins always. Existing DBs: migrate_automation.
             notify_audience TEXT NOT NULL DEFAULT 'editor'
-                CHECK (notify_audience IN ('manager', 'editor', 'contributor', 'viewer'))
+                CHECK (notify_audience IN ('manager', 'editor', 'contributor', 'viewer')),
+            -- The person whose AI accounts a delegated lane or a judge
+            -- spends, recorded by the platform when it writes the row
+            -- (core/config/spender.py): '' the subscriptions shared with
+            -- agents, NULL a row written before the column. No request
+            -- body sets it. Existing DBs: migrate_automation.
+            spender_sub TEXT
         )
     """)
     # Template-idempotency partial indexes — one row per
@@ -429,9 +440,10 @@ def init_triggers(conn) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_api_keys_prefix ON agent_api_keys(prefix)")
 
-    # Per-user API keys (per-user). Permission scopes (JSONB list) restrict
-    # what the key can do. v1 supports 'triggers'; future: chat / tasks /
-    # notifications (alternative input layers like WhatsApp/Telegram/Slack).
+    # Per-user API keys. Permission scopes (JSONB list) restrict what the key
+    # can do; ``agents`` names the agents it reaches (empty: every agent the
+    # person holds); ``expires_at`` is NULL only on a key minted before 2.0,
+    # which keeps working as it did.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS user_api_keys (
             id TEXT PRIMARY KEY,
@@ -442,11 +454,37 @@ def init_triggers(conn) -> None:
             permissions JSONB NOT NULL,
             created_at TEXT NOT NULL,
             last_used_at TEXT,
-            revoked_at TEXT
+            revoked_at TEXT,
+            agents JSONB NOT NULL DEFAULT '[]',
+            expires_at TEXT,
+            run_without_asking BOOLEAN NOT NULL DEFAULT FALSE
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_api_keys_user ON user_api_keys(user_sub)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_api_keys_prefix ON user_api_keys(prefix)")
+    # A key's message sent once per request id (the send's claim), and what a
+    # key created, which its revocation lists.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_api_key_requests (
+            key_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            message_id INTEGER,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (key_id, request_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_api_key_created (
+            key_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            ref TEXT NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            agent TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (key_id, kind, ref)
+        )
+    """)
 
 
 def _column_default(conn, table: str, column: str) -> str | None:
@@ -480,3 +518,13 @@ def migrate_automation(conn) -> None:
             conn.execute(f"ALTER TABLE {table} ALTER COLUMN notify_audience SET DEFAULT 'editor'")
     conn.execute("ALTER TABLE notifications "
                  "ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'viewer'")
+    # Who pays for a lane (2.0): NULL on every row written before, which
+    # the spender reads as its creator when that names a person.
+    for table in ("dynamic_tasks", "task_runs"):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS spender_sub TEXT")
+    # A key's agents, its expiry and its "run without asking" (2.0): a key
+    # minted before keeps every agent, no expiry, and asks.
+    conn.execute("ALTER TABLE user_api_keys ADD COLUMN IF NOT EXISTS agents JSONB NOT NULL DEFAULT '[]'")
+    conn.execute("ALTER TABLE user_api_keys ADD COLUMN IF NOT EXISTS expires_at TEXT")
+    conn.execute("ALTER TABLE user_api_keys "
+                 "ADD COLUMN IF NOT EXISTS run_without_asking BOOLEAN NOT NULL DEFAULT FALSE")

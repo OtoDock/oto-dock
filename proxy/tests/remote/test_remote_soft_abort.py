@@ -4,8 +4,8 @@ Local abort went graceful-first (control_request{interrupt}, process + MCPs
 survive) while the remote path still hard-killed the satellite CLI subprocess
 and set ``cli_dead`` — so the next prompt paid a full re-warm (the observed
 >10s think delay on a Windows satellite). The remote layer now mirrors the
-local seam: ``interrupt_turn`` frame for claude-code-cli on satellites ≥
-0.5.89 with a live turn, watchdog escalation to the hard abort otherwise.
+local seam: ``interrupt_turn`` frame for claude-code-cli with a live turn,
+watchdog escalation to the hard abort otherwise.
 
 Codex followed on 2026-07-09: the satellite's codex twin was ALWAYS soft
 (``turn/interrupt``, warm daemon) but the proxy still returned False —
@@ -52,12 +52,9 @@ def _make_info(
     return info
 
 
-def _make_layer(*, soft_supported: bool = True) -> RemoteExecutionLayer:
+def _make_layer() -> RemoteExecutionLayer:
     layer = RemoteExecutionLayer.__new__(RemoteExecutionLayer)
     layer._cm = MagicMock()
-    layer._cm.satellite_supports_soft_interrupt = MagicMock(
-        return_value=soft_supported,
-    )
     layer._cm.send_fire_and_forget = AsyncMock()
     layer._cm.drop_grace_session = MagicMock()
     layer._cm.arm_abort_acked = MagicMock()
@@ -73,8 +70,8 @@ def _sent_frame_types(layer) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_soft_abort_graceful_for_cli_on_supported_satellite():
-    layer = _make_layer(soft_supported=True)
+async def test_soft_abort_graceful_for_cli():
+    layer = _make_layer()
     info = _make_info()
     layer._sessions[info.session_id] = info
 
@@ -91,27 +88,12 @@ async def test_soft_abort_graceful_for_cli_on_supported_satellite():
 
 
 @pytest.mark.asyncio
-async def test_old_satellite_keeps_hard_abort():
-    layer = _make_layer(soft_supported=False)
-    info = _make_info()
-    layer._sessions[info.session_id] = info
-
-    result = await layer.abort(info.session_id)
-
-    assert result is False
-    assert _sent_frame_types(layer) == ["abort"]
-    assert info.cli_dead is True
-    layer._cm.arm_abort_acked.assert_called_once()
-    layer._cm.drop_grace_session.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_codex_abort_graceful_on_supported_satellite():
+async def test_codex_abort_graceful():
     """Codex mirrors the local graceful abort: same ``abort`` wire frame
     (the deployed satellites' interrupt_turn handler is CLI-only), but the
     proxy returns True — producer stays alive for the terminal turn event,
     no cancelled-context injection, and no ack-drain armed."""
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     info = _make_info(execution_path="codex-cli")
     layer._sessions[info.session_id] = info
 
@@ -130,9 +112,9 @@ async def test_codex_abort_graceful_on_supported_satellite():
 
 
 @pytest.mark.asyncio
-async def test_codex_abort_stays_hard_on_old_satellite():
-    layer = _make_layer(soft_supported=False)
-    info = _make_info(execution_path="codex-cli")
+async def test_a_codex_hard_abort_keeps_the_daemon():
+    layer = _make_layer()
+    info = _make_info(execution_path="codex-cli", turn_active=False)
     layer._sessions[info.session_id] = info
 
     result = await layer.abort(info.session_id)
@@ -147,7 +129,7 @@ async def test_codex_abort_stays_hard_on_old_satellite():
 
 @pytest.mark.asyncio
 async def test_soft_abort_requires_live_turn():
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     info = _make_info(turn_active=False)
     layer._sessions[info.session_id] = info
 
@@ -175,7 +157,7 @@ async def test_a_stop_during_settle_takes_the_hard_path_at_once():
     2026-10-13 finding: a 30 s detour, then the watchdog's kill flushed the
     commands as done and the producer nudged a dead CLI). The abort kills
     at once, so the caller cancels the producer."""
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     info = _make_info()
     layer._sessions[info.session_id] = info
     state = _claude_turn_state(info, settle_after_result=30)
@@ -195,7 +177,7 @@ async def test_a_result_read_but_not_settling_keeps_the_graceful_path():
     """An interactive turn keeps the stream open for the stop_turn drain
     after its result (and a steer's turn may follow it): that is not a
     settle, so a Stop there stays graceful."""
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     info = _make_info()
     layer._sessions[info.session_id] = info
     state = _claude_turn_state(info, settle_after_result=0)
@@ -214,7 +196,7 @@ async def test_a_result_read_but_not_settling_keeps_the_graceful_path():
 @pytest.mark.asyncio
 async def test_watchdog_escalates_when_turn_never_closes(monkeypatch):
     monkeypatch.setattr(remote_abort, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     info = _make_info()
     layer._sessions[info.session_id] = info
 
@@ -240,13 +222,31 @@ async def test_watchdog_escalates_when_turn_never_closes(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("files_synced", "escalates"), [(False, True), (True, False)])
+async def test_the_watchdog_waits_by_where_the_session_runs(monkeypatch, files_synced, escalates):
+    """A compute machine beside the platform takes the platform's own short
+    bound; a machine with its own copy of the files keeps the network's."""
+    monkeypatch.setattr(remote_abort, "_BESIDE_INTERRUPT_WATCHDOG_S", 0.3)
+    monkeypatch.setattr(remote_abort, "_REMOTE_INTERRUPT_WATCHDOG_S", 30.0)
+    monkeypatch.setattr("storage.database.get_chat_by_session", MagicMock(return_value=None))
+    layer = _make_layer()
+    info = _make_info()
+    info.compute, info.files_synced = True, files_synced
+    layer._sessions[info.session_id] = info
+    assert await layer.abort(info.session_id) is True
+    await asyncio.sleep(1.0)
+    assert (_sent_frame_types(layer) == ["interrupt_turn", "abort"]) is escalates
+    info.turn_active = False  # let a waiting watchdog stand down
+
+
+@pytest.mark.asyncio
 async def test_codex_watchdog_escalates_when_turn_never_closes(monkeypatch):
     """Codex escalation: a second ``abort`` frame rides the hard path (arm +
     grace-drop + ack drain), the daemon still isn't flagged dead, and the
     optimistic graceful flag is flipped back so the next turn re-injects the
     cancelled context."""
     monkeypatch.setattr(remote_abort, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     info = _make_info(execution_path="codex-cli")
     layer._sessions[info.session_id] = info
 
@@ -273,7 +273,7 @@ async def test_codex_watchdog_escalates_when_turn_never_closes(monkeypatch):
 @pytest.mark.asyncio
 async def test_watchdog_stands_down_when_turn_closes(monkeypatch):
     monkeypatch.setattr(remote_abort, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     info = _make_info()
     layer._sessions[info.session_id] = info
 
@@ -289,7 +289,7 @@ async def test_watchdog_pins_to_the_interrupted_turn(monkeypatch):
     """A successor turn (new command id) must never be killed by a stale
     watchdog even if it is active at the deadline."""
     monkeypatch.setattr(remote_abort, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     info = _make_info()
     layer._sessions[info.session_id] = info
 
@@ -316,7 +316,7 @@ def _released(monkeypatch) -> list:
 
 @pytest.mark.asyncio
 async def test_interrupt_for_queued_fires_graceful_only(monkeypatch):
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     layer._cm.is_connected = MagicMock(return_value=True)
     info = _make_info()
     layer._sessions[info.session_id] = info
@@ -336,7 +336,7 @@ async def test_interrupt_for_queued_fires_graceful_only(monkeypatch):
 async def test_interrupt_for_queued_marks_the_turns_translator(monkeypatch):
     # The turn the interrupt closes may end in the CLI's "[ede_diagnostic]"
     # error result: the translator reads it as the interrupt landing.
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     layer._cm.is_connected = MagicMock(return_value=True)
     info = _make_info()
     layer._sessions[info.session_id] = info
@@ -345,6 +345,59 @@ async def test_interrupt_for_queued_marks_the_turns_translator(monkeypatch):
     assert info.engine_state.translator.interrupted is False
     assert await layer.interrupt_for_queued(info.session_id) is True
     assert info.engine_state.translator.interrupted is True
+
+
+async def _result_after_the_interrupt(layer, info, result: dict):
+    """The next turn's result through the adapter's stream."""
+    await layer._adapter(info).begin_turn(info, 0)
+    info.event_queue.put_nowait(result)
+    info.event_queue.put_nowait({"type": "_turn_ended", "command_id": info.current_send_command_id})
+    return [e async for e in layer._adapter(info).stream_turn(info, layer._cm)]
+
+
+@pytest.mark.asyncio
+async def test_an_interrupt_arms_the_thinking_watch_and_its_error_result_is_repaired(monkeypatch):
+    """The CLI keeps an unsigned thinking block after an interrupt in
+    mid-thinking and every later turn fails on its signature: the watch the
+    interrupt arms reads that error on the machine as on the platform, ends
+    the process (the next send resumes it) and arms the cut-turn line."""
+    from core.layers.cli import remote as cli_remote
+    layer = _make_layer()
+    layer._cm.is_connected = MagicMock(return_value=True)
+    info = _make_info()
+    layer._sessions[info.session_id] = info
+    _released(monkeypatch)
+    await layer._adapter(info).begin_turn(info, 0)
+    assert info.post_interrupt_watch is False
+    assert await layer.interrupt_for_queued(info.session_id) is True
+    assert info.post_interrupt_watch is True
+    from core.session import session_manager
+    hard = AsyncMock(return_value=False)
+    monkeypatch.setattr(layer, "_hard_abort", hard)
+    monkeypatch.setattr(session_manager, "_get_remote_layer", lambda: layer)
+    armed: list = []
+
+    async def _arm(session_id):
+        armed.append(session_id)
+    monkeypatch.setattr(cli_remote, "_arm_cancelled_context", _arm)
+    # A clean result stands the watch down.
+    await _result_after_the_interrupt(layer, info, {"type": "result", "subtype": "success", "result": "fine"})
+    assert info.post_interrupt_watch is False and hard.await_count == 0
+    # Armed again, the signature error is the wedge.
+    layer._adapter(info).note_interrupt(info)
+    await _result_after_the_interrupt(layer, info, {
+        "type": "result", "subtype": "error", "is_error": True,
+        "result": "API Error: 400 messages.1.content.0: thinking block has an invalid signature"})
+    await asyncio.sleep(0.05)
+    assert info.post_interrupt_watch is False
+    hard.assert_awaited_once_with(info.session_id)
+    assert armed == [info.session_id]
+    # Another error is not the wedge.
+    layer._adapter(info).note_interrupt(info)
+    await _result_after_the_interrupt(layer, info, {
+        "type": "result", "subtype": "error", "is_error": True, "result": "rate limit"})
+    await asyncio.sleep(0.05)
+    assert info.post_interrupt_watch is True and hard.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -356,29 +409,22 @@ async def test_interrupt_for_queued_gates_return_false(monkeypatch):
     )
 
     # No live turn.
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     layer._cm.is_connected = MagicMock(return_value=True)
     info = _make_info(turn_active=False)
     layer._sessions[info.session_id] = info
     assert await layer.interrupt_for_queued(info.session_id) is False
 
     # Codex sessions take steer, never this path.
-    layer2 = _make_layer(soft_supported=True)
+    layer2 = _make_layer()
     layer2._cm.is_connected = MagicMock(return_value=True)
     info2 = _make_info(session_id="sess-2", execution_path="codex-cli")
     layer2._sessions[info2.session_id] = info2
     assert await layer2.interrupt_for_queued(info2.session_id) is False
 
-    # Old satellite (no soft interrupt support).
-    layer3 = _make_layer(soft_supported=False)
-    layer3._cm.is_connected = MagicMock(return_value=True)
-    info3 = _make_info(session_id="sess-3")
-    layer3._sessions[info3.session_id] = info3
-    assert await layer3.interrupt_for_queued(info3.session_id) is False
-
     # Disconnected machine — send_fire_and_forget would silently no-op, so
     # the gate must refuse rather than claim an interrupt landed.
-    layer4 = _make_layer(soft_supported=True)
+    layer4 = _make_layer()
     layer4._cm.is_connected = MagicMock(return_value=False)
     info4 = _make_info(session_id="sess-4")
     layer4._sessions[info4.session_id] = info4
@@ -387,7 +433,7 @@ async def test_interrupt_for_queued_gates_return_false(monkeypatch):
     # Unknown session.
     assert await layer4.interrupt_for_queued("no-such") is False
 
-    for lyr in (layer, layer2, layer3, layer4):
+    for lyr in (layer, layer2, layer4):
         assert _sent_frame_types(lyr) == []
     # No blind denials on any refused path.
     assert released_total == []
@@ -395,7 +441,7 @@ async def test_interrupt_for_queued_gates_return_false(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_interrupt_for_queued_send_failure_never_denies_blind(monkeypatch):
-    layer = _make_layer(soft_supported=True)
+    layer = _make_layer()
     layer._cm.is_connected = MagicMock(return_value=True)
     layer._cm.send_fire_and_forget = AsyncMock(side_effect=RuntimeError("ws died"))
     info = _make_info()
@@ -405,3 +451,96 @@ async def test_interrupt_for_queued_send_failure_never_denies_blind(monkeypatch)
     assert await layer.interrupt_for_queued(info.session_id) is False
     # A failed send must NOT un-park the turn by denying its permission.
     assert released == []
+
+
+# -- a close with a card open ------------------------------------------------
+
+def _closing_layer(monkeypatch, order: list):
+    from core.remote import remote_execution
+    layer = _make_layer()
+    layer._cm.is_connected = MagicMock(return_value=True)
+    layer._cm.send_fire_and_forget = AsyncMock(
+        side_effect=lambda _m, frame: order.append(frame["type"]))
+    layer._cm.send_command = AsyncMock(side_effect=lambda _m, frame, **_k: order.append(frame["type"]))
+    layer._cm.debit_reported_session = MagicMock()
+    layer._cm.remove_session_queue = MagicMock()
+    monkeypatch.setattr(remote_execution, "forget_session", AsyncMock())
+    real = remote_abort.resolve_session_permissions
+
+    def _deny(sid, approved=False):
+        order.append("deny")
+        return real(sid, approved=approved)
+    monkeypatch.setattr(remote_abort, "resolve_session_permissions", _deny)
+    return layer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "want"), [
+    ("claude-code-cli", ["interrupt_turn", "deny", "close_session"]),
+    ("codex-cli", ["deny", "close_session"]),
+])
+async def test_a_close_with_a_card_open_denies_it_and_interrupts_first(monkeypatch, path, want):
+    """The platform's own sessions denied the open request and interrupted
+    before closing: a close no longer waits for the satellite's 10 s."""
+    from core.session import session_state
+    order: list = []
+    layer = _closing_layer(monkeypatch, order)
+    info = _make_info(execution_path=path, turn_active=False)
+    layer._sessions[info.session_id] = info
+    wait = session_state.open_permission_wait("rid-close-card", info.session_id)
+    await layer.close_session(info.session_id)
+    assert order[:len(want)] == want
+    assert wait.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_close_while_the_platform_stops_keeps_the_card(monkeypatch):
+    from core import drain
+    from core.session import session_state
+    order: list = []
+    layer = _closing_layer(monkeypatch, order)
+    monkeypatch.setattr(drain, "stopping", lambda: True)
+    info = _make_info(turn_active=False)
+    layer._sessions[info.session_id] = info
+    session_state.open_permission_wait("rid-close-stop", info.session_id)
+    await layer.close_session(info.session_id)
+    assert "interrupt_turn" not in order
+    assert "deny" not in order[:order.index("close_session")]
+
+
+@pytest.mark.asyncio
+async def test_a_close_drops_a_keys_mark_on_the_session(monkeypatch):
+    """A new life of the id is nobody's key turn: the mark goes at the close."""
+    from core.session import key_rows
+    layer = _closing_layer(monkeypatch, [])
+    info = _make_info(turn_active=False)
+    layer._sessions[info.session_id] = info
+    key_rows.mark_session(info.session_id)
+    await layer.close_session(info.session_id)
+    assert not key_rows.drives("", info.session_id)
+
+
+@pytest.mark.asyncio
+async def test_a_new_life_of_an_id_drops_an_old_mark(monkeypatch):
+    """A dead session's record goes with no close (``prepare_resume``) and
+    the next start reuses its id: that start drops a key's old mark, so the
+    new life is nobody's key turn. A re-warm of a session the layer still
+    holds is the same life and keeps it."""
+    from core.remote import remote_execution, remote_session_start
+    from core.session import key_rows
+
+    async def _impl(self, session_id, config, registered):
+        return None
+    monkeypatch.setattr(remote_session_start.RemoteSessionStartMixin, "_start_session_impl", _impl)
+    layer = remote_execution.RemoteExecutionLayer(MagicMock())
+    key_rows.mark_session("s-new-life")
+    key_rows.mark_session("s-held")
+    try:
+        await layer.start_session("s-new-life", MagicMock())
+        assert not key_rows.marked("s-new-life")
+        monkeypatch.setattr(remote_session_start, "session_is_held", lambda sid: True)
+        await layer.start_session("s-held", MagicMock())
+        assert key_rows.marked("s-held")
+    finally:
+        key_rows.forget_session("s-new-life")
+        key_rows.forget_session("s-held")

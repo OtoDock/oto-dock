@@ -8,9 +8,8 @@ detection function and one update function, not two copies that can drift.
 Tier behaviour (resolved by ``core/config/deployment.current_mode()``): a Docker
 MCP's catalog install starts its container on T1 and T2 (it pulls the new image,
 T1 builds only when none is published, then force-recreates);
-``_update_docker_mcp`` checks that start and reclaims the previous image tag. On
-T3 (cloud / external-pool) the update only refreshes the catalog files (the
-central pool owns the image lifecycle). npm/pypi MCPs converge
+``_update_docker_mcp`` checks that start and reclaims the previous image tag.
+npm/pypi MCPs converge
 to the catalog folder (``_update_node_python_mcp`` → ``install_from_catalog``) and
 install the latest version within the catalog ``version_constraint``, pinning the
 resolved version into the local manifest.
@@ -47,6 +46,7 @@ import psycopg
 from fastapi import HTTPException
 
 from services.mcp import mcp_manifest_types as _mt, mcp_registry
+from services.remote import machine_tools
 from storage import database as task_store
 
 logger = logging.getLogger("otodock.mcp-updater")
@@ -93,38 +93,6 @@ def is_held(manifest) -> bool:
         return (Path(mcp_dir) / HOLD_MARKER).exists()
     except OSError:
         return False
-
-
-# ---------------------------------------------------------------------------
-# Local-manifest pinning
-# ---------------------------------------------------------------------------
-
-def pin_local_manifest(
-    mcp_dir: Path, registry: str, package: str, resolved_version: str,
-    *, extras: tuple[str, ...] = (),
-) -> None:
-    """Pin a node/python install's LOCAL manifest to the resolved version.
-
-    node/python community MCPs are unpinned in the catalog (``npm:pkg`` /
-    ``pypi:pkg``, ``version: ""``); their version of record is the upstream
-    registry. After install/update the proxy resolves the concrete version and
-    writes it into BOTH ``manifest.version`` and ``manifest.server.source``
-    (``{registry}:{package}@{resolved_version}``) so detection and display are
-    deterministic and a remote satellite reinstalls the exact same version
-    (the satellite syncs this pinned manifest and never resolves "latest"
-    itself). Proxy-side only — the satellite receives an already-pinned manifest.
-
-    No-op-safe: callers pass a non-empty ``resolved_version`` for npm/pypi only;
-    docker/git+ manifests are never passed here. A PyPI source keeps its
-    ``extras``: ``pypi:name[a,b]@1.2.3``.
-    """
-    from services.mcp.mcp_installer import ParsedSource
-    manifest_path = mcp_dir / "manifest.json"
-    data = json.loads(manifest_path.read_text())
-    data["version"] = resolved_version
-    data.setdefault("server", {})["source"] = ParsedSource(
-        registry, package, "", tuple(extras)).pinned(resolved_version)
-    manifest_path.write_text(json.dumps(data, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +491,7 @@ async def _package_axis(manifests: dict, catalog: dict, source_changes: dict,
     bound, a changed catalog manifest, a venv outside the sandbox. Fills
     ``results``; answers the MCPs it checked."""
     from services.community import community_catalog
-    from services.mcp import mcp_installer, mcp_venv_bootstrap
+    from services.mcp import mcp_installer
 
     # npm/pypi candidates — COMMUNITY only. Update execution converges to the
     # community-catalog folder (install_from_catalog), which custom/local MCPs
@@ -552,11 +520,10 @@ async def _package_axis(manifests: dict, catalog: dict, source_changes: dict,
                 out[cname] = None
         return out
     installed_hashes = await asyncio.to_thread(_installed_hashes)
-    # A venv on an interpreter the session sandbox does not bind is rebuilt by
-    # the converge at the installed version (the admin's Update repairs it).
-    outside = await asyncio.to_thread(
-        lambda: {n for n, m, _r, _p in checks if _r == "pypi"
-                 and mcp_venv_bootstrap.venv_outside_sandbox(Path(m.mcp_dir))})
+    # A tool the compute machine that builds for the install does not hold in
+    # a healthy build is rebuilt by the converge at the installed version
+    # (the admin's Update repairs it).
+    outside = {n for n, _m, _r, _p in checks if _r == "pypi" and machine_tools.missing_on_builder(n)}
     now = _utcnow()
     # Each probe may read a registry document of tens of MB: a few at a time.
     registry_reads = asyncio.Semaphore(4)
@@ -613,7 +580,7 @@ async def _pinned_axis(manifests: dict, catalog: dict, source_changes: dict,
     against the catalog's version and manifest. Fills ``results``; answers
     how many it checked."""
     from services.community import community_catalog, community_installer
-    from services.mcp import mcp_installer, mcp_venv_bootstrap
+    from services.mcp import mcp_installer
 
     # Catalog-pinned MCPs — a container (its image tag) and a git+ source (its
     # ref): the installed version against the catalog version, then the
@@ -641,9 +608,7 @@ async def _pinned_axis(manifests: dict, catalog: dict, source_changes: dict,
         return out
     docker_hashes = await asyncio.to_thread(_docker_hashes) if docker_targets else {}
 
-    git_outside = await asyncio.to_thread(
-        lambda: {n for n, m in docker_targets
-                 if _is_git(m) and mcp_venv_bootstrap.venv_outside_sandbox(Path(m.mcp_dir))})
+    git_outside = {n for n, m in docker_targets if _is_git(m) and machine_tools.missing_on_builder(n)}
 
     docker_checked = 0
     for name, m in docker_targets:
@@ -808,17 +773,14 @@ async def _update_docker_mcp(name: str) -> dict:
 
     Docker MCPs run a pre-built image whose version of record is the catalog's
     manifest + ``server.image`` tag. ``install_from_catalog`` re-fetches the
-    manifest + compose and, when the MCP is enabled on a self-host tier (T1
-    and T2), pulls (or, on T1, builds) the image and force-recreates the
-    container: that is the update's one start. On T3 (external-pool) there is
-    no per-install container; refreshing the catalog files is the whole
-    update (the orchestrator skips docker MCPs on T3 anyway).
+    manifest + compose and, when the MCP is enabled, pulls (or, on T1,
+    builds) the image and force-recreates the container: that is the update's
+    one start.
 
     A start that failed (``container_started`` False: a pull cut by the
     proxy's stop, an image that did not come) keeps the previous image and
     the offer, and raises, so the update can run again.
     """
-    from core.config import deployment
     from services.community import community_installer
     from services.mcp import docker_manager
 
@@ -833,15 +795,14 @@ async def _update_docker_mcp(name: str) -> dict:
         raise HTTPException(500, CONTAINER_NOT_STARTED)
 
     # Reclaim the previous image tag once the new one is running, so the daemon
-    # doesn't keep one stale image per update. Only when the tag changed and
-    # we're self-host (cloud has no local image). Best-effort.
+    # doesn't keep one stale image per update. Only when the tag changed.
+    # Best-effort.
     refreshed = mcp_registry.get_manifest(name)
     new_image = (getattr(refreshed.server, "image", "") if refreshed else "") or ""
     if (
         old_image
         and new_image
         and old_image != new_image
-        and deployment.current_mode() != deployment.EXTERNAL_POOL
     ):
         _set_phase(name, PHASE_FINISHING, "Removing the previous image.")
         await asyncio.to_thread(docker_manager.remove_image, old_image)
@@ -894,7 +855,7 @@ async def _update_node_python_mcp(name: str, manifest, *, settled_only: bool = F
     already spawned subprocess, new sessions pick up the converged install.
     """
     from services.community import community_catalog, community_installer
-    from services.mcp import mcp_installer, mcp_venv_bootstrap
+    from services.mcp import mcp_installer
 
     parsed = mcp_installer.parse_source(manifest.server.source)
     if not parsed or parsed.registry not in ("npm", "pypi"):
@@ -929,8 +890,7 @@ async def _update_node_python_mcp(name: str, manifest, *, settled_only: bool = F
     if entry is not None and community_catalog.source_detail_differs(
             manifest.server.source, entry.get("source")):
         edited = True
-    rebuild = registry == "pypi" and await asyncio.to_thread(
-        mcp_venv_bootstrap.venv_outside_sandbox, Path(manifest.mcp_dir))
+    rebuild = registry == "pypi" and machine_tools.missing_on_builder(manifest.name)
     manifest_changed = edited or rebuild
 
     latest_waits = rel is not None and _is_pkg_newer(rel.latest, cur) and rel.settled != rel.latest
@@ -1014,6 +974,10 @@ async def update_one(name: str, *, settled_only: bool = False) -> dict:
             await asyncio.to_thread(_keep_check_result, name, offer)
         else:
             await asyncio.to_thread(_forget_check_result, name)
+        # The server's tool labels may have moved with it: listed again for
+        # the Outside people picks (services/mcp/tool_listing).
+        from services.mcp import tool_listing
+        tool_listing.schedule_after_install(name)
         return result
 
 
@@ -1222,14 +1186,8 @@ def job_state() -> dict:
 def community_targets() -> list:
     """Installed community MCPs the weekly job may update.
 
-    Local/core + custom MCPs ship with the platform → out of scope. On T3
-    (external-pool / cloud) docker MCPs are managed centrally by OtoDock, so they
-    are dropped here — the weekly job is a clean no-op for them (non-docker
-    community MCPs, if any, are still updated).
+    Local/core + custom MCPs ship with the platform → out of scope.
     """
-    from core.config import deployment
-
-    cloud = deployment.current_mode() == deployment.EXTERNAL_POOL
     out = []
     for m in mcp_registry.get_all_manifests().values():
         # Skill packages update from the skills catalog on every tier (pure
@@ -1238,8 +1196,6 @@ def community_targets() -> list:
             out.append(m)
             continue
         if m.category != "community":
-            continue
-        if cloud and _mt.is_container(m.server):
             continue
         out.append(m)
     return out
@@ -1252,12 +1208,19 @@ async def mcp_in_use(name: str) -> bool:
     connected to it (a force-recreate would drop that connection). Signals:
       * Direct-LLM layer — precise: the MCP names actually started for each live
         in-process session (``mcp_pool``).
-      * CLI + Codex layers — each live session's agent mapped through the
-        registry's runtime MCP set (``get_agent_mcps``); these layers connect to
-        the same shared container via their config files.
+      * Sessions on machines (Claude Code, Codex) — each live session's agent
+        mapped through the registry's runtime MCP set (``get_agent_mcps``);
+        they connect to the same shared container via their config files.
     Best-effort: a layer that can't be inspected is skipped (degrades to the same
-    behaviour as the manual Update button — no worse).
+    behaviour as the manual Update button — no worse). A Docker tool's every
+    call passes its door, so its answer is the door's: a call in flight or a
+    session bound to it (``services/containers``), or a session built before
+    this start that dials it directly.
     """
+    manifest = mcp_registry.get_manifest(name)
+    if manifest is not None and _mt.is_container(manifest.server):
+        from services.containers import idle, state
+        return state.in_use(name) or idle.held_directly(name)
     # Direct layer — precise per-session connections.
     try:
         from core.layers.direct.mcp import mcp_pool
@@ -1266,18 +1229,13 @@ async def mcp_in_use(name: str) -> bool:
     except Exception:
         logger.exception("mcp_in_use: direct-layer probe failed")
 
-    # CLI + Codex — collect live-session agents, then map to their MCP sets.
+    # Sessions on machines — collect their agents, then map to their MCP sets.
     agents: set[str] = set()
     try:
-        from core.layers.cli import session as cli_session
-        agents |= await cli_session.active_agent_names()
+        from core.session.session_manager import _get_remote_layer
+        agents = {info.agent_name for info in list(_get_remote_layer()._sessions.values())}
     except Exception:
-        logger.exception("mcp_in_use: cli-layer probe failed")
-    try:
-        from core.layers.codex import session as codex_session
-        agents |= await codex_session.active_agent_names()
-    except Exception:
-        logger.exception("mcp_in_use: codex-layer probe failed")
+        logger.exception("mcp_in_use: machine-session probe failed")
 
     for agent in agents:
         if not agent:

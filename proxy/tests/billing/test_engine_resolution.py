@@ -43,7 +43,7 @@ def _agent(primary: str = CLAUDE, extras: list[str] | None = None, *, pinned: st
     }
 
 
-def _holds(own: dict | None = None, pool: dict | None = None, seed: str = "",
+def _holds(own: dict | None = None, pool: dict | None = None,
            resting: dict | None = None, use: dict | None = None, first_shown: dict | None = None,
            connected: dict | None = None) -> er.Holdings:
     return er.Holdings(
@@ -51,7 +51,6 @@ def _holds(own: dict | None = None, pool: dict | None = None, seed: str = "",
         pool={k: frozenset(v) for k, v in (pool or {}).items()},
         resting={k: frozenset(v) for k, v in (resting or {}).items()},
         use=use or {}, first_shown=first_shown or {}, connected=connected or {},
-        seed=seed,
     )
 
 
@@ -61,25 +60,6 @@ ALL = [CODEX, DIRECT]   # the extras of an agent whose primary is Claude
 # One row per branch of the order and per edge case: (agent, holdings) ->
 # (engine, model, reason, allowed).
 TABLE = [
-    # A preferred engine stored before the order seeds the first place
-    # while the agent's window has no chats.
-    pytest.param(_agent(CLAUDE, ALL), _holds(own={CODEX: {"openai"}}, seed=CODEX),
-                 (CODEX, "sol", er.REASON_SEED, (CODEX,)), id="the seed held and allowed"),
-    pytest.param(_agent(CLAUDE, ALL), _holds(own={CLAUDE: {"anthropic"}, CODEX: {"openai"}}, seed=CODEX),
-                 (CODEX, "sol", er.REASON_SEED, (CODEX, CLAUDE)), id="the seed beats the default"),
-    pytest.param(_agent(CLAUDE, [DIRECT]), _holds(own={CLAUDE: {"anthropic"}, CODEX: {"openai"}}, seed=CODEX),
-                 (CLAUDE, "opus", er.REASON_AGENT_DEFAULT, (CLAUDE,)), id="the seed not allowed: the default"),
-    pytest.param(_agent(CLAUDE, ALL), _holds(own={CLAUDE: {"anthropic"}}, seed=CODEX),
-                 (CLAUDE, "opus", er.REASON_AGENT_DEFAULT, (CLAUDE,)), id="the seed not held: the default"),
-    pytest.param(_agent(CLAUDE, ALL), _holds(own={CLAUDE: {"anthropic"}, CODEX: {"openai"}}, seed=CODEX,
-                                             use={"demo": {CLAUDE: 1}}),
-                 (CLAUDE, "opus", er.REASON_USE, (CLAUDE, CODEX)), id="the seed gives way once the window has chats"),
-    pytest.param(_agent(CLAUDE, ALL), _holds(own={CLAUDE: {"anthropic"}, CODEX: {"openai"}}, seed=CODEX,
-                                             use={"other": {CLAUDE: 1}}),
-                 (CLAUDE, "opus", er.REASON_USE, (CLAUDE, CODEX)), id="the seed gives way to chats on another agent"),
-    pytest.param(_agent(CLAUDE, ALL), _holds(own={CLAUDE: {"anthropic"}, CODEX: {"openai"}}, seed=CODEX,
-                                             use={"other": {"acme-cli": 4}}),
-                 (CODEX, "sol", er.REASON_SEED, (CODEX, CLAUDE)), id="chats on an engine not listed leave the seed"),
     pytest.param(_agent(CODEX, [CLAUDE]), _holds(own={CLAUDE: {"anthropic"}, CODEX: {"openai"}}),
                  (CODEX, "sol", er.REASON_AGENT_DEFAULT, (CODEX, CLAUDE)), id="no chats: the default"),
     pytest.param(_agent(CODEX, [CLAUDE, DIRECT]), _holds(own={DIRECT: {"anthropic"}}, pool={CLAUDE: {"anthropic"}}),
@@ -104,8 +84,6 @@ TABLE = [
                  (CODEX, "qwen", er.REASON_AGENT_DEFAULT, (CODEX,)), id="local-only takes the local server"),
     pytest.param(_agent(CODEX, [CLAUDE], local_only=[CODEX], pinned="sol"), _holds(own={CODEX: {"openai"}, CLAUDE: {"anthropic"}}),
                  (CLAUDE, "opus", er.REASON_OWN, (CLAUDE,)), id="local-only skips a vendor pin and moves on"),
-    pytest.param(_agent(CLAUDE, [CODEX]), _holds(own={CODEX: {"openai"}}, seed=DIRECT),
-                 (CODEX, "sol", er.REASON_OWN, (CODEX,)), id="a seed outside the allowlist"),
     # "Holds" in step 2 includes the platform's borrowable accounts: the
     # agent's default reached through a pooled admin key comes before the
     # person's own subscription on another engine (step 2 of the order comes before step 3).
@@ -121,9 +99,6 @@ TABLE = [
                  (CLAUDE, "opus", er.REASON_AGENT_DEFAULT, (CLAUDE,)), id="every account resting: picked anyway"),
     pytest.param(_agent(DIRECT, []), _holds(own={DIRECT: {"anthropic", "openai"}}, resting={DIRECT: {"anthropic"}}),
                  (DIRECT, "gpt", er.REASON_AGENT_DEFAULT, (DIRECT,)), id="a resting provider: the awake one's model"),
-    pytest.param(_agent(CLAUDE, ALL), _holds(own={CLAUDE: {"anthropic"}, CODEX: {"openai"}}, seed=CLAUDE,
-                                             resting={CLAUDE: {"anthropic"}}),
-                 (CODEX, "sol", er.REASON_SEED, (CLAUDE, CODEX)), id="a resting seed is listed first, the pick skips it"),
 ]
 
 
@@ -215,12 +190,10 @@ def test_the_first_to_remember():
     assert (kept.first_shown, kept.first_is_new) == (CODEX, False)
     cold = er.resolve_for_person(agent, _holds(own=BOTH), CATALOG)
     assert (cold.first_shown, cold.first_is_new, cold.reason) == ("", False, er.REASON_AGENT_DEFAULT)
-    seeded = er.resolve_for_person(agent, _holds(own=BOTH, seed=CODEX), CATALOG)
-    assert (seeded.first_shown, seeded.first_is_new) == (CODEX, True)
 
 
 def test_person_order_with_nothing_listed():
-    assert er.person_order("demo", [], _holds(use={"demo": {CLAUDE: 3}}, seed=CLAUDE)) == ((), "")
+    assert er.person_order("demo", [], _holds(use={"demo": {CLAUDE: 3}})) == ((), "")
 
 
 def test_the_engine_map_and_the_order_for_me():
@@ -293,7 +266,6 @@ class TestHoldings:
         h = er.person_holdings(MEMBER, [CLAUDE, CODEX, DIRECT])
         # The pooled key is borrowable; the admin's OAuth login never is.
         assert h.pool == {CLAUDE: frozenset(), CODEX: {"openai"}, DIRECT: frozenset()}
-        assert h.seed == ""
         assert h.connected == {CLAUDE: subscription_store.list_personal(CLAUDE, MEMBER)[0]["created_at"]}
 
     def test_a_resting_account_is_held_and_marked(self, temp_db):
@@ -310,9 +282,7 @@ class TestHoldings:
             h = er.person_holdings(MEMBER, [CLAUDE])
         assert h.resting == {CLAUDE: frozenset()}
 
-    def test_a_stored_preferred_engine_is_read_as_the_seed(self, temp_db):
-        _store_preference(MEMBER, CODEX)
-        assert er.person_holdings(MEMBER, [CLAUDE]).seed == CODEX
+    def test_nobody_holds_nothing(self, temp_db):
         assert er.person_holdings("", [CLAUDE]) == er.Holdings()
 
     def test_the_connection_order_is_the_oldest_own_account(self, temp_db):
@@ -424,15 +394,6 @@ def _set(sql: str) -> None:
         conn.commit()
 
 
-def _store_preference(sub: str, engine: str) -> None:
-    """A preferred engine stored before the order followed use (nothing
-    writes the column now)."""
-    from storage.pg import get_conn
-    with get_conn() as conn:
-        conn.execute("UPDATE users SET preferred_execution_path = %s WHERE sub = %s", (engine, sub))
-        conn.commit()
-
-
 def _cookie(sub: str, email: str, role: str) -> dict[str, str]:
     from auth.providers import create_session_jwt
     return {"Cookie": f"session={create_session_jwt(sub, email, 'T User', role)}"}
@@ -485,30 +446,21 @@ class TestTheAgentRoutes:
         assert row["engines_for_me"][CODEX] is True
         assert row["execution_paths"] == [CLAUDE, CODEX, DIRECT]
 
-    def test_a_stored_preference_seeds_the_fields(self, client, seeded):
-        from storage.billing import subscription_store
-        subscription_store.add_subscription(CODEX, "openai", "oauth", owner_sub=ADMIN)
-        _store_preference(ADMIN, CODEX)
-        admin = client.get("/v1/agents/demo/info", headers=_cookie(ADMIN, "a@t", "admin")).json()
-        assert admin["engine_for_me"] == CODEX
-        assert admin["engine_order_for_me"] == [CODEX, CLAUDE, DIRECT]
-
     def test_a_failed_use_read_remembers_nothing(self, client, seeded):
-        """With the use unread, the seed would lead everywhere: it must not
-        be written over the firsts the picker really showed."""
+        """With the use unread, the order stands on the connections alone:
+        that is never written over the firsts the picker really showed."""
         import psycopg
 
         from storage.billing import subscription_store
         from storage.chat import engine_use
         from storage.prefs import user_ui_prefs_store
         subscription_store.add_subscription(CODEX, "openai", "oauth", owner_sub=ADMIN)
-        _store_preference(ADMIN, CODEX)
-        user_ui_prefs_store.remember_engine_firsts(ADMIN, {"demo": CLAUDE})
+        user_ui_prefs_store.remember_engine_firsts(ADMIN, {"demo": CODEX})
         headers = _cookie(ADMIN, "a@t", "admin")
         with patch.object(engine_use, "own_chat_counts", side_effect=psycopg.OperationalError("down")):
             info = client.get("/v1/agents/demo/info", headers=headers).json()
-        assert info["engine_for_me"] == CODEX
-        assert user_ui_prefs_store.engine_firsts(ADMIN) == {"demo": CLAUDE}
+        assert info["engine_for_me"] == CLAUDE
+        assert user_ui_prefs_store.engine_firsts(ADMIN) == {"demo": CODEX}
         assert er.person_holdings(ADMIN, [CLAUDE]).use_read is True
 
     def test_a_failed_remember_write_is_logged_and_the_answer_stands(self, client, seeded, caplog):

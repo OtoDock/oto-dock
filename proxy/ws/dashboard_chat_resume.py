@@ -31,7 +31,7 @@ from core.session import (
     visibility as _vis,
     warmup_registry,
 )
-from core.session.background_frames import running_background
+from core.session.background_frames import running_fields
 from core.session.session_manager import resolve_execution_path
 from core.session.session_state import (
     _chat_streaming_state,
@@ -244,7 +244,7 @@ class ChatResumeMixin(_Host):
         gated = await self._resume_gate(msg)
         if gated is None:
             return
-        cid, chat, locked = gated
+        cid, chat, locked, call_lock = gated
 
         # In-flight warmup re-attach: if a warmup is still running (fresh
         # satellite first chat, ~90s MCP install) and our WS reconnected,
@@ -257,6 +257,11 @@ class ChatResumeMixin(_Host):
             await self._resume_inflight(cid, chat, locked, inflight)
             return
 
+        # The session the socket holds is the chat's it was on: a resume that
+        # ends before it reaches this chat's own (a layer that cannot be
+        # resolved, a chat a call drives, a refused slot) leaves none.
+        if cid != self.chat_id:
+            self.session_id = None
         self.chat_id = cid
         self.agent_name = chat["agent"]
         # A pick made in the new-chat state (deferred for the chat that
@@ -313,7 +318,7 @@ class ChatResumeMixin(_Host):
         if r.plans and not self.chat_plan_filename:
             self.chat_plan_filename = r.plans[-1]["filename"]
 
-        pump, view_only_external, kind = await self._resume_history(cid, chat, r, locked, f)
+        pump, view_only_external, kind = await self._resume_history(cid, chat, r, locked, f, call_lock)
 
         if view_only_external:
             # Read-only view of a live external session: history is sent, but we
@@ -336,9 +341,12 @@ class ChatResumeMixin(_Host):
 
         await self._resume_lazy(chat, old_session_id, f)
 
-    async def _resume_gate(self, msg: dict) -> tuple[str, dict, dict[str, str]] | None:
-        """The chat the resume names, loaded and allowed: ``(cid, chat, locked)``,
-        or None after the error this sent (a deleting chat gets no answer)."""
+    async def _resume_gate(self, msg: dict) -> tuple[str, dict, dict[str, str], str] | None:
+        """The chat the resume names, loaded and allowed: ``(cid, chat, locked,
+        call_lock)``, or None after the error this sent (a deleting chat gets
+        no answer). ``call_lock`` is the rule's sentence when a call holds the
+        chat (the agent's conversation for good, a person's own until the call
+        ends), "" otherwise."""
         cid = msg.get("chat_id", "")
         if not cid:
             await self._send_error("chat_id required")
@@ -369,7 +377,8 @@ class ChatResumeMixin(_Host):
         drive_refusal = (refusal if _vis.is_shared_chat_owner(chat.get("user_sub"))
                          and not session_kind.is_task_chat_id(cid) else "")
         locked = {"drive_refusal": drive_refusal} if drive_refusal else {}
-        return cid, chat, locked
+        call_lock = refusal if refusal in (_vis.PHONE_CHAT_READ_ONLY, _vis.CALL_IN_PROGRESS) else ""
+        return cid, chat, locked, call_lock
 
     async def _resume_inflight(self, cid: str, chat: dict, locked: dict[str, str],
                                inflight: warmup_registry.InflightWarmup) -> None:
@@ -378,8 +387,7 @@ class ChatResumeMixin(_Host):
         from ws.dashboard import _CHAT_PAGE, _build_chat_restore
         await warmup_registry.attach_listener(cid, self._send)
         self._attached_warmups.add(cid)
-        self.chat_id = cid
-        self.agent_name = chat["agent"]
+        await self._onto_chat(chat)
         # (DB-first read): the first prompt was persisted at
         # send-time (_persist_first_prompt), so a switch-away/back or a mid-spawn
         # refresh must reload it from the DB — without this the bubble is blank
@@ -396,6 +404,9 @@ class ChatResumeMixin(_Host):
         inflight_msgs, inflight_has_more, inflight_restore = await chat_writer.submit(
             cid, _inflight_job, label="inflight_history",
         )
+        # An existing chat warms up too (a cold send, a wake, a move, the
+        # re-warm after the terminal switch): its badges stay.
+        running = await running_fields((cid,))
         await self._send({
             "type": wire.CHAT_HISTORY,
             "chat_id": cid,
@@ -417,6 +428,7 @@ class ChatResumeMixin(_Host):
             # A warmup is mid-spawn — the session is coming up; never
             # offer cross-engine options against it.
             "process_alive": True,
+            **running,
             **locked,
         })
         self._history_floors = None
@@ -537,7 +549,7 @@ class ChatResumeMixin(_Host):
 
             def _delta_job():
                 return (task_store.get_chat_messages_since(read_floors),
-                        task_store.get_chat_plans(cid), _build_chat_restore(cid))
+                        task_store.get_chat_plans(cid), _build_chat_restore(cid, related_chats))
 
             rows, plans, restore = await chat_writer.submit(
                 cid, _delta_job, label="history_delta",
@@ -552,7 +564,7 @@ class ChatResumeMixin(_Host):
                     msgs, more = task_store.get_chat_messages(cid), False
                 else:
                     msgs, more = task_store.get_chat_messages_page(cid, _CHAT_PAGE)
-                return msgs, more, task_store.get_chat_plans(cid), _build_chat_restore(cid)
+                return msgs, more, task_store.get_chat_plans(cid), _build_chat_restore(cid, related_chats)
 
             rows, has_more, plans, restore = await chat_writer.submit(
                 cid, _history_job, label="history_read",
@@ -676,7 +688,7 @@ class ChatResumeMixin(_Host):
                 )
 
     async def _resume_history(self, cid: str, chat: dict, r: _ResumeRows, locked: dict[str, str],
-                              f: _ResumeFacts) -> tuple["ChatStreamPump | None", bool, str]:
+                              f: _ResumeFacts, call_lock: str) -> tuple["ChatStreamPump | None", bool, str]:
         """The history frame: the pump re-read after the reap, the rows above a
         live pump's cutoff withheld, the view-only notice first on an externally
         driven chat, the frame encoded off the loop. Answers the pump, whether
@@ -688,12 +700,11 @@ class ChatResumeMixin(_Host):
         # this chat's stream out-of-band. Never attach to its pump — that would
         # steal the stream and kill the live call. Serve the FULL persisted
         # transcript read-only instead (no truncation, no attach below). A
-        # phone conversation is the call's between its turns too: this socket
+        # chat a call holds is the call's between its turns too: this socket
         # never binds the call's session (the drive gate refuses every frame
         # on it, and a bound session would still take its viewer's slot).
         view_only_external = (
-            session_kind.of_chat(chat) is session_kind.PHONE
-            or _vis.is_phone_chat_owner(chat.get("user_sub"))
+            bool(call_lock)
             or bool(pump and not pump.is_done
                     and pump.source_type in session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES)
         )
@@ -763,11 +774,10 @@ class ChatResumeMixin(_Host):
         # holds these rows and paints both at once.
         if pump and not pump.is_done and not view_only_external:
             frame["live_pending"] = True
-        # Background work still running: every stored spawn reads finished,
-        # so the page is told which ones are not (their badges).
-        running = running_background(r.read_floors or (cid,))
-        if running["agents"] or running["commands"]:
-            frame["running"] = running
+        # Background work and delegations still running: every stored spawn
+        # reads finished, and a delegation's spawn may be older than the
+        # page, so the page is told which ones are not (their badges).
+        frame.update(await running_fields(r.read_floors or (cid,)))
         if r.as_delta:
             frame["since_id"] = min(r.read_floors.values())
         kind = ""
@@ -779,7 +789,9 @@ class ChatResumeMixin(_Host):
             # call's pump announces itself, so the poll's first delta is what
             # tells it. The page says so and re-resumes when the chat's
             # status reads ready again; a repeat changes nothing there.
-            await self._send({"type": wire.CHAT_VIEW_ONLY, "chat_id": cid, "kind": kind})
+            await self._send({"type": wire.CHAT_VIEW_ONLY, "chat_id": cid, "kind": kind,
+                              # The composer's lock while the call holds the chat.
+                              **({"lock": call_lock} if call_lock else {})})
         # Encoded off the loop, row by row: a long history's dump never holds
         # the loop, and the thread yields between rows.
         if await self._send_text(await asyncio.to_thread(_encode_history, frame, messages)):

@@ -1,0 +1,41 @@
+{
+ "logged": [
+  [
+   "INFO",
+   "Proxy shutdown starting..."
+  ]
+ ],
+ "order": [
+  "_boot_process",
+  "_boot_database",
+  "_boot_registrations",
+  "_boot_mcps",
+  "_boot_subscriptions",
+  "_boot_services",
+  {
+   "args": [
+    "app",
+    "executor"
+   ],
+   "step": "_boot_arm"
+  },
+  "serving",
+  "note_platform_ending",
+  "_stop_workers",
+  {
+   "args": [
+    "logger otodock"
+   ],
+   "step": "_shutdown_sessions"
+  },
+  "stop_all",
+  "dispatcher.shutdown",
+  {
+   "args": [
+    "logger otodock"
+   ],
+   "step": "_shutdown_cleanup"
+  }
+ ],
+ "raised": "the tail failed"
+}

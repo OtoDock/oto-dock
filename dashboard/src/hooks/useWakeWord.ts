@@ -31,7 +31,7 @@ import { useChatAudioCapability } from './useChatAudioCapability'
 import { useMyAudioPrefs } from '../api/userAudio'
 import { useWakeKeywords } from '../api/wakeWord'
 import { useNotificationSound } from './useNotificationSound'
-import { lastReleasedMicOwner, micBusy, subscribeMic } from '../audio/micCoordinator'
+import { lastReleasedMicOwner, micBusy, noteCapture, subscribeMic } from '../audio/micCoordinator'
 import { ensureNativeMicPermission } from '../audio/micPermission'
 import { isNativePlatform } from '../audio/types'
 import {
@@ -274,6 +274,7 @@ export function useWakeWord(navigate: NavigateFunction, authed: boolean) {
       stream?.getTracks().forEach((t) => t.stop())
       node = null; source = null; ctx = null; stream = null
       wakeDiagListening(false)
+      noteCapture('wake', false)
     }
 
     // Suspension watchdog: Android can suspend the AudioContext
@@ -308,6 +309,9 @@ export function useWakeWord(navigate: NavigateFunction, authed: boolean) {
 
     const start = async () => {
       const myRun = ++run
+      // Before any microphone request: the playback session puts "auto"
+      // back on this note, since WebKit refuses a capture under "playback".
+      noteCapture('wake', true)
       try {
         if (isNativePlatform()) await ensureNativeMicPermission()
         if (cancelled || myRun !== run) return

@@ -1,0 +1,49 @@
+{
+ "clean": {
+  "logged": [],
+  "order": [
+   "oauth_refresh_worker",
+   "subscription_renewer",
+   "license_check_worker",
+   "release_check",
+   "phone_health_worker",
+   "token_fanout"
+  ]
+ },
+ "each one fails": {
+  "logged": [
+   [
+    "ERROR",
+    "OAuth refresh worker shutdown failed (continuing)"
+   ],
+   [
+    "ERROR",
+    "Subscription renewer shutdown failed (continuing)"
+   ],
+   [
+    "ERROR",
+    "License check worker shutdown failed (continuing)"
+   ],
+   [
+    "ERROR",
+    "Release check worker shutdown failed (continuing)"
+   ],
+   [
+    "ERROR",
+    "Phone health worker shutdown failed (continuing)"
+   ],
+   [
+    "ERROR",
+    "Token-freshness worker shutdown failed (continuing)"
+   ]
+  ],
+  "order": [
+   "oauth_refresh_worker",
+   "subscription_renewer",
+   "license_check_worker",
+   "release_check",
+   "phone_health_worker",
+   "token_fanout"
+  ]
+ }
+}

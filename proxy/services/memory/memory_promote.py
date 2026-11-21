@@ -16,6 +16,7 @@ from typing import Any
 
 import config
 from auth import roles
+from services.infra import safe_fs
 from services.memory import memory_file, memory_publish
 from services.memory.memory_file import Caps, MemoryOpError, OpResult
 from storage.agents import agent_store, memory_store
@@ -84,6 +85,10 @@ async def promote(
         src_result, dst_result = await asyncio.to_thread(
             memory_file.op_promote, src_root, dst_root, rel, target, caps=caps,
         )
+    except safe_fs.SafeFsError as exc:
+        raise MemoryOpError(
+            "Error: this memory folder is reached through a link, so nothing was moved."
+        ) from exc
     except OSError as exc:
         raise MemoryOpError(
             f"Error: {rel} could not be moved. Try again."

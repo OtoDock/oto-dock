@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react'
+import { copyOrSay } from '../../lib/copyText'
 
 interface Segment {
   label: string
@@ -52,12 +53,9 @@ export default function WorkspaceBreadcrumb({
       : virtualPrefix
 
   const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(copyTarget)
+    if (await copyOrSay(copyTarget)) {
       setCopied(true)
       setTimeout(() => setCopied(false), 1200)
-    } catch {
-      // No-op; clipboard unsupported.
     }
   }, [copyTarget])
 

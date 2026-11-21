@@ -64,12 +64,27 @@ def test_the_sentinel_round_trips_and_never_runs_on_a_machine():
     assert not placement.runs_on("abc", "")
 
 
+def test_a_pin_agrees_with_a_session_on_the_platforms_own_machine_only_by_its_clause():
+    """The platform's place (``local``) agrees with a session on a compute
+    machine, and with no other machine; a pin naming a machine agrees with
+    that machine alone, compute or not."""
+    assert placement.runs_on(placement.LOCAL, "c-1", platform_machine=True)
+    assert placement.runs_on("", "c-1", platform_machine=True)
+    assert not placement.runs_on(placement.LOCAL, "c-1")
+    assert placement.runs_on("c-1", "c-1", platform_machine=True)
+    assert not placement.runs_on("m-2", "c-1", platform_machine=True)
+    assert not placement.runs_on(placement.offline_sentinel("c-1"), "c-1", platform_machine=True)
+    assert not placement.runs_on(placement.LOCAL, "", platform_machine=True)
+
+
 def test_the_kinds_and_the_pairing_scopes():
-    assert placement.KINDS == (placement.KIND_LOCAL, placement.KIND_ADMIN_REMOTE, placement.KIND_USER_REMOTE)
-    assert placement.REMOTE_KINDS == (placement.KIND_ADMIN_REMOTE, placement.KIND_USER_REMOTE)
+    assert placement.KINDS == (placement.KIND_LOCAL, placement.KIND_ADMIN_REMOTE, placement.KIND_USER_REMOTE,
+                               placement.KIND_COMPUTE)
     assert placement.PAIRING_SCOPES == (placement.PAIRING_ADMIN, placement.PAIRING_USER)
+    assert placement.MACHINE_SCOPES == (placement.PAIRING_ADMIN, placement.PAIRING_USER, placement.PAIRING_COMPUTE)
     assert placement.machine_is_admin_paired({"pairing_scope": placement.PAIRING_ADMIN})
     assert not placement.machine_is_admin_paired({"pairing_scope": placement.PAIRING_USER})
+    assert not placement.machine_is_admin_paired({"pairing_scope": placement.PAIRING_COMPUTE})
     assert not placement.machine_is_admin_paired({})
     assert not placement.machine_is_admin_paired(None)
     # the stored spellings are the frozen ones
@@ -77,7 +92,47 @@ def test_the_kinds_and_the_pairing_scopes():
     assert (placement.KIND_ADMIN_REMOTE, placement.KIND_USER_REMOTE) == ("admin_remote", "user_remote")
     assert placement.SITE_MACHINE == "machine" and placement.OFFLINE_PREFIX == "__offline__:"
     assert (placement.PAIRING_ADMIN, placement.PAIRING_USER) == ("admin", "user")
+    assert placement.KIND_COMPUTE == placement.PAIRING_COMPUTE == "compute"
 
+
+@pytest.mark.parametrize("row, personal, compute", [
+    ({"pairing_scope": "user", "registered_by": "sub-a"}, True, False),
+    ({"pairing_scope": "admin", "registered_by": "sub-b"}, False, False),
+    ({"pairing_scope": "compute", "registered_by": ""}, False, True),
+    ({"pairing_scope": "other", "registered_by": "sub-c"}, False, False),
+    ({}, False, False),
+    (None, False, False),
+])
+def test_a_rows_scope_answers_once(row, personal, compute):
+    """A compute row is no person's machine: every reader that took "not
+    admin-paired" for "a person's" asks ``machine_is_personal``."""
+    assert placement.machine_is_personal(row) is personal
+    assert placement.machine_is_compute(row) is compute
+
+
+def test_owner_of_is_a_personal_machines_owner_and_nobody_else():
+    assert placement.owner_of({"pairing_scope": "user", "registered_by": "sub-a"}) == "sub-a"
+    # an admin's machine was paired by an admin, and is owned by the admin tier
+    assert placement.owner_of({"pairing_scope": "admin", "registered_by": "sub-b"}) == ""
+    assert placement.owner_of({"pairing_scope": "compute", "registered_by": None}) == ""
+    assert placement.owner_of({"pairing_scope": "user", "registered_by": None}) == ""
+    assert placement.owner_of(None) == ""
+
+
+def test_a_scope_no_release_writes_refuses_even_who_registered_it():
+    row = {"id": "x-1", "pairing_scope": "other", "registered_by": "sub-a"}
+    assert not placement.may_run_on(row, run_sub="sub-a", run_can_manage=True, user_paired_allowed=True)
+    assert not placement.may_run_on({"id": "x-2", "registered_by": "sub-a"}, run_sub="sub-a",
+                                    run_can_manage=True, user_paired_allowed=True)
+
+
+def test_nobody_may_run_on_a_compute_machine_yet():
+    # the row may name the admin who registered it (the owner rule allows it)
+    row = {"id": "c-1", "pairing_scope": "compute", "registered_by": "sub-a", "all_roles_run_here": True}
+    for run_sub, manage in (("", False), ("sub-a", True), ("sub-a", False), ("", True)):
+        assert not placement.may_run_on(row, run_sub=run_sub, run_can_manage=manage,
+                                        user_paired_allowed=True, agent_default="c-1")
+    assert not placement.admits_every_role(row, "c-1")
 
 def test_parse_device_grants_fails_closed():
     assert placement.parse_device_grants(None) == set()
@@ -99,14 +154,36 @@ def test_parse_device_grants_fails_closed():
     # fail-closes on the empty facts), but the checks probe the platform copy
     (placement.KIND_ADMIN_REMOTE, "", True, True, False, placement.SITE_LOCAL),
 ])
-def test_the_truth_table(kind, machine_id, remote, admin, user, site):
+def test_every_named_fact_equals_what_its_sites_read_before_on_the_three_kinds(
+        kind, machine_id, remote, admin, user, site):
+    """Before the facts apart every question was ``is_remote`` or its
+    negation; on the three kinds a 1.9.1 install has, each named fact still
+    answers exactly that, so no site's answer changed."""
     p = placement.PlacementCapabilities(kind=kind, machine_id=machine_id)
-    assert p.is_remote is remote and p.is_local is (not remote)
+    assert p.is_remote is remote
     assert p.admin_paired is admin and p.user_paired is user
     assert p.isolates_with_bwrap is (not remote)
     assert p.needs_path_translation is remote
+    assert p.files_synced is remote
     assert p.counts_toward_capacity is (not remote)
+    assert p.offers_device_tools is remote
+    # what the key-material gates read: "is_remote and not admin_paired"
+    assert p.user_paired is (remote and not admin)
     assert p.site == site
+    assert not hasattr(p, "is_local")
+
+
+def test_a_compute_placement_is_a_machine_for_its_process_and_the_platform_for_the_rest():
+    p = placement.PlacementCapabilities(kind=placement.KIND_COMPUTE, machine_id="c-1")
+    assert p.is_remote  # the process: reached over the machine's link
+    assert p.isolates_with_bwrap and not p.needs_path_translation and not p.files_synced
+    assert p.counts_toward_capacity and not p.offers_device_tools
+    assert not p.admin_paired and not p.user_paired
+    assert p.site == placement.SITE_LOCAL  # its files are the platform's own
+
+
+def test_an_unknown_kind_answers_with_a_persons_machine_rules():
+    assert placement.facts_of("nope") == placement.facts_of(placement.KIND_USER_REMOTE)
 
 
 def test_admin_paired_is_the_kind_not_the_row():
@@ -154,6 +231,18 @@ def test_from_machine_reads_the_row_once():
         allow_full_fs=True, claude_runtime_root="/tmp/claude-501",
         user_dirs={"desktop": "/Users/alice/Desktop"}, device_grants={"computer"}, has_display=True,
     )
+
+
+def test_a_compute_placement_carries_no_fact_of_its_row():
+    """Its sessions see sandbox paths: no path, OS user, full access or
+    device grant of the row reaches a reader that reads them ungated (the
+    ``~`` expansion, the permission hook's device grants)."""
+    row = {**_ROW, "id": "c-1", "name": "Compute one", "pairing_scope": "compute"}
+    p = placement.from_machine(placement.KIND_COMPUTE, row)
+    assert p == placement.PlacementCapabilities(kind=placement.KIND_COMPUTE, machine_id="c-1", label="Compute one")
+    assert p.home_dir == "" and p.agents_dir == "" and p.os_user == "" and p.user_dirs == {}
+    assert not p.allow_full_fs and p.device_grants == set() and p.has_display is None
+    assert p.state_dirs == ()
 
 
 def test_from_machine_fails_closed_on_a_missing_or_unreadable_row():
@@ -281,7 +370,7 @@ def test_the_dashboard_mirror_equals_the_authority():
     text = _MIRROR.read_text(encoding="utf-8")
     assert _ts_const_strings(text, "TARGET_LOCAL") == [placement.LOCAL]
     assert _ts_const_strings(text, "SITE") == [placement.SITE_LOCAL, placement.SITE_MACHINE]
-    assert _ts_const_strings(text, "PAIRING_SCOPE") == list(placement.PAIRING_SCOPES)
+    assert _ts_const_strings(text, "PAIRING_SCOPE") == list(placement.MACHINE_SCOPES)
     for fn in ("isLocalTarget", "machineOf"):
         assert f"export function {fn}(" in text, fn
     assert "export type SiteKind" in text and "export type PairingScope" in text
@@ -354,3 +443,55 @@ def test_from_machine_reads_the_two_state_keys_and_tolerates_their_absence():
         "id": "m", "capabilities": json.dumps({"os": "linux", "home_dir": "/home/office"})})
     assert old.reported_otodock_dir == "" and old.mcps_dir == ""
     assert old.otodock_dir == "/home/office/.oto-dock"
+
+
+def test_a_placement_carries_the_satellites_version_from_its_row():
+    """The build leaves the SSH hosts tool out of a machine whose satellite
+    cannot open the agent socket: the version rides the placement, every
+    kind, and an unreadable row still answers it."""
+    row = {**_ROW, "satellite_version": "0.5.173"}
+    assert placement.from_machine(placement.KIND_ADMIN_REMOTE, row).satellite_version == "0.5.173"
+    assert placement.from_machine(placement.KIND_COMPUTE, row).satellite_version == "0.5.173"
+    bad = placement.from_machine(placement.KIND_USER_REMOTE,
+                                 {**row, "capabilities": "{not json"})
+    assert bad.satellite_version == "0.5.173"
+    assert placement.from_machine(placement.KIND_ADMIN_REMOTE, _ROW).satellite_version == ""
+    assert placement.LOCAL_PLACEMENT.satellite_version == ""
+
+
+def test_from_machine_reads_the_exit_from_the_live_connection_first(monkeypatch):
+    """The machine rule's input: the connection's report when it is
+    connected, the row's capabilities when it is not, and nothing for a
+    satellite that reports none."""
+    import json
+
+    from core.remote import satellite_connection
+    row = {"id": "m-9", "name": "Laptop", "satellite_version": "0.5.175",
+           "capabilities": json.dumps({"os": "linux", "exit_port": 40001, "exit_ok": True})}
+    live = {"m-9": (0, False)}
+
+    report: dict = {}
+
+    class _Cm:
+        def exit_state(self, mid):
+            return live.get(mid, (0, False))
+
+        def exit_report(self, mid):
+            return report.get(mid, {})
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", _Cm)
+    p = placement.from_machine(placement.KIND_USER_REMOTE, row)
+    assert (p.exit_port, p.exit_ok) == (40001, True)
+    assert (p.exit_why, p.exit_upstream) == ("", False)
+    report["m-9"] = {"why": "installing", "upstream": True}
+    p = placement.from_machine(placement.KIND_USER_REMOTE, row)
+    assert (p.exit_why, p.exit_upstream) == ("installing", True)
+    del report["m-9"]
+    live["m-9"] = (40002, False)
+    p = placement.from_machine(placement.KIND_USER_REMOTE, row)
+    assert (p.exit_port, p.exit_ok) == (40002, False)
+    c = placement.from_machine(placement.KIND_COMPUTE, {**row, "id": "m-9"})
+    assert (c.exit_port, c.exit_ok) == (40002, False)
+    none = placement.from_machine(placement.KIND_USER_REMOTE, {"id": "m-8", "capabilities": json.dumps({"os": "linux"})})
+    assert (none.exit_port, none.exit_ok) == (0, False)
+    bad = placement.from_machine(placement.KIND_USER_REMOTE, {"id": "m-7", "capabilities": "{not json"})
+    assert (bad.exit_port, bad.exit_ok) == (0, False)

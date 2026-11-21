@@ -29,7 +29,9 @@ vi.mock('@/api/auth', async (orig) => ({
 }))
 
 import CollaboraFrame from '@/components/chat/media/CollaboraFrame'
+import { EDITOR_DARK_PAGE_KEY, EDITOR_DARK_THEME_KEY } from '@/components/chat/media/editorPrefs'
 import FilePreviewBody from '@/components/workspace/FilePreviewBody'
+import { ThemeContext } from '@/contexts/useTheme'
 
 const submitMock = vi.fn()
 
@@ -39,6 +41,43 @@ beforeEach(() => {
   apiFetchMock.mockReset()
   submitMock.mockReset()
   vi.spyOn(HTMLFormElement.prototype, 'submit').mockImplementation(submitMock)
+  localStorage.clear()
+})
+
+const themed = (theme: 'light' | 'dark', node: React.ReactNode) => (
+  <ThemeContext.Provider value={{ theme, setTheme: () => {}, resolvedTheme: theme }}>{node}</ThemeContext.Provider>
+)
+
+describe('CollaboraFrame and the editor\'s theme', () => {
+  it('seeds the theme and a white page before the post', () => {
+    submitMock.mockImplementation(() => {
+      expect(localStorage.getItem(EDITOR_DARK_THEME_KEY)).toBe('true')
+      expect(localStorage.getItem(EDITOR_DARK_PAGE_KEY)).toBe('false')
+    })
+    render(themed('dark', <CollaboraFrame url="/collabora/cool.html?WOPISrc=x" accessToken="tok" />))
+    expect(submitMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('seeds them before a frame that loads its address as it is', () => {
+    render(themed('light', <CollaboraFrame url="/collabora/cool.html?WOPISrc=x&access_token=old" />))
+    expect(localStorage.getItem(EDITOR_DARK_THEME_KEY)).toBe('false')
+    expect(localStorage.getItem(EDITOR_DARK_PAGE_KEY)).toBe('false')
+  })
+
+  it('keeps a page the person inverted', () => {
+    localStorage.setItem(EDITOR_DARK_PAGE_KEY, 'true')
+    render(themed('dark', <CollaboraFrame url="/collabora/cool.html?WOPISrc=x" accessToken="tok" />))
+    expect(localStorage.getItem(EDITOR_DARK_PAGE_KEY)).toBe('true')
+  })
+
+  it('a theme switch does not post the frame again', () => {
+    const view = render(themed('light', <CollaboraFrame url="/collabora/cool.html?WOPISrc=x" accessToken="tok" />))
+    view.rerender(themed('dark', <CollaboraFrame url="/collabora/cool.html?WOPISrc=x" accessToken="tok" />))
+    expect(submitMock).toHaveBeenCalledTimes(1)
+    view.rerender(themed('dark', <CollaboraFrame url="/collabora/cool.html?WOPISrc=x" accessToken="tok" frameKey={1} />))
+    expect(submitMock).toHaveBeenCalledTimes(2)
+    expect(localStorage.getItem(EDITOR_DARK_THEME_KEY)).toBe('true')
+  })
 })
 
 describe('CollaboraFrame', () => {

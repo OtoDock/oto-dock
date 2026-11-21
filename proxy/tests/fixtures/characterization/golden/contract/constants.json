@@ -1,0 +1,47 @@
+{
+ "AUTH_LOCAL": "local_endpoint",
+ "AUTH_TYPES": [
+  "oauth",
+  "api_key",
+  "local_endpoint",
+  "relay"
+ ],
+ "EFFORT_LADDER": [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra"
+ ],
+ "PROVIDER_KINDS": [
+  "vendor",
+  "local"
+ ],
+ "PROVIDER_LOCAL": "local",
+ "PROVIDER_VENDOR": "vendor",
+ "RECONNECT_WAIT_S": 10.0,
+ "WINDOW_ROLES": [
+  "session",
+  "quota"
+ ],
+ "permission_modes": {
+  "ASK_MODE": "ask",
+  "AUTO_REVIEW_MODE": "autoReview",
+  "DONT_ASK_MODE": "dontAsk",
+  "JUDGE_MODE": "judge",
+  "PERMISSION_MODES": [
+   "ask",
+   "autoReview",
+   "dontAsk",
+   "plan"
+  ],
+  "PLAN_MODE": "plan",
+  "STORED_ONLY_MODES": [
+   "auto",
+   "judge"
+  ],
+  "UNATTENDED_MODE": "auto"
+ },
+ "same_objects": true
+}

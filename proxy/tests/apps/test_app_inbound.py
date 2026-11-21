@@ -39,6 +39,7 @@ from services.apps import (
     app_lint,
     app_supervisor,
     app_tokens,
+    call_rate,
     manifest as _mf,
 )
 from storage import (
@@ -85,7 +86,7 @@ def _clean(monkeypatch):
     app_proxy._buckets.clear()
     rate_limiter._attempts.clear()
     monkeypatch.setattr(app_handlers, "schedule_drain", lambda app_id: None)
-    monkeypatch.setattr(app_proxy, "PLATFORM_RATE", 1000.0)
+    monkeypatch.setattr(call_rate, "RESERVE", 1000.0)
     yield
     app.dependency_overrides.pop(get_current_user, None)
     app_supervisor._instances.clear()

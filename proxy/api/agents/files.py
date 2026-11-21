@@ -47,8 +47,9 @@ from storage.pg import run_db
 _BOUND = [Depends(session_bound_to("name"))]
 from api.media.media import FdFileResponse
 from auth import roles, tokens
+from auth.path_policy import PRESS_NONE
 from auth.request_path import has_traversal
-from core import layout
+from core import agent_folder, layout
 
 # The write / delete bookkeeping every platform writer shares (tombstones,
 # authorship, library projection, satellite fan-out, recover-bin capture)
@@ -73,13 +74,15 @@ class _SessionGrant:
     are read; ``workspace/`` is written at the workspace tier, ``knowledge/``
     only with the manager-provenance grant (``knowledge_rw``); ``config/`` is
     read and, at the owner tier, written only when the context shows it; no
-    person's folder; a read-only context (a judge) writes nothing."""
+    person's folder; a read-only context (a judge) writes nothing; an app
+    button's press that reaches no folder of the agent reaches nothing."""
 
     session_id: str
     role: str
     config_visible: bool
     knowledge_rw: bool
     read_only: bool
+    no_folders: bool = False
 
     @classmethod
     def of(cls, session_id: str, ctx) -> "_SessionGrant":
@@ -88,11 +91,14 @@ class _SessionGrant:
             config_visible=bool(ctx.effective_config_visible),
             knowledge_rw=bool(getattr(ctx, "knowledge_rw", False)),
             read_only=getattr(ctx, "read_only", False) is True,
+            no_folders=getattr(ctx, "press_reach", "") == PRESS_NONE,
         )
 
     def check(self, path: str, *, writing: bool) -> None:
         def under(scope: str) -> bool:
             return path == scope or path.startswith(scope + "/")
+        if self.no_folders:
+            raise HTTPException(status_code=403, detail="This button's call reaches none of the agent's files")
         if under(layout.CONFIG):
             if not self.config_visible:
                 raise HTTPException(status_code=403, detail="This session does not see the agent's config")
@@ -236,9 +242,8 @@ def _build_tree(directory: Path, base: Path, depth: int, max_depth: int, *,
     Excludes:
       * Hidden entries (`.foo`)
       * `SKIP_DIRS` (node_modules, venv, etc.)
-      * **Protected OAuth credentials_dir subpaths** — e.g. `google-tokens/`
-        for workspace-mcp. Manifest-driven via
-        ``mcp_registry.get_protected_credentials_subpaths()``. Filtered
+      * **The folder names earlier releases gave OAuth token copies**
+        (``mcp_registry.get_protected_credentials_subpaths()``). Filtered
         for EVERY role (including admin) because raw OAuth tokens have
         no UX value in the file tree — the OAuth connect/disconnect UI
         is the intended management surface.
@@ -250,19 +255,32 @@ def _build_tree(directory: Path, base: Path, depth: int, max_depth: int, *,
     if depth > max_depth:
         return []
 
+    base_rel = "" if directory == base else directory.relative_to(base).as_posix()
+    # Each level is opened beneath ``base`` with no link followed (a folder
+    # replaced by a link since its parent was listed lists nothing), and its
+    # entries are read from that handle.
     try:
-        with os.scandir(directory) as it:
+        dirfd = safe_fs.open_dir_beneath(base, base_rel)
+    except OSError:
+        return []
+    try:
+        return _tree_level(dirfd, directory, base, base_rel, depth, max_depth, keep, link_stat)
+    finally:
+        os.close(dirfd)
+
+
+def _tree_level(dirfd: int, directory: Path, base: Path, base_rel: str, depth: int, max_depth: int,
+                keep: Callable[[str, int, bool], bool] | None,
+                link_stat: Callable[[str], os.stat_result | None] | None) -> list[dict]:
+    """One level of :func:`_build_tree`, listed from ``dirfd``."""
+    try:
+        with os.scandir(dirfd) as it:
             entries = list(it)
-    except PermissionError:
+    except OSError:
         return []
 
-    # Look up the protected credentials_dir subpath set ONCE per call
-    # (it's a frozenset of a few strings; cost is negligible). Doing it
-    # here keeps the lookup current with any manifest reload.
     from services.mcp import mcp_registry
     protected_subpaths = mcp_registry.get_protected_credentials_subpaths()
-
-    base_rel = "" if directory == base else directory.relative_to(base).as_posix()
 
     def _rel(name: str) -> str:
         return f"{base_rel}/{name}" if base_rel else name
@@ -369,7 +387,7 @@ def _build_tree_scoped(name: str, role: FileRole, username: str, *,
         except HTTPException:
             return None
         try:
-            st = os.stat(agent_dir / agent_rel)
+            st = safe_fs.lstat_beneath(config.AGENTS_DIR, canonical)
         except OSError:
             return None
         return st if stat.S_ISREG(st.st_mode) else None
@@ -464,12 +482,13 @@ def _filter_tree(nodes: list[dict], role: FileRole, username: str = "") -> list[
 
 
 def _check_oauth_protected(*paths: str) -> None:
-    """Refuse the request if ANY of the supplied paths references a
-    registered ``credentials_dir`` subpath, or lies under a ``.credentials``
-    folder (``knowledge/.credentials``, ``users/<u>/.credentials``), which
-    every session's sandbox masks whatever is left in it.
+    """Refuse the request if ANY of the supplied paths names a folder
+    earlier releases gave OAuth token copies
+    (``mcp_registry.get_protected_credentials_subpaths``), or lies under a
+    ``.credentials`` folder (``knowledge/.credentials``,
+    ``users/<u>/.credentials``), which every session's sandbox masks
+    whatever is left in it.
 
-    Manifest-driven (``mcp_registry.get_protected_credentials_subpaths``).
     Fires for EVERY role (even admin) because the OAuth connect/disconnect
     UI is the intended management surface; raw token JSON has no UX value
     and exposing it via the file API enables exfiltration.
@@ -625,7 +644,7 @@ def safe_agent_path(
     if "\x00" in raw_path:
         raise HTTPException(status_code=400, detail="Invalid path")
     norm = _normalize_path(raw_path)  # rejects empty / '.' / '..' segments
-    agent_root = Path(os.path.realpath(agent_dir))
+    agent_root = agent_folder.agent_root(name)
     try:
         resolved = resolve_under(agent_root / norm, agent_root)
     except PathOutsideRoot as exc:
@@ -694,7 +713,7 @@ def _acts_as_person(u: UserContext) -> bool:
     """Whether a file operation is judged at a person's role: a cookie, or a
     session token that names a person. The master key keeps the admin tier
     with no person; a no-user session is judged by its grant."""
-    return not u.is_api_key or u.kind == PrincipalKind.USER_SESSION
+    return not u.is_api_key or u.kind in (PrincipalKind.USER_SESSION, PrincipalKind.API_KEY)
 
 
 def _op_role(u: UserContext, name: str) -> FileRole:
@@ -718,7 +737,7 @@ def _agent_rel(name: str, resolved: Path, agent_dir: Path) -> str:
     answer: the agent's own NAME, then the answer below the agent root's
     realpath. The first component is the name, never the realpath's first
     segment, so an agent folder swapped for a link is refused at the open."""
-    sub = resolved.relative_to(Path(os.path.realpath(agent_dir))).as_posix()
+    sub = resolved.relative_to(agent_folder.agent_root(name)).as_posix()
     return name if sub in ("", ".") else f"{name}/{sub}"
 
 
@@ -1608,6 +1627,9 @@ async def write_agent_file(
     file_path, _ = safe_agent_path(agent_dir, name, path, u, writing=True, username=uname)
     agents_rel = _agent_rel(name, file_path, agent_dir)
     sub = _sub_of(name, agents_rel)
+    # The agent's own folder is no file to write, as it is none to delete.
+    if not sub:
+        raise HTTPException(status_code=403, detail="Cannot write to the agent root directory")
     async with _file_ops_slot():
         await asyncio.to_thread(
             _write_sync, name, agents_rel, req.content.encode("utf-8"), exclusive=False,

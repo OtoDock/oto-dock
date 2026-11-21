@@ -19,11 +19,8 @@ The order, written once (the engine docs say the same):
    new first engine needs six chats in ten of the window (the agent's, else
    every agent's), else the first the picker showed last stays
    (``user_ui_prefs.data.engine_first``, written by the agent routes alone)
-   while it has a chat in that window. A preferred engine stored before the
-   order (``users.preferred_execution_path``, never written now) comes first
-   while the person has no chat on an engine the agent lets them run, here
-   or anywhere. When chats or that preference decide the first place, the
-   pick is the first of the order;
+   while it has a chat in that window. When chats decide the first place,
+   the pick is the first of the order;
 2. else (no chat anywhere on an engine the agent lets them run) the agent's
    default engine, when the person holds it;
 3. else the first engine in the agent's order the person holds with an
@@ -81,7 +78,6 @@ logger = logging.getLogger("otodock")
 
 #: ``Resolution.reason``: which branch of the order answered.
 REASON_USE = "use"
-REASON_SEED = "seed"
 REASON_AGENT_DEFAULT = "agent_default"
 REASON_OWN = "own"
 REASON_PLATFORM = "platform"
@@ -114,18 +110,15 @@ class Holdings:
     own chats per agent and engine in the window (``use``), the engine
     their picker last showed first per agent (``first_shown``), when they
     connected each engine (``connected``: the oldest of their own active
-    accounts there, ISO), and a preferred engine stored before the order
-    (``seed``, '' = none). ``use_read`` is False when the use could not be
-    read: the order then stands on the seed and the connection order alone,
-    and nothing of it is remembered. Never mutated: the dicts may be
-    shared."""
+    accounts there, ISO). ``use_read`` is False when the use could not be
+    read: the order then stands on the connection order alone, and nothing
+    of it is remembered. Never mutated: the dicts may be shared."""
     own: dict[str, frozenset[str]] = field(default_factory=dict)
     pool: dict[str, frozenset[str]] = field(default_factory=dict)
     resting: dict[str, frozenset[str]] = field(default_factory=dict)
     use: dict[str, dict[str, int]] = field(default_factory=dict)
     first_shown: dict[str, str] = field(default_factory=dict)
     connected: dict[str, str] = field(default_factory=dict)
-    seed: str = ""
     use_read: bool = True
 
 
@@ -159,8 +152,8 @@ class Resolution:
     resolves), the branch that answered, the agent's allowlist in its
     order, the engines of it the person may run in their order, and each
     one's model. ``first_shown`` is the engine the person's order put first
-    by their use or a stored preference ('' otherwise), ``first_is_new``
-    whether it is not the one remembered for the agent."""
+    by their use ('' otherwise), ``first_is_new`` whether it is not the one
+    remembered for the agent."""
     execution_path: str
     model: str
     reason: str
@@ -240,7 +233,6 @@ def person_holdings(user_sub: str, engines: list[str] | None = None) -> Holdings
     one by default): the store reads of the pool's own rule, nothing
     acquired. A falsy sub holds nothing."""
     from services.engines import subscription_pool
-    from storage import database as task_store
     from storage.billing import subscription_store
     if not user_sub:
         return Holdings()
@@ -265,11 +257,9 @@ def person_holdings(user_sub: str, engines: list[str] | None = None) -> Holdings
         awake = {str(s["provider"]) for s in [*held, *borrowed]
                  if not subscription_pool.account_resting(str(s.get("id") or ""))}
         resting[path] = frozenset((own[path] | pool[path]) - awake)
-    row = task_store.get_user(user_sub) or {}
     use, first_shown, read = _person_use(user_sub)
     return Holdings(own=own, pool=pool, resting=resting, use=use, first_shown=first_shown,
-                    connected=connected, seed=str(row.get("preferred_execution_path") or ""),
-                    use_read=read)
+                    connected=connected, use_read=read)
 
 
 # --- the person's use -------------------------------------------------------
@@ -339,10 +329,8 @@ def _everywhere(use: dict[str, dict[str, int]]) -> dict[str, int]:
 def person_order(agent_slug: str, listed: list[str], holdings: Holdings) -> tuple[tuple[str, ...], str]:
     """``listed`` (the engines the person may run on the agent, in the
     allowlist's order) in the person's order, and what decided its first
-    place: ``REASON_USE`` (their chats), ``REASON_SEED`` (a stored
-    preferred engine, at the cold start alone: the person can no longer see
-    or change it, so it never outranks a chat) or ``""`` (no chat anywhere
-    on a listed engine: the connection order, and the ladder picks). Pure."""
+    place: ``REASON_USE`` (their chats) or ``""`` (no chat anywhere on a
+    listed engine: the connection order, and the ladder picks). Pure."""
     if not listed:
         return (), ""
     here = holdings.use.get(agent_slug, {})
@@ -358,8 +346,6 @@ def person_order(agent_slug: str, listed: list[str], holdings: Holdings) -> tupl
     def _total(counts: dict[str, int]) -> int:
         return sum(counts.get(p, 0) for p in listed)
 
-    if not _total(everywhere) and holdings.seed in index:
-        return _first(holdings.seed), REASON_SEED
     counts = here if _total(here) else everywhere
     total = _total(counts)
     if not total:
@@ -522,8 +508,8 @@ def resolve_many(agent_rows: list[dict], user_sub: str, *, remember: bool = Fals
         str(row.get("slug") or ""): resolve_for_person(row, holdings, catalog)
         for row in agent_rows if row.get("slug")
     }
-    # A failed use read orders by the seed and the connections alone: never
-    # remembered over the real firsts.
+    # A failed use read orders by the connections alone: never remembered
+    # over the real firsts.
     if remember and holdings.use_read:
         remember_firsts(user_sub, {slug: r.first_shown for slug, r in resolved.items() if r.first_is_new})
     return resolved

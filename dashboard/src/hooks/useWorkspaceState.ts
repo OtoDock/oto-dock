@@ -193,8 +193,10 @@ export function useWorkspaceState(agentName: string, lastAssistantMessageId: str
 
   // ---- URL helpers (preserve all other params) ----
 
+  // `consume`: a deep link's flag goes in this same write. A second write in
+  // the same pass starts from the same address and would undo this one.
   const writeOpen = useCallback(
-    (value: boolean) => {
+    (value: boolean, consume?: string) => {
       setSearchParams((prev) => {
         const next = new URLSearchParams(prev)
         if (value) next.set('ws', '1')
@@ -202,8 +204,9 @@ export function useWorkspaceState(agentName: string, lastAssistantMessageId: str
           next.delete('ws')
           next.delete('ws_preview')
         }
+        if (consume) next.delete(consume)
         return next
-      })
+      }, consume ? { replace: true } : undefined)
     },
     [setSearchParams],
   )
@@ -223,6 +226,9 @@ export function useWorkspaceState(agentName: string, lastAssistantMessageId: str
   // ---- Public actions ----
 
   const openWorkspace = useCallback(() => writeOpen(true), [writeOpen])
+  /** Open for a deep link (`?recover=1`): the flag leaves the address in the
+   *  same write, which replaces the link's entry. */
+  const openFromLink = useCallback((flag: string) => writeOpen(true, flag), [writeOpen])
   const closeWorkspace = useCallback(() => writeOpen(false), [writeOpen])
   const toggleWorkspace = useCallback(() => writeOpen(!open), [open, writeOpen])
   const openPreview = useCallback((p: string) => writePreview(p), [writePreview])
@@ -312,6 +318,7 @@ export function useWorkspaceState(agentName: string, lastAssistantMessageId: str
     state,
     clipboard,
     openWorkspace,
+    openFromLink,
     closeWorkspace,
     toggleWorkspace,
     openPreview,

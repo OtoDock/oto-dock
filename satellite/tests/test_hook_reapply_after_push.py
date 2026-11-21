@@ -97,6 +97,27 @@ def test_claude_clobber_reapplied():
         print("ok: Claude live-session clobber re-applied to real paths + snapshot refreshed")
 
 
+def test_a_live_sessions_home_takes_the_pushed_settings():
+    """A session in a home of its own reads its settings from the home,
+    written there for that session: a push to the scope's file re-writes the
+    home's with the real paths of the scope's scripts."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        agent_dir = tmp / "my-agent"
+        sess = _claude_session(agent_dir)
+        sess._engine_dir = sess._claude_dir / "own" / "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+        sess._engine_dir.mkdir(parents=True)
+        (sess._engine_dir / "settings.json").write_text("{}")
+        rel = "users/alice/.claude/settings.json"
+        (agent_dir / rel).write_text(_virtual_settings())
+        m = _mgr(tmp)
+        m.pty_sessions["s1"] = sess
+        m._reapply_hooks_after_push("my-agent", rel)
+        home = json.loads((sess._engine_dir / "settings.json").read_text())
+        gate = home["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        assert str(sess._claude_dir / "permission_gate.py") in gate
+
+
 def test_codex_clobber_reapplied():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)

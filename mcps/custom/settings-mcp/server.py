@@ -64,11 +64,9 @@ NOTHING_MATCHES = "Nothing matches. The platform skill's settings map has every 
 CARD_SHOWN = ("A card with this setting is in the chat. Each person whose role changes it sees their "
               "own value there and changes it. Anyone else sees only who changes it. You never see a value.")
 NO_CARD = "Say where the setting is instead."
-#: An older satellite refuses both routes, the catalog read first; each tool
-#: adds what to do.
+#: What a tool says when the satellite's tunnel refuses a route it does not
+#: forward.
 OLDER_SATELLITE = "This machine runs an older OtoDock satellite, which does not pass the settings on."
-OLDER_SATELLITE_SEARCH = f"{OLDER_SATELLITE} Answer from the platform skill's settings map."
-OLDER_SATELLITE_CARD = f"{OLDER_SATELLITE} Say where the setting is from the settings map."
 NO_ANSWER = "The platform did not answer. Say where the setting is from the settings map."
 #: The cards routes' sentences for the agent.
 CARD_DRAWN = ("A card is in the chat. Anyone in the chat may press it, and nothing happens until "
@@ -262,10 +260,7 @@ def _full(entry: dict) -> str:
 
 
 async def find_settings(query: str) -> str:
-    try:
-        rows = await catalog()
-    except _Refused as exc:
-        raise _Refused(OLDER_SATELLITE_SEARCH) if exc.older_satellite else exc from None
+    rows = await catalog()
     scored = sorted(((score(e, query), e) for e in rows), key=lambda t: (-t[0], t[1]["id"]))
     hits = [e for s, e in scored if s > 0][:MAX_MATCHES]
     if not hits:
@@ -274,10 +269,7 @@ async def find_settings(query: str) -> str:
 
 
 async def get_setting(setting_id: str) -> str:
-    try:
-        rows = await catalog()
-    except _Refused as exc:
-        raise _Refused(OLDER_SATELLITE_CARD) if exc.older_satellite else exc from None
+    rows = await catalog()
     entry = next((e for e in rows if e["id"] == setting_id), None)
     if entry is None:
         return f"No setting is called {setting_id}. Search with find_settings first."
@@ -287,8 +279,6 @@ async def get_setting(setting_id: str) -> str:
     try:
         await _request("POST", CARD_PATH, {"session_id": SESSION_ID, "setting": setting_id})
     except _Refused as exc:
-        if exc.older_satellite:
-            return f"{text}\n{OLDER_SATELLITE_CARD}"
         # A row the catalog said has a card and the route says has none
         # (a catalog read older than the route's): the agent says where.
         tail = f" {NO_CARD}" if exc.status == 409 else ""

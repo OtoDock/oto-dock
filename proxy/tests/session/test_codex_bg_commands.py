@@ -1,5 +1,4 @@
-"""Codex background terminals (unified_exec): translator detection/emission,
-the session's idle OOB delivery + drain reconciliation, and teardown sweeps.
+"""Codex background terminals (unified_exec): translator detection/emission.
 
 A ``commandExecution`` item may YIELD (unified_exec): the tool call returns to
 the model, the item stays open (possibly past ``turn/completed``), and the
@@ -11,11 +10,10 @@ deduped by the app-server), so a null processId proves nothing — EVERY command
 item is a candidate, the registry keys on the ITEM id throughout, and the
 unified_exec processId is bound late (terminalInteraction) purely for
 ``thread/backgroundTerminals/list`` matching. The translator mirrors the CLI's
-bg-bash contract (BG_COMMAND_START/END keyed by the itemId); the session adds
-the between-turns delivery (router OOB hook) and the pull-API drain backstop.
+bg-bash contract (BG_COMMAND_START/END keyed by the itemId); the session's
+holder adds the between-turns delivery (router OOB hook) and the pull-API
+drain backstop (``tests/remote/test_remote_codex_bg.py``).
 """
-import asyncio
-
 from core.events.bg_command_state import (
     _bg_command_registries,
     get_bg_command_registry,
@@ -28,9 +26,8 @@ from core.events.common_events import (
     TOOL_RESULT,
     TOOL_USE,
 )
-from core.layers.codex.app_server_client import AppServerError
+from core.layers.codex.events import CodexEvent
 from core.layers.codex.layer import CodexEventTranslator
-from core.layers.codex.session import CodexAppServerSession, CodexEvent
 
 MAIN = "thread-MAIN"
 
@@ -147,8 +144,8 @@ def test_delta_while_open_starts_badge_once():
 
 
 def test_supervised_sweep_starts_but_never_ends():
-    # Local layer: open candidate at turn/completed → START in the sweep, NO
-    # END — the badge stays live until the real item/completed.
+    # A supervised session: open candidate at turn/completed → START in the
+    # sweep, NO END — the badge stays live until the real item/completed.
     sid = "s-cx-sweep"
     try:
         tr = _tr(sid)
@@ -253,275 +250,6 @@ def test_turn_start_prunes_drain_resolved_candidates():
         _feed(tr, "turn/started")
         assert tr.pending_bg_commands() == []
         assert not tr.tracks_bg_command({"item": _cmd_item("i1")})
-    finally:
-        _bg_command_registries.pop(sid, None)
-
-
-# ---------------------------------------------------------------------------
-# 2. Session: idle OOB delivery, drain reconciliation, teardown sweep
-# ---------------------------------------------------------------------------
-
-class _FakeClient:
-    """Minimal AppServerClient: a notif_queue + a scriptable request()."""
-
-    def __init__(self, terminals=None, *, fail_list=False):
-        self.notif_queue: asyncio.Queue = asyncio.Queue()
-        self.is_alive = True
-        self.terminals = terminals if terminals is not None else []
-        self.fail_list = fail_list
-        self.list_calls = 0
-
-    async def request(self, method, params=None, *, timeout=None):
-        if method == "thread/backgroundTerminals/list":
-            self.list_calls += 1
-            if self.fail_list:
-                raise AppServerError("daemon busy")
-            return {"data": self.terminals}
-        return {}
-
-
-def _make_session(sid, client, translator):
-    s = CodexAppServerSession(
-        session_id=sid, agent_name="a", model="gpt-5.6-sol",
-        sandbox_mode="workspace-write", working_dir="/tmp",
-        config_dir="/tmp/.codex", thread_id=MAIN,
-    )
-    s._started = True
-    s._client = client
-    s.translator = translator
-    return s
-
-
-def _swept_candidate(tr, *, pid=None):
-    """One background terminal past its turn-end sweep (badge live, pending).
-    ``pid`` optionally binds the unified_exec processId via terminalInteraction
-    first (the only place it reliably appears on this wire)."""
-    _feed(tr, "item/started", item=_cmd_item("i1", command="sleep 40"))
-    if pid:
-        _feed(tr, "item/commandExecution/terminalInteraction",
-              itemId="i1", processId=pid, stdin="")
-    _feed(tr, "turn/completed", turn={"status": "completed"})
-
-
-def test_oob_completion_between_turns_marks_registry_done():
-    sid = "s-cx-oob"
-
-    async def run():
-        tr = _tr(sid)
-        _swept_candidate(tr)
-        session = _make_session(sid, _FakeClient(), tr)
-        session._router_task = asyncio.create_task(session._route_notifications())
-        try:
-            # Idle (no _default_consumer): the exit's item/completed lands on
-            # the router and must resolve via the OOB hook, not be dropped.
-            session._client.notif_queue.put_nowait(("item/completed", {
-                "threadId": MAIN,
-                "item": _cmd_item("i1", status="completed", exitCode=0,
-                                  aggregatedOutput="done"),
-            }))
-            for _ in range(50):
-                await asyncio.sleep(0.01)
-                if not get_bg_command_registry(sid).has_pending:
-                    break
-            assert get_bg_command_registry(sid).completed == {"i1"}
-            assert tr.pending_bg_commands() == []
-        finally:
-            await session._teardown_bg(reason="test")
-
-    try:
-        asyncio.run(run())
-    finally:
-        _bg_command_registries.pop(sid, None)
-
-
-def test_drain_resolves_item_missing_from_list():
-    sid = "s-cx-drain"
-
-    async def run():
-        tr = _tr(sid)
-        _swept_candidate(tr)
-        client = _FakeClient(terminals=[])   # PTY gone — exit event was lost
-        session = _make_session(sid, client, tr)
-        assert await session.drain_bg_commands() is True
-        assert get_bg_command_registry(sid).completed == {"i1"}
-        assert tr.pending_bg_commands() == []
-        # Self-paced: an immediate re-poll (monitor retries every 0.3s) makes
-        # no second RPC. (No pending would fast-path anyway — re-arm one.)
-        get_bg_command_registry(sid).register_spawn("i9", "i9")
-        assert await session.drain_bg_commands() is False
-        assert client.list_calls == 1
-
-    try:
-        asyncio.run(run())
-    finally:
-        _bg_command_registries.pop(sid, None)
-
-
-def test_a_drain_after_the_turn_s_reset_clears_the_badge_on_the_chat_s_pump(monkeypatch):
-    # A task run's producer drains its commands while the run's pump is still
-    # alive, after the Codex session's per-turn reset: the chat the pump bound
-    # at its start outlives that reset, so the frame reaches the pump.
-    from core.events.bg_command_state import reset_bg_command_registry
-    from core.events.stream_pump import _active_pumps
-    from core.session import session_state
-    sid = "s-cx-bound"
-    frames: list[dict] = []
-
-    class _Pump:
-        def push_ws_event(self, event):
-            frames.append(event)
-            return True
-
-    def _push_to_pump(chat_id, event):    # startup._push_to_pump
-        pump = _active_pumps.get(chat_id)
-        return pump.push_ws_event(event) if pump else False
-
-    monkeypatch.setattr(session_state, "_push_pump_event_fn", _push_to_pump)
-    monkeypatch.setitem(_active_pumps, "chat-cx", _Pump())
-
-    async def run():
-        tr = _tr(sid)
-        _swept_candidate(tr)
-        get_bg_command_registry(sid).chat_id = "chat-cx"   # the pump's turn-start bind
-        reset_bg_command_registry(sid)                       # CodexAppServerSession.send_message
-        session = _make_session(sid, _FakeClient(terminals=[]), tr)
-        assert await session.drain_bg_commands() is True
-
-    try:
-        asyncio.run(run())
-        assert frames == [{"type": "bg_command_done", "tool_use_id": "i1", "status": "completed"}]
-    finally:
-        _bg_command_registries.pop(sid, None)
-
-
-def test_the_first_of_two_terminals_clears_at_its_own_end_between_turns(monkeypatch):
-    # Two terminals outlive their turn; the first's exit lands on the idle
-    # router. No pump consumes the translated BG_COMMAND_END between turns, so
-    # its badge clears through the chat's viewers at once, not at the
-    # cohort's bg_commands_complete when the second ends too.
-    from core.session import session_state
-    sid = "s-cx-two"
-    monkeypatch.setattr(session_state, "_push_pump_event_fn", lambda cid, ev: False)
-    viewer: asyncio.Queue = asyncio.Queue()
-    monkeypatch.setitem(session_state._dashboard_notify_queues, "s-viewer", viewer)
-
-    async def run():
-        tr = _tr(sid)
-        _feed(tr, "item/started", item=_cmd_item("i1", command="sleep 20"))
-        _feed(tr, "item/started", item=_cmd_item("i2", command="sleep 40"))
-        _feed(tr, "turn/completed", turn={"status": "completed"})
-        get_bg_command_registry(sid).chat_id = "chat-cx-two"
-        session = _make_session(sid, _FakeClient(), tr)
-        session._apply_bg_command_oob("item/completed", {
-            "threadId": MAIN,
-            "item": _cmd_item("i1", status="completed", exitCode=0, aggregatedOutput="done"),
-        })
-        assert get_bg_command_registry(sid).pending_count == 1
-
-    try:
-        asyncio.run(run())
-        assert viewer.get_nowait() == {"type": "chat_ui_frame", "chat_id": "chat-cx-two", "frame": {
-            "type": "bg_command_done", "tool_use_id": "i1", "status": "completed"}}
-        assert viewer.empty()
-    finally:
-        _bg_command_registries.pop(sid, None)
-
-
-def test_drain_keeps_item_present_in_list():
-    # The list row names our tracked itemId → still running, NOT resolved
-    # (works even when the processId was never learned).
-    sid = "s-cx-drain-item"
-
-    async def run():
-        tr = _tr(sid)
-        _swept_candidate(tr)
-        client = _FakeClient(terminals=[
-            {"itemId": "i1", "processId": "p-1", "command": "sleep 40"}])
-        session = _make_session(sid, client, tr)
-        assert await session.drain_bg_commands() is False
-        assert get_bg_command_registry(sid).pending_count == 1
-        assert tr.pending_bg_commands() != []
-
-    try:
-        asyncio.run(run())
-    finally:
-        _bg_command_registries.pop(sid, None)
-
-
-def test_drain_keeps_item_matched_by_process_id_only():
-    # The list may name the CANONICAL itemId (ours is the synthesized
-    # approval-path one) — the pid learned via terminalInteraction must still
-    # match the row, keeping the entry pending.
-    sid = "s-cx-drain-pid"
-
-    async def run():
-        tr = _tr(sid)
-        _swept_candidate(tr, pid="p-1")
-        client = _FakeClient(terminals=[
-            {"itemId": "item-canonical-9", "processId": "p-1",
-             "command": "sleep 40"}])
-        session = _make_session(sid, client, tr)
-        assert await session.drain_bg_commands() is False
-        assert get_bg_command_registry(sid).pending_count == 1
-        assert tr.pending_bg_commands() != []
-
-    try:
-        asyncio.run(run())
-    finally:
-        _bg_command_registries.pop(sid, None)
-
-
-def test_drain_rpc_failure_is_no_progress():
-    sid = "s-cx-drain-fail"
-
-    async def run():
-        tr = _tr(sid)
-        _swept_candidate(tr)
-        session = _make_session(sid, _FakeClient(fail_list=True), tr)
-        assert await session.drain_bg_commands() is False
-        # Never resolve-on-error: the entry stays pending for the next poll.
-        assert get_bg_command_registry(sid).pending_count == 1
-        assert tr.pending_bg_commands() != []
-        assert not session.lock.locked()
-
-    try:
-        asyncio.run(run())
-    finally:
-        _bg_command_registries.pop(sid, None)
-
-
-def test_drain_backs_off_when_turn_in_flight():
-    sid = "s-cx-drain-lock"
-
-    async def run():
-        tr = _tr(sid)
-        _swept_candidate(tr)
-        client = _FakeClient(terminals=[])
-        session = _make_session(sid, client, tr)
-        async with session.lock:
-            assert await session.drain_bg_commands() is False
-        assert client.list_calls == 0
-        assert get_bg_command_registry(sid).pending_count == 1
-
-    try:
-        asyncio.run(run())
-    finally:
-        _bg_command_registries.pop(sid, None)
-
-
-def test_teardown_bg_resolves_pending_commands_as_killed():
-    sid = "s-cx-teardown"
-
-    async def run():
-        tr = _tr(sid)
-        _swept_candidate(tr)
-        session = _make_session(sid, _FakeClient(), tr)
-        await session._teardown_bg(reason="test")
-        assert get_bg_command_registry(sid).completed == {"i1"}
-        assert tr.pending_bg_commands() == []
-
-    try:
-        asyncio.run(run())
     finally:
         _bg_command_registries.pop(sid, None)
 

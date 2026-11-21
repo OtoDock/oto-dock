@@ -22,7 +22,7 @@ import { useClearMyMemory } from '@/api/memory'
 import { useApp, useApps } from '@/api/apps'
 import { useDeleteNotification } from '@/api/notifications'
 import { useDeleteNotebookEntry } from '@/api/notebook'
-import { useSetAgentServiceBinding } from '@/api/serviceAccounts'
+import { useAddAgentServiceAccount } from '@/api/serviceAccounts'
 import { fetchSigningSecret } from '@/api/subscriptions'
 import { useDeleteTrigger } from '@/api/triggers'
 import { useRevokeAgentApiKey } from '@/api/agentApiKeys'
@@ -57,8 +57,8 @@ const CASES: Case[] = [
   ['clear my memory', 'Could not clear your memory', mutation(useClearMyMemory, undefined)],
   ['delete a notification', 'Could not delete the notification', mutation(useDeleteNotification, 'n1')],
   ['delete a Notebook entry', 'Could not delete the entry', mutation(useDeleteNotebookEntry, 'e1')],
-  ['bind an account', 'Could not set the account',
-    mutation(useSetAgentServiceBinding, { agentName: 'a', mcpName: 'github-mcp', accountLabel: 'alice' })],
+  ['add an account to an agent', 'Could not add the account',
+    mutation(useAddAgentServiceAccount, { agentName: 'a', mcpName: 'github-mcp', accountLabel: 'alice' })],
   ['read a signing secret', 'Could not read the signing secret', () => fetchSigningSecret('s1')],
   ['delete a trigger', 'Could not delete the trigger', mutation(useDeleteTrigger, 't1')],
   ['revoke an agent key', 'Could not revoke the key', mutation(useRevokeAgentApiKey, { agent: 'a', keyId: 'k1' })],

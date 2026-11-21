@@ -65,4 +65,19 @@ describe('PlanView readOnly', () => {
     expect(screen.getByRole('button', { name: /Edit Plan/ })).toBeTruthy()
     expect(screen.queryByTestId('plan-readonly')).toBeNull()
   })
+
+  // Claude Code's exit carries no plan: the plan review card shows it.
+  it('draws nothing for an exit with no plan', () => {
+    const { container } = render(
+      <PlanView action="exit" toolInput={{}} onImplement={() => {}} onSendMessage={() => {}} />,
+    )
+    expect(container.innerHTML).toBe('')
+  })
+
+  it("keeps only the terminal's hint for an exit with no plan", () => {
+    render(<PlanView action="exit" toolInput={{}} readOnly />)
+    expect(screen.getByTestId('plan-readonly')).toBeTruthy()
+    expect(screen.queryByText(/No plan content available/)).toBeNull()
+    expect(screen.queryByText(/^Plan:/)).toBeNull()
+  })
 })

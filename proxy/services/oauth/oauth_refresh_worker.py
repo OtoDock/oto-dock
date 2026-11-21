@@ -464,6 +464,25 @@ async def _maybe_refresh_token_file(
     return await _refresh_candidate(cand, _TickState())
 
 
+async def refresh_if_due(token_file: Path) -> bool:
+    """One account's refresh when its token is due, asked by a tool whose
+    token is running out (``api/hooks/credentials.py``), so its ask never
+    waits for the next tick. The tick's path, threshold, account lock and
+    backoff; a failure is recorded in the backoff and answered False, never
+    raised into the caller. Whether a refresh was performed."""
+    username, provider_id = _token_file_parts(token_file)
+    try:
+        return await _maybe_refresh_token_file(
+            token_file=token_file, username=username, provider_id=provider_id,
+        )
+    except Exception as exc:  # noqa: BLE001  # as the tick's: any vendor failure backs off, never ends the caller
+        _, mtime = await asyncio.to_thread(_read_with_mtime, token_file)
+        _record_refresh_failure(token_file, exc, mtime)
+        logger.warning("OAuth refresh asked by a tool failed (provider %s): %s",
+                       provider_id, type(exc).__name__)
+        return False
+
+
 def renewable(raw: dict) -> bool:
     """Whether the worker has a way to renew this file: an installation
     (re-minted), client credentials with the client they were issued to

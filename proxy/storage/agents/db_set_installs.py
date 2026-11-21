@@ -1,6 +1,7 @@
 """The record of a department set's install (department_set_installer.py): one
-row per job with its members' states and its lines, so a card's outcome
-and the dialog read the row, and a restart marks the job it cut off.
+row per job with its members' states, its lines and the places of those
+that say something was not done (``not_done``), so a card's outcome and
+the dialog read the row, and a restart marks the job it cut off.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ def _row(row: dict | None) -> dict | None:
     if row is None:
         return None
     out = dict(row)
-    for key in ("members", "lines"):
+    for key in ("members", "lines", "not_done"):
         raw = out.get(key)
         out[key] = json.loads(raw) if isinstance(raw, str) else (raw or [])
     return out
@@ -69,7 +70,8 @@ def get(job_id: str) -> dict | None:
 
 
 def update(job_id: str, *, status: str | None = None, department_id: str | None = None,
-           members: list[dict] | None = None, lines: list[str] | None = None) -> dict | None:
+           members: list[dict] | None = None, lines: list[str] | None = None,
+           not_done: list[int] | None = None) -> dict | None:
     """Write what changed; an end state stamps ``ended_at``."""
     sets: list[str] = []
     vals: list = []
@@ -90,6 +92,9 @@ def update(job_id: str, *, status: str | None = None, department_id: str | None 
     if lines is not None:
         sets.append("lines = %s::jsonb")
         vals.append(json.dumps(lines))
+    if not_done is not None:
+        sets.append("not_done = %s::jsonb")
+        vals.append(json.dumps(not_done))
     if not sets:
         return get(job_id)
     vals.append(job_id)
@@ -113,16 +118,3 @@ def running_jobs() -> list[dict]:
         rows = conn.execute("SELECT * FROM set_installs WHERE status = %s ORDER BY started_at",
                             (RUNNING,)).fetchall()
     return [_row(r) for r in rows]  # type: ignore[misc]
-
-
-def interrupt(job_id: str, line: str) -> None:
-    """The job was cut off: its state and the sentence that says what stands."""
-    with get_conn() as conn:
-        row = conn.execute("SELECT lines FROM set_installs WHERE id = %s", (job_id,)).fetchone()
-        if row is None:
-            return
-        lines = row["lines"] if isinstance(row["lines"], list) else json.loads(row["lines"] or "[]")
-        conn.execute(
-            "UPDATE set_installs SET status = %s, ended_at = %s, lines = %s::jsonb WHERE id = %s",
-            (INTERRUPTED, _now(), json.dumps([*lines, line]), job_id))
-        conn.commit()

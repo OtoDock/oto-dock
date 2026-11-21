@@ -18,16 +18,51 @@ rate-dependent.
 from __future__ import annotations
 
 import array
+import bisect
 import collections
 import logging
 import struct
+import threading
 import time
+from typing import NamedTuple
 
 from audio.constants import SAMPLE_RATE, SAMPLE_WIDTH
 from audio.providers.vad.base import VadEvent, VadState
 from audio.providers.vad.silero_model import SileroModel
 
 logger = logging.getLogger(__name__)
+
+#: The windows whose scores a VAD keeps for a reader (``SileroVad.scored``):
+#: twelve seconds of 32 ms windows.
+_SCORES_KEPT = 375
+
+
+class Scored(NamedTuple):
+    """What a VAD scored over a time span. Numbers only."""
+
+    windows: int        # the windows scored in the span
+    over: int           # at or over the probability threshold in force
+    speech: int         # of those, at or over the energy floor: what the state machine counts
+    longest_run: int    # the longest run of counted windows in a row
+    needed_run: int     # the run a speech start needs while listening
+    peak: float         # the highest probability
+    bargein: int        # the windows scored in barge-in mode
+
+
+#: The edges of the loudness bands a VAD counts its windows in
+#: (``SileroVad.by_loudness``), as RMS: under 75, 75 to 150, 150 to 300, 300
+#: to 600, 600 to 1,200, above. Fixed, so two calls compare whatever the
+#: energy floor was on each.
+LOUDNESS_EDGES = (75, 150, 300, 600, 1200)
+
+
+class Loudness(NamedTuple):
+    """A VAD's windows by loudness. Per band of ``LOUDNESS_EDGES``: the
+    windows scored, and those of them at or over the probability threshold in
+    force. Numbers only."""
+
+    listening: tuple[tuple[int, int], ...]
+    bargein: tuple[tuple[int, int], ...]
 
 
 class SileroVad:
@@ -78,9 +113,21 @@ class SileroVad:
         self._bargein_chunks_since_reset = 0
         self._BARGEIN_RESET_INTERVAL = 30  # ~1s (30 chunks × 32ms)
 
+        # The last windows' scores, for a reader that asks what the detector
+        # saw (``scored``): (time, probability, over the threshold, counted as
+        # speech, barge-in mode). The feeding thread writes, a reader copies.
+        self._scores: collections.deque[tuple[float, float, bool, bool, bool]] = collections.deque(
+            maxlen=_SCORES_KEPT)
+        self._scores_lock = threading.Lock()
+        # Every window of the call by loudness (``by_loudness``): per mode
+        # (barge-in or not) and band, [windows, those over the threshold].
+        self._bands: dict[bool, list[list[int]]] = {
+            mode: [[0, 0] for _ in range(len(LOUDNESS_EDGES) + 1)] for mode in (False, True)}
+
         # One ONNX session per instance; the analysis window (32 ms) is derived
         # from the sample rate by the model itself. Every "fresh model" reset
-        # below zeroes its recurrent state, which is the whole of its memory.
+        # below zeroes its recurrent state and its kept context, which are
+        # the whole of its memory.
         self._model = SileroModel(self._sample_rate)
         self._chunk_bytes = self._model.window_size_samples * SAMPLE_WIDTH
         logger.info(
@@ -90,9 +137,12 @@ class SileroVad:
             "bargein_silence=%sms, "
             "bargein_debounce=%s chunks, "
             "bargein_ratio=%s, "
+            "min_energy_rms=%s, "
+            "start_debounce=%s chunks, "
             "rate=%s)",
             threshold, self._bargein_threshold, silence_duration_ms, self._bargein_silence_ms,
-            self._bargein_debounce_chunks, self._bargein_chunk_ratio, self._sample_rate
+            self._bargein_debounce_chunks, self._bargein_chunk_ratio, f"{min_energy_rms:g}",
+            self._normal_debounce_chunks, self._sample_rate
         )
 
     def _reset_model(self) -> None:
@@ -130,6 +180,57 @@ class SileroVad:
         self._early_speech_count = 0
         self._probable_fired = False
         self._reset_model()
+        with self._scores_lock:
+            self._scores.clear()
+            for bands in self._bands.values():
+                for counts in bands:
+                    counts[:] = [0, 0]
+
+    def _keep_score(self, now_ms: float, probability: float, threshold: float, is_speech: bool,
+                    rms: float, *, again: bool = False) -> None:
+        """One window's score into the ring and into its loudness band.
+        ``again``: the same window, scored once more on a fresh model,
+        replaces its first score and is counted once, with its second
+        verdict."""
+        passed = probability >= threshold
+        entry = (now_ms / 1000.0, probability, passed, is_speech, self._bargein_mode)
+        counts = self._bands[self._bargein_mode][bisect.bisect_right(LOUDNESS_EDGES, rms)]
+        with self._scores_lock:
+            if again and self._scores:
+                counts[1] += passed - self._scores[-1][2]
+                self._scores[-1] = entry
+            else:
+                counts[0] += 1
+                counts[1] += passed
+                self._scores.append(entry)
+
+    def by_loudness(self) -> Loudness:
+        """This VAD's windows by loudness since its last ``reset()``, while
+        listening and in barge-in mode. A read: it changes nothing, and it
+        may come from another thread than the one that feeds the VAD."""
+        with self._scores_lock:
+            return Loudness(*(tuple((windows, over) for windows, over in self._bands[mode])
+                              for mode in (False, True)))
+
+    def scored(self, since: float, until: float) -> Scored:
+        """What this VAD scored between two ``time.monotonic()`` stamps, of
+        the last ``_SCORES_KEPT`` windows. A read: it changes nothing, and it
+        may come from another thread than the one that feeds the VAD."""
+        with self._scores_lock:
+            kept = list(self._scores)
+        windows = over = speech = run = longest = bargein = 0
+        peak = 0.0
+        for at, probability, passed, counted, mode in kept:
+            if not since <= at <= until:
+                continue
+            windows += 1
+            over += passed
+            speech += counted
+            bargein += mode
+            peak = max(peak, probability)
+            run = run + 1 if counted else 0
+            longest = max(longest, run)
+        return Scored(windows, over, speech, longest, self._normal_debounce_chunks, peak, bargein)
 
     def process(self, audio_bytes: bytes) -> VadEvent:
         """Feed raw PCM bytes and return any state transition event."""
@@ -163,6 +264,7 @@ class SileroVad:
 
         is_speech = probability >= active_threshold and energy_ok
         now_ms = time.monotonic() * 1000
+        self._keep_score(now_ms, probability, active_threshold, is_speech, rms)
 
         # Diagnostic: log near-miss detections in IDLE mode
         if self.state == VadState.IDLE and not is_speech:
@@ -192,6 +294,7 @@ class SileroVad:
                     # Re-run this chunk on the fresh model
                     probability = self._model.process(float32_audio)
                     is_speech = probability >= active_threshold and energy_ok
+                    self._keep_score(now_ms, probability, active_threshold, is_speech, rms, again=True)
                     logger.debug("VAD: periodic Silero reset during bargein")
 
                 # Track consecutive chunks at normal threshold for early STT unmute

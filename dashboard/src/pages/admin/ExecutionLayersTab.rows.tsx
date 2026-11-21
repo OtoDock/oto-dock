@@ -24,6 +24,7 @@ import Switch from '../../components/ui/Switch'
 import InfoTip from '../../components/ui/InfoTip'
 import { AddModelForm } from './ExecutionLayersTab.forms'
 import { SubscriptionWindowBars } from '../../components/engines/SubscriptionWindows'
+import AccountRunning from '../../components/engines/AccountRunning'
 import { TierMark } from '../../components/common/TierMark'
 import { TIER_LABELS, tierTitle } from '../../lib/tiers'
 import { ENGINE_SUBSCRIPTION_STATUS, type EngineSubscriptionStatus } from '../../lib/status/engineSubscription'
@@ -53,7 +54,10 @@ export function SubscriptionRow({
   sub,
   layer,
   vendorId,
+  accountName = '',
   onDiscover,
+  onChanged,
+  onRemoved,
 }: {
   sub: Subscription
   layer: string
@@ -61,7 +65,14 @@ export function SubscriptionRow({
    *  engine). A row on the card's own vendor needs no provider badge; every
    *  other provider is named. */
   vendorId: string
+  /** What an account of the engine is called ("Claude"): another admin's row,
+   *  which names no label or email, is titled by it. */
+  accountName?: string
   onDiscover?: (sub: Subscription) => void
+  /** A tick of the admin's: the list orders itself again after a quiet spell. */
+  onChanged?: () => void
+  /** The row was removed: it leaves the list at once. */
+  onRemoved?: (id: string) => void
 }) {
   const dialogs = useDialogs()
   const updateMut = useUpdateSubscription()
@@ -72,6 +83,10 @@ export function SubscriptionRow({
   // platform infra (owner_sub=''); other admins' accounts are read-only.
   const ownerless = !sub.owner_sub
   const manageable = sub.is_mine || ownerless
+  // A tick still saving shows its own value: a row the list keeps for its
+  // spell may already have left the list the optimistic update reads.
+  const saving = updateMut.isPending && updateMut.variables?.id === sub.id ? updateMut.variables : undefined
+  const othersRow = !manageable && !sub.label && !sub.oauth_email && accountName
   // A login that ends inside the notice's window. The connect exchange
   // renews only a row its caller owns, so the hint names who can renew it.
   const ending = loginEndsIn(sub)
@@ -88,7 +103,8 @@ export function SubscriptionRow({
       <div className="flex-1 min-w-0">
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="text-sm font-medium text-primary truncate">
-            {sub.label || sub.oauth_email || `${sub.provider} ${AUTH_TYPE_LABELS[sub.auth_type] || sub.auth_type}`}
+            {sub.label || sub.oauth_email || (othersRow ? `${accountName} account`
+              : `${sub.provider} ${AUTH_TYPE_LABELS[sub.auth_type] || sub.auth_type}`)}
           </span>
           <Badge variant={STATUS_VARIANT[sub.status] || 'neutral'}>{sub.status}</Badge>
           {endingLabel && (
@@ -99,6 +115,7 @@ export function SubscriptionRow({
           )}
           <Badge>{AUTH_TYPE_LABELS[sub.auth_type] || sub.auth_type}</Badge>
           {sub.provider !== vendorId && <Badge variant="info">{sub.provider}</Badge>}
+          <AccountRunning live={sub.live} />
         </div>
         {sub.oauth_email && sub.label && (
           <p className="text-xs text-tertiary truncate">{sub.oauth_email}</p>
@@ -114,9 +131,10 @@ export function SubscriptionRow({
                 <label className="flex items-center gap-1 text-xs text-tertiary cursor-pointer">
                   <input
                     type="checkbox"
-                    checked={sub.use_personal}
+                    checked={saving?.use_personal ?? sub.use_personal}
                     onChange={(e) => {
                       const on = e.target.checked
+                      onChanged?.()
                       void run('personal', () => updateMut.mutateAsync({ layer, id: sub.id, use_personal: on }), { failTitle: 'The account setting was not saved' })
                     }}
                   />
@@ -130,9 +148,10 @@ export function SubscriptionRow({
               <label className="flex items-center gap-1 text-xs text-tertiary cursor-pointer">
                 <input
                   type="checkbox"
-                  checked={sub.contribute_platform}
+                  checked={saving?.contribute_platform ?? sub.contribute_platform}
                   onChange={(e) => {
                     const on = e.target.checked
+                    onChanged?.()
                     void run('shared', () => updateMut.mutateAsync({ layer, id: sub.id, contribute_platform: on }), { failTitle: 'The account setting was not saved' })
                   }}
                 />
@@ -168,6 +187,7 @@ export function SubscriptionRow({
               if (!(await dialogs.confirm({ title: 'Remove this subscription?', confirmLabel: 'Remove', tone: 'danger' }))) return
               try {
                 await deleteMut.mutateAsync({ layer, id: sub.id })
+                onRemoved?.(sub.id)
               } catch (e) {
                 const err = e as Error & { status?: number }
                 if (err.status !== 409) {
@@ -180,7 +200,7 @@ export function SubscriptionRow({
                   confirmLabel: 'Remove anyway',
                   tone: 'danger',
                 })) {
-                  deleteMut.mutate({ layer, id: sub.id, force: true })
+                  deleteMut.mutate({ layer, id: sub.id, force: true }, { onSuccess: () => onRemoved?.(sub.id) })
                 }
               }
             }}

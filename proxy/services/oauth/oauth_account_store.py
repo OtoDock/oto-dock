@@ -3,14 +3,14 @@
 One stop for every OAuth flow side-effect after a successful exchange:
   * Persist the credentials (DB row + ``user_credential_accounts`` row).
   * Write the per-user token file in the canonical ``generic_oauth_v1``
-    shape. When the manifest declares ``token_format.aliases``, those
-    legacy keys are emitted alongside the canonical ones so MCPs whose
-    upstream reader expects a specific key layout (workspace-mcp's
-    ``google.auth`` lib) keep working unchanged.
+    shape. When the manifest declares ``token_format.aliases``, those keys
+    are emitted alongside the canonical ones. The file reaches no tool (a
+    stdio MCP takes its token through ``mcp_env_injection``), so no tool
+    reads an alias.
   * Mark the connected services on the account.
 
 Also owns the central-token-dir path helpers used by
-``services/credential_resolver`` and ``core/credentials/credential_files``.
+``services/credential_resolver`` and ``core/credentials/mcp_gateway``.
 
 Directory layout — keyed by provider_id, one dir per user:
 
@@ -27,10 +27,7 @@ dir directly. One credential, two routes. There is no platform "service
 account" token tree (removed before the public release).
 
 Multiple MCPs sharing a provider_id share the token dir, so one OAuth
-grant powers every MCP of that provider. The dir name MUST match the
-manifest's ``path_env.<KEY>.subpath`` declaration (e.g. workspace-mcp
-declares ``"google-tokens"``) so the resolver's per-session file copy
-finds the source.
+grant powers every MCP of that provider.
 """
 
 from __future__ import annotations
@@ -138,10 +135,10 @@ def account_token_path(token_dir: Path, account_label: str) -> Path:
 # ---------------------------------------------------------------------------
 # Token file write — canonical ``generic_oauth_v1`` shape
 #
-# Optional manifest-declared aliases let legacy-shape MCP readers
-# (workspace-mcp's google.auth lib expects `token`/`expiry`/`token_uri`)
-# see their expected keys alongside the canonical ones in the same file.
-# Most providers declare no aliases — their files are pure canonical.
+# Optional manifest-declared aliases are emitted alongside the canonical keys
+# in the same file (the two Google manifests declare `token`/`expiry`/
+# `token_uri`). The file reaches no tool, so no tool reads them. Most
+# providers declare no aliases: their files are pure canonical.
 # ---------------------------------------------------------------------------
 
 def render_generic_oauth_v1_token(

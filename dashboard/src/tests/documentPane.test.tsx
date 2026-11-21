@@ -35,6 +35,7 @@ import { chipRef, resetFoldForTests } from '@/components/chat/artifacts/fold'
 import { paneChat, useDocumentPaneStore, useDocumentPushStore } from '@/store/documentPaneStore'
 import type { ChatDocument } from '@/api/documents'
 import { useDocumentChips } from '@/pages/agent/chat/useDocumentChips'
+import { onAppToast, type AppToast } from '@/lib/appToasts'
 
 const ORIGIN = window.location.origin
 const listing: ChatDocument[] = [
@@ -125,6 +126,229 @@ describe('DocumentPane', () => {
     useDocumentPaneStore.getState().restore('c1')
     fireEvent.click(screen.getByRole('button', { name: 'Close the document pane' }))
     await waitFor(() => expect(paneChat('c1').open).toBe(false))
+  })
+})
+
+describe('the options menu at the far right of the header', () => {
+  const offered: ChatDocument[] = [
+    { ...listing[0], downloads: ['pdf', 'csv'] },
+    { ...listing[1], downloads: ['pdf'] },
+    {
+      file_id: 'fc', filename: 'scan.pdf', download_url: '/v1/media/c', generation: 10, downloads: [],
+      versions: [{ snapshot_id: 'c1v', message_id: 2, version: 1, generation: 10, turn: 1, available: true }],
+    },
+  ]
+  const toasts: AppToast[] = []
+  let stopToasts = () => {}
+  let clicked: Array<{ href: string; download: string }> = []
+  beforeEach(() => {
+    toasts.length = 0
+    stopToasts = onAppToast((t) => toasts.push(t))
+    clicked = []
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      clicked.push({ href: this.getAttribute('href') ?? '', download: this.download })
+    })
+  })
+  afterEach(() => stopToasts())
+
+  function stubDownloads(answer: (body: Record<string, unknown>) => { ok: boolean; status: number; json: unknown }) {
+    const posts: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.includes('/v1/documents/chat-documents')) {
+        return { ok: true, status: 200, json: async () => ({ documents: offered }) }
+      }
+      if (url.includes('/v1/documents/download')) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        posts.push(body)
+        const a = answer(body)
+        return { ok: a.ok, status: a.status, text: async () => JSON.stringify(a.json), json: async () => a.json }
+      }
+      return { ok: true, status: 200, json: async () => ({ wopi_url: `${ORIGIN}/collabora/x`, access_token: 'minted' }) }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return posts
+  }
+  const ok = (body: Record<string, unknown>) => ({
+    ok: true, status: 200,
+    json: { download_url: `/v1/media/t-${String(body.format) || 'plain'}?download=1`, filename: `report.${String(body.format) || 'docx'}` },
+  })
+  const openMenu = async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Document options' }))
+    return screen.findByRole('menu', { name: 'Document options' })
+  }
+  const rows = (menu: HTMLElement) => within(menu).getAllByRole('menuitem').map((r) => r.textContent)
+
+  it('the header keeps Versions, Minimize and Close at the far right, the options just left of Close', async () => {
+    stubDownloads(ok)
+    useDocumentPaneStore.getState().openFile('c1', 'fa')
+    wrap(<DocumentPane chatId="c1" placement="docked" shown />)
+    await screen.findAllByRole('tab')
+    for (const name of ['Versions', 'Minimize', 'Document options', 'Close the document pane']) {
+      expect(screen.getByRole('button', { name })).toBeInTheDocument()
+    }
+    expect(screen.queryByRole('button', { name: 'Refresh' })).toBeNull()
+    expect(screen.queryByRole('link', { name: 'Download' })).toBeNull()
+    const close = screen.getByRole('button', { name: 'Close the document pane' })
+    expect(close.parentElement!.lastElementChild).toBe(close)
+    expect(close.previousElementSibling).toBe(screen.getByRole('button', { name: 'Document options' }))
+  })
+
+  it('offers what each type allows, in order', async () => {
+    stubDownloads(ok)
+    for (const [fid, want] of [
+      ['fa', ['Refresh', 'Download', 'Download as PDF']],
+      ['fb', ['Refresh', 'Download', 'Download as PDF', 'Download as CSV']],
+      ['fc', ['Refresh', 'Download']],
+    ] as const) {
+      useDocumentPaneStore.setState({ owner: 'me', byChat: {} })
+      useDocumentPaneStore.getState().openFile('c1', fid)
+      const view = wrap(<DocumentPane chatId="c1" placement="docked" shown />)
+      await screen.findAllByRole('tab')
+      await waitFor(async () => expect(rows(await openMenu())).toEqual(want))
+      view.unmount()
+    }
+  })
+
+  it('Download takes the live file through its own link', async () => {
+    const posts = stubDownloads(ok)
+    useDocumentPaneStore.getState().openFile('c1', 'fa')
+    wrap(<DocumentPane chatId="c1" placement="docked" shown />)
+    await screen.findAllByRole('tab')
+    fireEvent.click(within(await openMenu()).getByRole('menuitem', { name: 'Download' }))
+    await waitFor(() => expect(clicked).toEqual([{ href: '/v1/media/a?fn=report.docx', download: 'report.docx' }]))
+    expect(posts).toEqual([])
+  })
+
+  it('Download as PDF asks the server, then starts its link under the name it answered', async () => {
+    const posts = stubDownloads(ok)
+    useDocumentPaneStore.getState().openFile('c1', 'fa')
+    wrap(<DocumentPane chatId="c1" placement="docked" shown />)
+    await screen.findAllByRole('tab')
+    fireEvent.click(within(await openMenu()).getByRole('menuitem', { name: 'Download as PDF' }))
+    await waitFor(() => expect(clicked).toEqual([{ href: '/v1/media/t-pdf?download=1&fn=report.pdf', download: 'report.pdf' }]))
+    expect(posts).toEqual([{ chat_id: 'c1', file_id: 'fa', snapshot_id: '', format: 'pdf' }])
+  })
+
+  it('a version downloads as that version, as it is and as PDF', async () => {
+    const posts = stubDownloads(ok)
+    useDocumentPaneStore.getState().openFile('c1', 'fa')
+    useDocumentPaneStore.getState().showVersion('c1', 'fa', 'a2')
+    wrap(<DocumentPane chatId="c1" placement="docked" shown />)
+    await screen.findAllByRole('tab')
+    fireEvent.click(within(await openMenu()).getByRole('menuitem', { name: 'Download' }))
+    await waitFor(() => expect(posts).toHaveLength(1))
+    fireEvent.click(within(await openMenu()).getByRole('menuitem', { name: 'Download as PDF' }))
+    await waitFor(() => expect(posts).toHaveLength(2))
+    expect(posts).toEqual([
+      { chat_id: 'c1', file_id: 'fa', snapshot_id: 'a2', format: '' },
+      { chat_id: 'c1', file_id: 'fa', snapshot_id: 'a2', format: 'pdf' },
+    ])
+    await waitFor(() => expect(clicked.map((c) => c.download)).toEqual(['report.docx', 'report.pdf']))
+  })
+
+  it('a refusal is a toast with the server\'s sentence, and nothing downloads', async () => {
+    stubDownloads(() => ({ ok: false, status: 429, json: { detail: 'A download is already being prepared. Wait for it to finish.' } }))
+    useDocumentPaneStore.getState().openFile('c1', 'fb')
+    wrap(<DocumentPane chatId="c1" placement="docked" shown />)
+    await screen.findAllByRole('tab')
+    fireEvent.click(within(await openMenu()).getByRole('menuitem', { name: 'Download as CSV' }))
+    await waitFor(() => expect(toasts).toHaveLength(1))
+    expect(toasts[0]).toMatchObject({ severity: 'warning', body: 'A download is already being prepared. Wait for it to finish.' })
+    expect(clicked).toEqual([])
+  })
+
+  it('the download rows wait while one is prepared', async () => {
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/v1/documents/chat-documents')) return { ok: true, status: 200, json: async () => ({ documents: offered }) }
+      if (url.includes('/v1/documents/download')) {
+        await gate
+        return { ok: true, status: 200, json: async () => ({ download_url: '/v1/media/t?download=1', filename: 'budget.pdf' }) }
+      }
+      return { ok: true, status: 200, json: async () => ({ wopi_url: `${ORIGIN}/collabora/x`, access_token: 'minted' }) }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    useDocumentPaneStore.getState().openFile('c1', 'fb')
+    wrap(<DocumentPane chatId="c1" placement="docked" shown />)
+    await screen.findAllByRole('tab')
+    fireEvent.click(within(await openMenu()).getByRole('menuitem', { name: 'Download as PDF' }))
+    const waiting = await screen.findByRole('button', { name: 'Preparing the download' })
+    expect(waiting).toHaveAttribute('aria-busy', 'true')
+    fireEvent.click(waiting)
+    const menu = await screen.findByRole('menu', { name: 'Document options' })
+    expect(within(menu).getByRole('menuitem', { name: 'Download as CSV' })).toBeDisabled()
+    expect(within(menu).getByRole('menuitem', { name: 'Refresh' })).not.toBeDisabled()
+    release()
+    await waitFor(() => expect(clicked).toHaveLength(1))
+    expect(screen.getByRole('button', { name: 'Document options' })).toHaveAttribute('aria-busy', 'false')
+  })
+
+  it('a live document with unsaved edits is saved before it downloads', async () => {
+    const seq: string[] = []
+    const posts = stubDownloads((b) => { seq.push('prepare'); return ok(b) })
+    h.edited = true
+    h.win = window
+    const post = vi.spyOn(window, 'postMessage').mockImplementation((m: unknown) => {
+      if (String(m).includes('"Action_Save"')) {
+        seq.push('save')
+        window.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({ MessageId: 'Action_Save_Resp', Values: { success: true } }), source: window,
+        }))
+      }
+    })
+    useDocumentPaneStore.getState().openFile('c1', 'fa')
+    wrap(<DocumentPane chatId="c1" placement="docked" shown />)
+    await screen.findAllByRole('tab')
+    act(() => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: JSON.stringify({ MessageId: 'Doc_ModifiedStatus', Values: { Modified: true } }), source: window,
+      }))
+    })
+    fireEvent.click(within(await openMenu()).getByRole('menuitem', { name: 'Download as PDF' }))
+    await waitFor(() => expect(posts).toHaveLength(1))
+    expect(seq).toEqual(['save', 'prepare'])
+    expect(toasts).toEqual([])
+    post.mockRestore()
+  })
+
+  it('Esc closes the menu before the floating window, and the window losing the focus closes it', async () => {
+    stubDownloads(ok)
+    useDocumentPaneStore.getState().openFile('c1', 'fa')
+    wrap(<ChatDocumentPane chatId="c1" placement="floating" hidden={false} userSub="me" />)
+    await screen.findAllByRole('tab')
+    fireEvent.pointerDown(screen.getAllByRole('tab')[0])
+    const menu = await openMenu()
+    expect(document.activeElement).toBe(within(menu).getAllByRole('menuitem')[0])
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('menu', { name: 'Document options' })).toBeNull())
+    expect(paneChat('c1').open).toBe(true)
+    await openMenu()
+    act(() => { window.dispatchEvent(new Event('blur')) })
+    await waitFor(() => expect(screen.queryByRole('menu', { name: 'Document options' })).toBeNull())
+  })
+
+  it('ArrowUp with no row focused goes to the last row, in both header menus', async () => {
+    stubDownloads(ok)
+    useDocumentPaneStore.getState().openFile('c1', 'fa')
+    wrap(<DocumentPane chatId="c1" placement="docked" shown />)
+    await screen.findAllByRole('tab')
+    const options = await openMenu()
+    const rows = within(options).getAllByRole('menuitem').filter((r) => !(r as HTMLButtonElement).disabled)
+    await waitFor(() => expect(document.activeElement).toBe(rows[0]))
+    act(() => { (document.activeElement as HTMLElement).blur() })
+    fireEvent.keyDown(options, { key: 'ArrowUp' })
+    expect(document.activeElement).toBe(rows[rows.length - 1])
+    fireEvent.keyDown(options, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('menu', { name: 'Document options' })).toBeNull())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Versions' }))
+    const versions = await screen.findByRole('menu', { name: 'Versions' })
+    const radios = within(versions).getAllByRole('menuitemradio').filter((r) => !(r as HTMLButtonElement).disabled)
+    await waitFor(() => expect(document.activeElement).toBe(radios[0]))
+    act(() => { (document.activeElement as HTMLElement).blur() })
+    fireEvent.keyDown(versions, { key: 'ArrowUp' })
+    expect(document.activeElement).toBe(radios[radios.length - 1])
   })
 })
 
@@ -319,12 +543,14 @@ describe('changes made from outside the pane leave the document first', () => {
   it('a card for another document leaves first; refused, the pane stays on the edited one', async () => {
     stubFetch()
     openOnReport()
+    // Before the first render: the stand-in's `reloadAvailable` is read when
+    // the frame renders, and nothing here renders it again before the click.
+    editedAndChanged()
     wrap(<>
       <ChatDocumentPane chatId="c1" placement="docked" hidden={false} userSub="me" />
       <DocumentCard chatId="c1" fileId="fb" filename="budget.xlsx" downloadUrl="/v1/media/b" snapshotId="b1" />
     </>)
     await screen.findAllByRole('tab')
-    editedAndChanged()
     fireEvent.click(await screen.findByTitle('Open the document'))
     expect(await screen.findByText(/This file changed while you edited it/)).toBeInTheDocument()
     expect(paneChat('c1').active).toBe('fa')

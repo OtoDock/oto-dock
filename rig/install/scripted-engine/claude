@@ -1,0 +1,17 @@
+#!/bin/sh
+# Claude Code for the rig: a key the rig made reaches its scripted model server,
+# and any other key reaches the vendor. CLAUDE_BIN names this file, and the
+# sandbox mounts its folder. Nothing else in the install changes.
+# A terminal on a key carries it in OTO_CLAUDE_API_KEY for its key helper.
+case "${ANTHROPIC_API_KEY:-${OTO_CLAUDE_API_KEY:-}}" in
+    rig-scripted-*)
+        export ANTHROPIC_BASE_URL="http://198.18.0.1:18099"
+        export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+        # The scripted server stands in for the vendor's host, which the
+        # credential exit leaves direct (NO_PROXY names the engines' hosts);
+        # Claude Code sends even a plain-http base URL through HTTPS_PROXY.
+        export NO_PROXY="${NO_PROXY:+$NO_PROXY,}198.18.0.1"
+        export no_proxy="$NO_PROXY"
+        ;;
+esac
+exec /usr/local/bin/claude "$@"

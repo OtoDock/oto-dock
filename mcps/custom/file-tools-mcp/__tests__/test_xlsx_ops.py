@@ -372,7 +372,7 @@ def test_import_csv_refuses_a_file_that_is_not_regular(tmp_path):
     fifo = tmp_path / "pipe.csv"
     os.mkfifo(fifo)
     msg = _write(tmp_path / "fifo.xlsx", [{"op": "import_csv", "csv_path": str(fifo)}])
-    assert "is not a regular file" in msg
+    assert "not a regular file" in msg
 
 
 @pytest.mark.parametrize("start, text, words", [

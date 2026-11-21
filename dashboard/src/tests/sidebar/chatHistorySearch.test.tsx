@@ -8,6 +8,7 @@ vi.mock('@/api/chats', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/api/chats')>(),
   useDeleteChat: () => ({ mutate: vi.fn() }),
   useRenameChat: () => ({ mutate: vi.fn() }),
+  useSetChatPinned: () => ({ mutate: vi.fn() }),
   useSearchChats: () => searchMock(),
 }))
 vi.mock('@/hooks/useActiveChats', () => ({ useActiveChats: () => [] }))

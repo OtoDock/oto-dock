@@ -1,30 +1,40 @@
 {
   "name": "agent-config-mcp",
   "label": "Agent Self-Config",
-  "description": "Lets an agent inspect and modify its own settings — its persona (config/agent.md), identity (display name, description, color), default model, default execution layer, default scope, and per-agent memory toggles — and mark post-install setup complete. Platform admins/creators additionally get self-scope company wiring: share this agent's knowledge folder as a shared knowledge library, attach/detach other agents' libraries, and assign the agent to a department (each such call requires in-chat approval). Permission-aware: viewers see zero tools.",
-  "version": "1.4.8",
+  "description": "Lets an agent mark post-install setup complete, and inspect and modify its own settings: its persona (config/agent.md), identity (display name, description, color), default model, default execution layer, default scope and per-agent memory toggles. Platform admins/creators additionally get self-scope company wiring. They share this agent's knowledge folder as a shared knowledge library, attach/detach other agents' libraries, and assign the agent to a department. Each such call requires in-chat approval. Managers also limit what the agent may use of each MCP (get_tool_limits, set_tool_limits). Every person's chat also gets the two tools of its own session, reload_session and switch_account. The first rebuilds this chat's session after a tool was enabled or an account connected. The second moves this chat to another account of one tool. Permission-aware: below the editor tier a session sees complete_setup and those two only.",
+  "version": "1.8.1",
   "category": "core",
-
   "server": {
     "runtime": "python",
     "transport": "stdio",
     "command": "venv/bin/python",
-    "args": ["server.py"]
+    "args": [
+      "server.py"
+    ],
+    "starts": "with_chat"
   },
-
   "credentials": {
     "type": "none"
   },
-
   "config": [],
-
   "env": {},
   "agent_env": {},
-
-  "exclude_from": ["task", "meeting", "external"],
-
-  "skills": [],
-
+  "exclude_from": [
+    "meeting",
+    "external"
+  ],
+  "skills": [
+    {
+      "id": "session-reload",
+      "loading": "always",
+      "file": "docs/session-reload.md",
+      "description": "When to reload this chat's session or switch its account",
+      "default_exclude_from": [
+        "phone",
+        "task"
+      ]
+    }
+  ],
   "permissions": {
     "default_tier": "sensitive",
     "rules": [
@@ -41,6 +51,14 @@
         "tier": "standard"
       },
       {
+        "tool": "reload_session",
+        "tier": "standard"
+      },
+      {
+        "tool": "switch_account",
+        "tier": "sensitive"
+      },
+      {
         "tool": "share_knowledge_folder",
         "tier": "critical"
       },
@@ -54,6 +72,14 @@
       },
       {
         "tool": "set_department",
+        "tier": "critical"
+      },
+      {
+        "tool": "set_outside_people",
+        "tier": "critical"
+      },
+      {
+        "tool": "set_tool_limits",
         "tier": "critical"
       }
     ]

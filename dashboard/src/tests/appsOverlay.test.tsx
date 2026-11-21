@@ -34,12 +34,19 @@ const reorderMutate = vi.hoisted(() => vi.fn((_ids: string[]) => Promise.resolve
 // The rollback mutation: the host passes per-call callbacks, a test fires them.
 const rollbackMutate = vi.hoisted(() => vi.fn())
 const unpinMutate = vi.hoisted(() => vi.fn((_id: string) => Promise.resolve()))
+// An app that follows its source: the host passes per-call callbacks too.
+const followCalls = vi.hoisted(() => ({ take: vi.fn(), send: vi.fn(), stop: vi.fn() }))
+// One mock of the module for the whole file: of two registrations for one
+// module either can land last, so the second is never sure to win.
 vi.mock('@/api/apps', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/apps')>()),
   useApps: () => ({ data: appsData.current, isLoading: false }),
   useUnpinApp: () => ({ mutateAsync: unpinMutate, isPending: false }),
   useRollbackApp: () => ({ mutate: rollbackMutate, isPending: false }),
   useReorderApps: () => ({ mutateAsync: reorderMutate, isPending: false }),
+  useTakeRelease: () => ({ mutate: followCalls.take, isPending: false }),
+  useSendToSource: () => ({ mutate: followCalls.send, isPending: false }),
+  useStopFollowing: () => ({ mutate: followCalls.stop, isPending: false }),
 }))
 vi.mock('@/components/sharing/SharePopover', () => ({
   default: ({ app }: { app: { id: string } }) => <div data-testid="share-popover">{app.id}</div>,
@@ -186,7 +193,8 @@ describe('AppsOverlay — chip strip visibility', () => {
     fireEvent.click(screen.getByRole('menuitem', { name: 'Roll back' }))
     const confirm = screen.getByTestId('app-rollback-confirm')
     expect(confirm.textContent).toContain('Roll back “board” to the previous release?')
-    expect(confirm.textContent).toContain('Its data goes back to before this release')
+    expect(confirm.textContent).toContain('Roll back “board” to the previous release? Everyone switches at once. Its data goes back too. The newer data is kept as a backup.')
+    expect(confirm.textContent).not.toContain('server')
     // Cancel: nothing moves.
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(screen.queryByTestId('app-rollback-confirm')).toBeNull()
@@ -201,7 +209,7 @@ describe('AppsOverlay — chip strip visibility', () => {
     act(() => { callbacks.onSuccess({ release: 3, screens: 2, db_restored: true, snapshot: 'rollback-x.sqlite' }) })
     const notice = screen.getByTestId('app-rollback-notice')
     expect(notice.textContent).toContain('Release 3 serves again.')
-    expect(notice.textContent).toContain('restored from before release 4')
+    expect(notice.textContent).toContain('Its data went back to before release 4. The newer data is kept as a backup.')
     fireEvent.click(screen.getByLabelText('Dismiss'))
     expect(screen.queryByTestId('app-rollback-notice')).toBeNull()
     // A refusal shows its reason the same way.
@@ -217,7 +225,7 @@ describe('AppsOverlay — chip strip visibility', () => {
     const folder = mkApp('board', { kind: 'folder' })
     expect(rollbackNoticeText(file, 2, { release: 1, screens: 0 })).toBe('Release 1 serves again.')
     expect(rollbackNoticeText(folder, 5, { release: 4, screens: 1, db_restored: true, snapshot: 's' }))
-      .toContain('restored from before release 5')
+      .toContain('Its data went back to before release 5. The newer data is kept as a backup.')
     expect(rollbackNoticeText(folder, 5, { release: 4, screens: 1, db_restored: false }))
       .toContain('No copy from before release 5 exists, so the app keeps its current data.')
   })
@@ -585,18 +593,6 @@ describe('AppsOverlay — the soft unpin of an app that runs a server says Stop 
 })
 
 // ─── An app that follows another agent's app (services/apps/app_follow.py): the card's three states, Not now, the menu rows ───
-
-const followCalls = vi.hoisted(() => ({ take: vi.fn(), send: vi.fn(), stop: vi.fn() }))
-vi.mock('@/api/apps', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@/api/apps')>()),
-  useApps: () => ({ data: appsData.current, isLoading: false }),
-  useUnpinApp: () => ({ mutateAsync: unpinMutate, isPending: false }),
-  useRollbackApp: () => ({ mutate: rollbackMutate, isPending: false }),
-  useReorderApps: () => ({ mutateAsync: reorderMutate, isPending: false }),
-  useTakeRelease: () => ({ mutate: followCalls.take, isPending: false }),
-  useSendToSource: () => ({ mutate: followCalls.send, isPending: false }),
-  useStopFollowing: () => ({ mutate: followCalls.stop, isPending: false }),
-}))
 
 import { mergePrompt, showsFollowCard } from '@/components/apps/AppFollowCard.helpers'
 

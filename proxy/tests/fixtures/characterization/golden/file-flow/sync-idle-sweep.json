@@ -1,0 +1,20 @@
+{
+ "merges": [
+  [
+   "merge",
+   "m-idle",
+   "changed",
+   {
+    "background": true,
+    "target_role": "admin",
+    "target_username": null
+   }
+  ]
+ ],
+ "pending": [],
+ "synced": {
+  "busy": "fp1",
+  "changed": "fp2",
+  "same": "fp1"
+ }
+}

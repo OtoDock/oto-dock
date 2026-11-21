@@ -361,7 +361,7 @@
    "group": "Connected Accounts",
    "label": "Connected account",
    "kind": "item",
-   "help": "One account of a service: its label, the services it reaches, the default star, and Reconnect, Disconnect or Remove. Agents not bound to another account use the default.",
+   "help": "One account of a service: its label, the services it reaches, the default star, and Reconnect, Disconnect or Remove. An agent you gave no account of the service uses the default.",
    "reads": "member",
    "writes": "member",
    "where": "User Settings, Integrations",
@@ -392,13 +392,14 @@
    "group": "Use this account for specific agents",
    "label": "Use this account for specific agents",
    "kind": "item",
-   "help": "Binds one of your agents to this account. On GitHub you can limit the repositories the agent reaches in your chats, or make it read only.",
+   "help": "Lets one of your agents use this account. An agent can have several accounts of a service and starts on its default one. On GitHub you can limit the repositories the agent reaches in your chats, or make it read only.",
    "reads": "member",
    "writes": "member",
    "where": "User Settings, Integrations",
    "who": "Any signed-in person, on their own account.",
    "card": false,
    "names": [
+    "Make default",
     "Change",
     "Read only",
     "All repositories the account reaches",
@@ -474,7 +475,7 @@
    "group": "API Keys",
    "label": "+ Create key",
    "kind": "action",
-   "help": "Makes a personal API key for your webhook triggers. The key shows once.",
+   "help": "Makes a personal API key: what it may do, on which agents, and when it ends. The key shows once.",
    "reads": "member",
    "writes": "member",
    "where": "User Settings, Integrations",
@@ -483,7 +484,9 @@
    "names": [
     "Create",
     "Name",
-    "triggers: fire your own webhook triggers",
+    "Which agents",
+    "It ends after",
+    "May run without asking",
     "Copy to clipboard"
    ]
   },
@@ -597,7 +600,7 @@
     "Save token",
     "Clear",
     "Browser profile",
-    "Also let unattended runs like scheduled tasks, triggers, calls and meetings use this browser. Off, they cannot use it at all."
+    "Also let unattended runs like scheduled tasks, triggers, calls, meetings and API keys use this browser. Off, they cannot use it at all."
    ],
    "note": "Shown once browser control is granted.",
    "item": "a machine with browser control"
@@ -1271,6 +1274,34 @@
    }
   },
   {
+   "id": "admin.platform.working-files-cleanup",
+   "area": "admin",
+   "section": "platform",
+   "group": "Storage and Retention",
+   "label": "Clean up old uploads",
+   "kind": "toggle",
+   "help": "Uploads left untouched for the set period spend 7 days in the Recover bin, then go for good.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Setup, System Settings",
+   "who": "A platform administrator.",
+   "card": true,
+   "tab": "System Settings",
+   "value": {
+    "read": {
+     "path": "/v1/admin/platform-settings",
+     "field": "working_files_retention_enabled"
+    },
+    "write": {
+     "path": "/v1/admin/platform-settings",
+     "field": "working_files_retention_enabled"
+    },
+    "default": true,
+    "confirm": "On, old uploads go to the Recover bin after the set period. Off keeps them all.",
+    "cloudManaged": true
+   }
+  },
+  {
    "id": "admin.platform.archive-cleanup",
    "area": "admin",
    "section": "platform",
@@ -1329,60 +1360,6 @@
     },
     "default": true,
     "confirm": "On, community MCPs update once a week on their own. Off, every update waits for an admin."
-   }
-  },
-  {
-   "id": "admin.platform.store-review",
-   "area": "admin",
-   "section": "platform",
-   "group": "Mobile apps",
-   "label": "Ask for a store rating",
-   "kind": "toggle",
-   "help": "The Android and iOS apps ask each person to rate OtoDock in Google Play or the App Store. They ask twice at most, after something went well.",
-   "reads": "admin",
-   "writes": "admin",
-   "where": "Admin, Setup, System Settings",
-   "who": "A platform administrator.",
-   "card": true,
-   "tab": "System Settings",
-   "value": {
-    "read": {
-     "path": "/v1/admin/platform-settings",
-     "field": "store_review_enabled"
-    },
-    "write": {
-     "path": "/v1/admin/platform-settings",
-     "field": "store_review_enabled"
-    },
-    "default": true,
-    "confirm": "On, the Android and iOS apps ask each person for a store rating twice at most. Off, they never ask."
-   }
-  },
-  {
-   "id": "admin.platform.store-review-days",
-   "area": "admin",
-   "section": "platform",
-   "group": "Mobile apps",
-   "label": "Days before the second ask",
-   "kind": "number",
-   "help": "The second store rating ask comes at least this many days after the first. From 30 to 730.",
-   "reads": "admin",
-   "writes": "admin",
-   "where": "Admin, Setup, System Settings",
-   "who": "A platform administrator.",
-   "card": true,
-   "tab": "System Settings",
-   "value": {
-    "read": {
-     "path": "/v1/admin/platform-settings",
-     "field": "store_review_days"
-    },
-    "write": {
-     "path": "/v1/admin/platform-settings",
-     "field": "store_review_days"
-    },
-    "default": 90,
-    "confirm": "The second ask comes at least this many days after the first."
    }
   },
   {
@@ -1465,6 +1442,37 @@
     "Forget"
    ],
    "item": "an installed MCP"
+  },
+  {
+   "id": "admin.mcp-servers.keep-running",
+   "area": "admin",
+   "section": "mcp-servers",
+   "group": "MCP Servers",
+   "label": "Keep running",
+   "kind": "item",
+   "help": "A tool in its own container stops after 15 idle minutes by default. It starts again at its next use. Keep running keeps it up and uses memory all the time.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, MCP Servers",
+   "who": "A platform administrator.",
+   "card": false,
+   "note": "Not on a hosted install, where every tool sleeps when idle. A tool that runs with the platform has no switch.",
+   "item": "a tool in its own container"
+  },
+  {
+   "id": "admin.mcp-servers.browser-local-network",
+   "area": "admin",
+   "section": "mcp-servers",
+   "group": "Local network",
+   "label": "Let the browser open pages on your local network",
+   "kind": "toggle",
+   "help": "Turned on, the browser reaches what this server reaches. Changing it restarts the browser.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, MCP Servers",
+   "who": "A platform administrator.",
+   "card": false,
+   "note": "Not on a hosted install. Callers and outside people lose the browser while it is on."
   },
   {
    "id": "admin.skills.package",
@@ -1557,6 +1565,45 @@
    "card": false,
    "note": "Only the agents whose default place is this machine. Turning it on asks first.",
    "item": "a machine an admin paired"
+  },
+  {
+   "id": "admin.remote-machines.compute-add",
+   "area": "admin",
+   "section": "remote-machines",
+   "group": "Compute machines",
+   "label": "Add a compute machine",
+   "kind": "action",
+   "help": "Adds a server you control as a compute machine. You give it a name, then run one command on that server.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Remote Machines",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Add machine"
+   ],
+   "note": "Only an install that runs in Docker can add one. Otherwise the card says why."
+  },
+  {
+   "id": "admin.remote-machines.compute-machine",
+   "area": "admin",
+   "section": "remote-machines",
+   "group": "Compute machines",
+   "label": "Compute machine",
+   "kind": "item",
+   "help": "A machine the platform runs itself, with no owner. Chats, terminals, tasks, calls and meetings on the platform run on these machines. Apps run on the one beside the platform.",
+   "reads": "admin",
+   "writes": "admin",
+   "where": "Admin, Remote Machines",
+   "who": "A platform administrator.",
+   "card": false,
+   "names": [
+    "Pair again",
+    "Lock to this address",
+    "Remove"
+   ],
+   "note": "The one beside the platform cannot be removed. Lock to this address refuses a sign-in from another address and tells every admin.",
+   "item": "a compute machine"
   },
   {
    "id": "admin.shares.share",

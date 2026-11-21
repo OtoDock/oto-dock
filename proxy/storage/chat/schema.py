@@ -6,11 +6,17 @@ statement is idempotent (``CREATE ... IF NOT EXISTS``); see
 ``docs/architecture/DATABASE-SCHEMA.md``.
 """
 
+import json
 import logging
 
+from core.permission_modes import ASK_MODE, AUTO_REVIEW_MODE
 from storage.schema_base import _drop_invalid_indexes, _index_exists
 
 logger = logging.getLogger("otodock")
+
+#: The mode words a release before 1.9 stored in ``chats.permission_mode``,
+#: and the word each one is now. Only the migration below reads them.
+_MODES_BEFORE_1_9 = {"default": ASK_MODE, "acceptEdits": AUTO_REVIEW_MODE}
 
 
 def init_chats(conn) -> None:
@@ -23,7 +29,7 @@ def init_chats(conn) -> None:
             agent TEXT NOT NULL,
             title TEXT DEFAULT '',
             session_id TEXT,
-            permission_mode TEXT DEFAULT 'default',
+            permission_mode TEXT DEFAULT 'ask',
             model TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -99,7 +105,13 @@ def init_chats(conn) -> None:
             -- refs ('agent:<name>' | 'user:<name>'), '' = none. Attached by
             -- the checks tool for a chat, copied from the task for a run.
             -- Existing DBs: run_migrations adds it.
-            checks TEXT NOT NULL DEFAULT ''
+            checks TEXT NOT NULL DEFAULT '',
+            -- the outside person this conversation is with (an
+            -- external_identities id), '' for every other chat
+            external_identity_id TEXT NOT NULL DEFAULT '',
+            -- the compute machine on another host the chat's engine session
+            -- last started on, '' for every other chat
+            compute_machine TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_user ON chats(user_sub)")
@@ -142,6 +154,21 @@ def init_chats(conn) -> None:
             PRIMARY KEY (chat_id, user_sub)
         )
     """)
+
+    # A person's pinned chats (``storage/chat/chat_pins.py``): one row per
+    # person and chat, the real person's sub even on a Shared-only agent's
+    # pool chat. Both keys cascade, so a chat's delete and a person's delete
+    # take their pins. Whole-table CREATE (the new-table pattern: an existing
+    # install converges at its first boot).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pinned_chats (
+            user_sub TEXT NOT NULL REFERENCES users(sub) ON DELETE CASCADE,
+            chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+            pinned_at TEXT NOT NULL,
+            PRIMARY KEY (user_sub, chat_id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pinned_chats_chat ON pinned_chats (chat_id)")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chat_messages (
@@ -231,7 +258,12 @@ def init_chats(conn) -> None:
     # an engine turn runs (its result has not arrived); ``early_ranges`` (a
     # JSON list of ``[after, upto]``) names the rows that engine turn saved
     # before its end, committed with those rows (a replay deletes them).
-    # Created at every boot (IF NOT EXISTS), nothing to migrate.
+    # The facts a continue of the turn needs sit on the row from its start,
+    # since a killed process writes nothing: who the session runs as
+    # (``person``, a sub, '' for the agent itself), the kind of session, its
+    # mode, the machine it runs on, the task run that drives it, the plan it
+    # implements, and ``card``, the permission card that waits on a person
+    # (JSON, '' when none). ``kind`` is '' only on a row an older release left.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chat_open_turns (
             chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
@@ -239,7 +271,64 @@ def init_chats(conn) -> None:
             session_id TEXT NOT NULL DEFAULT '',
             started_at TEXT NOT NULL,
             engine_open BOOLEAN NOT NULL DEFAULT TRUE,
-            early_ranges TEXT NOT NULL DEFAULT '[]'
+            early_ranges TEXT NOT NULL DEFAULT '[]',
+            person TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT '',
+            mode TEXT NOT NULL DEFAULT '',
+            machine_id TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL DEFAULT '',
+            plan TEXT NOT NULL DEFAULT '',
+            card TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+    # The turns the platform itself cut (``storage/chat/cut_records.py``): a
+    # stop, a crash, a machine that lost the session. The boot turns every
+    # open-turn row it finds into one, and the continue pass
+    # (``services/scheduler/continue_pass.py``) works from them. ``state``:
+    # ``pending`` (the pass takes it), ``waiting`` (its machine has not said
+    # whether it still holds the session), ``running`` (the pass holds it),
+    # then ``continued``, ``gave_way``, ``dropped`` or ``left``. No role is
+    # stored: the pass reads the person's standing when it starts a session.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_cut_turns (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+            turn_token TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL DEFAULT '',
+            person TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT '',
+            mode TEXT NOT NULL DEFAULT '',
+            machine_id TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL DEFAULT '',
+            plan TEXT NOT NULL DEFAULT '',
+            card TEXT NOT NULL DEFAULT '',
+            engine_open BOOLEAN NOT NULL DEFAULT TRUE,
+            started_at TEXT NOT NULL DEFAULT '',
+            cause TEXT NOT NULL,
+            cut_at TEXT NOT NULL,
+            state TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            settled_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_cut_turns_state ON chat_cut_turns (state)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_cut_turns_chat ON chat_cut_turns (chat_id, id)")
+
+    # A reload or a move the agent asked for that waits for its turn's end
+    # (``storage/chat/pending_rebuilds.py``): the waiter is a task in memory,
+    # the row is what a restart finds. One per chat, gone when the waiter ends.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_pending_rebuilds (
+            chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+            what TEXT NOT NULL,
+            person TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '',
+            target TEXT NOT NULL DEFAULT '',
+            choices TEXT NOT NULL DEFAULT '{}',
+            deadline TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
     """)
 
@@ -274,6 +363,45 @@ def init_chats(conn) -> None:
         conn.execute(
             "CREATE INDEX idx_chat_search_vector ON chat_search USING GIN(search_vector)"
         )
+    # The record of each conversation in an agent's Conversations tab
+    # (storage/chat/conversation_store.py): the line it came on, its
+    # direction, the outside person it was with, and what the wrap-up after
+    # it recorded. One row per phone-owned conversation; it goes with its chat.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_records (
+            chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+            agent TEXT NOT NULL,
+            line TEXT NOT NULL,
+            direction TEXT NOT NULL DEFAULT 'inbound',
+            identity_id TEXT NOT NULL DEFAULT '',
+            outcome TEXT NOT NULL DEFAULT '',
+            follow_ups TEXT NOT NULL DEFAULT '[]',
+            wrapup TEXT NOT NULL DEFAULT '',
+            wrapup_run_id TEXT NOT NULL DEFAULT '',
+            wrapup_attempts INTEGER NOT NULL DEFAULT 0,
+            wrote TEXT NOT NULL DEFAULT '[]',
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation_records_identity "
+                 "ON conversation_records (agent, identity_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation_records_wrapup "
+                 "ON conversation_records (wrapup) WHERE wrapup IN ('pending', 'running')")
+    # A wrap-up's one-line note for the team, when the agent's switch is on:
+    # rendered into members' and the agent's own prompts, never a file, so no
+    # model tool writes it and forgetting a person removes their lines.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS outside_notes (
+            id SERIAL PRIMARY KEY,
+            agent TEXT NOT NULL,
+            identity_id TEXT NOT NULL DEFAULT '',
+            chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+            day TEXT NOT NULL,
+            text TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_outside_notes_agent ON outside_notes (agent, id)")
 
 
 def init_meetings(conn) -> None:
@@ -384,14 +512,30 @@ def init_reply_reports(conn) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_reply_reports_chat ON reply_reports (chat_id)"
     )
-    migrate_chat(conn)
+
+
+def _current_mode_words(conn) -> None:
+    """2.0: a chat that stored a mode word from before 1.9 holds the word it
+    reads as, and the column's default is Ask. A boot after the first finds
+    no such row, and the default is written only while the catalog names
+    another; in the boot's transaction, so a failure stops the boot."""
+    for old, new in _MODES_BEFORE_1_9.items():
+        conn.execute("UPDATE chats SET permission_mode = %s WHERE permission_mode = %s", (new, old))
+    row = conn.execute(
+        "SELECT column_default FROM information_schema.columns WHERE table_schema = current_schema() "
+        "AND table_name = 'chats' AND column_name = 'permission_mode'").fetchone()
+    if row and not (row["column_default"] or "").startswith(f"'{ASK_MODE}'"):
+        conn.execute(f"ALTER TABLE chats ALTER COLUMN permission_mode SET DEFAULT '{ASK_MODE}'")
 
 
 def migrate_chat(conn) -> None:
     """The chat domain's forward migrations on an existing install, at
-    startup before the pool serves a request (``init_reply_reports`` calls
-    it). Reports outlive their chat (1.9.1): a ``reply_reports`` made with
-    ``chat_id NOT NULL ... ON DELETE CASCADE`` gets ``ON DELETE SET NULL``
+    startup before the pool serves a request (``run_migrations`` calls it): the
+    columns on ``chats``, the stored wakes' shape, the index it no longer needs,
+    the waiting messages of deleted people, the mode words from before 1.9
+    (all before the reports' step, which returns early once it is done).
+    Reports outlive their chat (1.9.1): a
+    ``reply_reports`` made with ``chat_id NOT NULL ... ON DELETE CASCADE`` gets ``ON DELETE SET NULL``
     and a nullable column, and every report's ``chat_title`` from its chat
     (all of them still have one). Read from the catalog, so a boot after the
     first does nothing, and it never runs on a table the CREATE above made:
@@ -399,6 +543,99 @@ def migrate_chat(conn) -> None:
     the constraint DDL meets no pool (the reason the other constraints live
     in ``run_migrations``). Inside a SAVEPOINT: a failure leaves the reports
     going with their chat and the next boot tries again."""
+    # 2026-09-17: checks (CHECKS.md). The checks attached to a chat (a JSON
+    # list of refs, '' = none) and to a task; empty on every pre-existing
+    # row. The three checks tables are new tables (init_checks).
+    conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS checks TEXT NOT NULL DEFAULT ''")
+    # 2.0: the outside person a phone conversation is with.
+    conn.execute(
+        "ALTER TABLE chats ADD COLUMN IF NOT EXISTS external_identity_id TEXT NOT NULL DEFAULT ''"
+    )
+    # 2.0: the compute machine on another host the chat's engine session last
+    # started on (its own copy holds the engine's record): where the chat
+    # stays. Only such a machine's id is written; '' everywhere else.
+    conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS compute_machine TEXT NOT NULL DEFAULT ''")
+    # What a continue of a cut turn needs, on the turn's own row.
+    for column in ("person", "kind", "mode", "machine_id", "run_id", "plan", "card"):
+        conn.execute(f"ALTER TABLE chat_open_turns ADD COLUMN IF NOT EXISTS {column} "
+                     "TEXT NOT NULL DEFAULT ''")
+    # 2026-07-18: durable delegate-wake replay — undeliverable delegate
+    # results are stored on the parent chat and injected at its next
+    # warmup/turn.
+    conn.execute(
+        "ALTER TABLE chats "
+        "ADD COLUMN IF NOT EXISTS pending_delegate_wake TEXT NOT NULL DEFAULT ''"
+    )
+    # The chats with a parked wake (startup and every satellite reconnect);
+    # here, not in init_chats: the column itself arrives by this migration.
+    _drop_invalid_indexes(conn, "idx_chats_pending_wake")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chats_pending_wake ON chats (id) "
+        "WHERE pending_delegate_wake <> ''"
+    )
+    # A stored wake names the person it runs as since 1.7.1 (a JSON array of
+    # {"prompt", "person", "role", "by"}); 1.7.0 stored plain strings. Each
+    # such value is rewritten with no person; a converted value starts with
+    # '[{', so the pass is idempotent and needs no flag. A value that is not
+    # JSON is cleared (the reader would drop it anyway).
+    conn.execute("SAVEPOINT pending_wake_records")
+    try:
+        from storage.chat.db_chats import wake_records
+        rows = conn.execute(
+            "SELECT id, pending_delegate_wake FROM chats "
+            "WHERE pending_delegate_wake <> '' AND pending_delegate_wake NOT LIKE '[{%%'"
+        ).fetchall()
+        for r in rows:
+            wakes = wake_records(r["pending_delegate_wake"])
+            if not wakes and r["pending_delegate_wake"].strip() != "[]":
+                logger.warning("pending wake migration: chat %s held no readable wake; cleared",
+                               r["id"])
+            conn.execute("UPDATE chats SET pending_delegate_wake = %s WHERE id = %s",
+                         (json.dumps(wakes) if wakes else "", r["id"]))
+        conn.execute("RELEASE SAVEPOINT pending_wake_records")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT pending_wake_records")
+        logger.exception("pending wake migration failed; it retries at the next startup")
+    # The engine-reported running cost total at the last recorded turn and
+    # the engine session it belongs to. Claude Code ≥ 2.1.277 resumes
+    # a session from its saved total, and the pump's per-turn delta needs the
+    # baseline across a proxy restart: the in-memory map made durable, keyed
+    # by session id exactly like it (a fresh session on the chat starts at 0).
+    # 0 / '' on every pre-existing row.
+    conn.execute(
+        "ALTER TABLE chats "
+        "ADD COLUMN IF NOT EXISTS engine_cost_total DOUBLE PRECISION NOT NULL DEFAULT 0"
+    )
+    conn.execute(
+        "ALTER TABLE chats "
+        "ADD COLUMN IF NOT EXISTS engine_cost_session_id TEXT NOT NULL DEFAULT ''"
+    )
+
+    # The single-column agent index on chats (1.7.1): idx_chats_agent_updated
+    # covers it by its prefix, and every chats UPDATE rewrote it for nothing.
+    # Guarded by the catalog so a database that never had it, or already
+    # lost it, does nothing here.
+    if _index_exists(conn, "idx_chats_agent"):
+        conn.execute("SAVEPOINT drop_idx_chats_agent")
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_chats_agent")
+            conn.execute("RELEASE SAVEPOINT drop_idx_chats_agent")
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT drop_idx_chats_agent")
+            logger.exception("dropping idx_chats_agent failed; the next boot retries")
+    # 1.8.0: a deleted person's waiting messages go with them; rows a 1.7.x
+    # deletion left behind could never be sent. One-shot.
+    _QUEUE_FLAG = "chat_input_queue_orphans_swept"
+    if not conn.execute("SELECT 1 FROM platform_settings WHERE key = %s",
+                        (_QUEUE_FLAG,)).fetchone():
+        gone = conn.execute(
+            "DELETE FROM chat_input_queue q WHERE q.author_sub <> '' AND NOT EXISTS "
+            "(SELECT 1 FROM users u WHERE u.sub = q.author_sub)").rowcount
+        if gone:
+            logger.info("chat_input_queue: %d waiting message(s) of deleted people removed", gone)
+        conn.execute("INSERT INTO platform_settings (key, value) VALUES (%s, 'done') "
+                     "ON CONFLICT (key) DO NOTHING", (_QUEUE_FLAG,))
+    _current_mode_words(conn)
     fk = conn.execute(
         "SELECT c.conname FROM pg_constraint c "
         "JOIN pg_class t ON t.oid = c.conrelid "
@@ -437,3 +674,43 @@ def migrate_chat(conn) -> None:
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT reply_reports_outlive_chats")
         logger.exception("reply_reports could not be made to outlive their chat; the next boot retries")
+
+
+# 2.0: one record per phone-owned conversation an existing install holds.
+_RECORDS_FLAG = "conversation_records_backfilled"
+
+
+def backfill_conversation_records(conn) -> None:
+    """The record of every phone-owned conversation made before the record
+    existed, its line from the call log's label for its session. Only a
+    caller's label (``caller:``, ``caller-pin:``, ``ephemeral``) or a
+    recorded outside person gives the caller line and ``shared`` the
+    route-less one; anything else, a pruned call-log row or an empty label
+    included, gives ``person``, which stays a manager's as in 1.9.1: the
+    label is younger than some calls and its rows age out. One-shot, called
+    by ``run_migrations`` after the call log's columns are there."""
+    if conn.execute("SELECT 1 FROM platform_settings WHERE key = %s",
+                    (_RECORDS_FLAG,)).fetchone():
+        return
+    made = conn.execute(
+        """INSERT INTO conversation_records
+               (chat_id, agent, line, direction, identity_id, started_at)
+           SELECT c.id, c.agent,
+                  CASE WHEN c.external_identity_id <> '' THEN 'caller'
+                       WHEN l.identity LIKE 'caller:%%' OR l.identity LIKE 'caller-pin:%%'
+                            OR l.identity = 'ephemeral' THEN 'caller'
+                       WHEN l.identity = 'shared' THEN 'shared'
+                       ELSE 'person' END,
+                  COALESCE(l.direction, 'inbound'), c.external_identity_id, c.created_at
+           FROM chats c
+           LEFT JOIN LATERAL (
+               SELECT p.identity, p.direction FROM phone_call_log p
+               WHERE c.session_id IS NOT NULL AND c.session_id <> ''
+                 AND p.session_id = c.session_id
+               ORDER BY p.started_at DESC LIMIT 1) l ON TRUE
+           WHERE c.source_type = 'phone' AND c.user_sub = 'phone'
+           ON CONFLICT (chat_id) DO NOTHING""").rowcount
+    if made:
+        logger.info("conversation_records: %d existing conversation(s) recorded", made)
+    conn.execute("INSERT INTO platform_settings (key, value) VALUES (%s, 'done') "
+                 "ON CONFLICT (key) DO NOTHING", (_RECORDS_FLAG,))

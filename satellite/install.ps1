@@ -8,7 +8,9 @@
 # this template at the bottom.
 #
 # Usage (end-user, via dashboard install command):
-#     powershell -ExecutionPolicy Bypass -Command "& { $r = Invoke-WebRequest -Headers @{'X-Pairing-Token'='<TOK>'} 'https://<platform>/v1/satellite/bootstrap?os=windows'; Invoke-Expression $r.Content }"
+#     powershell -ExecutionPolicy Bypass -Command "& { iwr -Headers @{'X-Pairing-Token'='<TOK>'} 'https://<platform>/v1/satellite/bootstrap?os=windows' -OutFile (Join-Path ([IO.Path]::GetTempPath()) 'otodock-pair.ps1'); & (Join-Path ([IO.Path]::GetTempPath()) 'otodock-pair.ps1') }"
+#     (the bootstrap is saved to a file and run as a file: Windows' script
+#     scan refuses the download-and-run shape as a download cradle)
 #
 # Repo-local dev invocation:
 #     $env:MACHINE_ID = "..."; $env:MACHINE_SECRET = "..."; $env:PLATFORM_URL = "wss://..."
@@ -29,7 +31,7 @@ $ErrorActionPreference = 'Stop'
 # Windows consoles ship with "QuickEdit Mode" ON. The instant the user
 # CLICKS anywhere in the window (e.g. to select/copy text), the console
 # enters selection mode and SUSPENDS the foreground child process the
-# moment its output buffer fills — pip/venv creation appears to "freeze"
+# moment its output buffer fills -- pip/venv creation appears to "freeze"
 # for minutes until the user presses a key / Ctrl+C, which exits selection
 # mode and the process resumes (exactly the "it continued when I hit
 # Ctrl+C" symptom). Clear ENABLE_QUICK_EDIT_MODE (0x40) on stdin so a stray
@@ -57,7 +59,7 @@ public static extern bool SetConsoleMode(System.IntPtr handle, int mode);
         [void][Win32.OtoConsole]::SetConsoleMode($h, $new)
     }
 } catch {
-    # No console / not supported — install proceeds; a click could still
+    # No console / not supported -- install proceeds; a click could still
     # pause it, but that's the pre-existing default, not a failure.
 }
 
@@ -77,7 +79,7 @@ if (-not $env:MACHINE_ID -or -not $env:MACHINE_SECRET -or -not $env:PLATFORM_URL
     Write-Host "This script is invoked via the platform's bootstrap endpoint,"
     Write-Host "which sets these automatically:"
     Write-Host ""
-    Write-Host "  powershell -ExecutionPolicy Bypass -Command `"& { iex (iwr -Headers @{'X-Pairing-Token'='<TOK>'} 'https://<platform>/v1/satellite/bootstrap?os=windows').Content }`""
+    Write-Host "  powershell -ExecutionPolicy Bypass -Command `"& { iwr -Headers @{'X-Pairing-Token'='<TOK>'} 'https://<platform>/v1/satellite/bootstrap?os=windows' -OutFile (Join-Path ([IO.Path]::GetTempPath()) 'otodock-pair.ps1'); & (Join-Path ([IO.Path]::GetTempPath()) 'otodock-pair.ps1') }`""
     exit 1
 }
 
@@ -185,7 +187,7 @@ function Test-PythonVersion {
     # Test-Path but, when no real Python is installed, print "Python was not
     # found..." to stderr and exit 9009. Under this script's
     # $ErrorActionPreference='Stop' (also set by the bootstrap header), that
-    # native-command stderr is promoted to a TERMINATING error — which would
+    # native-command stderr is promoted to a TERMINATING error -- which would
     # abort the whole installer right here instead of letting us fall through to
     # the py-launcher / direct-path fallbacks below. Relax the preference
     # locally (function scope only) and wrap in try/catch so a stub degrades to
@@ -272,7 +274,7 @@ if (-not $PythonCmd) {
     Err "Most often this is the Windows 'App execution aliases' for Python:"
     Err "if typing 'python' opens the Microsoft Store or prints 'Python was"
     Err "not found', those stubs are shadowing the real install. Fix via"
-    Err "Settings > Apps > Advanced app settings > App execution aliases —"
+    Err "Settings > Apps > Advanced app settings > App execution aliases --"
     Err "turn OFF python.exe and python3.exe, then re-run this installer."
     Err "Or install Python manually: winget install -e --id Python.Python.3.12"
     exit 1
@@ -289,7 +291,7 @@ try {
         -Name 'LongPathsEnabled' -Value 1 -Type DWord -ErrorAction Stop
     Info "Long path support enabled (effective after reboot)"
 } catch {
-    # Expected on a per-user (non-admin) install — this HKLM tweak is
+    # Expected on a per-user (non-admin) install -- this HKLM tweak is
     # OPTIONAL, not required. Info (not Warn) so it doesn't read as a failure.
     Info "Skipped optional long-path registry tweak (needs admin; not required)."
 }
@@ -355,6 +357,16 @@ if ($LASTEXITCODE -ne 0) {
     Err "pip install failed"
     exit 1
 }
+# The credential exit's packages, best effort and from wheels alone: a host
+# with no wheel for one of them still installs and runs every tool that
+# needs no key; the tools that need one stay off there.
+$ExitReq = Join-Path $SatDir "requirements-exit.txt"
+if (Test-Path $ExitReq) {
+    & $VenvPip install -q --no-input --progress-bar off --only-binary :all: -r $ExitReq
+    if ($LASTEXITCODE -ne 0) {
+        Warn "Some packages have no build for this computer. Tools that need a key stay off on it."
+    }
+}
 Ok "Python dependencies installed"
 
 # ---- Step 7: satellite.conf -------------------------------------------
@@ -364,7 +376,7 @@ Ok "Python dependencies installed"
 function ToForward { param([string]$p) return $p.Replace('\', '/') }
 
 # Bare CLI names on purpose: the daemon resolves the actual binary at
-# runtime (pin-verified, npm dirs scanned explicitly — host/cli_versions.py),
+# runtime (pin-verified, npm dirs scanned explicitly -- host/cli_versions.py),
 # so the conf must not freeze whatever this installer shell happens to
 # resolve. A capture here once pinned a stale shadowed copy for good.
 
@@ -386,7 +398,7 @@ codex_bin = codex
 "@
 # Write UTF-8 *without* BOM. Windows PowerShell 5.1's `Set-Content
 # -Encoding UTF8` prepends a BOM, which Python's configparser rejects
-# as garbage in the first section header ('﻿[satellite]'). Using
+# as garbage in the first section header (a BOM before '[satellite]'). Using
 # .NET directly with UTF8Encoding(False) is the portable way to write
 # BOM-less UTF-8 from any PS version.
 [System.IO.File]::WriteAllText(
@@ -415,12 +427,11 @@ $principalId = "$env:USERDOMAIN\$env:USERNAME"
 Info "Registering scheduled task '$TaskName' for $principalId (no admin)..."
 
 # conhost --headless: Win11 delegates console apps to Windows Terminal by
-# default, and WT IGNORES -WindowStyle Hidden for scheduled tasks — the
+# default, and WT IGNORES -WindowStyle Hidden for scheduled tasks -- the
 # daemon ran inside a VISIBLE terminal window that killed it when closed
 # (Win10's legacy conhost honors the hide, hence the machine split).
 # Forcing a headless classic console host shows no window under either
-# terminal; conhost propagates the child's exit code, so the task's
-# restart-on-failure (boot-guard) semantics are preserved.
+# terminal; conhost passes the child's exit code on to the task's result.
 $action = New-ScheduledTaskAction `
     -Execute "conhost.exe" `
     -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerPs1`"" `
@@ -428,9 +439,11 @@ $action = New-ScheduledTaskAction `
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $principalId
 $principal = New-ScheduledTaskPrincipal -UserId $principalId `
     -LogonType Interactive -RunLevel Limited
-# Restart-on-FAILURE (3x, 1 min apart) is what lets the boot-guard's
-# crash-attempt counter advance. A clean exit-0 (update / rollback) is
-# NOT auto-restarted -- the daemon relaunches
+# The restart setting (3x, 1 min apart) does not bring back a program that
+# started and then exited with an error: a start that died at import waits
+# for the next start (the sign-in or the Start Menu entry), and only then does
+# the boot guard's crash-attempt counter advance. A clean exit-0 (update /
+# rollback) is not restarted either -- the daemon relaunches
 # itself via `schtasks /Run` (config.py::relaunch_self). IgnoreNew keeps a
 # second instance from starting if one is already running. ExecutionTimeLimit
 # 0 = run forever. Battery flags keep it alive on laptops.
@@ -489,7 +502,7 @@ Ok "Add/Remove Programs entry created"
 # silent (no console window) and single-instance (the task's
 # MultipleInstances=IgnoreNew makes a second click a no-op while it's running),
 # and it reuses runner.ps1's staged-update swap. Clicking it shows nothing on
-# screen — the tray icon just appears and connects.
+# screen -- the tray icon just appears and connects.
 $launcherVbs = Join-Path $OtoDir "start-tray.vbs"
 @'
 ' OtoDock Satellite -- silent tray launcher (no console window). Starts the

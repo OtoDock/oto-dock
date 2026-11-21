@@ -28,7 +28,8 @@ Then apply edits with `edit_image` following this professional Lightroom-style w
      ~20 the change is nearly invisible and it steepens toward 50. Move in steps
      of 10-15 and read the Tone check line after each pass.
    - `whites` — white point (level is RELATIVE: positive brightens highlights, negative
-     compresses them; 0 = no change)
+     compresses them; 0 = no change). Use 10 to 30. It clips the brightest tones first
+     (measured: +50 took a full ramp from 2 % to 11 % clipped whites), so read the Tone check.
    - `blacks` — black point (level is RELATIVE: **negative deepens toward pure black**
      (-20 to -40 to restore depth after dehaze or on faded scans), positive lifts
      (10-20 for the faded/matte look), **0 = no change** — it does NOT mean "pure black")

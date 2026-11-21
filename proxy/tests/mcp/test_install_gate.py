@@ -17,7 +17,7 @@ from fastapi import HTTPException
 
 import config
 from services.community import community_installer as ci
-from services.mcp import mcp_registry
+from services.mcp import mcp_manifest_store, mcp_registry
 
 
 def _context_only(name: str = "weather-tools", skills: list | None = None) -> dict:
@@ -51,7 +51,7 @@ def mcps_dir(temp_db, tmp_path, monkeypatch):
     root = tmp_path / "opt" / "otodock" / "mcps"
     (root / "community").mkdir(parents=True)
     monkeypatch.setattr(config, "MCPS_DIR", root)
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     return root
 
 
@@ -119,11 +119,15 @@ def fake_package_install(monkeypatch):
 
     async def _install(mcp_dir, runtime, source, **kw):
         calls.append((runtime, source))
+        parsed = ci.mcp_installer.parse_source(source)
+        # A build of a pinned source reads its pin back.
         return ci.mcp_installer.InstallResult(
-            ok=True, log="", version_hash="h", resolved_version="1.0.0",
+            ok=True, log="", version_hash="h",
+            resolved_version=(parsed.version if parsed else "") or "1.0.0",
         )
 
-    monkeypatch.setattr(ci.mcp_installer, "install_mcp", _install)
+    from tests._compute import builds
+    builds(monkeypatch, install=_install)
     return calls
 
 
@@ -283,7 +287,8 @@ async def test_source_build_reaches_the_installer(mcps_dir, tmp_path, monkeypatc
         seen.append(kw)
         return ci.mcp_installer.InstallResult(ok=True, log="", version_hash="h", resolved_version="1.0.0")
 
-    monkeypatch.setattr(ci.mcp_installer, "install_mcp", _install)
+    from tests._compute import builds
+    builds(monkeypatch, install=_install)
     manifest = _packaged("pypi:unifi-network-mcp", runtime="python")
     manifest["server"]["source_build"] = ["antlr4-python3-runtime"]
     await _install_packaged(tmp_path, manifest, "a")
@@ -335,7 +340,7 @@ async def test_a_name_shipped_with_the_platform_is_refused(mcps_dir, tmp_path):
         config=[], env={}, agent_env={}, exclude_from=[], skills=[],
         mcp_dir=mcps_dir / "custom" / "weather-tools",
     )
-    mcp_registry._manifests["weather-tools"] = shipped
+    mcp_manifest_store._manifests["weather-tools"] = shipped
     with pytest.raises(HTTPException) as ei:
         await _install(_folder(tmp_path, _context_only()))
     assert ei.value.status_code == 409
@@ -395,3 +400,78 @@ async def test_patches_are_catalog_owned_not_preserved(mcps_dir, tmp_path):
         (src_b / p).write_text((src_a / p).read_text())
     assert (await ci.install_from_extracted_folder(src_b))["status"] == "updated"
     assert not (target / "patches").exists()
+
+
+# ---------------------------------------------------------------------------
+# A package never names the platform's sessions folder, and its sandbox
+# mounts stay inside its own folder.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def platform_layout(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    monkeypatch.setattr(config, "PLATFORM_ROOT", root)
+    monkeypatch.setattr(config, "MCPS_DIR", root / "mcps")
+    monkeypatch.setattr(config, "AGENTS_DIR", root / "data" / "agents")
+    monkeypatch.setattr(config, "SESSIONS_DIR", root / "data" / "sessions")
+    return root
+
+
+def _package(**over) -> dict:
+    data = {"name": "stand-in", "label": "Stand-in", "description": "d", "version": "1.0.0",
+            "category": "custom",
+            "server": {"runtime": "python", "command": "python3", "transport": "stdio",
+                       "args": ["${mcp_dir}/server.py", "--port", "${port}"]},
+            "env": {"DATA": "${mcp_dir}/data"}, "agent_env": {"WHO": "${agent_name}"},
+            "sandbox": {"mounts": [{"host": "${mcp_dir}/cache", "sandbox": "/cache", "mode": "rw"}]}}
+    for key, value in over.items():
+        if key == "args":
+            data["server"]["args"] = value
+        elif key == "command":
+            data["server"]["command"] = value
+        else:
+            data[key] = value
+    return data
+
+
+def test_an_honest_package_passes(platform_layout):
+    assert ci._validate_manifest(_package()) == []
+
+
+_UP = "." + "./"
+
+
+@pytest.mark.parametrize("over", [
+    {"args": ["SESSIONS/user-mcp-configs/x.json"]},
+    {"args": ["--config=${platform_root}/data/sessions/x.json"]},
+    {"args": ["${mcp_dir}/" + _UP * 3 + "data/sessions/tokens"]},
+    {"command": "${platform.host_agents_dir}/" + _UP + "sessions/run"},
+    {"env": {"X": "${platform_root}/data/sessions"}},
+    {"agent_env": {"Y": "SESSIONS"}},
+], ids=["an-absolute-argument", "a-root-token", "a-climb-from-the-tool-folder", "the-command", "env", "agent-env"])
+def test_a_package_that_names_the_sessions_folder_is_refused(platform_layout, over):
+    over = json.loads(json.dumps(over).replace("SESSIONS", str(config.SESSIONS_DIR)))
+    errors = ci._validate_manifest(_package(**over))
+    assert any("must not name the platform's sessions folder" in e for e in errors), errors
+
+
+@pytest.mark.parametrize("host", ["${mcp_dir}/" + _UP + "other-tool", "${mcp_dir}/a/" + _UP * 2 + "x", "/etc",
+                                  "${platform_root}/mcps", "${mcp_dir}/", ""])
+def test_a_sandbox_mount_outside_the_tool_folder_is_refused(platform_layout, host):
+    errors = ci._validate_manifest(_package(sandbox={"mounts": [{"host": host, "sandbox": "/x", "mode": "ro"}]}))
+    assert any("sandbox.mounts" in e for e in errors), errors
+
+
+def test_the_tool_folder_itself_may_be_mounted(platform_layout):
+    assert ci._validate_manifest(_package(sandbox={"mounts": [{"host": "${mcp_dir}", "sandbox": "/t"}]})) == []
+
+
+def test_no_bundled_package_names_the_sessions_folder_or_mounts_outside_itself():
+    """Every manifest this repository ships passes the two new rules."""
+    found = []
+    for manifest in sorted(Path(config.MCPS_DIR).glob("*/*/manifest.json")):
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        found += [f"{manifest.parent.name}: {e}" for e in ci._validate_manifest(data)
+                  if "sessions folder" in e or "sandbox.mounts" in e]
+    assert found == []

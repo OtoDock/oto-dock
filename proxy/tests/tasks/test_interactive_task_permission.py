@@ -9,7 +9,7 @@ security context and the session's engine are stubbed).
 """
 import pytest
 
-from api.hooks import permission, routing
+from api.hooks import permission, questions, routing
 
 
 @pytest.fixture
@@ -28,6 +28,8 @@ def _stub(monkeypatch):
             pushed.append(item)
 
     monkeypatch.setattr(permission, "get_permission_queue", lambda sid: _Q())
+
+    monkeypatch.setattr(questions, "get_permission_queue", lambda sid: _Q())
     return pushed
 
 

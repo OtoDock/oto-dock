@@ -5,6 +5,8 @@ and auth.json construction produce identical output on both paths.
 
 from __future__ import annotations
 
+import pytest
+
 from core.layers.codex.helpers import (
     build_auth_json,
     map_effort_to_codex,
@@ -190,38 +192,67 @@ def test_supports_ultra_flags_match_openai_manifest():
     # Sol/Terra and Astra carry ultra; Luna is capped at max by OpenAI's own
     # manifest. These flags must stay in sync with helpers._ULTRA_EFFORT_MODEL_PREFIXES.
     import config as app_config
-    assert app_config.get_model_supports_ultra("gpt-6.1-sol") is True
+    assert app_config.get_model_supports_ultra("gpt-6.2-sol") is True
     assert app_config.get_model_supports_ultra("gpt-6.1-terra") is True
-    assert app_config.get_model_supports_ultra("gpt-6-astra") is True
+    assert app_config.get_model_supports_ultra("gpt-6.2-astra") is True
     assert app_config.get_model_supports_ultra("gpt-6-luna") is False
     assert app_config.get_model_supports_ultra("claude-opus-5-5") is False
-    # Registry-only gate: the retired 5.6 Sol and Terra and GPT-6 Sol have no
-    # row any more (the wire clamp in helpers still knows them).
+    # Registry-only gate: the retired 5.6 Sol and Terra, GPT-6 Sol, 6.1 Sol
+    # and 6 Astra have no row any more (the wire clamp in helpers still knows
+    # them).
+    assert app_config.get_model_supports_ultra("gpt-6.1-sol") is False
+    assert app_config.get_model_supports_ultra("gpt-6-astra") is False
     assert app_config.get_model_supports_ultra("gpt-5.6-sol") is False
     assert app_config.get_model_supports_ultra("gpt-5.6-terra") is False
     assert app_config.get_model_supports_ultra("gpt-6-sol") is False
     assert app_config.get_model_supports_ultra("no-such-model") is False
 
 
-def test_gpt6_astra_registry_entry():
-    # A NEW model next to the 5.6 family (not a rename): codex-cli only until
-    # the hosted relay prices it; listed right after the Sol row (GPT-6.1 Sol
-    # the tier-2 default) so it reads first; the vendor's 1.05M window with
-    # the 272k price tier (Codex reads its live window either way).
+def test_gpt6_2_astra_registry_entry():
+    # GPT-6.2 Astra replaces GPT-6 Astra: codex-cli only until the hosted
+    # relay prices it; listed right after the Sol row (GPT-6.2 Sol the tier-2
+    # default) so it reads first; the vendor's 1.05M window with the 272k
+    # price tier (Codex reads its live window either way); OpenAI's page of
+    # 2026-11-17 for the prices.
     import config as app_config
-    entry = app_config.MODEL_REGISTRY["gpt-6-astra"]
+    entry = app_config.MODEL_REGISTRY["gpt-6.2-astra"]
     assert entry["provider"] == "openai"
     assert entry["layers"] == ["codex-cli"]
     assert entry["context_window"] == 1_050_000
     assert entry["long_context"] == (272_000, 2.0, 1.5)
-    assert entry["pricing"] == (10.0, 50.0, 12.50, 1.00)
+    assert entry["pricing"] == (8.0, 40.0, 10.0, 0.40)
     assert entry["supports_xhigh"] and entry["supports_ultra"] and entry["supports_reasoning"]
+    assert entry["tier"] == 1
     codex_ids = [m["value"] for m in app_config.get_layer_models("codex-cli")]
-    assert codex_ids.index("gpt-6.1-sol") < codex_ids.index("gpt-6-astra") < codex_ids.index("gpt-6.1-terra")
-    assert "gpt-6-sol" not in codex_ids and "gpt-5.6-terra" not in codex_ids
-    assert "gpt-6-astra" not in {m["value"] for m in app_config.get_layer_models("direct-llm")}
-    assert "gpt-6-astra" not in app_config.MODEL_SUCCESSORS
-    assert app_config.get_model_supports_xhigh("gpt-6-astra") is True
+    assert codex_ids.index("gpt-6.2-sol") < codex_ids.index("gpt-6.2-astra") < codex_ids.index("gpt-6.1-terra")
+    for retired in ("gpt-6-sol", "gpt-5.6-terra", "gpt-6.1-sol", "gpt-6-astra"):
+        assert retired not in codex_ids
+    assert "gpt-6.2-astra" not in {m["value"] for m in app_config.get_layer_models("direct-llm")}
+    assert app_config.MODEL_SUCCESSORS["gpt-6-astra"] == "gpt-6.2-astra"
+    assert app_config.get_model_supports_xhigh("gpt-6.2-astra") is True
+
+
+def test_gpt6_2_sol_registry_entry():
+    # GPT-6.2 Sol replaces GPT-6.1 Sol on both engines with 6.1 Sol's tuple
+    # exactly, and is the Codex default.
+    import config as app_config
+    from core.layers.codex.layer import _CODEX_CAPABILITIES
+    entry = app_config.MODEL_REGISTRY["gpt-6.2-sol"]
+    assert entry["layers"] == ["codex-cli", "direct-llm"] and entry["server_tools"] is True
+    assert entry["pricing"] == (2.0, 10.0, 2.50, 0.10)
+    assert entry["long_context"] == (272_000, 2.0, 1.5) and entry["context_window"] == 1_050_000
+    assert entry["tier"] == 2
+    assert app_config.MODEL_SUCCESSORS["gpt-6.1-sol"] == "gpt-6.2-sol"
+    assert _CODEX_CAPABILITIES.model_policy.default_model == "gpt-6.2-sol"
+
+
+@pytest.mark.parametrize("model", ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-astra"])
+def test_the_6_2_ids_and_the_ids_they_replace_keep_max_and_ultra(model):
+    # Codex 0.169.1's own catalog: low to max and ultra on every one of
+    # them; a pin left on a retired id keeps its ceiling at the wire.
+    assert map_effort_to_codex("max", model) == "max"
+    assert map_effort_to_codex("ultra", model) == "ultra"
+    assert map_effort_to_codex("xhigh", model) == "xhigh"
 
 
 def test_layer_models_emit_ultra_only_on_codex_layer():
@@ -234,10 +265,11 @@ def test_layer_models_emit_ultra_only_on_codex_layer():
     from core.layers.direct.layer import _DIRECT_CAPABILITIES
     codex = {m["value"]: m for m in _CODEX_CAPABILITIES.models}
     direct = {m["value"]: m for m in _DIRECT_CAPABILITIES.models}
-    assert codex["gpt-6.1-sol"]["supports_ultra"] is True
+    assert codex["gpt-6.2-sol"]["supports_ultra"] is True
+    assert codex["gpt-6.2-astra"]["supports_ultra"] is True
     assert codex["gpt-6.1-terra"]["supports_ultra"] is True
     assert codex["gpt-6-luna"]["supports_ultra"] is False
-    assert direct["gpt-6.1-sol"]["supports_ultra"] is False
+    assert direct["gpt-6.2-sol"]["supports_ultra"] is False
     assert direct["gpt-6.1-terra"]["supports_ultra"] is False
     assert direct["gpt-6-luna"]["supports_ultra"] is False
 

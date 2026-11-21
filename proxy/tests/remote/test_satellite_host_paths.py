@@ -29,7 +29,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from auth.path_policy import SecurityContext
 from core import placement
-from core.remote import remote_file_flow as rff
+from core.remote import remote_file_cache, remote_file_flow as rff
 from satellite.sessions.session_manager import (
     _validate_satellite_host_path,
 )
@@ -110,10 +110,14 @@ class TestHostCachePaths:
         cp, _ = rff._host_cache_paths("sess", "m1", "/home/alice/Desktop/foo.png")
         assert cp.name == "foo.png"
 
-    def test_cache_paths_sidecar_filename(self):
-        cp, sidecar = rff._host_cache_paths("sess", "m1", "/x.png")
-        assert sidecar.name == "_meta.json"
-        assert cp.parent == sidecar.parent
+    def test_the_record_is_kept_where_only_the_server_writes(self):
+        """The record decides where a write-back lands, so it never sits in
+        the cache a session's tools write: a machine file named like it is
+        cached like any other."""
+        import config
+        cp, meta = rff._host_cache_paths("sess", "m1", "/home/alice/_meta.json")
+        assert meta.parent == config.SESSIONS_DIR / "host-cache" / "sess"
+        assert meta.name == f"{cp.parent.name}.json" and cp.name == "_meta.json"
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +167,7 @@ class TestPullThroughHostPath:
     async def test_writes_sidecar_with_metadata(self, monkeypatch, tmp_path):
         # Redirect the cache root into tmp_path for isolation.
         monkeypatch.setattr(rff, "_host_cache_root", lambda: tmp_path)
+        monkeypatch.setattr(remote_file_cache, "_host_cache_root", lambda: tmp_path)
         monkeypatch.setattr(rff, "_get_remote_session_info", lambda s: _FakeInfo())
 
         fake_cm = AsyncMock()
@@ -183,14 +188,15 @@ class TestPullThroughHostPath:
         assert result is not None
         assert result.read_bytes() == b"file-bytes"
 
-        sidecar = result.parent / "_meta.json"
-        meta = json.loads(sidecar.read_text())
+        assert not (result.parent / "_meta.json").exists()
+        meta = json.loads(rff._host_cache_paths("sess-x", "m1", "/etc/hosts")[1].read_text())
         assert meta["machine_id"] == "m1"
         assert meta["abs_path"] == "/etc/hosts"
 
     @pytest.mark.asyncio
     async def test_returns_none_on_pull_failure(self, monkeypatch, tmp_path):
         monkeypatch.setattr(rff, "_host_cache_root", lambda: tmp_path)
+        monkeypatch.setattr(remote_file_cache, "_host_cache_root", lambda: tmp_path)
         monkeypatch.setattr(rff, "_get_remote_session_info", lambda s: _FakeInfo())
 
         fake_cm = AsyncMock()
@@ -203,23 +209,38 @@ class TestPullThroughHostPath:
         assert result is None
 
 
+def _pulled(session_id: str, machine_id: str, abs_path: str, data: bytes):
+    """A cache file and its record, as ``pull_through_host_path`` leaves them."""
+    cache_path, meta_path = rff._host_cache_paths(session_id, machine_id, abs_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(data)
+    rff._write_host_meta(meta_path, {"machine_id": machine_id, "abs_path": abs_path})
+    return cache_path, meta_path
+
+
+def _fake_cm():
+    fake_cm = AsyncMock()
+    seen: list = []
+
+    async def _push(machine_id, ref, source, **kw):
+        from pathlib import Path as _P
+        seen.append((machine_id, ref, str(source), _P(source).read_bytes()))  # noqa: ASYNC240  # a test's own temporary files
+        return True
+    fake_cm.push_file.side_effect = _push
+    return fake_cm, seen
+
+
 class TestPushBackHostPath:
     @pytest.fixture(autouse=True)
     def _session(self, monkeypatch, tmp_path):
         import config
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
         monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: _FakeInfo())
+        monkeypatch.setattr(rff, "_may_write_host_path", lambda sid, p: True)
 
     @pytest.mark.asyncio
     async def test_pushes_using_sidecar_metadata(self, monkeypatch, tmp_path):
-        # Build a cache file + sidecar as if pull_through wrote them.
-        cache_path = rff.host_cache_session_root("sess1") / "abc" / "foo.png"
-        cache_path.parent.mkdir(parents=True)
-        cache_path.write_bytes(b"new-bytes")
-        sidecar = cache_path.parent / "_meta.json"
-        sidecar.write_text(json.dumps({
-            "machine_id": "m1", "abs_path": "/home/alice/Desktop/foo.png",
-        }))
+        cache_path, _meta = _pulled("sess1", "m1", "/home/alice/Desktop/foo.png", b"new-bytes")
 
         fake_cm = AsyncMock()
         fake_cm.push_file.return_value = True
@@ -235,9 +256,10 @@ class TestPushBackHostPath:
         ref = call.args[1]
         assert ref.kind == "satellite_host"
         assert ref.value == "/home/alice/Desktop/foo.png"
-        # Streaming refactor (1.4.0): push_file receives the cache PATH.
+        # push_file receives the opened cache file's descriptor path.
         from pathlib import Path as _P
-        assert _P(call.args[2]).read_bytes() == b"new-bytes"  # noqa: ASYNC240  # a test's own temporary files
+        assert str(call.args[2]).startswith(("/proc/self/fd/", "/dev/fd/"))
+        assert not _P(call.args[2]).exists()  # noqa: ASYNC240  # closed once the push is done
 
     @pytest.mark.asyncio
     async def test_missing_sidecar_returns_false(self, tmp_path):
@@ -247,12 +269,110 @@ class TestPushBackHostPath:
 
     @pytest.mark.asyncio
     async def test_missing_machine_id_in_sidecar(self, tmp_path):
-        cp = rff.host_cache_session_root("sess1") / "cache" / "f.png"
-        cp.parent.mkdir(parents=True)
-        cp.write_bytes(b"x")
-        (cp.parent / "_meta.json").write_text(json.dumps({"abs_path": "/x"}))
+        cp, meta = _pulled("sess1", "m1", "/x", b"x")
+        rff._write_host_meta(meta, {"abs_path": "/x"})
         ok = await rff.push_back_host_path("sess1", str(cp))
         assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_a_record_in_the_cache_folder_never_moves_a_write(self, tmp_path):
+        """What a session's tools may write in its cache never names the
+        machine path a write-back lands on: a record there that names another
+        path than the folder was made for is refused."""
+        cp, meta = _pulled("sess1", "m1", "/home/alice/doc.txt", b"edited")
+        meta.unlink()
+        (cp.parent / "_meta.json").write_text(json.dumps({
+            "machine_id": "m1", "abs_path": "/home/alice/other.txt"}))
+        fake_cm, seen = _fake_cm()
+        with patch("core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
+            assert await rff.push_back_host_path("sess1", str(cp)) is False
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_record_of_an_earlier_release_is_taken_once_when_it_is_its_own(self, tmp_path):
+        """A pull made before the upgrade kept its record beside the file:
+        the push-back takes it when it names this very folder's path and
+        moves it to the server's own folder."""
+        cp, meta = _pulled("sess1", "m1", "/home/alice/doc.txt", b"edited")
+        meta.unlink()
+        (cp.parent / "_meta.json").write_text(json.dumps({
+            "machine_id": "m1", "abs_path": "/home/alice/doc.txt"}))
+        fake_cm, seen = _fake_cm()
+        with patch("core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
+            assert await rff.push_back_host_path("sess1", str(cp)) is True
+        assert [(r.value, data) for _m, r, _s, data in seen] == [("/home/alice/doc.txt", b"edited")]
+        assert json.loads(meta.read_text())["abs_path"] == "/home/alice/doc.txt"
+
+    @pytest.mark.asyncio
+    async def test_a_machine_file_named_like_the_old_record_round_trips(self, tmp_path):
+        cp, _meta = _pulled("sess1", "m1", "/home/alice/_meta.json", b'{"mine": true}')
+        fake_cm, seen = _fake_cm()
+        with patch("core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
+            assert await rff.push_back_host_path("sess1", str(cp)) is True
+        assert [(r.value, data) for _m, r, _s, data in seen] == [
+            ("/home/alice/_meta.json", b'{"mine": true}')]
+
+    @pytest.mark.asyncio
+    async def test_a_file_of_another_sessions_cache_is_refused_whatever_the_records(self, tmp_path):
+        """Two sessions pulled the same machine path: each pushes back only
+        its own cache's file, never the other's."""
+        theirs, _ = _pulled("sess2", "m1", "/home/alice/doc.txt", b"sess2's edit")
+        _pulled("sess1", "m1", "/home/alice/doc.txt", b"sess1's copy")
+        fake_cm, seen = _fake_cm()
+        with patch("core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
+            assert await rff.push_back_host_path("sess1", str(theirs)) is False
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_file_outside_the_cache_folder_is_refused_whatever_its_record(self, tmp_path):
+        """Only a file of the host cache folder itself is pushed back: the same
+        session, digest and name under another folder of the agents tree are
+        not the cache, even with this session's record for that digest."""
+        import config
+        cp, _meta = _pulled("sess1", "m1", "/home/alice/doc.txt", b"edited")
+        elsewhere = config.AGENTS_DIR / "my-agent" / "sess1" / cp.parent.name / cp.name
+        elsewhere.parent.mkdir(parents=True)
+        elsewhere.write_bytes(b"not the cache")
+        assert remote_file_cache.host_cache_entry(str(elsewhere), "sess1") is None
+        assert remote_file_cache.host_cache_entry(str(cp), "sess1") == (cp.parent.name, cp.name)
+        fake_cm, seen = _fake_cm()
+        with patch("core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
+            assert await rff.push_back_host_path("sess1", str(elsewhere)) is False
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_link_at_the_cached_file_is_never_read(self, tmp_path):
+        cp, _meta = _pulled("sess1", "m1", "/home/alice/doc.txt", b"edited")
+        (tmp_path / "stand-in.txt").write_bytes(b"stand-in")
+        cp.unlink()
+        cp.symlink_to(tmp_path / "stand-in.txt")
+        fake_cm, seen = _fake_cm()
+        with patch("core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
+            assert await rff.push_back_host_path("sess1", str(cp)) is False
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_path_the_session_may_not_write_is_refused(self, monkeypatch, tmp_path):
+        cp, _meta = _pulled("sess1", "m1", "/home/alice/doc.txt", b"edited")
+        monkeypatch.setattr(rff, "_may_write_host_path", lambda sid, p: False)
+        fake_cm, seen = _fake_cm()
+        with patch("core.remote.satellite_connection.get_connection_manager", return_value=fake_cm):
+            assert await rff.push_back_host_path("sess1", str(cp)) is False
+        assert seen == []
+
+    def test_the_close_removes_the_cache_and_its_records_never_through_a_link(self, tmp_path):
+        import config
+        cp, meta = _pulled("sess1", "m1", "/home/alice/doc.txt", b"x")
+        rff._remove_host_cache("sess1")
+        assert not cp.parent.parent.exists() and not meta.parent.exists()
+        outside = tmp_path / "outside"
+        (outside / "sess2").mkdir(parents=True)
+        (outside / "sess2" / "keep.txt").write_text("stand-in")
+        root = config.AGENTS_DIR / ".remote-host-cache"
+        root.rmdir()
+        root.symlink_to(outside)
+        rff._remove_host_cache("sess2")
+        assert (outside / "sess2" / "keep.txt").read_text() == "stand-in"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("where,machine", [
@@ -267,9 +387,11 @@ class TestPushBackHostPath:
             self, tmp_path, where, machine):
         cp = tmp_path / where / "f.png"
         cp.parent.mkdir(parents=True, exist_ok=True)
-        cp.write_bytes(b"attacker bytes")
+        cp.write_bytes(b"stand-in bytes")
         (cp.parent / "_meta.json").write_text(json.dumps({
             "machine_id": machine, "abs_path": "/home/victim/notes.txt"}))
+        meta = remote_file_cache._host_meta_root() / "sess1" / f"{cp.parent.name}.json"
+        rff._write_host_meta(meta, {"machine_id": machine, "abs_path": "/home/victim/notes.txt"})
         fake_cm = AsyncMock()
         fake_cm.push_file.return_value = True
         with patch(
@@ -296,18 +418,88 @@ def _make_remote_ctx(*, allow_full_fs=False) -> SecurityContext:
 
 class TestResolvePathHookSatelliteHost:
     @pytest.fixture
-    def client(self, monkeypatch):
+    def client(self, monkeypatch, tmp_path):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
+        import config
         from api.hooks import hooks as hooks_mod, paths
 
+        # The answers are judged where they land beneath the agents tree: a
+        # stand-in tree here, the pulled files placed where production puts
+        # them (the agent's own folder, the session's own host cache).
+        monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+        monkeypatch.setattr("auth.path_policy._AGENTS_DIR", (tmp_path / "agents").resolve())
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
             paths, "verify_session_match_async", AsyncMock(return_value=None),
         )
         return TestClient(app)
+
+    def test_a_cache_answer_that_leads_into_the_agent_is_judged_there(self, client, monkeypatch, tmp_path):
+        """The session's cache holds files from its machine only: a cache
+        answer whose folder leads into another person's folder of the agent
+        is judged there by the role matrix and refused."""
+        monkeypatch.setattr(
+            "api.hooks.paths.get_session_security",
+            lambda sid: _make_remote_ctx(allow_full_fs=True),
+        )
+        monkeypatch.setattr(
+            "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
+        )
+        bob = tmp_path / "agents" / "my-agent" / "users" / "bob" / "workspace"
+        bob.mkdir(parents=True)
+        (bob / "notes.png").write_bytes(b"bob's")
+        cache = tmp_path / "agents" / ".remote-host-cache" / "s1"
+        cache.mkdir(parents=True)
+        (cache / "d").symlink_to(bob)
+
+        async def fake_pull(session_id, abs_path):
+            return cache / "d" / "notes.png"
+
+        monkeypatch.setattr(
+            "core.remote.remote_file_flow.pull_through_host_path", fake_pull,
+        )
+        r = client.post("/v1/hooks/resolve-path", json={
+            "session_id": "s1", "path": "/etc/notes.png",
+        }, headers={"Authorization": "Bearer test"})
+        assert r.status_code == 403
+
+    def test_a_cache_answer_keeps_the_configured_agents_folder(self, client, monkeypatch, tmp_path):
+        """A data folder that is itself a link: the answer for a host-cache
+        file names it under the agents folder as configured, never its
+        realpath, so a Docker tool's write-back of it still matches the
+        cache record."""
+        import config
+        real = tmp_path / "real-data"
+        (real / ".remote-host-cache" / "s1").mkdir(parents=True)
+        (real / ".remote-host-cache" / "s1" / "f.docx").write_bytes(b"x")
+        linked = tmp_path / "data-link"
+        linked.symlink_to(real)
+        monkeypatch.setattr(config, "AGENTS_DIR", linked)
+        monkeypatch.setattr("auth.path_policy._AGENTS_DIR", real)
+        monkeypatch.setattr(
+            "api.hooks.paths.get_session_security",
+            lambda sid: _make_remote_ctx(allow_full_fs=True),
+        )
+        monkeypatch.setattr(
+            "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
+        )
+
+        async def fake_pull(session_id, abs_path):
+            return linked / ".remote-host-cache" / "s1" / "f.docx"
+
+        monkeypatch.setattr(
+            "core.remote.remote_file_flow.pull_through_host_path", fake_pull,
+        )
+        r = client.post("/v1/hooks/resolve-path", json={
+            "session_id": "s1", "path": "/etc/f.docx",
+        }, headers={"Authorization": "Bearer test"})
+        assert r.status_code == 200, r.text
+        assert r.json()["host_path"] == str(linked / ".remote-host-cache" / "s1" / "f.docx")
+        assert r.json()["agents_relative"] == "/.remote-host-cache/s1/f.docx"
+        assert r.json()["agent"] == ".remote-host-cache"
 
     def test_satellite_host_path_rejected_home_only(self, client, monkeypatch):
         monkeypatch.setattr(
@@ -334,7 +526,7 @@ class TestResolvePathHookSatelliteHost:
             "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
         )
         # Stub the host-cache pull to write a synthetic file.
-        cache_file = tmp_path / "cache" / "f"
+        cache_file = tmp_path / "agents" / ".remote-host-cache" / "s1" / "f"
         cache_file.parent.mkdir(parents=True)
         cache_file.write_bytes(b"x")
 
@@ -372,7 +564,7 @@ class TestResolvePathHookSatelliteHost:
         monkeypatch.setattr(
             "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
         )
-        cache_file = tmp_path / "cache" / "report.docx"
+        cache_file = tmp_path / "agents" / "my-agent" / "users" / "alice" / "workspace" / "report.docx"
         cache_file.parent.mkdir(parents=True)
         cache_file.write_bytes(b"x")
         captured: dict = {}
@@ -410,7 +602,7 @@ class TestResolvePathHookSatelliteHost:
         monkeypatch.setattr(
             "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
         )
-        cache_file = tmp_path / "cache" / "report.docx"
+        cache_file = tmp_path / "agents" / "my-agent" / "users" / "alice" / "workspace" / "report.docx"
         cache_file.parent.mkdir(parents=True)
         cache_file.write_bytes(b"x")
         captured: dict = {}
@@ -443,7 +635,7 @@ class TestResolvePathHookSatelliteHost:
         monkeypatch.setattr(
             "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
         )
-        cache_file = tmp_path / "cache" / "report.docx"
+        cache_file = tmp_path / "agents" / "my-agent" / "users" / "alice" / "workspace" / "report.docx"
         cache_file.parent.mkdir(parents=True)
         cache_file.write_bytes(b"x")
         captured: dict = {}
@@ -469,9 +661,6 @@ class TestResolvePathHookSatelliteHost:
         output_path) must resolve to the platform creation path — not fall
         through to the lexical translator. Regression for edit_image failing
         its first call with a new output_path on a remote session."""
-        import config
-
-        monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
         monkeypatch.setattr(
             "api.hooks.paths.get_session_security",
             lambda sid: _make_remote_ctx(allow_full_fs=False),
@@ -494,8 +683,8 @@ class TestResolvePathHookSatelliteHost:
         assert r.status_code == 200
         body = r.json()
         expected = str(
-            (tmp_path / "my-agent" / "users" / "alice" / "workspace"
-             / "photos" / "img_pro.png").resolve()
+            tmp_path / "agents" / "my-agent" / "users" / "alice" / "workspace"
+            / "photos" / "img_pro.png"
         )
         assert body["host_path"] == expected
         # _to_agents_relative keeps the leading "/" (file-tools lstrips it).
@@ -516,7 +705,7 @@ class TestResolvePathHookSatelliteHost:
         monkeypatch.setattr(
             "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
         )
-        cache_file = tmp_path / "cache" / "report.docx"
+        cache_file = tmp_path / "agents" / "my-agent" / "users" / "alice" / "workspace" / "report.docx"
         cache_file.parent.mkdir(parents=True)
         cache_file.write_bytes(b"current")
 
@@ -1076,6 +1265,7 @@ class TestClassifyHeldPath:
 
         import config
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+        monkeypatch.setattr("auth.path_policy._AGENTS_DIR", tmp_path.resolve())
         from core.session import session_state
         monkeypatch.setitem(session_state._session_security, sid, SecurityContext(
             role=role, username="alice", agent="pa", is_admin_agent=False))
@@ -1150,7 +1340,7 @@ class TestPullThroughMirrorFallback:
         monkeypatch.setattr(rff, "_probe_stat", _probe)
 
         class _CM:
-            async def pull_file_to_path(self, mid, ref, dest, agent_slug=""):
+            async def pull_file_to_path(self, mid, ref, dest, agent_slug="", hash_out=None):
                 return False  # satellite can't serve it (flush not landed)
 
         from core.remote import satellite_connection
@@ -1185,7 +1375,7 @@ class TestPullThroughMirrorFallback:
         monkeypatch.setattr(rff, "_probe_stat", _probe)
 
         class _CM:
-            async def pull_file_to_path(self, mid, ref, dest, agent_slug=""):
+            async def pull_file_to_path(self, mid, ref, dest, agent_slug="", hash_out=None):
                 return False
 
         from core.remote import satellite_connection
@@ -1477,3 +1667,31 @@ class TestResolvePathDisplayPathCarveOut:
         assert r.status_code == 200, r.text
         assert r.json()["host_path"] == str(cache_file)
         assert r.json()["agent"] == ".remote-host-cache"
+
+
+@pytest.mark.parametrize("abs_path,allowed", [
+    ("/home/dave/Desktop/doc.txt", True),
+    ("/etc/hosts", False),
+])
+def test_the_push_back_asks_the_write_rule_for_the_machine_path(monkeypatch, abs_path, allowed):
+    """The pull admits a path the session may read; the write-back asks the
+    path policy again for a write, the policy's own answer for that path."""
+    from core.session import session_state
+    monkeypatch.setattr(session_state, "_session_security", {"sess-w": _make_remote_ctx()})
+    assert rff._may_write_host_path("sess-w", abs_path) is allowed
+    assert rff._may_write_host_path("sess-unknown", abs_path) is False
+
+
+def test_the_push_back_reads_the_write_rules_answer_not_only_its_path(monkeypatch):
+    """A refusal that still names the path is a refusal."""
+    import dataclasses
+
+    from core.session import session_state
+    from services import path_policy_v2
+    monkeypatch.setattr(session_state, "_session_security", {"sess-w": _make_remote_ctx()})
+    real = path_policy_v2.resolve_path_for_session
+
+    def _refused_with_its_path(ctx, raw, **kw):
+        return dataclasses.replace(real(ctx, raw, **kw), allowed=False, error="refused")
+    monkeypatch.setattr(path_policy_v2, "resolve_path_for_session", _refused_with_its_path)
+    assert rff._may_write_host_path("sess-w", "/home/dave/Desktop/doc.txt") is False

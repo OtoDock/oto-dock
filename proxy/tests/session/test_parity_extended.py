@@ -562,8 +562,7 @@ def test_codex_usage_limit_and_policy_declines_are_typed_endings():
 
 def test_codex_error_codex_retries_does_not_end_the_turn():
     """``willRetry`` sits at the params' top level (0.156.1); a retried error
-    is not the turn's end. An older satellite ends its own turn on it, so the
-    remote adapter keeps the ERROR there."""
+    is not the turn's end."""
     from core.layers.codex import CodexEvent, CodexEventTranslator
 
     retried = {"error": {"message": "stream disconnected"}, "threadId": "t", "turnId": "u",
@@ -571,9 +570,6 @@ def test_codex_error_codex_retries_does_not_end_the_turn():
     assert CodexEventTranslator().translate(CodexEvent(type="error", data=retried)) == []
     nested = {"error": {"message": "stream disconnected", "willRetry": True}}
     assert CodexEventTranslator().translate(CodexEvent(type="error", data=nested)) == []
-    old_satellite = CodexEventTranslator()
-    old_satellite.retried_errors_end_turn = True
-    assert [e.type for e in old_satellite.translate(CodexEvent(type="error", data=retried))] == ["error"]
     final = {**retried, "willRetry": False}
     assert [e.type for e in CodexEventTranslator().translate(CodexEvent(type="error", data=final))] == ["error"]
 

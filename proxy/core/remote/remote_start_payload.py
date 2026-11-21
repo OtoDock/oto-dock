@@ -16,42 +16,17 @@ import logging
 from typing import TYPE_CHECKING
 
 from core import layout
-from core.execution_layer import AgentConfig, RemoteStartContext, RemoteStartPlan
-from core.permission_modes import LEGACY_MODES, cli_mode
+from core.execution_layer import (
+    AgentConfig,
+    RemoteStartContext,
+    RemoteStartPlan,
+    SpawnPlan,
+)
+from core.permission_modes import cli_mode
 from core.remote.tunnel_state import valid_port
 from core.sandbox import session_config_dir as _scd
 
 logger = logging.getLogger("remote-layer")
-
-#: The first satellite that speaks the 1.9 permission modes: Ask and Auto by
-#: their own words, Auto on the engine's own review, Codex without the
-#: retired approval policy. An older one is sent the words before 1.9.
-REVIEW_MODES_SATELLITE_VERSION = "0.5.156"
-_OLD_WORDS = {new: old for old, new in LEGACY_MODES.items()}
-
-
-def _version_tuple(v: str) -> tuple[int, ...]:
-    out: list[int] = []
-    for part in (v or "").split("."):
-        digits = "".join(ch for ch in part if ch.isdigit())
-        out.append(int(digits) if digits else 0)
-    return tuple(out)
-
-
-def speaks_review_modes(cm, machine_id: str) -> bool:
-    """Whether the machine's satellite speaks the 1.9 permission modes."""
-    return _version_tuple(cm.satellite_version(machine_id)) >= _version_tuple(
-        REVIEW_MODES_SATELLITE_VERSION)
-
-
-def wire_mode(cm, machine_id: str, mode: str) -> str:
-    """The mode word for the machine's satellite: the current word, or the
-    word before 1.9 for a satellite that does not speak the new ones (it
-    then runs today's Ask and today's Accept Edits)."""
-    if speaks_review_modes(cm, machine_id):
-        return mode
-    return _OLD_WORDS.get(mode, mode)
-
 
 # --- Hook script cache ---------------------------------------------------
 # Hook scripts are bundled into every `start_session` payload so the
@@ -79,8 +54,7 @@ def _load_hook_scripts() -> dict[str, str]:
     hooks_dir = Path(app_config.HOOKS_DIR)
     scripts: dict[str, str] = {}
     # The same scripts the local sandbox installs (HOOK_SCRIPTS is the one
-    # list); a satellite older than 0.5.121 writes stop_tracker.py and
-    # never names it in its hook files — harmless.
+    # list).
     from core.sandbox.session_config_dir import HOOK_SCRIPTS
     for name in HOOK_SCRIPTS:
         path = hooks_dir / name
@@ -92,29 +66,33 @@ def _load_hook_scripts() -> dict[str, str]:
     return scripts
 
 
-async def _gateway_facts(bundles: dict, gateway_mode: bool) -> dict[str, dict]:
+def _gateway_facts(bundles: dict) -> dict[str, dict]:
     """What the engine's config rewrite needs per credentialed HTTP MCP, by
-    mcpServers key: the upstream origin and path, the header, whether the
-    upstream is a sidecar the proxy reaches itself, and, for a vendor entry
-    on a machine below the gateway version, the header's value resolved
-    here off the loop (the inline shape; a refusal leaves the value empty
-    and the vendor answers the MCP). Secret-free in gateway mode."""
-    from core.credentials import mcp_gateway
+    mcpServers key: the upstream origin and path, the header, and whether
+    the upstream is a sidecar the proxy reaches itself or a credential the
+    proxy forwards through the tunnel. Secret-free: the machine's gateway
+    adds the credential on the way out."""
     facts: dict[str, dict] = {}
     for key, bundle in (bundles or {}).items():
         cred = getattr(bundle, "gateway", None)
         if cred is None:
             continue
-        f = {"upstream": cred.upstream, "path": cred.path, "header": cred.header,
-             "proxy_local": bool(cred.proxy_local), "tunneled": cred.forwarded_here, "value": ""}
-        if not cred.forwarded_here and not gateway_mode:
-            res = await asyncio.to_thread(mcp_gateway.resolve_credential, cred)
-            if isinstance(res, mcp_gateway.Refusal):
-                logger.warning("gateway: %s keeps no credential on this machine: %s", key, res.reason)
-            else:
-                f["value"] = res.value
-        facts[key] = f
+        facts[key] = {"upstream": cred.upstream, "path": cred.path, "header": cred.header,
+                      "proxy_local": bool(cred.proxy_local), "tunneled": cred.forwarded_here}
     return facts
+
+
+def _strip_private_carriers(env: dict) -> None:
+    """No engine's PRIVATE carrier (a credential blob, a local endpoint,
+    the model rows) ever rides the satellite env: the engine's own builder
+    consumed its own; this strips every registered engine's, so a session
+    of one engine can never ship another's."""
+    from core.session.session_manager import get_all_layers
+    for other in get_all_layers().values():
+        other_adapter = other.remote_adapter()
+        if other_adapter is not None:
+            for key in other_adapter.private_env_keys:
+                env.pop(key, None)
 
 
 if TYPE_CHECKING:
@@ -123,17 +101,43 @@ else:
     _Host = object
 
 
+async def ssh_agent_payload(config: AgentConfig) -> dict | None:
+    """The ``ssh_agent`` field of a paired machine's start payload: the
+    agent's public key lines by key name, for a session that takes the
+    keys (``session_takes_ssh_keys``) on a machine (every satellite at the
+    platform's floor opens the socket). None otherwise."""
+    from core.credentials import ssh_signer
+    from core.sandbox.session_config_dir import session_takes_ssh_keys
+    from storage.pg import run_db
+    ctx = config.security_context
+    if not session_takes_ssh_keys(ctx):
+        return None
+    machine = getattr(ctx, "placement", None)
+    if machine is None:
+        return None
+    lines = await run_db(ssh_signer.public_lines, config.agent_name)
+    if not lines:
+        return None
+    return {"public_keys": dict(lines)}
+
+
 class RemoteStartPayloadMixin(_Host):
     # --- Payload builders ---
 
     async def _build_start_payload(
         self, session_id: str, config: AgentConfig, execution_path: str,
+        spawn: SpawnPlan | None = None,
     ) -> RemoteStartPlan:
         """Build the config payload sent to the satellite for start_session,
         plus what the caller needs to know about it (``RemoteStartPlan``):
-        the shared part here, the engine's part through its remote adapter."""
+        the shared part here, the engine's part through its remote adapter.
+        ``spawn`` is a compute session's plan: the machine runs the plan's
+        argv and environment in the sandbox it renders from the plan's
+        description, reading the platform's folder itself, so the payload
+        carries the plan and the words the machine reads and none of the
+        files a paired computer is sent."""
         import config as app_config
-        from core.session.session_manager import get_all_layers, get_layer_by_path
+        from core.session.session_manager import get_layer_by_path
         engine = get_layer_by_path(execution_path)
         adapter = engine.remote_adapter()
         if adapter is None:
@@ -158,10 +162,9 @@ class RemoteStartPayloadMixin(_Host):
         # with "allow" (its missing-env early return), which breaks
         # permission prompts and AskUserQuestion on remote agents.
         #
-        # Local `PersistentSession.start()` uses `build_session_env()` to
-        # add the same three vars for the local subprocess; here we do the
-        # equivalent for the payload env the satellite will inherit into
-        # the spawned CLI/Codex process.
+        # The three vars `build_session_env()` gives a spawn plan, for the
+        # payload env the satellite will inherit into the spawned CLI/Codex
+        # process.
         from auth.session_token import create_session_token
 
         # PROXY_URL points at the satellite's local tunnel server
@@ -169,8 +172,10 @@ class RemoteStartPayloadMixin(_Host):
         # MCP HTTP traffic ride the existing WS tunnel back to the platform.
         # The satellite reports its chosen ephemeral port in capabilities
         # at auth time.
+        from core.remote.remote_session_start import machine_of_config
         from storage import remote_store as _remote_store
-        machine = _remote_store.get_remote_machine(config.execution_target)
+        machine_id = machine_of_config(config)
+        machine = _remote_store.get_remote_machine(machine_id)
         sat_port = 0
         # ``target_os`` drives OS-aware MCP path rewriting (Windows uses
         # ~/OtoDock/...venv/Scripts/...exe vs Unix ~/.oto-dock/...venv/bin/...).
@@ -187,10 +192,10 @@ class RemoteStartPayloadMixin(_Host):
         # The live connection's port first: a heartbeat that reported the
         # local link on a new port (satellite 0.5.168) reaches the row only
         # through the off-loop caps lane.
-        sat_port = valid_port(self._cm.tunnel_port(config.execution_target)) or sat_port
+        sat_port = valid_port(self._cm.tunnel_port(machine_id)) or sat_port
         if not sat_port:
             raise RuntimeError(
-                f"Satellite {config.execution_target[:8]} has not reported "
+                f"Satellite {machine_id[:8]} has not reported "
                 f"a local_tunnel_port in its capabilities — start_session "
                 f"requires satellite 0.4.0+."
             )
@@ -204,6 +209,20 @@ class RemoteStartPayloadMixin(_Host):
         if _sec_username:
             from storage import database as _db_us
             _user_sub = _db_us.get_user_sub_by_username(_sec_username) or ""
+        # The start's riding part (``core/session/start_context.py``): a fresh
+        # conversation holds none of it, on a compute machine too; a Codex
+        # start takes it through its start hook where the machine writes the
+        # hook (a compute machine reads the platform's own hooks).
+        from core.session import start_context
+        if not config.resume:
+            start_context.reset(session_id)
+        if start_context.engine_door(execution_path) == start_context.DOOR_HOOK and (
+                spawn is not None or self._cm.satellite_takes_start_context(machine_id)):
+            start_context.set_door(session_id, start_context.DOOR_HOOK)
+        if spawn is not None:
+            return self._compute_payload(session_id, config, execution_path, spawn,
+                                         machine_id=machine_id, sat_port=sat_port,
+                                         target_os=target_os, scope_root=cwd_relative)
         env: dict[str, str] = {
             "PROXY_URL": f"http://127.0.0.1:{sat_port}",
             "PROXY_API_KEY": create_session_token(
@@ -247,10 +266,9 @@ class RemoteStartPayloadMixin(_Host):
         # is the single source of truth).
         payload = {
             "system_prompt": config.system_prompt,
-            "permission_mode": wire_mode(self._cm, config.execution_target, config.permission_mode),
-            # Claude Code's own word for the mode (a 0.5.156 satellite spawns
-            # by it: the CLI's auto mode for Auto, never for the unattended
-            # word an older reading of ``auto`` could confuse it with).
+            "permission_mode": config.permission_mode,
+            # Claude Code's own word for the mode, which the satellite spawns
+            # by (the CLI's auto mode for Auto).
             "cli_permission_mode": cli_mode(config.permission_mode),
             "client_type": config.client_type,
             "model": config.model,
@@ -267,28 +285,38 @@ class RemoteStartPayloadMixin(_Host):
             # headless → satellite keeps its xterm-256color default).
             "term": config.term or "",
             "hook_scripts": _load_hook_scripts(),
-            # The command wrappers (satellite 0.5.139 writes them under the
-            # config dir's bin/; an older satellite ignores the key).
+            # The command wrappers (the satellite writes them under the
+            # config dir's bin/).
             "command_wrappers": dict(_scd.COMMAND_WRAPPERS),
             "use_native_permissions": config.use_native_permissions,
             "multi_value_envs": config.multi_value_envs or {},
         }
 
-        # Hook parity (HOOKS.md): a satellite older than 0.5.121 runs this
-        # session without a Stop hook (no turn-end signal from the machine)
-        # and, for a Codex chat, answers a question empty. Warn, never
-        # refuse — auto-update brings it up at its next reconnect.
-        if not self._cm.satellite_supports_hook_parity(config.execution_target):
-            logger.warning(
-                "Remote %s %s "
-                "%s: %s "
-                "runs satellite %s "
-                "(< 0.5.121) — no Stop hook and no Codex question bridge on "
-                "this machine until it updates at its next reconnect",
-                execution_path, config.client_type or 'session', session_id[:8],
-                self._cm.satellite_name(config.execution_target),
-                self._cm.satellite_version(config.execution_target) or 'unknown'
-            )
+        # A terminal whose satellite runs the start hook asks for the start's
+        # riding part at each start, and so does a headless Codex session;
+        # a terminal whose satellite cannot gets it in its text, as before.
+        # Asked of every start there: the settings file is the scope's.
+        if self._cm.satellite_takes_start_context(machine_id):
+            payload["start_context_parts"] = start_context.HOOK_PARTS
+        elif config.interactive:
+            payload["system_prompt"] = (config.system_prompt or "") + await asyncio.to_thread(
+                start_context.inline_block, session_id)
+
+        # The session's SSH agent socket on the machine: the
+        # satellite opens it and forwards each message to the proxy's
+        # signer; the public halves ride along for the key dir.
+        ssh_agent = await ssh_agent_payload(config)
+        if ssh_agent is not None:
+            payload["ssh_agent"] = ssh_agent
+        # The machine's credential exit (the machine admitted):
+        # the session's secret, the hash its pushed values are keyed by and
+        # its entries, nothing of a value (``credential_exit.machine_block``).
+        from core.credentials import credential_exit
+        from core.remote.mcp_gateway_push import token_hash_of
+        block = credential_exit.machine_block(session_id, config.mcp_secret_bundles,
+                                              token_hash_of(env["PROXY_API_KEY"]))
+        if block is not None:
+            payload["exit"] = block
 
         # Credential broker: the stdio servers that have a secret bundle
         # — each gets a per-(session, mcp) cap-token injected into its env by the
@@ -296,18 +324,15 @@ class RemoteStartPayloadMixin(_Host):
         # the interceptor.
         secret_bundle_keys = set(config.mcp_secret_bundles or {})
         # The credential gateway: what the engine's rewrite needs per
-        # credentialed HTTP MCP. On a machine that runs the gateway a vendor
-        # entry dials the machine's loopback gateway and a sidecar entry the
-        # tunnel; below the gateway version a vendor entry keeps the inline
-        # shape, its value resolved here, off the loop.
-        gateway_mode = self._cm.satellite_supports_mcp_gateway(config.execution_target) is True
-        gateway = await _gateway_facts(config.mcp_secret_bundles or {}, gateway_mode)
+        # credentialed HTTP MCP. A vendor entry dials the machine's loopback
+        # gateway and a sidecar entry the tunnel.
+        gateway = _gateway_facts(config.mcp_secret_bundles or {})
 
         # The engine's part: its config dir, credential file, MCP config in
         # its format, resume handle, effort and sandbox mapping.
         plan = adapter.start_payload(payload, RemoteStartContext(
             session_id=session_id,
-            machine_id=config.execution_target,
+            machine_id=machine_id,
             sat_port=sat_port,
             target_os=target_os,
             config=config,
@@ -316,17 +341,73 @@ class RemoteStartPayloadMixin(_Host):
             proxy_api_key=env["PROXY_API_KEY"],
             secret_bundle_keys=secret_bundle_keys,
             gateway=gateway,
-            gateway_mode=gateway_mode,
             cm=self._cm,
         ))
-        plan.gateway_mode = gateway_mode
-        # No engine's PRIVATE carrier (a credential blob, a local endpoint,
-        # the model rows) ever rides the satellite env — the engine's own
-        # builder consumed its own above; this strips every registered
-        # engine's, so a session of one engine can never ship another's.
-        for other in get_all_layers().values():
-            other_adapter = other.remote_adapter()
-            if other_adapter is not None:
-                for key in other_adapter.private_env_keys:
-                    env.pop(key, None)
+        _strip_private_carriers(env)
+        return plan
+
+    def _compute_payload(
+        self, session_id: str, config: AgentConfig, execution_path: str, spawn: SpawnPlan, *,
+        machine_id: str, sat_port: int, target_os: str, scope_root: str,
+    ) -> RemoteStartPlan:
+        """The payload of a session on a compute machine. The environment
+        is the plan's exactly (``PROXY_URL`` on the proxy port, which the
+        rendered sandbox splices onto the machine's link; the machine adds
+        nothing). No hook scripts, wrappers, MCP config, login file or
+        prompt ride it: the engine's layer wrote them into the platform's
+        folder, which the machine's session reads. ``tunnel_port`` names
+        the link the session is started on, which its ``PROXY_URL`` cannot."""
+        import config as app_config
+        from core.session.session_manager import get_layer_by_path
+        adapter = get_layer_by_path(execution_path).remote_adapter()
+        if adapter is None:
+            raise RuntimeError(f"{execution_path} cannot run remotely")
+        env = spawn.env
+        payload = {
+            "permission_mode": config.permission_mode,
+            "cli_permission_mode": cli_mode(config.permission_mode),
+            "client_type": config.client_type,
+            "model": config.model,
+            "effort": config.effort,
+            "max_thinking_tokens": app_config.MAX_THINKING_TOKENS,
+            "env": env,
+            "cwd_relative": scope_root,
+            "work_cwd": "",
+            "term": config.term or "",
+            "use_native_permissions": config.use_native_permissions,
+            "sandbox": spawn.sandbox,
+            "argv": list(spawn.argv),
+            "cwd": spawn.cwd,
+            "tunnel_port": sat_port,
+        }
+        # The description names the session's agent socket: the machine
+        # opens it under that name and forwards the messages; the key dir
+        # with the public halves is the platform's folder, which it reads.
+        if spawn.sandbox.get("ssh_agent"):
+            payload["ssh_agent"] = {"public_keys": {}}
+        # The description names the exit's splice: the machine's exit takes
+        # the session's door from this block (its secret, the hash its
+        # pushed values are keyed by, its entries, its carves for the dial rule).
+        if spawn.sandbox.get("exit_port"):
+            from core.credentials import credential_exit
+            from core.remote.mcp_gateway_push import token_hash_of
+            block = credential_exit.machine_block(session_id, config.mcp_secret_bundles,
+                                                  token_hash_of(str(env.get("PROXY_API_KEY") or "")))
+            if block is not None:
+                payload["exit"] = block
+        plan = adapter.start_payload(payload, RemoteStartContext(
+            session_id=session_id,
+            machine_id=machine_id,
+            sat_port=sat_port,
+            target_os=target_os,
+            config=config,
+            scope_root=scope_root,
+            env=env,
+            proxy_api_key=str(env.get("PROXY_API_KEY") or ""),
+            secret_bundle_keys=set(config.mcp_secret_bundles or {}),
+            gateway=_gateway_facts(config.mcp_secret_bundles or {}),
+            cm=self._cm,
+            spawn=spawn,
+        ))
+        _strip_private_carriers(env)
         return plan

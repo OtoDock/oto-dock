@@ -3,10 +3,11 @@ import { useNavigate } from 'react-router-dom'
 import { useAgents } from '../../api/agents'
 import { useActiveChats, type ActiveChatRow } from '../../hooks/useActiveChats'
 import { useCollapsePref } from '../../hooks/useCollapsePref'
-import { useChatStore } from '../../store/chatStore'
+import { markChatRead } from '../../lib/chat/readMarks'
 import { SOURCE_TYPE } from '../../lib/session/kind'
 import { CHAT_PHASE } from '../../lib/status/chat'
 import { GLASS } from '../ui/glass'
+import { LIVE_DOT } from '../ui/classes'
 
 interface Props {
   currentAgent?: string
@@ -23,6 +24,10 @@ interface Props {
       is symmetric to it — chat view drops own chats and keeps own live
       tasks; task view drops own tasks and keeps own live chats. */
   tasksMode?: boolean
+  /** Sidebar only: the ids the list below shows when it is not the whole
+      chat history (the pinned view). An own live chat it does not show
+      stays in the strip. */
+  shownIds?: ReadonlySet<string>
 }
 
 /** Cross-agent "Active now" section — the sidebar's top slot AND the empty chat page.
@@ -55,7 +60,7 @@ interface Props {
  * inner-scroll container (~3 rows; the home variant goes two-up on md+ and
  * caps at ~2 grid rows).
  */
-export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect, onNavigate, variant = 'sidebar', tasksMode = false }: Props) {
+export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect, onNavigate, variant = 'sidebar', tasksMode = false, shownIds }: Props) {
   const navigate = useNavigate()
   const { data: agents } = useAgents()
   const agentMeta = useMemo(() => new Map((agents || []).map((a) => [a.name, a])), [agents])
@@ -73,6 +78,7 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
     r.id !== activeChatId &&
     (variant !== 'sidebar' || r.agent !== currentAgent ||
       (tasksMode ? r.sourceType !== SOURCE_TYPE.TASK : r.sourceType === SOURCE_TYPE.TASK) ||
+      (!tasksMode && shownIds !== undefined && !shownIds.has(r.id)) ||
       keepOrphan(r)))
   // Persisted per surface and SHARED across mounted copies (the sidebar
   // renders twice inside ResponsiveDrawer). Both start open: the empty chat
@@ -87,9 +93,10 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
   const anyLive = rows.some((r) => r.phase === CHAT_PHASE.STREAMING)
 
   const openRow = (row: ActiveChatRow) => {
-    // Clicking IS seeing: retire the finished-unread row immediately (the
-    // chat page confirms via chat_read).
-    useChatStore.getState().setUnread(row.id, false)
+    // Clicking IS seeing: the mark retires the finished-unread row once its
+    // frame goes out, and is held while no socket is open (the chat page
+    // marks it again).
+    markChatRead(row.id)
     if (row.sourceType === SOURCE_TYPE.TASK) {
       // Task runs render on the chat page — open it with task mode on.
       navigate(`/chat/${row.agent}/${row.id}?tasks=1`)
@@ -119,7 +126,7 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
         </svg>
         Active now · {rows.length}
         {!open && anyLive && (
-          <span className="w-1.5 h-1.5 rounded-full bg-action animate-pulse motion-reduce:animate-none shrink-0" />
+          <span className={LIVE_DOT} />
         )}
       </button>
       {open && (

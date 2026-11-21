@@ -6,11 +6,12 @@
 // the viewer closed "by itself" (2026-08-13 operator report, reproduced live
 // with a single synthetic input event).
 
-import { describe, it, expect, vi } from 'vitest'
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import { render } from '@testing-library/react'
 
 import ImageLightbox from '@/components/chat/media/ImageLightbox'
 import { triggerDownload } from '@/components/chat/media/imageDownload'
+import { onAppToast } from '@/lib/appToasts'
 import { installFakeNativeChannel } from './fixtures/nativeChannel'
 
 describe('ImageLightbox stability under host re-renders', () => {
@@ -61,5 +62,41 @@ describe('ImageLightbox download in the Android app', () => {
       click.mockRestore()
       ch.uninstall()
     }
+  })
+})
+
+// When the fetch fails the download opens the address in a new window: only an
+// address the dashboard's own link check passes, never one a session chose
+// with another scheme.
+describe('a picture download whose fetch fails', () => {
+  const said: string[] = []
+  let stop = () => {}
+  beforeEach(() => { said.length = 0; stop = onAppToast((t) => said.push(t.title)) })
+  afterEach(() => stop())
+
+  async function fallback(img: { url?: string; downloadUrl?: string }) {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('blocked'))))
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    try {
+      await triggerDownload(img, 0)
+      return open.mock.calls
+    } finally {
+      open.mockRestore()
+      vi.unstubAllGlobals()
+    }
+  }
+
+  it('opens a web address', async () => {
+    expect(await fallback({ url: 'https://cdn.example.com/a.png' })).toEqual([
+      ['https://cdn.example.com/a.png', '_blank', 'noopener'],
+    ])
+    expect(said).toEqual([])
+  })
+
+  it('opens nothing for an address of another scheme, and says so', async () => {
+    expect(await fallback({ url: 'javascript:alert(1)' })).toEqual([])
+    expect(await fallback({ url: 'https://cdn.example.com/a.png', downloadUrl: 'javascript:alert(1)' })).toEqual([])
+    expect(await fallback({ url: 'data:text/html,hi' })).toEqual([])
+    expect(said).toEqual(Array(3).fill('The picture could not be downloaded.'))
   })
 })

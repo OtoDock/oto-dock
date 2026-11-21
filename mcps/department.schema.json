@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.1/mcps/department.schema.json",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v2.0.0/mcps/department.schema.json",
   "title": "OtoDock department set",
   "description": "The catalog rules for a department set (OtoDock is a fair source project): one department.json in its own catalog folder, naming the agent templates of the department with their level, the delegation wiring, the head's shared library, the briefing schedules and the bindings between the members' apps. Installing a set creates the department, installs or adopts every member and places it, shares the library and leaves the schedules paused. The platform's set loader (services/community/community_department_sets.py, through storage/catalog_schema.py) refuses a set that breaks these rules and adds the ones a schema cannot state: a template named once, every member's level named in levels, the library's source and a schedule's or a binding's members among the members. The catalog's generator checks what needs the templates beside the set: that each member exists, that a schedule names a task its template ships, that a binding names an app and a binding the from-app declares. Unknown keys are allowed: a catalog is additive. A field read with a default takes null and is read as absent.",
   "$comment": "x-otodock-first-release: the platform release that first ships this schema and reads the registry's departments key (an older platform lists the templates alone). x-otodock-hint: the words a finding uses for the rule, {value} standing for the value found.",
@@ -28,6 +28,39 @@
     "description": {
       "type": ["string", "null"],
       "description": "One or two sentences for the set's card."
+    },
+    "summary": {
+      "type": ["string", "null"],
+      "maxLength": 200,
+      "not": {"type": "string", "pattern": "\\n"},
+      "x-otodock-hint": "the summary is one or two short sentences on one line, at most 200 characters",
+      "description": "What the department does, in one or two short sentences: the store's card and the install dialog show it in place of the description. The bounds of a template's summary. A release that does not read it shows the description, so it needs no platform floor."
+    },
+    "highlights": {
+      "type": ["array", "null"],
+      "maxItems": 6,
+      "x-otodock-hint": "a department has at most 6 highlights",
+      "description": "Up to six things the department does for a person, each an icon and a few words, on its card and in the install dialog. The definition of a template's highlights (a test holds the two equal). A release that does not read them shows none, so they need no platform floor.",
+      "items": {
+        "type": "object",
+        "required": ["icon", "text"],
+        "additionalProperties": true,
+        "properties": {
+          "icon": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,23}$",
+            "x-otodock-hint": "a highlight's icon is a name from the dashboard's icon set, like video (got {value})",
+            "description": "A name from the dashboard's icon set (release/highlights.ts ICON_PATHS). The catalog's lint refuses a name the set lacks; a release that does not know a name draws a neutral mark."
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60,
+            "not": {"type": "string", "pattern": "\\n"},
+            "x-otodock-hint": "a highlight's text is a few words on one line, at most 60 characters"
+          }
+        }
+      }
     },
     "version": {
       "type": "string",

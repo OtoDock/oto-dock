@@ -1,14 +1,18 @@
 """Installing a department set (the registry's departments key): the plan a person sees,
 the job that installs or adopts every member, then creates or reuses the
-department and places them all in one transaction, shares the head's
-library and lists the paused schedules; and the offer's placement, when a
-second member of a set is installed alone.
+department and places them all in one transaction with the record of
+which agent fills each member of the set (what a binding that names a
+member reads, services/apps/binding_target.py), shares the head's library
+and lists the paused schedules; and the offer's placement, when a second
+member of a set is installed alone.
 
 Members first, the department second: a member that fails leaves the
 installed ones as standalone agents and no department, with a line saying
 so. One job per set at a time (the ``set_installs`` row's insert is the
 claim: a partial unique index on the running jobs); the job is that row, so
-a card's outcome reads it and a restart marks the job it cut off.
+a card's outcome reads it and a restart marks the job it cut off. A line
+that says something was not done is written through ``JobLines.add_not_done``
+alone: the dialog shows those lines and folds the others.
 """
 
 from __future__ import annotations
@@ -19,8 +23,7 @@ from collections.abc import Iterable
 
 from fastapi import HTTPException
 
-import config
-from core import layout
+from core import agent_folder, layout
 from services.community import community_agent_installer, community_catalog
 from services.community.community_department_sets import (
     DepartmentSet,
@@ -28,6 +31,7 @@ from services.community.community_department_sets import (
     template_entry,
 )
 from services.departments import assignment, edge_compiler
+from services.infra import safe_fs
 from services.knowledge import library_rules
 from storage.agents import agent_store, db_departments, db_set_installs
 from storage.automation import db_tasks
@@ -40,13 +44,19 @@ logger = logging.getLogger("otodock.department-set-installer")
 # the job's own states are db_set_installs', mirrored in
 # lib/status/setInstall.ts).
 ACTION_NEW = "new"
+# An agent placed as it is: one that stands alone, or one this department holds already.
 ACTION_ADOPT = "adopt"
+# An agent taken from a department made by hand (the one move, assignment.assign).
+ACTION_MOVE = "move"
+# A member's choice: install a new agent, else the slug of an agent to use.
+USE_NEW = "new"
 MEMBER_PENDING = "pending"
 MEMBER_INSTALLING = "installing"
 MEMBER_INSTALLED = "installed"
 MEMBER_ADOPTED = "adopted"
 MEMBER_FAILED = "failed"
 ALREADY_RUNNING = "This department set is being installed already. Wait for it to finish."
+STALE_CHOICE = "The agent you chose has changed since the dialog opened. Open the dialog again."
 INTERRUPTED_LINE = ("The platform restarted while this department was being installed. "
                     "The agents it installed stand alone. Install the department again to place them.")
 INTERRUPTED_PLACED_LINE = ("The platform restarted while this department was being installed. "
@@ -54,6 +64,31 @@ INTERRUPTED_PLACED_LINE = ("The platform restarted while this department was bei
                            "to share the library and check the schedules.")
 
 _locks: dict[str, asyncio.Lock] = {}
+
+
+class JobLines(list[str]):
+    """A job's lines in their order, and the places of those that say
+    something was not done (``not_done``): an agent not installed or not
+    moved, a library not shared or attached, a schedule not found, a cut
+    or failed install. The dialog shows those above the rest, which fold."""
+
+    def __init__(self, lines: Iterable[str] = (), not_done: Iterable[int] = ()) -> None:
+        super().__init__(lines)
+        self.not_done: list[int] = list(not_done)
+
+    @classmethod
+    def of(cls, job: dict | None) -> JobLines:
+        return cls((job or {}).get("lines") or [], (job or {}).get("not_done") or [])
+
+    def add_not_done(self, text: str) -> None:
+        """The one way a line that says something was not done is written."""
+        self.not_done.append(len(self))
+        self.append(text)
+
+
+def _save(job_id: str, lines: JobLines, **fields) -> None:
+    """The job's row with its lines and the places of those not done."""
+    db_set_installs.update(job_id, lines=list(lines), not_done=list(lines.not_done), **fields)
 
 
 class SetInstallRefused(Exception):
@@ -100,15 +135,59 @@ def reusable_department(dset: DepartmentSet, department_name: str, u) -> dict | 
     return existing if [lv["name"] for lv in existing["levels"]] == dset.levels else None
 
 
+def _may_assign(u) -> bool:
+    try:
+        assignment.require_assigner(u)
+    except assignment.AssignmentRefused:
+        return False
+    return True
+
+
+def usable_agents(u, template: str, rows: list[dict], departments: dict[str, dict],
+                  here: str = "") -> list[dict]:
+    """The agents ``u`` may use for a member of ``template``, oldest first:
+    installed from that template, managed by the person, on their own or in
+    a department made by hand (never one installed from the catalog: its
+    own apps read its agents), never one in ``here`` (the department this
+    install fills, which keeps it). None for a caller who may not place
+    agents (an API key, a session with no person). The preview, the
+    install's check before it acts, the dialog and the install card all
+    read this."""
+    if not _may_assign(u):
+        return []
+    out = []
+    for a in rows:
+        if str(a.get("community_template") or "") != template or not _managed(u, a["slug"]):
+            continue
+        dept_id = str(a.get("department_id") or "")
+        if dept_id:
+            dept = departments.get(dept_id)
+            if dept_id == here or dept is None or dept.get("community_set"):
+                continue
+        out.append(a)
+    return sorted(out, key=lambda a: str(a.get("created_at") or ""))
+
+
+def preselected(usable: list[dict]) -> dict | None:
+    """The agent a member's choice starts on: the one usable agent when it
+    stands alone, else none (install a new one): never a guess between
+    several, never a move."""
+    return usable[0] if len(usable) == 1 and not usable[0].get("department_id") else None
+
+
 def plan_members(dset: DepartmentSet, registry: dict, u, choices: dict[str, str] | None = None,
                  department_name: str = "") -> list[dict]:
-    """One row per member: ``new`` (installed under ``slug``, the
-    template's when free else the suggestion) or ``adopt`` (an installed
-    agent from the template that the department of this name holds
-    already, else one that sits in no department and the person manages;
-    the oldest when several; ``choices`` may ask for ``new`` instead), with
-    the agents from the template that sit in other departments
-    (``placed``) so the dialog can say so."""
+    """One row per member. ``kept``: the department of this name holds an
+    agent of the member already (adopted, no choice). Else the member's
+    choice (``choices``: ``USE_NEW`` or the slug of one of its
+    ``usable_agents``; absent, the ``preselected`` one): ``new`` (installed
+    under ``slug``, the template's when free else the suggestion),
+    ``adopt`` (an agent on its own) or ``move`` (an agent from a department
+    made by hand, ``moves_from`` naming it). ``options`` lists the usable
+    agents, by name with their department, for the dialog's choice. A
+    choice outside them is refused (400) in one sentence (a kept member
+    takes ``USE_NEW`` alone: a new copy takes its place); one agent never
+    fills two places."""
     choices = choices or {}
     reused = reusable_department(dset, department_name, u)
     reused_id = reused["id"] if reused else ""
@@ -116,51 +195,77 @@ def plan_members(dset: DepartmentSet, registry: dict, u, choices: dict[str, str]
     for a in agent_store.get_all_agents():
         if a.get("community_template"):
             by_template.setdefault(str(a["community_template"]), []).append(a)
+    departments = {d["id"]: d for d in db_departments.list_departments()}
+    members = db_departments.members_by_department()
+    # A usable agent is the person's to manage, so its department is one they see.
+    names = {i: d["name"] for i, d in departments.items()
+             if assignment.can_see_department(u, d, members.get(i, []))}
+    taken: set[str] = set()
     out = []
     for m in dset.members:
         entry = template_entry(registry, m.template) or {}
+        display = str(entry.get("display_name") or m.template)
         rows = by_template.get(m.template, [])
-        in_department = sorted(
-            (a for a in rows if reused_id and a.get("department_id") == reused_id and _managed(u, a["slug"])),
-            key=lambda a: str(a.get("created_at") or ""))
-        standalone = in_department or sorted(
-            (a for a in rows if not a.get("department_id") and _managed(u, a["slug"])),
-            key=lambda a: str(a.get("created_at") or ""))
-        placed = [a["slug"] for a in rows if a.get("department_id") and a.get("department_id") != reused_id]
         row = {
-            "template": m.template, "level": m.level,
-            "display_name": str(entry.get("display_name") or m.template),
+            "template": m.template, "level": m.level, "display_name": display,
             "version": str(entry.get("version") or ""),
             "platform_compat_ok": community_catalog.platform_version_ok(entry.get("platform_min_version")),
-            "in_catalog": bool(entry),
-            "placed": placed,
-            "standalone": [a["slug"] for a in standalone],
+            "in_catalog": bool(entry), "kept": False, "options": [],
         }
-        if standalone and choices.get(m.template) != ACTION_NEW:
-            row.update(action=ACTION_ADOPT, slug=standalone[0]["slug"])
-        else:
+        choice = choices.get(m.template)
+        kept = sorted((a for a in rows if reused_id and a.get("department_id") == reused_id
+                       and _managed(u, a["slug"])), key=lambda a: str(a.get("created_at") or ""))
+        if kept and _may_assign(u) and choice != USE_NEW:
+            if choice is not None:
+                raise SetInstallRefused(400, _refused(choice, display))
+            row.update(action=ACTION_ADOPT, slug=kept[0]["slug"], kept=True, choice=kept[0]["slug"])
+            taken.add(kept[0]["slug"])
+            out.append(row)
+            continue
+        # A kept member's new copy takes its place (no other agent is offered for it).
+        usable = [] if kept else [a for a in usable_agents(u, m.template, rows, departments, reused_id)
+                                  if a["slug"] not in taken]
+        row["options"] = [{"slug": a["slug"], "display_name": str(a.get("display_name") or a["slug"]),
+                           "department": names.get(str(a.get("department_id") or ""), "")
+                           if a.get("department_id") else ""} for a in usable]
+        if choice is None:
+            pre = preselected(usable)
+            choice = pre["slug"] if pre else USE_NEW
+        chosen = next((a for a in usable if a["slug"] == choice), None)
+        if choice != USE_NEW and chosen is None:
+            raise SetInstallRefused(400, _refused(choice, display))
+        row["choice"] = choice
+        if chosen is None:
             free = (agent_store.reserved_slug_refusal(m.template) is None
                     and not agent_store.agent_exists(m.template))
             target = m.template if free else community_agent_installer._propose_free_slug(m.template)
             row.update(action=ACTION_NEW, slug=target)
+        elif chosen.get("department_id"):
+            dept_id = str(chosen["department_id"])
+            row.update(action=ACTION_MOVE, slug=chosen["slug"],
+                       moves_from={"id": dept_id, "name": names.get(dept_id, "")})
+        else:
+            row.update(action=ACTION_ADOPT, slug=chosen["slug"])
+        if chosen is not None:
+            taken.add(chosen["slug"])
         out.append(row)
     return out
 
 
+def _refused(choice: str, display: str) -> str:
+    return f"{choice} cannot fill the place of {display}. Choose another agent or install a new one."
+
+
 def departments_from(dset: DepartmentSet, u) -> list[dict]:
-    """The departments this set made, as the person may see them (an
-    admin: all; else the ones they created or hold a member of)."""
+    """The departments this set made, those the person may see
+    (``assignment.can_see_department``)."""
     out = []
-    members: dict[str, list[str]] = {}
-    for a in agent_store.get_all_agents():
-        if a.get("department_id"):
-            members.setdefault(a["department_id"], []).append(a["slug"])
+    members = db_departments.members_by_department()
     for d in db_departments.list_departments():
         if d.get("community_set") != dset.slug:
             continue
         slugs = members.get(d["id"], [])
-        if not u.is_admin and d.get("created_by_sub") != (u.acting_sub or "") \
-                and not any(u.can_access_agent(s) for s in slugs):
+        if not assignment.can_see_department(u, d, slugs):
             continue
         out.append({"id": d["id"], "name": d["name"], "version": d.get("community_set_version") or "",
                     "members": slugs})
@@ -229,26 +334,28 @@ async def _run(job_id: str, dset: DepartmentSet, registry: dict, department_name
             job = await asyncio.to_thread(db_set_installs.get, job_id)
             if job is None or job["status"] != db_set_installs.RUNNING:
                 return
-            lines = list(job["lines"])
+            lines = JobLines.of(job)
             slugs = {m["template"]: m["slug"] for m in job["members"]}
             installed_here = {m["slug"] for m in job["members"] if m["status"] == MEMBER_INSTALLED}
-            dept = await _place(dset, department_name, slugs, u, lines, job_id=job_id)
+            moving = {m["slug"]: str((m.get("moves_from") or {}).get("name") or "")
+                      for m in job["members"] if m["action"] == ACTION_MOVE}
+            dept = await _place(dset, department_name, slugs, u, lines, job_id=job_id, installed=installed_here,
+                                moving=moving)
             if dept is None:
-                await asyncio.to_thread(db_set_installs.update, job_id, status=db_set_installs.FAILED, lines=lines)
+                await asyncio.to_thread(_save, job_id, lines, status=db_set_installs.FAILED)
                 await _notify(u, f"{department_name} was not installed", lines)
                 return
-            await asyncio.to_thread(db_set_installs.update, job_id, department_id=dept["id"], lines=lines)
+            await asyncio.to_thread(_save, job_id, lines, department_id=dept["id"])
             await _share_library(dset, department_name, slugs, installed_here, u, lines)
             await asyncio.to_thread(_check_schedules, dset, slugs, lines)
-            _bindings_note(dset, slugs, lines)
-            await asyncio.to_thread(db_set_installs.update, job_id, status=db_set_installs.DONE, lines=lines)
+            await asyncio.to_thread(_save, job_id, lines, status=db_set_installs.DONE)
             await _notify(u, f"{department_name} is installed", lines)
         except Exception as exc:  # the job's row carries the failure, the log the trace
             logger.exception("set install %s failed", job_id)
             job = await asyncio.to_thread(db_set_installs.get, job_id)
-            lines = list(job["lines"]) if job else []
-            lines.append(f"The install stopped on an unexpected error: {exc}")
-            await asyncio.to_thread(db_set_installs.update, job_id, status=db_set_installs.FAILED, lines=lines)
+            lines = JobLines.of(job)
+            lines.add_not_done(f"The install stopped on an unexpected error: {exc}")
+            await asyncio.to_thread(_save, job_id, lines, status=db_set_installs.FAILED)
 
 
 async def _install_members(job_id: str, dset: DepartmentSet, registry: dict, u, consent: bool) -> None:
@@ -256,21 +363,20 @@ async def _install_members(job_id: str, dset: DepartmentSet, registry: dict, u, 
     a member that fails ends the job with the standalone line."""
     job = await asyncio.to_thread(db_set_installs.get, job_id)
     members = list(job["members"]) if job else []
-    lines: list[str] = []
+    lines = JobLines()
     reused = reusable_department(dset, job["department_name"], u) if job else None
     reused_id = reused["id"] if reused else ""
     for i, m in enumerate(members):
-        if m["action"] == ACTION_ADOPT:
-            row = agent_store.get_agent(m["slug"])
-            held = row is not None and (not row.get("department_id") or row.get("department_id") == reused_id)
-            if row is not None and held and _managed(u, m["slug"]):
+        if m["action"] in (ACTION_ADOPT, ACTION_MOVE):
+            row = await asyncio.to_thread(agent_store.get_agent, m["slug"])
+            if row is not None and await asyncio.to_thread(_still_usable, u, m, row, reused_id):
                 members[i] = {**m, "status": MEMBER_ADOPTED}
-                where = "in the department already" if row.get("department_id") else "installed before"
-                lines.append(f"Uses {row.get('display_name') or m['slug']} ({m['slug']}), {where}.")
+                if m["action"] == ACTION_ADOPT:
+                    where = "in the department already" if m.get("kept") else "installed before"
+                    lines.append(f"Uses {row.get('display_name') or m['slug']} ({m['slug']}), {where}.")
             else:
-                members[i] = {**m, "status": MEMBER_FAILED,
-                              "detail": "The agent to use is gone, or in a department, or not yours to manage."}
-            await asyncio.to_thread(db_set_installs.update, job_id, members=members, lines=lines)
+                members[i] = {**m, "status": MEMBER_FAILED, "detail": STALE_CHOICE}
+            await asyncio.to_thread(_save, job_id, lines, members=members)
             if members[i]["status"] == MEMBER_FAILED:
                 break
             continue
@@ -284,22 +390,35 @@ async def _install_members(job_id: str, dset: DepartmentSet, registry: dict, u, 
             lines.append(f"Installed {m['display_name']} as {slug}.")
         else:
             members[i] = {**m, "status": MEMBER_FAILED, "detail": detail}
-        await asyncio.to_thread(db_set_installs.update, job_id, members=members, lines=lines)
+        await asyncio.to_thread(_save, job_id, lines, members=members)
         if not slug:
             break
     failed = [m for m in members if m["status"] == MEMBER_FAILED]
     if failed:
         rest = [m for m in members if m["status"] in (MEMBER_INSTALLED, MEMBER_ADOPTED)]
         for m in failed:
-            lines.append(f"{m['display_name']} was not installed: {m['detail']}")
+            lines.add_not_done(f"{m['display_name']} was not installed: {m['detail']}")
         if rest:
-            lines.append("The installed agents stand alone: " + _names(m["slug"] for m in rest) + ".")
+            lines.add_not_done("The installed agents stand alone: " + _names(m["slug"] for m in rest) + ".")
         else:
-            lines.append("No agent was installed.")
+            lines.add_not_done("No agent was installed.")
         left = [{**m, "status": MEMBER_PENDING} if m["status"] == MEMBER_PENDING else m for m in members]
-        await asyncio.to_thread(db_set_installs.update, job_id, status=db_set_installs.FAILED,
-                                members=left, lines=lines)
+        await asyncio.to_thread(_save, job_id, lines, status=db_set_installs.FAILED, members=left)
         await _notify(u, "The department was not installed", lines)
+
+
+def _still_usable(u, m: dict, row: dict, reused_id: str) -> bool:
+    """The plan's choice, asked again right before the job acts: the agent
+    sits where the plan saw it and is still one of the member's
+    ``usable_agents`` (or, kept, still in this department and the
+    person's to manage)."""
+    where = str(row.get("department_id") or "")
+    if m.get("kept"):
+        return bool(reused_id) and where == reused_id and _managed(u, row["slug"])
+    if where != str((m.get("moves_from") or {}).get("id") or ""):
+        return False
+    departments = {d["id"]: d for d in db_departments.list_departments()}
+    return bool(usable_agents(u, m["template"], [row], departments, reused_id))
 
 
 async def _install_one(template: str, target: str, u, app_consent: dict, check_consent: dict) -> tuple[str, str]:
@@ -331,21 +450,36 @@ async def _install_one(template: str, target: str, u, app_consent: dict, check_c
 # ---------------------------------------------------------------------------
 
 async def _place(dset: DepartmentSet, department_name: str, slugs: dict[str, str], u,
-                 lines: list[str], job_id: str = "") -> dict | None:
+                 lines: JobLines, job_id: str = "", templates: list[str] | None = None,
+                 installed: set[str] | None = None, moving: dict[str, str] | None = None) -> dict | None:
     """The department created (written to the job at once, so a restart
     between the create and the placement finds it), or reused when this
     set made one under the same name that the person may edit and whose
-    levels still match; every member placed in one transaction; one
-    recompile. None with a line when a placement cannot be made."""
+    levels still match; every member placed in one transaction, with the
+    record of which agent fills each member template of the set
+    (``templates``, the whole set's when a part of it is placed: the places
+    left unfilled keep what they recorded; an agent this job only adopted
+    never takes over a place a member still fills, while one it
+    ``installed`` does: the member's "Install a new one"); one recompile. An
+    agent that leaves a department made by hand (``moving``: its slug and
+    that department's name) moves first, through ``assignment.assign``,
+    the one move, and its other managers are told. None with a line when a
+    placement cannot be made."""
     existing = await asyncio.to_thread(reusable_department, dset, department_name, u)
     reuse = existing is not None
     placements: list[tuple[str, str]] = []
     missing = [t for t, s in slugs.items() if not agent_store.get_agent(s)]
     if missing:
-        lines.append("Some agents are gone: " + ", ".join(missing) + ". Nothing was placed.")
+        lines.add_not_done("Some agents are gone: " + ", ".join(missing) + ". Nothing was placed.")
         return None
     dept: dict
     if reuse and existing is not None:
+        # Never refused here (``reusable_department`` asked the edit right):
+        # the rule's one owner is asked all the same. A department this job
+        # makes is the person's own.
+        if not await asyncio.to_thread(assignment.may_place_into, u, existing):
+            lines.add_not_done(assignment.PLACE_REFUSED)
+            return None
         dept = existing
         lines.append(f"The department {department_name} existed already and was used.")
     else:
@@ -356,18 +490,42 @@ async def _place(dset: DepartmentSet, department_name: str, slugs: dict[str, str
         if job_id:
             await asyncio.to_thread(db_set_installs.update, job_id, department_id=dept["id"])
     level_ids = {lv["name"]: lv["id"] for lv in dept["levels"]}
+    moving = moving or {}
+    refused: set[str] = set()
     for m in dset.members:
-        placements.append((slugs[m.template], level_ids[m.level]))
+        agent = slugs[m.template]
+        if agent not in moving:
+            placements.append((agent, level_ids[m.level]))
+            continue
+        try:
+            await assignment.assign(agent, dept["id"], level_ids[m.level], u)
+        except assignment.AssignmentRefused as exc:
+            refused.add(agent)
+            lines.add_not_done(f"{_names([agent])} was not moved here: {exc.detail}")
+            continue
+        lines.append(f"{_names([agent])} moved here from {moving[agent] or 'another department'}.")
+        await _notify_moved(u, agent, moving[agent], department_name)
+    members: dict[str, str | None] = {}
+    for template in templates or dset.templates:
+        slug = slugs.get(template)
+        if slug in refused:
+            slug = None
+        if slug is not None and reuse and slug not in (installed or set()):
+            held = await asyncio.to_thread(db_departments.filled_by, dept["id"], template)
+            if held:
+                slug = held
+        members[template] = slug
     try:
-        await asyncio.to_thread(db_departments.place_members, dept["id"], placements)
+        await asyncio.to_thread(db_departments.place_members, dept["id"], placements, members)
     except Exception:
         logger.exception("set install: placement failed")
         if not reuse:
             await asyncio.to_thread(db_departments.delete_department, dept["id"])
-        lines.append("The agents could not be placed in the department. They stand alone.")
+        lines.add_not_done("The agents could not be placed in the department. They stand alone.")
         return None
     await asyncio.to_thread(edge_compiler.recompile)
-    lines.append(f"The department {department_name} holds " + _names(slugs.values()) + ".")
+    lines.append(f"The department {department_name} holds "
+                 + _names(s for s in slugs.values() if s not in refused) + ".")
     return dept
 
 
@@ -393,24 +551,25 @@ async def place_from_set(dset: DepartmentSet, registry: dict, department_name: s
             slugs[row["template"]] = row["slug"]
     if new_template not in slugs or len(slugs) < 2:
         raise SetInstallRefused(409, "No second agent of this set stands alone to place with it.")
-    lines: list[str] = []
+    lines = JobLines()
     lock = _lock_for(dset.slug)
     async with lock:
         placed = {t: s for t, s in slugs.items()}
         partial = DepartmentSet(**{**dset.__dict__, "members": [m for m in dset.members if m.template in placed]})
-        dept = await _place(partial, department_name.strip(), placed, u, lines)
+        dept = await _place(partial, department_name.strip(), placed, u, lines, templates=dset.templates,
+                            installed={new_slug})
         if dept is not None:
             await _share_library(partial, department_name.strip(), placed, {new_slug}, u, lines)
             await asyncio.to_thread(_check_schedules, partial, placed, lines)
-    return {"department": dept, "lines": lines, "members": placed}
+    return {"department": dept, "lines": list(lines), "members": placed}
 
 
 # ---------------------------------------------------------------------------
-# The library, the schedules, the bindings
+# The library and the schedules
 # ---------------------------------------------------------------------------
 
 async def _share_library(dset: DepartmentSet, department_name: str, slugs: dict[str, str],
-                         installed_here: set[str], u, lines: list[str]) -> None:
+                         installed_here: set[str], u, lines: JobLines) -> None:
     """The head's folder as a library named after the department (or the
     library already covering it), attached to every other member the
     person may wire. The folder is made when missing."""
@@ -423,9 +582,14 @@ async def _share_library(dset: DepartmentSet, department_name: str, slugs: dict[
         subdir = library_rules.normalize_subdir(lib.subdir)
         if not (u.is_admin or source in installed_here or _managed(u, source)):
             raise HTTPException(403, f"You do not manage {source}, which holds the library.")
-        folder = config.get_agent_dir(source) / layout.KNOWLEDGE / subdir if subdir \
-            else config.get_agent_dir(source) / layout.KNOWLEDGE
-        await asyncio.to_thread(folder.mkdir, parents=True, exist_ok=True)
+        # Made beneath the head's real folder with no link followed: a
+        # folder a session replaced by a link gets nothing made through it.
+        try:
+            await asyncio.to_thread(
+                safe_fs.mkdirs_beneath, agent_folder.agent_root(source),
+                f"{layout.KNOWLEDGE}/{subdir}" if subdir else layout.KNOWLEDGE)
+        except OSError:
+            raise HTTPException(400, f"The head's {subdir or 'knowledge'} folder is not a plain folder.") from None
         await asyncio.to_thread(library_rules.validate_subdir_on_disk, source, subdir)
         # Only the set's own folder is reused: a wider library would hand
         # the members more than the set says.
@@ -438,7 +602,7 @@ async def _share_library(dset: DepartmentSet, department_name: str, slugs: dict[
             lines.append(f"The library {name} was shared already.")
         elif covering is not None:
             folder_words = f"{subdir} folder" if subdir else "knowledge folder"
-            lines.append(f"The library {covering.get('name') or 'of the head'} already covers the head's "
+            lines.add_not_done(f"The library {covering.get('name') or 'of the head'} already covers the head's "
                          f"{folder_words}, so none was made for the department. Attach it to the others yourself.")
             return
         else:
@@ -449,7 +613,7 @@ async def _share_library(dset: DepartmentSet, department_name: str, slugs: dict[
                 name=department_name, subdir=subdir)
             name, lib_subdir = department_name, subdir
     except HTTPException as exc:
-        lines.append(f"The library was not shared: {exc.detail}")
+        lines.add_not_done(f"The library was not shared: {exc.detail}")
         return
     from services.knowledge import library_projector
     attached: list[str] = []
@@ -463,7 +627,7 @@ async def _share_library(dset: DepartmentSet, department_name: str, slugs: dict[
                 db_knowledge_libraries.attach, source, consumer, writable=lib.writable,
                 created_by=u.acting_sub or "", subdir=lib_subdir)
         except ValueError as exc:
-            lines.append(f"The library was not attached to {_names([consumer])}: {exc}")
+            lines.add_not_done(f"The library was not attached to {_names([consumer])}: {exc}")
             continue
         await library_projector.attach_setup(source, consumer)
         attached.append(consumer)
@@ -471,12 +635,12 @@ async def _share_library(dset: DepartmentSet, department_name: str, slugs: dict[
         how = "writable" if lib.writable else "read only"
         lines.append(f"The library {name} is shared from {_names([source])} to {_names(attached)}, {how}.")
     if skipped:
-        lines.append(f"The library was not attached to {_names(skipped)}: you do not manage them.")
+        lines.add_not_done(f"The library was not attached to {_names(skipped)}: you do not manage them.")
 
 
-def _check_schedules(dset: DepartmentSet, slugs: dict[str, str], lines: list[str]) -> None:
-    """The briefing schedules the set names, each proved paused (the
-    templates seed them so); one running already is named."""
+def _check_schedules(dset: DepartmentSet, slugs: dict[str, str], lines: JobLines) -> None:
+    """The schedules the set names, each proved paused (the templates seed
+    them so) and counted; one running already, or not found, is named."""
     paused: list[str] = []
     running: list[str] = []
     absent: list[str] = []
@@ -492,24 +656,37 @@ def _check_schedules(dset: DepartmentSet, slugs: dict[str, str], lines: list[str
             running.append(label)
         else:
             paused.append(label)
-    if paused:
-        lines.append("The briefing schedules are paused: " + ", ".join(paused) + ". Each setup page says which to start.")
+    if len(paused) == 1:
+        lines.append("1 schedule is paused. Its agent's setup page says whether to start it.")
+    elif paused:
+        lines.append(f"{len(paused)} schedules are paused. Each agent's setup page says which to start.")
     if running:
         lines.append("These schedules run already: " + ", ".join(running) + ".")
     if absent:
-        lines.append("These schedules were not found: " + ", ".join(absent) + ".")
+        lines.add_not_done("These schedules were not found: " + ", ".join(absent) + ".")
 
 
-def _bindings_note(dset: DepartmentSet, slugs: dict[str, str], lines: list[str]) -> None:
-    """A member that landed under another slug than its template's is not
-    the one the from-app's bindings name."""
-    for b in dset.bindings:
-        actual = slugs.get(b.to_member)
-        if actual and actual != b.to_member:
-            lines.append(
-                f"The app {b.app} of {_names([slugs.get(b.from_member, b.from_member)])} reads "
-                f"{_names([actual])} by its first name, {b.to_member}, not {actual}. "
-                "It shows nothing for this department yet.")
+async def _notify_moved(u, slug: str, left: str, joined: str) -> None:
+    """The moved agent's other managers hear where it went (the person who
+    installed knows): one notice each, linked to the agent."""
+    from auth import roles
+    from services.notifications import notification_manager
+    from storage.identity import db_users
+    mover = u.acting_sub or u.sub
+    try:
+        subs = [r["sub"] for r in await asyncio.to_thread(db_users.get_agent_users, slug)
+                if roles.can_manage(r.get("agent_role")) and r["sub"] != mover]
+        if not subs:
+            return
+        label = await asyncio.to_thread(notification_manager.agent_label, slug)
+        for sub in subs:
+            await notification_manager.fire_notification(
+                title=f"{label} moved to {joined}",
+                body=f"It left the {left or 'other'} department when the {joined} department was installed.",
+                severity="info", scope="user", target=sub, source="community_agent", source_id=slug,
+                href=f"/agents/{slug}")
+    except Exception:  # a notice never fails the job
+        logger.exception("set install: the notice of a moved agent failed")
 
 
 async def _notify(u, title: str, lines: list[str]) -> None:
@@ -564,6 +741,8 @@ def interrupt_at_boot() -> list[str]:
                 line = INTERRUPTED_PLACED_LINE
             else:
                 db_departments.delete_department(dept["id"])
-        db_set_installs.interrupt(job["id"], line)
+        lines = JobLines.of(job)
+        lines.add_not_done(line)
+        _save(job["id"], lines, status=db_set_installs.INTERRUPTED)
         marked.append(job["id"])
     return marked

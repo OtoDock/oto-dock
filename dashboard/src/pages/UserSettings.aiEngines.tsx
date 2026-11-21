@@ -14,6 +14,8 @@ import InvokedForm from '../components/common/InvokedForm'
 import { primaryPointerCoarse } from '../components/common/useInvokedForm'
 import {
   useUserExecutionLayers,
+  useAccountsLive,
+  useListReading,
   useUserAddSubscription,
   useUserDeleteSubscription,
   useUserUpdateSubscription,
@@ -44,6 +46,9 @@ import { Badge, SaveState } from '../components/ui/SettingsControls'
 import { useSaveState } from '../hooks/useSaveState'
 import InfoTip from '../components/ui/InfoTip'
 import { PAGE_TITLE } from '../components/ui/classes'
+import { copyOrSay } from '../lib/copyText'
+import { useSettledOrder } from '../components/engines/useSettledOrder'
+import AccountRunning from '../components/engines/AccountRunning'
 
 // ---------------------------------------------------------------------------
 // Execution Layers Section
@@ -85,6 +90,16 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const isAdmin = isPlatformAdmin(user)
 
   const userSubs = layer.user_subscriptions || []
+  // The cards keep their places while the person looks: a change re-orders
+  // the list after a quiet spell, in the order the pool uses the accounts.
+  const list = useListReading('own')
+  const pending = list.pending
+  const { shown, changed, removed, itemRef, listRef } = useSettledOrder(userSubs, {
+    open: expanded,
+    settings: (s) => `${s.status}:${s.use_personal}:${s.contribute_platform}`,
+    pending,
+  })
+  const live = useAccountsLive('own', expanded, pending).data
   // An active login that ends inside the notice's window: its chip, else null.
   const endingChip = (sub: Subscription) => {
     const when = loginEndsIn(sub)
@@ -120,7 +135,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const handleDelete = async (sub: Subscription) => {
     const title = sub.auth_type === 'api_key' ? 'Remove your API key?' : 'Remove your subscription?'
     if (await dialogs.confirm({ title, confirmLabel: 'Remove', tone: 'danger' })) {
-      void deleteSub.mutateAsync({ layer: layer.name, id: sub.id }).catch(toastError(
+      void deleteSub.mutateAsync({ layer: layer.name, id: sub.id }).then(() => removed(sub.id), toastError(
         sub.auth_type === 'api_key' ? 'The API key was not removed' : 'The subscription was not removed',
       ))
     }
@@ -138,7 +153,11 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
         type="button"
         aria-expanded={expanded}
         className="w-full flex items-center justify-between p-4 text-left"
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => {
+          // An opened list reads the pool's order now.
+          if (!expanded) list.reread()
+          setExpanded(!expanded)
+        }}
       >
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
@@ -185,10 +204,10 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
       </button>
 
       {expanded && (
-        <div className="px-4 pb-4 border-t border-subtle pt-3 space-y-3">
+        <div ref={listRef} tabIndex={-1} className="px-4 pb-4 border-t border-subtle pt-3 space-y-3 outline-none">
           {/* Existing subscriptions */}
-          {userSubs.map(sub => (
-            <div key={sub.id} className={`${CARD_BORDERED} py-2 px-3`}>
+          {shown.map(sub => (
+            <div key={sub.id} ref={itemRef(sub.id)} className={`${CARD_BORDERED} py-2 px-3`}>
               <div className="flex items-center justify-between gap-2">
                 {/* min-w-0 + wrap keep long labels/emails inside the viewport
                     on mobile — without it the badge and Remove button get
@@ -209,6 +228,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                       {endingChip(sub)}
                     </span>
                   )}
+                  <AccountRunning live={live?.[sub.id]?.live ?? sub.live} />
                 </div>
                 <div className="shrink-0 flex items-center gap-2">
                   {(sub.status === ENGINE_SUBSCRIPTION_STATUS.EXPIRED || endingChip(sub)) && hasLogin && (
@@ -229,7 +249,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                 </div>
               </div>
               {sub.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE && sub.auth_type !== 'api_key' && (
-                <SubscriptionWindowBars windows={sub.windows} />
+                <SubscriptionWindowBars windows={live?.[sub.id] ? live[sub.id].windows : sub.windows} />
               )}
               {sub.status === ENGINE_SUBSCRIPTION_STATUS.EXPIRED && (
                 <p className="mt-1 text-xs text-status-warning-fg">
@@ -257,6 +277,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                       disabled={sub.status !== ENGINE_SUBSCRIPTION_STATUS.ACTIVE}
                       onChange={(e) => {
                         const on = e.target.checked
+                        changed()
                         void run(`${sub.id}:personal`, () => updateSub.mutateAsync({ layer: layer.name, id: sub.id, use_personal: on }), { failTitle: 'The account setting was not saved' })
                       }}
                       className="accent-action"
@@ -275,6 +296,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                         disabled={sub.status !== ENGINE_SUBSCRIPTION_STATUS.ACTIVE}
                         onChange={(e) => {
                           const on = e.target.checked
+                          changed()
                           void run(`${sub.id}:shared`, () => updateSub.mutateAsync({ layer: layer.name, id: sub.id, contribute_platform: on }), { failTitle: 'The account setting was not saved' })
                         }}
                         className="accent-action"
@@ -336,7 +358,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
           {showApiKey && (
             <InPlaceApiKeyForm
               layer={layer.name} providers={keyProviderList}
-              mutation={addKey} onDone={() => setShowApiKey(false)} returnTo={apiKeyButtonRef}
+              mutation={addKey} onDone={() => { changed(); setShowApiKey(false) }} returnTo={apiKeyButtonRef}
             />
           )}
           {connect && (
@@ -344,7 +366,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
               layer={layer}
               reconnect={connect.reconnect}
               adding={userSubs.length > 0}
-              onClose={() => setConnect(null)}
+              onClose={() => { changed(); setConnect(null) }}
             />
           )}
         </div>
@@ -653,7 +675,7 @@ function EngineConnectDialog({ layer, reconnect, adding, onClose }: {
               <p className="text-xs text-secondary">2. Enter this one-time code:</p>
               <div className="flex items-center gap-2">
                 <span className="px-4 py-2 text-lg font-mono font-bold tracking-widest bg-surface-sunken border border-subtle rounded-control text-primary select-all">{userCode}</span>
-                <Button variant="secondary" size="xs" onClick={() => navigator.clipboard.writeText(userCode)}>Copy</Button>
+                <Button variant="secondary" size="xs" onClick={() => void copyOrSay(userCode)}>Copy</Button>
               </div>
             </div>
             <div role="status" className="flex items-center gap-2 text-xs text-secondary">

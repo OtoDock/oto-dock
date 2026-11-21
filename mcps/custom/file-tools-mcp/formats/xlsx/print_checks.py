@@ -36,7 +36,7 @@ def print_layout(ctx: checks.CheckContext) -> list[checks.Finding]:
     if not marks:
         return []
     landed: dict[int, list[tuple[int, Any, Any]]] = {}
-    with fitz.open(ctx.rendered_pdf) as doc:
+    with ctx.open_rendering() as doc:
         colours: dict[int, int | None] = {}
         for page in doc:
             for info in page.get_image_info(xrefs=True):

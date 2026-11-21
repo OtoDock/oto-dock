@@ -82,6 +82,10 @@ USER_MEMORY_ENABLED = (
 AGENT_MEMORY_ENABLED = (
     os.environ.get("OTO_MEMORY_AGENT_ENABLED", "true").lower() == "true"
 )
+# The wrap-up after a conversation: the user scope is the outside person's
+# memory (the platform maps the session's token to it), with no person on
+# the platform behind the session.
+PERSON = os.environ.get("OTO_MEMORY_PERSON", "false").lower() == "true"
 
 
 server = Server("memory-mcp")
@@ -116,7 +120,7 @@ def _available_scopes() -> list[str]:
     scopes: list[str] = []
     if AGENT_MEMORY_ENABLED:
         scopes.append("agent")
-    if USER_SUB and USER_MEMORY_ENABLED:
+    if (USER_SUB or PERSON) and USER_MEMORY_ENABLED:
         scopes.append("user")
     return scopes
 
@@ -138,7 +142,9 @@ def _memory_tool() -> Tool:
     if shared:
         scope_lines.append("/memories/agent/ shared with every user of this agent")
     if personal:
-        scope_lines.append("/memories/user/ private to the current user")
+        scope_lines.append(
+            "/memories/user/ the memory of the person this conversation was with"
+            if PERSON else "/memories/user/ private to the current user")
     # The rules live in the prompt's Memory section, once; the description
     # carries the scopes, the default and the commands.
     description = (

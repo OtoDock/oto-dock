@@ -1,13 +1,12 @@
-"""The Codex app-server daemon starts off the event loop.
+"""The Codex app-server client starts its daemon through the spawner it is
+given.
 
 The transport client is vendored into the satellite as a stdlib-only module,
-so it takes the spawner as a callable: the proxy's layer hands it
-``pty_relay.spawn_piped`` inside a spawn slot; the satellite (and the client
-alone) keep ``asyncio.create_subprocess_exec``.
+so it takes the spawner as a callable; without one it keeps
+``asyncio.create_subprocess_exec``.
 """
 
 import asyncio
-import contextlib
 from unittest.mock import AsyncMock
 
 import pytest
@@ -77,25 +76,3 @@ async def test_start_uses_the_injected_spawner():
     assert client.proc is proc and client.is_alive
     proc._rc = 0  # exited: close() has no group to signal
     await client.close()
-
-
-@pytest.mark.asyncio
-async def test_the_codex_layer_spawns_in_a_slot(monkeypatch):
-    from core.layers.codex import session as cs
-    from core.sandbox import pty_relay
-    events: list = []
-
-    @contextlib.asynccontextmanager
-    async def _slot():
-        events.append("slot-in")
-        yield
-        events.append("slot-out")
-
-    async def _piped(argv, *, cwd, env, limit):
-        events.append(("spawn", list(argv), cwd, limit))
-        return "proc"
-    monkeypatch.setattr(pty_relay, "spawn_slot", _slot)
-    monkeypatch.setattr(pty_relay, "spawn_piped", _piped)
-    out = await cs._spawn_app_server(["codex", "app-server"], cwd="/w", env={}, limit=5)
-    assert out == "proc"
-    assert events == ["slot-in", ("spawn", ["codex", "app-server"], "/w", 5), "slot-out"]

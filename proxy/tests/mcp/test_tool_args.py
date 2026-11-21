@@ -109,6 +109,7 @@ def _child_env(tmp_path) -> dict:
         "OTO_CAN_EDIT_AGENT": "true",
         "OTO_SCOPE": "user",
         "OTO_USERNAME": "dev-admin",
+        "OTO_USER_SUB": "sub-dev-admin",
     }
 
 

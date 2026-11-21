@@ -17,12 +17,15 @@ if str(_PROXY_DIR) not in sys.path:
 from core.events import tool_roles
 from core.execution_layer import (
     AUTH_TYPES,
+    IN_BAND_KINDS,
     PERMISSION_MODES,
     PROVIDER_KINDS,
     WINDOW_ROLES,
+    WINDOW_SCOPES,
     ExecutionLayer,
     LayerCapabilities,
 )
+from core.remote_engine_adapter import RemoteEngineAdapter
 from core.session.session_manager import account_label_for, get_all_layers
 
 # The satellite reads the pinned CLI versions under exactly these keys
@@ -42,18 +45,26 @@ def test_declared_default_model_is_one_the_layer_serves():
 
 def test_method_shadowing_flags_agree_with_the_methods():
     # supports_steer / supports_compact / supports_interrupt_for_queued exist
-    # as DATA because the remote layer must know without calling the local
-    # method; this binds each flag to the override so they cannot drift.
+    # as DATA because shared code must know without calling the method; this
+    # binds each flag to the override so they cannot drift. The method is the
+    # layer's own for an engine that holds its sessions in the proxy, and its
+    # remote adapter's for an engine whose sessions run on a machine. An
+    # adapter has no stop-and-send of its own: the remote layer reads the
+    # flag and sends the adapter's soft interrupt frame
+    # (``remote_abort.interrupt_for_queued``).
     # Scoped to the registry: the remote layer (not registered — a placement,
     # not an engine) overrides all three as forwarders.
     for path, layer in get_all_layers().items():
         b = layer.capabilities.behaviour
-        cls = type(layer)
-        assert b.supports_steer == (cls.steer is not ExecutionLayer.steer), path
-        assert b.supports_compact == (cls.compact is not ExecutionLayer.compact), path
-        assert b.supports_interrupt_for_queued == (
-            cls.interrupt_for_queued is not ExecutionLayer.interrupt_for_queued
-        ), path
+        if isinstance(layer, ExecutionLayer):
+            cls, base = type(layer), ExecutionLayer
+            assert b.supports_interrupt_for_queued == (
+                cls.interrupt_for_queued is not ExecutionLayer.interrupt_for_queued
+            ), path
+        else:
+            cls, base = type(layer.remote_adapter()), RemoteEngineAdapter
+        assert b.supports_steer == (cls.steer is not base.steer), path
+        assert b.supports_compact == (cls.compact is not base.compact), path
 
 
 def test_pin_keys_are_the_frozen_satellite_vocabulary():
@@ -180,6 +191,45 @@ def test_remote_runtime_facts_follow_supports_remote_execution():
             assert rt.has_os_process, path
         if rt.interactive_submit_backstop:
             assert rt.supports_interactive_pty, path
+        if rt.interactive_reports_model:
+            assert rt.supports_interactive_pty, path
+
+
+# A pick inside each engine's terminal, as its stream records it.
+_PICKS = {
+    "claude-code-cli": [
+        '{"type": "user", "uuid": "u1", "message": {"role": "user", "content": '
+        '"<command-name>/model</command-name><command-args>claude-opus-5-5</command-args>"}}',
+        '{"type": "user", "uuid": "u2", "message": {"role": "user", "content": "go on"}}',
+        '{"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "id": "m1", '
+        '"model": "claude-opus-5-5", "content": [{"type": "text", "text": "ok"}]}}',
+    ],
+    "codex-cli": [
+        '{"type": "turn_context", "payload": {"turn_id": "a", "model": "gpt-6.1-sol", '
+        '"collaboration_mode": {"mode": "default"}}}',
+        '{"type": "turn_context", "payload": {"turn_id": "b", "model": "gpt-6-astra", '
+        '"collaboration_mode": {"mode": "default"}}}',
+    ],
+}
+
+
+def test_an_engine_that_reports_a_terminal_pick_names_one_from_its_stream(monkeypatch):
+    # The capability is the contract the terminal's pump reads: an engine
+    # declares it exactly when its own tailer names a person's pick, so the
+    # pump never asks which engine runs.
+    from storage import database as task_store
+    monkeypatch.setattr(task_store, "add_chat_message", lambda *a, **k: 1, raising=False)
+    monkeypatch.setattr(task_store, "rebuild_chat_search", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(task_store, "get_chat", lambda *a, **k: {"title": "t"}, raising=False)
+    declared = {path for path, layer in get_all_layers().items()
+                if layer.capabilities.runtime.interactive_reports_model}
+    assert declared == set(_PICKS)
+    for path in declared:
+        tailer = get_all_layers()[path].transcript_tailer()
+        tailer.forget("contract-pick")
+        got = tailer.tail_lines("contract-pick", "contract-chat", _PICKS[path])
+        tailer.forget("contract-pick")
+        assert got.get("model_chosen"), path
 
 
 def test_the_remote_adapter_matches_supports_remote_execution():
@@ -231,18 +281,36 @@ def test_the_credential_adapter_matches_the_declaration():
 
 # --- usage (phase 3b) --------------------------------------------------------
 
-def test_declared_windows_have_distinct_keys_and_one_quota_window():
-    # The routing, the day cap and the alerts key off THE quota window; a
-    # vendor with two would need the readers to choose, and none has one.
+def test_declared_windows_have_distinct_keys_and_a_quota_window():
+    # The drain order reads the account's quota windows (the soonest reset
+    # with room, quota_reset), the day cap and the alerts the first one; a
+    # model's window is one per family and at most one is declared.
     for path, layer in get_all_layers().items():
         specs = layer.capabilities.usage.windows
         keys = [s.key for s in specs]
         assert len(set(keys)) == len(keys), (path, keys)
         for s in specs:
             assert s.role in WINDOW_ROLES, (path, s)
+            assert s.scope in WINDOW_SCOPES, (path, s)
             assert s.length_s > 0 and s.label, (path, s)
         if specs:
-            assert [s.role for s in specs].count("quota") == 1, (path, specs)
+            assert any(s.role == "quota" and s.scope == "account" for s in specs), (path, specs)
+            assert [s.scope for s in specs].count("model") <= 1, (path, specs)
+
+
+def test_in_band_reports_are_declared_once_per_kind():
+    # Where a live session reports its account's windows, and whether the
+    # platform may act on it (a reading) or only show it (a hint).
+    for path, layer in get_all_layers().items():
+        in_band = layer.capabilities.usage.in_band
+        assert len({b.kind for b in in_band}) == len(in_band), path
+        assert len({b.source for b in in_band}) == len(in_band), path
+        for b in in_band:
+            assert b.kind in IN_BAND_KINDS and b.source and b.source != "poll", (path, b)
+            if b.kind == "terminal":
+                assert not b.trusted, (path, b)
+        if in_band:
+            assert layer.capabilities.usage.windows, path
 
 
 def test_an_engine_without_a_login_declares_no_windows():
@@ -355,7 +423,7 @@ def test_the_effort_scales_agree_with_the_adapters():
         "low", "medium", "high", "high", "high"]
     assert get_adapter("openai")._wire_effort("max") == "xhigh"
     # Anthropic's rewrite is inline (anthropic_adapter.stream_response,
-    # cli/session._build_persistent_cmd): every level but ultra goes through
+    # cli/spawn._build_persistent_cmd): every level but ultra goes through
     # as itself, xhigh only when the row supports it.
     for path in ("direct-llm", "claude-code-cli"):
         anthropic = _entries(path)["anthropic"]
@@ -384,8 +452,8 @@ def test_effort_per_model_names_a_flag_the_rows_carry():
 # ---------------------------------------------------------------------------
 
 def test_the_config_dir_builder_matches_the_declaration(monkeypatch):
-    # Every registered engine prepares the config dir a local session
-    # mounts (the default raises); an engine with a config_dir_name returns
+    # Every registered engine prepares the config dir a session mounts
+    # (the default raises); an engine with a config_dir_name returns
     # a dir of that name, one without still returns SOME dir (Direct LLM
     # keeps its plans and MCP config home in the .claude tree).
     monkeypatch.setattr("core.sandbox.skills_materializer.materialize_skills_for_sandbox",
@@ -402,13 +470,12 @@ def test_the_config_dir_builder_matches_the_declaration(monkeypatch):
             assert d.name.startswith("."), (path, d.name)
 
 
-def test_the_binary_path_and_the_pin_follow_the_binary():
-    # cli_binary_path() names the executable this host runs exactly when the
-    # descriptor declares a binary; pinned_cli_version() likewise (the
-    # frozen-pin-key test above already binds the version to the pin key).
+def test_the_pin_follows_the_binary():
+    # pinned_cli_version() names a version exactly when the descriptor
+    # declares a binary (the frozen-pin-key test above already binds the
+    # version to the pin key).
     for path, layer in get_all_layers().items():
         has_binary = bool(layer.capabilities.runtime.binary)
-        assert bool(layer.cli_binary_path()) == has_binary, path
         assert bool(layer.pinned_cli_version()) == has_binary, path
 
 
@@ -564,15 +631,18 @@ def test_resumes_interactive_answers_the_flag_unless_the_engine_resumes_by_a_han
     codex = layers["codex-cli"]
     assert codex.resumes_interactive(_cfg(execution_target="mach-1", resume_handle="tid")) is True
     assert codex.resumes_interactive(_cfg(execution_target="mach-1", resume_handle="", resume=True)) is False
-    from core.session import codex_rollout_tailer
+    from core.session import codex_rollout_tailer as rollouts
     seen = []
-    monkeypatch.setattr(codex_rollout_tailer, "rollout_exists",
-                        lambda home, tid: seen.append((home, tid)) or True)
+    monkeypatch.setattr(rollouts, "find_rollout",
+                        lambda home, tid, agent="": seen.append((home, tid, agent)) or (rollouts.FOUND, "/r"))
     assert codex.resumes_interactive(_cfg(resume_handle="tid")) is True
-    assert seen == [("/agents/a/users/u/.codex", "tid")]
-    monkeypatch.setattr(codex_rollout_tailer, "rollout_exists", lambda home, tid: False)
+    assert seen == [("/agents/a/users/u/.codex", "tid", "a")]
+    monkeypatch.setattr(rollouts, "find_rollout", lambda home, tid, agent="": (rollouts.MISSING, None))
     assert codex.resumes_interactive(_cfg(resume_handle="tid", resume=True)) is False
     assert codex.resumes_interactive(_cfg(resume_handle="", resume=True)) is False
+    # A search that could not decide trusts the handle, as on a machine.
+    monkeypatch.setattr(rollouts, "find_rollout", lambda home, tid, agent="": (rollouts.UNDECIDED, None))
+    assert codex.resumes_interactive(_cfg(resume_handle="tid")) is True
 
 
 # --- core-seams phase 2: the tool vocabulary, the provider kinds, the modes --
@@ -638,34 +708,30 @@ def test_auto_review_is_offered_only_by_an_engine_with_a_reviewer():
     assert caps["direct-llm"].permission_modes == ["ask", "dontAsk"]
 
 
-def test_old_mode_words_read_and_enter_in_the_current_vocabulary():
-    from core.permission_modes import chat_row, cli_mode, current_mode, entry_mode
-    assert current_mode("default") == "ask"
-    assert current_mode("acceptEdits") == "autoReview"
-    # The unattended word and the judge keep their own meaning.
-    assert current_mode("auto") == "auto"
-    assert current_mode("judge") == "judge"
-    assert entry_mode("acceptEdits") == "autoReview"
-    assert entry_mode("acceptEdits", ["ask", "dontAsk"]) == "ask"
+def test_mode_words_enter_as_the_engine_offers_them():
+    """A word no engine declares, a word from before 1.9 among them, enters
+    as the engine's first mode and reaches Claude Code as its asking word."""
+    from core.permission_modes import cli_mode, entry_mode, known_mode
+    assert [known_mode(m) for m in ("autoReview", "auto", "judge", "plan", "acceptEdits", "default", "")] == [
+        "autoReview", "auto", "judge", "plan", "ask", "ask", "ask"]
+    assert entry_mode("autoReview") == "autoReview"
+    assert entry_mode("autoReview", ["ask", "dontAsk"]) == "ask"
     assert entry_mode("", ["ask", "dontAsk"]) == "ask"
     assert entry_mode("auto") == "ask"           # never the unattended word from a person
     assert entry_mode("bogus", ["ask", "autoReview"]) == "ask"
-    assert chat_row({"id": "c", "permission_mode": "acceptEdits"})["permission_mode"] == "autoReview"
-    assert chat_row({"id": "c", "permission_mode": "auto"})["permission_mode"] == "auto"
-    assert {m: cli_mode(m) for m in ("ask", "autoReview", "dontAsk", "plan", "auto", "default")} == {
+    assert entry_mode("acceptEdits") == "ask"
+    assert {m: cli_mode(m) for m in ("ask", "autoReview", "dontAsk", "plan", "auto", "acceptEdits")} == {
         "ask": "default", "autoReview": "auto", "dontAsk": "dontAsk", "plan": "plan",
-        "auto": "default", "default": "default"}
+        "auto": "default", "acceptEdits": "default"}
 
 
 def test_each_engine_says_when_its_own_reviewer_runs(monkeypatch):
     """The hook's live word decides: Claude Code reports ``auto`` in its own
     auto mode; Codex reports ``default`` under on-request, and its reviewer
-    runs when the turn started with it (local) or when the machine speaks
-    the 1.9 modes and the session is in Auto (remote). A call no hook raised
+    runs when the session is in Auto. A call no hook raised
     (the Codex bridge) carries no word: never reviewed. Direct LLM has none."""
     from unittest.mock import MagicMock
 
-    from core.layers.codex import session as codex_session
     from core.session import session_manager
     layers = get_all_layers()
     cli, codex, direct = layers["claude-code-cli"], layers["codex-cli"], layers["direct-llm"]
@@ -673,72 +739,15 @@ def test_each_engine_says_when_its_own_reviewer_runs(monkeypatch):
     assert [cli.engine_reviews("s", w) for w in ("", "default", "acceptEdits", "plan")] == [False] * 4
     assert direct.engine_reviews("s", "auto") is False
 
-    local = MagicMock(review_turn=True)
-    monkeypatch.setitem(codex_session._codex_sessions, "codex-local", local)
-    assert codex.engine_reviews("codex-local", "default") is True
-    assert codex.engine_reviews("codex-local", "bypassPermissions") is False
-    assert codex.engine_reviews("codex-local", "") is False
-    local.review_turn = False
-    assert codex.engine_reviews("codex-local", "default") is False
-
     remote = MagicMock()
-    remote._sessions = {"codex-remote": MagicMock(mode="autoReview", machine_id="m1")}
-    cm = MagicMock()
+    remote._sessions = {"codex-remote": MagicMock(mode="autoReview")}
     monkeypatch.setattr(session_manager, "_get_remote_layer", lambda: remote)
-    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
-    cm.satellite_version.return_value = "0.5.156"
     assert codex.engine_reviews("codex-remote", "default") is True
-    cm.satellite_version.return_value = "0.5.155"
-    assert codex.engine_reviews("codex-remote", "default") is False
-    cm.satellite_version.return_value = "0.5.156"
+    assert codex.engine_reviews("codex-remote", "bypassPermissions") is False
+    assert codex.engine_reviews("codex-remote", "") is False
     remote._sessions["codex-remote"].mode = "ask"
     assert codex.engine_reviews("codex-remote", "default") is False
-
-
-def test_the_cli_gets_its_own_word_for_a_mode_change(monkeypatch):
-    """A change queued during a turn carries the platform's word; Claude
-    Code is sent its own (Auto is its auto mode, Ask its default)."""
-    import asyncio
-    from unittest.mock import AsyncMock, MagicMock
-
-    from core.layers.cli import layer as cli_layer
-    session = MagicMock()
-    session.send_control_request = AsyncMock(return_value={})
-    session.lock = asyncio.Lock()
-
-    async def _session(sid):
-        return session
-    monkeypatch.setattr(cli_layer, "get_persistent_session", _session)
-    cli = get_all_layers()["claude-code-cli"]
-
-    async def run():
-        await cli.send_control_request("s", "set_permission_mode", mode="autoReview")
-        await cli.send_control_request("s", "set_permission_mode", mode="ask")
-        await cli.change_mode("s", "acceptEdits")
-        await cli.send_control_request("s", "set_model", model="m")
-    asyncio.run(run())
-    assert [c.args + tuple(sorted(c.kwargs.items())) for c in session.send_control_request.call_args_list] == [
-        ("set_permission_mode", ("mode", "auto")), ("set_permission_mode", ("mode", "default")),
-        ("set_permission_mode", ("mode", "auto")), ("set_model", ("model", "m"))]
-
-
-def test_a_satellite_before_1_9_gets_the_words_before_1_9():
-    """An older satellite runs today's Ask and today's Accept Edits under the
-    words it knows; a 0.5.156 one gets the current words."""
-    from unittest.mock import MagicMock
-
-    from core.remote.remote_start_payload import speaks_review_modes, wire_mode
-    cm = MagicMock()
-    words = ("ask", "autoReview", "dontAsk", "plan", "auto", "judge")
-    for version in ("0.5.155", "", "garbage"):
-        cm.satellite_version.return_value = version
-        assert not speaks_review_modes(cm, "m")
-        assert [wire_mode(cm, "m", w) for w in words] == [
-            "default", "acceptEdits", "dontAsk", "plan", "auto", "judge"]
-    for version in ("0.5.156", "0.6.0"):
-        cm.satellite_version.return_value = version
-        assert speaks_review_modes(cm, "m")
-        assert [wire_mode(cm, "m", w) for w in words] == list(words)
+    assert codex.engine_reviews("held-by-nobody", "default") is False
 
 
 def test_installed_name_follows_the_binary():
@@ -775,3 +784,28 @@ def test_a_level_folds_down_onto_a_declared_scale():
     assert fold_effort("xhigh", []) == "xhigh"            # nothing declared: unchanged
     assert fold_effort("low", ["medium", "high"]) == "medium"   # nothing below: the lowest
     assert fold_effort("none", groq) == "none"            # off the ladder: the map decides
+
+
+def test_what_the_live_layer_may_ask_each_engine_for():
+    """The test rig's live layer provokes a behaviour only on an engine that declares
+    it, so a flag flipped to false would turn a broken behaviour into "not
+    supported". The five it reads are pinned here and in the rig's own table
+    (``rig/live/l10_behaviours.py`` ``DECLARED``): a change is made in both."""
+    from core.layers.cli.layer import _CLI_CAPABILITIES
+    from core.layers.codex.layer import _CODEX_CAPABILITIES
+    from core.layers.direct.layer import _DIRECT_CAPABILITIES
+
+    def read(caps):
+        return (caps.supports_subagents, caps.supports_plan_mode, caps.supports_permissions,
+                caps.behaviour.supports_background_commands, caps.behaviour.supports_step_descriptions)
+
+    declared = {caps.name: read(caps) for caps in (_CLI_CAPABILITIES, _CODEX_CAPABILITIES, _DIRECT_CAPABILITIES)}
+    assert declared == {
+        "claude-code-cli": (True, True, True, True, True),
+        "codex-cli": (True, True, True, True, False),
+        "direct-llm": (False, False, True, False, False),
+    }
+    for caps in (_CLI_CAPABILITIES, _CODEX_CAPABILITIES, _DIRECT_CAPABILITIES):
+        assert not caps.behaviour.supports_background_commands or caps.behaviour.supports_bash
+        for key in ("supports_background_commands", "supports_step_descriptions"):
+            assert key in caps.to_dict()["behaviour"]

@@ -32,6 +32,14 @@ precedence = "override"
 SPDX-FileCopyrightText = "2026 Lucide Icons and Contributors"
 SPDX-License-Identifier = "ISC"
 
+# Manrope, the font the README's diagrams are drawn with (maintainers'
+# tooling).
+[[annotations]]
+path = "**/readme-diagrams/src/fonts/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2018 The Manrope Project Authors"
+SPDX-License-Identifier = "OFL-1.1"
+
 # Silero VAD v5.1.2 (snakers4/silero-vad), the phone's voice activity model.
 [[annotations]]
 path = "audio/models/silero_vad.onnx"

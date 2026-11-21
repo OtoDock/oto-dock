@@ -30,6 +30,14 @@ export const MODE_HINT: Record<DepartmentMode, string> = {
   both: 'Each level delegates up and down. Agents on the same level also delegate to each other.',
 }
 
+/** One short line for the install dialog's "How it is set up". */
+export const MODE_SETUP: Record<DepartmentMode, string> = {
+  off: 'The levels do not hand work to each other.',
+  down: 'Each level hands work to the level below.',
+  down_across: 'Each level hands work down and across.',
+  both: 'Every level hands work up, down and across.',
+}
+
 /** The lower-case words for summary lines. */
 export const MODE_SUMMARY: Record<DepartmentMode, string> = {
   off: 'delegation off',

@@ -10,7 +10,7 @@ Run: cd proxy && venv/bin/pytest tests/mcp/test_meetings_context.py -v
 
 from __future__ import annotations
 
-from services.mcp import dynamic_context
+from services.mcp import dynamic_context, dynamic_providers
 from storage.agents import agent_store
 from storage.identity import db_users
 
@@ -76,7 +76,7 @@ class TestMeetingsProvider:
         many = [
             {"slug": f"a{i}", "display_name": f"A{i}",
              "description": "", "role": "viewer"}
-            for i in range(dynamic_context._MEETINGS_ACCESS_CAP + 5)
+            for i in range(dynamic_providers._MEETINGS_ACCESS_CAP + 5)
         ]
         out = dynamic_context._meetings_mcp_context(
             "pa", delegation_targets=["pa"], meetings_access=many)

@@ -1,14 +1,15 @@
 """App steps (APPS.md "Steps"): a handler whose name is in the manifest's
-``steps`` block runs a script where the agent's sessions run — the local
-sandbox with the app identity's mount row, or the machine
-``resolve_execution_target`` names — instead of the server route. No model,
-no MCP, never ``/config``; the approval is the authority (the script's
-sha256 is in the signed manifest and is checked against the live release at
-every fire, and only those verified bytes run: a local step sees no other
-file of the release, as a machine is sent only the script); the verdict is
-the exit code, kept on the delivery with the
-first 32 KB of output; a finished step wakes the server handlers subscribed
-to ``step:<name>`` through the ordinary event path.
+``steps`` block runs a script where the agent's sessions run, instead of
+the server route: the compute machine that serves the platform's place, in
+the sandbox with the app identity's mount row, or the machine
+``resolve_execution_target`` names. No model, no MCP, never ``/config``.
+The approval is the authority: the script's sha256 is in the signed
+manifest and is checked against the live release at every fire, and only
+those verified bytes run. A step on a compute machine sees no other file
+of the release, as a paired machine is sent only the script. The verdict
+is the exit code, kept on the delivery with the first 32 KB of output. A
+finished step wakes the server handlers subscribed to ``step:<name>``
+through the ordinary event path.
 
 Where things run mirrors sessions: a shared app's step is an agent-scoped
 run (the approver's provenance decides knowledge RW and, on manager
@@ -24,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,7 +51,7 @@ CLAIM_MARGIN_S = 60
 OFFLINE_REARM_S = 300
 OUTPUT_KEEP_BYTES = deliveries.STEP_OUTPUT_KEEP_BYTES
 STEPS_DIR_NAME = "steps"
-# The folder of a local run's scratch directory the verified script is
+# The folder of a compute run's scratch directory the verified script is
 # staged into, mounted read-only at ``/app``.
 STAGED_DIR_NAME = "app"
 # The task type a step's OTO_* env names (no session, no model).
@@ -59,7 +59,6 @@ TASK_TYPE = "step"
 
 argv_for = _runner.argv_for
 scrub = _runner.scrub
-_output_text = _runner.output_text
 REDACTED = _runner.REDACTED
 
 
@@ -101,7 +100,7 @@ class StepPlan:
     script: bytes
     identity: object          # core.config.task_config_builder.TaskIdentity
     vis: object               # core.session.visibility.VisibilityResolution
-    target: str               # placement.LOCAL or a machine id
+    target: str               # a machine id
     credential_env: dict
     workspace_relative: str   # "workspace" or "users/<u>/workspace"
     knowledge_relative: str   # "knowledge" or "" (Personal-only: no shared trees)
@@ -146,9 +145,21 @@ def placement_for(row: dict, identity) -> str:
     target, reason = resolve_execution_target(
         row.get("agent") or "", identity.creds_user_sub or None, identity.role)
     if placement.is_offline_sentinel(target):
-        raise StepUnavailable("the machine is offline")
+        from services.remote import machine_away
+        raise StepUnavailable(machine_away.away_sentence(
+            placement.offline_machine_of(target), "", "the machine is offline"))
     if reason:
         logger.info("App step on %s: placement %s (%s)", row.get("slug"), target[:8], reason)
+    if placement.is_local(target):
+        # The platform's place is the compute machine that serves it, as it
+        # is for a session; its folders are the platform's, so nothing syncs.
+        # With none the step waits for one, as for a machine that is offline:
+        # the platform runs no step itself.
+        from services.apps import app_compute
+        machine = app_compute.place()
+        if machine is None:
+            raise StepUnavailable("the machine is offline")
+        return str(machine["id"])
     return target
 
 
@@ -292,7 +303,7 @@ def _spec_for(plan: StepPlan, claim: str) -> ScriptSpec:
     env = step_env(plan, claim)
     env["OTO_TASK_TYPE"] = TASK_TYPE
     staged = None
-    if placement.is_local(plan.target):
+    if _on_compute(plan.target):
         if releases.live_release_dir(row) is None:
             raise StepRefused("the app has no live release")
         staged = _stage_script(row, d["id"], plan.run, plan.script)
@@ -313,10 +324,11 @@ def _spec_for(plan: StepPlan, claim: str) -> ScriptSpec:
     )
 
 
-def _build_local(plan: StepPlan, claim: str) -> tuple[list[str], dict[str, str], Path]:
-    """The argv, the env and the scratch directory of a local run (the
-    tests read it; the runner is what runs it)."""
-    return _runner.build_local(_spec_for(plan, claim))
+def _on_compute(target: str) -> bool:
+    """A compute machine shares the agent's folder, so its step is staged
+    there. A paired machine is sent the script's bytes."""
+    from core.remote.satellite_connection import get_connection_manager
+    return get_connection_manager().is_compute(target)
 
 
 def _convert(res: _runner.ScriptResult) -> StepResult:
@@ -324,24 +336,9 @@ def _convert(res: _runner.ScriptResult) -> StepResult:
                       ran_on=res.ran_on, seconds=res.seconds)
 
 
-async def run_local(plan: StepPlan, claim: str) -> StepResult:
-    try:
-        spec = await asyncio.to_thread(_spec_for, plan, claim)
-        return _convert(await _runner.run_local(spec))
-    except ScriptRefused as e:
-        raise StepRefused(e.reason) from e
-    except ScriptUnavailable as e:
-        raise StepUnavailable(e.reason) from e
-    finally:
-        # The runner removes the scratch directory after a run; a run that
-        # never started leaves the staged script there otherwise.
-        await asyncio.to_thread(
-            shutil.rmtree, _local_step_dir(plan.row, plan.delivery["id"]), True)
-
-
 async def run_remote(plan: StepPlan, claim: str, machine_id: str) -> StepResult:
-    """One ``step_run`` frame to the machine; the ack carries the verdict
-    (satellite 0.5.122). What the script prints streams into the app log."""
+    """One ``step_run`` frame to the machine; the ack carries the verdict.
+    What the script prints streams into the app log."""
     from services.apps import app_supervisor
     row = plan.row
 
@@ -353,9 +350,13 @@ async def run_remote(plan: StepPlan, claim: str, machine_id: str) -> StepResult:
         spec.on_output = _on_output
         return _convert(await _runner.run_remote(spec, machine_id))
     except ScriptRefused as e:
-        raise StepRefused(e.reason.replace("too old for scripts", "too old for steps")) from e
+        raise StepRefused(e.reason) from e
     except ScriptUnavailable as e:
         raise StepUnavailable(e.reason) from e
+    finally:
+        # A compute run staged its script; a paired run has nothing there.
+        await asyncio.to_thread(
+            _runner.remove_run_folder, row["agent"], _local_step_dir(row, plan.delivery["id"]))
 
 
 # ── the fire ────────────────────────────────────────────────────────────────
@@ -425,10 +426,7 @@ async def fire(d: dict, row: dict) -> None:
     d["started_at"] = _now_iso()
     await _run_update(d, status=run_status.RUNNING, started_at=d["started_at"])
     try:
-        if placement.is_local(plan.target):
-            result = await run_local(plan, claim)
-        else:
-            result = await run_remote(plan, claim, plan.target)
+        result = await run_remote(plan, claim, plan.target)
         result.output = scrub(result.output, secrets_of(plan, claim))
     except StepRefused as e:
         await _record(d, deliveries.DEAD, None, e.reason)
@@ -447,7 +445,7 @@ async def fire(d: dict, row: dict) -> None:
         status = deliveries.DEAD
         reason = f"exit {result.exit_code}" + (f": {tail}" if tail else "")
     await _record(d, status, result, reason)
-    where = "the sandbox" if placement.is_local(result.ran_on) else f"machine {result.ran_on[:8]}"
+    where = "the sandbox" if _on_compute(result.ran_on) else f"machine {result.ran_on[:8]}"
     try:
         await app_supervisor.append_log(
             row, f"[{_now_iso()}] step {d['handler']}: {status} ({reason or 'exit 0'}) "

@@ -1,0 +1,465 @@
+[
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-queue",
+    "streaming",
+    {
+     "agent": "term-queue"
+    }
+   ]
+  ],
+  "slot_acquired": [
+   [
+    "sid-queue",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-queue": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_title_timer",
+     "_run_midturn_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "a turn is open",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_fire_title_timer",
+    30.0
+   ],
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "injected": [],
+  "item_keys": [
+   "agent",
+   "chat_id",
+   "on_injected",
+   "source",
+   "text"
+  ],
+  "state": {
+   "sid-queue": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": "turn_open",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [
+     "first result",
+     "second result",
+     "third result"
+    ],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer",
+     "_run_midturn_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "queued while busy",
+  "timers": [
+   [
+    "_fire_inject_backstop",
+    5.0
+   ]
+  ]
+ },
+ {
+  "answers": [
+   true,
+   false
+  ],
+  "state": {
+   "sid-queue": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": "turn_open",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [
+     "first result",
+     "second result"
+    ],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer",
+     "_run_midturn_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "a queued prompt is cancelled"
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-queue",
+    "ready",
+    {
+     "agent": "term-queue"
+    }
+   ]
+  ],
+  "state": {
+   "sid-queue": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": "turn_open",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [
+     "first result",
+     "second result"
+    ],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "<lambda>",
+     "_fire_inject_backstop",
+     "_fire_title_timer"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the turn closes: a drain is kicked",
+  "timers": [
+   [
+    "<lambda>",
+    2.1
+   ]
+  ],
+  "turn_end": [
+   [
+    "sid-queue",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-queue",
+    "streaming",
+    {
+     "agent": "term-queue"
+    }
+   ]
+  ],
+  "injected": [
+   "first"
+  ],
+  "pty": [
+   "first result"
+  ],
+  "state": {
+   "sid-queue": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [
+     "second result"
+    ],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_submit",
+     "_fire_submit",
+     "_fire_title_timer",
+     "_run_midturn_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "the drain injects the head: the body, the turn opens",
+  "timers": [
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ],
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "\r"
+  ],
+  "state": {
+   "sid-queue": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [
+     "second result"
+    ],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer",
+     "_run_midturn_tail",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "its Enter",
+  "timers": [
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ]
+  ]
+ },
+ {
+  "state": {
+   "sid-queue": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": "turn_open",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [
+     "second result"
+    ],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer",
+     "_run_midturn_tail",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "one item per turn: the next is held"
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-queue",
+    "ready",
+    {
+     "agent": "term-queue"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-queue",
+    "streaming",
+    {
+     "agent": "term-queue"
+    }
+   ]
+  ],
+  "pty": [
+   "second result",
+   "\r"
+  ],
+  "second_item": [
+   "chat_id",
+   "note",
+   "source",
+   "text"
+  ],
+  "state": {
+   "sid-queue": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": true,
+    "has_viewer": true,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer",
+     "_run_midturn_tail",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "the second turn's close drains the second",
+  "timers": [
+   [
+    "<lambda>",
+    2.1
+   ],
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ],
+   [
+    "_run_midturn_tail",
+    1.0
+   ],
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ]
+  ],
+  "turn_end": [
+   [
+    "sid-queue",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ }
+]

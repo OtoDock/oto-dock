@@ -9,6 +9,7 @@ delivers is the engine's full file content; this module never shapes it.
 
 import json
 import stat
+from unittest.mock import patch
 
 import pytest
 
@@ -21,6 +22,7 @@ CODEX_FILE = {"auth_mode": "chatgpt", "tokens": {"access_token": "t", "refresh_t
 
 def _clean():
     tf._targets.clear()
+    tf._missed.clear()
 
 
 class TestWriter:
@@ -46,6 +48,43 @@ class TestWriter:
         target = tmp_path / "users" / "alice" / ".codex"
         tf.write_credential_file(target, "auth.json", CODEX_FILE)
         assert json.loads((target / "auth.json").read_text()) == CODEX_FILE
+
+    def test_a_missing_folder_beneath_an_agent_is_made_with_no_link_followed(self, tmp_path, monkeypatch):
+        """In an agent's folder the writer makes a missing folder beneath the
+        agent's real folder: a folder link above it refuses the write, and
+        the folder the link names gets nothing."""
+        import config as app_config
+        agents = tmp_path / "agents"
+        monkeypatch.setattr(app_config, "AGENTS_DIR", agents)
+        (agents / "pa" / "users").mkdir(parents=True)
+        tf.write_credential_file(agents / "pa" / "users" / "bob" / ".codex", "auth.json", CODEX_FILE)
+        assert json.loads((agents / "pa" / "users" / "bob" / ".codex" / "auth.json").read_text()) == CODEX_FILE
+        stand_in = tmp_path / "stand-in"
+        stand_in.mkdir()
+        (agents / "pa" / "users" / "alice").symlink_to(stand_in)
+        with pytest.raises(OSError):
+            tf.write_credential_file(agents / "pa" / "users" / "alice" / ".codex", "auth.json", CODEX_FILE)
+        assert list(stand_in.iterdir()) == []
+
+    def test_a_renewal_after_a_sessions_close_makes_no_home(self, tmp_path):
+        """A session's home is made by its start alone: the writer makes no
+        home that is gone, and the fan-out skips one with its line."""
+        store = tmp_path / "users" / "alice" / ".claude"
+        home = store / "own" / "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+        with pytest.raises(OSError):
+            tf.write_credential_file(home, ".credentials.json", CLAUDE_FILE)
+        assert not (store / "own").exists()
+        _clean()
+        tf.register_session_target("s-gone", tf.CredentialFileTarget(layer="claude-code-cli", host_dir=str(home)))
+        written: list[str] = []
+        with patch.object(tf, "write_credential_file", wraps=tf.write_credential_file) as writer:
+            tf.fan_out(["s-gone"], layer="claude-code-cli", payload=CLAUDE_FILE, on_written=written.append)
+        writer.assert_not_called()
+        assert written == [] and not (store / "own").exists()
+        home.mkdir(parents=True)
+        tf.fan_out(["s-gone"], layer="claude-code-cli", payload=CLAUDE_FILE, on_written=written.append)
+        assert written == ["s-gone"] and json.loads((home / ".credentials.json").read_text()) == CLAUDE_FILE
+        _clean()
 
 
 class TestCredentialFileSpec:
@@ -123,15 +162,16 @@ class TestFanOut:
         assert not (tmp_path / "auth.json").exists()
         assert not (tmp_path / ".credentials.json").exists()
 
-    def test_remote_targets_skipped_without_loop(self):
+    def test_remote_targets_skipped_without_loop(self, monkeypatch):
         # No captured event loop (unit-test context) → remote push is skipped
-        # with a log line, never raises, never calls back.
+        # with a log line, never raises, never calls back. An earlier test's
+        # app startup leaves its closed loop here.
+        monkeypatch.setattr(tf, "_loop", None)
         tf.register_session_target("s1", tf.CredentialFileTarget(
             layer="claude-code-cli", machine_id="m1", agent_name="agent",
             dir_relative="users/u/.claude",
         ))
         written = []
-        assert tf._loop is None
         tf.fan_out(["s1"], layer="claude-code-cli", payload=CLAUDE_FILE,
                    on_written=written.append)
         assert written == []
@@ -217,6 +257,328 @@ class TestFanOut:
                    return_value=cm):
             asyncio.run(run())
         assert written == []
+
+
+def test_a_push_the_machine_answers_session_gone_is_not_written():
+    """The satellite answers a push for a home that is gone with ``ok`` and a
+    note: nothing was written, so the session's snapshot does not move."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    cm = MagicMock()
+    cm.is_connected.return_value = True
+    cm.send_command = AsyncMock(return_value={"type": "ack", "status": "ok", "note": "session gone, not written"})
+    written: list[str] = []
+
+    async def run():
+        await tf._push_remote("m1", "agent", "users/u/.claude/own/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+                              "claude", {"claudeAiOauth": {}}, ["s1"], written.append)
+
+    with patch("core.remote.satellite_connection.get_connection_manager", return_value=cm):
+        asyncio.run(run())
+    assert written == []
+    cm.send_command = AsyncMock(return_value={"type": "ack", "status": "ok"})
+    with patch("core.remote.satellite_connection.get_connection_manager", return_value=cm):
+        asyncio.run(run())
+    assert written == ["s1"]
+
+
+class TestAMachineThatMissedAPush:
+    """A renewal reaches a paired machine's sessions by a push. One that
+    finds the machine away is owed: the machine's next sign-in pushes the
+    account's current sign-in to those sessions, before the five-minute
+    worker would look. One owner, the fan-out, asks the pool for it."""
+
+    HOME = "workspace/.claude/own/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+    def setup_method(self):
+        _clean()
+
+    def teardown_method(self):
+        _clean()
+
+    def _target(self, sid="s1", machine="m1", rel=None):
+        tf.register_session_target(sid, tf.CredentialFileTarget(
+            layer="claude-code-cli", machine_id=machine, agent_name="agent", dir_relative=rel or self.HOME))
+
+    def _machine(self, *, connected=True, answer=None, fails=False):
+        from unittest.mock import AsyncMock, MagicMock
+        cm = MagicMock()
+        cm.is_connected.return_value = connected
+        cm.send_command = AsyncMock(side_effect=RuntimeError("the link dropped") if fails else None,
+                                    return_value=answer or {"type": "ack", "status": "ok"})
+        return cm
+
+    async def _renewal(self, cm, written, sids=("s1",), rel=None):
+        with patch("core.remote.satellite_connection.get_connection_manager", return_value=cm):
+            await tf._push_remote("m1", "agent", rel or self.HOME, "claude", {"claudeAiOauth": {"accessToken": "new"}},
+                                  list(sids), written.append)
+
+    def _pool(self, monkeypatch, cm, written, bound=None):
+        """The pool's side: who a session is bound to, and its push of the
+        account's stored sign-in, run here as the fan-out's own push."""
+        import asyncio
+
+        from services.engines import subscription_pool as pool
+        asked: list[tuple[str, list[str]]] = []
+        loop = asyncio.get_running_loop()
+
+        def _fan_out_current_token(sub_id, only=None):
+            asked.append((sub_id, sorted(only or [])))
+            for sid in only or []:
+                t = tf.session_target(sid)
+                asyncio.run_coroutine_threadsafe(self._renewal(cm, written, (sid,), t.dir_relative), loop).result(5)
+        monkeypatch.setattr(pool, "bound_attribution", lambda sid: ((bound or {}).get(sid, "sub-1"), None))
+        monkeypatch.setattr(pool, "fan_out_current_token", _fan_out_current_token)
+        return asked
+
+    @pytest.mark.asyncio
+    async def test_a_machine_away_at_the_renewal_gets_the_sign_in_when_it_signs_in(self, monkeypatch):
+        self._target()
+        written: list[str] = []
+        await self._renewal(self._machine(connected=False), written)
+        assert written == [] and tf._missed == {"m1": {"s1"}}
+        back = self._machine()
+        asked = self._pool(monkeypatch, back, written)
+        await tf.machine_signed_in("m1")
+        assert asked == [("sub-1", ["s1"])]
+        assert written == ["s1"] and not tf._missed
+        frame = back.send_command.call_args.args[1]
+        assert frame["type"] == "credentials_update" and frame["dir_relative"] == self.HOME
+        # Nothing is owed any more: the next sign-in asks nobody.
+        await tf.machine_signed_in("m1")
+        assert asked == [("sub-1", ["s1"])]
+
+    @pytest.mark.asyncio
+    async def test_a_push_that_failed_is_owed_too_and_a_second_sign_in_pays_it(self, monkeypatch):
+        """The link dropped under the push, and again under the first
+        sign-in's push: the session stays owed until one lands."""
+        self._target()
+        written: list[str] = []
+        await self._renewal(self._machine(fails=True), written)
+        assert tf._missed == {"m1": {"s1"}}
+        asked = self._pool(monkeypatch, self._machine(fails=True), written)
+        await tf.machine_signed_in("m1")
+        assert written == [] and tf._missed == {"m1": {"s1"}} and len(asked) == 1
+        asked = self._pool(monkeypatch, self._machine(), written)
+        await tf.machine_signed_in("m1")
+        assert written == ["s1"] and not tf._missed and asked == [("sub-1", ["s1"])]
+
+    @pytest.mark.asyncio
+    async def test_a_push_that_failed_with_the_link_up_is_paid_by_the_workers_next_round(self, monkeypatch):
+        """No sign-in follows a push that failed while the machine stayed
+        signed in. The worker's round names the session to the pool's call,
+        which sends it in its one list of the round: once, and never again
+        when it landed. A machine that is away is asked nothing."""
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from services.engines import subscription_pool as pool
+        self._target()
+        written: list[str] = []
+        await self._renewal(self._machine(fails=True), written)
+        assert tf._missed == {"m1": {"s1"}}
+        up = self._machine()
+        rounds: list[frozenset[str]] = []
+        loop = asyncio.get_running_loop()
+
+        def _fresh(sub_id, runway, owed=frozenset()):
+            rounds.append(frozenset(owed))
+            for sid in sorted(owed):
+                asyncio.run_coroutine_threadsafe(self._renewal(up, written, (sid,)), loop).result(5)
+            return True
+        monkeypatch.setattr("services.engines.subscription_windows.poll_due", AsyncMock(return_value=0))
+        monkeypatch.setattr(pool, "rebind_delisted_sessions", lambda: 0)
+        monkeypatch.setattr(pool, "rebalance_scopes", lambda: None)
+        monkeypatch.setattr(pool, "bound_oauth_subscription_ids", lambda: {"sub-1"})
+        monkeypatch.setattr(pool, "within_boot_grace", lambda: True)
+        monkeypatch.setattr(pool, "ensure_fresh_and_fan_out", _fresh)
+        with patch("core.remote.satellite_connection.get_connection_manager",
+                   return_value=self._machine(connected=False)):
+            await tf._tick()
+        assert rounds == [frozenset()] and written == [] and tf._missed == {"m1": {"s1"}}
+        with patch("core.remote.satellite_connection.get_connection_manager", return_value=up):
+            await tf._tick()
+            assert rounds[-1] == {"s1"} and written == ["s1"] and not tf._missed
+            await tf._tick()
+        assert rounds[-1] == frozenset() and written == ["s1"] and up.send_command.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_ended_meanwhile_gets_nothing(self, monkeypatch):
+        self._target("s1")
+        self._target("s2", rel="workspace/.claude/own/11111111-2222-3333-4444-555555555555")
+        written: list[str] = []
+        away = self._machine(connected=False)
+        await self._renewal(away, written, ("s1",))
+        await self._renewal(away, written, ("s2",), "workspace/.claude/own/11111111-2222-3333-4444-555555555555")
+        assert tf._missed == {"m1": {"s1", "s2"}}
+        tf.unregister_session_target("s1")
+        assert tf._missed == {"m1": {"s2"}}
+        back = self._machine()
+        asked = self._pool(monkeypatch, back, written)
+        await tf.machine_signed_in("m1")
+        assert asked == [("sub-1", ["s2"])] and written == ["s2"]
+        assert back.send_command.call_count == 1
+        # The last one ends too: the machine's entry goes with it.
+        self._target("s3")
+        await self._renewal(away, written, ("s3",))
+        tf.unregister_session_target("s3")
+        assert not tf._missed
+        await tf.machine_signed_in("m1")
+        assert len(asked) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_session_gone_on_the_machine_or_unbound_is_owed_nothing(self, monkeypatch):
+        """The machine answers "session gone, not written": nothing is owed.
+        A session bound to no account at the sign-in is asked of nobody."""
+        self._target()
+        written: list[str] = []
+        await self._renewal(self._machine(connected=False), written)
+        await self._renewal(self._machine(answer={"type": "ack", "status": "ok",
+                                                  "note": "session gone, not written"}), written)
+        assert not tf._missed and written == []
+        await self._renewal(self._machine(connected=False), written)
+        asked = self._pool(monkeypatch, self._machine(), written, bound={"s1": None})
+        await tf.machine_signed_in("m1")
+        assert asked == [] and written == [] and not tf._missed
+
+    @pytest.mark.asyncio
+    async def test_a_later_push_that_lands_settles_the_debt(self, monkeypatch):
+        """The five-minute worker reached the session first: the sign-in
+        after it asks nobody."""
+        self._target()
+        written: list[str] = []
+        await self._renewal(self._machine(connected=False), written)
+        await self._renewal(self._machine(), written)
+        assert written == ["s1"] and not tf._missed
+        asked = self._pool(monkeypatch, self._machine(), written)
+        await tf.machine_signed_in("m1")
+        assert asked == []
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_moved_to_another_machine_is_not_pushed_for_the_old_one(self, monkeypatch):
+        self._target()
+        written: list[str] = []
+        await self._renewal(self._machine(connected=False), written)
+        self._target(machine="m2")
+        asked = self._pool(monkeypatch, self._machine(), written)
+        await tf.machine_signed_in("m1")
+        assert asked == [] and written == []
+
+    @pytest.mark.asyncio
+    async def test_a_store_that_cannot_be_read_at_the_sign_in_keeps_the_debt(self, monkeypatch):
+        import psycopg
+
+        from services.engines import subscription_pool as pool
+        self._target()
+        written: list[str] = []
+        await self._renewal(self._machine(connected=False), written)
+
+        def _down(sub_id, only=None):
+            raise psycopg.OperationalError("the database is away")
+        monkeypatch.setattr(pool, "bound_attribution", lambda sid: ("sub-1", None))
+        monkeypatch.setattr(pool, "fan_out_current_token", _down)
+        await tf.machine_signed_in("m1")
+        assert tf._missed == {"m1": {"s1"}}
+
+    @pytest.mark.asyncio
+    async def test_each_account_is_asked_for_its_own_sessions(self, monkeypatch):
+        other = "workspace/.claude/own/11111111-2222-3333-4444-555555555555"
+        self._target("s1")
+        self._target("s2", rel=other)
+        written: list[str] = []
+        away = self._machine(connected=False)
+        await self._renewal(away, written, ("s1",))
+        await self._renewal(away, written, ("s2",), other)
+        asked = self._pool(monkeypatch, self._machine(), written, bound={"s1": "sub-1", "s2": "sub-2"})
+        await tf.machine_signed_in("m1")
+        assert sorted(asked) == [("sub-1", ["s1"]), ("sub-2", ["s2"])] and sorted(written) == ["s1", "s2"]
+
+    @pytest.mark.asyncio
+    async def test_the_catch_up_asks_the_pools_own_maps_and_never_the_store(self, monkeypatch):
+        """Who a session is bound to is read from the maps the pool holds in
+        memory. A session they do not hold is asked of nobody: the pool
+        pushes only to sessions those maps hold, so the store's answer never
+        led to a push and only cost a read on the loop."""
+        from services.engines import pool_bindings, subscription_pool as pool
+        self._target()
+        written: list[str] = []
+        away = self._machine(connected=False)
+        await self._renewal(away, written)
+        reads: list[str] = []
+        asked: list[str] = []
+        monkeypatch.setattr(pool_bindings.subscription_store, "get_session_binding",
+                            lambda sid: reads.append(sid) or {"subscription_id": "sub-1"})
+        monkeypatch.setattr(pool, "fan_out_current_token", lambda sub_id, only=None: asked.append(sub_id))
+        await tf.machine_signed_in("m1")
+        assert reads == [] and asked == []
+        await self._renewal(away, written)
+        monkeypatch.setitem(pool._session_subscriptions, "s1", "sub-1")
+        await tf.machine_signed_in("m1")
+        assert reads == [] and asked == ["sub-1"]
+
+    @pytest.mark.asyncio
+    async def test_a_push_whose_send_fails_after_the_sessions_end_owes_nothing(self):
+        """The note keeps a session only while it is registered. This is the
+        rule that bounds it: a push that fails after its session ended
+        leaves nothing behind for a sign-in that may never come."""
+        from unittest.mock import AsyncMock, MagicMock
+        self._target()
+        cm = MagicMock()
+        cm.is_connected.return_value = True
+
+        async def _send(machine_id, frame, timeout=15.0):
+            tf.unregister_session_target("s1")
+            raise RuntimeError("the link dropped")
+        cm.send_command = AsyncMock(side_effect=_send)
+        written: list[str] = []
+        await self._renewal(cm, written)
+        assert written == [] and tf._missed == {}
+
+    @pytest.mark.asyncio
+    async def test_one_accounts_failed_read_keeps_it_owed_and_the_next_account_is_still_asked(self, monkeypatch):
+        """Two accounts have sessions on one machine. The first account's
+        stored sign-in cannot be read at the sign-in: its session stays
+        owed, and the second account's session gets its sign-in all the
+        same."""
+        import psycopg
+
+        from services.engines import subscription_pool as pool
+        other = "workspace/.claude/own/11111111-2222-3333-4444-555555555555"
+        self._target("s1")
+        self._target("s2", rel=other)
+        written: list[str] = []
+        away = self._machine(connected=False)
+        await self._renewal(away, written, ("s1",))
+        await self._renewal(away, written, ("s2",), other)
+        self._pool(monkeypatch, self._machine(), written, bound={"s1": "sub-1", "s2": "sub-2"})
+        works = pool.fan_out_current_token
+        seen: list[str] = []
+
+        def _the_first_cannot_be_read(sub_id, only=None):
+            seen.append(sub_id)
+            if len(seen) == 1:
+                raise psycopg.OperationalError("the database is away")
+            works(sub_id, only)
+        monkeypatch.setattr(pool, "fan_out_current_token", _the_first_cannot_be_read)
+        await tf.machine_signed_in("m1")
+        assert sorted(seen) == ["sub-1", "sub-2"]
+        owed, paid = ("s1", "s2") if seen[0] == "sub-1" else ("s2", "s1")
+        assert tf._missed == {"m1": {owed}} and written == [paid]
+
+    @pytest.mark.asyncio
+    async def test_a_compute_machine_on_the_platforms_disk_is_written_at_once_and_owed_nothing(
+            self, tmp_path, monkeypatch):
+        """Its sessions' files are the platform's own: a renewal writes them
+        with no push, so its sign-in finds nothing owed and asks nobody."""
+        tf.register_session_target("s1", tf.CredentialFileTarget(layer="claude-code-cli", host_dir=str(tmp_path)))
+        written: list[str] = []
+        tf.fan_out(["s1"], layer="claude-code-cli", payload=CLAUDE_FILE, on_written=written.append)
+        assert written == ["s1"] and json.loads((tmp_path / ".credentials.json").read_text()) == CLAUDE_FILE
+        assert not tf._missed
+        asked = self._pool(monkeypatch, self._machine(), written)
+        await tf.machine_signed_in("compute-beside")
+        assert asked == []
 
 
 class TestExpectedSubGuard:

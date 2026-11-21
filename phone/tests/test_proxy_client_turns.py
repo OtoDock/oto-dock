@@ -188,3 +188,33 @@ def test_the_daemons_own_close_is_not_a_loss():
 
 async def _async_noop(*a, **kw):
     return None
+
+
+def test_an_error_frame_is_spoken_in_the_platforms_words_when_it_sends_them():
+    """The platform writes one line for a caller when an engine stopped and
+    the next turn starts it again (``data.say``): the caller hears that line.
+    With none, with an empty one or with one too long to speak, the caller
+    hears the apology, as from a platform that knows no such field."""
+    from proxy.client import spoken_error
+    say = "Sorry, I had to stop for a moment. Could you say that again?"
+    assert spoken_error({"message": "⚠ This chat used too much memory.", "say": say}) == say
+    assert spoken_error({"message": "⚠ The engine reported an error."}) == "Sorry, I encountered an error."
+    assert spoken_error({"say": "   "}) == "Sorry, I encountered an error."
+    assert spoken_error({"say": "x" * 201}) == "Sorry, I encountered an error."
+    assert spoken_error({"say": ["not", "text"]}) == "Sorry, I encountered an error."
+    assert spoken_error(None) == "Sorry, I encountered an error."
+    # A spoken conversation keeps its own apology and says the same line.
+    assert spoken_error({"message": "x"}, "Sorry, I hit an error handling that.") == "Sorry, I hit an error handling that."
+    assert spoken_error({"say": say}, "Sorry, I hit an error handling that.") == say
+
+    async def run():
+        c = _client()
+        ws = c._ws
+        ws.push({"type": "error", "turn": 1, "data": {"message": "⚠ memory", "say": say}})
+        c._recv_task = asyncio.create_task(c._recv_loop())
+        chunks = [chunk async for chunk in c._ws_send_message("hello")]
+        ws.end()
+        await c._recv_task
+        return chunks
+
+    assert asyncio.run(run()) == [say]

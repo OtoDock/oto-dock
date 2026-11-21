@@ -563,6 +563,31 @@ def _apply_schema(conn) -> None:
         _schema_stats["after"].append(_previous_test)
 
 
+_STREAM_READS = (".stdout.read", ".stderr.read", ".stdout.readline", ".stderr.readline",
+                 ".stdout.readexactly", ".stdout.readuntil")
+
+
+@pytest.fixture(autouse=True)
+def _fake_streams_answer_bytes(monkeypatch):
+    """A fake process's stream that answers a read with anything but bytes
+    fails the test at once. An ``AsyncMock`` process answers every read with
+    a mock, never ``b""``: a reader looping to end-of-stream on it spins and
+    records every call, and one test grew a worker to 13 GB that way
+    (2026-11-11). Give the fake a real ``asyncio.StreamReader``, fed and
+    closed with ``feed_eof()``."""
+    from unittest import mock
+    execute = mock.AsyncMockMixin._execute_mock_call
+
+    async def _checked(self, /, *args, **kwargs):
+        result = await execute(self, *args, **kwargs)
+        if not isinstance(result, (bytes, bytearray)) and self._extract_mock_name().endswith(_STREAM_READS):
+            raise AssertionError(
+                f"{self._extract_mock_name()} answered {type(result).__name__}, not bytes: give the "
+                "fake process a real asyncio.StreamReader (feed_data, then feed_eof)")
+        return result
+    monkeypatch.setattr(mock.AsyncMockMixin, "_execute_mock_call", _checked)
+
+
 @pytest.fixture(autouse=True)
 def _no_remembered_resume_targets():
     """The remote resume keeps the targets its probes resolved for two
@@ -579,9 +604,31 @@ def _no_exit_failsafe():
     hard-exit failsafe: a daemon timer that os._exit(3)s the process three
     seconds later, here an xdist worker in the middle of a later test. The
     failsafe's own tests arm it by hand."""
-    import startup
-    startup._ARM_EXIT_FAILSAFE = False
+    import startup_shutdown
+    startup_shutdown._ARM_EXIT_FAILSAFE = False
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_egress_proxy(monkeypatch):
+    """The runner's own proxy variables never reach a test: a client that
+    reads the environment would send a test's loopback calls through the
+    runner's proxy. A test of the egress proxy sets its own."""
+    for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _exit_sessions_forgotten():
+    """Every start on a machine a test makes is recorded by the credential
+    exit (the carves, the variables, the machine's door): what one test
+    recorded is forgotten after it, never read by the next."""
+    from core.credentials import credential_exit
+    before = set(credential_exit._sessions)
+    yield
+    for sid in set(credential_exit._sessions) - before:
+        credential_exit.forget(sid)
 
 
 @pytest.fixture(autouse=True)
@@ -597,16 +644,21 @@ def _compose_runs_allowed():
 @pytest.fixture(autouse=True)
 def _platform_running():
     """A test whose app shutdown ran marks the platform ending for the
-    process (pumps then keep a cut turn's open-turn record): each test
-    starts with it running."""
+    process (pumps then keep a cut turn's open-turn record, and new work is
+    held): each test starts with it running and no drain on."""
     import sys
-    pump_module = sys.modules.get("core.events.stream_pump")
-    if pump_module is not None:
-        pump_module._platform_ending = False
+
+    def _running() -> None:
+        pump_module = sys.modules.get("core.events.stream_pump")
+        if pump_module is not None:
+            pump_module._platform_ending = False
+        drain_module = sys.modules.get("core.drain")
+        if drain_module is not None:
+            drain_module.reset_for_tests()
+
+    _running()
     yield
-    pump_module = sys.modules.get("core.events.stream_pump")
-    if pump_module is not None:
-        pump_module._platform_ending = False
+    _running()
 
 
 @pytest.fixture(autouse=True)
@@ -624,6 +676,168 @@ def _catalog_loop_unbound():
         catalog._loop = None
 
 
+def _shared_engine_objects() -> list[tuple[str, object]]:
+    """The objects every test of a worker shares, each by what the guard
+    calls it: every engine, its remote adapter once made
+    (``Engine.remote_adapter``), and the remote layer once made. A stand-in
+    a test registered in their place is its own object and is not read."""
+    import inspect
+    manager = sys.modules.get("core.session.session_manager")
+    shared: list[tuple[str, object]] = []
+    for path, engine in (getattr(manager, "_ENGINES", None) or {}).items():
+        shared.append((f"the {path} engine", engine))
+        adapter = inspect.getattr_static(engine, "_remote_adapter", None)
+        if adapter is not None:
+            shared.append((f"the {path} engine's remote adapter", adapter))
+    layer = getattr(manager, "_remote_layer", None)
+    if layer is not None:
+        shared.append(("the remote layer", layer))
+    return [(label, obj) for label, obj in shared if type(obj).__module__.startswith("core.")]
+
+
+def _shared_engine_classes() -> dict[type, dict[str, object]]:
+    """What each class of a shared object defines now, by name: the classes
+    of ``_shared_engine_objects``, every engine adapter's and the remote
+    layer's (known before an object of them is made), each with its bases
+    in the proxy. A class's own machinery (dunder names, the ABC's cache) is
+    left out: the interpreter writes it. The adapters' and the remote layer's
+    modules are imported here, so a class a test imports first is read before
+    that test too."""
+    import importlib
+    for module in ("core.remote_engine_adapter", "core.remote.remote_execution"):
+        importlib.import_module(module)
+    classes: list[type] = [type(obj) for _label, obj in _shared_engine_objects()]
+    adapters = getattr(sys.modules.get("core.remote_engine_adapter"), "RemoteEngineAdapter", None)
+    pending = [adapters] if adapters is not None else []
+    while pending:
+        klass = pending.pop()
+        classes.append(klass)
+        pending.extend(klass.__subclasses__())
+    layer = getattr(sys.modules.get("core.remote.remote_execution"), "RemoteExecutionLayer", None)
+    if layer is not None:
+        classes.append(layer)
+    return {base: {name: value for name, value in vars(base).items() if not name.startswith(("__", "_abc_"))}
+            for klass in classes for base in klass.__mro__ if base.__module__.startswith("core.")}
+
+
+def _undo_shared_engine_leaks(classes: dict[type, dict[str, object]]) -> list[str]:
+    """Put the shared objects and their classes back as made, and name what
+    a test left on them. On an object: a name its class defines as a method,
+    held by the object itself. ``monkeypatch.setattr`` leaves the class's own
+    method there, bound, at its undo: taken off, and no leak. On a class: a
+    name that changed, came or went since ``classes`` was read."""
+    import inspect
+    import types
+    left: list[str] = []
+    for label, obj in _shared_engine_objects():
+        for name, value in list(vars(obj).items()):
+            made = inspect.getattr_static(type(obj), name, None)
+            if not isinstance(made, (types.FunctionType, staticmethod, classmethod)):
+                continue        # the object's own state, not a method of its class
+            own = made if isinstance(made, types.FunctionType) else made.__func__
+            if getattr(value, "__func__", value) is not own:
+                left.append(f"{label}: {name}")
+            delattr(obj, name)
+    for klass, before in classes.items():
+        now = {name: value for name, value in vars(klass).items() if not name.startswith(("__", "_abc_"))}
+        for name in sorted(set(before) | set(now)):
+            if name in before and name in now and now[name] is before[name]:
+                continue
+            left.append(f"the class {klass.__name__}: {name}")
+            if name in before:
+                setattr(klass, name, before[name])
+            else:
+                delattr(klass, name)
+    return left
+
+
+def _the_remote_layer() -> object:
+    return getattr(sys.modules.get("core.session.session_manager"), "_remote_layer", None)
+
+
+def _undo_remote_layer_swap(before: object) -> list[str]:
+    """Put the remote layer back as it was before the test, and name what a
+    test left in its place. A layer made where there was none (its first
+    use) is no swap."""
+    now = _the_remote_layer()
+    if now is before or (before is None and type(now).__module__.startswith("core.")):
+        return []
+    sys.modules["core.session.session_manager"]._remote_layer = before
+    return ["the remote layer: removed" if now is None else f"the remote layer: replaced by a {type(now).__name__}"]
+
+
+_SHARED_ENGINE_CLASSES: pytest.StashKey[dict[type, dict[str, object]]] = pytest.StashKey()
+_REMOTE_LAYER_BEFORE: pytest.StashKey[object] = pytest.StashKey()
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item):
+    """Before a test's fixtures: what the shared objects' classes define, and
+    which object the remote layer is, for the guard at its end
+    (``pytest_runtest_teardown``)."""
+    item.stash[_SHARED_ENGINE_CLASSES] = _shared_engine_classes()
+    item.stash[_REMOTE_LAYER_BEFORE] = _the_remote_layer()
+    return (yield)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item):
+    """An engine, its remote adapter and the remote layer are one object each
+    for the whole process, and their classes are every test's. A test that
+    replaces a method on one of them by a plain assignment, or the remote
+    layer itself, leaves the replacement for every test after it in the same
+    worker: a machine turn then starts with no settle, or with another test's
+    stand-in. Such a test fails here, by name, and the object is put back.
+    ``monkeypatch.setattr`` is the way. A hook around the whole teardown,
+    never a fixture: a fixture set up after ``monkeypatch`` would read the
+    objects before the test's own patches are undone, and the order of
+    autouse fixtures follows their names."""
+    try:
+        yield
+    finally:
+        left = _undo_remote_layer_swap(item.stash.get(_REMOTE_LAYER_BEFORE, None))
+        left += _undo_shared_engine_leaks(item.stash.get(_SHARED_ENGINE_CLASSES, {}))
+    if left:
+        pytest.fail("this test left a stand-in on an object every test of the worker shares "
+                    f"({'; '.join(left)}): replace it with monkeypatch.setattr")
+
+
+@pytest.fixture(autouse=True)
+def _box_condition_unbound():
+    """A test that initialised admission (``concurrency.init()``, or an app
+    startup) leaves the box's condition bound to its own loop, closed when
+    the test ends: a wait on it in a later test's loop raises. Each test
+    starts with none, as a process that has not started admission: a test
+    that waits on the box initialises it in its own loop."""
+    import sys
+    box = sys.modules.get("core.concurrency")
+    if box is not None:
+        box._cond = None
+    yield
+    box = sys.modules.get("core.concurrency")
+    if box is not None:
+        box._cond = None
+
+
+@pytest.fixture(autouse=True)
+def _no_mcp_installs_at_boot(monkeypatch):
+    """A test whose app startup ran (a lifespan client) would build a venv for
+    every bundled MCP in the checkout, past the test's timeout on a host with
+    no uv, then bring the docker MCPs up on the box's engine. Each test starts
+    with nothing to install or bring up. The tests of the pass and of the
+    bring-up override this fixture and bring their own folders and fakes."""
+    from services.mcp import docker_manager, mcp_venv_bootstrap
+
+    async def _nothing_to_build() -> dict[str, str]:
+        return {}
+
+    monkeypatch.setattr(mcp_venv_bootstrap, "ensure_bundled_venvs_at_startup", _nothing_to_build)
+    # The boot's own pair: a scan that finds nothing never holds new work.
+    monkeypatch.setattr(mcp_venv_bootstrap, "scan_bundled_venvs", mcp_venv_bootstrap.VenvPlan)
+    monkeypatch.setattr(mcp_venv_bootstrap, "prune_unused_pythons", list)
+    monkeypatch.setattr(docker_manager, "startup_docker_mcps", lambda: None)
+
+
 @pytest.fixture(autouse=True)
 def _no_renderer_of_the_box(monkeypatch):
     """A folder app's deploy has file-tools render its page when one answers,
@@ -635,6 +849,17 @@ def _no_renderer_of_the_box(monkeypatch):
     from services.apps import app_render
     monkeypatch.setattr(app_render, "renderer_base_url", lambda: "")
     app_render._probe.update({"at": 0.0, "ok": False, "reason": "", "base": ""})
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_machine_signed_in_earlier():
+    """A sign-in opens a machine's window after a restart, per process
+    (``remote_file_cache``). Fakes reuse machine ids across tests."""
+    cache = sys.modules.get("core.remote.remote_file_cache")
+    if cache is not None:
+        cache._merged_agents.clear()
+        cache._merge_left.clear()
     yield
 
 
@@ -719,6 +944,7 @@ def temp_db():
         # ended) must not join the next test's burst; the install id read
         # once per process must not outlive the test that stubbed it.
         _nm._file_batches.clear()
+        _nm._file_flushes.clear()
         _nm._install_id_value = ""
         from services.notifications import push_sender as _ps
         _ps.reset_relay_verdict()
@@ -728,9 +954,9 @@ def temp_db():
         # the persisted mirror right after a bind or a release. The queue
         # itself is exercised by tests/billing/test_binding_writer.py, which
         # reopens it for its own tests.
-        from services.engines import subscription_pool as _pool
-        _pool._binding_writer = None
-        _pool._binding_writes_closed = True
+        from services.engines import pool_writer as _pool_writer
+        _pool_writer._binding_writer = None
+        _pool_writer._binding_writes_closed = True
         _wd.reset_caches()
     except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
         pass
@@ -747,6 +973,9 @@ def temp_db():
                     shutil.rmtree(child, ignore_errors=True)
                 else:
                     child.unlink(missing_ok=True)
+        # The histories of those folders live beside them, in the sessions
+        # folder (services/infra/git_writer.py).
+        shutil.rmtree(_cfg.SESSIONS_DIR / "history", ignore_errors=True)
     except OSError:
         pass
 
@@ -839,6 +1068,19 @@ def loop_db_guard():
     from storage import pg
     yield _LoopDbGuard()
     pg.disarm_loop_guard()
+
+
+@pytest.fixture
+def loop_disk_guard():
+    """Opt-in, function-scoped, never autouse: the fence for the paths whose
+    disk writes left the loop (``tests/_disk_guard.py``). ``with
+    loop_disk_guard.active():`` arms it for the calling thread; the block's
+    exit fails the test with every write made on that thread. Disarmed on
+    teardown no matter how the test exits."""
+    from tests._disk_guard import LoopDiskGuard
+    guard = LoopDiskGuard()
+    yield guard
+    guard.disarm()
 
 
 def _seed_users(conn=None):

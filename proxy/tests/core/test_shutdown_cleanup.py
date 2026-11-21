@@ -15,6 +15,7 @@ import time
 import pytest
 
 import startup
+import startup_shutdown
 from storage import pg as pg_pool
 
 
@@ -22,6 +23,7 @@ class _FakePump:
     def __init__(self):
         self.aborted = False
         self._task = None
+        self.records_engine_turn = False
 
     def abort(self):
         self.aborted = True
@@ -29,7 +31,7 @@ class _FakePump:
 
 @pytest.fixture(autouse=True)
 def _no_failsafe(monkeypatch):
-    monkeypatch.setattr(startup, "_ARM_EXIT_FAILSAFE", False)
+    monkeypatch.setattr(startup_shutdown, "_ARM_EXIT_FAILSAFE", False)
     startup._bg_tasks.clear()
     yield
     startup._bg_tasks.clear()
@@ -42,7 +44,7 @@ class TestCleanupOrder:
         async def _fake_flush(logger):
             order.append("flush")
 
-        monkeypatch.setattr(startup, "_flush_active_pumps", _fake_flush)
+        monkeypatch.setattr(startup_shutdown, "_flush_active_pumps", _fake_flush)
         monkeypatch.setattr(startup.task_store, "list_orphaned_runs",
                             lambda: order.append("orphans") or [])
         monkeypatch.setattr(startup.task_store, "mark_orphaned_runs_failed",
@@ -129,7 +131,7 @@ class TestPumpFlush:
         monkeypatch.setattr(run_recovery, "is_recovery_eligible",
                             lambda chat_id: chat_id == "chat-keep")
         try:
-            asyncio.run(startup._flush_active_pumps(startup.logger))
+            asyncio.run(startup_shutdown._flush_active_pumps(startup.logger))
         finally:
             _active_pumps.pop("chat-keep", None)
             _active_pumps.pop("chat-flush", None)
@@ -140,8 +142,8 @@ class TestPumpFlush:
 class TestFailsafe:
     def test_fires_exit_code_3_after_grace(self, monkeypatch):
         fired: list[int] = []
-        monkeypatch.setattr(startup, "_ARM_EXIT_FAILSAFE", True)
-        monkeypatch.setattr(startup, "_EXIT_FAILSAFE_GRACE_S", 0.05)
+        monkeypatch.setattr(startup_shutdown, "_ARM_EXIT_FAILSAFE", True)
+        monkeypatch.setattr(startup_shutdown, "_EXIT_FAILSAFE_GRACE_S", 0.05)
         monkeypatch.setattr(os, "_exit", fired.append)
         monkeypatch.setattr(startup.logging, "shutdown", lambda: None)
 
@@ -158,8 +160,8 @@ class TestFailsafe:
         would block on it and the hard exit would never happen."""
         from core import log_queue
         calls: list[str] = []
-        monkeypatch.setattr(startup, "_ARM_EXIT_FAILSAFE", True)
-        monkeypatch.setattr(startup, "_EXIT_FAILSAFE_GRACE_S", 0.05)
+        monkeypatch.setattr(startup_shutdown, "_ARM_EXIT_FAILSAFE", True)
+        monkeypatch.setattr(startup_shutdown, "_EXIT_FAILSAFE_GRACE_S", 0.05)
         monkeypatch.setattr(os, "_exit", lambda code: calls.append(f"exit:{code}"))
         monkeypatch.setattr(startup.logging, "shutdown",
                             lambda: calls.append("shutdown"))
@@ -176,7 +178,7 @@ class TestFailsafe:
 
     def test_flag_off_arms_nothing(self, monkeypatch):
         armed: list = []
-        monkeypatch.setattr(startup, "_ARM_EXIT_FAILSAFE", False)
+        monkeypatch.setattr(startup_shutdown, "_ARM_EXIT_FAILSAFE", False)
         monkeypatch.setattr(threading, "Timer",
                             lambda *a, **k: armed.append(a))
         startup._arm_exit_failsafe()

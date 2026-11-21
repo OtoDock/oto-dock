@@ -177,3 +177,20 @@ def test_concurrent_notes_and_consumes_under_the_lock():
         t.join()
     assert sum(consumed) == per_thread * writers
     assert "c11" not in TE._sent_prompts
+
+
+
+def test_a_persisted_prompts_note_is_good_for_the_first_prompt_line_only():
+    """A terminal taken back after a restart: the open turn's prompt has its
+    row, so its journaled line (with the typing's preludes) is skipped once.
+    A first line with other words is another prompt, and the note goes."""
+    from core.session import transcript_tool_events as tte
+    tte._sent_prompts.clear()
+    tte.note_persisted_prompt("c-1", "Run it.", owner="s-1")
+    assert tte.consume_sent_prompt("c-1", "[Current time: Saturday, November 07, 2026 06:48 (6:48 AM) UTC]\n\nRun it.")
+    assert "c-1" not in tte._sent_prompts
+    tte.note_persisted_prompt("c-1", "Run it.", owner="s-1")
+    tte.note_sent_prompt("c-1", "Next one.", owner="s-1")
+    assert tte.consume_sent_prompt("c-1", "Next one.")
+    assert "c-1" not in tte._sent_prompts
+    assert not tte.consume_sent_prompt("c-1", "Run it.")

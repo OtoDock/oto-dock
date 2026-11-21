@@ -39,7 +39,7 @@ import { savePending, saveConfirm } from '@/lib/shareConfirm'
 
 const app = {
   id: 'app-1', title: 'Schedule', slug: 'schedule', scope: 'personal' as const, agent: 'dev',
-  actions: [{ id: 'book', label: 'Book', type: 'fire_task' as const, task_id: 't1' }],
+  actions: [{ id: 'book', label: 'Book', type: 'fire_task' as const, task_id: 't1', min_role: 'external' as const }],
 }
 const teamApp = { ...app, id: 'app-2', title: 'Board', slug: 'board', scope: 'shared' as const }
 const directoryWithAll = (): Directory => ({
@@ -300,6 +300,15 @@ describe('SharePopover — chats', () => {
 })
 
 describe('SharePopover — links', () => {
+  it('offers no Buttons switch when no button is open to external identities', () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const closed = { ...app, actions: [{ id: 'book', label: 'Book', type: 'fire_task' as const, task_id: 't1' }] }
+    render(<QueryClientProvider client={qc}><SharePopover app={closed} onClose={vi.fn()} /></QueryClientProvider>)
+    openLinkTab()
+    expect(screen.queryByLabelText('Buttons on the link')).toBeNull()
+    expect(screen.getByTestId('share-no-link-buttons').textContent).toContain('Its buttons do not work on a link.')
+  })
+
   it('makes a password link after the confirm and shows the secret once', async () => {
     state.createAsync
       .mockRejectedValueOnce(new ConfirmRequired('password', 'Enter your password'))

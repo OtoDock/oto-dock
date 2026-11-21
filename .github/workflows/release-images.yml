@@ -158,10 +158,10 @@ jobs:
 
   boot:
     # Start the images each platform built, by digest, before any tag exists:
-    # a Postgres, the proxy until /health answers (its first boot builds the
-    # bundled MCP venvs), the phone service against that proxy, the file tools
-    # (scripts/image-boot-check.sh). Each architecture boots on its own native
-    # runner, as it was built.
+    # a Postgres, the proxy until /health answers (the image carries the
+    # bundled MCP venvs, a first boot builds none), the phone service against
+    # that proxy, the file tools (scripts/image-boot-check.sh). Each
+    # architecture boots on its own native runner, as it was built.
     if: github.repository == 'OtoDock/oto-dock'
     needs: [build]
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}

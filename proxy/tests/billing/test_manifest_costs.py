@@ -175,3 +175,20 @@ class TestListMatchValues:
         with pytest.raises(ValueError, match="scalar or a list"):
             _parse_costs_block({"currency": "USD", "provider": "x", "rules": [
                 {"tool": "f", "match": {"k": {"a": 1}}, "amount": 1}]}, "x")
+
+
+class TestResultHas:
+    """Framework: a rule may also require words in the tool's answer."""
+
+    def test_parses_and_is_no_duplicate_of_the_catch_all(self):
+        block = _parse_costs_block({"currency": "USD", "provider": "x", "rules": [
+            {"tool": "t", "result_has": "with B.", "amount": 1},
+            {"tool": "t", "amount": 2},
+        ]}, "x")
+        assert [r.result_has for r in block.rules] == ["with B.", ""]
+
+    @pytest.mark.parametrize("bad", [5, "", ["with B."]])
+    def test_must_be_words(self, bad):
+        with pytest.raises(ValueError, match=r"rules\[0\]\.result_has"):
+            _parse_costs_block({"currency": "USD", "provider": "x",
+                                "rules": [{"tool": "t", "result_has": bad, "amount": 1}]}, "x")

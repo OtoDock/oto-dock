@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import uuid
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -319,6 +321,22 @@ def test_chat_delete_removes_the_copies_and_the_reaper_sweeps_the_rest():
     assert not (config.AGENTS_DIR / share2["snapshot_ref"]).exists()
 
 
+def test_a_share_whose_copy_was_never_made_goes_quietly_with_its_chat(caplog):
+    """A live share with no copy (its build failed, as every share of a
+    moved agent's chat did before 2.0) has nothing to remove when its chat
+    is deleted, and nothing is said."""
+    import logging
+    import shutil
+    chat_id = _chat()
+    share = share_store.get_share(_share(chat_id)["share"]["id"])
+    shutil.rmtree(config.AGENTS_DIR / share["snapshot_ref"])
+    share_store.set_snapshot_ref(share["id"], "")
+    with caplog.at_level(logging.WARNING):
+        assert client.delete(f"/v1/chats/{chat_id}").status_code == 200
+    assert "share snapshot not removed" not in caplog.text
+    assert share_store.get_share(share["id"]) is None
+
+
 def test_the_daily_sweep_removes_a_revoked_chat_share_s_copy_then_its_row():
     """Thirty days after a revoke the sweep removes the copy (its own pass,
     which finds the folder through the row) and then the row."""
@@ -387,6 +405,177 @@ def test_snapshot_copy_refuses_swapped_symlink(tmp_path):
             assert b"JWT_SECRET" not in p.read_bytes()
     # The other copies are intact.
     assert (root / doc["files"]["tok-ui-1"]).read_text() == "<div class='card'>chart</div>"
+
+
+
+# ───────────────────────── the copy's own folder, reached with no link ──────
+
+
+def _outside(factory, *rels: str) -> Path:
+    """A stand-in folder beside the agents folder, holding a kept file at
+    each of ``rels``."""
+    out = factory.mktemp("outside")
+    for rel in rels:
+        (out / rel).parent.mkdir(parents=True, exist_ok=True)
+        (out / rel).write_text("kept")
+    return out
+
+
+def _swap_for_link(path: Path, target: Path) -> None:
+    """``path`` moved aside and a link to ``target`` put at its name."""
+    path.rename(path.with_name(path.name + "-moved"))
+    path.symlink_to(target, target_is_directory=target.is_dir())
+
+
+def test_the_copys_removal_never_follows_a_link_above_it(tmp_path_factory):
+    share = share_store.get_share(_share(_chat())["share"]["id"])
+    out = _outside(tmp_path_factory, f"{share['id']}/keep.md")
+    _swap_for_link(config.AGENTS_DIR / AGENT / "shares" / "users" / "owner", out)
+    chat_snapshot.remove(share)
+    assert (out / share["id"] / "keep.md").read_text() == "kept"
+
+
+def test_the_sweeps_never_list_or_remove_through_a_link(tmp_path_factory, caplog):
+    out = _outside(tmp_path_factory, "old-id/keep.md", "users/gone/x/keep.md")
+    users = config.AGENTS_DIR / AGENT / "shares" / "users"
+    users.mkdir(parents=True)
+    (users / "linked").symlink_to(out, target_is_directory=True)
+    honest = users / "owner" / "orphan-id"
+    honest.mkdir(parents=True)
+    with caplog.at_level("WARNING"):
+        assert chat_snapshot.sweep_orphans(set()) == 1
+    assert "not listed" not in caplog.text  # a linked bucket is passed over, never tried
+    assert not honest.exists() and (out / "old-id" / "keep.md").read_text() == "kept"
+    other = config.AGENTS_DIR / "other-agent"
+    other.mkdir()
+    (other / "shares").symlink_to(out, target_is_directory=True)
+    assert chat_snapshot.remove_user_snapshots("gone") == 0
+    assert (out / "users" / "gone" / "x" / "keep.md").read_text() == "kept"
+
+
+def test_the_copy_is_read_and_served_with_no_link_followed(tmp_path_factory):
+    body = _share(_chat())
+    share_id = body["share"]["id"]
+    share = share_store.get_share(share_id)
+    root = config.AGENTS_DIR / share["snapshot_ref"]
+    doc = json.loads((root / "chat.json").read_text())
+    out = _outside(tmp_path_factory)
+    (out / "chat.json").write_text(json.dumps({**doc, "title": "From outside"}))
+    (out / "page.html").write_text("<p>outside page</p>")
+    (out / "img.png").write_bytes(b"outside bytes")
+    _swap_for_link(root / "chat.json", out / "chat.json")
+    _swap_for_link(root / doc["files"]["tok-ui-1"], out / "page.html")
+    _swap_for_link(root / doc["files"]["img-1"], out / "img.png")
+    assert chat_snapshot.load(share) is None
+    _as(_user(OTHER, agents=(), agent_roles={}))
+    assert client.get(f"/v1/shares/{share_id}/snapshot").status_code == 404
+    page = client.get(f"/v1/shares/{share_id}/ui/tok-ui-1")
+    assert page.status_code == 404 and "outside page" not in page.text
+    assert client.get(f"/v1/shares/{share_id}/media/img-1").status_code == 404
+
+
+def test_a_share_reads_only_its_own_copy_and_only_its_two_folders():
+    """The row's ``snapshot_ref`` must name the share's own folder, and the
+    map's entry one of the copy's two folders: ``chat.json`` itself is never
+    served as a copy."""
+    one = share_store.get_share(_share(_chat())["share"]["id"])
+    assert chat_snapshot.load(one) is not None
+    assert chat_snapshot.load({**one, "id": str(uuid.uuid4())}) is None
+    root = config.AGENTS_DIR / one["snapshot_ref"]
+    doc = json.loads((root / "chat.json").read_text())
+    doc["files"]["own-doc"] = "chat.json"
+    (root / "chat.json").write_text(json.dumps(doc))
+    assert chat_snapshot.open_file(one, "own-doc") is None
+    assert chat_snapshot.read_page(one, "own-doc") is None
+    opened = chat_snapshot.open_file(one, "img-1")
+    assert opened is not None
+    os.close(opened[0])
+    (root / "notes").mkdir()
+    (root / "notes" / "x.txt").write_text("not a copy")
+    doc["files"]["notes"] = "notes/x.txt"
+    (root / "chat.json").write_text(json.dumps(doc))
+    assert chat_snapshot.open_file(one, "notes") is None and chat_snapshot.read_page(one, "notes") is None
+
+
+def test_a_copy_that_is_a_link_is_never_served_or_read(tmp_path_factory):
+    """``chat.json`` as written; the page and a picture each a link to a
+    file beside the agents folder: neither is served nor read."""
+    share = share_store.get_share(_share(_chat())["share"]["id"])
+    root = config.AGENTS_DIR / share["snapshot_ref"]
+    doc = json.loads((root / "chat.json").read_text())
+    out = _outside(tmp_path_factory)
+    (out / "page.html").write_text("<p>outside page</p>")
+    (out / "img.png").write_bytes(b"outside bytes")
+    _swap_for_link(root / doc["files"]["tok-ui-1"], out / "page.html")
+    _swap_for_link(root / doc["files"]["img-1"], out / "img.png")
+    assert chat_snapshot.read_page(share, "tok-ui-1") is None
+    assert chat_snapshot.open_file(share, "img-1") is None
+
+
+def test_a_copys_media_is_served_from_the_file_it_opened():
+    body = _share(_chat())
+    share_id = body["share"]["id"]
+    _as(_user(OTHER, agents=(), agent_roles={}))
+    img = client.get(f"/v1/shares/{share_id}/media/img-1")
+    assert img.status_code == 200 and img.content == b"\x89PNG\r\n\x1a\nfake"
+    assert img.headers["content-type"].startswith("image/png") and "attachment" not in \
+        img.headers.get("content-disposition", "")
+    assert img.headers["x-content-type-options"] == "nosniff"
+    pdf = client.get(f"/v1/shares/{share_id}/media/tok-file-1")
+    assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF")
+    ranged = client.get(f"/v1/shares/{share_id}/media/tok-file-1", headers={"Range": "bytes=0-3"})
+    assert ranged.status_code == 206 and ranged.content == b"%PDF"
+
+
+def test_a_reference_outside_the_shares_folder_is_refused():
+    """A row whose reference names another folder of the agent is never
+    read or removed, also when its last part is the share's own id."""
+    share_id = str(uuid.uuid4())
+    folder = config.AGENTS_DIR / AGENT / "workspace" / "users" / "u" / share_id
+    folder.mkdir(parents=True)
+    (folder / "chat.json").write_text(json.dumps({"files": {}}))
+    share = {"snapshot_ref": f"{AGENT}/workspace/users/u/{share_id}", "id": share_id}
+    assert chat_snapshot.load(share) is None
+    chat_snapshot.remove(share)
+    assert (folder / "chat.json").is_file()
+
+
+def test_a_copy_of_an_active_type_downloads():
+    """A copy whose type is not inert (a page, an SVG) is served as a
+    download, never inline, with nosniff."""
+    body = _share(_chat())
+    share = share_store.get_share(body["share"]["id"])
+    root = config.AGENTS_DIR / share["snapshot_ref"]
+    doc = json.loads((root / "chat.json").read_text())
+    (root / "media" / "page.html").write_text("<p>a page</p>")
+    doc["files"]["page"] = "media/page.html"
+    (root / "chat.json").write_text(json.dumps(doc))
+    _as(_user(OTHER, agents=(), agent_roles={}))
+    got = client.get(f"/v1/shares/{share['id']}/media/page")
+    assert got.status_code == 200
+    assert got.headers.get("content-disposition", "").startswith("attachment")
+    assert got.headers["x-content-type-options"] == "nosniff"
+
+
+def test_a_chat_of_an_agent_behind_the_operators_link_is_shared_read_and_removed(tmp_path_factory):
+    """An agent folder the admin moved to another disk behind a link: the
+    chat shares, its copy reads and goes with the chat."""
+    disk = tmp_path_factory.mktemp("disk2")
+    folder = config.AGENTS_DIR / AGENT
+    folder.rename(disk / AGENT)
+    folder.symlink_to(disk / AGENT, target_is_directory=True)
+    chat_id = _chat()
+    body = _share(chat_id)
+    share = share_store.get_share(body["share"]["id"])
+    real = disk / AGENT / "shares" / "users" / "owner" / share["id"]
+    assert (real / "chat.json").is_file()
+    _as(_user(OTHER, agents=(), agent_roles={}))
+    snap = client.get(f"/v1/shares/{share['id']}/snapshot")
+    assert snap.status_code == 200 and snap.json()["title"] == "Plan review"
+    assert client.get(f"/v1/shares/{share['id']}/media/img-1").status_code == 200
+    _as(_user())
+    assert client.delete(f"/v1/chats/{chat_id}").status_code == 200
+    assert not real.exists()
 
 
 # ───────────────────────── reporting a reply from the copy ──────────────────

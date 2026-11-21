@@ -173,15 +173,26 @@ class TestPreludeLine:
         assert again == "the prompt"                   # unchanged → no prefix
 
 
-class TestContextBlock:
-    def test_block_lists_sessions_and_tasks(self, temp_db, streaming_state):
-        sib = _mk_chat(title="Header rework")
-        _stream(sib)
-        _running_task(task_id="dyn-ctx1")
-        block = sa.context_block(AGENT, OWNER)
-        assert block.startswith("## Active parallel sessions")
-        assert "'Header rework' — generating" in block
-        assert "(dyn-ctx1) — running" in block
+class TestStartSection:
+    """The parallel sessions as a start's riding section
+    (``core/session/start_context.py``): sorted, so an unchanged set is the
+    same bytes, and the chat then holds it, so the turn's line repeats
+    nothing."""
 
-    def test_none_when_quiet(self, temp_db):
-        assert sa.context_block(AGENT, OWNER) is None
+    def test_the_section_lists_sessions_and_tasks_sorted(self, temp_db, streaming_state, monkeypatch):
+        own = _mk_chat(title="Mine")
+        for title in ("Zeta lane", "Alpha lane"):
+            _stream(_mk_chat(title=title))
+        _running_task(task_id="dyn-ctx1")
+        gather = sa._gather_sync
+        # The live set comes in any order: here the worst one.
+        monkeypatch.setattr(sa, "_gather_sync", lambda *a, **k: tuple(
+            sorted(part, reverse=True) for part in gather(*a, **k)))
+        section = sa.start_section_sync(own)
+        assert section.index("'Alpha lane': generating") < section.index("'Zeta lane': generating")
+        assert "(dyn-ctx1): running" in section and "'Mine'" not in section
+        assert sa.start_section_sync(own) == section
+        assert sa._line_for_chat_sync(own) == ""          # the chat holds this view
+
+    def test_a_quiet_chat_says_none(self, temp_db):
+        assert sa.start_section_sync(_mk_chat(title="Mine")) == "_None._"

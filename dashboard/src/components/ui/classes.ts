@@ -83,6 +83,10 @@ export const PAGE_TITLE = 'hidden md:block font-display text-xl font-semibold te
 // a confirm or an edit form.
 export const BUTTON_DANGER_QUIET = `${BUTTON_BASE} ${BUTTON_SIZE.xs} text-status-danger-fg hover:bg-status-danger-bg`
 
+/** The small pulsing dot of something running now (the active chats'
+ *  header, an account's sessions); still under reduced motion. */
+export const LIVE_DOT = 'w-1.5 h-1.5 rounded-full bg-action animate-pulse motion-reduce:animate-none shrink-0'
+
 // Depth from the surface step and the elevation. A group (a collapsible
 // card) is CARD; an item inside it sits on the page's own colour with a
 // hairline, a recess rather than a second raise.
@@ -138,3 +142,10 @@ export const HOVER_REVEAL_FADE =
 // the group's own focusable reveals it for the keyboard.
 export const HOVER_REVEAL_FLEX =
   '[@media(hover:hover)]:hidden group-hover:flex group-focus-within:flex'
+// The composer's width: the inset its root keeps from the screen's edges and
+// the column it caps its box at. The status row above it and every notice
+// between the chat and the composer (ChatBanners, the chat's lock, the usage
+// limit) take the same two, so no notice runs edge to edge on a phone or
+// past the message box on a wide screen. A notice keeps no width of its own.
+export const COMPOSER_INSET = 'px-3'
+export const COMPOSER_COLUMN = 'mx-auto w-full max-w-4xl'

@@ -35,23 +35,26 @@ def formula_counts(wb) -> dict[str, int]:
     return {ws.title: sum(1 for cell in ws._cells.values() if cell.data_type == "f") for ws in wb.worksheets}
 
 
-def outside_parts(path: str) -> list[str]:
+def outside_parts(source: Any) -> list[str]:
     """What the original package holds that reads outside the workbook:
     links to other workbooks, data connections, query tables, pivot tables
-    over another source."""
+    over another source. ``source``: a path (``shared.safe_open_read``) or
+    the file the caller holds."""
+    import shared
     from formats.xlsx import loss
 
     found: list[str] = []
-    try:
-        with zipfile.ZipFile(path) as zf:
-            names = zf.namelist()
-            for prefix, what in _OUTSIDE_PARTS:
-                if any(name.startswith(prefix) for name in names):
-                    found.append(what)
-            if any(loss.outside_pivots(zf)):
-                found.append("pivot tables over another source")
-    except (OSError, zipfile.BadZipFile):
-        pass
+    with shared.reading(source) as fh:
+        try:
+            with zipfile.ZipFile(fh) as zf:
+                names = zf.namelist()
+                for prefix, what in _OUTSIDE_PARTS:
+                    if any(name.startswith(prefix) for name in names):
+                        found.append(what)
+                if any(loss.outside_pivots(zf)):
+                    found.append("pivot tables over another source")
+        except (OSError, zipfile.BadZipFile):
+            pass
     return found
 
 

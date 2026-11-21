@@ -93,6 +93,8 @@ def test_a_clean_folder_has_no_findings(tmp_path):
     ("otodockWidgets.mount(el, {widget: 'tasks'})", "client.widget-feed"),
     ("otodockWidgets.mount(el, {widget: 'checks'})", "client.widget-feed"),
     ("otodockWidgets.mount(el, {widget: 'connect'})", "client.widget-feed"),
+    ("otodockWidgets.mount(el, {widget: 'media', path: 'workspace/a.mp4'})", "client.widget-feed"),
+    ("otodockWidgets.mediaLink('workspace/a.mp4')", "client.widget-feed"),
 ])
 def test_client_fail_rules_fire_on_the_mistake(tmp_path, snippet, rule):
     page = GOOD_PAGE.replace("location.hash = \"x\";", snippet + ";")
@@ -862,13 +864,10 @@ const a = json({{ error: "the card — gone", k: "{key}" }}, 404);
 
 
 def test_the_word_lists_split_the_release_gates_list():
-    import ast
-    path = config.BASE_DIR.parent.joinpath("dev", "release-check", "changelog_lint.py")
-    if not path.is_file():
-        pytest.skip("the release gate is in the private tree only")
-    tree = ast.parse(path.read_text())
-    gate = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
-                and any(getattr(t, "id", "") == "INTERNAL_WORDS" for t in node.targets))
+    # The app lint ships in the image and keeps its own copy, split for apps;
+    # the writing rules' list it splits is scripts/prose/rules.json's.
+    rules = json.loads(config.BASE_DIR.parent.joinpath("scripts", "prose", "rules.json").read_text())
+    gate = rules["words"]["inside"]
     from services.apps import app_lint_words as words
     assert set(words.APP_WORDS) | set(words.EVERYDAY_WORDS) == set(gate)
     assert not set(words.APP_WORDS) & set(words.EVERYDAY_WORDS)
@@ -1105,3 +1104,16 @@ def test_a_words_row_names_the_line_its_text_starts_on(tmp_path):
     page = "<div>\n  <label>\n    Price in minor units (1250 = 12.50; 0 = free)\n  </label>\n</div>\n"
     findings = _lint(tmp_path, {"client/index.html": page})
     assert [(f.rule, f.line) for f in findings if f.rule.startswith("words.")] == [("words.semicolon", 3)]
+
+
+def test_a_page_that_shows_a_media_link_may_set_crossorigin_on_its_own_element(tmp_path):
+    # The link's answer allows it (a canvas stays readable); the asset route
+    # sends no such header, so the warning stays for every other page.
+    page = GOOD_PAGE.replace("location.hash = \"x\";", "video.crossOrigin = 'anonymous';")
+    plain = _lint(tmp_path, {"client/index.html": page}, Declared(feeds={"sessions"}))
+    assert "client.module" in _rules(plain, "warn"), plain
+    media = _lint(tmp_path, {"client/index.html": page}, Declared(feeds={"sessions"}, methods={"files.media"}))
+    assert "client.module" not in _rules(media, "warn"), media
+    module = GOOD_PAGE.replace("location.hash = \"x\";", "import('./x.js');")
+    still = _lint(tmp_path, {"client/index.html": module}, Declared(feeds={"sessions"}, methods={"files.media"}))
+    assert "client.module" in _rules(still, "warn"), still

@@ -15,6 +15,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from services.mcp import mcp_manifest_store
 from storage.identity import credential_store
 from storage.pg import get_conn
 
@@ -148,7 +149,6 @@ class TestAccountsEndpointServiceOnlyFlag:
         # writing a fixture manifest to disk, register one in-memory.
         from dataclasses import dataclass, field
 
-        from services.mcp import mcp_registry
 
         @dataclass
         class _Cred:
@@ -165,7 +165,7 @@ class TestAccountsEndpointServiceOnlyFlag:
             credentials: _Cred = field(default_factory=_Cred)
             server: _Srv = field(default_factory=_Srv)
 
-        mcp_registry._manifests[mcp_name] = _Manifest(name=mcp_name)
+        mcp_manifest_store._manifests[mcp_name] = _Manifest(name=mcp_name)
         try:
             client = _build_client(user_sub)
             r = client.get(
@@ -176,14 +176,13 @@ class TestAccountsEndpointServiceOnlyFlag:
             assert body["accounts"] == []
             assert body["has_service_credentials_only"] is False
         finally:
-            mcp_registry._manifests.pop(mcp_name, None)
+            mcp_manifest_store._manifests.pop(mcp_name, None)
 
     def test_user_oauth_present_flag_is_false(self, mcp_name, user_sub):
         """With a user-OAuth account connected, the flag is False and the
         account is listed."""
         from dataclasses import dataclass, field
 
-        from services.mcp import mcp_registry
 
         @dataclass
         class _Cred:
@@ -200,7 +199,7 @@ class TestAccountsEndpointServiceOnlyFlag:
             credentials: _Cred = field(default_factory=_Cred)
             server: _Srv = field(default_factory=_Srv)
 
-        mcp_registry._manifests[mcp_name] = _Manifest(name=mcp_name)
+        mcp_manifest_store._manifests[mcp_name] = _Manifest(name=mcp_name)
         try:
             credential_store.set_user_credentials(
                 user_sub, mcp_name, {"OAUTH_TOKEN": "abc"},
@@ -215,4 +214,4 @@ class TestAccountsEndpointServiceOnlyFlag:
             assert len(body["accounts"]) == 1
             assert body["has_service_credentials_only"] is False
         finally:
-            mcp_registry._manifests.pop(mcp_name, None)
+            mcp_manifest_store._manifests.pop(mcp_name, None)

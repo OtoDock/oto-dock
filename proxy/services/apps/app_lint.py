@@ -105,11 +105,37 @@ class Declared:
     handlers: set[str] = field(default_factory=set)
     # The buttons that act for the agent with no floor, in manifest order.
     unfloored: list[str] = field(default_factory=list)
+    # The buttons that send a list of edits and that outside people may
+    # press (a list button's floor is the contributor's unless raised).
+    open_lists: list[str] = field(default_factory=list)
+    # A tool button's file fields, ``(action id, "read" | "write")``, and the
+    # folders the app declares for each mode (``files``): a field with no
+    # folder of its mode is refused at every press.
+    file_fields: list[tuple[str, str]] = field(default_factory=list)
+    folders: dict[str, list[str]] = field(default_factory=dict)
+
+
+def _file_modes(schema) -> list[str]:
+    """The modes of a schema's file fields, top level and in a list's
+    operations, each once, in order."""
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    fields = [p for p in (props or {}).values() if isinstance(p, dict)] if isinstance(props, dict) else []
+    for p in list(fields):
+        items = p.get("items") if p.get("type") == "array" else None
+        for variant in (items.get("oneOf") or []) if isinstance(items, dict) else []:
+            inner = variant.get("properties") if isinstance(variant, dict) else None
+            fields += [q for q in (inner or {}).values() if isinstance(q, dict)] if isinstance(inner, dict) else []
+    return list(dict.fromkeys(p["file"] for p in fields if p.get("file") in ("read", "write")))
+
+
+def _folders(block) -> dict[str, list[str]]:
+    block = block if isinstance(block, dict) else {}
+    return {mode: [x for x in (block.get(mode) or []) if isinstance(x, str)] for mode in ("read", "write")}
 
 
 def declared_from_actions(actions_json: str) -> Declared:
     from auth import roles
-    from services.apps.manifest import ACTING_ACTION_TYPES
+    from services.apps.manifest import ACTING_ACTION_TYPES, has_list
     d = Declared()
     try:
         actions = json.loads(actions_json or "[]")
@@ -121,9 +147,14 @@ def declared_from_actions(actions_json: str) -> Declared:
         if a.get("id"):
             d.action_ids.add(str(a["id"]))
             # A raw template document may still spell the default floor.
-            if a.get("type") in ACTING_ACTION_TYPES and a.get("min_role") in (None, roles.VIEWER,
-                                                                              roles.NO_ACCESS):
+            if a.get("type") == "mcp_tool" and has_list(a):
+                if a.get("min_role") == roles.EXTERNAL:
+                    d.open_lists.append(str(a["id"]))
+            elif a.get("type") in ACTING_ACTION_TYPES and a.get("min_role") in (None, roles.VIEWER,
+                                                                                roles.NO_ACCESS):
                 d.unfloored.append(str(a["id"]))
+        if a.get("type") == "mcp_tool" and a.get("id"):
+            d.file_fields += [(str(a["id"]), mode) for mode in _file_modes(a.get("args_schema"))]
         if a.get("type") == "data_feed" and a.get("feed"):
             d.feeds.add(str(a["feed"]))
         if a.get("type") == "platform" and a.get("method"):
@@ -137,6 +168,7 @@ def declared_from_doc(doc: dict) -> Declared:
     and server rules need, read off the document."""
     d = declared_from_actions(json.dumps(doc.get("actions") or []))
     d.egress = {h for h in (doc.get("egress") or []) if isinstance(h, str)}
+    d.folders = _folders(doc.get("files"))
     handlers_doc = doc.get("handlers")
     h = handlers_doc if isinstance(handlers_doc, dict) else {}
     d.handlers = (set(h.get("on_schedule") or {}) | set(h.get("on_trigger") or [])
@@ -153,6 +185,8 @@ def declared_from_manifest(m) -> Declared:
     d = declared_from_actions(m.actions_json)
     with contextlib.suppress(ValueError):
         d.egress = {h for h in json.loads(m.egress_json or "[]") if isinstance(h, str)}
+    with contextlib.suppress(ValueError):
+        d.folders = _folders(json.loads(m.files_json or "{}"))
     try:
         h = json.loads(m.handlers_json or "{}")
     except ValueError:
@@ -481,6 +515,10 @@ _NAVIGATION = ("the host blanks a page that navigates or reloads itself; change 
 # client source; a ``script_only`` rule reads an HTML page's scripts alone,
 # ``guard`` refuses a match right after a word (``word``) or an identifier
 # or a dot (``ident``).
+# A page that shows a media link sets ``crossorigin`` on its own element on
+# purpose (the link's answer allows it, so a canvas stays readable): the
+# warning is for a page that declares no ``files.media``.
+_CROSSORIGIN_RE = _needs(re.compile(r"crossorigin\b", re.I), "crossorigin")
 _CLIENT_PATTERNS: list[tuple[str, str, re.Pattern, str, bool, str]] = [
     ("client.raw-fetch", FAIL,
      _needs(re.compile(r"fetch\s*\("), "fetch"),
@@ -552,9 +590,7 @@ _CLIENT_PATTERNS: list[tuple[str, str, re.Pattern, str, bool, str]] = [
     ("client.module", WARN,
      _needs(re.compile(r"import\s*\(", re.I), "import"),
      _MODULE, False, "ident"),
-    ("client.module", WARN,
-     _needs(re.compile(r"crossorigin\b", re.I), "crossorigin"),
-     _MODULE, False, "word"),
+    ("client.module", WARN, _CROSSORIGIN_RE, _MODULE, False, "word"),
     ("client.base", WARN,
      _needs(re.compile(r"<base\b", re.I), "<base"),
      "base-uri 'none': the tag is ignored",
@@ -573,6 +609,9 @@ _FEED_RE = _needs(re.compile(r"otodock\.feed\s*\(\s*[\"']([A-Za-z_]+)[\"']"), "o
 _ACTION_RE = _needs(re.compile(r"otodock\.action\s*\(\s*[\"']([\w-]+)[\"']"), "otodock.action")
 _METHOD_RE = _needs(re.compile(r"otodock\.platform\s*\(\s*[\"']([\w.]+)[\"']"), "otodock.platform")
 _WIDGET_RE = _needs(re.compile(r"widget\s*:\s*[\"'](\w+)[\"']"), "widget")
+# The kit asks ``files.media`` itself, so the page never names the method.
+_MEDIA_LINK_RE = _needs(re.compile(r"otodockWidgets\s*\.\s*mediaLink\s*\("), "mediaLink")
+_NEEDS_MEDIA = "files.media declared as a platform action"
 _ONCLOSE_RE = _needs(re.compile(
     r"\.onclose\s*=\s*(?:function\s*\([^)]{0,200}\)|\([^)]{0,200}\)\s*=>|\w{1,64}\s*=>)\s*\{"), ".onclose")
 _TAILWIND_CLASS_RE = re.compile(r"class\s*=\s*[\"'][^\"']*\b(flex|grid|px-\d|py-\d|p-\d|mt-\d|mb-\d|gap-\d|text-(?:xs|sm|lg|xl)|rounded(?:-\w+)?|font-(?:medium|semibold|bold))\b")
@@ -588,6 +627,8 @@ def _lint_client(text: str, file: str, d: Declared, assets: set[str] | None) -> 
 
     code = script_view(src) if html else src
     for rule, severity, pattern, message, script_only, guard in _CLIENT_PATTERNS:
+        if pattern is _CROSSORIGIN_RE and "files.media" in d.methods:
+            continue
         for m in _hits(pattern, code if script_only else src, guard):
             if not add(rule, severity, m.start(), message):
                 break
@@ -662,6 +703,11 @@ def _lint_client(text: str, file: str, d: Declared, assets: set[str] | None) -> 
         elif w == "connect" and "integrations.status" not in d.methods:
             add("client.widget-feed", FAIL, m.start(),
                 "the connect widget needs integrations.status declared as a platform action")
+        elif w == "media" and "files.media" not in d.methods:
+            add("client.widget-feed", FAIL, m.start(), f"the media widget needs {_NEEDS_MEDIA}")
+    for m in _hits(_MEDIA_LINK_RE, src):
+        if "files.media" not in d.methods:
+            add("client.widget-feed", FAIL, m.start(), f"otodockWidgets.mediaLink needs {_NEEDS_MEDIA}")
     for m in islice(_ONCLOSE_RE.finditer(src), MAX_BODY_SCANS):
         body = _body_after(src, m.end() - 1)
         if re.search(r"otodock\.ws\s*\(|setTimeout\s*\(", body):
@@ -1284,6 +1330,28 @@ def _page_brand(src: str, file: str) -> list[Finding]:
 
 _ACTION_FLOOR = ("The button {id} acts for the agent, and everyone who opens the app can press it. "
                  "Give it a min_role, such as editor.")
+_LIST_FLOOR = ("The button {id} sends a list of edits, and outside people can press it. Their press "
+               "reaches none of the agent's files, but it still uses the app's accounts. Give it a "
+               "min_role, such as editor.")
+
+
+_FILE_FOLDER = ("The button {id} names a file, but the app declares no folder it may {mode}. "
+                "Add one to its files block.")
+
+
+def _floor_findings(d: Declared) -> list[tuple[str, str]]:
+    """``(action id, sentence)`` of every ``app.action-floor`` warning."""
+    return ([(a, _ACTION_FLOOR.format(id=a)) for a in d.unfloored]
+            + [(a, _LIST_FLOOR.format(id=a)) for a in d.open_lists])
+
+
+def _folder_findings(d: Declared) -> list[tuple[str, str]]:
+    """``(action id, sentence)`` of every ``app.file-folder`` warning: a
+    file field whose mode has no declared folder (a read may use a write
+    folder too, as ``catalog._declared_prefixes`` reads them)."""
+    reads = d.folders.get("read", []) + d.folders.get("write", [])
+    return [(a, _FILE_FOLDER.format(id=a, mode=mode)) for a, mode in d.file_fields
+            if not (d.folders.get("write") if mode == "write" else reads)]
 
 
 def _lint_manifest(raw: str, d: Declared) -> list[Finding]:
@@ -1303,9 +1371,10 @@ def _lint_manifest(raw: str, d: Declared) -> list[Finding]:
             rows.add("app.description", WARN, max(at, 0),
                      f"The description runs past {MAX_DESCRIPTION_CHARS} characters. Keep it to a "
                      "sentence or two.")
-    for action_id in d.unfloored:
-        m = re.search(r'"id"\s*:\s*"' + re.escape(action_id) + '"', raw)
-        rows.add("app.action-floor", WARN, m.start() if m else 0, _ACTION_FLOOR.format(id=action_id))
+    for rule, found in (("app.action-floor", _floor_findings(d)), ("app.file-folder", _folder_findings(d))):
+        for action_id, sentence in found:
+            m = re.search(r'"id"\s*:\s*"' + re.escape(action_id) + '"', raw)
+            rows.add(rule, WARN, m.start() if m else 0, sentence)
     return rows.rows
 
 
@@ -1354,8 +1423,10 @@ def lint_html(content: str, actions_json: str, file: str = "app.html") -> list[F
     from services.apps import app_lint_words as words
     d = declared_from_actions(actions_json)
     out = (_lint_secrets(content, file, "client.secret") + _lint_client(content, file, d, None)
-           + [Finding("app.action-floor", WARN, file, 1, _ACTION_FLOOR.format(id=action_id))
-              for action_id in d.unfloored])
+           + [Finding("app.action-floor", WARN, file, 1, sentence)
+              for _id, sentence in _floor_findings(d)]
+           + [Finding("app.file-folder", WARN, file, 1, sentence)
+              for _id, sentence in _folder_findings(d)])
     part = content[:words.MAX_FILE_CHARS]
     page = words.read_page(part)
     texts = page.texts + words.script_texts(script_view(strip_comments(part, True)))

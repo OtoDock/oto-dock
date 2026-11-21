@@ -119,6 +119,18 @@ def test_the_per_session_mcp_config_copies_are_host_local_in_both_trees():
     assert _satellite_constant("_CLAUDE_HOST_LOCAL_RE") == proxy_fs._CLAUDE_HOST_LOCAL_RE.pattern
 
 
+
+def test_a_codex_sessions_own_files_are_host_local():
+    """A Codex session's profile and ``.session.json`` carry its text and
+    tool tokens, a thread's record names what the thread holds: each host
+    writes its own, never synced either way (``session_text``)."""
+    for name in ("s-1.config.toml", "s-1.session.json", "t-1.text-sha256"):
+        assert proxy_fs._is_codex_runtime_state(f"users/u/.codex/{name}"), name
+        assert proxy_fs._is_codex_runtime_state(f"workspace/.codex/{name}"), name
+        assert not proxy_fs._is_codex_runtime_state(f"workspace/{name}"), name
+    for name in ("notes.toml", "a b.session.json", "s-1.session.json.bak"):
+        assert not proxy_fs._is_codex_runtime_state(f"users/u/.codex/{name}"), name
+
 def test_a_hook_file_writes_temp_never_syncs_on_either_side():
     """``write_if_changed`` writes a temp beside a hook file (and beside a
     command wrapper in ``bin/``) for the moment of the rename; a crashed
@@ -144,10 +156,10 @@ def test_the_runtime_helpers_key_on_the_one_whitelist():
     # The cruft-dir and cruft-file helpers answer for every synced engine dir
     # (they used to spell the pair themselves).
     for d in proxy_fs.INCLUDE_DOTTED_DIRS:
-        assert proxy_fs._is_cli_runtime_child(d, "projects")
+        assert proxy_fs.is_runtime_child(d, "projects")
         assert proxy_fs._is_cli_runtime_cruft_file(d, "x.backup.1")
         assert proxy_fs.is_engine_machinery_path(f"users/u/{d}/settings.json")
-    assert not proxy_fs._is_cli_runtime_child("workspace", "projects")
+    assert not proxy_fs.is_runtime_child("workspace", "projects")
     assert proxy_fs.is_engine_machinery_path("users/u/.credentials/x.json")
     assert not proxy_fs.is_engine_machinery_path("workspace/notes.md")
 
@@ -176,3 +188,16 @@ def test_the_engine_homes_are_the_config_dirs_directly_under_a_scope_root():
     assert proxy_fs.is_unsynced_engine_home_path("workspace/.codex/commands/x.md")
     assert not proxy_fs.is_unsynced_engine_home_path("users/u/.codex/prompts/x.md")
     assert proxy_fs.is_unsynced_engine_home_path("users/u/.claude/prompts/x.md")
+    # A session's home (``core/sandbox/session_home``) is never synced, not
+    # even what its links reach: the walk never enters ``own`` (a junction
+    # there is walked as a folder on Windows).
+    sid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    for rel in (f"workspace/.claude/own/{sid}/.credentials.json", f"users/u/.claude/own/{sid}/settings.json",
+                f"workspace/.claude/own/{sid}/skills/x/SKILL.md", "workspace/.claude/own"):
+        assert proxy_fs.is_unsynced_engine_home_path(rel), rel
+    # What Codex 0.169 writes beside its sign-in (two empty locks, and a
+    # temporary file holding the credentials a killed save can leave) is a
+    # direct file of the engine folder or of a home: never synced.
+    for name in ("auth.lock", "auth.json.lock", ".auth-Ab12Cd"):
+        for rel in (f"users/u/.codex/{name}", f"workspace/.codex/{name}", f"users/u/.codex/own/{sid}/{name}"):
+            assert proxy_fs.is_unsynced_engine_home_path(rel), rel

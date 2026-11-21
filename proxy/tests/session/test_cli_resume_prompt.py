@@ -7,11 +7,22 @@ prompt (no agent identity, duties, or client context). DB-free.
 """
 from pathlib import Path
 
-from core.layers.cli.session import PersistentSession
+import pytest
+
+import config
+from core.layers.cli.spawn import ClaudeSpawn
 
 
-def _mk(resume: bool, claude_dir) -> PersistentSession:
-    return PersistentSession(
+@pytest.fixture(autouse=True)
+def _agents_root(monkeypatch, tmp_path):
+    # The prompt file is written beneath an agent's folder only: the engine
+    # folder sits in the agent folder ``agent`` of the test's agents root.
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    (tmp_path / "agent" / ".claude").mkdir(parents=True)
+
+
+def _mk(resume: bool, claude_dir) -> ClaudeSpawn:
+    return ClaudeSpawn(
         session_id="sess-resume001122",
         agent_prompt="AGENT IDENTITY BLOCK",
         mcp_config_path=None,
@@ -24,13 +35,13 @@ def _mk(resume: bool, claude_dir) -> PersistentSession:
 
 
 def test_fresh_spawn_appends_system_prompt(tmp_path):
-    cmd, _env, _cwd = _mk(False, tmp_path).build_spawn_command()
+    cmd, _env, _cwd = _mk(False, tmp_path / "agent" / ".claude").build_spawn_command()
     assert "--append-system-prompt-file" in cmd
     assert "--session-id" in cmd
 
 
 def test_resume_spawn_appends_system_prompt(tmp_path):
-    cmd, _env, _cwd = _mk(True, tmp_path).build_spawn_command()
+    cmd, _env, _cwd = _mk(True, tmp_path / "agent" / ".claude").build_spawn_command()
     assert "--resume" in cmd
     assert "--append-system-prompt-file" in cmd
     prompt_file = Path(cmd[cmd.index("--append-system-prompt-file") + 1])

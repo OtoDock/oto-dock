@@ -13,6 +13,7 @@ import posixpath
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from lxml import etree
 
@@ -82,39 +83,43 @@ def _office_document(zf: zipfile.ZipFile) -> tuple[str, str] | None:
     return None
 
 
-def is_strict(path: str) -> bool:
+def is_strict(source: Any) -> bool:
     """True for a Strict-conformance workbook: a Strict relationship type, a
     workbook root in a Strict namespace, or conformance="strict". A file
     that is not a readable package answers False so openpyxl reports its
     own error."""
-    try:
-        with zipfile.ZipFile(path) as zf:
-            main = _office_document(zf)
-            if main is None:
-                return False
-            rtype, part = main
-            if rtype.startswith(_STRICT_PREFIX):
-                return True
-            try:
-                with zf.open(part) as fh:
-                    for _event, elem in etree.iterparse(
-                        fh, events=("start",), resolve_entities=False,
-                        no_network=True, load_dtd=False, huge_tree=False,
-                    ):
-                        return (
-                            elem.tag.startswith("{" + _STRICT_PREFIX)
-                            or elem.get("conformance") == "strict"
-                        )
-            except (KeyError, etree.XMLSyntaxError):
-                return False
-    except (OSError, zipfile.BadZipFile):
+    import shared
+
+    with shared.reading(source) as package:
+        try:
+            with zipfile.ZipFile(package) as zf:
+                main = _office_document(zf)
+                if main is None:
+                    return False
+                rtype, part = main
+                if rtype.startswith(_STRICT_PREFIX):
+                    return True
+                try:
+                    with zf.open(part) as fh:
+                        for _event, elem in etree.iterparse(
+                            fh, events=("start",), resolve_entities=False,
+                            no_network=True, load_dtd=False, huge_tree=False,
+                        ):
+                            return (
+                                elem.tag.startswith("{" + _STRICT_PREFIX)
+                                or elem.get("conformance") == "strict"
+                            )
+                except (KeyError, etree.XMLSyntaxError):
+                    return False
+        except (OSError, zipfile.BadZipFile):
+            return False
         return False
-    return False
 
 
-def check_readable(path: str) -> None:
-    """Refuse a workbook openpyxl would misread, before any load."""
-    if is_strict(path):
+def check_readable(source: Any) -> None:
+    """Refuse a workbook openpyxl would misread, before any load: ``source``
+    a path (``shared.safe_open_read``) or the file the caller holds."""
+    if is_strict(source):
         raise ValueError(STRICT_MESSAGE)
 
 
@@ -128,31 +133,34 @@ class MacroParts:
     root_rels: list[dict[str, str]] = field(default_factory=list)
 
 
-def read_macro_parts(path: str) -> MacroParts:
+def read_macro_parts(source: Any) -> MacroParts:
     """Read the parts to restore, from the original, before it is replaced."""
-    parts = MacroParts()
-    try:
-        with zipfile.ZipFile(path) as zf:
-            names = set(zf.namelist())
-            try:
-                types = etree.fromstring(zf.read("[Content_Types].xml"), _PARSER)
-                for ov in types.findall(f"{{{_CT_NS}}}Override"):
-                    name = ov.get("PartName", "")
-                    if name:
-                        parts.overrides[name] = ov.get("ContentType", "")
-            except (KeyError, etree.XMLSyntaxError):
-                pass
-            if _VBA_RELS in names:
-                parts.vba_rels = zf.read(_VBA_RELS)
-            main = _office_document(zf)
-            if main is not None:
-                root = etree.fromstring(zf.read("_rels/.rels"), _PARSER)
-                for rel in root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
-                    if rel.get("Type") in _CUSTOM_UI_TYPES:
-                        parts.root_rels.append(dict(rel.attrib))
-    except (OSError, zipfile.BadZipFile, KeyError, etree.XMLSyntaxError):
-        return MacroParts()
-    return parts
+    import shared
+
+    with shared.reading(source) as fh:
+        parts = MacroParts()
+        try:
+            with zipfile.ZipFile(fh) as zf:
+                names = set(zf.namelist())
+                try:
+                    types = etree.fromstring(zf.read("[Content_Types].xml"), _PARSER)
+                    for ov in types.findall(f"{{{_CT_NS}}}Override"):
+                        name = ov.get("PartName", "")
+                        if name:
+                            parts.overrides[name] = ov.get("ContentType", "")
+                except (KeyError, etree.XMLSyntaxError):
+                    pass
+                if _VBA_RELS in names:
+                    parts.vba_rels = zf.read(_VBA_RELS)
+                main = _office_document(zf)
+                if main is not None:
+                    root = etree.fromstring(zf.read("_rels/.rels"), _PARSER)
+                    for rel in root.findall(f"{{{_PKG_REL_NS}}}Relationship"):
+                        if rel.get("Type") in _CUSTOM_UI_TYPES:
+                            parts.root_rels.append(dict(rel.attrib))
+        except (OSError, zipfile.BadZipFile, KeyError, etree.XMLSyntaxError):
+            return MacroParts()
+        return parts
 
 
 def _content_types(xml: bytes, names: set[str], ext: str, kept: MacroParts) -> bytes:
@@ -281,23 +289,26 @@ def sheet_targets(zf: zipfile.ZipFile) -> dict[str, str]:
     return out
 
 
-def sheet_parts(path: str) -> dict[str, SheetParts]:
+def sheet_parts(source: Any) -> dict[str, SheetParts]:
     """Each sheet's own parts, by sheet title, as the file names them; an
     empty map for a file that is not a readable package."""
-    try:
-        with zipfile.ZipFile(path) as zf:
-            out: dict[str, SheetParts] = {}
-            for title, part in sheet_targets(zf).items():
-                comments = vml = None
-                for _rid, rtype, target in _rels_of(zf, part):
-                    if rtype.endswith(_COMMENTS_SUFFIX):
-                        comments = target
-                    elif rtype.endswith(_VML_SUFFIX):
-                        vml = target
-                out[title] = SheetParts(part, comments, vml)
-            return out
-    except (OSError, zipfile.BadZipFile, KeyError, etree.XMLSyntaxError):
-        return {}
+    import shared
+
+    with shared.reading(source) as fh:
+        try:
+            with zipfile.ZipFile(fh) as zf:
+                out: dict[str, SheetParts] = {}
+                for title, part in sheet_targets(zf).items():
+                    comments = vml = None
+                    for _rid, rtype, target in _rels_of(zf, part):
+                        if rtype.endswith(_COMMENTS_SUFFIX):
+                            comments = target
+                        elif rtype.endswith(_VML_SUFFIX):
+                            vml = target
+                    out[title] = SheetParts(part, comments, vml)
+                return out
+        except (OSError, zipfile.BadZipFile, KeyError, etree.XMLSyntaxError):
+            return {}
 
 
 def defined_names(zf: zipfile.ZipFile) -> dict[tuple[str | None, str], str]:

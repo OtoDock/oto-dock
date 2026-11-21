@@ -9,6 +9,7 @@ Verifies that:
 - config_builder produces valid AgentConfig
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -406,15 +407,24 @@ class TestExecutionLayerABC:
 
 class TestSessionManager:
     def test_get_layer_for_cli_agent(self):
-        from core.layers.cli.layer import CLIExecutionLayer
+        """A process engine's session of the platform's place runs on the
+        compute machine its config was built on (the remote layer); with no
+        compute placement there is no layer: the platform starts none
+        itself, and the lookup is refused with the sentence."""
+        from core import placement
         from core.session.session_manager import get_execution_layer
+        from tests._compute import placed
 
-        with patch("core.session.session_manager.agent_store") as mock_store:
+        sentinel_layer = MagicMock()
+        with patch("core.session.session_manager.agent_store") as mock_store, \
+                patch("core.session.session_manager._get_remote_layer", return_value=sentinel_layer):
             mock_store.get_agent.return_value = {
                 "slug": "test", "execution_path": "claude-code-cli",
             }
-            layer = get_execution_layer("test")
-            assert isinstance(layer, CLIExecutionLayer)
+            assert get_execution_layer("test", placement_built=placed()) is sentinel_layer
+            with pytest.raises(placement.NoComputeMachine) as refused:
+                get_execution_layer("test")
+            assert str(refused.value) == placement.NO_COMPUTE_SENTENCE
 
     def test_get_layer_for_direct_agent(self):
         from core.layers.direct.layer import DirectLLMExecutionLayer
@@ -429,34 +439,51 @@ class TestSessionManager:
 
     def test_unknown_agent_falls_back_to_the_platform_default(self):
         # An agent row that is GONE while a session of it may still be live
-        # (deleted mid-session, a shutdown sweep) must NOT raise: the caller
-        # at that point is almost always trying to CLOSE something. The
-        # platform default is the right guess — it is what the row said.
+        # (deleted mid-session, a shutdown sweep) is read as the platform
+        # default engine — it is what the row said — never as an unknown
+        # engine: with the compute placement its session was built on, the
+        # layer that holds it answers; with none, the answer is the one any
+        # process engine of the platform's place gets (the refusal).
         # Contrast test_unknown_path_fails_closed below: a KNOWN row naming
-        # an unknown engine is a configuration error and does raise.
-        from core.layers.cli.layer import CLIExecutionLayer
+        # an unknown engine is a configuration error.
+        from core import placement
         from core.session.session_manager import get_execution_layer
+        from tests._compute import placed
 
-        with patch("core.session.session_manager.agent_store") as mock_store:
+        sentinel_layer = MagicMock()
+        with patch("core.session.session_manager.agent_store") as mock_store, \
+                patch("core.session.session_manager._get_remote_layer", return_value=sentinel_layer):
             mock_store.get_agent.return_value = None
-            layer = get_execution_layer("nonexistent")
-            assert isinstance(layer, CLIExecutionLayer)
+            assert get_execution_layer("nonexistent", placement_built=placed()) is sentinel_layer
+            with pytest.raises(placement.NoComputeMachine) as refused:
+                get_execution_layer("nonexistent")
+            assert str(refused.value) == placement.NO_COMPUTE_SENTENCE
 
     def test_execution_target_local_skips_resolution(self):
-        """A provided execution_target='local' returns the local layer by
-        path WITHOUT re-resolving — the resolver must not be consulted."""
-        from core.layers.cli.layer import CLIExecutionLayer
+        """A provided execution_target='local' is answered WITHOUT
+        re-resolving — the resolver must not be consulted: the remote layer
+        for the compute placement the caller built, the refusal with none
+        (never a layer a second resolution would have named)."""
+        from core import placement
         from core.session.session_manager import get_execution_layer
+        from tests._compute import placed
 
+        sentinel_layer = MagicMock()
         with patch("core.session.session_manager.agent_store") as mock_store, \
-                patch("services.remote.remote_status.resolve_execution_target") as mock_resolve:
+                patch("services.remote.remote_status.resolve_execution_target") as mock_resolve, \
+                patch("core.session.session_manager._get_remote_layer", return_value=sentinel_layer):
             mock_store.get_agent.return_value = {
                 "slug": "test", "execution_path": "claude-code-cli",
             }
             layer = get_execution_layer(
                 "test", execution_path="claude-code-cli", execution_target="local",
+                placement_built=placed(),
             )
-            assert isinstance(layer, CLIExecutionLayer)
+            assert layer is sentinel_layer
+            with pytest.raises(placement.NoComputeMachine):
+                get_execution_layer(
+                    "test", execution_path="claude-code-cli", execution_target="local",
+                )
             mock_resolve.assert_not_called()
 
     def test_execution_target_remote_skips_resolution(self):
@@ -583,50 +610,53 @@ class TestSessionManager:
         with pytest.raises(ValueError):   # it IS a ValueError
             get_layer_by_path("unknown-path")
 
-    def test_valid_execution_paths_is_the_registry(self):
+    def test_valid_execution_paths_is_the_registry(self, monkeypatch):
         from core.session.session_manager import (
-            _LAYERS,
-            register_layer,
+            _ENGINES,
+            get_layer_by_path,
             valid_execution_paths,
         )
 
-        assert valid_execution_paths() == set(_LAYERS)
+        assert valid_execution_paths() == set(_ENGINES)
         assert "claude-code-cli" in valid_execution_paths()
-        # Registering a layer is the ONE step that makes its id valid
+        # An engine in the table is the ONE step that makes its id valid
         # everywhere — the API validators, the checks parser and the admin
         # endpoints all read this set.
-        try:
-            register_layer("acme-cli", MagicMock())
-            assert "acme-cli" in valid_execution_paths()
-        finally:
-            _LAYERS.pop("acme-cli", None)
-        assert "acme-cli" not in valid_execution_paths()
+        engine = MagicMock()
+        monkeypatch.setitem(_ENGINES, "acme-cli", engine)
+        assert "acme-cli" in valid_execution_paths() and get_layer_by_path("acme-cli") is engine
 
-    def test_find_layer_for_session_asks_each_layer(self):
+    def test_find_layer_for_session_asks_each_holder(self):
         from core.session.session_manager import (
             find_layer_for_session,
-            get_all_layers,
+            holding_engines,
         )
 
         assert find_layer_for_session("no-such-session") is None
         assert find_layer_for_session("") is None
-        # Every registered layer answers ownership synchronously, without the
-        # caller importing its private pool dict.
-        for layer in get_all_layers().values():
+        # Every layer that holds sessions answers ownership synchronously,
+        # without the caller importing its private pool dict. Direct LLM's
+        # is always one of them: it runs on no machine.
+        assert "direct-llm" in holding_engines()
+        for layer in holding_engines().values():
             assert layer.owns_session("no-such-session") is False
 
-    def test_register_layer(self):
-        from core.session.session_manager import (
-            _LAYERS,
-            get_layer_by_path,
-            register_layer,
-        )
+    def test_an_engine_that_holds_no_session_is_no_holder(self, monkeypatch):
+        """The engines' table answers facts. Who holds a session is asked
+        of the holders alone."""
+        from core.engine import Engine
+        from core.session import session_manager
 
-        mock_layer = MagicMock()
-        register_layer("test-layer", mock_layer)
-        assert get_layer_by_path("test-layer") is mock_layer
-        # Cleanup
-        _LAYERS.pop("test-layer", None)
+        class _FactsOnly(Engine):
+            capabilities = session_manager.get_layer_by_path("claude-code-cli").capabilities
+
+            async def can_resume_session(self, *a, **kw):
+                raise AssertionError
+
+        monkeypatch.setitem(session_manager._ENGINES, "facts-only", _FactsOnly())
+        assert "facts-only" in session_manager.valid_execution_paths()
+        assert "facts-only" not in session_manager.holding_engines()
+        assert session_manager.find_layer_for_session("any") is None
 
 
 # ---------------------------------------------------------------------------
@@ -664,21 +694,6 @@ class TestSessionMode:
         set_session_mode(sid, "ask")
         set_session_mode(sid, "autoReview")
         assert get_session_mode(sid) == "autoReview"
-        _session_modes.pop(sid, None)
-
-    def test_a_word_from_before_1_9_is_recorded_in_the_current_vocabulary(self):
-        from core.session.session_state import (
-            _session_modes,
-            get_session_mode,
-            register_session_state,
-            set_session_mode,
-        )
-
-        sid = "test-session-mode-legacy"
-        set_session_mode(sid, "acceptEdits")
-        assert get_session_mode(sid) == "autoReview"
-        register_session_state(sid, "default", None)
-        assert get_session_mode(sid) == "ask"
         _session_modes.pop(sid, None)
 
 
@@ -781,13 +796,17 @@ class TestDirectLifecycle:
 
 
 class TestCliResumeProbe:
-    """The local transcript probe reads line by line in a thread: the first
-    user line decides, a torn last line is no fault, a file with no user
-    line or none at all is fresh, a disk fault is undecided."""
+    """The probe of a transcript in the platform's folder reads line by line
+    in a thread: the first user line decides, a torn last line is no fault,
+    a file with no user line or none at all is fresh, a disk fault is
+    undecided."""
 
-    def test_the_first_user_line_decides_and_a_torn_tail_is_no_fault(self, tmp_path):
+    def test_the_first_user_line_decides_and_a_torn_tail_is_no_fault(self, tmp_path, monkeypatch):
+        import config as app_config
         from core.layers.cli.layer import CLIExecutionLayer
-        f = tmp_path / "s.jsonl"
+        monkeypatch.setattr(app_config, "AGENTS_DIR", tmp_path)   # read beneath an agent's folder only
+        (tmp_path / "ag").mkdir()
+        f = tmp_path / "ag" / "s.jsonl"
         f.write_bytes(b'{"type":"summary"}\n{"type":"user","message":"hi"}\n\xff\xfe torn')
         assert CLIExecutionLayer._session_file_has_user_message(f) is ResumeVerdict.RESUMABLE
         f.write_bytes(b'{"type": "user"}\n' + b"x" * 4096)
@@ -796,20 +815,134 @@ class TestCliResumeProbe:
         assert CLIExecutionLayer._session_file_has_user_message(f) is ResumeVerdict.FRESH
         f.write_bytes(b"")
         assert CLIExecutionLayer._session_file_has_user_message(f) is ResumeVerdict.FRESH
-        assert CLIExecutionLayer._session_file_has_user_message(tmp_path / "gone.jsonl") is ResumeVerdict.FRESH
+        assert CLIExecutionLayer._session_file_has_user_message(tmp_path / "ag" / "gone.jsonl") is ResumeVerdict.FRESH
 
     def test_a_disk_fault_is_undecided(self, tmp_path, monkeypatch):
         import errno
-        from pathlib import Path
 
+        import config as app_config
         from core.layers.cli.layer import CLIExecutionLayer
-        f = tmp_path / "s.jsonl"
+        from services.infra import safe_fs
+        monkeypatch.setattr(app_config, "AGENTS_DIR", tmp_path)
+        (tmp_path / "ag").mkdir()
+        f = tmp_path / "ag" / "s.jsonl"
         f.write_text('{"type":"user"}\n')
 
-        def _fault(self, *a, **kw):
+        def _fault(*a, **kw):
             raise OSError(errno.EIO, "Input/output error")
-        monkeypatch.setattr(Path, "open", _fault)
+        monkeypatch.setattr(safe_fs, "open_regular_for_read", _fault)
         assert CLIExecutionLayer._session_file_has_user_message(f) is ResumeVerdict.UNKNOWN
+
+    @staticmethod
+    def _store(tmp_path, monkeypatch):
+        """An engine folder under the test's own agents root, and a folder
+        beside the agent with a stand-in transcript that holds a prompt."""
+        import config as app_config
+        monkeypatch.setattr(app_config, "AGENTS_DIR", tmp_path)
+        store = tmp_path / "ag" / "users" / "u" / ".claude"
+        (store / "projects").mkdir(parents=True)
+        elsewhere = tmp_path / "elsewhere" / "p"
+        elsewhere.mkdir(parents=True)
+        (elsewhere / "sess-l.jsonl").write_text('{"type":"user"}\n')
+        return store, elsewhere
+
+    def test_a_linked_project_folder_reads_as_fresh(self, tmp_path, monkeypatch):
+        from core.layers.cli.layer import CLIExecutionLayer
+        store, elsewhere = self._store(tmp_path, monkeypatch)
+        (store / "projects" / "p").symlink_to(elsewhere)
+        assert CLIExecutionLayer._probe_on_disk(str(store), "sess-l") is ResumeVerdict.FRESH
+
+    def test_a_link_at_the_transcript_reads_as_fresh(self, tmp_path, monkeypatch):
+        from core.layers.cli.layer import CLIExecutionLayer
+        store, elsewhere = self._store(tmp_path, monkeypatch)
+        (store / "projects" / "p").mkdir()
+        (store / "projects" / "p" / "sess-l.jsonl").symlink_to(elsewhere / "sess-l.jsonl")
+        assert CLIExecutionLayer._probe_on_disk(str(store), "sess-l") is ResumeVerdict.FRESH
+        assert CLIExecutionLayer._session_file_has_user_message(
+            store / "projects" / "p" / "sess-l.jsonl") is ResumeVerdict.FRESH
+
+    def test_a_pipe_at_the_transcript_reads_as_fresh_at_once(self, tmp_path, monkeypatch):
+        import os
+        import threading
+
+        from core.layers.cli.layer import CLIExecutionLayer
+        store, _ = self._store(tmp_path, monkeypatch)
+        (store / "projects" / "p").mkdir()
+        pipe = store / "projects" / "p" / "sess-l.jsonl"
+        os.mkfifo(pipe)
+        out: list = []
+        th = threading.Thread(target=lambda: out.append(
+            (CLIExecutionLayer._probe_on_disk(str(store), "sess-l"),
+             CLIExecutionLayer._session_file_has_user_message(pipe))), daemon=True)
+        th.start()
+        th.join(5)
+        assert out == [(ResumeVerdict.FRESH, ResumeVerdict.FRESH)]
+
+    def test_a_fault_in_the_search_is_undecided(self, tmp_path, monkeypatch):
+        import errno
+
+        from core.layers.cli.layer import CLIExecutionLayer
+        from core.session import transcript_tailer
+        store, _ = self._store(tmp_path, monkeypatch)
+
+        def _fault(*a, **kw):
+            raise OSError(errno.EMFILE, "Too many open files")
+        monkeypatch.setattr(transcript_tailer, "find_transcript", _fault)
+        assert CLIExecutionLayer._probe_on_disk(str(store), "sess-l") is ResumeVerdict.UNKNOWN
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a folder with no permission bits")
+    def test_a_projects_folder_it_cannot_read_is_undecided(self, tmp_path, monkeypatch):
+        """The transcript search could not look: it raises, and the probe
+        answers unknown, never a fresh session."""
+        from core.layers.cli.layer import CLIExecutionLayer
+        from core.session import transcript_tailer
+        store, _ = self._store(tmp_path, monkeypatch)
+        (store / "projects" / "-users-u").mkdir()
+        (store / "projects" / "-users-u" / "sess-l.jsonl").write_text('{"type":"user"}\n')
+        (store / "projects").chmod(0)
+        try:
+            with pytest.raises(OSError):
+                transcript_tailer.transcript_files(str(store), "sess-l")
+            verdict = CLIExecutionLayer._probe_on_disk(str(store), "sess-l")
+        finally:
+            (store / "projects").chmod(0o755)
+        assert verdict is ResumeVerdict.UNKNOWN
+        assert CLIExecutionLayer._probe_on_disk(str(store), "sess-l") is ResumeVerdict.RESUMABLE
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root lists a folder with no read bit")
+    def test_the_probe_names_the_agent_so_an_unlistable_agents_folder_loses_nothing(self, tmp_path, monkeypatch):
+        """An agent behind the operator's link, its engine folder recorded at
+        the real place: the probe names the agent, so a listing of the agents
+        folder that fails never reads as a fresh session."""
+        import asyncio
+
+        import config as app_config
+        from core.layers.cli.layer import CLIExecutionLayer
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        monkeypatch.setattr(app_config, "AGENTS_DIR", agents)
+        real = tmp_path / "disk2" / "ag"
+        store = real / "users" / "u" / ".claude"
+        (store / "projects" / "-users-u").mkdir(parents=True)
+        (store / "projects" / "-users-u" / "sess-ul.jsonl").write_text('{"type":"user"}\n')
+        (agents / "ag").symlink_to(real)
+        monkeypatch.setattr("core.session.session_state.get_session_claude_dir",
+                            lambda s: str(store) if s == "sess-ul" else None)
+        agents.chmod(0o311)
+        try:
+            verdict = asyncio.run(CLIExecutionLayer().can_resume_session("sess-ul", agent_name="ag"))
+        finally:
+            agents.chmod(0o755)
+        assert verdict is ResumeVerdict.RESUMABLE
+
+    def test_the_honest_transcript_resumes(self, tmp_path, monkeypatch):
+        from core.layers.cli.layer import CLIExecutionLayer
+        store, _ = self._store(tmp_path, monkeypatch)
+        (store / "projects" / "-users-u").mkdir()
+        (store / "projects" / "-users-u" / "sess-l.jsonl").write_text('{"type":"user"}\n')
+        assert CLIExecutionLayer._probe_on_disk(str(store), "sess-l") is ResumeVerdict.RESUMABLE
+        assert CLIExecutionLayer().chat_session_files(store.parent, "sess-l", "") == [
+            store / "projects" / "-users-u" / "sess-l.jsonl"]
 
     @pytest.mark.asyncio
     async def test_the_probe_runs_off_the_loop(self, temp_db, monkeypatch):
@@ -823,9 +956,9 @@ class TestCliResumeProbe:
         threads: list = []
         original = CLIExecutionLayer._session_file_has_user_message
 
-        def _record(session_file):
+        def _record(session_file, agent=""):
             threads.append(threading.current_thread())
-            return original(session_file)
+            return original(session_file, agent)
         monkeypatch.setattr(CLIExecutionLayer, "_session_file_has_user_message", staticmethod(_record))
         layer = CLIExecutionLayer()
         assert await layer.can_resume_session(
@@ -877,6 +1010,23 @@ class TestCodexResumeGate:
 
         layer = CodexCLIExecutionLayer()
         assert await layer.can_resume_session("sess-crg2", agent_name="a1") is ResumeVerdict.RESUMABLE
+
+    @pytest.mark.asyncio
+    async def test_a_search_that_cannot_decide_is_unknown_and_runs_off_the_loop(self, temp_db, monkeypatch):
+        import threading
+
+        from core.layers.codex.layer import CodexCLIExecutionLayer
+        from core.session import codex_rollout_tailer as rollouts
+
+        temp_db.create_chat("crg4", "user-admin", "a1")
+        temp_db.update_chat("crg4", session_id="sess-crg4", codex_thread_id="th-und")
+        threads: list = []
+        monkeypatch.setattr(rollouts, "find_rollout", lambda home, tid, agent="": threads.append(
+            threading.current_thread()) or (rollouts.UNDECIDED, None))
+        layer = CodexCLIExecutionLayer()
+        assert await layer.can_resume_session(
+            "sess-crg4", agent_name="a1", username="alice") is ResumeVerdict.UNKNOWN
+        assert threads and threads[0] is not threading.main_thread()
 
     @pytest.mark.asyncio
     async def test_no_thread_id_refuses(self, temp_db):

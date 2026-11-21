@@ -41,7 +41,7 @@ export default function RemoteFallbackBanner({
   return (
     <div
       role="status"
-      className="mb-2 w-full max-w-4xl mx-auto px-3 py-2 rounded-card bg-status-warning-bg border border-status-warning-border text-xs text-status-warning-fg"
+      className="mb-2 w-full px-3 py-2 rounded-card bg-status-warning-bg border border-status-warning-border text-xs text-status-warning-fg"
     >
       <div className="flex items-center gap-2">
         <span className="min-w-0">

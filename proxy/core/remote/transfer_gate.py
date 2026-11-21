@@ -1,8 +1,8 @@
 """Outbound-transfer gate (Feature F, 1.4.0, per machine since 1.7.1).
 
 Bounds how many LARGE proxy→satellite pushes run at once to each machine,
-across the three push paths: the live fan-out (``workspace_fanout.fan_out_write``),
-the initial-sync push branch (``remote_workspace_sync``) and a read's re-push
+across the three push paths: a machine's lane (``machine_push_lane``), the
+initial-sync push branch (``remote_workspace_sync``) and a read's re-push
 of a platform-ahead copy (``remote_file_flow``). A machine's bytes in flight
 are bounded by its connection's bulk credit (``satellite_connection
 ._BulkCredit``), which the pushes to it share; this caps how many large ones

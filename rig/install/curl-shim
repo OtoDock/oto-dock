@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# Put on PATH as `curl` for one command: the install scripts' GitHub addresses
+# answer from a candidate's tree (RIG_CANDIDATE), so install.sh runs byte for byte
+# as it ships for a build nobody has published. Every other address is the real curl.
+set -euo pipefail
+REAL="$(PATH="$(printf '%s' "$PATH" | sed "s|$(dirname "$0"):||")" command -v curl)"
+url="" out="" remote=0 prev=""
+for arg in "$@"; do
+    case "$prev" in -o) out="$arg" ;; esac
+    case "$arg" in
+        https://raw.githubusercontent.com/OtoDock/oto-dock/*) url="$arg" ;;
+        -fsSLO|-O) remote=1 ;;
+    esac
+    prev="$arg"
+done
+if [ -z "$url" ]; then
+    exec "$REAL" "$@"
+fi
+rel="${url#https://raw.githubusercontent.com/OtoDock/oto-dock/}"
+rel="${rel#*/}"
+src="$RIG_CANDIDATE/$rel"
+[ -f "$src" ] || { echo "curl-shim: the candidate has no $rel" >&2; exit 22; }
+if [ -n "$out" ]; then
+    cp "$src" "$out"
+elif [ "$remote" = 1 ]; then
+    cp "$src" "$(basename "$rel")"
+else
+    cat "$src"
+fi

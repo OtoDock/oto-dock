@@ -8,11 +8,19 @@ divergent satellite from mass-deleting platform data, and what lets an offline
 satellite apply a missed delete when it reconnects.
 
 A tombstone is written whenever the platform deletes a file — a dashboard delete
-(including each file under a deleted directory), or an applied live satellite
-delete. ``deleted_at_mtime`` (epoch seconds) orders the tombstone against a
+(including each file under a deleted directory), an applied live satellite
+delete, the retention sweep aging a file out (origin ``retention``), or the
+end-of-turn scan noticing a file a session removed in its own sandbox (origin
+``session-delete``, ``services/infra/file_bookkeeping.py``). That scan is the one
+place a tombstone follows from a file having gone: it records only a path a
+paired machine holds, that was there at the last look, and that the session
+ended could write. ``deleted_at_mtime`` (epoch seconds) orders the tombstone against a
 satellite re-create of the same path (clock-offset-adjusted at merge time).
 
-One row per ``(agent_slug, rel_path)`` — re-deleting refreshes it. Reaped after
+One row per ``(agent_slug, rel_path)``. A new delete of the path refreshes it.
+A machine reporting again a delete already recorded, for a file the platform
+no longer holds, leaves it as it is (``satellite_file_transfer._delete_recorded``),
+so the row keeps the first delete's time and age. Reaped after
 ``FILE_TOMBSTONE_TTL_DAYS`` (30d): past that, a re-created file at the path is
 simply re-adopted (the delete is assumed long-since propagated to every machine).
 
@@ -76,6 +84,15 @@ def get(agent_slug: str, rel_path: str) -> dict | None:
 # hold never authorizes a delete, and a fixed Windows satellite brings the
 # machine's copy back (``core/remote/file_sync.diff_manifests``).
 HOLD_ORIGIN = "windows-hash-hold"
+
+# The origin of a delete the end-of-turn scan inferred from a session's file
+# having gone (``services/infra/file_bookkeeping.py``).
+SESSION_DELETE_ORIGIN = "session-delete"
+# The origin of an upload the retention sweep aged out.
+RETENTION_ORIGIN = "retention"
+# Nobody asked for these deletes: a machine's copy the Recover bin cannot take
+# stays where it is, and taking it never pushes out what is already in the bin.
+UNASKED_ORIGINS = (SESSION_DELETE_ORIGIN, RETENTION_ORIGIN)
 
 
 def load_for_agent(agent_slug: str) -> dict[str, float]:

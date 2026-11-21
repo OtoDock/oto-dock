@@ -140,5 +140,29 @@ export function useChatAttachments({ agentName, draftKey }: {
     })
   }, [agentName, draftKey, uploadCap])
 
-  return { handleAddFiles, handleAddFolder, handleRemoveFile, handleRetryFile }
+  // A file the composer fetches before it can upload (a card dragged from
+  // another chat): one chip at once, uploading so Send waits, whose ✕ ends
+  // the fetch too. A refusal is the chip's sentence. The file then takes
+  // the same queue as a picked one.
+  const handleAddFetched = useCallback((name: string, load: (signal: AbortSignal) => Promise<File>) => {
+    if (!draftKey) return
+    const id = Math.random().toString(36).slice(2, 10)
+    const abort = new AbortController()
+    useChatStore.getState().addPendingFiles(draftKey, [{
+      id, name, size: 0, uploading: true, queued: true, abortController: abort,
+    }])
+    void load(abort.signal).then((file) => {
+      if (abort.signal.aborted) return
+      patchPendingFile(id, { name: file.name, size: file.size, file, uploadSent: 0, uploadTotal: file.size })
+      enqueueChatUpload({ fileId: id, file, agent: agentName || '', abort })
+    }, (e: unknown) => {
+      if (abort.signal.aborted) return
+      patchPendingFile(id, {
+        uploading: false, queued: false, abortController: undefined,
+        error: e instanceof Error && e.message ? e.message : 'The file could not be fetched.',
+      })
+    })
+  }, [agentName, draftKey])
+
+  return { handleAddFiles, handleAddFolder, handleAddFetched, handleRemoveFile, handleRetryFile }
 }

@@ -14,7 +14,6 @@ import time
 from typing import TYPE_CHECKING, cast
 
 from auth import roles
-from core.session import session_kind
 from storage import database as task_store, db_apps
 from storage.automation import notification_store
 from storage.identity import db_users
@@ -115,32 +114,33 @@ def _compute(row: dict) -> list[str]:
         return []
     agent = row.get("agent") or ""
     admins = set(notification_store.get_admin_user_subs())
+    # Each person's row on the app's agent: the role a Dock pin's chat is
+    # judged at below.
+    agent_rows: dict[str, str] = {}
     if row.get("username"):
         # A personal row reaches its owner only: admins may open it on
         # demand, but its frames are not theirs to receive.
         owner = row.get("owner_sub") or task_store.get_user_sub_by_username(row["username"]) or ""
-        members: dict[str, str] = {owner: "owner"} if owner else {}
-        candidates = set(members)
+        candidates = {owner} if owner else set()
     else:
-        members = {r["sub"]: r["agent_role"] for r in db_users.get_agent_users(agent)}
-        candidates = (set(members) | admins) - task_store.hidden_for_users(row.get("id") or "")
+        agent_rows = {r["sub"]: r["agent_role"] for r in db_users.get_agent_users(agent)}
+        candidates = (set(agent_rows) | admins) - task_store.hidden_for_users(row.get("id") or "")
     # People a share admits (SHARING.md): the person grantees who have not
     # hidden the app, and the members of every agent an agent or department
     # share places it in, minus their hide there; a grantee of a Dock pin
     # still has to pass its chat below.
     from storage.sharing import share_store
-    for sub in share_store.internal_grantees(row.get("id") or ""):
-        candidates.add(sub)
-        members.setdefault(sub, "grantee")
+    candidates.update(share_store.internal_grantees(row.get("id") or ""))
     if not row.get("username"):
-        for sub, role in share_store.placement_audience(row.get("id") or ""):
-            candidates.add(sub)
-            members.setdefault(sub, role)
+        candidates.update(sub for sub, _role in share_store.placement_audience(row.get("id") or ""))
     chat_id = row.get("scope_chat_id") or ""
     project_id = row.get("scope_project_id") or ""
     if not chat_id and not project_id:
         return sorted(candidates)
-    # A Dock pin follows its chat's access rule, the chat fetched once.
+    # A Dock pin follows its chat's access rule (``visibility.may_open_chat``),
+    # each candidate at their own row on the app's agent: a grantee or a
+    # placed agent's member holds none there unless they are a member too.
+    from core.session import visibility
     if chat_id:
         chat = task_store.get_chat(chat_id)
         chats = [chat] if chat else []
@@ -148,39 +148,15 @@ def _compute(row: dict) -> list[str]:
         chats = [c for c in task_store.list_chats_by_project(project_id) if c]
     if not chats:
         return []
+    if row.get("username"):
+        agent_rows = {r["sub"]: r["agent_role"] for r in db_users.get_agent_users(agent)}
+    facts = [(c, *visibility.chat_facts(c)) for c in chats]
     return sorted(
         sub for sub in candidates
-        if any(_may_open_chat(sub, sub in admins, sub in members, c,
-                              is_manager=roles.can_manage(members.get(sub))) for c in chats)
+        if any(visibility.may_open_chat(c, sub, agent_rows.get(sub) or roles.NO_ACCESS, admin=sub in admins,
+                                        run=run, record=record)
+               for c, run, record in facts)
     )
-
-
-def _may_open_chat(sub: str, is_admin: bool, is_member: bool, chat: dict, *,
-                   is_manager: bool = False) -> bool:
-    """``core.session.visibility.can_access_chat`` for a user known by sub and
-    membership alone, so the fan-out builds no principal per candidate."""
-    from core.session.visibility import (
-        _run_for_chat,
-        is_phone_chat_owner,
-        is_shared_chat_owner,
-        is_task_chat_owner,
-    )
-    if is_admin:
-        return True
-    owner = chat.get("user_sub", "") or ""
-    if session_kind.of_chat(chat) is session_kind.PHONE or is_phone_chat_owner(owner):
-        return is_manager
-    if owner == sub:
-        return True
-    if is_shared_chat_owner(owner):
-        return is_member
-    if is_task_chat_owner(owner) or session_kind.of_chat(chat) is session_kind.TASK:
-        run = _run_for_chat(chat)
-        if run is not None:
-            if (run.get("scope") or "agent") == "user":
-                return run.get("created_by") == sub
-            return is_member
-    return False
 
 
 def app_access(row: dict, user: UserContext) -> bool:

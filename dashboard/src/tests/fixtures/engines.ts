@@ -59,7 +59,7 @@ export function descriptor(over: DescriptorOverrides = {}): LayerCapabilities {
       installed_name: '',
     },
     behaviour: {
-      rebuilds_history_from_db: false, attach_images_inline: false, phone_http_mcps: true,
+      rebuilds_history_from_db: false, attach_images_inline: false,
       skills_delivery: 'materialized_dir', supports_bash: false, supports_plans_dir: false,
       builtin_file_tools: false, has_shell_on_external_route: true, provider_pinned_per_session: false,
       supports_steer: false, supports_compact: false, supports_interrupt_for_queued: false,

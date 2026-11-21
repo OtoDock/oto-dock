@@ -519,3 +519,38 @@ async def test_the_multiplex_keeps_a_result_that_lands_while_cancelling():
     await asyncio.sleep(0.01)
     done = await DashboardConnection._collect_late_results({first}, {late})
     assert late in done and late.result() == "landed"
+
+
+class TestTheEnginesOwnTurnBeforeTheMessage:
+    def test_a_turn_the_engine_ran_unread_lands_above_the_sent_message(
+        self, temp_db, monkeypatch,
+    ):
+        """A turn the engine ran by itself that nobody read waits for the
+        next send: the send reads it before it writes the person's row, so
+        the chat keeps the order in which things happened."""
+        gate = asyncio.Event()
+        gate.set()
+        calls = {"n": 0}
+        layer = FakeExecutionLayer()
+        layer.turn_events = _gated_turns(gate, calls)
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, sid = await warm_new_chat(ws, layer, slug)
+                layer.on_waiting_read = lambda s: task_store.add_chat_message(
+                    chat_id, "assistant", "the engine's own reply")
+                ws.client_send({"type": "chat", "text": "hello", "chat_id": chat_id})
+                for _ in range(40):
+                    frame = await ws.next_frame()
+                    if frame.get("type") == "done":
+                        break
+                assert layer.waiting_reads == [sid]
+                rows = [(m["role"], m["content"]) for m in task_store.get_chat_messages(chat_id)
+                        if m["role"] in ("user", "assistant")]
+                assert rows.index(("assistant", "the engine's own reply")) \
+                    < rows.index(("user", "hello"))
+        run_ws_scenario(scenario)

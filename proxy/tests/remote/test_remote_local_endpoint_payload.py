@@ -5,11 +5,9 @@ A codex-cli ``local_endpoint`` subscription reaches the layer as
 ``_CODEX_ENDPOINT_URL`` / ``_CODEX_LOCAL_API_KEY`` (+ ``_CODEX_ENDPOINT_PROVIDER``
 and the provider's model rows). The satellite writes its own config.toml, so
 the proxy carries the provider as the ``local_model_provider`` payload field
-(satellite >= 0.5.116: ``base_url``, ``env_key``; >= 0.5.117 also
-``stream_idle_timeout_ms`` and the per-session model ``catalog_json``) and the
-key as the child-env variable the provider's ``env_key`` names — never the
-private variables, and never to a satellite below 0.5.116 (which would run the
-local model name against Codex's built-in OpenAI provider).
+(``base_url``, ``env_key``, ``stream_idle_timeout_ms`` and the per-session
+model ``catalog_json``) and the key as the child-env variable the provider's
+``env_key`` names, never the private variables.
 """
 
 import json
@@ -53,13 +51,8 @@ def _config(**overrides):
 
 @pytest.fixture()
 def layer():
-    # The connection manager is a MagicMock, so every gate is truthy unless
-    # pinned — each test sets the local-provider gate EXPLICITLY.
     lay = RemoteExecutionLayer(MagicMock())
-    lay._cm.satellite_supports_local_model_provider.return_value = True
-    lay._cm.satellite_supports_local_model_catalog.return_value = True
-    lay._cm.satellite_version.return_value = "0.5.117"
-    lay._cm.satellite_name.return_value = "drill-sat"
+    lay._cm.satellite_version.return_value = "0.5.171"
     return lay
 
 
@@ -89,8 +82,14 @@ class TestLocalEndpointPayload:
         assert "CODEX_API_KEY" not in payload["env"]
         assert "auth_json" not in payload
         # The deferred-tools note rides AGENTS.md — one prompt, both fields.
-        assert payload["agents_md_content"].endswith(LOCAL_PROVIDER_TOOL_NOTE + "\n")
+        # Then the note on the shell's network, which every Codex session reads.
+        from core.layers.codex.helpers import BOX_NETWORK_NOTE
+        assert payload["agents_md_content"].endswith(
+            LOCAL_PROVIDER_TOOL_NOTE + "\n\n" + BOX_NETWORK_NOTE + "\n")
         assert payload["agents_md_content"] == payload["system_prompt"]
+        # The satellite takes the text as the session's own (an older one
+        # ignores the flag and writes AGENTS.md from the two keys).
+        assert payload["codex_session_text"] is True
         assert payload["agents_md_content"].startswith(config.system_prompt)
 
     @pytest.mark.asyncio
@@ -109,7 +108,7 @@ class TestLocalEndpointPayload:
             "_CODEX_ENDPOINT_PROVIDER": "ollama",
         })
         payload = await _build(layer, config)
-        assert payload["agents_md_content"].endswith(OLLAMA_PROVIDER_TOOL_NOTE + "\n")
+        assert OLLAMA_PROVIDER_TOOL_NOTE + "\n" in payload["agents_md_content"]
         assert "_CODEX_ENDPOINT_PROVIDER" not in payload["env"]
 
     @pytest.mark.asyncio
@@ -144,22 +143,6 @@ class TestLocalEndpointPayload:
         assert LOCAL_MODEL_ROWS_ENV not in payload["env"]
 
     @pytest.mark.asyncio
-    async def test_satellite_below_0_5_117_gets_the_provider_without_the_catalog(self, layer, caplog):
-        # Additive fields: a 0.5.116 satellite ignores them, so the proxy sends
-        # the 0.5.116 shape and logs the gap instead of refusing the session.
-        layer._cm.satellite_supports_local_model_catalog.return_value = False
-        layer._cm.satellite_version.return_value = "0.5.116"
-        config = _config(extra_env={
-            "_CODEX_ENDPOINT_URL": "http://127.0.0.1:11434/v1",
-            "_CODEX_ENDPOINT_PROVIDER": "ollama",
-        })
-        payload = await _build(layer, config)
-        assert payload["local_model_provider"] == {
-            "base_url": "http://127.0.0.1:11434/v1", "env_key": "",
-        }
-        assert any("0.5.117" in r.message and "drill-sat" in r.message for r in caplog.records)
-
-    @pytest.mark.asyncio
     async def test_url_is_forwarded_verbatim_no_loopback_rewrite(self, layer):
         # The SATELLITE host dials the URL as configured; a loopback URL means
         # the satellite's own machine (never rewritten for the proxy host).
@@ -169,38 +152,28 @@ class TestLocalEndpointPayload:
 
     @pytest.mark.asyncio
     async def test_hosted_session_carries_no_provider(self, layer):
-        config = _config(model="gpt-6.1-terra", extra_env={"CODEX_API_KEY": "sk-test"})
+        from core.execution_layer import SubscriptionHandle
+        from core.session.session_manager import get_layer_by_path
+        key_file = {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test"}
+        # The env the pool's adapter builds for an OpenAI key, not one made here.
+        env = get_layer_by_path("codex-cli").subscription_env(SubscriptionHandle(
+            subscription_id="sub-key", layer="codex-cli", provider="openai", auth_type="api_key",
+            api_key="sk-test", oauth_access_token=None, endpoint_url=None))
+        config = _config(model="gpt-6.1-terra", extra_env=env)
         payload = await _build(layer, config)
         assert "local_model_provider" not in payload
         assert LOCAL_ENDPOINT_KEY_ENV not in payload["env"]
-        assert payload["env"]["CODEX_API_KEY"] == "sk-test"
+        # An OpenAI key reaches the machine as the sign-in file, never in the
+        # session's environment.
+        assert payload["auth_json"] == key_file
+        assert "sk-test" not in json.dumps(payload["env"])
         # Hosted models know Codex's deferred-tool convention: no note.
         assert LOCAL_PROVIDER_TOOL_NOTE not in payload["agents_md_content"]
-        assert payload["agents_md_content"] == config.system_prompt
-
-    @pytest.mark.asyncio
-    async def test_old_satellite_is_refused_with_its_version(self, layer):
-        layer._cm.satellite_supports_local_model_provider.return_value = False
-        layer._cm.satellite_version.return_value = "0.5.115"
-        config = _config(extra_env={
-            "_CODEX_ENDPOINT_URL": _URL, "_CODEX_LOCAL_API_KEY": "llama-key",
-        })
-        with pytest.raises(
-            RuntimeError, match=r"0\.5\.116 or newer — drill-sat runs 0\.5\.115",
-        ):
-            await _build(layer, config)
-
-    @pytest.mark.asyncio
-    async def test_old_satellite_unknown_version_is_refused(self, layer):
-        layer._cm.satellite_supports_local_model_provider.return_value = False
-        layer._cm.satellite_version.return_value = ""
-        config = _config(extra_env={"_CODEX_ENDPOINT_URL": _URL})
-        with pytest.raises(RuntimeError, match="runs an unknown version"):
-            await _build(layer, config)
+        from core.layers.codex.helpers import with_box_network_note
+        assert payload["agents_md_content"] == with_box_network_note(config.system_prompt)
 
     @pytest.mark.asyncio
     async def test_claude_payload_pops_the_variables_and_carries_no_provider(self, layer):
-        layer._cm.satellite_supports_local_model_provider.return_value = False
         config = _config(model="claude-sonnet-5", extra_env={
             "_CODEX_ENDPOINT_URL": _URL, "_CODEX_LOCAL_API_KEY": "llama-key",
             "_CODEX_ENDPOINT_PROVIDER": "openai_compatible",
@@ -215,31 +188,14 @@ class TestLocalEndpointPayload:
         assert payload["env"]["ANTHROPIC_API_KEY"] == "sk-ant"
 
 
-def test_satellite_supports_local_model_provider_gate():
+def test_the_version_and_name_lookups():
     from core.remote.satellite_connection import (
         SatelliteConnection,
         SatelliteConnectionManager,
     )
     cm = SatelliteConnectionManager()
-    for mid, ver in (
-        ("old", "0.5.115"), ("new", "0.5.116"), ("catalog", "0.5.117"),
-        ("future", "0.6.0"), ("blank", ""),
-    ):
-        cm._connections[mid] = SatelliteConnection(
-            machine_id=mid, ws=None, satellite_version=ver,
-        )
-    assert cm.satellite_supports_local_model_provider("new") is True
-    assert cm.satellite_supports_local_model_provider("future") is True
-    assert cm.satellite_supports_local_model_provider("old") is False
-    assert cm.satellite_supports_local_model_provider("blank") is False
-    assert cm.satellite_supports_local_model_provider("offline") is False
-    # The soft gate for the 0.5.117 fields (idle timeout + model catalog):
-    # 0.5.116 still gets the provider, without them.
-    assert cm.satellite_supports_local_model_catalog("new") is False
-    assert cm.satellite_supports_local_model_catalog("catalog") is True
-    assert cm.satellite_supports_local_model_catalog("future") is True
-    assert cm.satellite_supports_local_model_catalog("offline") is False
-    assert cm.satellite_version("old") == "0.5.115"
+    cm._connections["m"] = SatelliteConnection(machine_id="m", ws=None, satellite_version="0.5.171")
+    assert cm.satellite_version("m") == "0.5.171"
     assert cm.satellite_version("offline") == ""
     # No display name registered → the short machine id.
     assert cm.satellite_name("offline-machine-id") == "offline-"

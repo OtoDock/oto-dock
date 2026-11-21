@@ -25,11 +25,12 @@ PAIRS = [
     (tokens.SESSION, tokens.SIGN_IN), (tokens.SIGN_IN, tokens.TWO_FACTOR),
     (tokens.SIGN_IN, tokens.PASSWORD_RESET), (tokens.SIGN_IN, tokens.INVITE),
     (tokens.SESSION, tokens.CLI), (tokens.SESSION, tokens.MCP_CREDENTIALS),
-    (tokens.MCP_CREDENTIALS, tokens.SESSION_FILES), (tokens.WOPI, tokens.SIGN_IN),
+    (tokens.WOPI, tokens.SIGN_IN),
     (tokens.WOPI, tokens.SESSION), (tokens.AUDIO_STT, tokens.AUDIO_TTS),
     (tokens.AUDIO_STT, tokens.DUPLEX), (tokens.AUDIO_TTS, tokens.DUPLEX),
     (tokens.SHARE_UNLOCK, tokens.SHARE_APP_SESSION), (tokens.ZIP_DOWNLOAD, tokens.SESSION),
     (tokens.TRUSTED_DEVICE, tokens.SIGN_IN), (tokens.RENDER, tokens.SIGN_IN),
+    (tokens.SESSION, tokens.TOOL_CALLBACK), (tokens.TOOL_CALLBACK, tokens.CLI),
 ]
 
 
@@ -146,6 +147,15 @@ def test_a_decode_that_forgets_the_audience_fails_on_these_tokens():
         jwt.decode(tok, tokens._key(tokens.SIGN_IN), algorithms=["HS256"])
     with pytest.raises(jwt.InvalidTokenError):
         jwt.decode(tok, config.JWT_SECRET, algorithms=["HS256"])
+
+
+def test_a_derived_value_is_bound_to_its_subject_kind_and_secret(monkeypatch):
+    one = tokens.derive(tokens.EXIT_DOOR, "s-1")
+    assert tokens.derive(tokens.EXIT_DOOR, "s-1") == one and len(one) == 64
+    assert tokens.derive(tokens.EXIT_DOOR, "s-2") != one
+    assert tokens.derive(tokens.MCP_TOKEN, "s-1") != one
+    monkeypatch.setattr(config, "JWT_SECRET", "another-install-" + "x" * 40)
+    assert tokens.derive(tokens.EXIT_DOOR, "s-1") != one
 
 
 def test_the_wopi_kind_signs_under_its_own_setting(monkeypatch):

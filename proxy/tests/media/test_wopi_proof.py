@@ -113,7 +113,9 @@ def rig(temp_db, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "WOPI_BASE_URL", "http://otodock-proxy:8400", raising=False)
     monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://app.example", raising=False)
     monkeypatch.setattr(wopi, "_person_holds_now", lambda sub, iat: True)
-    wopi._holder_answers.clear()
+    monkeypatch.setattr(wopi, "_standing_now", lambda sub, agent, path, chat: "edit")
+    wopi._holders.answers.clear()
+    wopi._documents.answers.clear()
     target = tmp_path / "test-agent" / "workspace" / "x.docx"
     target.parent.mkdir(parents=True)
     target.write_bytes(b"agent bytes")
@@ -125,7 +127,7 @@ def rig(temp_db, tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     yield {"plain": TestClient(app), "signed": signed_client(app), "token": token,
            "id": wopi.encode_file_id(rel), "reads": reads, "monkeypatch": monkeypatch}
-    wopi._holder_answers.clear()
+    wopi._holders.answers.clear()
 
 
 def _info(rig, headers=None, token=None, client="plain"):

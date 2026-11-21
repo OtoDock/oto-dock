@@ -193,56 +193,40 @@ _FAILED: set[int] = set()
 _MODELS_LOCK = threading.Lock()
 
 
-def _upsampled(samples: np.ndarray) -> np.ndarray:
-    """8 kHz to 16 kHz by linear interpolation."""
-    x = samples.astype(np.float32)
-    out = np.empty(len(x) * 2, dtype=np.float32)
-    out[0::2] = x
-    out[1::2] = np.append((x[:-1] + x[1:]) / 2, x[-1:]) if len(x) else x
-    return out
-
-
 class SpeechCheck:
-    """The seconds of speech in a stretch, by the bundled Silero model, in a
-    worker thread (the model carries state between windows: the calls take
-    turns). ``model_factory`` gives a check its own model (the tests).
-
-    At 8 kHz the model runs on the audio upsampled to 16 kHz: fed one 32 ms
-    window at a time with no context (the wrapper's feed, the phone VAD's),
-    Silero's 8 kHz head heard 9 % of a speaker's clear speech, its 16 kHz
-    head 90 % of the same audio upsampled, and silence 0 % either way."""
+    """The seconds of speech in a stretch, by the bundled Silero model at the
+    audio's own rate, in a worker thread (the model carries state between
+    windows: the calls take turns). ``model_factory`` gives a check its own
+    model (the tests)."""
 
     def __init__(self, rate: int, model_factory: Callable[[int], object] | None = None) -> None:
         self.rate = rate
-        self._model_rate = 16000 if rate == 8000 else rate
         self._factory = model_factory
         self._model = None
         self._lock = threading.Lock() if model_factory is not None else _MODELS_LOCK
 
     @property
     def usable(self) -> bool:
-        return self.rate in (8000, 16000) and (self._factory is not None or self._model_rate not in _FAILED)
+        return self.rate in (8000, 16000) and (self._factory is not None or self.rate not in _FAILED)
 
     def _load(self):
         if self._model is None:
             if self._factory is not None:
-                self._model = self._factory(self._model_rate)
+                self._model = self._factory(self.rate)
             else:
-                if self._model_rate not in _MODELS:
+                if self.rate not in _MODELS:
                     from audio.providers.vad.silero_model import SileroModel
-                    _MODELS[self._model_rate] = SileroModel(self._model_rate)
-                self._model = _MODELS[self._model_rate]
+                    _MODELS[self.rate] = SileroModel(self.rate)
+                self._model = _MODELS[self.rate]
         return self._model
 
     def seconds(self, context: np.ndarray, stretch: np.ndarray) -> float:
-        if self._model_rate != self.rate:
-            context, stretch = _upsampled(context), _upsampled(stretch)
         with self._lock:
             try:
                 model = self._load()
             except Exception as e:  # noqa: BLE001  # onnxruntime or a missing model file: the second listen stands down
-                if self._model_rate not in _FAILED:
-                    _FAILED.add(self._model_rate)
+                if self.rate not in _FAILED:
+                    _FAILED.add(self.rate)
                     logger.warning("second listen off: the speech model did not load: %s", e)
                 return 0.0
             model.reset()
@@ -253,7 +237,7 @@ class SpeechCheck:
             for i in range(0, len(audio) - size + 1, size):
                 if model.process(audio[i:i + size]) >= SPEECH_PROBABILITY and i + size > first:
                     speech += size
-            return speech / self._model_rate
+            return speech / self.rate
 
 
 @dataclass

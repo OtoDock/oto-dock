@@ -13,6 +13,9 @@ recovery scope so a restore can be authorization-gated:
   ``users/<slug>/`` file whose slug no longer maps to a user); only a manager of
   the agent (or an admin) may list / restore it.
 
+The retention sweep's working-files pass also parks an aged upload here, with
+reason ``deleted``, for the same seven days.
+
 Entries expire after 7 days (reaped by ``startup.py``'s sweep loop); the
 retention sweep also drops rows whose bytes are gone and bytes no row names
 (``prune_missing_blobs``, ``prune_orphan_blobs``). **No version history** — this
@@ -108,7 +111,7 @@ def _resolve_scope_owner(rel_path: str) -> tuple[str, str]:
 _NON_RECOVERABLE_SEGMENTS = frozenset({".claude", ".codex", layout.CREDENTIALS_DIR, ".config"})
 
 
-def _is_recoverable_path(rel_path: str) -> bool:
+def is_recoverable_path(rel_path: str) -> bool:
     """True only for real CONTENT worth recovering.
 
     Excludes session state + secrets — ``.claude`` / ``.codex`` (CLI session
@@ -122,6 +125,27 @@ def _is_recoverable_path(rel_path: str) -> bool:
     if not parts:
         return False
     return not any(seg in _NON_RECOVERABLE_SEGMENTS for seg in parts)
+
+
+def already_binned(agent_slug: str, rel_path: str, content: bytes) -> bool:
+    """True when exactly these bytes of this path are already recoverable."""
+    return _already_binned(agent_slug, rel_path, "sha256:" + hashlib.sha256(content).hexdigest())
+
+
+def room_left(agent_slug: str) -> int | None:
+    """Bytes the retention sweep may still park for this agent, None when the
+    bin has no cap. Half the cap is left to what people delete: a sweep that
+    filled the bin would make their next delete evict an entry inside its
+    seven days."""
+    cap = config.RECOVER_BIN_AGENT_MAX_BYTES
+    if cap <= 0:
+        return None
+    with get_conn() as conn:
+        used = int(conn.execute(
+            "SELECT COALESCE(SUM(size), 0) AS total FROM recover_bin WHERE agent_slug=%s",
+            (agent_slug,),
+        ).fetchone()["total"] or 0)
+    return max(0, cap // 2 - used)
 
 
 def _already_binned(agent_slug: str, rel_path: str, file_hash: str) -> bool:
@@ -229,25 +253,44 @@ def _enforce_agent_cap(agent_slug: str, incoming: int) -> None:
         )
 
 
+def _fits_under_cap(agent_slug: str, incoming: int) -> bool:
+    """Whether ``incoming`` more bytes stay under the per-agent cap as it is."""
+    cap = config.RECOVER_BIN_AGENT_MAX_BYTES
+    if cap <= 0:
+        return True
+    with get_conn() as conn:
+        total = int(conn.execute(
+            "SELECT COALESCE(SUM(size), 0) AS total FROM recover_bin WHERE agent_slug=%s",
+            (agent_slug,),
+        ).fetchone()["total"] or 0)
+    return total + incoming <= cap
+
+
 def capture(
     agent_slug: str,
     rel_path: str,
     content: bytes,
     reason: str,
     ttl_days: int = RECOVER_BIN_TTL_DAYS,
+    *,
+    evict: bool = True,
 ) -> dict | None:
     """Back up the pre-change bytes of a removed/overwritten file.
 
     Returns the entry metadata, or ``None`` when nothing was binned — empty
     content, content over ``RECOVER_BIN_MAX_BYTES``, or a disk/DB failure.
     Binning is a best-effort safety net, NEVER a gate: the caller proceeds with
-    the delete/overwrite regardless of the return value.
+    the delete/overwrite regardless of the return value (the retention sweep
+    and a merge's delete nobody asked for read it, and keep the file on
+    ``None``). ``evict=False`` (the sweep and an inferred delete) refuses
+    rather than make room: its files must never push out what a person
+    deleted, or the copy before it.
     """
     if reason not in VALID_REASONS:
         raise ValueError(f"recover-bin: invalid reason {reason!r}")
     if not content:
         return None  # nothing to recover (empty / zero-byte file)
-    if not _is_recoverable_path(rel_path):
+    if not is_recoverable_path(rel_path):
         return None  # session state / generated config / secrets — never binned
     if len(content) > config.RECOVER_BIN_MAX_BYTES:
         logger.info(
@@ -261,7 +304,10 @@ def capture(
         return None  # idempotent — this exact version is already recoverable
 
     # Make room under the per-agent cap before writing (evict oldest-first).
-    _enforce_agent_cap(agent_slug, len(content))
+    if evict:
+        _enforce_agent_cap(agent_slug, len(content))
+    elif not _fits_under_cap(agent_slug, len(content)):
+        return None
 
     scope, owner_sub = _resolve_scope_owner(rel_path)
     original_name = rel_path.rsplit("/", 1)[-1]

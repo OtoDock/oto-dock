@@ -15,6 +15,7 @@ import asyncio
 from core import placement
 from storage import database as task_store
 from storage.agents import agent_store
+from tests._compute import serve
 
 
 def _mk_user(sub: str, name: str, role: str = "member") -> str:
@@ -42,7 +43,13 @@ def _stub_capture(monkeypatch, tmp_path) -> dict:
     # user-scoped work with no resolved subscription (NoSubscriptionError).
     monkeypatch.setattr(cb.subscription_pool, "resolve_subscription_env", lambda *a, **k: ("sub-test", {}))
     monkeypatch.setattr(cb.remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
-    monkeypatch.setattr(cb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT)
+    # The platform's place is served by a compute machine: the builder
+    # places the session there, as the store's own reader answers it.
+    serve(monkeypatch)
+    monkeypatch.setattr(
+        cb.remote_store, "placement_of",
+        lambda *a, compute=None, **k: (placement.from_machine(placement.KIND_COMPUTE, compute)
+                                       if compute else placement.LOCAL_PLACEMENT))
     monkeypatch.setattr(cb.config, "build_agent_prompt", lambda *a, **k: "PROMPT")
     monkeypatch.setattr(cb.config, "get_cli_model", lambda *a, **k: "m")
     monkeypatch.setattr(cb.config, "get_cli_effort", lambda *a, **k: "")

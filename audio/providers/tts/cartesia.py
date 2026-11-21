@@ -22,6 +22,7 @@ import contextlib
 import logging
 import math
 import time
+from types import SimpleNamespace
 from typing import get_args, get_type_hints
 
 from cartesia import AsyncCartesia
@@ -36,6 +37,7 @@ from audio.providers.tts.base import (
     TTSProvider,
     UnsupportedProviderOperation,
     VoiceInfo,
+    speakable,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,6 +118,12 @@ def _generation_config(advanced: dict) -> dict | None:
     return config or None
 
 
+#: What ends the receiver of a context nothing was said in: the SDK's
+#: ``receive`` yields it, ends on its type and drops the context's queue, as
+#: on the vendor's own ``done``.
+_NOTHING_SAID = SimpleNamespace(type="done")
+
+
 def _log_refusal(event) -> None:
     """A Cartesia ``error`` frame ends its context: say why (the vendor's
     title and message, never the text spoken)."""
@@ -184,6 +192,11 @@ class CartesiaTTS(TTSProvider):
         self._generation_config = _generation_config(self._advanced)
         self._t_first_send = 0.0   # first-audio isolation stamps (per context)
         self._sent_chars = 0
+        # A context with nothing to say (``send_text_chunk``): its event
+        # queue, the text held until the first words, the end of its input.
+        self._queue = None
+        self._held = ""
+        self._input_ended = False
 
     # ── Factory / metadata ─────────────────────────────────────────
 
@@ -304,6 +317,13 @@ class CartesiaTTS(TTSProvider):
         # First-audio isolation stamps (one context at a time — provider-level)
         self._t_first_send = 0.0
         self._sent_chars = 0
+        # The context's own queue, taken now: a reconnect of the connection
+        # clears the SDK's table, and a receiver already waits on this one.
+        # None where the SDK shapes a context otherwise: then every chunk
+        # and every end goes to the vendor, as it always did.
+        self._queue = getattr(self._conn, "_context_queues", {}).get(getattr(self._ctx, "_context_id", None))
+        self._held = ""
+        self._input_ended = False
         logger.debug("TTS streaming context started")
 
     async def send_text_chunk(self, text: str, is_last: bool = False) -> None:
@@ -312,18 +332,33 @@ class CartesiaTTS(TTSProvider):
         Args:
             text: Text to synthesize (empty is allowed — used to flush the end).
             is_last: If True, signals no more text will follow.
+
+        A context opens at Cartesia with its first words. Text with nothing
+        to say that comes before them (markup, punctuation) is held and goes
+        in front of them, so a reply reads to Cartesia as it always did. An
+        end on a context nothing was said in goes to no vendor: Cartesia
+        refuses an end with no transcript before it, so the receiver is
+        ended here instead. After the end of input a chunk changes nothing.
         """
-        if not self._ctx or self._cancelled:
+        if not self._ctx or self._cancelled or self._input_ended:
             return
 
         try:
             if text:
-                await self._ctx.push(text)
-                self._sent_chars += len(text)
-                if not self._t_first_send:
-                    self._t_first_send = time.monotonic()
+                if self._sent_chars or self._queue is None or speakable(text):
+                    text, self._held = self._held + text, ""
+                    await self._ctx.push(text)
+                    self._sent_chars += len(text)
+                    if not self._t_first_send:
+                        self._t_first_send = time.monotonic()
+                else:
+                    self._held += text
             if is_last:
-                await self._ctx.no_more_inputs()
+                self._input_ended = True
+                if self._sent_chars or self._queue is None:
+                    await self._ctx.no_more_inputs()
+                else:
+                    self._queue.put_nowait(_NOTHING_SAID)
         except Exception as e:  # noqa: BLE001  # the Cartesia SDK raises whatever its socket does
             if not self._cancelled:
                 logger.error("TTS send error: %s", e)
@@ -363,6 +398,8 @@ class CartesiaTTS(TTSProvider):
         """
         self._cancelled = True
         self._ctx = None
+        self._queue = None
+        self._held = ""
         logger.debug("TTS streaming cancelled (barge-in)")
 
     # ── Voice discovery ────────────────────────────────────────────

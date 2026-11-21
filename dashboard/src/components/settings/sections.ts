@@ -60,7 +60,8 @@ export function adminSections(opts: {
   ]
 }
 
-export function agentSections(name: string, canManage: boolean): SettingsSection[] {
+/** `canEdit`: an editor or above on the agent (a manager is one too). */
+export function agentSections(name: string, canManage: boolean, canEdit = canManage): SettingsSection[] {
   const b = agentSettingsBase(name)
   return [
     { label: 'Overview', path: `${b}/overview`, icon: IconOverview, index: true },
@@ -70,10 +71,11 @@ export function agentSections(name: string, canManage: boolean): SettingsSection
     // Everyone sees the offered checks and the verdicts they may see;
     // managers create and edit the agent's (CHECKS.md).
     { label: 'Checks', path: `${b}/checks`, icon: IconShieldCheck },
-    // Monitoring: read-only operational views. Conversations are the
-    // externally driven sessions (phone); dashboard chats live in the chat
-    // sidebar. The pages gate their own actions.
-    { label: 'Conversations', path: `${b}/conversations`, icon: IconPhone, visible: canManage, group: MONITORING },
+    // Monitoring: read-only operational views. Conversations are the phone
+    // conversations of outside people and the people who reached the agent,
+    // for its editors and managers; a person's own calls live in their chat
+    // history. The pages gate their own actions.
+    { label: 'Conversations', path: `${b}/conversations`, icon: IconPhone, visible: canEdit, group: MONITORING },
     { label: 'Scheduled Tasks', path: `${b}/scheduled-tasks`, icon: IconClock, group: MONITORING },
     { label: 'Triggers', path: `${b}/triggers`, icon: IconBolt, group: MONITORING },
     { label: 'Notifications', path: `${b}/notifications`, icon: IconBell, group: MONITORING },

@@ -110,11 +110,11 @@ page the user was already on. What changes:
   means the extension is missing, its token is stale, or the user must click
   Allow in their browser — tell them exactly that (install from the Chrome
   Web Store; regenerate the token on the extension's page and save it in the
-  machine settings; click Allow). Unattended sessions (scheduled tasks, calls,
-  meetings) can use it only when a token is saved and the machine's owner (an
-  admin, for a platform machine) ticked "Also let unattended runs (scheduled
-  tasks, triggers, calls, meetings) use this browser"; otherwise they cannot
-  use the browser.
+  machine settings; click Allow). Unattended sessions (scheduled tasks,
+  triggers, calls, meetings, API keys) can use it only when a token is saved
+  and the machine's owner (an admin, for a platform machine) ticked "Also let
+  unattended runs like scheduled tasks, triggers, calls, meetings and API keys
+  use this browser"; otherwise they cannot use the browser.
 - **The connect page opens in the profile that has the extension.** The
   machine's "Browser profile" setting names it; empty, the one profile that
   has the extension is used. An error that lists the browser's profiles means

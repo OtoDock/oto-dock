@@ -1,5 +1,6 @@
 import { lazy, Suspense, useState, useCallback, type CSSProperties } from 'react'
 import { CODE_BODY_STYLE } from '../../lib/chat/codeStyle'
+import { copyOrSay } from '../../lib/copyText'
 
 // The highlighter (react-syntax-highlighter with every Prism grammar) loads
 // on the first fenced block a chat renders; a chat without code never loads
@@ -29,7 +30,8 @@ export default function CodeBlock({ language, children, inline }: Props) {
   const [copied, setCopied] = useState(false)
 
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(children).then(() => {
+    void copyOrSay(children).then((ok) => {
+      if (!ok) return
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })

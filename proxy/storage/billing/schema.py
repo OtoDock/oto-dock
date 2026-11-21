@@ -96,6 +96,8 @@ def init_execution_layers(conn) -> None:
     # the spawn path didn't stamp the acquisition context (same fail-soft rule
     # as the in-memory ctx map); '' means agent-scope. ``scope_key`` is the
     # credential-file-sharing domain (see subscription_pool.credential_scope_key).
+    # ``model`` is the model the session started with, NULL on a row an earlier
+    # release wrote: the pool judges a session with no chat row by it.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS subscription_session_bindings (
             session_id TEXT PRIMARY KEY,
@@ -103,10 +105,34 @@ def init_execution_layers(conn) -> None:
             layer TEXT NOT NULL DEFAULT '',
             user_sub TEXT,
             scope_key TEXT NOT NULL DEFAULT '',
-            bound_at TEXT NOT NULL
+            bound_at TEXT NOT NULL,
+            model TEXT
         )
     """)
+    conn.execute("ALTER TABLE subscription_session_bindings ADD COLUMN IF NOT EXISTS model TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ssb_scope ON subscription_session_bindings(scope_key)")
+
+    # --- Usage-limit rests (persisted mirror of the pool's rest structures,
+    # so an account that reached its limit stays out of the selection across
+    # a proxy restart). One row per (account, scope): ``scope`` '' is the
+    # account-wide rest, else the model scope key the rest holds for.
+    # ``until_at`` / ``rested_at`` are unix seconds; ``window_key`` names the
+    # window an account-wide rest waits on ('' = a plain cooldown, whose
+    # ``rested_at`` is not read back); ``hard`` marks a real account limit
+    # (the scope rebalance's trigger). No foreign key: a rest's write may
+    # land after its account's delete, so subscription_pool.load_rests drops
+    # the rows of accounts that are gone, with the expired ones, at boot.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscription_rests (
+            account_id TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT '',
+            until_at DOUBLE PRECISION NOT NULL,
+            rested_at DOUBLE PRECISION NOT NULL,
+            window_key TEXT NOT NULL DEFAULT '',
+            hard BOOLEAN NOT NULL DEFAULT FALSE,
+            PRIMARY KEY (account_id, scope)
+        )
+    """)
 
     # --- Provider windows: the vendor's own 5-hour / weekly window state per
     # OAuth subscription, one append-only row per observation (a poll or a
@@ -126,9 +152,14 @@ def init_execution_layers(conn) -> None:
             five_hour_resets_at TEXT,
             seven_day_pct REAL,
             seven_day_resets_at TEXT,
-            data JSONB NOT NULL DEFAULT '{}'
+            data JSONB NOT NULL DEFAULT '{}',
+            hint BOOLEAN NOT NULL DEFAULT FALSE
         )
     """)
+    # ``hint``: a session's own report the agent could have written (a
+    # terminal's status line, a rollout line). Stored and shown, never read
+    # by the pool's routing, caps or alerts (subscription_store).
+    conn.execute("ALTER TABLE subscription_window_samples ADD COLUMN IF NOT EXISTS hint BOOLEAN NOT NULL DEFAULT FALSE")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sws_sub_time ON subscription_window_samples(subscription_id, observed_at DESC)")
     # One row per (account, weekly window, threshold) — the dedup for the
     # owner's 90 % / 100 % notifications. ``resets_at`` names the window

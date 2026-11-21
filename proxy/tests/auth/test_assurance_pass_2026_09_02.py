@@ -225,9 +225,10 @@ def test_verified_literal_path_refuses_symlink(tmp_path):
 
 
 def test_oauth_resolve_writes_no_token_file_into_any_agent_tree(tmp_path, monkeypatch):
-    """The resolver answers the sandbox-virtual ``credentials_dir`` path and
-    writes nothing under the agents root, whatever the agent name: the file
-    travels in the session's delivery route."""
+    """The resolver answers the account's access token for the tool's own
+    process and writes nothing under the agents root, whatever the agent
+    name: no token file is copied anywhere."""
+    import json
     from types import SimpleNamespace
 
     import config
@@ -237,25 +238,23 @@ def test_oauth_resolve_writes_no_token_file_into_any_agent_tree(tmp_path, monkey
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
     token_dir = tmp_path / "tokens"
     token_dir.mkdir()
-    (token_dir / "acct.json").write_text("{}")
+    (token_dir / "acct.json").write_text(json.dumps({"access_token": "at", "refresh_token": "rt"}))
     manifest = SimpleNamespace(
-        name="workspace", credentials=SimpleNamespace(oauth={"provider_id": "google"}),
+        name="workspace",
+        credentials=SimpleNamespace(oauth={"provider_id": "google", "mcp_env_injection": ["TOKEN"]}),
     )
     monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: manifest)
-    monkeypatch.setattr(
-        mcp_registry, "get_credentials_dirs", lambda name: [("TOKEN_DIR", "google")])
     monkeypatch.setattr(
         cr, "_bound_token_source", lambda *a, **k: (token_dir, "acct", "alice"))
 
     monkeypatch.setattr("storage.database.get_username_by_sub", lambda sub: "alice")
-    virtual = "/users/alice/.credentials/google"
     for name in ("../escape", "pa"):
         out = cr._resolve_oauth_mcp("workspace", {}, "user-1", "user", agent_name=name)
-        assert out == {"TOKEN_DIR": virtual}
+        assert out == {"TOKEN": "at"}
     assert not (tmp_path / "escape").exists()
     assert not (tmp_path / "agents").exists()
     out = cr._resolve_oauth_mcp("workspace", {}, None, "agent", agent_name="pa")
-    assert out == {"TOKEN_DIR": "/knowledge/.credentials/google"}
+    assert out == {"TOKEN": "at"}
 
 
 def test_the_boot_sweep_removes_the_agent_tree_credentials_of_earlier_releases(tmp_path, monkeypatch):

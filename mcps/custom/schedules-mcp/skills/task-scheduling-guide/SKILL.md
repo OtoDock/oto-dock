@@ -58,7 +58,8 @@ any session — chats and task runs alike.
 Guardrails (enforced):
 
 - Recurring continuations are always bounded — `max_runs` (default 5) or `until`. A chat must never wake itself forever. For indefinite monitoring, create a recurring **task** instead (`create_scheduled_task`) — each run gets a fresh context instead of accreting into this chat.
-- Wakes **coalesce**: a new wake is skipped while a previous one is still unprocessed in this chat.
+- Recurring wakes **coalesce**: a run is skipped while a previous wake is still unprocessed in this chat, and `list_tasks` says how many times in a row. A one-shot wake is never skipped: it is delivered behind the wake in front of it.
+- `list_tasks` says `will not fire` for a one-shot whose time passed with nothing left to run it: run it or delete it.
 - Continuations auto-cancel when this chat is deleted, appear in `list_tasks`, and are cancelled with `delete_task`.
 
 ## Cron schedules
@@ -83,7 +84,7 @@ that don't divide 24 evenly (every 17 hours, every 5h30m, every 3 days), use
 - **Cross-agent reads**: `list_tasks`, `get_task_history`, and `get_task_result` take an optional `agent` argument — another agent's slug, or `"all"` for every agent your user can access; `get_task` takes none, since a task id already names its agent. You see exactly what your user would see on that agent's pages (their role travels with you); sessions without a user see only agent-scope tasks and runs, of this agent and its wired delegation targets (the scheduled-briefing pattern: read what your delegation targets did, then summarize). Reading is where it ends: to CHANGE another agent's schedule, ask that agent via delegation — mutations never cross agents.
 - **`pause_task(task_id)`** — stops a task from firing on its schedule without deleting it. The task can be resumed later. Use when the user says "pause", "stop for now", "disable temporarily".
 - **`resume_task(task_id)`** — re-enables a paused task. For one-time tasks whose `run_at` has already passed, resume keeps the row active but does NOT auto-fire — the user can run it manually from the dashboard if they want.
-- **`edit_task(task_id, ...)`** — change the schedule, run time, name, prompt, timeout, notification settings, the timezone (`timezone=`, see below), or the model / execution layer of an existing task **without deleting and recreating it**. Pass only the fields you want to change. `schedule`, `interval_seconds` and `run_at` are mutually exclusive — setting one switches the mode and clears the others. Use this whenever the user says "change the time of X", "update the X reminder to Y", "make this run every 3 hours instead", "edit the prompt of X". Always prefer this over delete+recreate — it preserves the task ID, history references, and any in-flight context.
+- **`edit_task(task_id, ...)`** — change the schedule, run time, name, prompt, timeout, notification settings, the timezone (`timezone=`, see below), or the model / execution layer of an existing task **without deleting and recreating it**. Pass only the fields you want to change. `schedule`, `interval_seconds` and `run_at` are mutually exclusive — setting one switches the mode and clears the others. Use this whenever the user says "change the time of X", "update the X reminder to Y", "make this run every 3 hours instead", "edit the prompt of X". Always prefer this over delete+recreate — it preserves the task ID, history references, and any in-flight context. In a task's run or a delegated job (no person in the session), a change to the prompt, the permission mode (Auto or Don't Ask) or the checks of a task that runs with the right to change the agent's knowledge is refused unless your own run holds that right. A wake's prompt changes only from the chat it wakes. Other fields stay editable.
 - **`delete_task(task_id)`** — permanently removes a task (or a pending continuation). Use when the user says "delete", "remove", "cancel for good". Static tasks (defined in `tasks.json`) cannot be deleted via this tool.
 - **`run_task(task_id, wait?, timeout_seconds?)`** — fires an existing task immediately, regardless of schedule. Use for "run X now" or to manually fire a paused/expired task. With `wait=true` the call returns the run's output once the run ends, with its status (completed, failed or cancelled); after `timeout_seconds` (default 600) it returns while the run continues, so read the result later with `get_task_result`.
 - **`cancel_task_run(run_id)`** — stops a running or queued run (the id from `get_task_history`); a `run_task` wait on that run returns at once with status cancelled.
@@ -176,6 +177,18 @@ the webhook body at fire time. Wire it up afterwards with
 `create_trigger(task_id=...)` from the **triggers-mcp**. Cross-scope linkage
 is enforced — a user-scoped trigger can only run a user-scoped task;
 agent-scoped triggers only agent-scoped tasks.
+
+## Across a restart
+
+A one-time task or a continuation that came due while OtoDock was down fires
+once when it is back. `delay_seconds` counts from the task's creation, so a
+restart does not start the count again. A recurring task's missed fires are
+not caught up. A run the restart cut is reopened under its own id, goes on
+from where it stopped and notifies as usual, once. After a restore or more
+than a day down nothing is caught up: a one-time task stays unfired, and the
+run reads failed in `get_task_history` with "Cut short when the platform
+restarted", with no `Task Failed` notification. While OtoDock updates, a
+fire waits: the run stays pending and starts when OtoDock is back.
 
 ## Timezone semantics
 

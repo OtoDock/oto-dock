@@ -52,7 +52,7 @@ def install(monkeypatch, tmp_path) -> SimpleNamespace:
         phone_config_builder as pcb,
         task_config_builder as tcb,
     )
-    from services.mcp import dynamic_context, mcp_registry
+    from services.mcp import dynamic_context, mcp_manifest_store, mcp_registry
     from services.mcp.mcp_manifest_types import PathEnvDecl
     from services.meetings import meeting_context as mc
     from storage.agents import agent_store
@@ -74,8 +74,8 @@ def install(monkeypatch, tmp_path) -> SimpleNamespace:
 
     files = _manifest("char-files", path_env={"CHAR_FILES_DIR": PathEnvDecl(role="workspace", subpath="files")})
     phone = _manifest("phone-mcp")
-    monkeypatch.setitem(mcp_registry._manifests, files.name, files)
-    monkeypatch.setitem(mcp_registry._manifests, phone.name, phone)
+    monkeypatch.setitem(mcp_manifest_store._manifests, files.name, files)
+    monkeypatch.setitem(mcp_manifest_store._manifests, phone.name, phone)
     for agent in (AGENT, SHARED):
         mcp_store.set_manager_enabled_mcps(agent, [files.name, phone.name])
     mcp_store.set_mcp_enabled(files.name, True)

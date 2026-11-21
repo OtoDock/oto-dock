@@ -303,6 +303,9 @@ def post_tool(
     synchronous; the rendering and the cost engine stay with the caller.
     ``command`` is for an adapter that carries the shell text outside the
     input (the headless forwarder); the input's own is read otherwise."""
+    # The call ran: a woken terminal no longer waits on its question.
+    from core.session.session_state import end_terminal_ask
+    end_terminal_ask(session_id, tool_use_id or "")
     rec = ToolRecord(
         tool_name=tool_name or "", tool_use_id=tool_use_id or "",
         paths=_paths_of(tool_input), is_error=bool(is_error), source=source,

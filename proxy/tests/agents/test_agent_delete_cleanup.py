@@ -254,6 +254,9 @@ _KEEP_AFTER_DELETE = {
     # the agent goes, and the retention sweep deletes it a year after it was
     # filed.
     "reply_reports",
+    # What a person's API key made: ``agent`` is a display record in the list
+    # its revocation shows, and the key and its rows go with the person.
+    "user_api_key_created",
 }
 
 

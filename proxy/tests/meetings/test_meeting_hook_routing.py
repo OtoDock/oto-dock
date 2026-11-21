@@ -457,7 +457,7 @@ async def test_codex_named_meeting_tool_marks_the_turn(moderator_session, monkey
     from core.session.session_manager import get_layer_by_path
     monkeypatch.setattr("core.session.session_manager.engine_layer_for_session",
                         lambda sid: get_layer_by_path("codex-cli"))
-    from services.mcp import mcp_registry as reg
+    from services.mcp import mcp_manifest_store
     from services.mcp.mcp_manifest_types import (
         CredentialConfig,
         McpManifest,
@@ -470,7 +470,7 @@ async def test_codex_named_meeting_tool_marks_the_turn(moderator_session, monkey
         exclude_from=[], skills=[], server_name="", permissions=None,
         mcp_dir=Path(app_config.MCPS_DIR) / "custom" / "meetings-mcp",
     )
-    monkeypatch.setattr(reg, "_manifests", {"meetings-mcp": manifest})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {"meetings-mcp": manifest})
     allowed = await _decide(moderator_session, "mcp__meetings_mcp__direct_to",
                             {"agents": ["agent-b"]})
     assert allowed["decision"] == "allow"

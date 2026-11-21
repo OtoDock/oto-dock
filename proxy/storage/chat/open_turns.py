@@ -8,7 +8,10 @@ when the engine's result arrived, so a row left with it off is a turn that
 had finished. The rows an engine turn saved before its end are named by
 ``early_ranges``, appended in the same transaction as those rows: a replay of
 the turn after a restart deletes them before it writes the whole turn again,
-and a turn nothing replays keeps them.
+and a turn nothing replays keeps them. The row also says who the turn runs as
+and how (``FACTS``), written at the start because a killed process writes
+nothing, and the permission card that waits on a person (``set_card``): what
+a continue of the turn is built from (``storage/chat/cut_records.py``).
 
 Synchronous: the pump calls these on the chat's writer lane, the boot and the
 recovery on the DB executor or the lane.
@@ -25,6 +28,12 @@ from storage.chat.db_chats import _ROLE_USER, rebuild_chat_search
 from storage.pg import get_conn
 
 logger = logging.getLogger("otodock")
+
+
+#: The columns a continue reads, beside the turn's own: the sub the session
+#: runs as ('' for the agent itself), the kind of session, its mode, the
+#: machine it runs on, the task run that drives it, the plan it implements.
+FACTS = ("person", "kind", "mode", "machine_id", "run_id", "plan")
 
 
 class Taken(NamedTuple):
@@ -45,20 +54,34 @@ def _ranges_of(raw: str | None) -> list[tuple[int, int]]:
         return []
 
 
-def open_turn(chat_id: str, token: str, session_id: str) -> None:
+def open_turn(chat_id: str, token: str, session_id: str, **facts: str) -> None:
     """The chat's turn ``token`` started: its row, replacing any older one,
-    its engine turn open, no early ranges. A chat with no row writes
-    nothing."""
+    its engine turn open, no early ranges, no card, and the ``FACTS`` given.
+    A chat with no row writes nothing."""
+    values = [str(facts.get(name) or "") for name in FACTS]
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO chat_open_turns (chat_id, turn_token, session_id, started_at,
-                                            engine_open, early_ranges)
-               SELECT %s, %s, %s, %s, TRUE, '[]' WHERE EXISTS (SELECT 1 FROM chats WHERE id=%s)
+                                            engine_open, early_ranges, card,
+                                            person, kind, mode, machine_id, run_id, plan)
+               SELECT %s, %s, %s, %s, TRUE, '[]', '', %s, %s, %s, %s, %s, %s
+               WHERE EXISTS (SELECT 1 FROM chats WHERE id=%s)
                ON CONFLICT (chat_id) DO UPDATE SET turn_token=EXCLUDED.turn_token,
                    session_id=EXCLUDED.session_id, started_at=EXCLUDED.started_at,
-                   engine_open=TRUE, early_ranges='[]'""",
-            (chat_id, token, session_id, _now(), chat_id),
+                   engine_open=TRUE, early_ranges='[]', card='',
+                   person=EXCLUDED.person, kind=EXCLUDED.kind, mode=EXCLUDED.mode,
+                   machine_id=EXCLUDED.machine_id, run_id=EXCLUDED.run_id, plan=EXCLUDED.plan""",
+            (chat_id, token, session_id, _now(), *values, chat_id),
         )
+        conn.commit()
+
+
+def set_card(chat_id: str, token: str, card: str) -> None:
+    """The permission card the turn ``token`` waits on (JSON), or '' once a
+    person answered it."""
+    with get_conn() as conn:
+        conn.execute("UPDATE chat_open_turns SET card=%s WHERE chat_id=%s AND turn_token=%s",
+                     (card, chat_id, token))
         conn.commit()
 
 
@@ -108,11 +131,21 @@ def end_turn(chat_id: str, token: str) -> bool:
 def list_open() -> list[dict]:
     """Every row: at boot, the turns the last process left."""
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT chat_id, turn_token, session_id, started_at, engine_open "
-            "FROM chat_open_turns ORDER BY started_at",
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM chat_open_turns ORDER BY started_at").fetchall()
     return [dict(r) for r in rows]
+
+
+def get_open(chat_id: str) -> dict | None:
+    """The chat's row, None when no turn of it is open."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM chat_open_turns WHERE chat_id=%s", (chat_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def count_open() -> int:
+    with get_conn() as conn:
+        row = conn.execute("SELECT count(*) AS n FROM chat_open_turns").fetchone()
+    return int(row["n"]) if row else 0
 
 
 def _closing_row_in(conn: psycopg.Connection[Any], chat_id: str, event_type: str, event_data: str,

@@ -6,6 +6,7 @@ on missing chat / until bound / max_runs, and per-chat coalescing.
 """
 
 import asyncio
+import functools
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -237,6 +238,10 @@ def fire_env(temp_db, monkeypatch):
     scheduler._continuation_skip_counts.clear()
 
 
+def _skips(task_id):
+    return scheduler._continuation_skip_counts.get(task_id, 0)
+
+
 def _wake_events(chat_id):
     return [m for m in task_store.get_chat_messages(chat_id)
             if m.get("event_type") == "schedule_wake"]
@@ -279,6 +284,34 @@ class TestFireContinuation:
             scheduler._continuation_cursors.clear()
         assert [(c["user_sub"], c["role"]) for c in fire_env["calls"]] == [
             (None, "viewer"), (None, "manager")]
+
+    def test_a_wake_of_a_persons_own_chat_builds_the_chat(self, fire_env):
+        """A continuation of the person's own chat starts the chat's own
+        session: the warm-up's builder, the chat's mode read when it is
+        built, the dashboard kind. Never the unattended task build."""
+        chat_id = str(uuid.uuid4())
+        task_store.create_chat(chat_id, "user-viewer2", AGENT)
+        task = _cont_task(chat_id, delay_seconds=60)
+        self._persist(task)
+        asyncio.run(scheduler._fire_continuation(task))
+        (call,) = fire_env["calls"]
+        assert call["user_sub"] == "user-viewer2"
+        assert call["oneshot_fn"].keywords["build"] == "chat"
+        assert call["oneshot_fn"].keywords["client_type"] == "dashboard"
+        assert call["oneshot_fn"].keywords["permission_mode"] not in ("auto", "dontAsk")
+
+    def test_a_wake_with_nobody_behind_it_keeps_the_unattended_build(self, fire_env):
+        """The agent's own wake of a chat runs as nobody: the delivery's own
+        builder, the unattended mode, no kind."""
+        chat_id = fire_env["chat_id"]
+        task = _cont_task(chat_id, delay_seconds=60).model_copy(
+            update={"scope": "agent", "created_by": AGENT})
+        self._persist(task)
+        asyncio.run(scheduler._fire_continuation(task))
+        (call,) = fire_env["calls"]
+        assert call["oneshot_fn"].keywords == {
+            "permission_mode": "auto", "client_type": "", "build": "wake",
+            "fresh_without_session": False, "driven_by": "schedule_wake"}
 
     def test_missing_chat_self_cancels(self, fire_env):
         task = _cont_task("no-such-chat", delay_seconds=60)
@@ -370,6 +403,196 @@ class TestFireContinuation:
         task = _cont_task(fire_env["chat_id"], delay_seconds=60, id="dyn-route1")
         asyncio.run(scheduler._execute_task(task))
         assert seen == ["dyn-route1"]
+
+
+class TestWakeCursor:
+    """A recurring wake is skipped while the previous wake sits unprocessed,
+    judged by the previous wake's own row: every rung but the socket's writes
+    it before it delivers, so a rung that ran the wake's turn before the
+    ladder returned (an idle session, a dead one, a closed terminal warmed
+    again) leaves the chat already past it, and a rung that queued the wake
+    leaves it waiting until its turn writes. Each path in its own order."""
+
+    def _ladder(self, fire_env, monkeypatch, path_of):
+        """The ladder each fire walks: ``path_of(prompt)`` names the rung and
+        whether that rung runs the wake's turn before it returns."""
+        from core.events import chat_writer
+        from core.session import session_delivery
+
+        async def _fake(cid, prompt, **kw):
+            path, turn_inside = path_of(prompt)
+            fire_env["calls"].append({"chat_id": cid, "prompt": prompt, "path": path})
+            if path != "ws":
+                kw["persist_event"](cid)
+            if turn_inside:
+                await chat_writer.submit(cid, functools.partial(
+                    task_store.add_chat_message, cid, "assistant", f"turn of {prompt}"))
+            out = session_delivery.DeliveryOutcome(path, chat_id=cid)
+            await kw["on_outcome"](out)
+            return out
+        monkeypatch.setattr(session_delivery, "deliver_prompt", _fake)
+
+    def _prompts(self, fire_env):
+        return [c["prompt"] for c in fire_env["calls"]]
+
+    @pytest.mark.parametrize("path", ["persistent", "oneshot"])
+    def test_a_wake_whose_turn_ran_inside_the_ladder_frees_the_next(
+            self, fire_env, monkeypatch, path):
+        """An idle chat after a wake that the ladder ran to its end: nobody
+        writes, and the next run of the recurring wake still arrives. A closed
+        terminal warmed again for its wake answers ``oneshot`` too."""
+        chat_id = fire_env["chat_id"]
+        self._ladder(fire_env, monkeypatch, lambda prompt: (path, True))
+        task = _cont_task(chat_id, schedule="*/50 * * * *", max_runs=10)
+        asyncio.run(scheduler.add_dynamic_task(task))
+        for _ in range(3):
+            asyncio.run(scheduler._fire_continuation(task))
+        assert len(fire_env["calls"]) == 3
+        assert _skips(task.id) == 0
+
+    @pytest.mark.parametrize("path", ["pty", "steer", "pump", "none"])
+    def test_a_queued_wake_holds_the_next_until_its_turn_writes(
+            self, fire_env, monkeypatch, path):
+        chat_id = fire_env["chat_id"]
+        self._ladder(fire_env, monkeypatch, lambda prompt: (path, False))
+        task = _cont_task(chat_id, schedule="*/50 * * * *", max_runs=10)
+        asyncio.run(scheduler.add_dynamic_task(task))
+        asyncio.run(scheduler._fire_continuation(task))
+        asyncio.run(scheduler._fire_continuation(task))
+        assert len(fire_env["calls"]) == 1
+        assert _skips(task.id) == 1
+        task_store.add_chat_message(chat_id, "assistant", "the queued wake's turn")
+        asyncio.run(scheduler._fire_continuation(task))
+        assert len(fire_env["calls"]) == 2
+        assert _skips(task.id) == 0
+
+    def test_the_sockets_rung_marks_the_chat_as_it_was_handed_over(self, fire_env, monkeypatch):
+        """The socket's handler writes the wake's row and runs its turn after
+        the ladder returned: until it wrote, the next run waits, and after it
+        the next run is never held back."""
+        chat_id = fire_env["chat_id"]
+        task_store.add_chat_message(chat_id, "user", "an earlier message")
+        self._ladder(fire_env, monkeypatch, lambda prompt: ("ws", False))
+        task = _cont_task(chat_id, schedule="*/50 * * * *", max_runs=10)
+        asyncio.run(scheduler.add_dynamic_task(task))
+        asyncio.run(scheduler._fire_continuation(task))
+        asyncio.run(scheduler._fire_continuation(task))
+        assert len(fire_env["calls"]) == 1
+        task_store.add_chat_message(chat_id, "event", "", event_type="schedule_wake")
+        task_store.add_chat_message(chat_id, "assistant", "the socket's wake turn")
+        asyncio.run(scheduler._fire_continuation(task))
+        assert len(fire_env["calls"]) == 2
+
+    def test_a_one_shot_is_delivered_behind_an_unprocessed_wake(self, fire_env, monkeypatch):
+        """A one-shot carries its own words and has no next run: it meets the
+        skip rule and is delivered all the same, and its row ends. The next
+        recurring run then waits behind it, as behind any unprocessed wake."""
+        chat_id = fire_env["chat_id"]
+        self._ladder(fire_env, monkeypatch, lambda prompt: ("pty", False))
+        watch = _cont_task(chat_id, schedule="*/50 * * * *", max_runs=10, prompt="watch")
+        once = _cont_task(chat_id, delay_seconds=60, prompt="check the gate")
+        for task in (watch, once):
+            asyncio.run(scheduler.add_dynamic_task(task))
+        asyncio.run(scheduler._fire_continuation(watch))
+        asyncio.run(scheduler._fire_continuation(once))
+        assert self._prompts(fire_env) == ["watch", "check the gate"]
+        assert task_store.get_dynamic_task(once.id) is None
+        assert len(_wake_events(chat_id)) == 2
+        asyncio.run(scheduler._fire_continuation(watch))
+        assert self._prompts(fire_env) == ["watch", "check the gate"]
+        assert _skips(watch.id) == 1
+
+    def test_an_earlier_fire_that_returns_later_keeps_the_newer_mark(self, fire_env, monkeypatch):
+        """A wake that runs its turn inside the ladder while a second wake is
+        queued behind that turn returns last: the queued wake is still
+        unprocessed, and the next recurring run waits for it."""
+        chat_id = fire_env["chat_id"]
+        from core.events import chat_writer
+        from core.session import session_delivery
+        watch = _cont_task(chat_id, schedule="*/50 * * * *", max_runs=10, prompt="watch")
+        once = _cont_task(chat_id, delay_seconds=60, prompt="queued behind")
+        for task in (watch, once):
+            asyncio.run(scheduler.add_dynamic_task(task))
+
+        async def _fake(cid, prompt, **kw):
+            fire_env["calls"].append({"prompt": prompt})
+            kw["persist_event"](cid)
+            path = "pty"
+            if prompt.endswith("watch") and len(fire_env["calls"]) == 1:
+                path = "oneshot"
+                await chat_writer.submit(cid, functools.partial(
+                    task_store.add_chat_message, cid, "assistant", "the watch's turn"))
+                await scheduler._fire_continuation(once)
+            out = session_delivery.DeliveryOutcome(path, chat_id=cid)
+            await kw["on_outcome"](out)
+            return out
+        monkeypatch.setattr(session_delivery, "deliver_prompt", _fake)
+        asyncio.run(scheduler._fire_continuation(watch))
+        asyncio.run(scheduler._fire_continuation(watch))
+        assert [c["prompt"] for c in fire_env["calls"]] == ["watch", "queued behind"]
+        assert _skips(watch.id) == 1
+
+    def test_a_wake_row_that_failed_holds_nothing_back(self, fire_env, monkeypatch):
+        """The wake's own row could not be written and its turn ran inside the
+        ladder: the next run is not held back by the turn's rows."""
+        import psycopg
+        chat_id = fire_env["chat_id"]
+        self._ladder(fire_env, monkeypatch, lambda prompt: ("oneshot", True))
+        real_add = task_store.add_chat_message
+
+        def _add(cid, role, content="", **kw):
+            if kw.get("event_type") == "schedule_wake":
+                raise psycopg.OperationalError("the row was refused")
+            return real_add(cid, role, content, **kw)
+        monkeypatch.setattr(task_store, "add_chat_message", _add)
+        task = _cont_task(chat_id, schedule="*/50 * * * *", max_runs=10)
+        asyncio.run(scheduler.add_dynamic_task(task))
+        asyncio.run(scheduler._fire_continuation(task))
+        asyncio.run(scheduler._fire_continuation(task))
+        assert len(fire_env["calls"]) == 2
+
+    def test_the_afternoon_of_2026_11_16(self, fire_env, monkeypatch):
+        """The internal install's log, replayed: the watchdog warms the closed
+        terminal and its turn runs to its end inside the ladder. Inside that
+        turn a one-shot is steered in, and the turn schedules a second one.
+        Nobody writes in the chat afterwards. The second one-shot arrives at
+        its time, and so does every later run of the watchdog."""
+        chat_id = fire_env["chat_id"]
+        watchdog = _cont_task(chat_id, interval_seconds=3000, max_runs=40, prompt="watchdog")
+        first = _cont_task(chat_id, delay_seconds=2400, prompt="gate wake one")
+        second = _cont_task(chat_id, delay_seconds=2280, prompt="gate wake two")
+        for task in (watchdog, first, second):
+            asyncio.run(scheduler.add_dynamic_task(task))
+        from core.events import chat_writer
+        from core.session import session_delivery
+
+        async def _fake(cid, prompt, **kw):
+            fire_env["calls"].append({"prompt": prompt})
+            kw["persist_event"](cid)
+            path = "oneshot"
+            if prompt.endswith("gate wake one"):
+                path = "pty"   # steered into the open turn, which writes after
+            elif prompt.endswith("watchdog") and len(fire_env["calls"]) == 1:
+                await scheduler._fire_continuation(first)
+            if path == "oneshot":
+                # A closed terminal warmed again: its turn ends before the
+                # ladder returns, and nobody writes in the chat after it.
+                await chat_writer.submit(cid, functools.partial(
+                    task_store.add_chat_message, cid, "assistant", f"turn of {prompt}"))
+            out = session_delivery.DeliveryOutcome(path, chat_id=cid)
+            await kw["on_outcome"](out)
+            return out
+        monkeypatch.setattr(session_delivery, "deliver_prompt", _fake)
+
+        asyncio.run(scheduler._fire_continuation(watchdog))       # 10:50:50
+        assert task_store.get_dynamic_task(first.id) is None      # 10:52:30
+        asyncio.run(scheduler._fire_continuation(second))         # 11:30:30
+        assert task_store.get_dynamic_task(second.id) is None
+        asyncio.run(scheduler._fire_continuation(watchdog))       # 11:40:50
+        asyncio.run(scheduler._fire_continuation(watchdog))       # 12:30:50
+        assert [c["prompt"] for c in fire_env["calls"]] == [
+            "watchdog", "gate wake one", "gate wake two", "watchdog", "watchdog"]
+        assert _skips(watchdog.id) == 0
 
 
 class TestChatDeleteCancelsContinuations:

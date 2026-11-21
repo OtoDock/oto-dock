@@ -5,6 +5,9 @@
 #   scripts/restore.sh ./backups/otodock-1.8.0-20261030-031500      # the database and the trees
 #   scripts/restore.sh ./backups/otodock-1.8.0-20261030-031500 --db-only
 #   scripts/restore.sh ./backups/otodock-otodock-20260627-031500.sql.gz   # a dump alone (the old shape)
+#   scripts/restore.sh <backup> --yes    # no question asked: for a script that stopped the platform
+#   scripts/restore.sh --marks-only      # after a database restored by other means: the
+#                                        # continuity marks alone are cleared (the step below)
 #
 # DESTRUCTIVE: the database is replaced whole (its public schema recreated,
 # then the dump fed in), and the agents tree, the ssh keys and the sessions
@@ -12,13 +15,14 @@
 # (the previous tree is set aside inside the volume until the restore
 # succeeds). A run directory without sessions.tar.gz (a backup from before
 # the sessions tree was archived, or one whose trees were pruned) restores
-# without it and says so. Stop the proxy first; start it after (migrations
-# run forward on boot).
+# without it and says so. Stop the proxy and the compute service first; start
+# them after (migrations run forward on boot).
 #
 # Before it changes anything the script refuses:
 #   - while the platform runs (the project's proxy container in state
 #     running, restarting or paused, or on bare metal the port the env files
-#     publish);
+#     publish), and while the compute service runs (its sessions write the
+#     agents tree);
 #   - a backup taken on a NEWER release than the running images: the server
 #     would refuse the database at boot (--allow-newer warns instead; then
 #     start the server with OTODOCK_ALLOW_NEWER_DATABASE=true);
@@ -58,17 +62,23 @@ SRC=""
 DB_ONLY=false
 ALLOW_NEWER=false
 IGNORE_KEY=false
+YES=false
+MARKS_ONLY=false
+USAGE="usage: $0 <run directory | dump.sql.gz | dump.sql> [--db-only] [--allow-newer] [--ignore-credential-key] [--yes]
+       $0 --marks-only"
 for arg in "$@"; do
   case "$arg" in
     --db-only) DB_ONLY=true ;;
     --allow-newer) ALLOW_NEWER=true ;;
     --ignore-credential-key) IGNORE_KEY=true ;;
-    -*) echo "usage: $0 <run directory | dump.sql.gz | dump.sql> [--db-only] [--allow-newer] [--ignore-credential-key]" >&2; exit 1 ;;
+    --yes) YES=true ;;
+    --marks-only) MARKS_ONLY=true ;;
+    -*) echo "$USAGE" >&2; exit 1 ;;
     *) SRC="$arg" ;;
   esac
 done
-if [ -z "$SRC" ] || ! [ -e "$SRC" ]; then
-  echo "usage: $0 <run directory | dump.sql.gz | dump.sql> [--db-only] [--allow-newer] [--ignore-credential-key]" >&2
+if ! $MARKS_ONLY && { [ -z "$SRC" ] || ! [ -e "$SRC" ]; }; then
+  echo "$USAGE" >&2
   exit 1
 fi
 
@@ -79,7 +89,9 @@ fail() { echo "restore.sh: error: $*" >&2; exit 1; }
 # The backup: a run directory (its manifest and files) or a bare dump.
 MANIFEST=""
 DUMP=""
-if [ -d "$SRC" ]; then
+if $MARKS_ONLY; then
+  :
+elif [ -d "$SRC" ]; then
   [ -f "$SRC/manifest" ] || fail "$SRC has no manifest: not a backup.sh run directory"
   MANIFEST="$SRC/manifest"
   # The dump's name is in the manifest (db.sql.gz from backup.sh; upgrade.sh's
@@ -254,7 +266,7 @@ say "restoring as database role '${DB_USER}' (project $PROJECT, $TOPOLOGY)."
 if [ "$TOPOLOGY" = docker ]; then
   if [ "$PROXY_RUNNING" = true ]; then
     echo "error: the platform is running (container ${PROXY_CID}, state ${PROXY_STATE}): stop the proxy first" >&2
-    echo "       (docker compose stop otodock-proxy, in the install folder)" >&2
+    echo "       Stop it first. In the install folder, run: docker compose stop otodock-proxy otodock-compute" >&2
     exit 1
   fi
 else
@@ -280,6 +292,40 @@ else
       exit 1
     fi
   done
+  # The compute unit outlives a stop of the proxy's unit, and its sessions
+  # write the agents tree.
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet otodock-compute; then
+    echo "error: the compute unit otodock-compute is running:" >&2
+    echo "       stop it first: sudo systemctl stop otodock-proxy otodock-compute" >&2
+    exit 1
+  fi
+fi
+# The compute service's sessions write the agents tree: it stops with the proxy.
+COMPUTE_CID="$(platform_container otodock-compute "" -a)" || exit 1
+if [ -n "$COMPUTE_CID" ]; then
+  case "$(docker inspect -f '{{.State.Status}}' "$COMPUTE_CID" 2>/dev/null || true)" in
+    running|restarting|paused)
+      echo "error: the compute service is running (container ${COMPUTE_CID}): stop it first" >&2
+      echo "       (docker compose stop otodock-proxy otodock-compute, in the install folder)" >&2
+      exit 1 ;;
+  esac
+fi
+
+# When the source was last alive says nothing of this install: with the marks
+# gone the next boot takes up nothing the dump left open. A chat gets its card,
+# a run fails with its one report, and no one-time task fires again. The
+# restored record of the keys is the SOURCE's; the next boot writes this
+# install's own, and a second restore before that must not compare against it.
+clear_marks() {
+  docker exec "$PG_CID" psql -q -U "$DB_USER" -d "$DB_NAME" \
+    -c "DELETE FROM platform_settings WHERE key = 'credential_key_fingerprints'" >/dev/null 2>&1 || true
+  docker exec "$PG_CID" psql -q -U "$DB_USER" -d "$DB_NAME" \
+    -c "DELETE FROM platform_settings WHERE key IN ('platform_alive_at', 'platform_held_at', 'platform_clean_stop')" >/dev/null 2>&1 || true
+}
+if $MARKS_ONLY; then
+  clear_marks
+  say "the continuity marks are cleared: the next start takes up nothing the database left open."
+  exit 0
 fi
 
 # --- the versions ---------------------------------------------------------------------
@@ -536,17 +582,21 @@ except BaseException as e:
           "put it back by hand, or run the restore again.", file=sys.stderr)
     sys.exit(1)
 if os.geteuid() == 0:
-    st = os.lstat(root)
-    for dirpath, dirnames, filenames in os.walk(root):
-        if dirpath == aside or dirpath.startswith(aside + os.sep):
-            dirnames[:] = []
-            continue
+    # Each folder is entered from its parent's handle and each name owned
+    # from there, never through a link: a container that still writes the
+    # tree cannot send the walk elsewhere. The tree's real place is walked,
+    # so a tree that is the operator's link keeps its ownership pass.
+    real = os.path.realpath(root)
+    st = os.lstat(real)
+    kept = os.path.basename(aside)
+    for dirpath, dirnames, filenames, dirfd in os.fwalk(real):
+        if dirpath == real:
+            dirnames[:] = [d for d in dirnames if d != kept]
         for name in dirnames + filenames:
-            path = os.path.join(dirpath, name)
-            if path == aside or name.startswith(".pre-restore-"):
+            if name.startswith(".pre-restore-"):
                 continue
             try:
-                os.lchown(path, st.st_uid, st.st_gid)
+                os.chown(name, st.st_uid, st.st_gid, dir_fd=dirfd, follow_symlinks=False)
             except OSError:
                 pass
 shutil.rmtree(aside)
@@ -580,6 +630,26 @@ restore_tree() { # restore_tree <archive> <volume or ''> <path in the container>
     say "restoring $(basename "$archive") into $hdir"
     "$HOST_PY" -c "$RESTORE_PY" "$hdir" "$ts" < "$archive" || fail "the tree restore failed (above)"
   fi
+}
+# The histories of memory and settings live in the sessions tree (history/).
+# A run that brings back the agents tree alone would leave this install's own
+# beside folders they do not belong to: they are set aside by one rename,
+# never deleted, and the next start takes what the restored folders hold.
+set_histories_aside() {
+  local ts out="" py='import os, sys
+src = os.path.join(sys.argv[1], "history")
+if os.path.isdir(src) and not os.path.islink(src):
+    os.rename(src, src + ".before-restore-" + sys.argv[2])
+    print("history.before-restore-" + sys.argv[2])'
+  ts="$(date +%Y%m%d-%H%M%S)"
+  if [ "$TOPOLOGY" = docker ] && [ -n "$SESSIONS_VOL" ]; then
+    out="$(docker run --rm --network none -v "$SESSIONS_VOL:/opt/otodock/sessions" --entrypoint python3 "$IMAGE" -c "$py" /opt/otodock/sessions "$ts")" \
+      || warn "this install's histories of memory and settings could not be set aside: they may not match the restored folders"
+  elif [ "$TOPOLOGY" = host ] && [ -d "$SESSIONS_DIR" ]; then
+    out="$("$HOST_PY" -c "$py" "$SESSIONS_DIR" "$ts")" \
+      || warn "this install's histories of memory and settings could not be set aside: they may not match the restored folders"
+  fi
+  [ -z "$out" ] || say "the histories of memory and settings did not come with this run: this install's own are kept aside as $out in the sessions tree, and the next start takes what the restored folders hold."
 }
 RESTORE_KEYS=false
 if [ "$RESTORE_TREES" = true ] && [ -f "$SRC/ssh-keys.tar.gz" ]; then
@@ -630,9 +700,11 @@ elif [ -z "$MANIFEST" ]; then
   echo "A dump alone: the agents tree and the env file are not in it."
 fi
 echo "This OVERWRITES current data. Stop the proxy before continuing."
-printf "Type 'yes' to continue: "
-read -r confirm
-[ "$confirm" = "yes" ] || { echo "Aborted."; exit 1; }
+if ! $YES; then
+  printf "Type 'yes' to continue: "
+  read -r confirm
+  [ "$confirm" = "yes" ] || { echo "Aborted."; exit 1; }
+fi
 
 # --- the database -----------------------------------------------------------------------
 # The public schema is recreated first: a table the dump does not know (one
@@ -677,10 +749,7 @@ case "$DUMP" in
   *.gz) gunzip -c "$DUMP" | docker exec -i "$PG_CID" psql -q -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" ;;
   *)    docker exec -i "$PG_CID" psql -q -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" < "$DUMP" ;;
 esac
-# The restored record of the keys is the SOURCE's; the next boot writes this
-# install's own, and a second restore before that must not compare against it.
-docker exec "$PG_CID" psql -q -U "$DB_USER" -d "$DB_NAME" \
-  -c "DELETE FROM platform_settings WHERE key = 'credential_key_fingerprints'" >/dev/null 2>&1 || true
+clear_marks
 DB_STAGE=finished
 
 # The recreated schema belongs to the restore role; on the containerised stack
@@ -697,12 +766,13 @@ if [ "$RESTORE_TREES" = true ]; then
   restore_tree "$SRC/agents.tar.gz" "$AGENTS_VOL" /opt/otodock/agents "$AGENTS_DIR"
   [ "$RESTORE_KEYS" = false ] || restore_tree "$SRC/ssh-keys.tar.gz" "$KEYS_VOL" /opt/otodock/mcps/custom/ssh-hosts/keys "$KEYS_DIR"
   [ "$RESTORE_SESSIONS" = false ] || restore_tree "$SRC/sessions.tar.gz" "$SESSIONS_VOL" /opt/otodock/sessions "$SESSIONS_DIR"
+  [ "$RESTORE_SESSIONS" = true ] || set_histories_aside
 fi
 # A compose stack is started with up -d, not start/restart: a container keeps the
 # env file it mounted, and an editor that wrote .env as a new file (sed -i too)
 # leaves a started container on the old contents.
 if [ "$TOPOLOGY" = docker ]; then
-  echo "Restore complete. Start the proxy with 'docker compose up -d' (a recreate, so it reads the .env you edited); migrations re-run idempotently on boot."
+  echo "Restore complete. Start the platform with: docker compose up -d. It reads the .env you edited, updates the database as it starts, and gives the compute service a new sign-in if it needs one. Community tools are in no backup: on a new host, install them again under Admin, MCP Servers."
 else
   echo "Restore complete. Start the proxy; migrations re-run idempotently on boot."
 fi

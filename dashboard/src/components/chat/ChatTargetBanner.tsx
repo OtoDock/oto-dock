@@ -3,7 +3,7 @@ import { useState } from 'react'
 import type { TargetMismatch } from '../../store/chatStore'
 import { placePhrase, useChatTargets } from '../../api/remoteMachines'
 import { isLocalTarget } from '../../lib/placement'
-import { loadDismissedTargets, recordDismissedTarget } from '../../lib/targetNoticeDismissals'
+import { loadDismissed, recordDismissed } from '../../lib/chatNoticeDismissals'
 import { ChatTargetsMenu } from './RunsOnChip'
 
 interface Props {
@@ -26,7 +26,7 @@ const BUTTON = 'ml-auto shrink-0 px-2 py-1 rounded-control border border-current
 // Persistent (until X'd) notice that this chat is pinned to an execution
 // target different from where the agent's NEW chats run, with the "move it"
 // escape hatch: the chat's places as a menu (the chip's). Dismissal is
-// sticky per resolved target (lib/targetNoticeDismissals): the same mismatch
+// sticky per resolved target (lib/chatNoticeDismissals): the same mismatch
 // never re-shows, a NEW resolved target shows once again — and it only hides
 // the banner; the chip and the sidebar kebab keep the move reachable. A
 // place a person chose (`place_chosen` in the chat's targets answer) is no
@@ -36,13 +36,13 @@ export default function ChatTargetBanner({ chatId, mismatch, moveDisabled = fals
   // Dismissed resolved-target ids for this chat, reloaded on chat switch
   // (the component stays mounted across chat navigation).
   const [dismissed, setDismissed] = useState<Set<string>>(() =>
-    chatId ? loadDismissedTargets(chatId) : new Set(),
+    chatId ? loadDismissed('chattarget', chatId) : new Set(),
   )
   // The chat switch reloads the dismissals, in render.
   const [forChat, setForChat] = useState(chatId)
   if (forChat !== chatId) {
     setForChat(chatId)
-    setDismissed(chatId ? loadDismissedTargets(chatId) : new Set())
+    setDismissed(chatId ? loadDismissed('chattarget', chatId) : new Set())
   }
 
   if (!chatId || !mismatch) return null
@@ -58,7 +58,7 @@ export default function ChatTargetBanner({ chatId, mismatch, moveDisabled = fals
   return (
     <div
       role="status"
-      className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-card border border-status-warning-border bg-status-warning-bg text-status-warning-fg"
+      className="w-full px-3 py-2 text-xs rounded-card border border-status-warning-border bg-status-warning-bg text-status-warning-fg"
     >
       <div className="flex items-center gap-2">
         <span className="truncate min-w-0">{copy}</span>
@@ -81,8 +81,8 @@ export default function ChatTargetBanner({ chatId, mismatch, moveDisabled = fals
         <button
           type="button"
           onClick={() => {
-            recordDismissedTarget(chatId, mismatch.resolvedTarget)
-            setDismissed(loadDismissedTargets(chatId))
+            recordDismissed('chattarget', chatId, mismatch.resolvedTarget)
+            setDismissed(loadDismissed('chattarget', chatId))
           }}
           className="shrink-0 px-1.5 py-0.5 rounded-control hover:underline"
           title="Dismiss"

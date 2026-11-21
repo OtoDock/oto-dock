@@ -166,9 +166,9 @@ export function useDuplexWakeArm({
 }) {
   // Wake word ARM (?wake=1 was consumed above into wakeRequested): start
   // duplex on a FRESH chat of the route agent. Never trust the page's chatId
-  // state here — right after a wake navigation from another open chat it is
-  // STALE (nothing resets state for an EXTERNAL entry into the new-chat
-  // view), and starting on it attached duplex to the previous agent's dead
+  // state here — in the commit of a wake navigation from another open chat it
+  // is STALE (useChatUrlEntry clears it in the same commit, after this
+  // render), and starting on it attached duplex to the previous agent's dead
   // interactive chat (live-hit 2026-08-14: session_dead → heal refused
   // interactive_chat → spoken error, no reply). Stale state runs
   // handleNewChat — the canonical full reset, and wake means "new chat" by

@@ -1,0 +1,14 @@
+# The credential exit's relay and authority, vendored from the proxy
+# (sessions/credential_exit.py over _vendored/exit_relay.py and
+# _vendored/exit_authority.py), installed best effort after
+# requirements.txt by the installers, the update, the bare-metal setup and,
+# on a paired computer that lacks them, the satellite itself at boot:
+# a host with no cryptography wheel (32-bit ARM outside piwheels, say) still
+# installs and updates, runs no exit, and its sessions leave out every tool
+# that needs a key, since the machine rule reads it as having no listener.
+# Compiled against the main lock (-c requirements.txt), so a package both
+# need is pinned the same. The proxy's own pins as floors, so the two venvs
+# never hold an older one than the platform.
+httpx>=0.28.1
+h11>=0.16.0
+cryptography>=50.0.0

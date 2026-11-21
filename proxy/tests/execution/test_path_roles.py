@@ -165,52 +165,6 @@ def test_config_unknown_role_empty():
 
 
 # ---------------------------------------------------------------------------
-# resolve_role: credentials_dir (moved under .credentials/ subdir)
-# ---------------------------------------------------------------------------
-
-
-def test_credentials_dir_user_scoped():
-    """User-scope tokens land under the user's own .credentials/ dir."""
-    assert resolve_role(
-        "credentials_dir", username="alice", subpath="google-tokens",
-    ) == "/users/alice/.credentials/google-tokens"
-
-
-def test_credentials_dir_agent_scoped():
-    """Agent-scope tokens land under the agent's knowledge/.credentials/ —
-    universal across all agent-scope sessions (phone/task/trigger).
-    """
-    assert resolve_role(
-        "credentials_dir", username="", subpath="google-tokens",
-    ) == "/knowledge/.credentials/google-tokens"
-
-
-def test_credentials_dir_strips_leading_slash():
-    """Subpath with leading slash should not produce double slash."""
-    assert resolve_role(
-        "credentials_dir", username="alice", subpath="/google-tokens",
-    ) == "/users/alice/.credentials/google-tokens"
-
-
-def test_credentials_dir_requires_subpath():
-    with pytest.raises(ValueError, match="credentials_dir.*subpath"):
-        resolve_role("credentials_dir", username="alice")
-
-
-def test_credentials_dir_requires_subpath_agent_scope():
-    with pytest.raises(ValueError, match="credentials_dir.*subpath"):
-        resolve_role("credentials_dir", username="")
-
-
-def test_credentials_dir_ignores_user_role():
-    """credentials_dir doesn't gate on access level."""
-    for role in ("viewer", "editor", "manager", "admin", ""):
-        assert resolve_role(
-            "credentials_dir", username="alice", subpath="google-tokens", user_role=role,
-        ) == "/users/alice/.credentials/google-tokens"
-
-
-# ---------------------------------------------------------------------------
 # resolve_role: knowledge_dir (new role)
 # ---------------------------------------------------------------------------
 
@@ -293,7 +247,6 @@ def test_roles_constant_lists_all_roles():
         "shared_workspace",
         "config",
         "knowledge_dir",
-        "credentials_dir",
     )
 
 
@@ -305,24 +258,24 @@ def test_roles_constant_lists_all_roles():
 def test_resolve_path_env_with_dict_input():
     raw = {
         "IMAGE_SAVE_DIR": {"role": "workspace"},
-        "MY_CREDS": {"role": "credentials_dir", "subpath": "google-tokens"},
+        "MY_DOCS": {"role": "knowledge_dir", "subpath": "docs"},
     }
     result = resolve_path_env(raw, username="alice", user_role="manager")
     assert result == {
         "IMAGE_SAVE_DIR": "/users/alice/workspace",
-        "MY_CREDS": "/users/alice/.credentials/google-tokens",
+        "MY_DOCS": "/knowledge/docs",
     }
 
 
 def test_resolve_path_env_agent_scoped():
     raw = {
         "IMAGE_SAVE_DIR": {"role": "workspace"},
-        "MY_CREDS": {"role": "credentials_dir", "subpath": "google-tokens"},
+        "MY_DOCS": {"role": "knowledge_dir", "subpath": "docs"},
     }
     result = resolve_path_env(raw, username="")
     assert result == {
         "IMAGE_SAVE_DIR": "/workspace",
-        "MY_CREDS": "/knowledge/.credentials/google-tokens",
+        "MY_DOCS": "/knowledge/docs",
     }
 
 
@@ -408,13 +361,13 @@ def test_resolve_path_env_entry_multivalue_with_subpaths():
     """Each item carries its own subpath."""
     decl = {
         "values": [
-            {"role": "credentials_dir", "subpath": "tokens"},
-            {"role": "credentials_dir", "subpath": "keys"},
+            {"role": "workspace", "subpath": "tokens"},
+            {"role": "workspace", "subpath": "keys"},
         ],
         "join": ":",
     }
     result = resolve_path_env_entry(decl, username="alice")
-    assert result == "/users/alice/.credentials/tokens:/users/alice/.credentials/keys"
+    assert result == "/users/alice/workspace/tokens:/users/alice/workspace/keys"
 
 
 def test_resolve_path_env_entry_multivalue_all_empty_returns_empty():
@@ -523,13 +476,6 @@ def test_viewer_workspace_lands_inside_user_mount():
     assert result.startswith("/users/viewer1/")
 
 
-def test_viewer_credentials_lands_inside_user_mount():
-    result = resolve_role(
-        "credentials_dir", username="viewer1", subpath=".some_creds",
-    )
-    assert result.startswith("/users/viewer1/")
-
-
 def test_viewer_accessible_roots_via_multivalue():
     """An ALLOWED_FILE_DIRS-style multi-value yields exactly the viewer's mount set."""
     decl = {
@@ -583,7 +529,7 @@ def test_parse_path_env_valid_shorthand_entries():
 
     raw = {
         "IMAGE_SAVE_DIR": {"role": "workspace"},
-        "CREDS": {"role": "credentials_dir", "subpath": ".keys"},
+        "CREDS": {"role": "knowledge_dir", "subpath": ".keys"},
     }
     result = _parse_path_env(raw, "test-mcp")
     assert "IMAGE_SAVE_DIR" in result
@@ -591,7 +537,7 @@ def test_parse_path_env_valid_shorthand_entries():
     assert result["IMAGE_SAVE_DIR"].subpath == ""
     assert result["IMAGE_SAVE_DIR"].is_multi is False
     assert "CREDS" in result
-    assert result["CREDS"].role == "credentials_dir"
+    assert result["CREDS"].role == "knowledge_dir"
     assert result["CREDS"].subpath == ".keys"
 
 
@@ -605,18 +551,6 @@ def test_parse_path_env_drops_unknown_role():
     result = _parse_path_env(raw, "test-mcp")
     assert "GOOD" in result
     assert "BAD" not in result
-
-
-def test_parse_path_env_drops_credentials_dir_without_subpath():
-    from services.mcp.mcp_registry import _parse_path_env
-
-    raw = {
-        "BAD": {"role": "credentials_dir"},  # missing subpath
-        "GOOD": {"role": "credentials_dir", "subpath": ".keys"},
-    }
-    result = _parse_path_env(raw, "test-mcp")
-    assert "BAD" not in result
-    assert "GOOD" in result
 
 
 def test_parse_path_env_drops_non_dict_values():
@@ -708,8 +642,8 @@ def test_parse_path_env_multivalue_with_subpath():
     raw = {
         "MULTI_CREDS": {
             "values": [
-                {"role": "credentials_dir", "subpath": "tokens"},
-                {"role": "credentials_dir", "subpath": "keys"},
+                {"role": "knowledge_dir", "subpath": "tokens"},
+                {"role": "knowledge_dir", "subpath": "keys"},
             ],
             "join": ":",
         },
@@ -730,20 +664,6 @@ def test_parse_path_env_multivalue_drops_invalid_inner_role():
                 {"role": "workspace"},
                 {"role": "made_up"},  # invalid
             ],
-            "join": ":",
-        },
-    }
-    result = _parse_path_env(raw, "test-mcp")
-    assert "X" not in result
-
-
-def test_parse_path_env_multivalue_drops_invalid_inner_creds_no_subpath():
-    """credentials_dir item without subpath inside multi-value drops the entry."""
-    from services.mcp.mcp_registry import _parse_path_env
-
-    raw = {
-        "X": {
-            "values": [{"role": "credentials_dir"}],
             "join": ":",
         },
     }

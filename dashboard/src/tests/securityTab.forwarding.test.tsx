@@ -34,6 +34,7 @@ const h = vi.hoisted(() => ({
   },
 }))
 
+vi.mock('@/pages/admin/ApiKeysCard', () => ({ default: () => null }))
 vi.mock('@/api/auth', () => ({ apiFetch: vi.fn(async () => ({ ok: true, json: async () => ({}) })) }))
 vi.mock('@/api/oauth', () => ({
   useBearerAllowlist: () => ({ data: [], isLoading: false }),

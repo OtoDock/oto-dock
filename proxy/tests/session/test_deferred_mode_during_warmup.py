@@ -317,3 +317,31 @@ def test_a_mode_the_chats_engine_lacks_drops_to_its_first(temp_db):
     assert asyncio.run(coerce_chat_mode(cid, "autoReview", "direct-llm")) == "ask"
     assert temp_db.get_chat(cid)["permission_mode"] == "ask"
     assert asyncio.run(coerce_chat_mode(cid, "ask", "claude-code-cli")) == "ask"
+
+
+def test_a_mode_pick_on_a_session_for_nobody_closes_it_and_keeps_its_word(temp_db, monkeypatch):
+    """A headless session a wake built for nobody on the chat (its recorded
+    word nobody picks): the menu's pick goes to the row and closes the
+    session, never relabels it (the rule would then let a person ride it)."""
+    layer = FakeExecutionLayer()
+    stub_dashboard_seams(monkeypatch, layer)
+    slug = make_test_agent()
+    out: dict = {}
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            ws.client_send({"type": "warmup", "agent": slug, "permission_mode": "ask"})
+            out["ready"] = await _frame(ws, "warmup_ready")
+            sid = out["ready"]["session_id"]
+            session_state.set_session_mode(sid, "auto")      # what a wake for nobody records
+            ws.client_send({"type": "mode_change", "mode": "dontAsk",
+                            "chat_id": out["ready"]["chat_id"]})
+            await _frame(ws, "mode_changed")
+            ws.client_send({"type": "close"})
+
+    run_ws_scenario(scenario)
+    sid = out["ready"]["session_id"]
+    assert sid in layer.closed_sessions
+    assert session_state.get_session_mode(sid) == "auto"
+    assert temp_db.get_chat(out["ready"]["chat_id"])["permission_mode"] == "dontAsk"

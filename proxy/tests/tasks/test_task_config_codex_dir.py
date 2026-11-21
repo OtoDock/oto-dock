@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from core import placement
 from core.config import task_config_builder as tcb
+from tests._compute import serve
 
 
 def _stub(monkeypatch, *, execution_path: str):
@@ -54,7 +55,13 @@ def _stub(monkeypatch, *, execution_path: str):
     monkeypatch.setattr(tcb.asyncio, "to_thread", _to_thread)
 
     monkeypatch.setattr(tcb.remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
-    monkeypatch.setattr(tcb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT)
+    # A run of the platform's place is built on the compute machine that
+    # serves it: the store's reader answers that machine's placement.
+    serve(monkeypatch)
+    monkeypatch.setattr(
+        tcb.remote_store, "placement_of",
+        lambda *a, compute=None, **k: (placement.from_machine(placement.KIND_COMPUTE, compute)
+                                       if compute else placement.LOCAL_PLACEMENT))
 
     def _build_mcp(*a, **k):
         calls["mcp_format"] = k.get("mcp_config_format")

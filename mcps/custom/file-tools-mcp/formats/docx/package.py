@@ -49,10 +49,14 @@ MAX_XML_TOTAL = 400 * 1024 * 1024
 _MB = 1024 * 1024
 
 
-def preflight(path: str) -> None:
-    """Refuse a file too large to open, before anything loads it."""
+def preflight(source: Any) -> None:
+    """Refuse a file too large to open, before anything loads it.
+    ``source``: a path (opened with ``shared.safe_open_read``) or the binary
+    file the caller holds."""
+    import shared
+
     try:
-        with zipfile.ZipFile(path) as zf:
+        with shared.reading(source) as fh, zipfile.ZipFile(fh) as zf:
             infos = zf.infolist()
     except zipfile.BadZipFile:
         raise ValueError("This file is not a valid Word document (it is not a zip package). If it is an "
@@ -80,25 +84,36 @@ def _register_main_types() -> None:
     register_part_types()
 
 
-def _is_strict(path: str) -> bool:
+def _is_strict(fh: Any) -> bool:
     try:
-        with zipfile.ZipFile(path) as zf:
+        fh.seek(0)
+        with zipfile.ZipFile(fh) as zf:
             rels = zf.read("_rels/.rels")
     except (KeyError, OSError, zipfile.BadZipFile):
         return False
     return _STRICT_NAMESPACE.encode() in rels
 
 
-def open_document(path: str) -> Any:
-    """The python-docx Document of a .docx, .dotx, .docm or .dotm file."""
+def open_document(source: Any) -> Any:
+    """The python-docx Document of a .docx, .dotx, .docm or .dotm file:
+    ``source`` is a path (opened with ``shared.safe_open_read``: beneath the
+    mount, no link followed) or the binary file the caller holds. The
+    package is read whole at the open."""
+    import shared
+
+    with shared.reading(source) as fh:
+        return _open_document(fh)
+
+
+def _open_document(fh: Any) -> Any:
     from docx.package import Package
 
     _register_main_types()
-    package = Package.open(path)
+    package = Package.open(fh)
     try:
         part = package.main_document_part
     except KeyError:
-        if _is_strict(path):
+        if _is_strict(fh):
             raise ValueError(
                 "This document is saved as Strict Open XML, which these tools cannot "
                 "edit. Save it as a normal Word document (.docx) first."

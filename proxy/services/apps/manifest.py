@@ -26,12 +26,19 @@ ACTION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 CHECK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 MCP_TOOL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 SCHEMA_PROP_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,39}$")
-MAX_ACTIONS = 16
+# Buttons, feeds and platform methods together. An app that edits video or
+# photos needs one action per control: sixteen was a squeeze with no reason
+# behind it. An older platform refuses the seventeenth, so a template that
+# declares more states the version it needs.
+MAX_ACTIONS = 32
 MAX_LABEL_CHARS = 80
 MAX_PROMPT_CHARS = 4000
-MAX_MANIFEST_BYTES = 32 * 1024
+MAX_MANIFEST_BYTES = 64 * 1024   # the room per action that sixteen had
 MAX_FIXED_ARGS_BYTES = 4 * 1024
 MAX_SCHEMA_BYTES = 4 * 1024
+# A schema that holds a list of operations: a platform before 2.0 refuses
+# it anyway, so only it may pass the older cap.
+MAX_LIST_SCHEMA_BYTES = 8 * 1024
 MAX_SCHEMA_PROPS = 16
 MAX_STRING_MAXLENGTH = 4000
 MAX_ENUM_VALUES = 50
@@ -61,6 +68,14 @@ ALLOWED_PLATFORM_METHODS = frozenset(_CATALOG_METHODS)
 # every viewer of the app and is never stored, so a manifest that names it
 # signs exactly like one that omits it.
 ACTION_ROLES = roles.AGENT_ROLES
+# The floor that opens a button or an exported method to outside people (a
+# caller's session, a visitor of a shared link): accepted only where an
+# outsider can press or call, and stored, since it differs from the default.
+OUTSIDE_FLOOR = roles.EXTERNAL
+OUTSIDE_FLOOR_ACTION_TYPES = frozenset({"mcp_tool", "fire_task"})
+# The role a shared link's visitor is judged at, by the button routes and in
+# the claim the app's own code reads.
+LINK_ROLE = roles.EXTERNAL
 # The buttons that act for the agent (run a task, send it a prompt, call a
 # tool): with no floor, everyone who opens the app may press them.
 ACTING_ACTION_TYPES = frozenset({"fire_task", "send_prompt", "mcp_tool"})
@@ -73,11 +88,14 @@ def caller_role(row: dict, user: UserContext | None) -> str:
     the role the share gives them (SHARING.md: a person share's cap; an
     agent or department placement's cap, capped by their role on the
     receiving agent; the strongest share admitting them, whichever panel
-    lists the app), read from the store; anyone else is a viewer. Every bearer principal
+    lists the app), read from the store; an outside person's session is
+    ``external``, below every floor; anyone else is a viewer. Every bearer principal
     (session JWT, master key, delegation callers) clamps to viewer whatever
     its owner's role, so a prompt never drives a floored button; admin
     passes every floor. The share read is a DB round trip: call it off the
     loop for a viewer who is neither owner nor member."""
+    if user is not None and getattr(user, "is_external", False):
+        return roles.EXTERNAL
     if user is None or getattr(user, "is_api_key", False):
         return roles.VIEWER
     if user.is_admin:
@@ -105,9 +123,27 @@ def _min_role(a: dict, aid: str) -> tuple[str | None, str]:
     raw = a.get("min_role")
     if raw in (None, roles.NO_ACCESS, roles.VIEWER):
         return None, ""
+    if raw == OUTSIDE_FLOOR:
+        if a.get("type") not in OUTSIDE_FLOOR_ACTION_TYPES:
+            return None, (f"action {aid!r}: min_role external opens a button to outside people, "
+                          "and only a tool or a task button can be one")
+        return raw, ""
     if raw not in ACTION_ROLES:
-        return None, f"action {aid!r}: min_role must be viewer, contributor, editor or manager"
+        return None, f"action {aid!r}: min_role must be viewer, contributor, editor, manager or external"
     return raw, ""
+
+
+def _fire_task_target_error(aid: str, action: dict, task_id: str, agent: str, shared: bool,
+                            blueprint_tasks: frozenset[str] | None) -> str:
+    """Why a ``fire_task`` button's target is refused; '' when it is fine."""
+    if blueprint_tasks is None:
+        err = check_task_target(task_id, agent, shared)
+        return f"action {aid!r}: {err}" if err else ""
+    if task_id:
+        return f"action {aid!r}: a template's button names its blueprint task by slug, never task_id"
+    if str(action.get("task") or "") not in blueprint_tasks:
+        return f"action {aid!r} names a task its blueprint.json does not have"
+    return ""
 
 
 def check_task_target(task_id: str, agent: str, shared: bool) -> str:
@@ -153,20 +189,162 @@ _SCHEMA_ROOT_KEYS = {"type", "properties", "required", "additionalProperties"}
 _SCHEMA_PROP_KEYS = {"type", "enum", "maxLength", "minLength",
                      "minimum", "maximum", "description"}
 _SCHEMA_TYPES = {"string", "integer", "number", "boolean"}
+# A tool button's extras: one list property
+# of named operations, and ``file`` on a string that names a file, judged at
+# the press for the presser inside the app's folders.
+_FILE_MODES = ("read", "write")
+_FILE = "file"
+_LIST_KEYS = {"type", "maxItems", "items", "description"}
+_VARIANT_KEYS = {"type", "properties", "required", "additionalProperties"}
+OP_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+MAX_LIST_ITEMS = 32
+MAX_LIST_VARIANTS = 16
 
 
 def _is_num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def validate_args_schema(schema) -> tuple[dict | None, str]:
+def _norm_prop(name: str, p, *, tool: bool) -> tuple[dict | None, str]:
+    """One plain property of a schema or of a list's operation: its kind,
+    its bounds and, on a tool button's string, ``file``."""
+    if not isinstance(p, dict):
+        return None, f"property {name!r} must be an object"
+    allowed = _SCHEMA_PROP_KEYS | ({_FILE} if tool else set())
+    if set(p) - allowed:
+        bad = sorted(set(p) - allowed)
+        return None, f"property {name!r}: unsupported keys {bad}"
+    ptype = p.get("type")
+    if ptype not in _SCHEMA_TYPES:
+        return None, f"property {name!r}: type must be one of {sorted(_SCHEMA_TYPES)}"
+    np: dict = {"type": ptype}
+    enum = p.get("enum")
+    if enum is not None:
+        if ptype == "boolean":
+            return None, f"property {name!r}: enum not allowed for boolean"
+        if not isinstance(enum, list) or not enum or len(enum) > MAX_ENUM_VALUES:
+            return None, f"property {name!r}: enum must be 1..{MAX_ENUM_VALUES} values"
+        for ev in enum:
+            if ptype == "string":
+                if not isinstance(ev, str) or len(ev) > MAX_ENUM_STR_CHARS:
+                    return None, f"property {name!r}: enum values must be strings ≤{MAX_ENUM_STR_CHARS} chars"
+            elif ptype == "integer":
+                if not isinstance(ev, int) or isinstance(ev, bool):
+                    return None, f"property {name!r}: enum values must be integers"
+            elif not _is_num(ev):
+                return None, f"property {name!r}: enum values must be numbers"
+        np["enum"] = enum
+    if ptype == "string":
+        max_len = p.get("maxLength")
+        if max_len is None and enum is None:
+            return None, f"property {name!r}: string requires maxLength (or enum)"
+        if max_len is not None:
+            if not isinstance(max_len, int) or isinstance(max_len, bool) \
+                    or not 1 <= max_len <= MAX_STRING_MAXLENGTH:
+                return None, f"property {name!r}: maxLength must be 1..{MAX_STRING_MAXLENGTH}"
+            np["maxLength"] = max_len
+        min_len = p.get("minLength")
+        if min_len is not None:
+            if not isinstance(min_len, int) or isinstance(min_len, bool) \
+                    or min_len < 0 or (max_len is not None and min_len > max_len):
+                return None, f"property {name!r}: invalid minLength"
+            np["minLength"] = min_len
+        if _FILE in p:
+            if p[_FILE] not in _FILE_MODES or enum is not None:
+                return None, f"property {name!r}: file is read or write, on a string with no enum"
+            np[_FILE] = p[_FILE]
+    else:
+        if _FILE in p:
+            return None, f"property {name!r}: file is for a string"
+        if ptype in ("integer", "number"):
+            lo, hi = p.get("minimum"), p.get("maximum")
+            for label, v in (("minimum", lo), ("maximum", hi)):
+                if v is not None and not _is_num(v):
+                    return None, f"property {name!r}: {label} must be a number"
+            if lo is not None and hi is not None and lo > hi:
+                return None, f"property {name!r}: minimum > maximum"
+            if lo is not None:
+                np["minimum"] = lo
+            if hi is not None:
+                np["maximum"] = hi
+        elif any(k in p for k in ("maxLength", "minLength", "minimum", "maximum")):
+            return None, f"property {name!r}: bounds not allowed for boolean"
+    desc = p.get("description")
+    if desc is not None:
+        if not isinstance(desc, str) or len(desc) > MAX_SCHEMA_DESC_CHARS:
+            return None, f"property {name!r}: description ≤{MAX_SCHEMA_DESC_CHARS} chars"
+        np["description"] = desc
+    return np, ""
+
+
+def _norm_list(name: str, p: dict) -> tuple[dict | None, str]:
+    """The list property: at most ``maxItems`` operations, each an object
+    whose ``op`` is one of the declared names and whose other fields are
+    plain properties. ``op`` is always required, extra fields never."""
+    if set(p) - _LIST_KEYS:
+        return None, f"property {name!r}: unsupported keys {sorted(set(p) - _LIST_KEYS)}"
+    n = p.get("maxItems")
+    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= MAX_LIST_ITEMS:
+        return None, f"property {name!r}: maxItems must be 1..{MAX_LIST_ITEMS}"
+    items = p.get("items")
+    if not isinstance(items, dict) or set(items) != {"oneOf"}:
+        return None, f"property {name!r}: items must be {{\"oneOf\": [...]}}"
+    variants = items["oneOf"]
+    if not isinstance(variants, list) or not 1 <= len(variants) <= MAX_LIST_VARIANTS:
+        return None, f"property {name!r}: oneOf must list 1..{MAX_LIST_VARIANTS} operations"
+    norm_variants: list[dict] = []
+    ops: set[str] = set()
+    for v in variants:
+        if not isinstance(v, dict) or set(v) - _VARIANT_KEYS or v.get("type") != "object":
+            return None, f"property {name!r}: each operation is an object schema"
+        if v.get("additionalProperties", False) is not False:
+            return None, f"property {name!r}: an operation takes no other fields"
+        vprops = v.get("properties")
+        if not isinstance(vprops, dict):
+            return None, f"property {name!r}: each operation needs properties"
+        op = vprops.get("op")
+        if not isinstance(op, dict) or set(op) != {"const"} or not isinstance(op["const"], str) \
+                or not OP_NAME_RE.match(op["const"]):
+            return None, f"property {name!r}: each operation names itself with op: {{\"const\": \"name\"}}"
+        if op["const"] in ops:
+            return None, f"property {name!r}: operation {op['const']!r} is declared twice"
+        ops.add(op["const"])
+        fields = {k: f for k, f in vprops.items() if k != "op"}
+        if len(fields) > MAX_SCHEMA_PROPS:
+            return None, f"property {name!r}: at most {MAX_SCHEMA_PROPS} fields per operation"
+        nfields: dict[str, dict] = {"op": {"const": op["const"]}}
+        for fname, f in fields.items():
+            if not isinstance(fname, str) or not SCHEMA_PROP_RE.match(fname):
+                return None, f"property {name!r}: invalid field name {fname!r}"
+            nf, err = _norm_prop(f"{name}.{op['const']}.{fname}", f, tool=True)
+            if err:
+                return None, err
+            nfields[fname] = cast("dict", nf)
+        required = v.get("required", [])
+        if not isinstance(required, list) or not all(isinstance(r, str) and r in nfields for r in required):
+            return None, f"property {name!r}: required must list the operation's fields"
+        norm_variants.append({"type": "object", "properties": nfields,
+                              "required": list(dict.fromkeys(["op", *required])),
+                              "additionalProperties": False})
+    out: dict = {"type": "array", "maxItems": n, "items": {"oneOf": norm_variants}}
+    if p.get("description") is not None:
+        desc = p["description"]
+        if not isinstance(desc, str) or len(desc) > MAX_SCHEMA_DESC_CHARS:
+            return None, f"property {name!r}: description ≤{MAX_SCHEMA_DESC_CHARS} chars"
+        out["description"] = desc
+    return out, ""
+
+
+def validate_args_schema(schema, *, tool: bool = False) -> tuple[dict | None, str]:
     """Validate + normalize a declared ``args_schema`` — a deliberately
-    BOUNDED JSON-Schema subset (flat object of scalars), hand-checked instead
-    of handed to a full validator: the schema is the load-bearing gate between
-    page-controlled args and a real tool call, so no ``$ref``/``pattern``/
-    nesting surface is admitted at all. ``additionalProperties: false`` is
-    FORCED. Strings must be enum-valued or carry ``maxLength`` — every arg is
-    length-bounded by construction."""
+    BOUNDED JSON-Schema subset, hand-checked instead of handed to a full
+    validator: the schema is the load-bearing gate between page-controlled
+    args and a real tool call, so no ``$ref``/``pattern``/free nesting
+    surface is admitted at all. ``additionalProperties: false`` is FORCED.
+    Strings must be enum-valued or carry ``maxLength`` — every arg is
+    length-bounded by construction. A tool button (``tool``) may also hold
+    one list of named operations and mark a string as a ``file``; a schema
+    with neither normalizes to the text it always did."""
     if not isinstance(schema, dict):
         return None, "args_schema must be an object"
     if set(schema) - _SCHEMA_ROOT_KEYS:
@@ -180,69 +358,22 @@ def validate_args_schema(schema) -> tuple[dict | None, str]:
     if len(props) > MAX_SCHEMA_PROPS:
         return None, f"args_schema: at most {MAX_SCHEMA_PROPS} properties"
     norm_props: dict[str, dict] = {}
+    lists = 0
     for name, p in props.items():
         if not isinstance(name, str) or not SCHEMA_PROP_RE.match(name):
             return None, f"args_schema: invalid property name {name!r}"
-        if not isinstance(p, dict):
-            return None, f"args_schema: property {name!r} must be an object"
-        if set(p) - _SCHEMA_PROP_KEYS:
-            bad = sorted(set(p) - _SCHEMA_PROP_KEYS)
-            return None, f"args_schema: property {name!r}: unsupported keys {bad}"
-        ptype = p.get("type")
-        if ptype not in _SCHEMA_TYPES:
-            return None, f"args_schema: property {name!r}: type must be one of {sorted(_SCHEMA_TYPES)}"
-        np: dict = {"type": ptype}
-        enum = p.get("enum")
-        if enum is not None:
-            if ptype == "boolean":
-                return None, f"args_schema: property {name!r}: enum not allowed for boolean"
-            if not isinstance(enum, list) or not enum or len(enum) > MAX_ENUM_VALUES:
-                return None, f"args_schema: property {name!r}: enum must be 1..{MAX_ENUM_VALUES} values"
-            for ev in enum:
-                if ptype == "string":
-                    if not isinstance(ev, str) or len(ev) > MAX_ENUM_STR_CHARS:
-                        return None, f"args_schema: property {name!r}: enum values must be strings ≤{MAX_ENUM_STR_CHARS} chars"
-                elif ptype == "integer":
-                    if not isinstance(ev, int) or isinstance(ev, bool):
-                        return None, f"args_schema: property {name!r}: enum values must be integers"
-                elif not _is_num(ev):
-                    return None, f"args_schema: property {name!r}: enum values must be numbers"
-            np["enum"] = enum
-        if ptype == "string":
-            max_len = p.get("maxLength")
-            if max_len is None and enum is None:
-                return None, f"args_schema: property {name!r}: string requires maxLength (or enum)"
-            if max_len is not None:
-                if not isinstance(max_len, int) or isinstance(max_len, bool) \
-                        or not 1 <= max_len <= MAX_STRING_MAXLENGTH:
-                    return None, f"args_schema: property {name!r}: maxLength must be 1..{MAX_STRING_MAXLENGTH}"
-                np["maxLength"] = max_len
-            min_len = p.get("minLength")
-            if min_len is not None:
-                if not isinstance(min_len, int) or isinstance(min_len, bool) \
-                        or min_len < 0 or (max_len is not None and min_len > max_len):
-                    return None, f"args_schema: property {name!r}: invalid minLength"
-                np["minLength"] = min_len
-        elif ptype in ("integer", "number"):
-            lo, hi = p.get("minimum"), p.get("maximum")
-            for label, v in (("minimum", lo), ("maximum", hi)):
-                if v is not None and not _is_num(v):
-                    return None, f"args_schema: property {name!r}: {label} must be a number"
-            if lo is not None and hi is not None and lo > hi:
-                return None, f"args_schema: property {name!r}: minimum > maximum"
-            if lo is not None:
-                np["minimum"] = lo
-            if hi is not None:
-                np["maximum"] = hi
-        else:  # boolean
-            if any(k in p for k in ("maxLength", "minLength", "minimum", "maximum")):
-                return None, f"args_schema: property {name!r}: bounds not allowed for boolean"
-        desc = p.get("description")
-        if desc is not None:
-            if not isinstance(desc, str) or len(desc) > MAX_SCHEMA_DESC_CHARS:
-                return None, f"args_schema: property {name!r}: description ≤{MAX_SCHEMA_DESC_CHARS} chars"
-            np["description"] = desc
-        norm_props[name] = np
+        if isinstance(p, dict) and p.get("type") == "array":
+            if not tool:
+                return None, f"args_schema: property {name!r}: a list is for a tool button only"
+            lists += 1
+            if lists > 1:
+                return None, "args_schema: at most one list property"
+            np, err = _norm_list(name, p)
+        else:
+            np, err = _norm_prop(name, p, tool=tool)
+        if err:
+            return None, f"args_schema: {err}"
+        norm_props[name] = cast("dict", np)
     required = schema.get("required", [])
     if not isinstance(required, list) or len(set(required)) != len(required) \
             or not all(isinstance(r, str) and r in norm_props for r in required):
@@ -251,15 +382,85 @@ def validate_args_schema(schema) -> tuple[dict | None, str]:
                   "additionalProperties": False}
     if required:
         norm["required"] = required
-    if len(task_store.canonical_actions_json(norm).encode("utf-8")) > MAX_SCHEMA_BYTES:
+    cap = MAX_LIST_SCHEMA_BYTES if lists else MAX_SCHEMA_BYTES
+    if len(task_store.canonical_actions_json(norm).encode("utf-8")) > cap:
         return None, "args_schema too large"
     return norm, ""
+
+
+def has_list(action: dict) -> bool:
+    """A tool button whose schema holds a list of operations."""
+    props = (action.get("args_schema") or {}).get("properties") or {}
+    return any((p or {}).get("type") == "array" for p in props.values())
+
+
+def _check_value(name: str, p: dict, v) -> str:
+    """One page value against its normalized plain property."""
+    ptype = p["type"]
+    if ptype == "string":
+        if not isinstance(v, str):
+            return f"arg {name!r} must be a string"
+        if "maxLength" in p and len(v) > p["maxLength"]:
+            return f"arg {name!r} too long"
+        if "minLength" in p and len(v) < p["minLength"]:
+            return f"arg {name!r} too short"
+    elif ptype == "integer":
+        if not isinstance(v, int) or isinstance(v, bool):
+            return f"arg {name!r} must be an integer"
+    elif ptype == "number":
+        if not _is_num(v):
+            return f"arg {name!r} must be a number"
+    elif ptype == "boolean":
+        if not isinstance(v, bool):
+            return f"arg {name!r} must be a boolean"
+    if ptype in ("integer", "number"):
+        if "minimum" in p and v < p["minimum"]:
+            return f"arg {name!r} below minimum"
+        if "maximum" in p and v > p["maximum"]:
+            return f"arg {name!r} above maximum"
+    if "enum" in p and v not in p["enum"]:
+        return f"arg {name!r} not in enum"
+    return ""
+
+
+def _check_list(name: str, p: dict, v) -> tuple[list | None, str]:
+    """A page's list against its declared operations; a copy of the items,
+    so a later rewrite of a file field never touches the page's object."""
+    if not isinstance(v, list):
+        return None, f"arg {name!r} must be a list"
+    if len(v) > p["maxItems"]:
+        return None, f"arg {name!r} holds more than {p['maxItems']} items"
+    by_op = {variant["properties"]["op"]["const"]: variant for variant in p["items"]["oneOf"]}
+    out: list[dict] = []
+    for i, item in enumerate(v):
+        where = f"{name}[{i}]"
+        if not isinstance(item, dict):
+            return None, f"arg {where!r} must be an object"
+        variant = by_op.get(item.get("op")) if isinstance(item.get("op"), str) else None
+        if variant is None:
+            return None, f"arg {where!r}: op must be one of {sorted(by_op)}"
+        fields = variant["properties"]
+        unknown = sorted(set(item) - set(fields))
+        if unknown:
+            return None, f"arg {where!r}: unknown fields {unknown}"
+        missing = [r for r in variant["required"] if r not in item]
+        if missing:
+            return None, f"arg {where!r}: missing fields {missing}"
+        for fname, fv in item.items():
+            if fname == "op":
+                continue
+            err = _check_value(f"{where}.{fname}", fields[fname], fv)
+            if err:
+                return None, err
+        out.append(dict(item))
+    return out, ""
 
 
 def validate_args(schema: dict, args) -> tuple[dict | None, str]:
     """Exec-time gate: validate page-supplied ``args`` against a stored
     (already-normalized) ``args_schema``. Fail-closed: unknown keys, missing
-    required, and any type/enum/bounds mismatch reject the call."""
+    required, and any type/enum/bounds mismatch reject the call; a list's
+    every item is held to its operation."""
     if args is None:
         args = {}
     if not isinstance(args, dict):
@@ -271,33 +472,38 @@ def validate_args(schema: dict, args) -> tuple[dict | None, str]:
     missing = [r for r in schema.get("required", []) if r not in args]
     if missing:
         return None, f"missing required args {missing}"
+    out: dict = {}
     for name, v in args.items():
         p = props[name]
-        ptype = p["type"]
-        if ptype == "string":
-            if not isinstance(v, str):
-                return None, f"arg {name!r} must be a string"
-            if "maxLength" in p and len(v) > p["maxLength"]:
-                return None, f"arg {name!r} too long"
-            if "minLength" in p and len(v) < p["minLength"]:
-                return None, f"arg {name!r} too short"
-        elif ptype == "integer":
-            if not isinstance(v, int) or isinstance(v, bool):
-                return None, f"arg {name!r} must be an integer"
-        elif ptype == "number":
-            if not _is_num(v):
-                return None, f"arg {name!r} must be a number"
-        elif ptype == "boolean":
-            if not isinstance(v, bool):
-                return None, f"arg {name!r} must be a boolean"
-        if ptype in ("integer", "number"):
-            if "minimum" in p and v < p["minimum"]:
-                return None, f"arg {name!r} below minimum"
-            if "maximum" in p and v > p["maximum"]:
-                return None, f"arg {name!r} above maximum"
-        if "enum" in p and v not in p["enum"]:
-            return None, f"arg {name!r} not in enum"
-    return dict(args), ""
+        if p["type"] == "array":
+            items, err = _check_list(name, p, v)
+            if err:
+                return None, err
+            out[name] = items
+            continue
+        err = _check_value(name, p, v)
+        if err:
+            return None, err
+        out[name] = v
+    return out, ""
+
+
+def file_fields(action: dict, validated: dict) -> list[tuple[str, int | None, str, str]]:
+    """The declared file fields a press filled: ``(name, item index or None,
+    field, mode)``, top-level and in a list's items."""
+    props = (action.get("args_schema") or {}).get("properties") or {}
+    out: list[tuple[str, int | None, str, str]] = []
+    for name, v in validated.items():
+        p = props.get(name) or {}
+        if p.get("type") == "array":
+            by_op = {var["properties"]["op"]["const"]: var for var in p["items"]["oneOf"]}
+            for i, item in enumerate(v or []):
+                for fname, f in by_op[item["op"]]["properties"].items():
+                    if f.get(_FILE) and fname in item:
+                        out.append((name, i, fname, f[_FILE]))
+        elif p.get(_FILE):
+            out.append((name, None, name, p[_FILE]))
+    return out
 
 
 def merge_fixed_args(fixed: dict, args: dict) -> dict:
@@ -307,9 +513,43 @@ def merge_fixed_args(fixed: dict, args: dict) -> dict:
     return {**args, **fixed}
 
 
-def validate_actions(actions, agent: str, shared: bool) -> tuple[str | None, str]:
+def _default_floor(entry: dict) -> str | None:
+    """The floor an entry gets when its author named none, or named viewer:
+    the workspace tier (a contributor writes the shared workspace) for a
+    write through the platform (APPS.md "Files") and for a tool button that
+    sends a list of edits ("A list from a button"). The path is still judged
+    by the caller's own role at the file API."""
+    if entry.get("method") == "files.write":
+        return "contributor"
+    if entry.get("type") == "mcp_tool" and has_list(entry):
+        return "contributor"
+    return None
+
+
+def _send_prompt_entry(a: dict, aid: str, label: str) -> tuple[dict | None, str]:
+    """A prompt button's stored entry, or the reason it is refused."""
+    prompt = str(a.get("prompt") or "").strip()
+    if not prompt or len(prompt) > MAX_PROMPT_CHARS:
+        return None, f"action {aid!r}: prompt required (≤{MAX_PROMPT_CHARS} chars)"
+    entry: dict = {"id": aid, "label": label, "type": "send_prompt", "prompt": prompt}
+    # The button always starts a new chat with the agent and takes the person
+    # there. Stored only when asked for, so a manifest without it signs as it
+    # always did.
+    new_chat = a.get("new_chat")
+    if new_chat is not None and not isinstance(new_chat, bool):
+        return None, f"action {aid!r}: new_chat is true or false"
+    if new_chat:
+        entry["new_chat"] = True
+    return entry, ""
+
+
+def validate_actions(actions, agent: str, shared: bool, *,
+                     blueprint_tasks: frozenset[str] | None = None) -> tuple[str | None, str]:
     """Normalize + validate a declared-actions manifest. Returns
-    (canonical_json, "") or (None, reason)."""
+    (canonical_json, "") or (None, reason). ``blueprint_tasks`` is a
+    template's folder check, before its tasks exist: a ``fire_task`` that
+    names a blueprint task by slug skips the task lookup and is judged by
+    the rest of the rules."""
     if actions is None:
         actions = []
     if not isinstance(actions, list):
@@ -337,9 +577,9 @@ def validate_actions(actions, agent: str, shared: bool) -> tuple[str | None, str
         atype = a.get("type")
         if atype == "fire_task":
             task_id = str(a.get("task_id") or "")
-            err = check_task_target(task_id, agent, shared)
+            err = _fire_task_target_error(aid, a, task_id, agent, shared, blueprint_tasks)
             if err:
-                return None, f"action {aid!r}: {err}"
+                return None, err
             entry: dict = {"id": aid, "label": label, "type": "fire_task",
                            "task_id": task_id}
             if a.get("args_schema") is not None:
@@ -358,11 +598,10 @@ def validate_actions(actions, agent: str, shared: bool) -> tuple[str | None, str
                 if names:
                     entry["checks"] = list(dict.fromkeys(names))
         elif atype == "send_prompt":
-            prompt = str(a.get("prompt") or "").strip()
-            if not prompt or len(prompt) > MAX_PROMPT_CHARS:
-                return None, f"action {aid!r}: prompt required (≤{MAX_PROMPT_CHARS} chars)"
-            entry = {"id": aid, "label": label, "type": "send_prompt",
-                     "prompt": prompt}
+            prompt_entry, err = _send_prompt_entry(a, aid, label)
+            if prompt_entry is None:
+                return None, err
+            entry = prompt_entry
         elif atype == "mcp_tool":
             if available_mcps is None:
                 available_mcps = assigned_mcp_keys(agent)
@@ -387,7 +626,7 @@ def validate_actions(actions, agent: str, shared: bool) -> tuple[str | None, str
             entry = {"id": aid, "label": label, "type": "mcp_tool",
                      "mcp": mcp, "tool": tool, "fixed_args": fixed}
             if a.get("args_schema") is not None:
-                schema, err = validate_args_schema(a["args_schema"])
+                schema, err = validate_args_schema(a["args_schema"], tool=True)
                 if err:
                     return None, f"action {aid!r}: {err}"
                 overlap = sorted(set(fixed) & set(cast("dict", schema)["properties"]))  # no err: a schema
@@ -407,12 +646,6 @@ def validate_actions(actions, agent: str, shared: bool) -> tuple[str | None, str
                 return None, (f"action {aid!r}: unknown platform method {method!r} "
                               f"(available: {sorted(ALLOWED_PLATFORM_METHODS)})")
             entry = {"id": aid, "label": label, "type": "platform", "method": method}
-            # A write through the platform carries the workspace tier's floor
-            # (a contributor writes the shared workspace) unless the author
-            # asked for more (APPS.md "Files"); the path is still judged by
-            # the caller's own role at the file API.
-            if method == "files.write" and not min_role:
-                min_role = "contributor"
             # The audience names other people: a person reads it at editor
             # or above whatever the author declared (the app itself reads
             # it unattended), so the card's chip says so.
@@ -425,6 +658,7 @@ def validate_actions(actions, agent: str, shared: bool) -> tuple[str | None, str
                 entry["args_schema"] = schema
         else:
             return None, f"action {aid!r}: unknown type {atype!r}"
+        min_role = min_role or _default_floor(entry)
         if min_role:
             entry["min_role"] = min_role
         out.append(entry)
@@ -447,6 +681,14 @@ def find_action(row: dict, action_id: str) -> dict | None:
         if a.get("id") == action_id:
             return a
     return None
+
+
+def outside_buttons(row: dict) -> list[str]:
+    """The ids of the buttons outside people may press (a tool or a task
+    button floored ``external``): what a shared link's Buttons switch can
+    turn on."""
+    return [str(a.get("id")) for a in parse_actions(row)
+            if a.get("type") in OUTSIDE_FLOOR_ACTION_TYPES and a.get("min_role") == OUTSIDE_FLOOR]
 
 
 def parse_egress(row: dict) -> list[str]:

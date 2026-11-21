@@ -14,6 +14,7 @@ import contextlib
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -250,6 +251,115 @@ class TestCodexSessionThread:
         assert session.thread_id == "thread-fresh" and session.resume_refused is True
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("extra", [
+        {"local_model_provider": {"base_url": "http://127.0.0.1:11434/v1"}},
+        # A compute machine's payload names no provider to write, only that the
+        # session runs on a local model.
+        {"local_model": True},
+    ])
+    async def test_a_resume_of_a_local_session_names_its_provider(self, tmp_agent_dir, sat_config, extra):
+        """Codex 0.168 and later resumes a thread on the provider its rollout
+        saved, whatever ``config.toml`` names, so a chat moved from a hosted
+        model to a local one would run on the old provider. A request that
+        names the local provider is refused on a change by every Codex (probed
+        on 0.166.0 and 0.169.0), and the refusal starts a fresh thread."""
+        resume = await self._resume_request(tmp_agent_dir, sat_config, extra)
+        assert resume["modelProvider"] == "oto_local" and resume["model"] == "gpt-6.1-sol"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("extra", [
+        {},
+        # A payload with a blank address writes no provider: a hosted session.
+        {"local_model_provider": {"base_url": "  "}},
+    ])
+    async def test_a_resume_of_a_hosted_session_names_no_provider(self, tmp_agent_dir, sat_config, extra):
+        """A hosted session gains nothing from a name: Codex refuses a thread
+        born on the local endpoint there as not configured, named or not. And
+        a computer whose own Codex config sets a provider births its threads
+        on that one, which a named ``openai`` would refuse on every resume."""
+        resume = await self._resume_request(tmp_agent_dir, sat_config, extra)
+        assert "modelProvider" not in resume and resume["model"] == "gpt-6.1-sol"
+
+    @staticmethod
+    async def _resume_request(tmp_agent_dir, sat_config, extra: dict) -> dict:
+        """The ``thread/resume`` params a session with ``extra`` in its
+        payload sends for a thread the platform named."""
+        config = {"cwd_relative": "users/alice", "codex_dir_relative": "users/alice/.codex",
+                  "model": "gpt-6.1-sol", "env": {}, "thread_id": "thread-existing", **extra}
+        session = CodexSession("sess-prov", tmp_agent_dir, config, sat_config)
+        calls: list[tuple[str, dict]] = []
+
+        async def fake_request(method, params=None):
+            calls.append((method, params or {}))
+            return {"thread": {"id": (params or {}).get("threadId") or "new-thread"}}
+
+        session._client = AsyncMock()
+        session._client.request = fake_request
+        await session._open_thread()
+        assert session.thread_id == "thread-existing" and session.resume_refused is False
+        return next(p for m, p in calls if m == "thread/resume")
+
+    @pytest.mark.asyncio
+    async def test_a_resume_without_a_model_names_no_provider(self, tmp_agent_dir, sat_config):
+        """With no model named, Codex reads a named provider as a model
+        override and stops restoring the thread's saved model and effort."""
+        config = {"cwd_relative": "users/alice", "codex_dir_relative": "users/alice/.codex",
+                  "env": {}, "thread_id": "thread-existing"}
+        session = CodexSession("sess-nomodel", tmp_agent_dir, config, sat_config)
+        calls: list[tuple[str, dict]] = []
+
+        async def fake_request(method, params=None):
+            calls.append((method, params or {}))
+            return {"thread": {"id": "thread-existing"}}
+
+        session._client = AsyncMock()
+        session._client.request = fake_request
+        await session._open_thread()
+        resume = next(p for m, p in calls if m == "thread/resume")
+        assert "modelProvider" not in resume and "model" not in resume
+
+    @pytest.mark.asyncio
+    async def test_a_new_thread_names_no_provider(self, tmp_agent_dir, sat_config):
+        config = {"cwd_relative": "users/alice", "codex_dir_relative": "users/alice/.codex",
+                  "model": "gpt-6.1-sol", "env": {},
+                  "local_model_provider": {"base_url": "http://127.0.0.1:11434/v1"}}
+        session = CodexSession("sess-newprov", tmp_agent_dir, config, sat_config)
+        calls: list[tuple[str, dict]] = []
+
+        async def fake_request(method, params=None):
+            calls.append((method, params or {}))
+            return {"thread": {"id": "thread-new"}}
+
+        session._client = AsyncMock()
+        session._client.request = fake_request
+        await session._open_thread()
+        assert [m for m, _ in calls] == ["thread/start"]
+        assert "modelProvider" not in calls[0][1]
+
+    @pytest.mark.asyncio
+    async def test_a_resume_refused_for_its_provider_starts_a_new_thread(self, tmp_agent_dir, sat_config):
+        from satellite._vendored.app_server_client import AppServerError
+        config = {"cwd_relative": "users/alice", "codex_dir_relative": "users/alice/.codex",
+                  "model": "qwen3.6-35b-a3b:latest", "env": {}, "thread_id": "thread-hosted",
+                  "local_model_provider": {"base_url": "http://127.0.0.1:11434/v1"}}
+        session = CodexSession("sess-moved", tmp_agent_dir, config, sat_config)
+        calls: list[tuple[str, dict]] = []
+
+        async def fake_request(method, params=None):
+            calls.append((method, params or {}))
+            if method == "thread/resume":
+                raise AppServerError(-32600, "failed to load configuration: Cannot change this thread's "
+                                             "model provider from `openai` to `oto_local` on resume.")
+            return {"thread": {"id": "thread-fresh"}}
+
+        session._client = AsyncMock()
+        session._client.request = fake_request
+        await session._open_thread()
+        assert [m for m, _ in calls] == ["thread/resume", "thread/start"]
+        assert "modelProvider" not in calls[1][1]
+        assert session.thread_id == "thread-fresh" and session.resume_refused is True
+
+    @pytest.mark.asyncio
     async def test_start_opens_new_thread_when_none(self, tmp_agent_dir, codex_config, sat_config):
         session = CodexSession("sess-new", tmp_agent_dir, codex_config, sat_config)
 
@@ -356,6 +466,43 @@ class TestTurnParams:
         assert params["collaborationMode"] == {"mode": word, "settings": {
             "model": "gpt-5.4", "reasoning_effort": "high", "developer_instructions": None}}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["ask", "autoReview"])
+    async def test_a_turns_box_has_no_network_in_any_mode(
+            self, tmp_agent_dir, codex_config, sat_config, mode):
+        """Ask too. The platform's card judges a command before it runs, and
+        Codex calls no hook for text typed into a running terminal: with the
+        network on in the box, a typed command reached a host with nobody
+        asked. Off, a command that needs a host crosses the box, and the
+        crossing raises the platform's card. A mode change moves the next
+        turn's reviewer, never the box's network."""
+        from satellite._vendored.codex_approvals import build_sandbox_policy
+        session = CodexSession("sess-net", tmp_agent_dir, {
+            **codex_config, "permission_mode": mode, "sandbox_mode": "workspace-write"}, sat_config)
+        session.thread_id = "t1"
+        session._cwd = tmp_agent_dir / "users" / "alice"
+        sent: list = []
+
+        async def fake_request(method, params=None):
+            sent.append((method, dict(params or {})))
+            session._main_turn_done.set()
+            return {"turn": {"id": "u1"}}
+
+        session._client = AsyncMock()
+        session._client.request = fake_request
+        await asyncio.wait_for(session._run_turn_locked("hello"), 5)
+        other = "autoReview" if mode == "ask" else "ask"
+        await session.send_control_request(
+            "set_permission_mode", sandbox_mode="workspace-write", permission_mode=other)
+        await asyncio.wait_for(session._run_turn_locked("again"), 5)
+        first, later = [p for m, p in sent if m == "turn/start"]
+        policy = first["sandboxPolicy"]
+        assert policy == build_sandbox_policy("workspace-write", str(session._cwd))
+        assert (policy["type"], policy["networkAccess"], policy["writableRoots"]) == (
+            "workspaceWrite", False, [str(session._cwd)])
+        assert later["sandboxPolicy"]["networkAccess"] is False
+        assert first["approvalsReviewer"] != later["approvalsReviewer"]
+
     def test_an_unpinned_session_plans_with_the_threads_model(
             self, tmp_agent_dir, codex_config, sat_config):
         session = CodexSession("sess-cm2", tmp_agent_dir, {
@@ -366,6 +513,18 @@ class TestTurnParams:
         assert session._collaboration_mode("read-only") == {"mode": "plan", "settings": {
             "model": "gpt-6.1-sol", "reasoning_effort": None, "developer_instructions": None}}
 
+
+    def test_only_the_refusal_words_count_as_a_refused_summary(self):
+        from satellite.sessions.codex_session import _summary_refused
+        refusal = {"message": "unexpected status 400 Bad Request: Your organization must be verified to "
+                              "generate reasoning summaries.", "codexErrorInfo": "badRequest"}
+        assert _summary_refused({"error": refusal})
+        assert _summary_refused({"turn": {"status": "failed", "error": {
+            "message": "400 Bad Request: invalid value for reasoning.summary"}}})
+        assert not _summary_refused({"error": {"message": "usage limit reached",
+                                               "codexErrorInfo": "usageLimitExceeded"}})
+        assert not _summary_refused({"error": {"message": "reasoning.summary is great"}})
+        assert not _summary_refused(None)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("error_first", [True, False])
@@ -487,6 +646,342 @@ class TestRunTurnSerialization:
             mock_client.request.assert_awaited()  # turn/interrupt was issued
         finally:
             session._turn_lock.release()
+
+
+class _Daemon:
+    """A stand-in app-server client: ``turn/start`` answers a turn id,
+    ``turn/interrupt`` does what ``interrupt`` says (``"timeout"``, ``"error"``
+    or ``"ok"``), and a close ends it."""
+
+    def __init__(self, interrupt: str = "ok", turn_id: str = "turn-1"):
+        self.interrupt, self.turn_id = interrupt, turn_id
+        self.proc = None
+        self.notif_queue: asyncio.Queue = asyncio.Queue()
+        self.closed = False
+        self.requests: list[str] = []
+
+    @property
+    def is_alive(self) -> bool:
+        return not self.closed
+
+    async def request(self, method, params=None, *, timeout=None):
+        from satellite._vendored.app_server_client import AppServerError
+        self.requests.append(method)
+        if method == "turn/start":
+            return {"turn": {"id": self.turn_id}}
+        if method == "turn/interrupt" and self.interrupt == "timeout":
+            raise AppServerError(f"codex: turn/interrupt timed out after {timeout}s")
+        if method == "turn/interrupt" and self.interrupt == "error":
+            raise AppServerError("codex: turn/interrupt failed: no active turn")
+        return {}
+
+    async def close(self):
+        self.closed = True
+
+
+async def _until(check, what: str) -> None:
+    for _ in range(200):
+        if check():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(what)
+
+
+class TestAnInterruptThatIsNotAnswered:
+    """A turn waits for the daemon's ``turn/completed`` under the session's
+    turn lock. A daemon that does not take the interrupt (no answer, or an
+    error while the turn stays open) never sends it: the turn kept the lock
+    and every later message waited behind it, a Stop included. The daemon is
+    dropped, the thread kept, and the next turn re-warms with the thread."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("answer", ["timeout", "error"])
+    async def test_the_turn_ends_and_the_next_one_starts(
+            self, tmp_agent_dir, codex_config, sat_config, monkeypatch, answer):
+        from satellite.sessions import codex_session as cs
+        monkeypatch.setattr(cs, "_INTERRUPT_SETTLE_S", 0.05)
+        session = CodexSession("sess-wedge", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "thread-9"
+        wedged = _Daemon(interrupt=answer)
+        session._client = wedged
+        session._forwarder_task = asyncio.create_task(session._run_forwarder())
+        first = asyncio.create_task(session.run_turn("A"))
+        await _until(lambda: session._current_turn_id == "turn-1", "the turn never started")
+        await asyncio.wait_for(session.abort(), 5)
+        await asyncio.wait_for(first, 5)                   # the wait ended: the lock is free
+        assert wedged.closed and not session._turn_lock.locked()
+        assert session.thread_id == "thread-9" and not session._closed
+        # What the turn's end tells the platform: its own interrupt ended it.
+        assert session.take_turn_end() == {"reason": "interrupted"}
+        assert session.take_turn_end() == {}
+        # The next message re-warms the daemon on the same thread and runs.
+        fresh = _Daemon(turn_id="turn-2")
+        started: list[str] = []
+
+        async def _start():
+            started.append(session.thread_id)
+            session._client = fresh
+        with patch.object(session, "start", side_effect=_start):
+            second = asyncio.create_task(session.run_turn("B"))
+            await _until(lambda: session._current_turn_id == "turn-2", "the next turn never started")
+            session._main_turn_done.set()
+            await asyncio.wait_for(second, 5)
+        assert started == ["thread-9"] and fresh.requests == ["turn/start"]
+
+    @pytest.mark.asyncio
+    async def test_two_stops_drop_the_daemon_once_and_the_next_turn_waits(
+            self, tmp_agent_dir, codex_config, sat_config, monkeypatch):
+        """Two Stops while the interrupt goes unanswered both reach the drop.
+        The real client is marked closed at its close's first line and then
+        takes a while to die: the second drop met a closed client, ended the
+        turn's wait at once, and the first drop's end later ended the next
+        turn's wait, with no ``turn/completed``."""
+        from satellite.sessions import codex_session as cs
+        monkeypatch.setattr(cs, "_INTERRUPT_SETTLE_S", 0.05)
+
+        class _SlowDeath(_Daemon):
+            def __init__(self):
+                super().__init__(interrupt="timeout")
+                self.closes, self.dying = 0, asyncio.Event()
+
+            async def close(self):
+                self.closes += 1
+                if self.closed:
+                    return
+                self.closed = True
+                await self.dying.wait()
+
+        session = CodexSession("sess-twice", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "thread-9"
+        wedged = _SlowDeath()
+        session._client = wedged
+        session._forwarder_task = asyncio.create_task(session._run_forwarder())
+        first = asyncio.create_task(session.run_turn("A"))
+        await _until(lambda: session._current_turn_id == "turn-1", "the turn never started")
+        stops = [asyncio.create_task(session.abort())]
+        await asyncio.sleep(0.05)
+        stops.append(asyncio.create_task(session.abort()))
+        await _until(lambda: wedged.closes >= 1, "the daemon was never dropped")
+        await asyncio.sleep(0.2)
+        assert wedged.closes == 1 and not first.done()     # one drop, still dying
+        wedged.dying.set()
+        await asyncio.wait_for(asyncio.gather(first, *stops), 5)
+        fresh = _Daemon(turn_id="turn-2")
+
+        async def _start():
+            session._client = fresh
+        with patch.object(session, "start", side_effect=_start):
+            second = asyncio.create_task(session.run_turn("B"))
+            await _until(lambda: session._current_turn_id == "turn-2", "the next turn never started")
+            await asyncio.sleep(0.2)
+            assert not second.done()                       # it waits for its own end
+            session._main_turn_done.set()
+            await asyncio.wait_for(second, 5)
+
+    @pytest.mark.asyncio
+    async def test_a_stop_whose_turn_was_replaced_drops_nothing(
+            self, tmp_agent_dir, codex_config, sat_config, monkeypatch):
+        """The interrupt's error arrives after its turn ended and the next
+        one started: the daemon answers the next turn, so it stays."""
+        from satellite._vendored.app_server_client import AppServerError
+        from satellite.sessions import codex_session as cs
+        monkeypatch.setattr(cs, "_INTERRUPT_SETTLE_S", 0.05)
+
+        class _LateError(_Daemon):
+            def __init__(self):
+                super().__init__()
+                self.answer = asyncio.Event()
+
+            async def request(self, method, params=None, *, timeout=None):
+                if method == "turn/interrupt":
+                    self.requests.append(method)
+                    await self.answer.wait()
+                    raise AppServerError("codex: turn/interrupt failed: no active turn")
+                return await super().request(method, params, timeout=timeout)
+
+        session = CodexSession("sess-late", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "thread-9"
+        daemon = _LateError()
+        session._client = daemon
+        session._forwarder_task = asyncio.create_task(session._run_forwarder())
+        first = asyncio.create_task(session.run_turn("A"))
+        await _until(lambda: session._current_turn_id == "turn-1", "the turn never started")
+        stop = asyncio.create_task(session.abort())
+        await _until(lambda: "turn/interrupt" in daemon.requests, "no interrupt was sent")
+        daemon.notif_queue.put_nowait(("turn/completed", {"threadId": "thread-9", "turn": {"id": "turn-1"}}))
+        await asyncio.wait_for(first, 5)
+        daemon.turn_id = "turn-2"
+        second = asyncio.create_task(session.run_turn("B"))
+        await _until(lambda: session._current_turn_id == "turn-2", "the next turn never started")
+        daemon.answer.set()
+        await asyncio.wait_for(stop, 5)
+        assert not daemon.closed and not second.done() and session.take_turn_end() == {}
+        daemon.notif_queue.put_nowait(("turn/completed", {"threadId": "thread-9", "turn": {"id": "turn-2"}}))
+        await asyncio.wait_for(second, 5)
+        await session._stop_forwarder()
+
+    @pytest.mark.asyncio
+    async def test_an_error_for_a_turn_that_just_ended_keeps_the_daemon(
+            self, tmp_agent_dir, codex_config, sat_config):
+        """The turn completed while the interrupt was on its way: the daemon
+        answers an error and its ``turn/completed`` ends the wait by itself."""
+        session = CodexSession("sess-race", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "thread-9"
+        daemon = _Daemon(interrupt="error")
+        session._client = daemon
+        session._forwarder_task = asyncio.create_task(session._run_forwarder())
+        turn = asyncio.create_task(session.run_turn("A"))
+        await _until(lambda: session._current_turn_id == "turn-1", "the turn never started")
+        daemon.notif_queue.put_nowait(("turn/completed", {"threadId": "thread-9", "turn": {"id": "turn-1"}}))
+        await asyncio.wait_for(session.abort(), 5)
+        await asyncio.wait_for(turn, 5)
+        assert not daemon.closed and session.take_turn_end() == {}
+        await session._stop_forwarder()
+
+    @pytest.mark.asyncio
+    async def test_an_answered_interrupt_keeps_the_daemon(self, tmp_agent_dir, codex_config, sat_config):
+        session = CodexSession("sess-ok", tmp_agent_dir, codex_config, sat_config)
+        daemon = _Daemon()
+        session._client = daemon
+        session._current_turn_id = "turn-1"
+        await asyncio.wait_for(session.abort(), 5)
+        assert daemon.requests == ["turn/interrupt"] and not daemon.closed
+        assert session.take_turn_end() == {}
+
+
+class _SlowStart(_Daemon):
+    """A daemon whose ``turn/start`` answers when ``answer`` is set, each
+    start with the next turn id."""
+
+    def __init__(self):
+        super().__init__()
+        self.answer = asyncio.Event()
+        self.interrupted: list[str] = []
+        self._n = 0
+
+    async def request(self, method, params=None, *, timeout=None):
+        if method == "turn/start":
+            self.requests.append(method)
+            await self.answer.wait()
+            self._n += 1
+            return {"turn": {"id": f"turn-{self._n}"}}
+        if method == "turn/interrupt":
+            self.interrupted.append(params["turnId"])
+        return await super().request(method, params, timeout=timeout)
+
+
+class TestAStopDuringATurnsStart:
+    """A Stop pressed while the turn is inside its ``turn/start`` has no turn
+    id to interrupt yet. It was dropped, and the turn streamed on until the
+    platform's watchdog killed the session. It waits for the id, a short
+    bounded time, then interrupts."""
+
+    @pytest.mark.asyncio
+    async def test_the_interrupt_waits_for_the_turns_id(self, tmp_agent_dir, codex_config, sat_config):
+        session = CodexSession("sess-d6", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "thread-9"
+        daemon = _SlowStart()
+        session._client = daemon
+        turn = asyncio.create_task(session.run_turn("A"))
+        await _until(lambda: daemon.requests == ["turn/start"], "the turn never asked to start")
+        assert session._current_turn_id is None
+        stop = asyncio.create_task(session.abort())
+        await asyncio.sleep(0.05)
+        assert not stop.done() and daemon.interrupted == []      # no id yet: it waits
+        daemon.answer.set()
+        await asyncio.wait_for(stop, 5)
+        assert daemon.interrupted == ["turn-1"]
+        session._main_turn_done.set()
+        await asyncio.wait_for(turn, 5)
+
+    @pytest.mark.asyncio
+    async def test_the_wait_is_bounded_and_a_stop_with_no_turn_does_nothing(
+            self, tmp_agent_dir, codex_config, sat_config, monkeypatch):
+        from satellite.sessions import codex_session as cs
+        monkeypatch.setattr(cs, "_TURN_ID_WAIT_S", 0.1)
+        session = CodexSession("sess-d6b", tmp_agent_dir, codex_config, sat_config)
+        daemon = _SlowStart()
+        session._client = daemon
+        await asyncio.wait_for(session.abort(), 1)            # no turn at all: at once
+        assert daemon.interrupted == []
+        turn = asyncio.create_task(session.run_turn("A"))
+        await _until(lambda: daemon.requests == ["turn/start"], "the turn never asked to start")
+        await asyncio.wait_for(session.abort(), 2)            # the start never answers: the wait ends
+        assert daemon.interrupted == [] and not daemon.closed
+        turn.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await turn
+
+    @pytest.mark.asyncio
+    async def test_a_turn_started_again_takes_its_stop_on_its_own_id(self, tmp_agent_dir, codex_config, sat_config):
+        """The turn the API refused the summary for runs again under a new
+        id: a Stop in that second start interrupts the new turn, never the
+        one that already ended."""
+        session = CodexSession("sess-d6c", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "thread-9"
+        daemon = _SlowStart()
+        daemon.answer.set()
+        session._client = daemon
+        turn = asyncio.create_task(session.run_turn("A"))
+        await _until(lambda: session._current_turn_id == "turn-1", "the turn never started")
+        daemon.answer.clear()
+        session._summary_retry = True
+        session._main_turn_done.set()                        # the refused turn's end
+        await _until(lambda: daemon.requests == ["turn/start", "turn/start"], "the turn never started again")
+        stop = asyncio.create_task(session.abort())
+        await asyncio.sleep(0.05)
+        assert daemon.interrupted == []
+        daemon.answer.set()
+        await asyncio.wait_for(stop, 5)
+        assert daemon.interrupted == ["turn-2"]
+        session._main_turn_done.set()
+        await asyncio.wait_for(turn, 5)
+
+
+class TestTheDaemonExitsInATurn:
+    """The daemon went while a turn waited for it. The turn's end says the
+    engine exited, with its exit code, and the platform is sent no error of
+    the machine's own making beside it (it read two endings for one turn).
+    Between turns nothing waits: the platform hears the error as before."""
+
+    @pytest.mark.asyncio
+    async def test_the_turns_end_says_exited_with_the_code(self, tmp_agent_dir, codex_config, sat_config):
+        session = CodexSession("sess-exit", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "thread-9"
+        daemon = _Daemon()
+        daemon.proc = SimpleNamespace(returncode=101, pid=1)
+        daemon.last_stderr_line = "thread 'main' panicked at core/src/codex.rs"
+        session._client = daemon
+        forwarded: list[dict] = []
+
+        async def _forward(event):
+            forwarded.append(event)
+        session.set_event_forwarder(_forward)
+        session._forwarder_task = asyncio.create_task(session._run_forwarder())
+        turn = asyncio.create_task(session.run_turn("A"))
+        await _until(lambda: session._current_turn_id == "turn-1", "the turn never started")
+        daemon.notif_queue.put_nowait(("item/completed", {"threadId": "thread-9", "item": {"id": "i1"}}))
+        daemon.notif_queue.put_nowait(("__daemon_exit__", {}))
+        await asyncio.wait_for(turn, 5)
+        assert [e["method"] for e in forwarded] == ["item/completed"]
+        assert session.take_turn_end() == {"reason": "exited", "exit_code": 101,
+                                           "last_line": "thread 'main' panicked at core/src/codex.rs"}
+
+    @pytest.mark.asyncio
+    async def test_between_turns_the_platform_hears_the_error_as_before(
+            self, tmp_agent_dir, codex_config, sat_config):
+        session = CodexSession("sess-exit2", tmp_agent_dir, codex_config, sat_config)
+        daemon = _Daemon()
+        session._client = daemon
+        forwarded: list[dict] = []
+
+        async def _forward(event):
+            forwarded.append(event)
+        session.set_event_forwarder(_forward)
+        daemon.notif_queue.put_nowait(("__daemon_exit__", {}))
+        await asyncio.wait_for(session._run_forwarder(), 5)
+        assert [e["method"] for e in forwarded] == ["error"]
+        assert session.take_turn_end() == {}
 
 
 class TestConnectReportAndRevive:
@@ -649,6 +1144,8 @@ def test_pty_config_toml_puts_codex_worktrees_beside_the_codex_dir():
     )
     cfg = toml_loads(text)
     assert cfg["desktop"]["git-worktree-root"] == "/home/u/.oto-dock/agents/pa/users/u/.codex-worktrees"
+    # Twin of the proxy writer: no model picker near a limit.
+    assert cfg["notice"]["hide_rate_limit_model_nudge"] is True
     # A table, after the trust table and before any MCP section.
     assert text.index("[desktop]") > text.index("[projects.")
     assert cfg["projects"]["/home/u/work"]["trust_level"] == "trusted"
@@ -670,7 +1167,7 @@ _LOCAL_FULL = {
 
 
 def test_local_provider_toml_shapes():
-    from satellite.sessions.codex_session import local_provider_toml
+    from satellite.sessions.codex_files import local_provider_toml
     assert local_provider_toml(None) == ("", "")
     assert local_provider_toml({}) == ("", "")
     assert local_provider_toml({"base_url": "  "}) == ("", "")
@@ -688,7 +1185,7 @@ def test_local_provider_toml_shapes():
 
 
 def test_local_provider_toml_catalog_and_idle_timeout(tmp_path):
-    from satellite.sessions.codex_session import local_provider_toml
+    from satellite.sessions.codex_files import local_provider_toml
     from satellite.tests._toml import toml_loads
     codex_dir = tmp_path / "users" / "alice" / ".codex"
     root, table = local_provider_toml(_LOCAL_FULL, codex_dir)
@@ -711,7 +1208,7 @@ def test_local_provider_toml_catalog_and_idle_timeout(tmp_path):
 
 
 def test_write_or_drop_model_catalog(tmp_path):
-    from satellite.sessions.codex_session import write_or_drop_model_catalog
+    from satellite.sessions.codex_files import write_or_drop_model_catalog
     write_or_drop_model_catalog(tmp_path, _LOCAL_FULL)
     path = tmp_path / "models.json"
     assert path.read_text(encoding="utf-8") == _CATALOG
@@ -959,7 +1456,7 @@ class TestCodexSessionLocalProvider:
 
 
 def test_write_or_drop_auth_json(tmp_path):
-    from satellite.sessions.codex_session import write_or_drop_auth_json
+    from satellite.sessions.codex_files import write_or_drop_auth_json
     write_or_drop_auth_json(tmp_path, {"auth_mode": "chatgpt", "tokens": {}})
     assert json.loads((tmp_path / "auth.json").read_text())["auth_mode"] == "chatgpt"
     if sys.platform != "win32":
@@ -968,6 +1465,12 @@ def test_write_or_drop_auth_json(tmp_path):
     assert not (tmp_path / "auth.json").exists()
     write_or_drop_auth_json(tmp_path, {})  # empty payload value == absent; idempotent
     assert not (tmp_path / "auth.json").exists()
+    # An OpenAI key's file (2.0) is written as given, as a login's is.
+    key_file = {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-stand-in"}
+    write_or_drop_auth_json(tmp_path, key_file)
+    assert json.loads((tmp_path / "auth.json").read_text()) == key_file
+    if sys.platform != "win32":
+        assert (tmp_path / "auth.json").stat().st_mode & 0o777 == 0o600
 
 
 class TestHooksFloor:
@@ -1165,7 +1668,7 @@ class TestHooksFloor:
 
 
 def test_features_table_shapes():
-    from satellite.sessions.codex_session import features_table
+    from satellite.sessions.codex_files import features_table
     mcp = '[mcp_servers.task-mcp]\ncommand = "python3"'
     prepended = "[features]\ndefault_mode_request_user_input = true\n# note\n\n" + mcp
 
@@ -1225,6 +1728,172 @@ class TestRetriedErrorKeepsTheTurn:
             await task
         assert forwarded and forwarded[0]["method"] == "error"
         assert session._main_turn_done.is_set() is ends
+
+
+class _Notifications:
+    """The part of the app-server client the forwarder reads."""
+
+    def __init__(self):
+        self.notif_queue: asyncio.Queue = asyncio.Queue()
+
+
+class TestSubAgentThreadNeverEndsTheMainTurn:
+    """A sub-agent runs on its own thread and emits its own ``turn/completed``
+    (and possibly a final ``error``) while the main turn runs: both are
+    forwarded and neither releases the main turn, which ends on the main
+    thread's own."""
+
+    @pytest.mark.asyncio
+    async def test_only_the_main_threads_end_releases_the_turn(
+            self, tmp_agent_dir, codex_config, sat_config):
+        session = CodexSession("sess-sub", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "t-main"
+        released: list = []
+
+        async def forward(event):
+            released.append((event["method"], event["params"].get("threadId"),
+                             session._main_turn_done.is_set()))
+
+        session._forward_event = forward
+        session._client = _Notifications()
+        q = session._client.notif_queue
+        q.put_nowait(("error", {"threadId": "t-sub", "willRetry": False,
+                                "error": {"message": "sub boom"}}))
+        q.put_nowait(("turn/completed", {"threadId": "t-sub", "turn": {"status": "completed"}}))
+        q.put_nowait(("item/completed", {"threadId": "t-main", "item": {
+            "type": "agentMessage", "id": "m1", "text": "The sub-agent returned."}}))
+        q.put_nowait(("turn/completed", {"threadId": "t-main", "turn": {"status": "completed"}}))
+        task = asyncio.create_task(session._run_forwarder())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        # Each event as it left for the platform, with the turn still held
+        # through the sub-agent's end and the main agent's message after it.
+        assert released == [
+            ("error", "t-sub", False), ("turn/completed", "t-sub", False),
+            ("item/completed", "t-main", False), ("turn/completed", "t-main", False)]
+        assert session._main_turn_done.is_set()
+
+
+class _PipedDaemon:
+    """The part of a process the app-server client touches: a stdout the
+    test feeds, a stdin that answers ``initialize`` and keeps every line."""
+
+    def __init__(self):
+        self.pid = 4242
+        self.returncode = None
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_eof()
+        self.written: list[dict] = []
+        daemon = self
+
+        class _In:
+            def write(self, data):
+                msg = json.loads(data)
+                daemon.written.append(msg)
+                if msg.get("method") == "initialize":
+                    daemon.say({"id": msg["id"], "result": {}})
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+        self.stdin = _In()
+
+    def say(self, *messages: dict) -> None:
+        """Write the messages as ONE stdout chunk."""
+        self.stdout.feed_data(b"".join(
+            (json.dumps({"jsonrpc": "2.0", **m}) + "\n").encode() for m in messages))
+
+    async def wait(self):
+        return self.returncode
+
+
+class TestPatchPathsBeforeApproval:
+    """A patch's lean approval (``item/fileChange/requestApproval``, the item
+    id alone) names its files from the ``item/started`` before it. The
+    approval is answered in its own task, so the paths are recorded where
+    the notification is first read, or the decision sees a pathless Write."""
+
+    _STARTED = {"type": "fileChange", "id": "fc1", "changes": [{"path": "/users/a/x.py"}]}
+
+    @pytest.mark.asyncio
+    async def test_the_forwarder_records_a_patchs_paths_before_the_event_leaves(
+            self, tmp_agent_dir, codex_config, sat_config):
+        session = CodexSession("sess-fc", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "T"
+        known_at_forward: list = []
+
+        async def forward(event):
+            known_at_forward.append(sorted(session._item_paths))
+
+        session._forward_event = forward
+        session._client = _Notifications()
+        q = session._client.notif_queue
+        q.put_nowait(("item/started", {"threadId": "T", "item": self._STARTED}))
+        # A sub-agent's patch asks through the same bridge.
+        q.put_nowait(("item/started", {"threadId": "SUB", "item": {
+            "type": "fileChange", "id": "fc2", "changes": [{"path": "/users/a/y.py"}]}}))
+        q.put_nowait(("__daemon_exit__", {}))
+        await asyncio.wait_for(session._run_forwarder(), timeout=5)
+        assert session._item_paths == {"fc1": ["/users/a/x.py"], "fc2": ["/users/a/y.py"]}
+        assert known_at_forward[:2] == [["fc1"], ["fc1", "fc2"]]
+
+    @pytest.mark.asyncio
+    async def test_an_approval_in_the_same_chunk_as_its_item_names_the_file(
+            self, tmp_agent_dir, codex_config, sat_config, monkeypatch):
+        """The daemon's client, its reader and the session's bridge as a
+        start wires them, over a daemon that writes the item and its
+        approval in one chunk."""
+        from satellite.sessions import codex_session as codex_session_mod
+        daemon = _PipedDaemon()
+
+        async def _spawn(argv, *, cwd, env, limit):
+            return daemon
+
+        real_client = codex_session_mod.AppServerClient
+        monkeypatch.setattr(codex_session_mod, "AppServerClient",
+                            lambda **kw: real_client(**kw, spawn=_spawn))
+        session = CodexSession("sess-fc2", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "T"
+        session._cwd = tmp_agent_dir
+        asked: list = []
+
+        async def decide(tool_name, tool_input):
+            asked.append((tool_name, dict(tool_input)))
+            return {"decision": "deny"}
+
+        session._decide_permission_remote = decide
+        forwarder = None
+        try:
+            await session._connect_with_retry({}, codex_bin="codex")
+            forwarder = asyncio.create_task(session._run_forwarder())
+            await asyncio.sleep(0)
+            daemon.say(
+                {"method": "item/started", "params": {"threadId": "T", "item": self._STARTED}},
+                {"id": 7, "method": "item/fileChange/requestApproval",
+                 "params": {"threadId": "T", "itemId": "fc1"}})
+            for _ in range(200):
+                if any(m.get("id") == 7 for m in daemon.written):
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            if forwarder is not None:
+                forwarder.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await forwarder
+            daemon.returncode = 0  # exited: the client's close signals no process group
+            if session._client is not None:
+                await session._client.close()
+        assert [(name, tool_input["file_path"]) for name, tool_input in asked] == [
+            ("Write", "/users/a/x.py")]
+        answer = next(m for m in daemon.written if m.get("id") == 7)
+        assert answer["result"] == {"decision": "decline"}
 
 
 class TestBridgeHold:
@@ -1363,3 +2032,435 @@ class TestBridgeHold:
             assert await session._ask_question_remote([{"id": "q"}]) == {"q": {"answers": ["yes"]}}
         finally:
             await server.close()
+
+
+class TestSessionText:
+    """The platform gives a session its text as its own (``codex_session_text``):
+    no AGENTS.md every session of the home reads, the text on the thread, the
+    SessionStart hook for a resumed thread. Without the flag (an older
+    platform) the session starts as before."""
+
+    @staticmethod
+    async def _start(tmp_agent_dir, config, sat_config, sid="sess-st"):
+        session = CodexSession(sid, tmp_agent_dir, config, sat_config)
+        calls: list[tuple[str, dict]] = []
+        mock_client = AsyncMock()
+        mock_client.proc = None
+
+        async def fake_request(method, params=None):
+            calls.append((method, params or {}))
+            return {"thread": {"id": "thread-1"}}
+
+        mock_client.request = fake_request
+        c1, c2, c3 = _patch_daemon(session, mock_client)
+        with c1, c2, c3:
+            await session.start()
+        return session, calls
+
+    @pytest.mark.asyncio
+    async def test_the_text_is_the_sessions_own(self, tmp_agent_dir, codex_config, sat_config):
+        codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "AGENTS.md").write_text("an earlier session's text")
+        config = {**codex_config, "codex_session_text": True, "codex_attended_floor": True}
+        session, calls = await self._start(tmp_agent_dir, config, sat_config)
+        assert not (codex_dir / "AGENTS.md").exists()
+        own = json.loads((codex_dir / "sess-st.session.json").read_text())
+        assert own["developer_instructions"] == "# Test Agent\nYou are a test agent."
+        start = next(p for m, p in calls if m == "thread/start")
+        assert start["developerInstructions"] == own["developer_instructions"]
+        hooks = json.loads((codex_dir / "hooks.json").read_text())["hooks"]
+        entry = hooks["SessionStart"][0]["hooks"][0]
+        assert "session_text.py" in entry["command"] and entry["additionalContextLimit"] == 0
+        await session.close()
+        assert not (codex_dir / "sess-st.session.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_an_older_platform_gets_agents_md(self, tmp_agent_dir, codex_config, sat_config):
+        session, calls = await self._start(tmp_agent_dir, codex_config, sat_config)
+        codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
+        assert "Test Agent" in (codex_dir / "AGENTS.md").read_text()
+        start = next(p for m, p in calls if m == "thread/start")
+        assert "developerInstructions" not in start
+        assert "SessionStart" not in json.loads((codex_dir / "hooks.json").read_text())["hooks"]
+        await session.close()
+
+    def test_a_compute_thread_carries_the_platforms_files(self, tmp_agent_dir, codex_config, sat_config):
+        session = CodexSession("sess-c", tmp_agent_dir, {**codex_config, "codex_attended_floor": True},
+                               sat_config)
+        session._compute = True
+        session._developer_instructions = "INSTR-A"
+        session._session_config = {"mcp_servers": {"echo": {"command": "python3"}}}
+        overrides = session._thread_overrides()
+        assert overrides["developerInstructions"] == "INSTR-A"
+        assert overrides["config"] == {"mcp_servers": {"echo": {"command": "python3"}},
+                                       "bypass_hook_trust": True}
+
+
+class _Stop(Exception):
+    """Ends a compute start right after it read the session's files."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag,present", [(True, True), (True, False), (False, False)])
+async def test_a_compute_start_reads_its_own_file_only_under_the_flag(
+        tmp_agent_dir, codex_config, sat_config, flag, present):
+    """The platform's flag says it wrote the session's own file and no
+    AGENTS.md: the machine reads the file then, and a missing one refuses the
+    start (no text, no tools otherwise). Without the flag nothing is read or
+    removed."""
+    from satellite._vendored import session_text
+    from satellite.sessions import codex_session as cs
+    rel = "users/alice/.codex"
+    codex_dir = tmp_agent_dir / rel
+    codex_dir.mkdir(parents=True)
+    (codex_dir / "AGENTS.md").write_text("the platform's text")
+    if present:
+        session_text.write_session_files(codex_dir, "sess-c", text="INSTR-A", config={"a": 1},
+                                         writer=config.write_if_changed)
+    cfg = {**codex_config, "codex_dir_relative": rel, **({"codex_session_text": True} if flag else {})}
+    session = CodexSession("sess-c", tmp_agent_dir, cfg, sat_config)
+    with patch.object(cs.sandbox_host, "ready_own_copy", new=AsyncMock(return_value=False)), \
+            patch.object(cs.sandbox_host, "spawn_env", side_effect=_Stop), \
+            pytest.raises(RuntimeError if flag and not present else _Stop):
+        await session._start_compute()
+    assert (codex_dir / "AGENTS.md").exists() is not flag
+    assert session._developer_instructions == ("INSTR-A" if present else "")
+    assert session._session_config == ({"a": 1} if present else {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag,present", [(True, True), (True, False), (False, False)])
+async def test_a_compute_terminal_needs_its_profile_under_the_flag(
+        tmp_agent_dir, codex_config, sat_config, flag, present):
+    from satellite._vendored import session_text
+    from satellite.terminal.codex_pty_session import CodexPtySession
+    rel = "users/alice/.codex"
+    codex_dir = tmp_agent_dir / rel
+    codex_dir.mkdir(parents=True)
+    (codex_dir / "AGENTS.md").write_text("the platform's text")
+    if present:
+        session_text.write_session_files(codex_dir, "sess-t", text="INSTR-A", config={}, profile="",
+                                         writer=config.write_if_changed)
+    cfg = {**codex_config, "codex_dir_relative": rel, **({"codex_session_text": True} if flag else {})}
+    session = CodexPtySession("sess-t", tmp_agent_dir, cfg, sat_config, ws=None)
+    with patch("satellite.sessions.sandbox_host.ready_own_copy", new=AsyncMock(return_value=False)), \
+            patch.object(session, "_apply_resume_guard", side_effect=_Stop), \
+            pytest.raises(RuntimeError if flag and not present else _Stop):
+        await session._start_compute()
+    assert (codex_dir / "AGENTS.md").exists() is not flag
+
+class TestTerminalSessionText:
+    """A paired computer's Codex terminal names its own profile when the
+    platform gives the session its own text, and writes AGENTS.md otherwise."""
+
+    @staticmethod
+    async def _argv(tmp_agent_dir, config, sat_config):
+        from satellite.terminal.codex_pty_session import CodexPtySession
+        session = CodexPtySession("sess-term", tmp_agent_dir, config, sat_config, ws=None)
+        seen: dict = {}
+
+        async def _spawn(cmd, env, cwd):
+            seen["cmd"] = cmd
+
+        async def _files():
+            return {}
+
+        with patch.object(session, "_wire_and_spawn", new=_spawn), \
+                patch.object(session, "_session_agent_env", new=_files):
+            await session.start()
+        return seen["cmd"]
+
+    @pytest.mark.asyncio
+    async def test_the_terminal_names_its_profile(self, tmp_agent_dir, codex_config, sat_config):
+        cmd = await self._argv(tmp_agent_dir, {**codex_config, "codex_session_text": True}, sat_config)
+        assert cmd[cmd.index("-p") + 1] == "sess-term"
+        codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
+        profile = (codex_dir / "sess-term.config.toml").read_text()
+        assert profile.startswith('developer_instructions = "# Test Agent')
+        assert not (codex_dir / "AGENTS.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_an_older_platforms_terminal_reads_agents_md(self, tmp_agent_dir, codex_config, sat_config):
+        cmd = await self._argv(tmp_agent_dir, codex_config, sat_config)
+        assert "-p" not in cmd
+        assert (tmp_agent_dir / "users" / "alice" / ".codex" / "AGENTS.md").exists()
+
+
+def test_the_codex_start_hooks_carry_the_text_and_the_starts_data(tmp_path):
+    """The thread's text and the start's riding part, one SessionStart group,
+    neither trimmed (``additionalContextLimit`` 0)."""
+    from satellite.sessions.codex_session import _write_codex_hooks
+    _write_codex_hooks(tmp_path, session_text_hook=True, start_context=True)
+    group = json.loads((tmp_path / "hooks.json").read_text())["hooks"]["SessionStart"]
+    hooks = group[0]["hooks"]
+    assert len(group) == 1 and [("session_text.py" in h["command"], "start_context.py" in h["command"])
+                                for h in hooks] == [(True, False), (False, True)]
+    assert all(h["additionalContextLimit"] == 0 for h in hooks)
+    _write_codex_hooks(tmp_path)
+    assert "SessionStart" not in json.loads((tmp_path / "hooks.json").read_text())["hooks"]
+
+
+# ---------------------------------------------------------------------------
+# a Codex session in a home of its own
+# ---------------------------------------------------------------------------
+
+_HOME_SPEC = {"links": ["sessions", "skills", "prompts", "thread-writer-locks", "rules", "archived_sessions"],
+              "own_files": ["auth.json", "config.toml", "hooks.json", "models.json"],
+              "seed": {"installation_id": []}}
+_SID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+_LEFTOVERS = ("config.toml", "hooks.json", "auth.json", "models.json")
+
+
+def _store_with_leftovers(agent_dir):
+    store = agent_dir / "users" / "alice" / ".codex"
+    store.mkdir(parents=True)
+    for name in _LEFTOVERS:
+        (store / name).write_text("left by an earlier version")
+    return store
+
+
+class TestCodexSessionHome:
+    """A paired computer runs a Codex session from its home when the start asks:
+    its settings, hooks, model catalog, text and sign-in there, the hook
+    scripts and the rollouts the store's, the databases in the store."""
+
+    @pytest.mark.asyncio
+    async def test_the_app_server_runs_from_its_home(self, tmp_agent_dir, codex_config, sat_config):
+        store = _store_with_leftovers(tmp_agent_dir)
+        cfg = {**codex_config, "session_home": _HOME_SPEC, "codex_session_text": True,
+               "hook_scripts": {"permission_gate.py": "print(1)\n"},
+               "auth_json": {"auth_mode": "chatgpt", "tokens": {"access_token": "at"}},
+               "local_model_provider": {"base_url": "http://127.0.0.1:11434/v1",
+                                        "catalog_json": '{"models": []}'}}
+        session = CodexSession(_SID, tmp_agent_dir, cfg, sat_config)
+        seen: dict = {}
+
+        async def _connect(env):
+            seen.update(env)
+            session._client = _thread_client()
+        home = store / "own" / _SID
+        with patch.object(session, "_connect_with_retry", new=AsyncMock(side_effect=_connect)), \
+                patch.object(session, "_warm_mcps", new=AsyncMock()), \
+                patch.object(session, "_run_forwarder", new=AsyncMock()):
+            await session.start()
+            assert session._engine_dir == home and session._codex_dir == store
+            assert seen["CODEX_HOME"] == str(home) and seen["CODEX_SQLITE_HOME"] == str(store)
+            assert seen["OTO_HOOKS_DIR"] == str(store)
+            for name in (*_LEFTOVERS, f"{_SID}.session.json"):
+                assert (home / name).is_file(), name
+                assert not (store / name).exists(), name
+            assert (store / "permission_gate.py").is_file()
+            assert str(store / "permission_gate.py") in (home / "hooks.json").read_text()
+            assert str(home / "models.json") in (home / "config.toml").read_text()
+            assert json.loads((home / "auth.json").read_text())["tokens"]["access_token"] == "at"
+            for link in _HOME_SPEC["links"]:
+                assert (home / link).is_symlink(), link
+            await session.close()
+        assert not home.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_close_whose_first_step_raises_still_removes_the_home(self, tmp_agent_dir, codex_config,
+                                                                           sat_config):
+        """Whatever a close's earlier step raises, the home with the sign-in
+        goes: nothing else removes it while the satellite runs."""
+        store = _store_with_leftovers(tmp_agent_dir)
+        cfg = {**codex_config, "session_home": _HOME_SPEC, "codex_session_text": True,
+               "auth_json": {"auth_mode": "chatgpt", "tokens": {"access_token": "at"}}}
+        session = CodexSession(_SID, tmp_agent_dir, cfg, sat_config)
+
+        async def _connect(env):
+            session._client = _thread_client()
+        home = store / "own" / _SID
+        with patch.object(session, "_connect_with_retry", new=AsyncMock(side_effect=_connect)), \
+                patch.object(session, "_warm_mcps", new=AsyncMock()), \
+                patch.object(session, "_run_forwarder", new=AsyncMock()):
+            await session.start()
+            assert (home / "auth.json").is_file()
+            with patch.object(session, "_stop_forwarder", new=AsyncMock(side_effect=RuntimeError("stuck"))), \
+                    pytest.raises(RuntimeError):
+                await session.close()
+        assert not home.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_terminals_close_that_raises_still_removes_the_home(self, tmp_agent_dir, codex_config,
+                                                                         sat_config, monkeypatch):
+        from satellite.sessions import ssh_agent
+        from satellite.terminal.codex_pty_session import CodexPtySession
+        store = _store_with_leftovers(tmp_agent_dir)
+        cfg = {**codex_config, "session_home": _HOME_SPEC, "codex_session_text": True,
+               "auth_json": {"auth_mode": "chatgpt", "tokens": {"access_token": "at"}}}
+        session = CodexPtySession(_SID, tmp_agent_dir, cfg, sat_config, ws=None)
+
+        async def _spawn(cmd, env, cwd):
+            return None
+
+        async def _files():
+            return {}
+        with patch.object(session, "_wire_and_spawn", new=_spawn), \
+                patch.object(session, "_session_agent_env", new=_files):
+            await session.start()
+        home = store / "own" / _SID
+        assert (home / "auth.json").is_file()
+
+        def _stuck(_sid):
+            raise RuntimeError("stuck")
+        monkeypatch.setattr(ssh_agent, "stop", _stuck)
+        with pytest.raises(RuntimeError):
+            await session.close()
+        assert not home.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_session_with_no_home_keeps_the_store(self, tmp_agent_dir, codex_config, sat_config):
+        """A start that asks no home (an older platform) runs from the store as before."""
+        store = _store_with_leftovers(tmp_agent_dir)
+        session = CodexSession(_SID, tmp_agent_dir, {**codex_config, "codex_session_text": True}, sat_config)
+        seen: dict = {}
+
+        async def _connect(env):
+            seen.update(env)
+            session._client = _thread_client()
+        with patch.object(session, "_connect_with_retry", new=AsyncMock(side_effect=_connect)), \
+                patch.object(session, "_warm_mcps", new=AsyncMock()), \
+                patch.object(session, "_run_forwarder", new=AsyncMock()):
+            await session.start()
+            await session.close()
+        assert seen["CODEX_HOME"] == str(store) and "CODEX_SQLITE_HOME" not in seen
+        assert session._engine_dir == store
+        assert (store / "config.toml").read_text() != "left by an earlier version"
+        assert not (store / "own").exists()
+
+    @pytest.mark.asyncio
+    async def test_the_terminal_runs_from_its_home(self, tmp_agent_dir, codex_config, sat_config):
+        from satellite.terminal.codex_pty_session import CodexPtySession
+        store = _store_with_leftovers(tmp_agent_dir)
+        cfg = {**codex_config, "session_home": _HOME_SPEC, "codex_session_text": True,
+               "auth_json": {"auth_mode": "chatgpt", "tokens": {"access_token": "at"}}}
+        session = CodexPtySession(_SID, tmp_agent_dir, cfg, sat_config, ws=None)
+        seen: dict = {}
+
+        async def _spawn(cmd, env, cwd):
+            seen["cmd"], seen["env"] = cmd, env
+
+        async def _files():
+            return {}
+        with patch.object(session, "_wire_and_spawn", new=_spawn), \
+                patch.object(session, "_session_agent_env", new=_files):
+            await session.start()
+        home = store / "own" / _SID
+        assert session._engine_dir == home
+        assert seen["env"]["CODEX_HOME"] == str(home) and seen["env"]["CODEX_SQLITE_HOME"] == str(store)
+        assert seen["env"]["OTO_HOOKS_DIR"] == str(store)
+        assert seen["cmd"][seen["cmd"].index("-p") + 1] == _SID
+        for name in ("config.toml", "hooks.json", "auth.json", f"{_SID}.config.toml"):
+            assert (home / name).is_file(), name
+            assert not (store / name).exists(), name
+        # The worktrees stay beside the store, never in a home.
+        assert str(store.parent / ".codex-worktrees") in (home / "config.toml").read_text()
+        await session.close()
+        assert not home.exists()
+
+
+class _HomeStop(Exception):
+    """Ends a compute start right after it read the session's files."""
+
+
+@pytest.mark.asyncio
+async def test_a_compute_session_reads_its_text_in_its_home(tmp_agent_dir, codex_config, sat_config):
+    from satellite._vendored import session_text
+    from satellite.sessions import codex_session as cs
+    rel = "users/alice/.codex"
+    home = tmp_agent_dir / rel / "own" / _SID
+    home.mkdir(parents=True)
+    session_text.write_session_files(home, _SID, text="INSTR-H", config={"h": 1}, writer=config.write_if_changed)
+    cfg = {**codex_config, "codex_dir_relative": rel, "codex_session_text": True, "session_home": _HOME_SPEC}
+    session = CodexSession(_SID, tmp_agent_dir, cfg, sat_config)
+    with patch.object(cs.sandbox_host, "ready_own_copy", new=AsyncMock(return_value=False)), \
+            patch.object(cs.sandbox_host, "spawn_env", side_effect=_HomeStop), \
+            pytest.raises(_HomeStop):
+        await session._start_compute()
+    assert session._developer_instructions == "INSTR-H" and session._session_config == {"h": 1}
+    assert session._engine_dir == home
+
+
+@pytest.mark.asyncio
+async def test_a_compute_terminal_finds_its_profile_in_its_home(tmp_agent_dir, codex_config, sat_config):
+    from satellite._vendored import session_text
+    from satellite.terminal.codex_pty_session import CodexPtySession
+    rel = "users/alice/.codex"
+    home = tmp_agent_dir / rel / "own" / _SID
+    home.mkdir(parents=True)
+    session_text.write_session_files(home, _SID, text="INSTR-H", config={}, profile="",
+                                     writer=config.write_if_changed)
+    cfg = {**codex_config, "codex_dir_relative": rel, "codex_session_text": True, "session_home": _HOME_SPEC}
+    session = CodexPtySession(_SID, tmp_agent_dir, cfg, sat_config, ws=None)
+    with patch("satellite.sessions.sandbox_host.ready_own_copy", new=AsyncMock(return_value=False)), \
+            patch.object(session, "_apply_resume_guard", side_effect=_HomeStop), \
+            pytest.raises(_HomeStop):
+        await session._start_compute()
+    assert session._engine_dir == home
+
+
+# ---------------------------------------------------------------------------
+# the store's databases: no start deletes what another session reads
+# ---------------------------------------------------------------------------
+
+_DATABASES = ("state_5.sqlite", "state_5.sqlite-wal", "logs_2.sqlite", "goals_1.sqlite")
+
+
+def _store_with_databases(agent_dir):
+    store = agent_dir / "users" / "alice" / ".codex"
+    store.mkdir(parents=True, exist_ok=True)
+    for name in _DATABASES:
+        (store / name).write_bytes(b"another session's")
+    return store
+
+
+@pytest.mark.asyncio
+async def test_a_terminals_start_leaves_the_stores_databases(tmp_agent_dir, codex_config, sat_config):
+    """Codex 0.169 opens the databases another version wrote and rebuilds a
+    damaged one itself; the store's are every session's (CODEX_SQLITE_HOME)."""
+    from satellite.terminal.codex_pty_session import CodexPtySession
+    store = _store_with_databases(tmp_agent_dir)
+    session = CodexPtySession(_SID, tmp_agent_dir, {**codex_config, "session_home": _HOME_SPEC}, sat_config, ws=None)
+
+    async def _spawn(cmd, env, cwd):
+        return None
+
+    async def _files():
+        return {}
+    with patch.object(session, "_wire_and_spawn", new=_spawn), \
+            patch.object(session, "_session_agent_env", new=_files):
+        await session.start()
+    for name in _DATABASES:
+        assert (store / name).read_bytes() == b"another session's", name
+
+
+@pytest.mark.asyncio
+async def test_a_retried_app_server_start_leaves_the_stores_databases(tmp_agent_dir, codex_config, sat_config):
+    from satellite.sessions import codex_session as cs
+    store = _store_with_databases(tmp_agent_dir)
+    session = CodexSession(_SID, tmp_agent_dir, codex_config, sat_config)
+    session._codex_dir = store
+    session._cwd = tmp_agent_dir
+    tries: list[int] = []
+
+    class _Client:
+        def __init__(self, **_k):
+            self.proc = None
+
+        def set_server_request_handler(self, _h):
+            return None
+
+        async def start(self, _params):
+            tries.append(1)
+            if len(tries) == 1:
+                raise cs.AppServerError("the first start failed")
+
+        async def close(self):
+            return None
+    with patch.object(cs, "AppServerClient", _Client):
+        await session._connect_with_retry({})
+    assert len(tries) == 2
+    for name in _DATABASES:
+        assert (store / name).read_bytes() == b"another session's", name

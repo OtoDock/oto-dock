@@ -1,12 +1,13 @@
-"""The proxy's half of the ``session_move`` frame: the gate on the
-capability and the version, a push that names its scope (never a path), a
-pull that asks for a session file, and the answers only the asked machine
-may give; the ``chat_moved`` broadcast's audience."""
+"""The proxy's half of the ``session_move`` frame: a push that names its
+scope (never a path), a pull that asks for a session file, the answers only
+the asked machine may give, and the ``chat_moved`` broadcast's audience."""
 
 import asyncio
 import base64
 import hashlib
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +15,7 @@ from core.remote.satellite_connection import (
     SatelliteConnection,
     SatelliteConnectionManager,
 )
+from services.infra import safe_fs
 from services.path_policy_v2 import PathRef
 
 pytestmark = pytest.mark.asyncio
@@ -54,22 +56,6 @@ async def _sent(wire, n=1):
     raise AssertionError("nothing sent")
 
 
-async def test_the_gate_takes_the_flag_and_the_version():
-    mgr, conn, _ = _mgr()
-    assert mgr.satellite_supports_session_move("m1")
-    conn.capabilities = {}
-    assert not mgr.satellite_supports_session_move("m1")
-    conn.capabilities = {"session_move": True}
-    conn.satellite_version = "0.5.155"
-    assert not mgr.satellite_supports_session_move("m1")
-    # 0.5.156 flags the capability but resumes a carried Codex thread in the
-    # folder its rollout recorded: its moves continue from a summary.
-    conn.satellite_version = "0.5.156"
-    assert not mgr.satellite_supports_session_move("m1")
-    assert not mgr.satellite_supports_session_move("m-unknown")
-    conn.writer_task.cancel()
-
-
 async def test_a_push_carries_the_scope_and_the_chunk_fields(tmp_path):
     mgr, conn, wire = _mgr()
     src = tmp_path / "t.jsonl"
@@ -78,7 +64,9 @@ async def test_a_push_carries_the_scope_and_the_chunk_fields(tmp_path):
     digest = "sha256:" + hashlib.sha256(data).hexdigest()
     fields = {"type": "session_move", "op": "push", "engine": "e", "agent_slug": "a",
               "username": "u", "refs": ["r"], "rel": ".claude/projects/k/r.jsonl", "move_id": "m"}
-    task = asyncio.create_task(mgr.push_file("m1", PathRef(kind="agent_tree", value="x"), src,
+    held = os.open(src, os.O_RDONLY)
+    task = asyncio.create_task(mgr.push_file("m1", PathRef(kind="agent_tree", value="x"),
+                                             Path(safe_fs.fd_path(held)),
                                              agent_slug="a", content_hash=digest,
                                              frame_fields=fields))
     frame = await _sent(wire)
@@ -87,6 +75,7 @@ async def test_a_push_carries_the_scope_and_the_chunk_fields(tmp_path):
     assert base64.b64decode(frame["content_b64"]) == data
     await mgr.handle_message("m1", {"type": "ack", "command_id": frame["command_id"], "status": "ok"})
     assert await task
+    os.close(held)
     conn.writer_task.cancel()
 
 

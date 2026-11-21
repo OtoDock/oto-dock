@@ -38,18 +38,39 @@ from auth.request_path import has_traversal
 logger = logging.getLogger("otodock.satellite-tunnel")
 
 
+# What an app server may reach through its machine's app listener, on a
+# compute machine's link alone (frames marked ``via: "app"``): a byte twin of
+# the satellite's list. No hook, no Docker tool, nothing a session's token opens.
+_APP_ALLOWLIST_REGEXES = [
+    re.compile(r"^/v1/apps/[0-9a-f-]{36}/(api|platform|push|state|egress|events|bindings)(/.*)?$"),
+    re.compile(r"^/v1/apps/[0-9a-f-]{36}/actions/[A-Za-z0-9_-]{1,64}$"),
+]
+_APP_ID_RE = re.compile(r"^/v1/apps/([0-9a-f-]{36})/")
+#: One app's concurrent calls on one machine: an app cannot take another's room.
+_MAX_APP_STREAMS_PER_APP = 32
+
 # Allowlist mirrored from satellite/http_tunnel.py. Both sides must agree.
 _ALLOWLIST_REGEXES = [
     re.compile(
         r"^/v1/hooks/(resolve-path|resolve-tool-arg-paths|permission|"
         # The command-line credential (git and gh, satellite 0.5.139).
-        r"mcp-credentials|session-files|cli-credential|"
+        r"mcp-credentials|cli-credential|"
+        # A tool's saved answers and its start, on its fetch token (0.5.176).
+        r"tool-listing|tool-start|"
+        # The session's SSH agent socket, forwarded by the satellite (0.5.173).
+        r"ssh-agent|"
         r"images|image-generating|image-gen-failed|url|file|media|ui|"
         r"document-preview|tool-result|file-written|subagent|"
         # The Stop hook (turn end, both engines) and the Codex question
         # bridge (request_user_input → the dashboard card); satellite 0.5.121
         # admits the same two.
-        r"stop|codex-question)$"
+        r"stop|codex-question|"
+        # A terminal's status line report (hooks/usage_report.py); an older
+        # satellite writes no status line and admits none.
+        r"usage-report|"
+        # A terminal's start hook (the start's riding part); a satellite that
+        # reports start_context_hook admits it.
+        r"start-context)$"
     ),
     # display-mcp pinned apps (pin/unpin/list) and the live-apps hooks
     # (push/state/open, APPS.md "Live apps") — session-JWT gated
@@ -124,8 +145,25 @@ _ALLOWLIST_REGEXES = [
     # the routes judge the session's role proxy-side.
     re.compile(r"^/v1/community/(agents|departments)$"),
     re.compile(r"^/v1/departments$"),
+    # The platform's own tools on a machine (satellite 0.5.172): the agent's
+    # knowledge libraries (mcps-mcp), a local tool package's check (mcps-mcp),
+    # the conversations of an external identity, and the phone's call
+    # control; every one session-JWT gated by its route.
+    re.compile(r"^/v1/knowledge-libraries(/.*)?$"),
+    re.compile(r"^/v1/mcps/local-package/validate$"),
+    re.compile(r"^/v1/conversations(/.*)?$"),
+    re.compile(r"^/v1/phone/call-control(/.*)?$"),
+    # The credential gateway's path, from a compute machine alone (a paired
+    # machine serves it itself under its lease; ``handle_request_frame``
+    # refuses the row on every other link). Classed ``mcp``: its streams
+    # are a session's tool traffic.
+    re.compile(r"^/v1/mcp-gateway/[A-Za-z0-9_-]+(/.*)?$"),
     re.compile(r"^/mcp/[a-z0-9_-]+/.*$"),
 ]
+
+# The credential gateway's path on the tunnel, admitted from a compute
+# machine's link alone.
+_GATEWAY_PATH_RE = re.compile(r"^/v1/mcp-gateway/[A-Za-z0-9_-]+(/.*)?$")
 
 # Hop-by-hop headers — never forward upstream or downstream.
 _HOP_BY_HOP_HEADERS = {
@@ -206,6 +244,9 @@ _HOOK_POOL_MAX = 4096
 _VERDICT_HOOK_PATH = "/v1/hooks/stop"
 _PROMPT_HOOK_PATHS = frozenset({"/v1/hooks/permission", "/v1/hooks/codex-question"})
 _UNCLAMPED_HOOK_PATHS = frozenset({_VERDICT_HOOK_PATH, *_PROMPT_HOOK_PATHS})
+# A signature for the session's SSH client: answered at once, never held
+# behind the asking machine's file pushes (``_asker_settled``).
+_NO_SETTLE_PATHS = frozenset({"/v1/hooks/ssh-agent"})
 # A prompt waits on a person up to ``session_state.PROMPT_WAIT_S`` (the
 # proxy answers by then; its stream carries keepalives meanwhile): its stream
 # lives an hour past that, beyond the absolute cap every other stream keeps.
@@ -237,6 +278,14 @@ def _is_allowed_path(path: str) -> bool:
     if has_traversal(base):
         return False
     return any(rx.match(base) for rx in _ALLOWLIST_REGEXES)
+
+
+def _is_app_path(path: str) -> bool:
+    """A path an app server may call through its listener."""
+    base = path.split("?", 1)[0]
+    if has_traversal(base):
+        return False
+    return any(rx.match(base) for rx in _APP_ALLOWLIST_REGEXES)
 
 
 # Matches `/mcp/<name>/<rest>` so the dispatcher can resolve `<name>` → the
@@ -296,15 +345,18 @@ def _resolve_upstream_url(path: str) -> str | None:
 
 
 def _takes_gateway_credential(name: str) -> bool:
-    """Whether the MCP behind the tunnel slug ``name`` takes a credential the
-    gateway adds (``credentials.oauth.bearer_required`` or
-    ``credentials.api_key_header``): such an MCP is never reached by the
-    direct hop, whose bearer is the session token."""
+    """Whether the MCP behind the tunnel slug ``name`` is reached only
+    through the gateway's forward: one that takes a credential the gateway
+    adds (``credentials.oauth.bearer_required`` or
+    ``credentials.api_key_header``), and every Docker tool (its door). Such
+    an MCP is never reached by the direct hop."""
     try:
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_types as _mt, mcp_registry
         manifest = mcp_registry.get_manifest_by_config_key(name)
     except ImportError:
         return False
+    if manifest is not None and _mt.is_container(getattr(manifest, "server", None)):
+        return True
     creds = getattr(manifest, "credentials", None)
     oauth = getattr(creds, "oauth", None)
     header = getattr(creds, "api_key_header", None)
@@ -314,8 +366,8 @@ def _takes_gateway_credential(name: str) -> bool:
 
 async def _gateway_forward(session_id: str, path: str, method: str, headers: dict, body: bytes = b""):
     """The credential gateway's part of a tunneled ``/mcp/<name>/`` request:
-    None when the MCP takes no credential (the direct hop to the sidecar, as
-    for file-tools), a refusal when the session holds a vendor credential the
+    None when the MCP takes no credential and is no Docker tool (the direct
+    hop), a refusal when the session holds a vendor credential the
     proxy does not forward itself (a machine session's vendor traffic leaves
     the machine through its own gateway; only a credential an agent's GitHub
     reach narrows comes through here, judged), when the MCP takes a credential
@@ -346,9 +398,9 @@ async def _gateway_forward(session_id: str, path: str, method: str, headers: dic
 
 
 def _gateway_only(path: str) -> bool:
-    """A tunneled ``/mcp/<name>/`` path of an MCP with no sidecar to dial
-    but a credential the gateway adds: the gateway's forward is its only
-    way (a vendor MCP an agent's GitHub reach narrows)."""
+    """A tunneled ``/mcp/<name>/`` path the gateway's forward is the only
+    way to: a Docker tool (its door) or an MCP the gateway adds a credential
+    to (a vendor MCP an agent's GitHub reach narrows)."""
     m = _MCP_PATH_RE.match(path.split("?", 1)[0])
     return m is not None and _takes_gateway_credential(m.group(1))
 
@@ -357,28 +409,156 @@ class _AmbiguousAuthorization(Exception):
     """A tunneled request carries more than one Authorization header."""
 
 
-def _session_bearer_payload(headers: dict) -> dict | None:
-    """The payload of a request's session-JWT bearer, or None when the
-    request carries no bearer or one that is not a session token. The scheme
-    is read in any case, as the routes read it. More than one Authorization
-    header (keys differing in case) raises ``_AmbiguousAuthorization``:
-    which one a server reads is its own choice, so none is judged."""
+def _bearer_token(headers: dict) -> str:
+    """The request's bearer, "" when it carries none. The scheme is read in
+    any case, as the routes read it. More than one Authorization header
+    (keys differing in case) raises ``_AmbiguousAuthorization``: which one a
+    server reads is its own choice, so none is judged."""
     keys = [k for k in headers if isinstance(k, str) and k.lower() == "authorization"]
     if len(keys) > 1:
         raise _AmbiguousAuthorization()
     value = headers.get(keys[0]) if keys else None
     if not isinstance(value, str):
-        return None
+        return ""
     scheme, _, token = value.strip().partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
+def _session_bearer_payload(headers: dict) -> dict | None:
+    """The payload of a request's session-JWT bearer, or None when the
+    request carries no bearer or one that is not a session token."""
+    token = _bearer_token(headers)
+    if not token:
         return None
     from auth.session_token import validate_session_token
-    return validate_session_token(token.strip())
+    return validate_session_token(token)
+
+
+def _bearer_session(headers: dict) -> tuple[str, dict | None]:
+    """``(session id, session payload)`` of a bearer that names a session:
+    a session token (its payload second), the command-line token or one of
+    the capability tokens (None second). ``("", None)`` for no bearer or
+    one that names no session (an app step's claim, a key)."""
+    token = _bearer_token(headers)
+    if not token:
+        return "", None
+    from auth import tokens
+    from auth.session_token import validate_session_token
+    payload = validate_session_token(token)
+    if payload is not None:
+        return str(payload.get("sid") or ""), payload
+    for kind in (tokens.CLI, tokens.MCP_CREDENTIALS, tokens.MCP_TOKEN):
+        other = tokens.verify(token, kind)
+        if other is not None:
+            return str(other.get("sid") or ""), None
+    return "", None
+
+
+# session id → (machine, expires): where a session was last found, so the
+# calls of its closing moments (its tables are gone by then) still resolve to
+# its own machine and to no other.
+_RECENT_MACHINE_S = 120.0
+_RECENT_MACHINE_MAX = 4096
+_recent_machine: dict[str, tuple[str, float]] = {}
+
+HERE, ELSEWHERE, STARTING, UNKNOWN = "here", "elsewhere", "starting", "unknown"
+
+
+def _machine_of(manager, session_id: str) -> str:
+    """The machine that holds ``session_id``, "" when no table knows it.
+    Read first from the tables that are set before a start frame leaves:
+    a session's queue on a machine's connection or in its reconnect window,
+    the terminal table. Then the remote layer's record, then the machine
+    the session's registered context names (a task's, a terminal's)."""
+    from core.remote import remote_pty
+    for mid in manager.get_connected_machines():
+        conn = manager.get_connection(mid)
+        if conn is not None and session_id in conn.session_queues:
+            return str(mid)
+    for mid, held in list(getattr(manager, "_grace_sessions", {}).items()):
+        if session_id in held:
+            return str(mid)
+    for mid, sid in list(remote_pty._remote_ptys):
+        if sid == session_id:
+            return str(mid)
+    from core.remote.satellite_file_transfer import _machine_of_session
+    found = _machine_of_session(session_id)
+    if found:
+        return found
+    from core.session.session_state import get_session_security
+    sec = get_session_security(session_id)
+    placed = getattr(getattr(sec, "placement", None), "machine_id", "") if sec is not None else ""
+    return str(placed or "")
+
+
+def session_place(manager, machine_id: str, session_id: str) -> str:
+    """Where ``session_id`` is, seen from ``machine_id``'s tunnel: ``HERE``,
+    ``ELSEWHERE`` (another machine, or the platform itself), ``STARTING``
+    (no table knows it yet while it is marked starting: the caller may ask
+    again) or ``UNKNOWN``."""
+    now = time.monotonic()
+    found = _machine_of(manager, session_id)
+    if found:
+        if len(_recent_machine) >= _RECENT_MACHINE_MAX:
+            for sid in [s for s, (_m, exp) in _recent_machine.items() if exp <= now]:
+                del _recent_machine[sid]
+            if len(_recent_machine) >= _RECENT_MACHINE_MAX:
+                _recent_machine.clear()
+        _recent_machine[session_id] = (found, now + _RECENT_MACHINE_S)
+        return HERE if found == machine_id else ELSEWHERE
+    from core.session.session_state import session_is_held, session_is_live
+    if session_is_held(session_id):
+        return ELSEWHERE        # the platform's own sandbox holds it
+    recent = _recent_machine.get(session_id)
+    if recent is not None and recent[1] > now:
+        return HERE if recent[0] == machine_id else ELSEWHERE
+    return STARTING if session_is_live(session_id) else UNKNOWN
 
 
 async def _holder_current(payload: dict) -> bool:
     from auth import token_holder
     return await token_holder.holder_ok(payload)
+
+
+# How often a producer waiting for room looks at its stream again.
+_ROOM_POLL_S = 5.0
+
+
+async def _asker_settled(machine_id: str, agent_slug: str, since: int,
+                         stream: "_HttpStream") -> None:
+    """Wait until ``machine_id`` holds the files of ``agent_slug`` that the
+    platform changed since ``since`` (its lane's count when the request
+    began). Bounded by the stream's own timeout, ended by its cancel or by
+    the machine's drop. Never raises: the answer goes out either way."""
+    from core.remote import machine_push_lane
+    if machine_push_lane.seq(machine_id) == since:
+        return
+    try:
+        await asyncio.wait_for(
+            machine_push_lane.settled(machine_id, agent_slug, since=since,
+                                      idle_s=float(stream.timeout_s),
+                                      cancel=stream.cancel_event),
+            timeout=float(stream.timeout_s))
+    except asyncio.TimeoutError:
+        logger.info("tunnel: machine %s still lacks files of %s after %d s; answering",
+                    machine_id[:8], agent_slug, stream.timeout_s)
+    stream.last_activity = time.monotonic()
+
+
+async def _room_for(manager, machine_id: str, conn, stream: "_HttpStream") -> bool:
+    """Wait until ``conn`` holds less than its room bound. False when the
+    stream was cancelled or the connection is no longer the machine's (the
+    chunk is dropped: its reader is gone). A waiter counts again after it
+    wakes, so many waiting streams never queue together, and the time it
+    waits counts as the stream's activity (a slow download is no leak)."""
+    room = getattr(conn, "room", None)
+    while room is not None and not room.is_set():
+        if stream.cancel_event.is_set() or manager.get_connection(machine_id) is not conn:
+            return False
+        stream.last_activity = time.monotonic()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(room.wait(), _ROOM_POLL_S)
+    return not stream.cancel_event.is_set() and manager.get_connection(machine_id) is conn
 
 
 @dataclass
@@ -412,11 +592,16 @@ class _HttpStream:
 
 
 def _new_client(is_mcp: bool) -> httpx.AsyncClient:
+    """The MCP class dials Docker tools by service name: on a hosted
+    install only inside the install's own tool networks
+    (``pinned_http.docker_tool``). The hook class dials this proxy's own
+    listener."""
     size = _MCP_POOL_MAX if is_mcp else _HOOK_POOL_MAX
-    return httpx.AsyncClient(
-        timeout=None,
-        limits=httpx.Limits(max_connections=size, max_keepalive_connections=size),
-    )
+    limits = httpx.Limits(max_connections=size, max_keepalive_connections=size)
+    if is_mcp:
+        from services.infra import pinned_http
+        return httpx.AsyncClient(**pinned_http.tool_transport(timeout=None, limits=limits))
+    return httpx.AsyncClient(timeout=None, limits=limits)
 
 
 class SatelliteHttpTunnelDispatcher:
@@ -484,12 +669,21 @@ class SatelliteHttpTunnelDispatcher:
             return
 
         path = msg.get("path", "")
-        if not _is_allowed_path(path):
+        bare = str(path).split("?", 1)[0]
+        gateway = _GATEWAY_PATH_RE.match(bare) is not None
+        via_app = msg.get("via") == "app"
+        if via_app:
+            # App servers run only on a compute machine beside the platform
+            # (an app's data folder is the platform's alone).
+            denied = not manager.shares_folders(machine_id) or not _is_app_path(path)
+        else:
+            denied = not _is_allowed_path(path) or (gateway and not manager.is_compute(machine_id))
+        if denied:
             logger.warning(
                 # strip the query string — it can carry session ids / tokens
                 # (same rule as the upstream-error log below)
                 "tunnel: rejected non-allowlisted path: %s (machine %s)",
-                str(path).split("?", 1)[0][:200], machine_id[:8],
+                bare[:200], machine_id[:8],
             )
             await self._send_response(
                 manager, machine_id, stream_id,
@@ -508,12 +702,13 @@ class SatelliteHttpTunnelDispatcher:
             timeout_s = int(msg.get("timeout_s", 30))
         except (TypeError, ValueError):
             timeout_s = 30
-        is_mcp = _MCP_PATH_RE.match(str(path).split("?", 1)[0]) is not None
+        is_mcp = gateway or _MCP_PATH_RE.match(bare) is not None
         stream = _HttpStream(
             stream_id=stream_id,
             machine_id=machine_id,
             timeout_s=max(1, min(timeout_s, _stream_timeout_ceiling(path))),
-            kind="mcp" if is_mcp else "hook",
+            kind=(f"app:{_APP_ID_RE.match(bare).group(1)}" if via_app  # type: ignore[union-attr]  # _is_app_path matched it above
+                  else "mcp" if is_mcp else "hook"),
         )
         async with self._lock:
             if key in self._streams:
@@ -577,6 +772,10 @@ class SatelliteHttpTunnelDispatcher:
         """Why this stream must be refused, or None when its class has room
         on its machine (and, for an MCP stream, across the fleet)."""
         open_here = self._open.get((stream.machine_id, stream.kind), 0)
+        if stream.kind.startswith("app:"):
+            if open_here >= _MAX_APP_STREAMS_PER_APP:
+                return f"app has {open_here} open streams"
+            return None
         if stream.kind == "mcp":
             if open_here >= _MAX_MCP_STREAMS_PER_MACHINE:
                 return f"machine has {open_here} open MCP streams"
@@ -683,21 +882,58 @@ class SatelliteHttpTunnelDispatcher:
                 )
                 return
 
-            # A tunneled MCP request is judged on its session's liveness and
-            # its token's holder before anything else: a closed session or
-            # a person who is gone gets a 401 and the upstream is never
-            # contacted.
-            payload = None
-            if stream.kind == "mcp":
-                try:
-                    payload = _session_bearer_payload(headers)
-                except _AmbiguousAuthorization:
+            # A bearer that names a session (a session's token, its
+            # command-line token, a capability token) works only through the
+            # tunnel of the machine that holds that session: one printed in
+            # another session, on another machine or on the platform itself,
+            # is refused here and the upstream is never contacted. A session
+            # no table knows yet while it starts is told to ask again.
+            try:
+                bearer_sid, payload = _bearer_session(headers)
+            except _AmbiguousAuthorization:
+                await self._send_response(
+                    manager, machine_id, stream_id,
+                    status=400, headers={}, body=b"",
+                    error="ambiguous-authorization", body_eof=True,
+                )
+                return
+            if bearer_sid and stream.kind.startswith("app:"):
+                # An app server holds no session: a token that names one
+                # did not come from it.
+                await self._send_response(
+                    manager, machine_id, stream_id,
+                    status=401, headers={}, body=b"",
+                    error="session-token-on-app-listener", body_eof=True,
+                )
+                return
+            if bearer_sid:
+                place = session_place(manager, machine_id, bearer_sid)
+                if place != HERE:
+                    logger.warning(
+                        "tunnel: a token of session %s (%s) refused for %s through machine %s",
+                        bearer_sid[:8], place, path.split("?", 1)[0], machine_id[:8],
+                    )
                     await self._send_response(
                         manager, machine_id, stream_id,
-                        status=400, headers={}, body=b"",
-                        error="ambiguous-authorization", body_eof=True,
+                        status=503 if place == STARTING else 401, headers={}, body=b"",
+                        error=("session-starting" if place == STARTING
+                               else "session-not-on-machine"),
+                        body_eof=True,
                     )
                     return
+            # The asking machine's wait (below): the lane's count before the
+            # route runs.
+            asker_agent = ""
+            if (stream.kind == "hook" and payload is not None
+                    and path.split("?", 1)[0] not in _UNCLAMPED_HOOK_PATHS | _NO_SETTLE_PATHS):
+                asker_agent = str(payload.get("agent") or "")
+            from core.remote import machine_push_lane
+            asked_from = machine_push_lane.seq(machine_id)
+
+            # A tunneled MCP request is also judged on its session's liveness
+            # and its token's holder: a closed session or a person who is
+            # gone gets a 401.
+            if stream.kind == "mcp":
                 from core.session.session_state import session_token_refusal
                 if payload is not None and session_token_refusal(payload):
                     logger.info(
@@ -762,6 +998,16 @@ class SatelliteHttpTunnelDispatcher:
             is_mcp = stream.kind == "mcp"
             client = self._get_client(is_mcp)
             gateway_sid = str(payload.get("sid") or "") if (is_mcp and payload) else ""
+            if is_mcp and not gateway_sid and _gateway_only(path):
+                # A Docker tool, or a tool the gateway adds a credential to:
+                # reached by a session's own token alone, never bare.
+                await self._send_response(
+                    manager, machine_id, stream_id,
+                    status=401, headers={}, body=b"",
+                    error="session-required", body_eof=True,
+                )
+                return
+            answered = None
             if gateway_sid:
                 from core.credentials import mcp_gateway
                 prepared = await _gateway_forward(gateway_sid, path, method, headers, body_bytes)
@@ -778,7 +1024,10 @@ class SatelliteHttpTunnelDispatcher:
                         status=r_status, headers=r_headers, body=r_body, body_eof=True,
                     )
                     return
-                if prepared is not None:
+                if isinstance(prepared, mcp_gateway.Answered):
+                    # A Docker tool's door answered (``services/containers/door.py``).
+                    answered = prepared
+                elif prepared is not None:
                     url, headers, client = str(prepared.url), prepared.headers, prepared.client
                     if prepared.content is not None:
                         body_bytes = prepared.content
@@ -809,7 +1058,7 @@ class SatelliteHttpTunnelDispatcher:
             )
 
             try:
-                resp = await client.send(req, stream=True)
+                resp = answered if answered is not None else await client.send(req, stream=True)
             except httpx.RequestError as e:
                 logger.warning(
                     # strip the query string — it can carry session ids / tokens
@@ -881,7 +1130,14 @@ class SatelliteHttpTunnelDispatcher:
                         await self._send_chunk(
                             manager, machine_id, stream_id,
                             chunk[i:i + _MAX_FRAME_BODY], body_eof=False,
+                            stream=stream,
                         )
+                if asker_agent and not stream.cancel_event.is_set():
+                    # The route has answered in full: what it wrote for this
+                    # agent while it ran reaches the asking session's own
+                    # machine before the answer's last frame does, so the
+                    # session's next step finds the files there.
+                    await _asker_settled(machine_id, asker_agent, asked_from, stream)
             except (httpx.TransportError, httpx.StreamError) as e:
                 # Upstream body dropped mid-stream. This is the ROUTINE outcome
                 # when the satellite WS reconnects: every long-lived
@@ -975,10 +1231,16 @@ class SatelliteHttpTunnelDispatcher:
         chunk: bytes,
         *,
         body_eof: bool,
+        stream: "_HttpStream | None" = None,
     ) -> None:
-        """Send an ``http_response_chunk`` frame back to the satellite."""
+        """Send an ``http_response_chunk`` frame back to the satellite. A
+        body chunk of ``stream`` first waits while the machine's connection
+        holds ``ROOM_BYTES`` for its writer, so the upstream is read only as
+        fast as the machine takes it. The last frame never waits."""
         conn = manager.get_connection(machine_id)
         if conn is None:
+            return
+        if stream is not None and not body_eof and not await _room_for(manager, machine_id, conn, stream):
             return
         await conn.enqueue_send({
             "type": "http_response_chunk",

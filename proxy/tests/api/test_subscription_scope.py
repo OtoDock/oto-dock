@@ -23,11 +23,10 @@ if _proxy_root not in sys.path:
 
 from auth.providers import UserContext
 from services.mcp import mcp_registry
-from services.oauth import credential_resolver
 from services.webhooks import subscription_manager
 from storage.agents import agent_store
 from storage.automation import trigger_store, webhook_subscription_store
-from storage.identity import credential_store
+from storage.identity import credential_store, service_account_set
 
 AG = "shared-agent"
 SOLO = "solo-agent"
@@ -82,8 +81,8 @@ def _bind(owner: str, label: str = "acct", agent: str = AG):
     from storage import database as task_store
     task_store.add_user_agent(owner, agent, "manager", "test")
     credential_store.set_user_credentials(owner, MCP, {"k": "v"}, account_label=label)
-    assert credential_store.set_service_agent_binding(
-        MCP, agent, account_label=label, owner_sub=owner, set_by=owner)
+    assert service_account_set.add_service_account_to_agent(
+        MCP, agent, account_label=label, owner_sub=owner, set_by=owner) == ""
 
 
 def _sub(**kw) -> dict:
@@ -179,7 +178,7 @@ class TestCreateRoute:
         _seed_agents()
         row = _sub(scope="user", owner=M, agent=None, vendor_target="o/r", created_by=M)
 
-        async def vendor_refuses(r):
+        async def vendor_refuses(r, **kw):
             raise subscription_manager.VendorAPIError(
                 "vendor 401", vendor_status=401, vendor_body="bad credentials")
 
@@ -190,7 +189,7 @@ class TestCreateRoute:
         assert webhook_subscription_store.get_subscription(row["id"]) is None
 
 
-# --- the catalog route: service scope reads the bound owner's token ----------------
+# --- the catalog route: service scope reads the lender's token of one account -------
 
 class TestCatalogServiceGate:
     def _call(self, ctx, **kw):
@@ -224,19 +223,24 @@ class TestCatalogServiceGate:
             self._call(_manager())
         assert ei.value.status_code == 400
 
-    def test_other_label_is_400_and_names_the_bound_one(self, temp_db):
+    def test_a_label_the_set_does_not_hold_is_400_in_words(self, temp_db):
         _seed_agents()
         _bind(M)
         with pytest.raises(HTTPException) as ei:
             self._call(_manager(), account_label="other")
         assert ei.value.status_code == 400
-        assert ei.value.detail["bound_account_label"] == "acct"
+        assert ei.value.detail == "other is not one of this agent's accounts for GitHub."
 
-    def test_bound_label_reads_prefill(self, temp_db):
+    def test_an_account_of_the_set_reads_its_prefill_for_a_manager_alone(self, temp_db):
+        """Each account of the set reads its own lender's token, so only a
+        manager, who alone subscribes the agent, asks for one; a member is
+        refused before any token is read."""
         _seed_agents()
         _bind(M)
-        out = self._call(_viewer())
-        assert out["vendor_target_prefill"] == "T-SECRET"
+        assert self._call(_manager())["vendor_target_prefill"] == "T-SECRET"
+        with pytest.raises(HTTPException) as ei:
+            self._call(_viewer())
+        assert ei.value.status_code == 403
 
     def test_user_scope_untouched(self, temp_db):
         out = self._call(_viewer(), scope="user", agent=None)
@@ -271,7 +275,7 @@ class TestDeleteWithLinkedTriggers:
         from api.events.subscriptions import delete_subscription
         sid = self._seed()
 
-        async def no_vendor(row):
+        async def no_vendor(row, **kw):
             return None
 
         monkeypatch.setattr(subscription_manager, "_vendor_delete", no_vendor)
@@ -288,7 +292,7 @@ class TestDeleteWithLinkedTriggers:
         row = _sub(scope="user", owner=M, agent=None, vendor_target="o/r",
                    created_by=M)
 
-        async def no_vendor(r):
+        async def no_vendor(r, **kw):
             return None
 
         monkeypatch.setattr(subscription_manager, "_vendor_delete", no_vendor)
@@ -351,7 +355,7 @@ class TestServiceBindingsSummary:
         credential_store.set_user_credentials(M, MCP, {"k": "v"}, account_label="spare")
 
         monkeypatch.setattr(task_store, "get_user_agents", lambda sub: [AG, SOLO])
-        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda agent: [_manifest()])
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps_all_placements", lambda agent: [_manifest()])
         monkeypatch.setattr(mcp_registry, "get_credential_schema",
                             lambda name: {"type": "per_user", "fields": [], "oauth": False})
         monkeypatch.setattr(mcp_registry, "get_manifest", _manifest)
@@ -365,31 +369,39 @@ class TestServiceBindingsSummary:
         assert accounts["spare"]["service_bindings"] == []
 
 
-class TestClearBindingCascade:
-    def test_agent_rows_are_cleaned_before_the_binding_goes(self, temp_db, monkeypatch):
-        from api.mcp import credentials as cred_api
-        _seed_agents()
-        _bind(M)
+class TestRemovalCascade:
+    """Taking an account out of the agent's set (the set's DELETE, through
+    ``chat_reload.remove_service_account``) unregisters that account's own
+    subscriptions first, through its lender's token while the row still
+    resolves."""
+
+    @pytest.fixture(autouse=True)
+    def _gates(self, monkeypatch):
         monkeypatch.setattr(mcp_registry, "get_credential_schema",
                             lambda name: {"type": "per_user", "has_service_account": True})
         monkeypatch.setattr(mcp_registry, "get_visible_mcps_for_agent",
                             lambda agent: [_manifest()])
+
+    def test_agent_rows_are_cleaned_before_the_account_goes(self, temp_db, monkeypatch):
+        from api.mcp import service_account_set as set_api
+        _seed_agents()
+        _bind(M)
         seen: dict = {}
 
         async def fake_cleanup(**kw):
             seen.update(kw)
-            assert credential_resolver.pick_account(MCP, AG) is not None
+            assert credential_store.get_service_agent_binding(MCP, AG, account_label="acct") is not None
             return 1
 
         monkeypatch.setattr(subscription_manager, "cleanup_account_subscriptions", fake_cleanup)
-        out = asyncio.run(cred_api.clear_agent_service_binding(AG, MCP, user=_manager()))
-        assert out["status"] == "ok"
+        out = asyncio.run(set_api.remove_service_account(AG, MCP, account_label="acct", user=_manager()))
+        assert out["status"] == "ok" and out["accounts"] == []
         assert seen == {"scope": "service", "owner": M, "mcp_name": MCP,
-                        "account_label": "acct", "agent": AG}
+                        "account_label": "acct", "agent": AG, "token_owner_sub": M}
         assert credential_store.get_service_agent_binding(MCP, AG) is None
 
-    def test_no_binding_is_a_noop(self, temp_db, monkeypatch):
-        from api.mcp import credentials as cred_api
+    def test_an_account_the_set_does_not_hold_is_404(self, temp_db, monkeypatch):
+        from api.mcp import service_account_set as set_api
         _seed_agents()
         called = []
 
@@ -397,5 +409,6 @@ class TestClearBindingCascade:
             called.append(kw)
 
         monkeypatch.setattr(subscription_manager, "cleanup_account_subscriptions", fake_cleanup)
-        asyncio.run(cred_api.clear_agent_service_binding(AG, MCP, user=_manager()))
-        assert called == []
+        with pytest.raises(HTTPException) as ei:
+            asyncio.run(set_api.remove_service_account(AG, MCP, account_label="acct", user=_manager()))
+        assert ei.value.status_code == 404 and called == []

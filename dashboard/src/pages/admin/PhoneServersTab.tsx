@@ -6,9 +6,10 @@
 
 import { useState, type ReactNode } from 'react'
 import {
+  IDENTITY_AGENT,
   usePhoneRoutes, useCreatePhoneRoute, useUpdatePhoneRoute, useDeletePhoneRoute,
   useDeleteRoutePin,
-  usePhoneServers, useCreatePhoneServer,
+  usePhoneServers, usePhoneServerTypes, useCreatePhoneServer,
   usePhoneSettings, useSavePhoneSettings, usePhonePromptDefaults, useRouteMcpPreview,
   useExternalData, useSaveExternalData, useForgetExternalData,
   type PhoneRoute, type PhoneRouteCreate, type PhoneServerCreate, type RouteMode,
@@ -21,8 +22,9 @@ import {
   useTurnClassifier,
 } from '../../api/audio'
 import { useAgents, useAgentUsers } from '../../api/agents'
+import { isSharedOnly, modeOfAgent } from '../../lib/visibility'
 import { useTriggers, useCreateTrigger } from '../../api/triggers'
-import { SectionCard, SettingRow, Badge, SaveState } from '../../components/ui/SettingsControls'
+import { SectionCard, SettingRow, CheckboxRow, Badge, SaveState } from '../../components/ui/SettingsControls'
 import { useSaveState } from '../../hooks/useSaveState'
 import Switch from '../../components/ui/Switch'
 import InfoTip from '../../components/ui/InfoTip'
@@ -56,8 +58,16 @@ const ADAPTER_OPTIONS: { value: AdapterType; label: string; hint: string }[] = [
   { value: 'asterisk_manual', label: 'Asterisk, manual', hint: 'Any Asterisk. You install a dialplan snippet once. Each route then shows the exact AstDB command to run. No API access needed.' },
 ]
 
+/** Whether the install offers a server on your own PBX: a hosted install
+ *  offers Twilio alone, and so does one an admin set to Twilio only. */
+function offersPbx(types: string[] | null | undefined): boolean {
+  return !types || types.some(t => t.startsWith('asterisk'))
+}
+
 function AddServerForm() {
   const create = useCreatePhoneServer()
+  const { data: types } = usePhoneServerTypes()
+  const options = ADAPTER_OPTIONS.filter(o => !types || types.includes(o.value))
   const [open, setOpen] = useState(false)
   const [name, setName] = useState('')
   const [host, setHost] = useState('')
@@ -89,14 +99,21 @@ function AddServerForm() {
   }
 
   if (!open) return <button onClick={() => setOpen(true)} className="text-xs text-link hover:underline">+ Add phone server</button>
-  const hint = ADAPTER_OPTIONS.find(o => o.value === adapter)?.hint
+  const hint = options.find(o => o.value === adapter)?.hint
   return (
     <div className="p-3 rounded-card bg-surface-raised shadow-elevation-2 space-y-2">
       <div>
-        <label className="block text-xs font-medium text-primary mb-1">Server type</label>
-        <Select value={adapter} onChange={e => setAdapter(e.target.value as AdapterType)}>
-          {ADAPTER_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-        </Select>
+        {options.length === 1 ? (
+          // One type offered (a hosted install): a fact, not a choice.
+          <p className="text-xs text-primary"><span className="font-medium">Server type:</span> {options[0].label}</p>
+        ) : (
+          <>
+            <label className="block text-xs font-medium text-primary mb-1">Server type</label>
+            <Select value={adapter} onChange={e => setAdapter(e.target.value as AdapterType)}>
+              {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </Select>
+          </>
+        )}
         {hint && <p className="text-xs text-tertiary mt-1">{hint}</p>}
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -156,7 +173,7 @@ const EMPTY_ROUTE: PhoneRouteCreate = {
   background_sound: 'off',
   enabled: true, audiosocket_uuid: null, did: '', ami_caller_id: '', ami_outbound_context: '', dial_prefix: '',
   trigger_slug: null,
-  identity_mode: 'caller', identity_user_sub: null, remember_callers: true,
+  identity_mode: 'caller', identity_user_sub: null, remember_callers: true, line_tools: [],
 }
 
 // Per-route filler toggle: the wire value is 'on'/'off' (RouteMode), the
@@ -170,38 +187,81 @@ function ModeToggle({ label, value, onChange }: { label: string; value: RouteMod
 // DELETE endpoint after the route saves. The value never enters `form`.
 export type PinIntent = { dirty: boolean; enabled: boolean; value: string }
 
-// Whether a saved form ends as a user-mode inbound route with no PIN: the
-// state the server refuses without an explicit acknowledgement.
+// The identities whose caller acts as someone (a platform user, the agent
+// itself): an inbound route of theirs needs a PIN or an acknowledgement, and
+// an outbound one may carry a PIN.
+function actsAsSomeone(mode: string) {
+  return mode === 'user' || mode === 'agent'
+}
+
+// Whether a saved form ends as a user-mode or agent-mode inbound route with
+// no PIN: the state the server refuses without an explicit acknowledgement.
 function endsWithoutPin(form: { identity_mode: string; direction: string }, pin: PinIntent, hasPin: boolean) {
-  return form.identity_mode === 'user' && form.direction === PHONE_INBOUND
+  return actsAsSomeone(form.identity_mode) && form.direction === PHONE_INBOUND
     && !(pin.enabled && (pin.value !== '' || hasPin))
 }
 
 // Where a PIN belongs (the server's rule): every inbound route, and an
-// outbound route tied to a platform user (the person who answers enters it
-// before the agent speaks).
+// outbound route tied to a platform user or run as the agent itself (the
+// person who answers enters it before the agent speaks).
 function pinAllowed(form: { identity_mode: string; direction: string }) {
-  return form.direction === PHONE_INBOUND || form.identity_mode === 'user'
+  return form.direction === PHONE_INBOUND || actsAsSomeone(form.identity_mode)
 }
 
 // Who the caller IS on a route (docs/PHONE-CONFIG.md "Route identity and
-// role"). `caller` never reaches a user's session (on a Shared-only agent it
-// is simply the agent's shared space with no per-caller memory) and always
-// runs as a viewer of the shared space; `user` runs the tied user's own
-// session and is the mode that needs a PIN.
-const IDENTITY_OPTIONS: { value: PhoneRoute['identity_mode']; label: string; hint?: string; info: string }[] = [
-  { value: 'caller', label: 'Per caller, recommended', info: 'Each phone number gets its own private notes and files. This needs an agent with personal spaces. Nothing a caller says reaches other callers or the team\'s shared memory. Callers read the agent\'s shared files as viewers and change nothing. On a shared-only agent, callers work in the shared space with no per-caller memory.' },
+// role"). `caller` never reaches a user's session (on a Shared-only agent the
+// caller keeps their id and gets no folder of their own) and always
+// runs as an external identity, with what a manager picked on the agent's
+// External identities card; `user` runs the tied user's own session and
+// `agent` the agent itself, the two modes that need a PIN.
+// `hintWhenChosen`: the hint shows only while the option is picked.
+// A Shared-only agent gives a caller no folder of their own: `caller` then
+// reads CALLER_INFO_SHARED_ONLY.
+const IDENTITY_OPTIONS: { value: PhoneRoute['identity_mode']; label: string; hint?: string; hintWhenChosen?: boolean; info: string }[] = [
+  { value: 'caller', label: 'Per caller, recommended', info: 'Each phone number gets its own private notes and files. Each caller is an external identity and gets only the tools a manager picks in the agent\'s settings.' },
   { value: 'user', label: 'A platform user', hint: 'A call never gets more than manager rights.', info: 'Calls run as that user\'s own session, with their memory, schedules, meetings and delegation.' },
+  { value: 'agent', label: 'The agent itself', hint: 'Callers act as the agent. They can change its shared files and use its tools and accounts.', hintWhenChosen: true, info: 'Every call works in the agent\'s shared space. Its memory stays shut to callers. An agent with no shared space cannot take these calls.' },
 ]
 
+const CALLER_INFO_SHARED_ONLY = 'Each caller is an external identity and gets only the tools a manager picks in the agent\'s settings.'
+
 const IDENTITY_LABEL: Record<PhoneRoute['identity_mode'], string> = {
-  caller: 'per caller', shared: 'shared', user: 'user',
+  caller: 'per caller', shared: 'shared', user: 'user', agent: 'agent itself',
+}
+
+// The management tools a route run as the agent itself may tick open (the
+// preview names them); every one stays off on the line until ticked.
+function LineTools({ offered, picked, onChange }: {
+  offered: { name: string; label: string }[]
+  picked: string[]
+  onChange: (next: string[]) => void
+}) {
+  if (offered.length === 0) return null
+  return (
+    <div className="space-y-1.5" data-testid="route-line-tools">
+      <p className="text-xs font-medium text-primary">
+        <span>Tools this line may use</span>
+        <InfoTip label="Tools this line may use">These tools manage the platform. They stay off on this line unless you tick them.</InfoTip>
+      </p>
+      <p className="text-xs text-tertiary">Anyone who calls this line can use what you tick.</p>
+      {offered.map(t => (
+        <CheckboxRow
+          key={t.name}
+          id={`line-tool-${t.name}`}
+          label={t.label || t.name}
+          checked={picked.includes(t.name)}
+          onChange={on => onChange(on ? [...picked, t.name] : picked.filter(n => n !== t.name))}
+        />
+      ))}
+    </div>
+  )
 }
 
 // "Available on this line / Not on calls" — the same resolver the live
-// session uses, minus processes. Re-fetched as the agent or mode changes.
-function McpPreview({ agent, identityMode }: { agent: string; identityMode: PhoneRoute['identity_mode'] }) {
-  const { data, isLoading, isError } = useRouteMcpPreview(agent, identityMode)
+// session uses, minus processes. Re-fetched as the agent, the mode or the
+// agent line's ticks change.
+function McpPreview({ agent, preview }: { agent: string; preview: ReturnType<typeof useRouteMcpPreview> }) {
+  const { data, isLoading, isError } = preview
   if (!agent) return null
   if (isError) return null
   if (isLoading || !data) return <p className="text-xs text-tertiary">Checking the tools on this line…</p>
@@ -233,10 +293,12 @@ const FieldLabel = ({ label, large, aside, children }: { label: string; large?: 
 )
 
 function RouteModal({
-  route, agents, languages, servers, providers, onSave, onClose, saving, error,
+  route, agents, sharedOnlyAgents, languages, servers, providers, onSave, onClose, saving, error,
 }: {
   route: PhoneRouteCreate & { id?: string; pin_configured?: boolean }
   agents: string[]
+  /** The agents whose mode is Shared only, from the list the tab loads. */
+  sharedOnlyAgents: string[]
   languages: string[]
   servers: { id: number; name: string; adapter_type?: string }[]
   providers: AudioProvider[]
@@ -254,6 +316,8 @@ function RouteModal({
   // platform admin qualifies too — the server accepts any admin sub; the
   // currently tied sub stays selectable while editing).
   const { data: agentUsers } = useAgentUsers(form.identity_mode === 'user' ? form.agent : '')
+  const lineTools = form.line_tools ?? []
+  const preview = useRouteMcpPreview(form.agent, form.identity_mode, lineTools)
   const userChoices = (agentUsers || []).slice()
   if (form.identity_user_sub && !userChoices.some(u => u.sub === form.identity_user_sub)) {
     userChoices.push({ sub: form.identity_user_sub, name: form.identity_user_sub, email: '', role: '' })
@@ -299,25 +363,32 @@ function RouteModal({
     if (!dirty || await dialogs.confirm({ title: 'Discard the unsaved changes?', confirmLabel: 'Discard', tone: 'danger' })) onClose()
   }
 
-  // A user-mode inbound route saved without a PIN is an explicit choice: the
-  // admin confirms it in words and the request carries the acknowledgement
-  // (the server refuses the save without it).
+  // A user-mode or agent-mode inbound route saved without a PIN is an
+  // explicit choice: the admin confirms it in words and the request carries
+  // the acknowledgement (the server refuses the save without it).
   const save = async () => {
     const pin: PinIntent = { dirty: pinDirty, enabled: pinEnabled, value: pinValue }
     const noPin = endsWithoutPin(form, pin, hasPin)
     if (noPin) {
-      const picked = userChoices.find(u => u.sub === form.identity_user_sub)
-      const who = picked && picked.sub !== picked.name
-        ? (picked.name || picked.email || picked.sub)
-        : `the tied user (${form.identity_user_sub})`
+      let body: string
+      if (form.identity_mode === IDENTITY_AGENT) {
+        body = 'Anyone who calls this route acts as the agent itself. They can change its shared files and use its tools, its accounts and the tools you ticked.'
+      } else {
+        const picked = userChoices.find(u => u.sub === form.identity_user_sub)
+        const who = picked && picked.sub !== picked.name
+          ? (picked.name || picked.email || picked.sub)
+          : `the tied user (${form.identity_user_sub})`
+        body = `Anyone who calls this route will act as ${who}, with all their tools and credentials.`
+      }
       if (!(await dialogs.confirm({
         title: 'Save without a PIN?',
-        body: `Anyone who calls this route will act as ${who}, with all their tools and credentials.`,
+        body,
         confirmLabel: 'Save without a PIN',
         tone: 'danger',
       }))) return
     }
-    onSave(form, pin, noPin)
+    // The ticks belong to the agent's own line alone.
+    onSave(form.identity_mode === IDENTITY_AGENT ? form : { ...form, line_tools: [] }, pin, noPin)
   }
 
   return (
@@ -383,17 +454,22 @@ function RouteModal({
               <p className="text-xs text-tertiary mt-0.5">Who the agent is talking to on this line, and what the call may touch.</p>
             </div>
             <div className="space-y-1.5" role="radiogroup" aria-label="Caller identity">
-              {IDENTITY_OPTIONS.map(o => (
-                <div key={o.value} className="relative flex items-start gap-2 text-sm text-primary">
-                  <input type="radio" id={`identity-${o.value}`} name="identity_mode" value={o.value} checked={form.identity_mode === o.value}
-                    aria-describedby={o.hint ? `identity-${o.value}-hint` : undefined} onChange={() => set('identity_mode', o.value)} className="mt-0.5 cursor-pointer" />
-                  <div className="min-w-0">
-                    <label htmlFor={`identity-${o.value}`} className="font-medium cursor-pointer after:absolute after:inset-0">{o.label}</label>
-                    <span className="relative z-10"><InfoTip label={o.label}>{o.info}</InfoTip></span>
-                    {o.hint && <span id={`identity-${o.value}-hint`} className="block text-xs text-tertiary">{o.hint}</span>}
+              {IDENTITY_OPTIONS.map(o => {
+                const showHint = !!o.hint && (!o.hintWhenChosen || form.identity_mode === o.value)
+                return (
+                  <div key={o.value} className="relative flex items-start gap-2 text-sm text-primary">
+                    <input type="radio" id={`identity-${o.value}`} name="identity_mode" value={o.value} checked={form.identity_mode === o.value}
+                      aria-describedby={showHint ? `identity-${o.value}-hint` : undefined} onChange={() => set('identity_mode', o.value)} className="mt-0.5 cursor-pointer" />
+                    <div className="min-w-0">
+                      <label htmlFor={`identity-${o.value}`} className="font-medium cursor-pointer after:absolute after:inset-0">{o.label}</label>
+                      <span className="relative z-10"><InfoTip label={o.label}>
+                        {o.value === 'caller' && sharedOnlyAgents.includes(form.agent) ? CALLER_INFO_SHARED_ONLY : o.info}
+                      </InfoTip></span>
+                      {showHint && <span id={`identity-${o.value}-hint`} className="block text-xs text-tertiary">{o.hint}</span>}
+                    </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
             {form.identity_mode === 'user' ? (
               <div>
@@ -409,12 +485,18 @@ function RouteModal({
                     : 'Whoever answers a call on this route acts as that user. Require a PIN below so they enter it first. Use this route for calls to your own phone.'}
                 </p>
               </div>
+            ) : form.identity_mode === IDENTITY_AGENT ? (
+              <LineTools
+                offered={preview.data?.line_tools_offered ?? []}
+                picked={lineTools}
+                onChange={v => set('line_tools', v)}
+              />
             ) : (
               <SettingRow label="Remember callers" info="Keep each caller's notes between calls">
                 <Switch aria-label="Remember callers" checked={form.remember_callers} onChange={v => set('remember_callers', v)} />
               </SettingRow>
             )}
-            <McpPreview agent={form.agent} identityMode={form.identity_mode} />
+            <McpPreview agent={form.agent} preview={preview} />
           </div>
 
           {/* The PIN: every inbound route, and an outbound route tied to a
@@ -675,6 +757,7 @@ function RoutesSection() {
   const [logRoute, setLogRoute] = useState<PhoneRoute | null>(null)
 
   const agentSlugs = (agents || []).map(a => a.name)
+  const sharedOnlySlugs = (agents || []).filter(a => isSharedOnly(modeOfAgent(a))).map(a => a.name)
   const serverList = (servers || []).map(s => ({ id: s.id, name: s.name, adapter_type: s.adapter_type }))
   const defaultServerId = (servers || []).find(s => s.is_default)?.id ?? servers?.[0]?.id ?? null
   let configuredLanguages: string[] = []
@@ -846,7 +929,7 @@ function RoutesSection() {
 
       {editRoute && (
         <RouteModal
-          route={editRoute} agents={agentSlugs} languages={configuredLanguages}
+          route={editRoute} agents={agentSlugs} sharedOnlyAgents={sharedOnlySlugs} languages={configuredLanguages}
           servers={serverList} providers={providers || []}
           onSave={handleSave} onClose={() => setEditRoute(null)}
           saving={createMut.isPending || updateMut.isPending}
@@ -1091,11 +1174,18 @@ function LanguagesSection() {
   const updatePhrase = (key: string, value: string) => {
     save(key, 'phrases', JSON.stringify({ ...phrases, [lang]: { ...(phrases[lang] || {}), [key]: value } }))
   }
+  // A list saves only when it changed: leaving the field saves nothing.
+  const listOf = (value: string) => value.split(',').map(s => s.trim()).filter(Boolean)
+  const sameList = (a: string[], b: string[] = []) => a.length === b.length && a.every((s, i) => s === b[i])
   const updateBackchannel = (value: string) => {
-    save('backchannel', 'backchannel_phrases', JSON.stringify({ ...backchannel, [lang]: value.split(',').map(s => s.trim()).filter(Boolean) }))
+    const next = listOf(value)
+    if (sameList(next, backchannel[lang])) return
+    save('backchannel', 'backchannel_phrases', JSON.stringify({ ...backchannel, [lang]: next }))
   }
   const updateThinking = (value: string) => {
-    save('thinking', 'thinking_phrases', JSON.stringify({ ...thinking, [lang]: value.split(',').map(s => s.trim()).filter(Boolean) }))
+    const next = listOf(value)
+    if (sameList(next, thinking[lang])) return
+    save('thinking', 'thinking_phrases', JSON.stringify({ ...thinking, [lang]: next }))
   }
   const restoreLang = () => {
     const dp = DEFAULT_LANGUAGES.phrases[lang]
@@ -1110,6 +1200,9 @@ function LanguagesSection() {
       { failTitle: 'The language defaults were not restored' })
   }
 
+  // The fields wait for the saved settings: a write before them would merge
+  // into an empty copy and replace every language's lists.
+  if (!settings) return <p className="text-sm text-secondary">Loading...</p>
   const p: Record<string, string> = phrases[lang] || {}
   return (
     <div className="space-y-3">
@@ -1188,6 +1281,8 @@ const LIFECYCLE_FIELDS = [
 
 function InfrastructureSection() {
   const { data: settings } = usePhoneSettings()
+  const { data: types } = usePhoneServerTypes()
+  const transport = TRANSPORT_FIELDS.filter(f => f.key !== 'audiosocket_port' || offersPbx(types))
   const saveMut = useSavePhoneSettings()
   const { stateOf, run } = useSaveState()
 
@@ -1197,10 +1292,14 @@ function InfrastructureSection() {
     }
   }
 
+  // The fields wait for the saved settings: before them a field shows its
+  // built-in default, and leaving it saved that over the saved value.
+  if (!settings) return <p className="text-sm text-secondary">Loading...</p>
+
   const numRow = (f: { key: string; label: string; info: string; def: string }) => (
     <SettingRow key={f.key} label={f.label} info={f.info} save={stateOf(f.key)}>
       <Input type="number" defaultValue={settings?.[f.key] ?? f.def} key={`${f.key}-${settings?.[f.key] ?? ''}`}
-        onBlur={e => save(f.key, e.target.value)}
+        onBlur={e => { if (e.target.value !== (settings?.[f.key] ?? f.def)) save(f.key, e.target.value) }}
         className="max-w-28 text-right" />
     </SettingRow>
   )
@@ -1209,7 +1308,7 @@ function InfrastructureSection() {
     <div className="space-y-5">
       <div>
         <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Transport</h4>
-        <div className="space-y-2">{TRANSPORT_FIELDS.map(numRow)}</div>
+        <div className="space-y-2">{transport.map(numRow)}</div>
       </div>
       <div>
         <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Call Lifecycle</h4>

@@ -1,0 +1,147 @@
+// Checks on what R8 wrote for the release build: the dex a phone runs, never
+// R8's own lists (a rule can match and a later pass still drop the method).
+//
+// checkReleaseFullscreen: Android's WebView offers full screen to a page
+// only when the WebChromeClient's class declares onShowCustomView and
+// onHideCustomView. It looks for both by name, walking the client's classes
+// up to WebChromeClient. R8 removes a method that only calls its parent,
+// which is all Capacitor's onHideCustomView does: a build without it cannot
+// put any video in full screen, the dashboard's player or a frame's own.
+// proguard-rules.pro keeps both. This task reads the shrunk dex and fails
+// when the app's client, or Capacitor's (the proof that the rule's text
+// matched something), fails the WebView's rule.
+
+def otodockFullscreenClients = [
+        'com.otodock.FullscreenWebChromeClient',
+        'com.getcapacitor.BridgeWebChromeClient',
+]
+def otodockFullscreenMethods = [
+        'onShowCustomView': '(Landroid/view/View;Landroid/webkit/WebChromeClient$CustomViewCallback;)V',
+        'onHideCustomView': '()V',
+]
+
+def otodockDexdump = { File sdk, String preferred ->
+    def tools = new File(sdk, 'build-tools')
+    def versions = (tools.listFiles() ?: [] as File[])
+            .findAll { new File(it, 'dexdump').canExecute() }
+            .sort { a, b -> a.name <=> b.name }
+    def chosen = versions.find { it.name == preferred } ?: (versions ? versions.last() : null)
+    if (chosen == null) {
+        throw new GradleException("checkReleaseFullscreen needs the SDK's dexdump: none under ${tools}")
+    }
+    return new File(chosen, 'dexdump')
+}
+
+// descriptor -> [superclass: descriptor, methods: set of "name type"]
+def otodockDexClasses = { File dexdump, Collection<File> dexFiles ->
+    def classes = [:]
+    dexFiles.each { File dex ->
+        def process = new ProcessBuilder(dexdump.path, dex.path).redirectErrorStream(true).start()
+        def current = null
+        def inMethods = false
+        def name = null
+        process.inputStream.eachLine('UTF-8') { String raw ->
+            def line = raw.trim()
+            if (line.startsWith('Class descriptor')) {
+                current = [superclass: null, methods: [] as Set]
+                classes[line.substring(line.indexOf("'") + 1, line.lastIndexOf("'"))] = current
+                inMethods = false
+            } else if (current == null) {
+                return
+            } else if (line.startsWith('Superclass')) {
+                current.superclass = line.substring(line.indexOf("'") + 1, line.lastIndexOf("'"))
+            } else if (line.startsWith('Direct methods') || line.startsWith('Virtual methods')) {
+                inMethods = true
+            } else if (line.startsWith('Static fields') || line.startsWith('Instance fields')) {
+                inMethods = false
+            } else if (inMethods && line.startsWith('name')) {
+                name = line.substring(line.indexOf("'") + 1, line.lastIndexOf("'"))
+            } else if (inMethods && name != null && line.startsWith('type')) {
+                current.methods << (name + ' ' + line.substring(line.indexOf("'") + 1, line.lastIndexOf("'")))
+                name = null
+            }
+        }
+        if (process.waitFor() != 0) {
+            throw new GradleException("checkReleaseFullscreen: dexdump failed on ${dex}")
+        }
+    }
+    return classes
+}
+
+tasks.register('checkReleaseFullscreen') {
+    group = 'verification'
+    description = "The shrunk release build still declares what Android's WebView needs for full screen."
+    dependsOn tasks.matching { it.name == 'minifyReleaseWithR8' }
+    doLast {
+        def r8 = tasks.findByName('minifyReleaseWithR8')
+        if (r8 == null) throw new GradleException('checkReleaseFullscreen: no minifyReleaseWithR8 task')
+        def dexFiles = [] as Set
+        r8.outputs.files.files.each { File out ->
+            if (out.isDirectory()) {
+                out.eachFileRecurse { if (it.name ==~ /classes\d*\.dex/) dexFiles << it }
+            } else if (out.name ==~ /classes\d*\.dex/) {
+                dexFiles << out
+            }
+        }
+        def mapping = r8.outputs.files.files.find { it.name == 'mapping.txt' }
+        if (dexFiles.isEmpty() || mapping == null || !mapping.isFile()) {
+            throw new GradleException('checkReleaseFullscreen: R8 wrote no dex or no mapping.txt where this '
+                    + 'task looks (' + r8.outputs.files.files.join(', ') + ')')
+        }
+
+        // original class name -> the name R8 gave it
+        def shrunk = [:]
+        mapping.eachLine('UTF-8') { String line ->
+            if (!line.startsWith(' ') && !line.startsWith('#') && line.endsWith(':') && line.contains(' -> ')) {
+                def parts = line.substring(0, line.length() - 1).split(' -> ')
+                shrunk[parts[0]] = parts[1]
+            }
+        }
+
+        def sdk = androidComponents.sdkComponents.sdkDirectory.get().asFile
+        def classes = otodockDexClasses(otodockDexdump(sdk, android.buildToolsVersion), dexFiles)
+        def problems = []
+        otodockFullscreenClients.each { String original ->
+            def now = shrunk[original]
+            def descriptor = now == null ? null : 'L' + now.replace('.', '/') + ';'
+            if (descriptor == null || !classes.containsKey(descriptor)) {
+                problems << "${original} is not in the shrunk build"
+                return
+            }
+            def missing = new LinkedHashSet(otodockFullscreenMethods.keySet())
+            def at = descriptor
+            def own = true
+            while (at != null && at != 'Landroid/webkit/WebChromeClient;' && classes.containsKey(at)) {
+                // The app's client declares both itself; Capacitor's may inherit.
+                if (own || original != otodockFullscreenClients[0]) {
+                    otodockFullscreenMethods.each { m, type ->
+                        if (classes[at].methods.contains(m + ' ' + type)) missing.remove(m)
+                    }
+                }
+                own = false
+                at = classes[at].superclass
+            }
+            if (at != 'Landroid/webkit/WebChromeClient;') {
+                problems << "${original} (${now}) no longer extends android.webkit.WebChromeClient"
+            }
+            missing.each { problems << "${original} (${now}) does not declare ${it}" }
+        }
+        if (!problems.isEmpty()) {
+            throw new GradleException("The shrunk release build cannot put a video in full screen:\n  "
+                    + problems.join('\n  ')
+                    + "\nAndroid's WebView looks for both methods by name on the client's class. "
+                    + "Keep them in app/proguard-rules.pro.")
+        }
+        logger.lifecycle("checkReleaseFullscreen: ${otodockFullscreenClients.size()} clients declare both "
+                + "methods in ${dexFiles.size()} dex file(s).")
+    }
+}
+
+// Every R8 run is checked, and nothing is packaged from a build that fails:
+// CI's R8 step, a release APK and the store bundle alike.
+tasks.matching { it.name == 'minifyReleaseWithR8' }.configureEach {
+    finalizedBy 'checkReleaseFullscreen'
+}
+tasks.matching { it.name in ['packageRelease', 'packageReleaseBundle'] }.configureEach {
+    dependsOn 'checkReleaseFullscreen'
+}

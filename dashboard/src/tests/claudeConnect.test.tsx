@@ -31,6 +31,9 @@ vi.mock('@/api/executionLayers', async (importOriginal) => {
   const idle = () => ({ mutate: () => {}, mutateAsync: async () => ({}), isPending: false, isError: false, error: null })
   return {
     ...mod,
+    // The list's own reads need a query client this test does not mount: answered as a list at rest.
+    useListReading: () => ({ pending: false, reread: () => {} }),
+    useAccountsLive: () => ({ data: undefined }),
     useStartClaudeOAuth: () => ({
       mutateAsync: async (vars: unknown) => {
         h.startCalls.push(vars)

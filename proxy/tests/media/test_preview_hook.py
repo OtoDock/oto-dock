@@ -8,6 +8,7 @@ to another; each push is numbered among the file's pushes in the chat and
 trims the file's oldest version copies past the cap.
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -445,6 +446,43 @@ def test_a_takeover_during_the_push_keeps_the_token_from_the_next_person(
     assert _claims(hook())["user_sub"] == "bob-sub"
 
 
+@pytest.mark.parametrize("role,permissions", [("editor", "edit"), ("viewer", "view")])
+@pytest.mark.parametrize("recorded", [True, False], ids=["record-names-the-agent", "record-holds-no-agent"])
+def test_a_pushs_token_reads_the_same_under_the_editors_judge(temp_db, hook, terminal, monkeypatch,
+                                                              role, permissions, recorded):
+    """The push decides edit at the person's role on the session's agent, and
+    its token names that agent, so the editor's judge reads the same answer.
+    A session whose record holds no agent still has its security context's:
+    the token names that one, and an editor's push stays edit."""
+    from api.media import wopi
+    from core.session import session_state
+    if recorded:
+        monkeypatch.setitem(session_state._sessions, "sess-a", {"agent": "test-agent"})
+    else:
+        monkeypatch.delitem(session_state._sessions, "sess-a", raising=False)
+    person = task_store.create_local_user(f"{role}@t.com", "Pat", "Pat", "member", "x")
+    task_store.add_user_agent(person, "test-agent", role, "test")
+    task_store.create_chat("chat-a", "agent::test-agent", "test-agent")
+    terminal(person)
+    claims = _claims(hook())
+    assert (claims["agent"], claims["permissions"]) == ("test-agent", permissions)
+    wopi._documents.answers.clear()
+    assert asyncio.run(wopi.document_standing(claims)) == permissions
+
+
+def test_a_pushs_token_reads_as_the_chat_rule(temp_db, hook, terminal, monkeypatch):
+    """The editor judges a token by the rule its claims name: the push's
+    token for the person at the terminal names its chat, as the pane's do."""
+    import auth.providers
+    from api.media import wopi
+    monkeypatch.setattr(auth.providers, "acting_role_of", lambda sub, agent: "editor")
+    pat = task_store.create_local_user("pat@t.com", "Pat", "Pat", "member", "x")
+    task_store.create_chat("chat-a", "agent::test-agent", "test-agent")
+    terminal(pat)
+    claims = _claims(hook())
+    assert claims["chat_id"] == "chat-a" and wopi._rule_of(claims) == wopi._CHAT_RULE
+
+
 def test_the_relay_admits_the_socket_of_the_person_at_the_terminal(temp_db, hook, terminal, monkeypatch):
     """End to end: the token a terminal push carries opens the editor socket
     for the person at the terminal (their sign-in cookie), and for nobody
@@ -457,6 +495,7 @@ def test_the_relay_admits_the_socket_of_the_person_at_the_terminal(temp_db, hook
     monkeypatch.setattr(auth.providers, "acting_role_of", lambda sub, agent: "editor")
     pat = task_store.create_local_user("pat@t.com", "Pat", "Pat", "member", "x")
     kim = task_store.create_local_user("kim@t.com", "Kim", "Kim", "member", "x")
+    task_store.add_user_agent(pat, "test-agent", "editor", "test")
     task_store.create_chat("chat-a", "agent::test-agent", "test-agent")
     terminal(pat)
     token = hook()["access_token"]
@@ -468,12 +507,12 @@ def test_the_relay_admits_the_socket_of_the_person_at_the_terminal(temp_db, hook
         cookie = tokens.mint(tokens.SIGN_IN, {"purpose": "session", "sub": sub, "jti": f"in-{sub}"},
                              ttl_s=3600)
         return asyncio.run(collabora_proxy._collabora_authorized(scope, {"session": cookie}))
-    wopi._holder_answers.clear()
+    wopi._holders.answers.clear()
     try:
         assert opened_by(pat) == pat
         assert opened_by(kim) is None
     finally:
-        wopi._holder_answers.clear()
+        wopi._holders.answers.clear()
 
 
 
@@ -528,3 +567,149 @@ def test_the_write_notes_the_next_document_before_it_announces_the_change(
         "session_id": "sess-a", "path": "test-agent/workspace/report.docx",
     }, headers={"Authorization": "Bearer test"})
     assert [o for o in order if o[0] == "file_updated"] == []
+
+
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "remote"])
+@pytest.mark.parametrize("path,allowed", [
+    ("test-agent/workspace/report.docx", True),
+    ("other-agent/workspace/report.docx", False),
+    ("test-agent/users/bob/workspace/report.docx", False),
+    ("test-agent/config/agent.md", False),
+    ("test-agent/.claude/settings.json", False),
+    ("test-agent/workspace/../../other-agent/workspace/report.docx", False),
+])
+def test_a_file_tools_write_reaches_a_machine_only_under_the_sessions_own_write_rule(
+        monkeypatch, tmp_path, remote, path, allowed):
+    """The same judgement on a local chat's write as on a machine's: what a
+    machine receives goes no further than what the session could write."""
+    import config
+    from api.hooks import hooks as hooks_mod, lifecycle
+    from auth.path_policy import SecurityContext
+    from core.remote import remote_file_flow
+    from services.notifications import notification_manager
+    from services.remote import workspace_fanout
+    agents = tmp_path / "agents"
+    for rel in ("test-agent/workspace/report.docx", "other-agent/workspace/report.docx",
+                "test-agent/users/bob/workspace/report.docx", "test-agent/config/agent.md",
+                "test-agent/.claude/settings.json"):
+        (agents / rel).parent.mkdir(parents=True, exist_ok=True)
+        (agents / rel).write_bytes(b"bytes")
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    monkeypatch.setattr("auth.path_policy._AGENTS_DIR", agents.resolve())
+    monkeypatch.setattr(lifecycle, "verify_session_match_async", _pass_async)
+    monkeypatch.setattr(lifecycle, "get_session_security", lambda sid: SecurityContext(
+        role="editor", username="u", agent="test-agent", is_admin_agent=False))
+    monkeypatch.setattr(remote_file_flow, "is_remote_session", lambda sid: remote)
+    monkeypatch.setattr(notification_manager, "broadcast_file_updated", AsyncMock())
+    handed: list = []
+
+    async def fan_out(agent, rel, source, **kw):
+        handed.append((agent, rel, source, kw))
+
+    async def push_back(sid, rel):
+        handed.append(("test-agent", rel))
+        return True
+
+    monkeypatch.setattr(workspace_fanout, "fan_out_write", fan_out)
+    monkeypatch.setattr(workspace_fanout, "has_fanout_candidates", lambda *a, **k: True)
+    monkeypatch.setattr(remote_file_flow, "push_back", push_back)
+    app = FastAPI()
+    app.include_router(hooks_mod.router)
+    resp = TestClient(app).post("/v1/hooks/file-written", json={"session_id": "sess-a", "path": path},
+                                headers={"Authorization": "Bearer test"})
+    assert resp.status_code == 200
+    if not allowed:
+        assert handed == []
+    elif remote:
+        assert handed == [("test-agent", "workspace/report.docx")]
+    else:
+        assert handed == [("test-agent", "workspace/report.docx",
+                           agents / "test-agent/workspace/report.docx", {"include_idle": True})]
+
+
+def test_the_push_names_the_gates_answer_never_a_second_resolution(temp_db, hook, monkeypatch, tmp_path):
+    """The document the push opens is the place the gate authorized, read as
+    text. A link put there after the judgement leads nowhere else: the rel
+    is not resolved again (and the version copy, opened strictly, refuses)."""
+    from api.hooks import paths
+    from api.media.wopi import decode_file_id
+    other = tmp_path / "agents" / "test-agent" / "users" / "bob" / "workspace"
+    other.mkdir(parents=True)
+    (other / "theirs.docx").write_bytes(b"bob's")
+    answer = tmp_path / "agents" / "test-agent" / "workspace" / "mine.docx"
+    answer.symlink_to(other / "theirs.docx")
+
+    async def _judged(session_id, path):
+        return answer, None
+    monkeypatch.setattr(paths, "_classify_and_pull", _judged)
+    task_store.create_chat("chat-a", "user-a", "test-agent")
+    item = hook()
+    assert decode_file_id(item["file_id"]) == "test-agent/workspace/mine.docx"
+    assert item["snapshot_id"] == ""
+
+
+def test_a_document_in_the_sessions_own_cache_is_its_persons_to_edit(temp_db, hook, people, monkeypatch, tmp_path):
+    """A file pulled into THIS session's cache (read from the answer's name)
+    is editable by the session's own person; its digest reads the answer."""
+    from api.hooks import paths, preview
+    cached = tmp_path / "agents" / ".remote-host-cache" / "sess-a" / "d1" / "notes.docx"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"pulled")
+
+    async def _judged(session_id, path):
+        return cached, None
+    monkeypatch.setattr(paths, "_classify_and_pull", _judged)
+    monkeypatch.setattr(
+        "api.hooks.preview.get_session_security",
+        lambda sid: SimpleNamespace(role="manager", username="bob", mount_username="bob",
+                                    agent="test-agent"),
+    )
+    task_store.create_chat("chat-a", "user-a", "test-agent")
+    people("chat-a", "bob-sub")
+    assert _claims(hook())["permissions"] == "edit"
+    assert preview.file_digest(cached) != ""
+
+
+def test_the_digest_never_reads_through_a_link(hook, tmp_path):
+    from api.hooks import preview
+    doc = tmp_path / "agents" / "test-agent" / "workspace" / "report.docx"
+    link = doc.parent / "alias.docx"
+    link.symlink_to(doc)
+    assert preview.file_digest(doc) != ""
+    assert preview.file_digest(link) == ""
+
+
+def test_the_push_names_the_document_as_it_was_asked(temp_db, hook, monkeypatch, tmp_path):
+    """The document pane shows the name the session asked for, not the name
+    of the place a link led to."""
+    from api.hooks import paths
+    target = tmp_path / "agents" / "test-agent" / "workspace" / "drafts-v3.docx"
+    target.write_bytes(b"doc")
+
+    async def _judged(session_id, path):
+        return target, None
+    monkeypatch.setattr(paths, "_classify_and_pull", _judged)
+    task_store.create_chat("chat-a", "user-a", "test-agent")
+    assert hook()["filename"] == "report.docx"  # the hook posts /workspace/report.docx
+
+
+def test_a_document_from_a_machine_names_where_it_lives(temp_db, hook, monkeypatch, tmp_path):
+    """The preview's download of a paired computer's document records the
+    computer and the place there: the session's copy goes with the session."""
+    from api.hooks import paths
+    from core.remote import remote_file_flow
+    from services.path_policy_v2 import PathRef, PathResolution
+    cached = tmp_path / "agents" / ".remote-host-cache" / "sess-a" / "d1" / "notes.docx"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"pulled")
+
+    async def _pulled(session_id, path):
+        return cached, PathResolution(access_path=str(cached), allowed=True,
+                                      path_ref=PathRef("satellite_host", "C:/Users/bob/Desktop/notes.docx"))
+    monkeypatch.setattr(paths, "_classify_and_pull", _pulled)
+    monkeypatch.setattr(remote_file_flow, "_get_remote_session_info",
+                        lambda sid: SimpleNamespace(machine_id="m-win"))
+    task_store.create_chat("chat-a", "user-a", "test-agent")
+    token = hook()["download_url"].removeprefix("/v1/media/").split("?")[0]
+    info = task_store.get_media_token(token)
+    assert (info["origin_path"], info["machine_id"]) == ("C:/Users/bob/Desktop/notes.docx", "m-win")

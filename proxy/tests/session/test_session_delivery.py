@@ -14,11 +14,13 @@ import asyncio
 import contextlib
 import time
 
-# The ws rung now has a LIVENESS GATE: queue presence alone no longer routes —
-# the target session must be alive. Tests that exercise the ws route register
-# a fake alive CLI session alongside their notify queue.
+# The ws rung has a LIVENESS GATE: queue presence alone does not route, the
+# target session must be alive. Tests that exercise the ws route plant a live
+# session the platform holds alongside their notify queue.
 from contextlib import contextmanager
 from types import SimpleNamespace
+
+import pytest
 
 from core.session import (
     interactive_session as isess,
@@ -31,13 +33,15 @@ from storage import database as task_store
 
 
 @contextmanager
-def _alive_cli_session(sid):
-    from core.layers.cli import layer as _cli_layer
-    _cli_layer._persistent_sessions[sid] = SimpleNamespace(is_alive=True)
+def _alive_session(sid):
+    """A live session in the pool the platform holds itself (Direct LLM's):
+    on no machine, so it is on its chat's place whatever the chat's pin."""
+    from core.layers.direct import session as _direct
+    _direct._direct_sessions[sid] = SimpleNamespace(mcp_manager=None)
     try:
         yield
     finally:
-        _cli_layer._persistent_sessions.pop(sid, None)
+        _direct._direct_sessions.pop(sid, None)
 
 
 class _FakeISession:
@@ -83,7 +87,7 @@ class TestRungSelection:
                     "chat-p1", "the result", source="delegate_result",
                     session_id="sid-p1", agent="pa",
                     notify_payload={"type": "task_result_prompt"},
-                    persist_event=persists.append,
+                    persist_event=persists.append, role="manager",
                 ))
                 assert outcome.path == "pty"
                 assert outcome.session_id == "sid-p1"
@@ -105,12 +109,12 @@ class TestRungSelection:
             _dashboard_notify_queues["sid-w1"] = q
             persists = []
             try:
-                with _alive_cli_session("sid-w1"):
+                with _alive_session("sid-w1"):
                     outcome = asyncio.run(deliver_prompt(
                         "chat-w1", "the result", source="delegate_result",
                         session_id="sid-w1", agent="pa",
                         notify_payload={"type": "task_result_prompt"},
-                        persist_event=persists.append,
+                        persist_event=persists.append, role="manager",
                     ))
                 assert outcome.path == "ws"
                 assert persists == []                  # handler owns persistence
@@ -119,6 +123,77 @@ class TestRungSelection:
                 assert payload["chat_id"] == "chat-w1"
             finally:
                 _dashboard_notify_queues.pop("sid-w1", None)
+        finally:
+            _cleanup()
+
+    @pytest.mark.parametrize("pin, path", [
+        ("m-1", "ws"),        # the chat's own machine holds it
+        ("local", "none"),    # a move to the platform whose close failed
+        ("m-2", "none"),      # a move to another machine whose close failed
+    ])
+    def test_ws_rung_serves_a_chat_its_own_machine_holds(self, temp_db, monkeypatch, pin, path):
+        """The socket rung asks the layer that HOLDS the session: a chat on a
+        machine is the remote layer's, which the engine's own layer never
+        holds, so it used to skip the socket and take the ladder. A machine
+        holding it elsewhere than the chat's place still takes the ladder:
+        the handler would run the turn on the chat's place."""
+        from core.session import session_manager
+
+        class _Remote:
+            def owns_session(self, sid):
+                return sid == "sid-w3"
+
+            def machine_of_session(self, sid):
+                return "m-1"
+
+            def is_session_grace_held(self, sid):
+                return False
+
+            async def is_session_alive(self, sid):
+                return sid == "sid-w3"
+
+        manager = type("M", (), {"is_connected": staticmethod(lambda mid: mid == "m-1"),
+                                 "is_compute": staticmethod(lambda mid: False)})()
+        monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: manager)
+        monkeypatch.setattr(session_manager, "_remote_layer", _Remote())
+        try:
+            task_store.create_chat("chat-w3", "user-1", "pa")
+            task_store.update_chat("chat-w3", execution_target=pin)
+            q: asyncio.Queue = asyncio.Queue()
+            _dashboard_notify_queues["sid-w3"] = q
+            try:
+                outcome = asyncio.run(deliver_prompt(
+                    "chat-w3", "the result", source="delegate_result",
+                    session_id="sid-w3", agent="pa",
+                    notify_payload={"type": "task_result_prompt"},
+                    persist_event=lambda _c: None, role="manager",
+                ))
+                assert (outcome.path == "ws") is (path == "ws")
+                assert q.empty() is (path != "ws")
+            finally:
+                _dashboard_notify_queues.pop("sid-w3", None)
+        finally:
+            _cleanup()
+
+    def test_a_platform_holder_behind_a_machines_pin_takes_the_socket(self, temp_db, monkeypatch):
+        """The platform holds the session behind a machine's pin. It is no
+        machine's "elsewhere", so the socket serves it."""
+        from core.session import session_manager
+        monkeypatch.setattr(session_manager, "_remote_layer", None)
+        try:
+            task_store.create_chat("chat-f1", "user-1", "pa")
+            task_store.update_chat("chat-f1", execution_target="m-1")
+            q: asyncio.Queue = asyncio.Queue()
+            _dashboard_notify_queues["sid-f1"] = q
+            try:
+                with _alive_session("sid-f1"):
+                    outcome = asyncio.run(deliver_prompt(
+                        "chat-f1", "the result", source="delegate_result", session_id="sid-f1", agent="pa",
+                        notify_payload={"type": "task_result_prompt"}, persist_event=lambda _c: None,
+                        role="manager"))
+            finally:
+                _dashboard_notify_queues.pop("sid-f1", None)
+            assert outcome.path == "ws" and q.get_nowait()["session_id"] == "sid-f1"
         finally:
             _cleanup()
 
@@ -138,7 +213,7 @@ class TestRungSelection:
                     "chat-w2", "the result", source="delegate_result",
                     session_id="sid-w2", agent="pa",
                     notify_payload={"type": "task_result_prompt"},
-                    persist_event=persists.append,
+                    persist_event=persists.append, role="manager",
                 ))
                 assert outcome.path != "ws"
                 assert q.empty()                    # nothing routed to the socket
@@ -160,7 +235,7 @@ class TestRungSelection:
             outcome = asyncio.run(deliver_prompt(
                 "chat-m1", "the result", source="delegate_result",
                 session_id="sid-m1", agent="pa",
-                persist_event=persists.append,
+                persist_event=persists.append, role="manager",
             ))
             assert outcome.path == "pump"
             assert persists == ["chat-m1"]
@@ -185,7 +260,7 @@ class TestRungSelection:
                 "chat-f1", "the result", source="delegate_result",
                 session_id="sid-f1", agent="pa",
                 persist_event=persists.append,
-                oneshot_fn=_oneshot,
+                oneshot_fn=_oneshot, role="manager",
             ))
             # The fake is still "alive" in the registry, so the one-shot guard
             # refuses (correct — a real racing session would own the JSONL).
@@ -250,7 +325,7 @@ class TestSteerRung:
             outcome = asyncio.run(deliver_prompt(
                 "chat-st1", "steer me", source="delegate_result",
                 session_id="sid-st1", agent="pa",
-                persist_event=persists.append,
+                persist_event=persists.append, role="manager",
             ))
             assert outcome.path == "steer"
             assert outcome.session_id == "sid-st1"
@@ -273,7 +348,7 @@ class TestSteerRung:
             outcome = asyncio.run(deliver_prompt(
                 "chat-st1", "steer me", source="delegate_result",
                 session_id="sid-st1", agent="pa",
-                persist_event=persists.append,
+                persist_event=persists.append, role="manager",
             ))
             assert outcome.path == "pump"
             assert layer.calls == [("sid-st1", "steer me")]
@@ -290,7 +365,7 @@ class TestSteerRung:
             stream_pump._active_pumps["chat-st1"].is_done = True
             outcome = asyncio.run(deliver_prompt(
                 "chat-st1", "steer me", source="delegate_result",
-                session_id="sid-st1", agent="pa",
+                session_id="sid-st1", agent="pa", role="manager",
             ))
             assert layer.calls == []
             assert outcome.path in ("none", "pump")
@@ -313,7 +388,7 @@ class TestSteerRung:
             )
             outcome = asyncio.run(deliver_prompt(
                 "chat-st1", "steer me", source="delegate_result",
-                session_id="sid-st1", agent="pa",
+                session_id="sid-st1", agent="pa", role="manager",
             ))
             assert layer.calls == []
             assert outcome.path == "pump"
@@ -342,7 +417,7 @@ class TestSteerRung:
             )
             outcome = asyncio.run(deliver_prompt(
                 "chat-st1", "steer me", source="delegate_result",
-                session_id="sid-st1", agent="pa",
+                session_id="sid-st1", agent="pa", role="manager",
             ))
             assert outcome.path == "pump"
             assert pumped == [("chat-st1", "steer me")]
@@ -352,7 +427,7 @@ class TestSteerRung:
     def test_chat_layer_resolves_the_pinned_target(self, temp_db, monkeypatch):
         # A chat pinned to a satellite is steered through its REMOTE layer:
         # the resolver receives the row's path and target with the owner's
-        # role (the local engine layer never owns a remote session).
+        # role (an engine's own object holds no session).
         from core.session import session_delivery, session_manager
         seen = {}
 
@@ -395,7 +470,7 @@ class TestOneshotGuard:
                 "chat-g1", "the result", source="delegate_result",
                 session_id="sid-dead", agent="pa",
                 oneshot_fn=_oneshot,
-                allow_pty=False,                        # handback re-entry shape
+                allow_pty=False, role="manager",                        # handback re-entry shape
             ))
             assert outcome.path == "none"
             assert calls == []
@@ -420,7 +495,7 @@ class TestOneshotGuard:
                     return await deliver_prompt(
                         "chat-g2", "the result", source="delegate_result",
                         session_id="sid-g2", agent="pa",
-                        oneshot_fn=_oneshot,
+                        oneshot_fn=_oneshot, role="manager",
                     )
                 finally:
                     await warmup_registry.unregister("chat-g2")
@@ -444,7 +519,7 @@ class TestOneshotGuard:
                 "chat-g3", "the result", source="delegate_result",
                 session_id="sid-g3", agent="pa",
                 oneshot_fn=_oneshot,
-                on_outcome=outcomes.append,
+                on_outcome=outcomes.append, role="manager",
             ))
             assert outcome.path == "oneshot"
             assert outcome.response == "ECHO"
@@ -467,7 +542,7 @@ class TestOneshotGuard:
 
             asyncio.run(deliver_prompt(
                 "chat-g4", "the result", source="delegate_result",
-                session_id="sid-g4", agent="pa", oneshot_fn=_oneshot,
+                session_id="sid-g4", agent="pa", oneshot_fn=_oneshot, role="manager",
             ))
             assert seen == [True]
             assert oneshot_inflight("chat-g4") is None
@@ -478,7 +553,7 @@ class TestOneshotGuard:
             with contextlib.suppress(RuntimeError):
                 asyncio.run(deliver_prompt(
                     "chat-g4", "x", source="delegate_result",
-                    session_id="sid-g4", agent="pa", oneshot_fn=_boom,
+                    session_id="sid-g4", agent="pa", oneshot_fn=_boom, role="manager",
                 ))
             assert oneshot_inflight("chat-g4") is None  # finally released it
         finally:
@@ -502,7 +577,7 @@ class TestOneshotGuard:
                 await warmup_registry.register("chat-g5", "user-1", "pa")
                 task = asyncio.create_task(deliver_prompt(
                     "chat-g5", "the result", source="delegate_result",
-                    session_id="sid-dead", agent="pa", oneshot_fn=_oneshot,
+                    session_id="sid-dead", agent="pa", oneshot_fn=_oneshot, role="manager",
                 ))
                 await asyncio.sleep(0.2)          # deliver is now waiting
                 claims_during_wait.append(oneshot_inflight("chat-g5"))

@@ -247,6 +247,22 @@ class TestValidators:
         assert self._put(client, legacy["id"], {"name": "renamed"}).status_code == 200
         assert phone_route_store.get_route(legacy["id"])["identity_mode"] == "caller"
 
+    def test_an_agent_that_gets_a_line_gets_the_conversations_tool_once(self, client):
+        """A manager asks the tool about the line's conversations. Moving a
+        route brings it; a route edited in place never gives it back to an
+        agent whose manager took it away."""
+        from services.mcp.mcp_session_filter import CONVERSATIONS_MCP
+        from services.phone.outside_upgrade import give_conversations_tool
+        from storage.mcp import mcp_store
+        first, second = _make_agent(), _make_agent()
+        route = _make_route(first)
+        assert self._put(client, route["id"], {"name": "renamed"}).status_code == 200
+        assert CONVERSATIONS_MCP not in mcp_store.get_manager_enabled_mcps(first)
+        assert self._put(client, route["id"], {"agent": second}).status_code == 200
+        assert CONVERSATIONS_MCP in mcp_store.get_manager_enabled_mcps(second)
+        assert give_conversations_tool(second) is False
+        assert give_conversations_tool(first) is True
+
     def test_user_mode_needs_a_qualifying_user(self, client):
         agent = _make_agent()
         route = _make_route(agent)
@@ -497,17 +513,27 @@ class TestMcpPreview:
             _manifest("display-mcp", ["phone", "terminal"]),  # phone exclusion
             _manifest("helpdesk-mcp", ["external"]),          # manifest opt-out
         ]
-        monkeypatch.setattr(mcp_registry, "get_agent_mcps_all_placements", lambda a: fake)
+        from services.mcp import mcp_session_filter
+        monkeypatch.setattr(mcp_session_filter, "get_agent_mcps_all_placements", lambda a: fake)
         monkeypatch.setattr(mcp_registry, "get_manifest", lambda n: next((m for m in fake if m.name == n), None))
 
         r = client.get("/v1/admin/phone/routes/mcp-preview", params={"agent": agent})
         assert r.status_code == 200
         body = r.json()
-        assert [m["name"] for m in body["attached"]] == ["memory-mcp", "file-tools"]
+        # Nothing picked for outside people: nothing attaches.
+        assert [m["name"] for m in body["attached"]] == []
         reasons = {m["name"]: m["reason"] for m in body["excluded"]}
+        assert reasons["memory-mcp"] == "Not available on external routes"
+        assert reasons["file-tools"] == "Not picked for outside people"
         assert reasons["schedules-mcp"] == "Not available on external routes"
         assert reasons["display-mcp"] == "Excluded in phone mode"
         assert reasons["helpdesk-mcp"] == "Excluded in external mode"
+        # A pick opens the tool to the line.
+        from storage.agents import outside_store
+        outside_store.update(agent, upsert_tools=[
+            {"mcp_name": "file-tools", "access": "read_only", "functions": [], "granted": []}])
+        body = client.get("/v1/admin/phone/routes/mcp-preview", params={"agent": agent}).json()
+        assert [m["name"] for m in body["attached"]] == ["file-tools"]
 
         r = client.get("/v1/admin/phone/routes/mcp-preview",
                        params={"agent": agent, "identity_mode": "user"})
@@ -527,6 +553,5 @@ class TestMcpPreview:
         assert {
             "delegation-mcp", "schedules-mcp", "triggers-mcp", "notifications-mcp",
             "meetings-mcp", "agent-config-mcp", "agent-creator-mcp", "mcps-mcp",
-            "ssh-hosts", "phone-mcp",
+            "ssh-hosts", "phone-mcp", "memory-mcp",
         } <= EXTERNAL_DENIED_MCPS
-        assert "memory-mcp" not in EXTERNAL_DENIED_MCPS

@@ -19,6 +19,7 @@ from auth.providers import UserContext, create_session_jwt
 from core.session import session_kind, session_state, visibility
 from services.cards import actions, cards, lists, status as st
 from services.community import department_set_installer as installer
+from services.departments import assignment
 from storage import database as task_store
 from storage.agents import agent_store, db_departments
 from storage.cards import db_cards
@@ -67,8 +68,8 @@ def _drain(sid: str) -> list[dict]:
     return items
 
 
-def _dept(name="Eng"):
-    return db_departments.create_department(name, ADMIN, level_names=["Head", "Team"])
+def _dept(name="Eng", creator=ADMIN):
+    return db_departments.create_department(name, creator, level_names=["Head", "Team"])
 
 
 def _move_buttons(agent: str, dept: dict) -> list[dict]:
@@ -290,7 +291,7 @@ def test_the_parameters_are_capped_in_bytes(temp_db, monkeypatch):
 
 def test_the_draw_refuses_what_the_person_could_never_do(temp_db):
     agent_store.create_agent("alpha", "Alpha", created_by=ADMIN)
-    dept = _dept()
+    dept = _dept(creator=CREATOR)
     # A member managing the agent: not a creator.
     task_store.set_user_agents(MEMBER, ["alpha", AGENT], ADMIN, agent_roles={"alpha": "manager", AGENT: "manager"})
     token = _own_session("sid-card-m", MEMBER, "chat-card-m")
@@ -301,10 +302,14 @@ def test_the_draw_refuses_what_the_person_could_never_do(temp_db):
     token = _own_session("sid-card-c", CREATOR, "chat-card-c")
     r = _draw(token, "sid-card-c", _move_buttons("alpha", dept))
     assert r.status_code == 409 and r.json()["detail"] == "Manager or admin access required for this agent."
-    # A creator who manages it draws the card.
+    # A creator who manages it draws the card into the department they made.
     task_store.set_user_agents(CREATOR, ["alpha", AGENT], ADMIN, agent_roles={"alpha": "manager", AGENT: "manager"})
     token = _own_session("sid-card-c2", CREATOR, "chat-card-c2")
     assert _draw(token, "sid-card-c2", _move_buttons("alpha", dept)).status_code == 200
+    # Not into an empty department somebody else made.
+    theirs = _dept("Ops")
+    r = _draw(token, "sid-card-c2", _move_buttons("alpha", theirs))
+    assert r.status_code == 409 and r.json()["detail"] == assignment.PLACE_REFUSED
 
 
 # --- the state and the click --------------------------------------------------------
@@ -408,7 +413,7 @@ def test_the_clients_parameters_never_reach_the_action(temp_db):
 
 def test_the_role_is_checked_again_at_the_click(temp_db):
     agent_store.create_agent("alpha", "Alpha", created_by=ADMIN)
-    dept = _dept()
+    dept = _dept(creator=CREATOR)
     task_store.set_user_agents(CREATOR, ["alpha", AGENT], ADMIN, agent_roles={"alpha": "manager", AGENT: "manager"})
     token = _own_session("sid-role", CREATOR, "chat-role")
     card_id = _draw(token, "sid-role", _move_buttons("alpha", dept)).json()["card_id"]
@@ -438,7 +443,8 @@ def _shared_move(sid: str = "sid-shared-move", chat_id: str = "chat-shared-move"
     """A move card the admin drew in the Shared-only chat of ``AGENT``."""
     agent_store.create_agent(AGENT, "PA", created_by=ADMIN)
     agent_store.create_agent("alpha", "Alpha", created_by=ADMIN)
-    dept = _dept()
+    # The creator who presses it made the department (the placement rule).
+    dept = _dept(creator=CREATOR)
     task_store.create_chat(chat_id, visibility.shared_chat_owner(AGENT), AGENT)
     task_store.update_chat(chat_id, session_id=sid)
     r = _draw(live_session_token(sid, AGENT, user_sub=ADMIN), sid, _move_buttons("alpha", dept))
@@ -1287,6 +1293,7 @@ def test_a_say_press_is_refused_before_the_claim_when_the_person_may_not_send(te
     _person(MEMBER, "viewer", {AGENT: roles.VIEWER})
     member = _cookie(MEMBER, "viewer@test.com", roles.MEMBER)
     r = member.post(f"/v1/cards/{card_id}/act", json={"button": "yes"})
+    # The rule every door asks decides, in the card's own words.
     assert r.status_code == 403 and r.json()["detail"] == st.SHARED_NEEDS_EDITOR
     assert db_cards.clicks_of(card_id) == [] and queued == []
     # A full queue refuses with the composer's sentence and spends no click.
@@ -1505,3 +1512,26 @@ def test_share_app_copies_in_process_with_the_hooks_gates_and_refuses_a_taken_sl
     _person(MEMBER, "viewer", {AGENT: roles.VIEWER, "target": roles.EDITOR})
     r = _draw(token, "sid-share", _do("share_app", {"app_slug": "board", "target_agent": "target"}))
     assert r.status_code == 409 and r.json()["detail"] == "Only editors and managers share the team's apps of PA."
+
+
+def test_the_install_card_asks_the_department_before_it_installs(temp_db, monkeypatch):
+    installed = {}
+
+    async def fake_install(**kw):
+        installed.update(kw)
+        return {"agent_slug": kw["target_slug"]}
+
+    monkeypatch.setattr(actions.community_agent_installer, "install_from_catalog", fake_install)
+    theirs = _dept("Ops")
+    params = {"template_slug": "yacht-crew", "department_id": theirs["id"], "level_id": theirs["levels"][0]["id"]}
+    creator = UserContext(sub=CREATOR, email="manager@test.com", name="C", role=roles.CREATOR, agents=[],
+                          agent_roles={})
+    # The draw: refused with the placement's sentence.
+    assert actions._placement_refusal(params, creator) == assignment.PLACE_REFUSED
+    # The click: refused before anything is installed, never an agent left alone.
+    out = asyncio.run(actions._install_run(params, {}, creator))
+    assert out.status == st.OUTCOME_FAILED and assignment.PLACE_REFUSED in out.text
+    assert not installed
+    mine = _dept("Mine", creator=CREATOR)
+    assert actions._placement_refusal({**params, "department_id": mine["id"],
+                                       "level_id": mine["levels"][0]["id"]}, creator) is None

@@ -25,7 +25,6 @@ import io
 import json
 import os
 import re
-import shutil
 import sys
 import tempfile
 import time
@@ -319,9 +318,27 @@ class CheckContext:
         if self._fileobj is not None:
             self._fileobj.seek(0)
             return self._fileobj
-        fh = open_beneath_root(self.path)
+        import shared
+
+        fh = shared.safe_open_read(self.path)
         self._owned.append(fh)
         return fh
+
+    def open_rendering(self) -> Any:
+        """The rendering as a PyMuPDF document, read through
+        ``shared.safe_read_fd``: the parent's render, or the person's PDF
+        itself (a PDF is its own rendering), never followed through a
+        link."""
+        import fitz
+
+        import safe_fs
+        import shared
+
+        fd, _ = shared.safe_read_fd(self.rendered_pdf)
+        try:
+            return fitz.open(safe_fs.fd_path(fd), filetype="pdf")
+        finally:
+            os.close(fd)
 
     def zip(self) -> zipfile.ZipFile:
         """The package, refused past the entry and size caps."""
@@ -397,19 +414,6 @@ class CheckContext:
             stream = io.BufferedReader(_Prefixed(head, fh))
             yield from etree.iterparse(stream, events=("end",), tag=tags, resolve_entities=False,
                                        no_network=True, load_dtd=False, huge_tree=False)
-
-
-def open_beneath_root(path: str) -> BinaryIO:
-    """``path`` opened for reading beneath the mount, no component followed
-    through a link."""
-    import safe_fs
-    import shared
-
-    root = shared._write_root()
-    try:
-        return safe_fs.open_file_for_read(root, safe_fs.rel_under(path, root))
-    except safe_fs.SafeFsError as exc:
-        raise PermissionError(f"Cannot read '{shared._to_agents_relative(path)}': {exc.strerror}") from None
 
 
 # ---------------------------------------------------------------------------
@@ -494,10 +498,13 @@ def collect_baseline(fmt: str, *, path: str | None = None, create_new: bool = Fa
     snapshotting = [s for s in selected if s.snapshot is not None]
     if not specs and not snapshotting:
         return None
-    if create_new or not path or not os.path.exists(path):
+    import shared
+
+    st = None if create_new or not path else shared.safe_kind(path).st
+    if st is None:
         blank = _blank_baseline(fmt, specs) if specs else []
         return None if blank is None else Baseline(blank)
-    size = os.path.getsize(path)
+    size = st.st_size
     if size > BASELINE_MAX_BYTES:
         return Baseline([Finding(Severity.INFO, BASELINE_SKIPPED_CHECK,
                                  message=f"the file is {size // (1024 * 1024)} MB, so problems it already had are "
@@ -727,13 +734,15 @@ _MB = 1024 * 1024
 _CHECK_ADVICE = "Check a smaller copy of the file, or split it"
 
 
-def preflight(path: str, fmt: str, *, own_copy: bool = False) -> str | None:
+def preflight(path: str, fmt: str) -> str | None:
     """Refuse, before any worker, a file the checks will not read: too big,
     not a package, or a package whose directory alone is past the caps. Reads
-    only the size and the last 64 KB. ``own_copy``: a file the server made
-    in its own work folder (a converted copy), opened directly."""
+    only the size and the last 64 KB (``shared.safe_open_read``: the
+    person's file beneath the mount, a copy the server made plainly)."""
+    import shared
+
     name = os.path.basename(path)
-    with (open(path, "rb") if own_copy else open_beneath_root(path)) as fh:
+    with shared.safe_open_read(path) as fh:
         size = os.fstat(fh.fileno()).st_size
         if size > CHECK_MAX_FILE_BYTES:
             return (f"Error: {name} is {size // _MB} MB, past the {CHECK_MAX_FILE_BYTES // _MB} MB the checks "
@@ -767,12 +776,12 @@ class CheckResult:
 
 
 def check_document_core(path: str, fmt: str, only: tuple[str, ...], check_modules: tuple[str, ...],
-                        rendered_pdf: str | None = None, *, own_copy: bool = False,
+                        rendered_pdf: str | None = None, *,
                         exclude: tuple[str, ...] = ()) -> CheckResult:
     """Worker core: every check of the format (or those ``only`` names, less
-    ``exclude``) on the file, read beneath the mount (``own_copy``: a copy
-    the server made, opened directly); the ``render`` checks too when the
-    parent rendered it."""
+    ``exclude``) on the file (``CheckContext.open``: the person's file
+    beneath the mount, a copy the server made plainly); the ``render``
+    checks too when the parent rendered it."""
     load_check_modules(check_modules)
     known = check_ids(fmt)
     unknown = unknown_filters(fmt, only)
@@ -782,14 +791,9 @@ def check_document_core(path: str, fmt: str, only: tuple[str, ...], check_module
                 if (not only or matches_filter(s.check_id, only)) and not matches_filter(s.check_id, exclude)]
     if exclude and not selected:
         return CheckResult(ran=0, known=known)
-    fileobj = open(path, "rb") if own_copy else None
-    try:
-        with CheckContext(path, fmt, rendered_pdf=rendered_pdf, fileobj=fileobj) as ctx:
-            findings = run_checks(ctx, phase=DOCUMENT,
-                                  only=[s.check_id for s in selected] if exclude else only or None)
-    finally:
-        if fileobj is not None:
-            fileobj.close()
+    with CheckContext(path, fmt, rendered_pdf=rendered_pdf) as ctx:
+        findings = run_checks(ctx, phase=DOCUMENT,
+                              only=[s.check_id for s in selected] if exclude else only or None)
     return CheckResult(findings=findings, ran=len(selected), known=known,
                        read_rendering=len([s for s in selected if s.cost == COST_RENDER]))
 
@@ -813,9 +817,12 @@ async def handle_check_document(args: dict) -> str:
     from isolation import run_parse
 
     path = await shared._resolve_path(args["path"])
-    if not await asyncio.to_thread(os.path.exists, path):
+    # What sits at the name, no link followed; anything but a folder goes
+    # on to the strict open, which says why it cannot be read.
+    kind = (await asyncio.to_thread(shared.safe_kind, path)).kind
+    if kind == "missing":
         return f"Error: File not found: {args['path']}"
-    if not await asyncio.to_thread(os.path.isfile, path):
+    if kind == "dir":
         return f"Error: {args['path']} is not a file."
     ext = Path(path).suffix.lower()
     started = time.monotonic()
@@ -838,11 +845,9 @@ async def handle_check_document(args: dict) -> str:
         checked = None
         if work is not None and fmt == "xlsx":
             checked = await _recalculated_copy(path, work, started + PIPELINE_BUDGET_S, notes)
-        rendered_pdf = await _rendering(checked or path, fmt, wanted, work, notes, started + PIPELINE_BUDGET_S,
-                                        own_copy=checked is not None)
+        rendered_pdf = await _rendering(checked or path, fmt, wanted, work, notes, started + PIPELINE_BUDGET_S)
         result = await run_parse(check_document_core, checked or path, fmt, only, registered_modules(),
-                                 rendered_pdf, own_copy=checked is not None,
-                                 _deadline_at=started + PIPELINE_BUDGET_S, _advice=_CHECK_ADVICE)
+                                 rendered_pdf, _deadline_at=started + PIPELINE_BUDGET_S, _advice=_CHECK_ADVICE)
     finally:
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)
@@ -882,14 +887,14 @@ async def _check_legacy(args: dict, path: str, started: float) -> str:
     notes: list[str] = []
     try:
         fmt = FORMATS[copy.ext]
-        problem = await asyncio.to_thread(preflight, copy.path, fmt, own_copy=True)
+        problem = await asyncio.to_thread(preflight, copy.path, fmt)
         if problem:
             return problem
         exclude = tuple(f"{fmt}.{check}" for check in LEGACY_EXCLUDED) if copy.converted else ()
         rendered_pdf = await _rendering(copy.path, fmt, bool(args.get("render")), copy.work, notes,
-                                        started + PIPELINE_BUDGET_S, own_copy=True)
+                                        started + PIPELINE_BUDGET_S)
         result = await run_parse(check_document_core, copy.path, fmt, _filters(args.get("checks")),
-                                 registered_modules(), rendered_pdf, own_copy=True, exclude=exclude,
+                                 registered_modules(), rendered_pdf, exclude=exclude,
                                  _deadline_at=started + PIPELINE_BUDGET_S, _advice=_CHECK_ADVICE)
     finally:
         await asyncio.to_thread(shutil.rmtree, copy.work, True)
@@ -909,18 +914,20 @@ _VALUES_KEPT = "so the checks read the values the file has"
 
 def copy_workbook(path: str, work: str) -> tuple[str, dict[str, int], list[str]]:
     """Worker core: the workbook at ``path`` copied (read beneath the
-    mount) into a folder of ``work`` of its own (the rendering is written
-    into ``work``), its formula count per sheet, and where it reads outside
-    data."""
+    mount, capped while it is copied) into a folder of ``work`` of its own
+    (the rendering is written into ``work``), its formula count per sheet,
+    and where it reads outside data."""
     import openpyxl
 
+    import safe_fs
+    import shared
     from formats.xlsx import computed
 
     folder = os.path.join(work, WORKBOOK_COPY_STEM)
     os.mkdir(folder, 0o700)
     copy = os.path.join(folder, WORKBOOK_COPY_STEM + Path(path).suffix.lower())
-    with open_beneath_root(path) as src, open(copy, "wb") as dst:
-        shutil.copyfileobj(src, dst)
+    with shared.safe_open_read(path) as src, open(copy, "wb") as dst:
+        safe_fs.copy_fd(src, dst, max_size=CHECK_MAX_FILE_BYTES)
     book = openpyxl.load_workbook(copy)
     try:
         return copy, computed.formula_counts(book), computed.outside_reads(book, computed.outside_parts(copy))
@@ -978,7 +985,7 @@ async def _recalculated_copy(path: str, work: str, deadline: float, notes: list[
 PRINT_MARKS_FOLDER = "print-marks"
 
 
-async def _print_marked(path: str, work: str, deadline: float, notes: list[str], *, own_copy: bool) -> str:
+async def _print_marked(path: str, work: str, deadline: float, notes: list[str]) -> str:
     """The workbook's marked copy in a folder of ``work``, or ``path`` itself
     (with a note) when it cannot be made."""
     import asyncio
@@ -989,15 +996,15 @@ async def _print_marked(path: str, work: str, deadline: float, notes: list[str],
 
     folder = await asyncio.to_thread(render_engine.output_folder, work, PRINT_MARKS_FOLDER)
     try:
-        return await run_parse(print_marks.marked_copy, path, folder, own_copy=own_copy, _deadline_at=deadline,
+        return await run_parse(print_marks.marked_copy, path, folder, _deadline_at=deadline,
                                _advice=_CHECK_ADVICE)
     except (RuntimeError, OSError, ValueError) as exc:
         notes.append(f"How the workbook prints could not be checked ({str(exc) or exc.__class__.__name__}).")
         return path
 
 
-async def _rendering(path: str, fmt: str, wanted: bool, work: str | None, notes: list[str], deadline: float, *,
-                     own_copy: bool = False) -> str | None:
+async def _rendering(path: str, fmt: str, wanted: bool, work: str | None, notes: list[str],
+                     deadline: float) -> str | None:
     """The PDF the ``render`` checks read, made in the parent: a PDF is its
     own rendering, any other format goes through LibreOffice into ``work``
     (the caller's folder); a workbook as its marked copy, which prints as it
@@ -1011,7 +1018,7 @@ async def _rendering(path: str, fmt: str, wanted: bool, work: str | None, notes:
     if fmt == "pdf" or work is None:
         return path
     if fmt == "xlsx":
-        path = await _print_marked(path, work, deadline, notes, own_copy=own_copy)
+        path = await _print_marked(path, work, deadline, notes)
     try:
         return await render_engine.to_pdf(path, out_dir=work)
     except (RuntimeError, OSError, TimeoutError, ValueError) as exc:

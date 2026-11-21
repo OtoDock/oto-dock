@@ -17,8 +17,17 @@ process) it counts the stdio MCPs the proxy starts for the session (LIGHT when
 the config is unknown, never above HEAVY); Docker MCPs (sibling containers)
 and remote MCPs (HTTP) add ~0.
 
-**Remote sessions never count** — ``acquire(target=<machine_id>)`` returns
-immediately, untracked (the satellite enforces its own budget).
+**A personal or admin machine's sessions never count** —
+``acquire(target=<machine_id>)`` returns immediately, untracked (the
+satellite enforces its own count). **A compute machine's do**: a session it
+runs for the platform reserves here on that machine's *box*
+(``_session_box``), the box the session's registered placement or the
+caller's target (``placement.admission_target``) names. The install's
+compute machine shares the host with the platform, so the budget, the count
+cap, the queue and the grow-in debit stay one; Gate 2 reads the box's own free
+memory (the machine's report at its sign-in and in every heartbeat, nothing
+known admits nothing), and a box whose report says it has a cap of its own
+keeps its reservations under that cap too.
 
 **Graceful eviction under pressure**: every denied interactive admit runs the
 eviction loop, which frees BOTH gates (an evicted session returns budget to
@@ -72,21 +81,57 @@ no double-count.
 """
 
 import asyncio
-import collections
 import contextlib
-import json
 import logging
-import os
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import NamedTuple, cast
+from typing import cast
 
 import config
-from core import placement
+from core import concurrency_paired, placement
 from core.background import spawn
+from core.concurrency_scan import (
+    _ADMITTED,
+    _DENY_SPECULATIVE,
+    _GROW_WINDOW_S,
+    _STDIO_MCP_MB,
+    Admission,
+    _at_user_cap,
+    _box_reserved_mb,
+    _deny_busy,
+    _deny_busy_background,
+    _deny_user_cap,
+    _estimate_mb,
+    _fill_owner,
+    _grow_debits,
+    _growin_debit_mb,
+    _is_head,
+    _line,
+    _live_local_sids,
+    _oldest_evictable_local,
+    _owned,
+    _ring_join,
+    _ring_leave,
+    _satellite_stats,
+    _session_added_at,
+    _session_box,
+    _session_est,
+    _session_estimate,
+    _session_grown,
+    _session_host,
+    _session_owner,
+    _sessions,
+    _swap_credit_mb,
+    _task_ring,
+    _task_ring_order,
+    compute_reading,
+    compute_sessions,
+    host_of,
+    placed_on_compute,
+)
 from core.sandbox import host_resources
-from core.session import background_leash
+from core.session import background_leash, session_kind
 
 logger = logging.getLogger("otodock.concurrency")
 
@@ -99,99 +144,56 @@ _RECONCILE_GRACE_S = 120
 _MAINTENANCE_INTERVAL_S = 30
 # Live-RAM read cache TTL — a burst of admits under _cond reads the cgroup once.
 _LIVE_CACHE_TTL_S = 1.0
+
 # Admission queue: the head re-attempts at least this often (a live-RAM change
 # or a session ageing past the eviction floor notifies nobody).
 _QUEUE_SLICE_S = 5.0
 # A parked background wake re-checks whether a person took the chat over.
 _WAKE_SLICE_S = 1.0
-# Grow-in window: a freshly admitted session's RSS takes this long to
-# materialize; until then Gate 2 debits the un-grown remainder of its estimate
-# (linear decay). Without the debit, N near-simultaneous warmups all read the
-# same pre-growth free RAM and overcommit a small box.
-_GROW_WINDOW_S = 90.0
 
-# A Direct-LLM session: the adapter in the proxy, plus each stdio MCP it starts
-# in its own sandbox (about 50 MB for the server, 12 for pasta, 2 for bwrap).
-_DIRECT_BASE_MB = 100
-_DIRECT_STDIO_MCP_MB = 65
-# A generated MCP config is a few KB; anything this large is not one.
-_MCP_CONFIG_MAX_BYTES = 1024 * 1024
-
-# Map an eviction source to the execution_path that resolves its layer.
-_EVICT_CLOSE = {"cli": "claude-code-cli", "direct": "direct-llm", "codex": "codex-cli"}
+# An eviction source whose victim an engine's layer holds in the proxy.
+_EVICT_CLOSE = {"direct": "direct-llm"}
 
 
-class Admission(NamedTuple):
-    """Result of a local-slot admission attempt. Truthy iff admitted, so
-    gate-only call sites keep reading naturally (``if not await acquire...``);
-    denial surfaces show ``user_message`` (and log ``reason``) instead of
-    guessing why."""
-    ok: bool
-    reason: str | None = None        # "busy" | "busy_background" | "host_memory" | "user_cap" | "speculative"
-    user_message: str | None = None  # ready-to-display denial text (None when admitted)
+_DENY_TOOL_MEMORY = Admission(
+    False, "tool_memory",
+    "There is not enough free memory to start this tool right now. Try again in a few minutes.",
+)
 
-    def __bool__(self) -> bool:  # a NamedTuple is otherwise always truthy
-        return self.ok
-
-
-_ADMITTED = Admission(True)
-# A pre-warm that finds no room for two is skipped without a word: nothing
-# was asked for yet.
-_DENY_SPECULATIVE = Admission(False, "speculative", None)
+# A session of the platform's place with no compute machine to take it
+# (``placement.NO_COMPUTE``): its own reason word and the one sentence every
+# door says, decided before any gate, so it never reads as "low on memory"
+# and never reaches a paired computer's check or the platform's own box.
+_DENY_NO_COMPUTE = Admission(False, "no_compute", placement.NO_COMPUTE_SENTENCE)
+# How long a task, a delegated lane, a judge and a wrap-up wait for a compute
+# machine before their run fails with that sentence.
+NO_COMPUTE_WAIT_S = 300.0
 
 
-class _Scan(NamedTuple):
-    """One eviction scan: the victim ``(sid, source, is_prewarm)`` or None,
-    and how many otherwise-evictable sessions were spared for running
-    background work and for a turn in progress."""
-    victim: tuple[str, str, bool] | None
-    spared_background: int
-    spared_live: int
+def _grow_on_paired(session_id: str, judged: bool) -> Admission:
+    """A tool's late start in a session on a personal or admin machine: with
+    room in that machine's memory, else the tool's sentence."""
+    if not judged:
+        return _ADMITTED
+    from core.session import session_manager
+    found = session_manager.live_session(session_id)
+    machine = found.machine_id if found is not None else ""
+    if not machine or concurrency_paired.room(machine, _STDIO_MCP_MB) is not False:
+        return _ADMITTED
+    logger.info("Tool start refused (machine memory): %s on %s", session_id[:8], placement.log_id(machine))
+    return _DENY_TOOL_MEMORY
 
 
-def _deny_busy() -> Admission:
-    return Admission(
-        False, "busy",
-        "Too many active sessions. The platform is busy. Try again shortly, or close an idle chat.",
-    )
-
-
-def _deny_busy_background(spared: int) -> Admission:
-    return Admission(
-        False, "busy_background",
-        f"Too many active sessions, and the {spared} idle one(s) still have "
-        f"background work running. Try again in a few minutes, or stop that work.",
-    )
-
-
-def _deny_user_cap(held: int) -> Admission:
-    return Admission(
-        False, "user_cap",
-        f"You already have {held} sessions running on this platform. End one, or wait a "
-        "few minutes for an idle one to end, then try again.",
-    )
-
-
-def _deny_host_memory(est: int) -> Admission:
+def _deny_host_memory(est: int, box: str = "") -> Admission:
     # NOT session pressure: name the real cause, or the message contradicts the
     # admin page (which can truthfully show 0 active sessions).
     return Admission(
         False, "host_memory",
-        f"This server is low on memory: {_live_available_mb()} MB free, about "
-        f"{est + _floor_mb} MB needed to start. Free some memory on the server, "
+        f"This server is low on memory: {_box_live_mb(box)} MB free, about "
+        f"{est + _box_floor_mb(box)} MB needed to start. Free some memory on the server, "
         "then try again.",
     )
-
-# ---------------------------------------------------------------------------
-# Module-level state
-# ---------------------------------------------------------------------------
-
-_sessions: dict[str, str] = {}            # session_id -> surface kind
-_session_est: dict[str, int] = {}         # session_id -> reserved estimate (MB)
-_session_added_at: dict[str, float] = {}  # session_id -> time.monotonic() at acquire
-_session_owner: dict[str, str] = {}       # session_id -> the person it runs for, when known
-_reserved_mb: int = 0                     # cached Σ _session_est
-_line: list[object] = []                  # queued admits in arrival order (their tasks)
+_reserved_mb: int = 0                     # cached Σ _session_est of the platform's host
 _parked_tasks: int = 0                    # count of tasks blocked in acquire
 
 _cond: asyncio.Condition | None = None    # initialized in init()
@@ -207,14 +209,22 @@ _live_cache: tuple[float, int] | None = None   # (monotonic_ts, available_mb)
 # Initialization
 # ---------------------------------------------------------------------------
 
-def init() -> None:
-    """Create the condition and cache the budget/floor. Call once at startup."""
-    global _cond, _budget_mb, _total_mb, _floor_mb
-
-    _cond = asyncio.Condition()
+def _read_limits() -> None:
+    """The platform's total, budget and floor: at start, and again at every
+    maintenance tick, so a container cap changed while it runs counts (a
+    compute machine's limit is read again at every report)."""
+    global _budget_mb, _total_mb, _floor_mb
     _total_mb = max(1, host_resources.detect_memory_limit_bytes() // (1024 * 1024))
     _budget_mb = int(_total_mb * config.BUDGET_FRACTION)
-    _floor_mb = max(config.SESSION_RESERVE_FLOOR_MB, int(_total_mb * 0.03))
+    _floor_mb = _reserve_of(_total_mb)
+
+
+def init() -> None:
+    """Create the condition and read the budget/floor. Call once at startup."""
+    global _cond
+
+    _cond = asyncio.Condition()
+    _read_limits()
 
     logger.info(
         "Concurrency: budget=%dMB (%.0f%% of %dMB) · gate-2 floor=%dMB · est heavy/light=%d/%d MB "
@@ -223,56 +233,6 @@ def init() -> None:
         config.SESSION_EST_HEAVY_MB, config.SESSION_EST_LIGHT_MB, config.SESSION_EVICT_FLOOR_S,
         config.OTODOCK_MAX_LOCAL_SESSIONS or "off", config.MAX_SESSIONS_PER_USER or "off",
     )
-
-
-# ---------------------------------------------------------------------------
-# Estimates + gates (call gate helpers under _cond)
-# ---------------------------------------------------------------------------
-
-def _no_os_process(execution_path: str | None) -> bool:
-    """The engine runs in the proxy (Direct LLM), not as its own process tree."""
-    from core.session.session_manager import get_layer_capabilities
-    caps = get_layer_capabilities(execution_path or "")
-    return caps is not None and not caps.runtime.has_os_process
-
-
-def _estimate_mb(execution_path: str | None, stdio_mcps: int = 0) -> int:
-    """Coarse per-TYPE memory reserve: every subprocess engine is HEAVY; an
-    engine with no OS process (the in-process Direct LLM loop) reserves its
-    adapter plus the stdio MCPs it starts, LIGHT at the least and never more
-    than a CLI session carrying the same servers."""
-    heavy = config.SESSION_EST_HEAVY_MB
-    if not _no_os_process(execution_path):
-        return heavy
-    light = config.SESSION_EST_LIGHT_MB
-    if stdio_mcps <= 0:
-        return light
-    return min(heavy, max(light, _DIRECT_BASE_MB + stdio_mcps * _DIRECT_STDIO_MCP_MB))
-
-
-def _stdio_mcp_count(path: str) -> int:
-    """Stdio servers in a generated MCP config; 0 when the file is unreadable,
-    not JSON or implausibly large."""
-    from services.mcp.mcp_manifest_types import is_stdio_transport
-    try:
-        if os.path.getsize(path) > _MCP_CONFIG_MAX_BYTES:
-            return 0
-        with open(path, encoding="utf-8") as f:
-            servers = json.load(f).get("mcpServers") or {}
-        return sum(1 for server in servers.values()
-                   if isinstance(server, dict) and is_stdio_transport(server.get("type")))
-    except (OSError, ValueError):
-        return 0
-
-
-async def _session_estimate(session_id: str, execution_path: str | None,
-                            mcp_config_path: str) -> int:
-    """The reserve for a new session; the config is read off the loop, and
-    only for an in-process engine not yet tracked."""
-    stdio_mcps = 0
-    if mcp_config_path and session_id not in _sessions and _no_os_process(execution_path):
-        stdio_mcps = await asyncio.to_thread(_stdio_mcp_count, mcp_config_path)
-    return _estimate_mb(execution_path, stdio_mcps)
 
 
 def _live_available_mb() -> int:
@@ -295,81 +255,176 @@ def _live_available_mb() -> int:
     return mb
 
 
-def _swap_credit_mb() -> int:
-    """min(SwapFree / 2, SESSION_SWAP_CREDIT_MB) — 0 when disabled/swapless."""
-    if config.SESSION_SWAP_CREDIT_MB <= 0:
+# A compute box's evicted estimates since its last report: the report is
+# the only read of its free memory and an eviction does not change it, so
+# each one counts as freed until a report newer than it (box -> [(when, MB)]).
+_evicted_credit: dict[str, list[tuple[float, int]]] = {}
+
+
+def _reported_at(box: str) -> float:
+    """When a compute machine's last memory report was taken (monotonic)."""
+    from core.remote.satellite_connection import get_connection_manager
+    held = get_connection_manager().machine_memory_report(box, compute=True)
+    return time.monotonic() - (held[1] if held else 0.0)
+
+
+def _box_live_mb(box: str = "") -> int:
+    """A box's free memory: the platform's own read, or a compute machine's
+    report (0 when none is fresh) plus what it evicted since that report.
+    A reading writes nothing: the balancer reads it from a worker thread
+    (``box_room_mb``), and the stale credits go when one is written
+    (``_note_evicted_credit``)."""
+    if not box:
+        return _live_available_mb()
+    reading = compute_reading(box)
+    if not reading.known:
         return 0
-    swap_mb = host_resources.swap_free_bytes() // (1024 * 1024)
-    return min(swap_mb // 2, config.SESSION_SWAP_CREDIT_MB)
+    reported_at = _reported_at(box)
+    credit = [c for c in tuple(_evicted_credit.get(box, ())) if c[0] > reported_at]
+    return reading.available_mb + sum(mb for _, mb in credit)
 
 
-def _gate1(est: int, *, is_task: bool) -> bool:
-    """Reservation budget (instant). Tasks keep one HEAVY of headroom so background
-    work never consumes the room a human interactive session needs, and, under
+def _note_evicted_credit(box: str, mb: int) -> None:
+    """What an eviction on a compute box gives back until its next report,
+    with the credits that report already shows dropped. On the loop."""
+    reported_at = _reported_at(box)
+    kept = [c for c in _evicted_credit.get(box, []) if c[0] > reported_at]
+    _evicted_credit[box] = [*kept, (time.monotonic(), mb)]
+
+
+def _reserve_of(total_mb: int) -> int:
+    """The reserve of the platform's host or a compute machine of this size:
+    the larger of ``SESSION_RESERVE_FLOOR_MB`` and its share (``host_resources``,
+    the numbers a machine's guard reads too)."""
+    return host_resources.reserve_mb(total_mb, floor_mb=config.SESSION_RESERVE_FLOOR_MB,
+                                     share=host_resources.COMPUTE_SHARE)
+
+
+def _box_total_mb(box: str = "") -> int:
+    return _total_mb if not box else compute_reading(box).total_mb
+
+
+def _box_floor_mb(box: str = "") -> int:
+    """Gate 2's floor for a box: its reserve (``_reserve_of``)."""
+    if not box:
+        return _floor_mb
+    return _reserve_of(compute_reading(box).total_mb)
+
+
+def _task_headroom_mb(box: str = "") -> int:
+    """What a task or a background wake leaves free on a box, in both gates:
+    one HEAVY, or a thirty-second of the box's room on a small machine, so
+    the smallest server still starts a task beside a resting chat."""
+    return host_resources.task_headroom_mb(_box_total_mb(box), _box_floor_mb(box),
+                                           config.SESSION_EST_HEAVY_MB)
+
+
+def _box_budget_mb(box: str) -> int | None:
+    """A compute box's own budget, from its report: a compute machine on
+    another host always (it is a host of its own), one beside the platform
+    only when its report says it has a cap of its own; None otherwise."""
+    if not box:
+        return None
+    reading = compute_reading(box)
+    if not reading.capped and not host_of(box):
+        return None
+    return int(reading.total_mb * config.BUDGET_FRACTION)
+
+
+def _box_cap_ok(box: str, est: int, headroom: int) -> bool:
+    """A compute box with a budget of its own keeps its own reservations
+    under it."""
+    budget = _box_budget_mb(box)
+    return budget is None or _box_reserved_mb(box) + est <= budget - headroom
+
+
+def _host_count(host: str) -> int:
+    """The sessions that hold a slot on one host. Over copies of the tables:
+    the balancer reads it from a worker thread beside the loop."""
+    hosts = dict(_session_host)
+    return sum(1 for sid in list(_sessions) if hosts.get(sid, "") == host)
+
+
+def _gate1(est: int, *, is_task: bool, box: str = "") -> bool:
+    """Reservation budget (instant). Tasks keep a headroom (``_task_headroom_mb``)
+    so background work never consumes the room a human interactive session needs, and, under
     a hard cap of 2 or more, one slot of the count (under a cap of 1 a task
-    would never run)."""
+    would never run). The budget and the count are the platform's host's, its
+    own box and every compute machine beside it together; a capped compute box
+    adds its own cap. A compute machine on another host is judged against its
+    own report's budget alone, and the count does not cap it."""
+    headroom = _task_headroom_mb(box) if is_task else 0
+    if host_of(box):
+        return _box_cap_ok(box, est, headroom)
     cap = config.OTODOCK_MAX_LOCAL_SESSIONS
-    if cap and len(_sessions) + (1 if is_task and cap >= 2 else 0) >= cap:
+    if cap and _host_count("") + (1 if is_task and cap >= 2 else 0) >= cap:
         return False
-    headroom = config.SESSION_EST_HEAVY_MB if is_task else 0
-    return _reserved_mb + est <= _budget_mb - headroom
+    return _reserved_mb + est <= _budget_mb - headroom and _box_cap_ok(box, est, headroom)
 
 
-def _growin_debit_mb() -> int:
-    """Σ un-materialized estimate of sessions admitted < ``_GROW_WINDOW_S`` ago.
-
-    Linear decay: a session admitted N seconds ago is assumed to have grown
-    into ``est × N/window`` of its reservation already (visible in live RAM),
-    so only the remainder is debited — conservative during the window, zero
-    after it (no steady-state double-count)."""
-    now = time.monotonic()
-    debit = 0
-    for sid, added in _session_added_at.items():
-        elapsed = now - added
-        if elapsed < _GROW_WINDOW_S:
-            debit += int(_session_est.get(sid, 0) * (1.0 - elapsed / _GROW_WINDOW_S))
-    return debit
+def _gate2(est: int, *, is_task: bool, box: str = "") -> bool:
+    """Live-RAM OOM veto (grow-in-debited on the box's host), on the box's
+    own free memory. Same task headroom as gate 1."""
+    headroom = _task_headroom_mb(box) if is_task else 0
+    return _box_live_mb(box) - _growin_debit_mb(host_of(box)) - est >= _box_floor_mb(box) + headroom
 
 
-def _gate2(est: int, *, is_task: bool) -> bool:
-    """Live-RAM OOM veto (grow-in-debited). Same task headroom as gate 1."""
-    headroom = config.SESSION_EST_HEAVY_MB if is_task else 0
-    return _live_available_mb() - _growin_debit_mb() - est >= _floor_mb + headroom
+def box_room_mb(box: str = "") -> int:
+    """How much a new session could take on a box now: the smaller of its
+    host's Gate 1 room and its Gate 2 room, none on the platform's host at its
+    count cap. The balancer ranks the compute machines by it
+    (``remote_status.serving_compute_machine``)."""
+    cap = config.OTODOCK_MAX_LOCAL_SESSIONS
+    if not host_of(box) and cap and _host_count("") >= cap:
+        return 0
+    gate2 = _box_live_mb(box) - _growin_debit_mb(host_of(box)) - _box_floor_mb(box)
+    own = _box_budget_mb(box)
+    gate1 = own - _box_reserved_mb(box) if own is not None else _budget_mb - _reserved_mb
+    if own is not None and not host_of(box):
+        gate1 = min(gate1, _budget_mb - _reserved_mb)
+    return max(0, min(gate1, gate2))
 
 
-def _has_room(est: int, *, is_task: bool) -> bool:
-    return _gate1(est, is_task=is_task) and _gate2(est, is_task=is_task)
+def _has_room(est: int, *, is_task: bool, box: str = "") -> bool:
+    return _gate1(est, is_task=is_task, box=box) and _gate2(est, is_task=is_task, box=box)
 
 
-def _speculative_room(est: int, owner: str) -> bool:
+def _speculative_room(est: int, owner: str, box: str = "") -> bool:
     """Room for this session AND one HEAVY more, so a speculative spawn never
     takes the last slot a real session needs: the count cap, the budget and
     the live read (grow-in debited), nobody parked or queued for a slot, and
     the person below their cap."""
     heavy = config.SESSION_EST_HEAVY_MB
+    host = host_of(box)
     cap = config.OTODOCK_MAX_LOCAL_SESSIONS
-    if cap and len(_sessions) + 2 > cap:
+    if not host and cap and _host_count("") + 2 > cap:
         return False
-    if _parked_tasks > 0 or _line:
+    if _parked_tasks > 0 or any(h == host for _t, h in _line):
         return False
     if owner and config.MAX_SESSIONS_PER_USER > 0 and _at_user_cap(owner):
         return False
-    if _reserved_mb + est + heavy > _budget_mb:
+    if (not host and _reserved_mb + est + heavy > _budget_mb) or not _box_cap_ok(box, est + heavy, 0):
         return False
-    return _live_available_mb() - _growin_debit_mb() - est - heavy >= _floor_mb
+    return _box_live_mb(box) - _growin_debit_mb(host) - est - heavy >= _box_floor_mb(box)
 
 
-def prewarm_allowed(execution_path: str | None = None, *, user_sub: str | None = None) -> bool:
-    """Whether a pre-warm may start now: the box has room for it and one more
-    session (``fit_heavy >= 2``), nobody waits for a slot, and the person
-    holds fewer sessions than their cap. Read-only; a pre-warm site asks
-    before building the session's config."""
+def prewarm_allowed(execution_path: str | None = None, *, user_sub: str | None = None,
+                    shared_folder: bool = False) -> bool:
+    """Whether a pre-warm may start now: a compute machine serves the engine's place, its box has room
+    for the pre-warm and one more session (``fit_heavy >= 2``), nobody waits for a slot, and the person
+    holds fewer sessions than their cap. Read-only; a pre-warm site asks before building the session's
+    config, so with no compute machine nothing is built and nothing is said. ``shared_folder``: the
+    site's ``remote_status.keeps_beside``, read off the loop (this runs on it and reads no store)."""
     if _cond is None:
         return False
-    return _speculative_room(_estimate_mb(execution_path), user_sub or "")
+    from core.session.session_manager import compute_placement_for
+    built = compute_placement_for(execution_path or "", shared_folder=shared_folder)
+    if built is None:
+        return False
+    return _speculative_room(_estimate_mb(execution_path), user_sub or "", str(built.machine_id))
 
 
-def _add(session_id: str, kind: str, est: int, owner: str = "") -> None:
+def _add(session_id: str, kind: str, est: int, owner: str = "", box: str = "") -> None:
     """Reserve a slot. est is written ONLY here (never on idempotent re-acquire)."""
     global _reserved_mb
     assert session_id not in _session_est, f"double _add for {session_id}"
@@ -378,31 +433,30 @@ def _add(session_id: str, kind: str, est: int, owner: str = "") -> None:
     _session_added_at[session_id] = time.monotonic()
     if owner:
         _session_owner[session_id] = owner
-    _reserved_mb += est
+    if box:
+        _session_box[session_id] = box
+    host = host_of(box)
+    if host:
+        _session_host[session_id] = host
+    else:
+        _reserved_mb += est
 
 
-def _fill_owner(session_id: str, owner: str | None) -> None:
-    """An idempotent re-acquire that knows the owner records it when none is
-    recorded yet; a recorded owner is never overwritten."""
-    if owner and session_id in _sessions and not _session_owner.get(session_id):
-        _session_owner[session_id] = owner
-
-
-def _cap_owner(session_id: str) -> str:
-    """Whom a session counts against under the per-person cap: the ledger's
-    owner only. A session with none counts against nobody, so it is also no
-    one's to give up at the cap (``_make_room_under_user_cap``)."""
-    return _session_owner.get(session_id, "")
-
-
-def _owned(owner: str) -> int:
-    """Chat sessions the ledger holds for ``owner`` (``_cap_owner``)."""
-    return sum(1 for sid, kind in _sessions.items()
-               if kind == "chat" and _cap_owner(sid) == owner)
-
-
-def _at_user_cap(owner: str) -> bool:
-    return _owned(owner) >= config.MAX_SESSIONS_PER_USER
+def _move_box(session_id: str, box: str) -> None:
+    """A held reservation moved to another box, its host's sums with it."""
+    global _reserved_mb
+    est = _session_est.get(session_id, 0)
+    if not _session_host.pop(session_id, ""):
+        _reserved_mb = max(0, _reserved_mb - est)
+    if box:
+        _session_box[session_id] = box
+    else:
+        _session_box.pop(session_id, None)
+    host = host_of(box)
+    if host:
+        _session_host[session_id] = host
+    else:
+        _reserved_mb += est
 
 
 def _remove(session_id: str) -> str | None:
@@ -413,7 +467,9 @@ def _remove(session_id: str) -> str | None:
     est = _session_est.pop(session_id, None)
     _session_added_at.pop(session_id, None)
     _session_owner.pop(session_id, None)
-    if est:
+    _session_box.pop(session_id, None)
+    _session_grown.pop(session_id, None)
+    if est and not _session_host.pop(session_id, ""):
         _reserved_mb = max(0, _reserved_mb - est)
     return kind
 
@@ -445,6 +501,63 @@ def _schedule_notify() -> None:
 # Acquire / release
 # ---------------------------------------------------------------------------
 
+def _box_for(session_id: str, target: str) -> str | None:
+    """The box a session reserves on: the compute machine its registered
+    placement names (a resume or a re-attach passes the chat's ``local``
+    pin) while that machine is connected or the remote layer still holds the
+    session (its machine in its grace), else its caller's target, ``""`` for
+    the platform's own and a connected compute machine's id for one
+    (``placement.admission_target``); None for a personal or admin machine,
+    which counts its own sessions. A placement kept across a restart whose
+    machine is gone resumes on the platform: its box knows nothing."""
+    from core.remote.satellite_connection import get_connection_manager
+    from core.session import session_manager
+    manager = get_connection_manager()
+    machine = placed_on_compute(session_id)
+    if machine and (manager.is_compute(machine) or session_manager.live_session(session_id) is not None):
+        return machine
+    if placement.is_local(target):
+        return ""
+    return target if manager.is_compute(target) else None
+
+
+def _no_machine(session_id: str, target: str) -> bool:
+    """Whether the session is the platform's with no compute machine to take
+    it (``placement.NO_COMPUTE``, what ``placement.admission_target`` answers
+    for it) and no machine holds it already."""
+    return target == placement.NO_COMPUTE and not _box_for(session_id, placement.LOCAL)
+
+
+def compute_signed_in(machine_id: str = "") -> None:
+    """A compute machine signed in: what waits for one looks again (a task
+    parked on a box that knew nothing, ``wait_for_compute``), and the time
+    it went away is forgotten, so a later absence is counted from its own
+    start. Called beside the sign-in's other steps
+    (``compute_bootstrap.on_alive_report``)."""
+    if machine_id:
+        _box_away_since.pop(machine_id, None)
+    _schedule_notify()
+
+
+async def wait_for_compute(serves: Callable[[], bool], *, timeout_s: float = NO_COMPUTE_WAIT_S) -> bool:
+    """Wait until ``serves()`` answers true (a compute machine that can take
+    the caller's session is connected), at most ``timeout_s``: woken by a
+    sign-in (``compute_signed_in``), by any slot that frees and by the
+    maintenance tick. True when one serves. For a run that takes its slot
+    before it builds: it waits here, then its build either lands on the
+    machine or is refused with the sentence, which is the run's report."""
+    if serves():
+        return True
+    if _cond is None:
+        return False
+    try:
+        async with _cond:
+            await asyncio.wait_for(_cond.wait_for(serves), timeout=max(0.0, timeout_s))
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
 async def acquire(session_id: str, kind: str, *, target: str = placement.LOCAL,
                   execution_path: str | None = None, blocking: bool = False,
                   user_sub: str | None = None, per_user_cap: bool = True,
@@ -468,27 +581,38 @@ async def acquire(session_id: str, kind: str, *, target: str = placement.LOCAL,
     (:func:`prewarm_allowed`), never evicts, and is refused quietly
     (``reason="speculative"``, no message). ``queue_wait_s`` lets a denied
     interactive admit wait that long, in arrival order, for a slot.
-    ``mcp_config_path`` (the session's generated MCP config) sizes a Direct-LLM
-    reserve by the stdio MCPs it starts.
+    ``mcp_config_path`` (the session's generated MCP config) sizes the reserve
+    by the stdio tools it starts with and those that wait for their first
+    call (``_estimate_mb``); each later start grows it (``grow``).
+
+    A session of the platform's place with no compute machine to take it
+    (``target`` is ``placement.NO_COMPUTE``) is refused with the sentence
+    and reserves nothing, a task too: the platform runs no session itself.
     """
-    if not placement.is_local(target):
-        return _ADMITTED
+    if _no_machine(session_id, target):
+        if not speculative:
+            logger.info("Slot refused (no compute machine): %s (%s)", session_id[:8], kind)
+        return _DENY_SPECULATIVE if speculative else _DENY_NO_COMPUTE
+    box = _box_for(session_id, target)
+    if box is None:
+        return await _admit_on_paired(session_id, target, execution_path, blocking=blocking,
+                                      speculative=speculative, mcp_config_path=mcp_config_path)
 
     assert _cond is not None, "concurrency.init() not called"
     est = await _session_estimate(session_id, execution_path, mcp_config_path)
     owner = user_sub or ""
 
     if blocking:
-        return await _acquire_task(session_id, kind, est, owner, ring_key=ring_key)
+        return await _acquire_task(session_id, kind, est, owner, ring_key=ring_key, box=box)
     if speculative:
         async with _cond:
             if session_id in _sessions:
                 _fill_owner(session_id, owner)
                 return _ADMITTED
-            if not _speculative_room(est, owner):
+            if not _speculative_room(est, owner, box):
                 logger.debug("Speculative slot refused: %s (no room for two)", session_id[:8])
                 return _DENY_SPECULATIVE
-            _add(session_id, kind, est, owner)
+            _add(session_id, kind, est, owner, box)
             return _ADMITTED
 
     cap_owner = owner if (owner and per_user_cap and kind == "chat"
@@ -499,16 +623,16 @@ async def acquire(session_id: str, kind: str, *, target: str = placement.LOCAL,
             return adm
     if queue_wait_s and queue_wait_s > 0:
         return await _acquire_queued(session_id, kind, est, prefer_user=user_sub,
-                                     owner=owner, cap_owner=cap_owner, wait_s=queue_wait_s)
+                                     owner=owner, cap_owner=cap_owner, wait_s=queue_wait_s, box=box)
 
     async with _cond:
         if session_id in _sessions:
             _fill_owner(session_id, owner)
             return _ADMITTED
-        if _has_room(est, is_task=False):
+        if _has_room(est, is_task=False, box=box):
             if cap_owner and _at_user_cap(cap_owner):
                 return _deny_user_cap(_owned(cap_owner))
-            _add(session_id, kind, est, owner)
+            _add(session_id, kind, est, owner, box)
             logger.debug("Slot acquired: %s (%s) reserved=%d/%dMB", session_id[:8], kind,
                          _reserved_mb, _budget_mb)
             return _ADMITTED
@@ -519,20 +643,43 @@ async def acquire(session_id: str, kind: str, *, target: str = placement.LOCAL,
     # by itself — see the module docstring), applies the empty-platform
     # last-resort admit, and attributes the eventual denial honestly.
     return await _admit_with_eviction(session_id, kind, est, prefer_user=user_sub,
-                                      owner=owner, cap_owner=cap_owner)
+                                      owner=owner, cap_owner=cap_owner, box=box)
 
 
-def _is_head(ticket: object) -> bool:
-    """Whether ``ticket`` leads the admission line (a finished waiter's ticket
-    ahead of it is dropped: its own cleanup already ran or never will)."""
-    while (_line and _line[0] is not ticket and isinstance(_line[0], asyncio.Task)
-           and _line[0].done()):
-        _line.pop(0)
-    return bool(_line) and _line[0] is ticket
+async def _admit_on_paired(session_id: str, machine: str, execution_path: str | None, *,
+                           blocking: bool, speculative: bool, mcp_config_path: str) -> Admission:
+    """A personal or admin machine reserves nothing here; a NEW start there
+    is checked against the memory its satellite reports (``concurrency_paired``):
+    an interactive one closes idle sessions there first and is then refused
+    with one sentence, a task waits in that machine's line. A machine whose
+    memory is not known, and a session already there, pass as before."""
+    if (_cond is None or speculative or placement.is_local(machine)
+            or concurrency_paired.live(session_id, machine)
+            or concurrency_paired.room(machine, 0) is None):
+        return _ADMITTED
+    est = await _session_estimate(session_id, execution_path, mcp_config_path)
+    if blocking:
+        await concurrency_paired.wait_in_line(session_id, machine, est, _cond)
+        return _ADMITTED
+    if concurrency_paired.room(machine, est) is False:
+        await concurrency_paired.make_room(machine, est)
+        if concurrency_paired.room(machine, est) is False:
+            logger.info("Slot denied (machine memory): %s on %s, %d MB short", session_id[:8],
+                        placement.log_id(machine), concurrency_paired.shortfall_mb(machine, est))
+            return concurrency_paired.denial()
+    concurrency_paired.note_admitted(session_id, machine, est)
+    return _ADMITTED
+
+
+def machine_report(machine_id: str) -> None:
+    """A paired machine's memory report arrived: a task waiting in its line
+    reads it now."""
+    if concurrency_paired.report_arrived(machine_id):
+        _schedule_notify()
 
 
 async def _acquire_queued(session_id: str, kind: str, est: int, *, prefer_user: str | None,
-                          owner: str, cap_owner: str, wait_s: float) -> Admission:
+                          owner: str, cap_owner: str, wait_s: float, box: str = "") -> Admission:
     """Wait in arrival order, up to ``wait_s``, for a slot.
 
     The ticket is taken before the first attempt, so two newcomers never both
@@ -544,14 +691,16 @@ async def _acquire_queued(session_id: str, kind: str, est: int, *, prefer_user: 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + wait_s
     ticket: object = asyncio.current_task() or object()
+    host = host_of(box)
+    entry = (ticket, host)
     last: Admission | None = None
     async with cast("asyncio.Condition", _cond):
-        _line.append(ticket)
+        _line.append(entry)
     try:
         while True:
-            if _is_head(ticket):
+            if _is_head(ticket, host):
                 adm = await _admit_with_eviction(session_id, kind, est, prefer_user=prefer_user,
-                                                 owner=owner, cap_owner=cap_owner, quiet=True)
+                                                 owner=owner, cap_owner=cap_owner, quiet=True, box=box)
                 if adm or adm.reason in ("host_memory", "user_cap"):
                     return adm
                 last = adm
@@ -561,10 +710,10 @@ async def _acquire_queued(session_id: str, kind: str, est: int, *, prefer_user: 
                     return _ADMITTED
                 # Re-checked under the lock right before waiting: a release
                 # during the head's lock-free eviction pass notified nobody.
-                if _is_head(ticket) and _has_room(est, is_task=False):
+                if _is_head(ticket, host) and _has_room(est, is_task=False, box=box):
                     if cap_owner and _at_user_cap(cap_owner):
                         return _deny_user_cap(_owned(cap_owner))
-                    _add(session_id, kind, est, owner)
+                    _add(session_id, kind, est, owner, box)
                     return _ADMITTED
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -579,7 +728,7 @@ async def _acquire_queued(session_id: str, kind: str, est: int, *, prefer_user: 
         # Synchronous: an awaited cleanup can be cancelled half-way and leave
         # a ticket behind that holds the line for good.
         with contextlib.suppress(ValueError):
-            _line.remove(ticket)
+            _line.remove(entry)
         _schedule_notify()
 
 
@@ -618,35 +767,27 @@ async def _make_room_under_user_cap(session_id: str, owner: str) -> Admission | 
         await _evict_one(*scan.victim)
 
 
-# The parked tasks' ring (`_acquire_task`): one FIFO per creator and the
-# round-robin order of the creators, so one person's burst takes one slot
-# per round and a single run waits behind at most one run of each other
-# creator. A waiter is its (session id, estimate) ticket.
-_task_ring: dict[str, collections.deque[tuple[str, int]]] = {}
-_task_ring_order: collections.deque[str] = collections.deque()
+#: When each compute box a task waits on was first seen away.
+_box_away_since: dict[str, float] = {}
 
 
-def _ring_join(key: str, ticket: tuple[str, int]) -> None:
-    line = _task_ring.get(key)
-    if line is None:
-        line = _task_ring[key] = collections.deque()
-        _task_ring_order.append(key)
-    line.append(ticket)
+def _box_left(box: str) -> bool:
+    """Whether a waiting task's compute machine has been away for longer than
+    ``NO_COMPUTE_WAIT_S``: the ticket then gives up and its run's build
+    decides (another machine, or the sentence). While the machine is away
+    for less, its box knows nothing and the ticket stays parked: a sign-in
+    wakes it (``compute_signed_in``), so a short restart of the compute
+    machine costs a waiting run nothing."""
+    if not box:
+        return False
+    from core.remote.satellite_connection import get_connection_manager
+    if get_connection_manager().is_compute(box):
+        _box_away_since.pop(box, None)
+        return False
+    return time.monotonic() - _box_away_since.setdefault(box, time.monotonic()) > NO_COMPUTE_WAIT_S
 
 
-def _ring_leave(key: str, ticket: tuple[str, int]) -> None:
-    line = _task_ring.get(key)
-    if line is None:
-        return
-    with contextlib.suppress(ValueError):
-        line.remove(ticket)
-    if not line:
-        del _task_ring[key]
-        with contextlib.suppress(ValueError):
-            _task_ring_order.remove(key)
-
-
-def _ring_turn(key: str, ticket: tuple[str, int]) -> bool:
+def _ring_turn(key: str, ticket: tuple[str, int, str]) -> bool:
     """Whether ``ticket`` is the one the ring admits now: the head of the
     first creator in ring order whose head fits (a heavy head of one creator
     never blocks a lighter head of another)."""
@@ -655,7 +796,7 @@ def _ring_turn(key: str, ticket: tuple[str, int]) -> bool:
         if not line:
             continue
         head = line[0]
-        if _has_room(head[1], is_task=True):
+        if _has_room(head[1], is_task=True, box=head[2]):
             return k == key and head == ticket
     return False
 
@@ -670,8 +811,8 @@ def _ring_rotate(key: str) -> None:
 
 
 async def _acquire_task(session_id: str, kind: str, est: int, owner: str = "",
-                        ring_key: str = "") -> Admission:
-    """Blocking task acquire — waits until both gates allow (with HEAVY headroom),
+                        ring_key: str = "", box: str = "") -> Admission:
+    """Blocking task acquire — waits until both gates allow (with the task headroom),
     in the parked tasks' ring: the creators take turns. Task-side eviction is
     driven by the maintenance loop (keeps wait_for pure)."""
     global _parked_tasks
@@ -679,16 +820,16 @@ async def _acquire_task(session_id: str, kind: str, est: int, owner: str = "",
         if session_id in _sessions:
             _fill_owner(session_id, owner)
             return _ADMITTED
-        if not _has_room(est, is_task=True) or _task_ring:
+        if not _has_room(est, is_task=True, box=box) or _task_ring:
             key = ring_key or "-"
-            ticket = (session_id, est)
+            ticket = (session_id, est, box)
             _ring_join(key, ticket)
             _parked_tasks += 1
             logger.info("Task %s parked: no slot (reserved=%d/%dMB, sessions=%d)",
                         session_id[:8], _reserved_mb, _budget_mb, len(_sessions))
             try:
                 await cast("asyncio.Condition", _cond).wait_for(
-                    lambda: session_id in _sessions or _ring_turn(key, ticket))
+                    lambda: session_id in _sessions or _box_left(box) or _ring_turn(key, ticket))
             finally:
                 _parked_tasks -= 1  # decrement even on Cancelled/Timeout
                 _ring_leave(key, ticket)
@@ -696,20 +837,26 @@ async def _acquire_task(session_id: str, kind: str, est: int, owner: str = "",
         if session_id in _sessions:
             _fill_owner(session_id, owner)
             return _ADMITTED
-        _add(session_id, kind, est, owner)
+        if _box_left(box):
+            logger.info("Task %s gave up its place in line: its compute machine %s stayed away",
+                        session_id[:8], placement.log_id(box))
+            return _DENY_NO_COMPUTE
+        _add(session_id, kind, est, owner, box)
         return _ADMITTED
 
 
-def _pressure_snapshot(est: int) -> tuple[bool, int, bool]:
+def _pressure_snapshot(est: int, box: str = "") -> tuple[bool, int, bool]:
     """(gate1_ok, live_mb, sessions_account) — call under ``_cond``.
 
     ``sessions_account`` answers "could evicting tracked sessions plausibly
     close the Gate-2 gap?": the reservation sum covers the live shortfall
     (estimate + floor + grow-in debit − live). A negative shortfall (Gate 2
     passing) trivially accounts."""
-    live = _live_available_mb()
-    shortfall = (est + _floor_mb + _growin_debit_mb()) - live
-    return _gate1(est, is_task=False), live, _reserved_mb >= shortfall
+    live = _box_live_mb(box)
+    host = host_of(box)
+    shortfall = (est + _box_floor_mb(box) + _growin_debit_mb(host)) - live
+    held = _box_reserved_mb(box) if host else _reserved_mb
+    return _gate1(est, is_task=False, box=box), live, held >= shortfall
 
 
 async def _idle_timeout() -> int:
@@ -722,7 +869,8 @@ async def _idle_timeout() -> int:
 
 async def _admit_with_eviction(session_id: str, kind: str, est: int, *,
                                prefer_user: str | None, owner: str = "",
-                               cap_owner: str = "", quiet: bool = False) -> Admission:
+                               cap_owner: str = "", quiet: bool = False,
+                               box: str = "") -> Admission:
     """Loop: evict the most-idle idle local session → re-check → admit.
 
     Runs for EVERY denied interactive admit. Eviction frees BOTH gates (budget
@@ -735,6 +883,9 @@ async def _admit_with_eviction(session_id: str, kind: str, est: int, *,
     log_denial = logger.debug if quiet else logger.warning
     floor_age = min(config.SESSION_EVICT_FLOOR_S, await _idle_timeout())
     skipped_pending = 0
+    reading = compute_reading(box) if box else None
+    # A compute machine whose own cap binds gives up its own sessions first.
+    box_first = box if reading is not None and reading.capped else None
     while True:
         async with cast("asyncio.Condition", _cond):
             if session_id in _sessions:
@@ -742,20 +893,27 @@ async def _admit_with_eviction(session_id: str, kind: str, est: int, *,
                 return _ADMITTED
             if cap_owner and _at_user_cap(cap_owner):
                 return _deny_user_cap(_owned(cap_owner))
-            if _has_room(est, is_task=False):
-                _add(session_id, kind, est, owner)
+            if _has_room(est, is_task=False, box=box):
+                _add(session_id, kind, est, owner, box)
                 return _ADMITTED
-            gate1_ok, live, sessions_account = _pressure_snapshot(est)
-            if not _sessions:
-                # LAST-RESORT ADMIT: zero tracked sessions, so the veto is
+            gate1_ok, live, sessions_account = _pressure_snapshot(est, box)
+            if box and not compute_reading(box).known:
+                # Nothing known of the compute machine's memory admits
+                # nothing there: the platform's failed read does the same.
+                log_denial("Slot denied (no memory report from compute machine %s): %s",
+                           box[:8], session_id[:8])
+                return _deny_host_memory(est, box)
+            if not host_of(box) and _host_count("") == 0:
+                # LAST-RESORT ADMIT: zero sessions on the platform's host, so the veto is
                 # denying the platform its ONLY session — swap can back one
                 # (a slow session beats a locked-out user). By construction
-                # this bypasses both gates at most once.
-                _add(session_id, kind, est, owner)
+                # this bypasses both gates at most once. Never on another
+                # host, whose memory is not the platform's.
+                _add(session_id, kind, est, owner, box)
                 logger.warning(
                     "Concurrency: last-resort admit %s (%s) on a low-memory host "
                     "(live=%dMB, est=%dMB, floor=%dMB) — only session, swap-backed",
-                    session_id[:8], kind, live, est, _floor_mb,
+                    session_id[:8], kind, live, est, _box_floor_mb(box),
                 )
                 return _ADMITTED
             if gate1_ok and not sessions_account:
@@ -765,9 +923,9 @@ async def _admit_with_eviction(session_id: str, kind: str, est: int, *,
                 log_denial(
                     "Slot denied (live-RAM veto, not session pressure): %s "
                     "reserved=%d/%dMB live=%dMB floor=%dMB",
-                    session_id[:8], _reserved_mb, _budget_mb, live, _floor_mb,
+                    session_id[:8], _reserved_mb, _budget_mb, live, _box_floor_mb(box),
                 )
-                return _deny_host_memory(est)
+                return _deny_host_memory(est, box)
         # An interactive admit evicts a session with running background work
         # or a turn in progress only past the background-work ceiling; an
         # unused pre-warm yields at any age.
@@ -775,6 +933,7 @@ async def _admit_with_eviction(session_id: str, kind: str, est: int, *,
         scan = await _oldest_evictable_local(
             floor_age, prefer_user=prefer_user,
             pending_leash_s=ceiling, turn_leash_s=ceiling, prewarm_any_age=True,
+            box_first=box_first, host=host_of(box),
         )
         skipped_pending = scan.spared_background
         if scan.victim is None:
@@ -782,13 +941,13 @@ async def _admit_with_eviction(session_id: str, kind: str, est: int, *,
         await _evict_one(*scan.victim)
 
     async with cast("asyncio.Condition", _cond):
-        gate1_ok, live, sessions_account = _pressure_snapshot(est)
+        gate1_ok, live, sessions_account = _pressure_snapshot(est, box)
     if gate1_ok and not sessions_account:
         log_denial(
             "Slot denied (live-RAM veto after eviction): %s reserved=%d/%dMB live=%dMB floor=%dMB",
-            session_id[:8], _reserved_mb, _budget_mb, live, _floor_mb,
+            session_id[:8], _reserved_mb, _budget_mb, live, _box_floor_mb(box),
         )
-        return _deny_host_memory(est)
+        return _deny_host_memory(est, box)
     if skipped_pending:
         # The idle sessions are idle only in the sense that nobody types:
         # each holds a running background command or subagent.
@@ -805,9 +964,80 @@ async def _admit_with_eviction(session_id: str, kind: str, est: int, *,
     return _deny_busy()
 
 
+def _grow_room(delta: int, box: str) -> bool:
+    """Room on a session's box for one more tool's program: its host's
+    budget (a compute machine on another host has its own, ``_box_cap_ok``),
+    the box's own cap and its live memory. Never the session count: the
+    session is counted already."""
+    host = host_of(box)
+    live = _box_live_mb(box) - _growin_debit_mb(host) - delta >= _box_floor_mb(box)
+    if host:
+        return _box_cap_ok(box, delta, 0) and live
+    return _reserved_mb + delta <= _budget_mb and _box_cap_ok(box, delta, 0) and live
+
+
+async def grow(session_id: str, *, judged: bool, server: str = "") -> Admission:
+    """A tool's program starting in a tracked session: its reserve grows by
+    one program (``_STDIO_MCP_MB``), never past HEAVY in all, and the growth
+    is debited like an admission while it materializes. ``judged`` (a start
+    at the agent's first call) only with room on the session's box, else the
+    sentence the call answers; not judged (a program that starts with its
+    session) it is counted. What it added is kept per tool (``server``), so
+    a failed start gives back its own (``shrink``). An untracked session (a
+    personal or admin machine's, or one already gone) is admitted: its
+    machine counts its own."""
+    global _reserved_mb
+    if _cond is None:
+        return _ADMITTED
+    async with _cond:
+        est = _session_est.get(session_id)
+        if est is None:
+            return _grow_on_paired(session_id, judged)
+        delta = min(_STDIO_MCP_MB, max(0, config.SESSION_EST_HEAVY_MB - est))
+        if delta <= 0:
+            return _ADMITTED
+        box = _session_box.get(session_id, "")
+        if judged and not _grow_room(delta, box):
+            logger.info("Tool start refused: %s +%dMB reserved=%d/%dMB", session_id[:8], delta,
+                        _reserved_mb, _budget_mb)
+            return _DENY_TOOL_MEMORY
+        host = _session_host.get(session_id, "")
+        _session_est[session_id] = est + delta
+        tools = _session_grown.setdefault(session_id, {})
+        tools[server] = tools.get(server, 0) + delta
+        if not host:
+            _reserved_mb += delta
+        now = time.monotonic()
+        while _grow_debits and now - _grow_debits[0][0] >= _GROW_WINDOW_S:
+            _grow_debits.popleft()
+        _grow_debits.append((now, delta, host))
+        return _ADMITTED
+
+
+async def shrink(session_id: str, server: str = "") -> None:
+    """A tool's start that ``grow`` counted and that did not happen: one
+    program given back, never more than that tool's starts added (at the cap
+    a start adds less, or nothing)."""
+    global _reserved_mb
+    if _cond is None:
+        return
+    async with _cond:
+        tools = _session_grown.get(session_id, {})
+        grown = tools.get(server, 0)
+        delta = min(_STDIO_MCP_MB, grown)
+        if delta <= 0 or session_id not in _session_est:
+            return
+        _session_est[session_id] -= delta
+        tools[server] = grown - delta
+        if not _session_host.get(session_id, ""):
+            _reserved_mb = max(0, _reserved_mb - delta)
+        _cond.notify_all()
+
+
 def release(session_id: str) -> None:
     """Release a slot. Synchronous + idempotent — safe from reapers, finally
     blocks, the shutdown handler, and multiple cleanup paths for the same id."""
+    concurrency_paired.forget(session_id)
     if _remove(session_id) is None:
         return  # never tracked (e.g. remote) or already released
     _schedule_notify()
@@ -818,7 +1048,8 @@ async def reserve_background(session_id: str, *, target: str = placement.LOCAL,
                              superseded: Callable[[], bool]) -> str:
     """Reserve a slot for a background wake that is about to spawn a session.
 
-    Returns ``"untracked"`` (a machine target: its satellite budgets it),
+    Returns ``"untracked"`` (a machine target: its satellite budgets it, and
+    a second start of one id answers ``"superseded"``),
     ``"reserved"`` (this call added the slot, kind ``chat`` with no owner; the
     session's lifecycle releases it), ``"superseded"`` (the id is already
     tracked, or becomes tracked while waiting, or ``superseded()`` turns true:
@@ -828,12 +1059,6 @@ async def reserve_background(session_id: str, *, target: str = placement.LOCAL,
     tasks, re-checking every ``_WAKE_SLICE_S``. The check and the add share one
     lock hold."""
     global _parked_tasks
-    if not placement.is_local(target):
-        return "untracked"
-    assert _cond is not None, "concurrency.init() not called"
-    est = _estimate_mb(execution_path)
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(0.0, timeout_s)
 
     def taken() -> bool:
         if session_id in _sessions:
@@ -845,11 +1070,29 @@ async def reserve_background(session_id: str, *, target: str = placement.LOCAL,
                            session_id[:8], exc_info=True)
             return True
 
+    if _no_machine(session_id, target):
+        # No compute machine can take the wake: it is kept for later, as one
+        # for a machine that is offline.
+        return "superseded" if taken() else "timeout"
+    box = _box_for(session_id, target)
+    if box != "":
+        # The remote layer cannot tell a second start from a re-warm of a
+        # session it holds, so the second start is refused here.
+        from core.session.session_state import is_starting, session_is_held
+        if is_starting(session_id) or session_is_held(session_id) or taken():
+            return "superseded"
+        if box is None:
+            return await _wake_on_paired(session_id, target, execution_path, timeout_s, taken)
+    assert _cond is not None, "concurrency.init() not called"
+    est = _estimate_mb(execution_path)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout_s)
+
     async with _cond:
         if taken():
             return "superseded"
-        if _has_room(est, is_task=True):
-            _add(session_id, "chat", est)
+        if _has_room(est, is_task=True, box=box):
+            _add(session_id, "chat", est, box=box)
             return "reserved"
         _parked_tasks += 1
         logger.info("Wake %s parked: no slot (reserved=%d/%dMB)",
@@ -863,11 +1106,35 @@ async def reserve_background(session_id: str, *, target: str = placement.LOCAL,
                     await asyncio.wait_for(_cond.wait(), min(_WAKE_SLICE_S, remaining))
                 if taken():
                     return "superseded"
-                if _has_room(est, is_task=True):
-                    _add(session_id, "chat", est)
+                if _has_room(est, is_task=True, box=box):
+                    _add(session_id, "chat", est, box=box)
                     return "reserved"
         finally:
             _parked_tasks -= 1  # decrement even on Cancelled/Timeout
+
+
+async def _wake_on_paired(session_id: str, machine: str, execution_path: str | None,
+                          timeout_s: float, taken: Callable[[], bool]) -> str:
+    """A wake on a personal or admin machine: ``"untracked"`` (it reserves
+    nothing) once a new start fits that machine's memory, parked until then
+    up to ``timeout_s``."""
+    if _cond is None or concurrency_paired.live(session_id, machine):
+        return "untracked"
+    est = _estimate_mb(execution_path)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout_s)
+    while concurrency_paired.room(machine, est) is False:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return "timeout"
+        async with _cond:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(_cond.wait(), min(_WAKE_SLICE_S, remaining))
+        if taken():
+            return "superseded"
+    if concurrency_paired.room(machine, est) is not None:
+        concurrency_paired.note_admitted(session_id, machine, est)
+    return "untracked"
 
 
 def release_unless_live(session_id: str) -> bool:
@@ -900,6 +1167,34 @@ def release_chat_slot(session_id: str) -> None:
     release(session_id)
 
 
+async def rehome_slot(session_id: str, *, kind: str = "chat", target: str = placement.LOCAL,
+                      execution_path: str | None = None, user_sub: str | None = None,
+                      mcp_config_path: str = "") -> Admission:
+    """The reservation of a live session rebuilt in place, on the box it runs
+    on now. One the reaper released is acquired again. One held on another
+    box moves there in one step under the lock, and stays where it is when
+    that box has no room: nothing is given up that cannot be replaced, so the
+    session never ends up with neither. A denial ends nothing: the caller's
+    session is already running."""
+    assert _cond is not None, "concurrency.init() not called"
+    if _no_machine(session_id, target):
+        return _DENY_NO_COMPUTE
+    box = _box_for(session_id, target)
+    async with _cond:
+        if box is not None and session_id in _sessions and _session_box.get(session_id, "") != box:
+            est = _session_est[session_id]
+            if not (_box_cap_ok(box, est, 0) and _gate2(est, is_task=False, box=box)):
+                logger.warning("Slot not moved (no room on its new box): %s stays reserved where it was",
+                               session_id[:8])
+                return _deny_host_memory(est, box)
+            _move_box(session_id, box)
+            _session_added_at[session_id] = time.monotonic()  # its processes are new on that box
+            _cond.notify_all()
+            return _ADMITTED
+    return await acquire_chat_slot(session_id, kind=kind, target=target, execution_path=execution_path,
+                                   user_sub=user_sub, mcp_config_path=mcp_config_path)
+
+
 async def reap_session(session_id: str, close: Callable[[str], Awaitable[object]]) -> None:
     """An idle reaper's close of one session: its chat slot and its
     subscription seat are released whatever the close does (both releases
@@ -920,7 +1215,7 @@ async def reap_session(session_id: str, close: Callable[[str], Awaitable[object]
 @asynccontextmanager
 async def task_slot(session_id: str, *, target: str = placement.LOCAL,
                     execution_path: str | None = None, ring_key: str = ""):
-    """Background-task slot — blocking acquire (both gates + HEAVY headroom), then
+    """Background-task slot — blocking acquire (both gates + the task headroom), then
     always releases on exit. A remote task consumes no local slot and never blocks.
     ``ring_key`` (the task's creator) is the parked tasks' round-robin key: never
     the slot's owner, which keeps counting chats only."""
@@ -936,172 +1231,57 @@ async def acquire_meeting_slots(session_ids: list[str], *,
                                 targets: dict[str, str] | None = None,
                                 exec_paths: dict[str, str] | None = None,
                                 mcp_paths: dict[str, str] | None = None) -> Admission:
-    """Atomic-N reserve of the LOCAL participants against both gates. ``exec_paths``
-    maps session_id → execution_path (for the per-type estimate; absent ⇒ HEAVY),
-    ``mcp_paths`` session_id → its generated MCP config (a Direct participant's
-    stdio MCPs). Meetings deny-without-evicting (v1); the denial carries
-    reason+message like ``acquire()``. Releasing all ids later is safe (per-id
-    no-op for the untracked remote ones)."""
+    """Atomic-N reserve of the participants the platform counts, each on its
+    own box (the platform's, or a compute machine's for a Direct LLM
+    participant's tools), against both gates. ``exec_paths`` maps session_id →
+    execution_path (for the per-type estimate; absent ⇒ HEAVY), ``mcp_paths``
+    session_id → its generated MCP config (a Direct participant's stdio MCPs).
+    Meetings deny-without-evicting (v1); the denial carries reason+message
+    like ``acquire()``. Releasing all ids later is safe (per-id no-op for the
+    untracked remote ones)."""
     assert _cond is not None, "concurrency.init() not called"
     targets = targets or {}
     exec_paths = exec_paths or {}
     mcp_paths = mcp_paths or {}
-    local = [sid for sid in session_ids
-             if placement.is_local(targets.get(sid)) and sid not in _sessions]
+    if any(_no_machine(sid, targets.get(sid) or placement.LOCAL) for sid in session_ids):
+        return _DENY_NO_COMPUTE
+    boxes: dict[str, str] = {}
+    for sid in session_ids:
+        box = _box_for(sid, targets.get(sid) or placement.LOCAL)
+        if box is not None and sid not in _sessions:
+            boxes[sid] = box
     ests = {sid: await _session_estimate(sid, exec_paths.get(sid), mcp_paths.get(sid, ""))
-            for sid in local}
+            for sid in boxes}
     async with _cond:
-        local_new = [sid for sid in local if sid not in _sessions]
-        total_est = sum(ests[sid] for sid in local_new)
+        new = [sid for sid in boxes if sid not in _sessions]
+        total_est = sum(ests[sid] for sid in new)
         cap = config.OTODOCK_MAX_LOCAL_SESSIONS
-        if cap and len(_sessions) + len(local_new) > cap:
-            logger.warning("Meeting denied (hard cap): %d local participants", len(local_new))
+        # The count caps the platform's host alone: a meeting's participants
+        # are there (a Direct LLM participant's tools on a shared machine).
+        if cap and _host_count("") + len(new) > cap:
+            logger.warning("Meeting denied (hard cap): %d participants", len(new))
             return _deny_busy()
         if _reserved_mb + total_est > _budget_mb:
             logger.warning("Meeting denied (budget): need %dMB, reserved=%d/%dMB",
                            total_est, _reserved_mb, _budget_mb)
             return _deny_busy()
-        if not _gate2(total_est, is_task=False):
-            logger.warning("Meeting denied (live-RAM veto): need %dMB, live=%dMB floor=%dMB",
-                           total_est, _live_available_mb(), _floor_mb)
-            return _deny_host_memory(total_est)
-        for sid in local_new:
-            _add(sid, "meeting", ests[sid])
+        for box in {boxes[sid] for sid in new}:
+            box_est = sum(ests[sid] for sid in new if boxes[sid] == box)
+            if not _box_cap_ok(box, box_est, 0):
+                logger.warning("Meeting denied (the box's own cap): need %dMB on %s", box_est, box or "the platform")
+                return _deny_busy()
+            if not _gate2(box_est, is_task=False, box=box):
+                logger.warning("Meeting denied (live-RAM veto): need %dMB on %s, live=%dMB floor=%dMB",
+                               box_est, box or "the platform", _box_live_mb(box), _box_floor_mb(box))
+                return _deny_host_memory(box_est, box)
+        for sid in new:
+            _add(sid, "meeting", ests[sid], "", boxes[sid])
         return _ADMITTED
 
 
 def release_meeting_slots(session_ids: list[str]) -> None:
     for sid in session_ids:
         release(sid)
-
-
-# ---------------------------------------------------------------------------
-# Graceful LRU eviction
-# ---------------------------------------------------------------------------
-
-def _turn_live(sid: str, s: object) -> bool:
-    """True while the session is inside a turn: streaming, running a
-    foreground tool, or waiting on a person's answer, read from what each
-    session object exposes (a headless CLI turn, an app-server turn, a
-    terminal's open turn or parked question), any engine's question waiting
-    on a person, and the in-process engine's stream map."""
-    try:
-        if (getattr(s, "_turn_active", False) or getattr(s, "_current_turn_id", None)
-                or getattr(s, "turn_open", False) or getattr(s, "question_parked", False)):
-            return True
-        from core.session import session_state
-        if session_state.has_pending_prompt(sid):
-            return True
-        # The in-process engine touches last_activity only at the start and
-        # end of a turn; its layer's stream map is the truthful signal.
-        from core.layers.direct.layer import DirectLLMExecutionLayer
-        task = DirectLLMExecutionLayer._active_streams.get(sid)
-        return task is not None and not task.done()
-    except ImportError:
-        return False
-
-
-async def _oldest_evictable_local(min_idle_s: float, *,
-                                  prefer_user: str | None = None,
-                                  only_user: str | None = None,
-                                  pending_leash_s: float | None = None,
-                                  turn_leash_s: float | None = None,
-                                  prewarm_any_age: bool = False,
-                                  ) -> _Scan:
-    """Best eviction victim, plus how many otherwise-evictable sessions were
-    spared: with ``pending_leash_s`` a session whose registries show a
-    running command or subagent, with ``turn_leash_s`` a session inside a
-    turn, each skipped until it has been idle that long (None = no leash).
-
-    Scans the 4 real session pools (cli/direct/codex layer pools + interactive
-    locals). A candidate must hold a ``chat`` reservation (task, meeting and
-    phone reservations are released by their owners) and be idle
-    ≥ ``min_idle_s``, idle age counting from the newer of ``last_activity``
-    and the last permission hook. ``only_user`` limits the scan to the
-    sessions the per-person cap counts for that person (``_cap_owner``, the
-    owner ``_owned`` counts by). Ordering: unclaimed **pre-warms first**
-    (speculative, unused; at any age with ``prewarm_any_age``) → the
-    **requesting user's own** idle sessions → everyone else; within a group,
-    most-idle first. The order's owner is the ledger's, else the session's
-    own ``user_sub``: it orders and never counts.
-    """
-    now = time.monotonic()
-    try:
-        from core.session.prewarm_session_registry import _entries as _pw_entries
-    except ImportError:
-        _pw_entries = {}
-    try:
-        from core.session.session_state import get_hook_activity
-    except ImportError:
-        def get_hook_activity(_sid: str) -> float:  # type: ignore[misc]  # an ImportError fallback: mypy wants conditional variants to share parameter names (checker limitation)
-            return 0.0
-    cands: list[tuple[int, float, str, str, bool]] = []
-
-    spared_background = 0
-    spared_live = 0
-
-    def consider(sid: str, s: object, source: str) -> None:
-        nonlocal spared_background, spared_live
-        if _sessions.get(sid) != "chat":
-            return  # must hold a reclaimable reservation to be worth evicting
-        if only_user is not None and _cap_owner(sid) != only_user:
-            return
-        owner = _cap_owner(sid) or getattr(s, "user_sub", None) or ""
-        age = now - max(getattr(s, "last_activity", now), get_hook_activity(sid))
-        is_pw = sid in _pw_entries
-        if not (is_pw and prewarm_any_age):
-            if age < min_idle_s:
-                return
-            if (turn_leash_s is not None and age < turn_leash_s
-                    and _turn_live(sid, s)):
-                spared_live += 1
-                return
-            if (pending_leash_s is not None and age < pending_leash_s
-                    and background_leash.background_pending_count(sid)):
-                spared_background += 1
-                return
-        group = 0 if is_pw else (1 if (prefer_user and owner == prefer_user) else 2)
-        cands.append((group, -age, sid, source, is_pw))
-
-    s: object
-    try:
-        from core.layers.cli.session import (
-            _persistent_sessions,
-            _persistent_sessions_lock,
-        )
-        async with _persistent_sessions_lock:
-            for sid, s in list(_persistent_sessions.items()):
-                consider(sid, s, "cli")
-    except ImportError:
-        pass
-    try:
-        from core.layers.direct.session import _direct_sessions, _direct_sessions_lock
-        async with _direct_sessions_lock:
-            for sid, s in list(_direct_sessions.items()):
-                consider(sid, s, "direct")
-    except ImportError:
-        pass
-    try:
-        from core.layers.codex.session import _codex_sessions, _codex_sessions_lock
-        async with _codex_sessions_lock:
-            for sid, s in list(_codex_sessions.items()):
-                consider(sid, s, "codex")
-    except ImportError:
-        pass
-    try:
-        from core.session import interactive_session as _is
-        for sid in _is.live_session_ids(local_only=True):
-            s = _is.get(sid)
-            if s is not None:
-                consider(sid, s, "interactive")
-    except ImportError:
-        pass
-
-    if not cands:
-        return _Scan(None, spared_background, spared_live)
-    cands.sort()  # (group asc, -age asc ⇒ most-idle first within a group)
-    _, _, sid, source, is_pw = cands[0]
-    return _Scan((sid, source, is_pw), spared_background, spared_live)
 
 
 async def _evict_one(sid: str, source: str, is_prewarm: bool = False) -> bool:
@@ -1121,16 +1301,28 @@ async def _evict_one(sid: str, source: str, is_prewarm: bool = False) -> bool:
     async with cast("asyncio.Condition", _cond):
         if sid not in _sessions:
             return False
+        est, box = _session_est.get(sid, 0), _session_box.get(sid, "")
+        # Only the share the machine's report already shows in use comes back:
+        # a session inside its grow-in window was debited the rest, and that
+        # debit goes with it.
+        now = time.monotonic()
+        grown = min(1.0, (now - _session_added_at.get(sid, now - _GROW_WINDOW_S)) / _GROW_WINDOW_S)
         _remove(sid)
+        if box:
+            _note_evicted_credit(box, int(est * grown))
     logger.info("Concurrency: evicting idle %ssession %s (%s) to admit a new one",
                 "pre-warm " if is_prewarm else "", sid[:8], source)
     try:
+        from core.session import interactive_session as _is, session_manager
         if source == "interactive":
-            from core.session import interactive_session as _is
             await _is.close_session(sid, reason="evicted_for_capacity")
-        else:
-            from core.session.session_manager import get_layer_by_path
-            await get_layer_by_path(_EVICT_CLOSE[source]).close_session(sid)
+        elif source == "remote":
+            if session_manager._remote_layer is not None:
+                await session_manager._remote_layer.close_session(sid)
+        elif (holder := session_manager.holding_engines().get(_EVICT_CLOSE[source])) is not None:
+            await holder.close_session(sid)
+        else:  # an engine that holds no session in the proxy has no such victim
+            session_manager.release_unheld(sid)
     except Exception as e:  # noqa: BLE001  # closing an evicted session must not skip the cache reset below
         logger.warning("Concurrency: eviction close failed for %s (%s): %s", sid[:8], source, e)
     # The victim's RSS is freed now — drop the ≤1s live-RAM cache so the
@@ -1171,17 +1363,29 @@ def get_stats() -> dict:
         "tasks": {"active": by_surface.get("task", 0)},
         "by_surface": by_surface,
         "satellites": _satellite_stats(),
+        "compute": compute_stats(),
     }
 
 
-def _satellite_stats() -> list[dict]:
-    """Per-satellite live counts + load (filled by the satellite layer). Empty
-    until the satellite connection manager is up."""
-    try:
-        from core.remote.satellite_connection import get_connection_manager
-        return get_connection_manager().concurrency_stats()
-    except (ImportError, ValueError, TypeError):
-        return []
+def compute_stats() -> list[dict]:
+    """Each connected compute machine's box as the gates read it: its total
+    and free memory (MB, 0 free when no fresh report), whether it has a cap
+    of its own, what is reserved on it and how many sessions hold a slot."""
+    from core.remote.satellite_connection import get_connection_manager
+    out = []
+    for machine in sorted(get_connection_manager().compute_machine_ids()):
+        reading = compute_reading(machine)
+        out.append({
+            "machine_id": machine,
+            "own_host": bool(host_of(machine)),
+            "total_mb": reading.total_mb,
+            "available_mb": reading.available_mb,
+            "capped": reading.capped,
+            "reported": reading.known,
+            "reserved_mb": _box_reserved_mb(machine),
+            "sessions": sum(1 for sid in _sessions if _session_box.get(sid) == machine),
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1195,13 +1399,16 @@ async def maintenance_loop() -> None:
     while True:
         await asyncio.sleep(_MAINTENANCE_INTERVAL_S)
         try:
+            _read_limits()
             await _maintenance_pass()
         except Exception as e:  # noqa: BLE001  # the maintenance loop's tick: one failed pass must not end the loop
             logger.error("concurrency maintenance loop error: %s", e)
 
 
 async def _maintenance_pass() -> None:
-    """One maintenance tick: nothing to do unless a task is parked."""
+    """One maintenance tick: nothing to do unless a task is parked. A run
+    that waits for a compute machine (``wait_for_compute``) is woken by the
+    sign-in and by its own deadline."""
     if _parked_tasks <= 0 or _cond is None:
         return
     async with _cond:
@@ -1211,10 +1418,13 @@ async def _maintenance_pass() -> None:
         # A parked task run may evict a session with running background
         # work once it has been idle twice the idle timeout: a chat's
         # forgotten job must not hold the scheduler for hours.
+        # The budget it waits on is the platform's host's: a session on
+        # another host frees nothing there.
         scan = await _oldest_evictable_local(
             min(config.SESSION_EVICT_FLOOR_S, idle_timeout), prefer_user=None,
             pending_leash_s=2 * idle_timeout,
             turn_leash_s=background_leash.background_work_ceiling(),
+            host="",
         )
         if scan.victim is not None:
             await _evict_one(*scan.victim)
@@ -1222,39 +1432,32 @@ async def _maintenance_pass() -> None:
         _cond.notify_all()
 
 
-# ---------------------------------------------------------------------------
-# Reconciliation — safety net for orphaned slots
-# ---------------------------------------------------------------------------
-
-def _live_local_sids() -> set[str]:
-    """Every session id a LOCAL registry holds alive: each engine's pool, the
-    live pumps, the local interactive PTYs."""
-    from core.events.stream_pump import _active_pumps
-    from core.session.session_manager import get_all_layers
-
-    # Every LOCAL engine's live sessions, straight from the registry. The
-    # three private pool dicts (and their locks) used to be imported here by
-    # name, so a fourth engine's sessions would read as orphaned and have
-    # their concurrency slots released out from under them.
-    live_sids: set[str] = set()
-    for layer in get_all_layers().values():
-        live_sids.update(layer.local_session_ids())
-    live_sids.update(p.session_id for p in _active_pumps.values() if not p.is_done)
-
-    try:
-        from core.session.interactive_session import live_session_ids
-        live_sids.update(live_session_ids(local_only=True))
-    except ImportError:
-        pass
-    return live_sids
+def _adopt_compute_sessions() -> int:
+    """A session a compute machine runs that holds no slot (its acquire ran
+    in a process before this one, and the machine kept it across the
+    restart) takes one on its box: kind ``chat``, no owner, as a wake's,
+    stamped old so the grow-in debit does not count memory it already holds.
+    A task run's session is left to its run. Call under ``_cond``."""
+    from core.session.session_state import get_session_client_type
+    task = session_kind.TASK.name
+    adopted = 0
+    for sid, _s, _source, machine in compute_sessions():
+        if sid in _sessions or get_session_client_type(sid) == task:
+            continue
+        _add(sid, "chat", config.SESSION_EST_HEAVY_MB, box=machine)
+        _session_added_at[sid] = time.monotonic() - _GROW_WINDOW_S
+        adopted += 1
+    return adopted
 
 
 async def reconcile_chat_slots() -> int:
-    """Release orphaned LOCAL slots not backed by any live registry.
+    """Release orphaned slots not backed by any live registry, and give a
+    slot to a session a compute machine kept across a restart.
 
-    Tasks are EXCLUDED (their task_slot finally is authoritative); remote layer
-    sessions are not a live source (they never hold a slot); interactive counted
-    LOCAL-only; sids added within the last sweep are spared (mid-spawn window).
+    Tasks are EXCLUDED (their task_slot finally is authoritative); the live
+    source is ``_live_local_sids`` (Direct LLM's pool, the local terminals and
+    the sessions a compute machine runs for the platform); sids added within
+    the last sweep are spared (mid-spawn window).
     """
     live_sids = _live_local_sids()
 
@@ -1275,6 +1478,10 @@ async def reconcile_chat_slots() -> int:
             _remove(sid)
             logger.warning("Reconciliation: released orphaned slot %s (reserved=%d/%dMB)",
                            sid[:8], _reserved_mb, _budget_mb)
+        adopted = _adopt_compute_sessions()
+        if adopted:
+            logger.info("Reconciliation: %d session(s) a compute machine kept took a slot "
+                        "(reserved=%d/%dMB)", adopted, _reserved_mb, _budget_mb)
         if orphaned:
             _cond.notify_all()  # we already hold the lock
     return len(orphaned)

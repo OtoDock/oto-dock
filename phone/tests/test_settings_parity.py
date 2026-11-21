@@ -61,3 +61,26 @@ def test_every_allowlisted_key_is_read_or_seeded():
     stray = sorted(allowed - daemon - phone_seeded)
     assert stray == [], f"allowlisted keys nobody reads or seeds: {stray}"
     assert not allowed & INJECTED
+
+
+#: What a call's detector is built from (``pipeline/core.py``): the seven
+#: values it takes and the offset its silence is made of.
+_DETECTOR = ("vad_threshold", "vad_speech_pad_ms", "vad_min_energy_rms", "vad_silence_offset_ms",
+             "bargein_threshold", "bargein_debounce_ms", "bargein_chunk_ratio", "bargein_silence_duration_ms")
+_SEED_VALUE_RE = re.compile(r'^\s*"(?:audio|phone)_([a-z_0-9]+)":\s*"([^"]*)"', re.MULTILINE)
+
+
+def test_the_seed_and_the_daemon_agree_on_the_detectors_values():
+    """A fresh install runs the seed's values and a test builds the detector
+    from the daemon's defaults. Nothing else holds the two equal, and a test
+    on the detector means little if they drift apart."""
+    from config_manager import ConfigManager
+
+    seeded = dict(_SEED_VALUE_RE.findall(SEED.read_text(encoding="utf-8")))
+    daemon = ConfigManager()
+    for key in _DETECTOR:
+        assert float(seeded[key]) == float(getattr(daemon, key)), key
+    # The feed is no setting, for calls or for voice conversations: the seed
+    # writes no such row and the daemon reads none.
+    for key in ("vad_context", "voice_vad_context"):
+        assert key not in seeded and not hasattr(daemon, key)

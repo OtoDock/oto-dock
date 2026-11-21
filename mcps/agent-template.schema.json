@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.1/mcps/agent-template.schema.json",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v2.0.0/mcps/agent-template.schema.json",
   "title": "OtoDock agent template",
   "description": "The catalog rules for an OtoDock agent template (OtoDock is a fair source project): the template's folder validated as one document. The document is an object keyed by paths inside the folder (POSIX separators): each file x-otodock-documents names holds its parsed JSON, and every other file at the folder's top level holds true. Deeper files (the apps' trees, context/, the dashboards' pages) are not part of it. The platform's template loader (services/community/community_agent_template_store.py, through storage/catalog_schema.py) refuses a template that breaks these rules and adds the ones a schema cannot state: the template's mode against its apps and dashboards, duplicate slugs, the files a dashboard names, each app folder's files and its client/index.html, at most four apps and eight checks, the checks' own validator. Unknown files and keys are allowed: a catalog is additive. A field the platform reads with a default, or reads not at all, takes null and is read as absent.",
   "$comment": "Custom annotation keywords, ignored by validators. x-otodock-documents (here): the folder paths read as JSON documents; a * stands for one path segment, the whole path must match, and a dot-name never matches. x-otodock-first-release (here): the platform release that first ships this schema. x-otodock-since: the platform release that first reads the field; x-otodock-floors: a list of {pattern, since}, a value matching the pattern needs that release. Both are read on properties and items, never under patternProperties. x-otodock-hint: the words a finding uses for the rule, {value} standing for the value found.",
@@ -136,6 +136,39 @@
         },
         "display_name": {"$ref": "#/$defs/nonEmptyString", "description": "The agent's name on its card."},
         "description": {"type": ["string", "null"], "description": "One or two sentences for the agent's card."},
+        "summary": {
+          "type": ["string", "null"],
+          "maxLength": 200,
+          "not": {"type": "string", "pattern": "\\n"},
+          "x-otodock-hint": "the summary is one or two short sentences on one line, at most 200 characters",
+          "description": "What the agent does for a person, in one or two short sentences. The store's card and the install dialog show it above the highlights, in place of the description. A release that does not read it shows the description, so it needs no platform floor."
+        },
+        "highlights": {
+          "type": ["array", "null"],
+          "maxItems": 6,
+          "x-otodock-hint": "a template has at most 6 highlights",
+          "description": "Up to six things the agent does, each an icon and a few words, as the after-update cards show a feature. A release that does not read them shows the description, so they need no platform floor.",
+          "items": {
+            "type": "object",
+            "required": ["icon", "text"],
+            "additionalProperties": true,
+            "properties": {
+              "icon": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]{0,23}$",
+                "x-otodock-hint": "a highlight's icon is a name from the dashboard's icon set, like video (got {value})",
+                "description": "A name from the dashboard's icon set (release/highlights.ts ICON_PATHS). The catalog's lint refuses a name the set lacks; a release that does not know a name draws a neutral mark."
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 60,
+                "not": {"type": "string", "pattern": "\\n"},
+                "x-otodock-hint": "a highlight's text is a few words on one line, at most 60 characters"
+              }
+            }
+          }
+        },
         "color": {
           "type": ["string", "null"],
           "pattern": "^(#[0-9A-Fa-f]{6})?$",
@@ -154,6 +187,16 @@
         "collaborative": {
           "type": ["boolean", "null"],
           "description": "Default true. false with default_scope user makes a personal-only agent, false with agent a shared-only one."
+        },
+        "team_account": {
+          "type": ["boolean", "null"],
+          "x-otodock-since": "2.0.0",
+          "description": "Default false. true on a collaborative agent: every chat and run of a person uses the agent's own accounts of its tools, from the role floor up, and nobody's own account is offered. Refused at install with a private mode."
+        },
+        "team_account_floor": {
+          "enum": ["viewer", "contributor", "editor", "manager", null],
+          "x-otodock-since": "2.0.0",
+          "description": "With team_account: the lowest role whose sessions use the agent's own accounts (editor when absent). Below it a person gets no account for those tools."
         },
         "core_mcps": {
           "enum": ["all", "none", null],
@@ -239,8 +282,29 @@
               }
             }
           }
+        },
+        "limits": {
+          "type": ["object", "null"],
+          "x-otodock-since": "2.0.0",
+          "description": "What the agent may use of an MCP, by its canonical name, for the agent's own runs (runs) and for people's chats (chats): read_only, or a list of function names. An MCP named here need not be required: the limit waits until the tool is enabled. Never the outside column: a template opens nothing to outside people.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "runs": {"$ref": "#/$defs/toolLimit"},
+              "chats": {"$ref": "#/$defs/toolLimit"}
+            },
+            "x-otodock-hint": "a limit names runs or chats, each read_only or a list of function names"
+          }
         }
       }
+    },
+    "toolLimit": {
+      "anyOf": [
+        {"enum": ["read_only", null]},
+        {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/nonEmptyString"}}
+      ],
+      "x-otodock-hint": "a limit is read_only or a list of at least one function name"
     },
     "skillsJson": {
       "type": "object",
@@ -299,7 +363,7 @@
           "type": ["string", "null"],
           "pattern": "^\\S+$",
           "x-otodock-since": "1.9.0",
-          "x-otodock-hint": "invalid model id {value} (one word, such as claude-fable-5-1)",
+          "x-otodock-hint": "invalid model id {value} (one word, such as claude-fable-5-2)",
           "description": "Run this task on this model instead of the agent's default: the one exception to a template naming no model, for a task that needs a stronger or a cheaper model than the agent's own work. A retired id runs on its successor. A model the installed agent cannot use is dropped at install with its layer, the task runs on the agent's default and the install reports it.",
           "not": {"type": "string", "pattern": "\\n"}
         },
@@ -322,6 +386,20 @@
           "enum": ["manager", "editor", "contributor", "viewer", null],
           "x-otodock-since": "1.9.1",
           "description": "Who is told, for an agent-scope item: the lowest per-agent role its notifications reach (platform admins always). Absent tells editors and managers, the platform's default for a new task; viewer tells everyone who uses the agent."
+        },
+        "permission_mode": {
+          "enum": ["dontAsk", "autoReview", null],
+          "x-otodock-since": "2.0.0",
+          "x-otodock-hint": "invalid mode {value} (dontAsk or autoReview)",
+          "description": "How the task's runs act: dontAsk (the default) runs without asking, autoReview has the engine's own reviewer check a tool that needs approval first. An agent whose engine has no reviewer runs the task on dontAsk and the install reports it."
+        },
+        "timeout_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 60,
+          "maximum": 7200,
+          "x-otodock-since": "2.0.0",
+          "x-otodock-hint": "must be a whole number of seconds, from 60 to 7200",
+          "description": "How long a run waits for work it left running in the background. Absent means 600 seconds, and less than 600 changes nothing."
         }
       }
     },
@@ -514,6 +592,20 @@
                 "maxLength": 8000,
                 "pattern": "\\S",
                 "x-otodock-hint": "a prompt of 1 to 8000 characters is required"
+              },
+              "permission_mode": {
+                "enum": ["dontAsk", "autoReview", null],
+                "x-otodock-since": "2.0.0",
+                "x-otodock-hint": "invalid mode {value} (dontAsk or autoReview)",
+                "description": "How the task's runs act: dontAsk (the default) or autoReview, the engine's own reviewer."
+              },
+              "timeout_seconds": {
+                "type": ["integer", "null"],
+                "minimum": 60,
+                "maximum": 7200,
+                "x-otodock-since": "2.0.0",
+                "x-otodock-hint": "must be a whole number of seconds, from 60 to 7200",
+                "description": "How long a run waits for work it left running in the background. Absent means 600 seconds, and less than 600 changes nothing."
               }
             }
           }

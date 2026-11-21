@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 #
-# OtoDock sandbox doctor — read-only diagnosis of the local agent sandbox.
+# OtoDock sandbox doctor — read-only diagnosis of the agent sandbox on the
+# machine that runs the sessions (the compute service, or a compute unit).
 #
 # Answers "why can't sessions — or the Codex engine's own INNER sandbox —
 # create their namespaces on this host?" by collecting the host facts that
 # gate namespace creation and then running the exact probe ladder the
 # sandbox stack depends on:
 #
-#   P1  unshare -Urn                      (the proxy boot preflight's gate)
-#   P1b /dev/net/tun, a character device  (the boot checks it before P2b)
+#   P1  unshare -Urn                      (a user and network namespace)
+#   P1b /dev/net/tun, a character device  (the compute machine's start checks
+#                                          it before P2b)
 #   P2  one-level bwrap, our exact flags  (what every agent session runs in)
-#   P2b the network launcher wrapping P2  (the boot's last check: the shape
-#                                          every local session starts with)
+#   P2b the network launcher wrapping P2  (the compute machine's check at its
+#                                          start: the shape every session
+#                                          starts with)
 #   P3  bwrap nested inside bwrap         (what the Codex engine's
 #                                          "fs sandbox helper" needs)
 #   P4  Codex's npm-vendored bwrap, one level and nested (when found) —
@@ -20,10 +23,11 @@
 #       probe that reproduces "the local sandbox could not start".
 #
 # Where to run it:
-#   bare-metal (T1) install : scripts/sandbox-doctor.sh      (as the proxy user)
-#   containerised (T2/T3)   : docker exec -it otodock-proxy \
+#   bare-metal (T1) install : scripts/sandbox-doctor.sh   (as the install's user)
+#   containerised (T2/T3)   : docker compose exec otodock-compute \
 #                                 /opt/otodock/scripts/sandbox-doctor.sh
-#     (older images without the script: `docker cp` this file in first)
+#     (the compute service is where sessions run: the proxy's container has
+#     none of the sandbox's privileges, so every probe fails there by design)
 #
 # Read-only: writes nothing, needs no root. When reporting a sandbox issue,
 # send everything between the COPY markers.
@@ -67,7 +71,7 @@ fact "os" "$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}" || 
 fact "kernel" "$(uname -r 2>/dev/null || echo unknown)"
 fact "uid" "$(id -u) ($(id -un 2>/dev/null || true))"
 if [ -f /.dockerenv ] || grep -qs 'docker\|containerd\|kubepods' /proc/1/cgroup 2>/dev/null; then
-  fact "environment" "container (run this INSIDE the proxy container for T2/T3 installs)"
+  fact "environment" "container (run this INSIDE the compute container, otodock-compute, for T2/T3 installs)"
 else
   fact "environment" "bare metal / VM"
 fi
@@ -91,9 +95,9 @@ elif [ -e /dev/net/tun ]; then TUN="present, NOT a character device"
 else TUN="<missing>"; fi
 fact "/dev/net/tun" "$TUN"
 
-# The network launcher the proxy puts in front of every session's bwrap
-# (pasta outside, bwrap inside): proxy/scripts/ beside this script's scripts/,
-# in a checkout and in the image alike.
+# The network launcher in front of every session's bwrap (pasta outside,
+# bwrap inside): proxy/scripts/ beside this script's scripts/, in a checkout
+# and in the image alike (the compute machine runs its own copy of this file).
 LAUNCHER="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/proxy/scripts/oto-sandbox-net"
 fact "network launcher" "$([ -x "$LAUNCHER" ] && echo "$LAUNCHER" || echo "<not found at $LAUNCHER>")"
 
@@ -136,7 +140,7 @@ if command -v bwrap >/dev/null; then
           --ro-bind / / --dev /dev --proc /proc -- /bin/true; P2=$?
   if [ -x "$LAUNCHER" ]; then
     # shellcheck disable=SC2086
-    probe "P2b network launcher wrapping bwrap (the boot's shape check)" \
+    probe "P2b network launcher wrapping bwrap (the shape every session starts with)" \
       timeout 20 "$LAUNCHER" --block-private -- \
           bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --share-net $UIDFLAGS \
                 --ro-bind / / --dev /dev --proc /proc -- true; P2B=$?
@@ -168,32 +172,32 @@ fi
 section "Reading"
 APPARMOR_ON="$(read_sysctl /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
 if [ "$P1" -ne 0 ]; then
-  say "  An unprivileged user+net namespace cannot be created here — the proxy"
-  say "  boot preflight fails on this host before any sandbox is tried"
+  say "  An unprivileged user+net namespace cannot be created here, so the"
+  say "  compute machine's check fails at its start and no session can run"
   say "  (Ubuntu 23.10+: apparmor_restrict_unprivileged_userns=$APPARMOR_ON,"
   say "  see scripts/setup-apparmor-userns.sh; containers must allow user namespaces)."
 elif [ "$P1B" -ne 0 ] \
      || { [ "$P2B" -ne 0 ] && [ "$P2B" -ne 124 ] \
           && printf '%s' "$P2B_ERR" | grep -qiwE 'tun|tap'; }; then
-  # The boot checks the device before it runs the launcher, so a missing
-  # device is the refusal even when P2b was skipped.
+  # The compute machine's start checks the device before it runs the
+  # launcher, so a missing device is the refusal even when P2b was skipped.
   say "  The network launcher cannot open its tap device (/dev/net/tun: $TUN)."
-  say "  OtoDock refuses to start until it can. Docker: keep the proxy's"
-  say "  devices line (/dev/net/tun) from docker-compose.yml. Native install:"
+  say "  The compute machine refuses to run sessions until it can. Docker: keep"
+  say "  otodock-compute's devices line (/dev/net/tun) from docker-compose.yml. Native install:"
   say "  run sudo modprobe tun. In an LXC or OpenVZ container, the host must"
   say "  pass the device through."
 elif [ "$P2" -ne 0 ]; then
-  say "  The SESSION sandbox itself cannot start here — the proxy boot"
-  say "  preflight should already be failing loudly. Fix that first"
-  say "  (see the preflight error; Ubuntu 24.04+: setup-apparmor-userns.sh)."
+  say "  The SESSION sandbox itself cannot start here. The compute machine"
+  say "  says why at its start (its log and its status). Fix that first"
+  say "  (Ubuntu 24.04+: setup-apparmor-userns.sh)."
 elif [ "$P2B" -eq 124 ]; then
   say "  The network launcher did not answer within 20 seconds, the wait the"
-  say "  start allows. OtoDock starts and logs an error, but sessions may fail"
-  say "  to start. Run the doctor again when the host is quiet. Send this"
+  say "  compute machine's start allows before it refuses to run sessions."
+  say "  Run the doctor again when the host is quiet. Send this"
   say "  report to the OtoDock maintainers if it repeats."
 elif [ "$P2B" -ne 0 ]; then
   say "  bwrap starts, but not inside the network launcher (see P2b's error)."
-  say "  OtoDock refuses to start on this host for the same reason. Check that"
+  say "  The compute machine refuses to run sessions for the same reason. Check that"
   say "  pasta runs here (the pasta line above). Send this report to the"
   say "  OtoDock maintainers if it does."
 elif [ "$P3" -ne 0 ] || { [ -n "$VENDORED" ] && [ "$P4B" -ne 0 ]; }; then
@@ -211,8 +215,8 @@ elif [ -n "$VENDORED" ] && [ "$P4A" -ne 0 ]; then
   say "  works) — a per-binary AppArmor/profile asymmetry on this host."
 else
   say "  All probes pass — this host's namespace stack is healthy. If an"
-  say "  agent still reports sandbox failures, capture the proxy log lines"
-  say "  tagged [stderr][sandbox] and send them with this report."
+  say "  agent still reports sandbox failures, capture the compute service's"
+  say "  log lines for that session and send them with this report."
 fi
 
 say ""

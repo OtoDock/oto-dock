@@ -75,6 +75,8 @@ _run_lock = asyncio.Lock()
 # switch left in ``switching``, an install backup left beside its folder),
 # whatever the auto-update setting says.
 _reconciled = False
+#: The weekly run was skipped for want of a compute machine (said once).
+_skipped_for_machine = False
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +152,16 @@ async def maybe_run_weekly() -> None:
         return
     if not (overdue or _in_window(now)):
         return
+    # An update's build runs on a compute machine: with none connected the
+    # run is skipped, said once, and stays due for when one is back.
+    global _skipped_for_machine
+    from core.remote.satellite_connection import get_connection_manager
+    if not get_connection_manager().building_machine():
+        if not _skipped_for_machine:
+            logger.info("mcp autoupdate: no compute machine is connected, the weekly run waits for one")
+        _skipped_for_machine = True
+        return
+    _skipped_for_machine = False
     # Claim the slot up front so the next 60s tick sees "not due" even while the
     # run (incl. the multi-hour defer loop) is still in flight.
     await run_db(_set_last_run, now)

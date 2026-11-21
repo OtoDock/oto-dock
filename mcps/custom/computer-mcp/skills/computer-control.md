@@ -1,85 +1,139 @@
 ## Computer control (screen, mouse, keyboard)
 
-You can directly control this machine's screen, mouse, and keyboard through the
-`mcp__computer__computer` tool. This drives the **real desktop** — the same
-cursor and windows the user sees. Move deliberately and verify as you go.
+You control this machine's real screen, mouse and keyboard with the
+`mcp__computer__computer` tool. It is the same desktop a person uses, with the
+same cursor and the same windows. Move with care and look as you go.
 
-### The loop: screenshot → act → read the result
+### A more direct tool comes first
 
-1. Start with `action="screenshot"` to see the screen.
-2. Decide on ONE action and run it.
-3. **Every action returns a fresh screenshot** — read it to confirm the result
-   before the next action. Don't fire a burst of clicks blind.
+When another tool reaches the same thing directly, use that tool. A web page
+goes through a browser tool, and a program with a tool of its own goes through
+that tool. The screen is for a desktop program and for what no other tool
+reaches.
 
-**Coordinates are in the pixel space of the screenshot you just received.**
-`(0,0)` is the top-left; the result text tells you the image's `WIDTH x HEIGHT`.
-Never click outside those bounds, and always take a screenshot before clicking
-into a screen you haven't seen yet (resolution and layout vary by machine).
+### One call, a list of steps
+
+Every call sends `steps`, a list of 1 to 12 actions, also for one action. The
+steps run in order. One screenshot comes back at the end, with one line per
+step: done, failed, stopped with the reason, or not run.
+
+```json
+{"steps": [
+  {"action": "left_click", "coordinate": [412, 230]},
+  {"action": "type", "text": "Maria"},
+  {"action": "left_click", "coordinate": [412, 290]},
+  {"action": "type", "text": "Papadopoulou"}
+]}
+```
+
+The tool waits for the screen to settle after each step.
+
+**Batch only what you can see.** Send several steps when every target is
+visible in your last screenshot and you know what each step does: fields you
+can see, a copy from one visible window into another, keyboard shortcuts.
+
+**Look first after anything new.** Anything that opens something new goes
+last, and you look at the result before the next call: a menu, a dialog, a
+page, an app, a scroll, a field that suggests as you type (an address, a
+search box). Never guess where something you have not seen will be.
+
+**Alone, after a look.** Anything that sends, pays, deletes or confirms goes in
+a call of its own, after you have looked at the screen. Enter and Return may
+only be the last step that acts.
+
+**One call at a time.** Never send several computer calls in one turn. Put the
+actions in `steps`. Only one agent drives the screen at a time.
+
+**Read the lines.** A list stops at the first step that fails. Read what ran,
+what failed and what did not run. Plan again from the screenshot. Do not repeat
+the steps that ran.
+
+### When a list stops
+
+A list also stops before a step when the screen under your next click no longer
+matches your last screenshot, when someone moves the mouse, or when another
+window comes to the front. A key or a type step also stops when most of the
+screen changed. That is not an error. Look at the new screenshot and plan
+again. When the same spot changes again on your next try, the tool goes ahead
+and says so.
+
+If a step will bring another window to the front, name it in the next step's
+`window`, with part of its title or its program's name.
+
+**A person may take over.** When a list stops because the mouse moved, a person
+is at the computer. They may be signing in to something for you. Look at the
+picture, then wait or ask in the chat. Never fight for the mouse.
+
+### Coordinates
+
+Coordinates are in the pixel space of the last screenshot you received. `(0,0)`
+is the top left, and the result text gives the image's size. A point outside
+that picture is refused. A click needs a screenshot this tool returned earlier
+in this chat. When it has none, nothing runs and a fresh screenshot comes back.
 
 ### Actions
 
-- `screenshot` — capture the screen. Add `save=true` ONLY when the user
-  explicitly wants to keep/see a screenshot; it saves a full-resolution copy to
-  the workspace `screenshots/` folder, viewable in the dashboard. Your normal
-  per-action screenshots are not saved.
-- `cursor_position` — report where the cursor is (in screenshot pixels).
-- `mouse_move` — move to `coordinate: [x, y]`.
-- `left_click` / `right_click` / `middle_click` / `double_click` / `triple_click`
-  — click. `coordinate` is optional (omit to click where the cursor already is).
-  `text` optionally holds modifier keys during the click (e.g. `text="ctrl"` for
-  ctrl-click, `text="shift"` to extend a selection).
-- `left_click_drag` — drag to `coordinate`; optional `start_coordinate` (else it
-  drags from the current cursor position).
-- `left_mouse_down` / `left_mouse_up` — fine-grained drag control when a single
-  drag isn't enough.
-- `scroll` — `scroll_direction` (up/down/left/right) + `scroll_amount` (clicks),
-  optionally at `coordinate` (move there first so the right pane scrolls).
-- `key` — press a key or combo, xdotool syntax: `Return`, `Escape`, `Tab`,
-  `BackSpace`, `Delete`, `Up`/`Down`/`Left`/`Right`, `Page_Up`/`Page_Down`,
-  `Home`/`End`, `ctrl+s`, `ctrl+shift+t`, `alt+Tab`, `super` (Win/Cmd key), `F5`.
-- `hold_key` — hold a combo for `duration` seconds.
-- `type` — type literal `text`. Non-ASCII text (accents, CJK, emoji) is delivered
-  via the clipboard (which it overwrites); IME / dead-key composition is not
-  supported.
-- `wait` — pause `duration` seconds, then screenshot. Use it for slow-loading
-  pages or animations instead of hammering screenshots.
+- `screenshot`: the screen. Put it last. Add `save: true` only when the person
+  wants to keep or see the screenshot. It then saves a full resolution copy in
+  the workspace `screenshots/` folder.
+- `zoom`: a region at the screen's full sharpness, `region: [x0, y0, x1, y1]`
+  in your screenshot's space. Use it to read small text. Coordinates stay in
+  the full screenshot's space. At most 3 zooms in one call.
+- `cursor_position`: where the cursor is.
+- `mouse_move`: move to `coordinate: [x, y]`.
+- `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`:
+  a click at `coordinate`, or where the cursor is without one. `text` may hold
+  keys to keep down during the click, such as `"ctrl"` or `"shift"`.
+- `left_click_drag`: a drag to `coordinate`, from `start_coordinate` or from
+  the cursor.
+- `scroll`: `scroll_direction` (up, down, left, right) and `scroll_amount` (1
+  to 50), at `coordinate` so that the right pane scrolls.
+- `key`: a key or a combo in xdotool names: `Return`, `Escape`, `Tab`,
+  `BackSpace`, `Delete`, `Up`, `Down`, `Page_Down`, `Home`, `End`, `ctrl+s`,
+  `ctrl+shift+t`, `alt+Tab`, `super` (the Windows or Command key), `F5`.
+- `hold_key`: keep a combo down for `duration` seconds, at most 5.
+- `type`: literal `text`, at most 200 characters in one step. Split longer text
+  into several steps. Text with a line break, a tab or letters outside A to Z,
+  such as Greek, accents or emoji, goes through the clipboard in one paste, up
+  to 2,000 characters. Typed text never presses Enter or Tab: use a `key` step
+  for those.
+- `wait`: a pause of `duration` seconds, at most 5, then a screenshot. Use
+  several wait steps for a longer pause.
 
-### Good practice
+On a computer with several monitors, pass `display` on the call (1 is the
+primary). Work on one monitor at a time.
 
-- One action at a time; read the returned screenshot before the next step.
-- Prefer keyboard shortcuts (`key`) over hunting for buttons when you know them.
-- To type into a field, click it first, then `type`.
-- Don't drive a machine the user is actively using — you share one cursor.
-- If something looks wrong, take a `screenshot` and reassess rather than guessing.
+### Showing a person something
 
-### When it can't act (you'll get a clear ⚠️ message — read it, don't retry blindly)
+The chat does not show this tool's pictures. To show a person part of the
+screen, or to keep it as content, zoom on it with `save: true`. Then show the
+saved file with the image display tool, by the full path the line gives after
+"On this computer".
 
-- **Wayland (Linux):** synthetic input is blocked by the compositor. The user
-  must log into an **X11/Xorg** session instead. Capture may also be blocked.
-- **No display / locked / asleep:** a headless server, the login screen, or a
-  locked session can't be captured or controlled until a user is logged in at
-  the physical console.
-- **macOS permissions:** macOS must let the satellite's app (**OtoDock Satellite**
-  in System Settings → Privacy & Security) see the screen and control the mouse
-  and keyboard. Your first action makes macOS show both questions on the Mac's
-  screen. Until the user turns them on, an action macOS would block is refused
-  with a ⚠️ message naming the switch and the list it sits in. Pass it on to the
-  user as it is, and tell them to start a new chat on this machine afterwards. A chat
-  that is already open keeps the old answer. On macOS 27 the first screenshot also
-  shows a question about the system private window picker. It blocks nothing. A
-  command that reads Documents, Desktop or Downloads for the first time waits until
-  the user answers macOS's question for that folder on the Mac's screen. Tell them,
-  or ask them to turn on Full Disk Access for OtoDock Satellite once.
-  If screenshots are still black or clicks still do nothing, call
-  `mcp__computer__check_permissions`: it shows both permissions and the app
-  macOS asks on behalf of. Password fields may drop keystrokes while Secure
-  Input is on.
-- **Windows UAC / elevated windows:** a non-elevated agent can't click UAC
-  prompts or windows of "Run as administrator" apps; you'll get a note when this
-  is likely.
+### When it cannot act
 
-### Multi-monitor
+The tool answers with a ⚠️ message. Read it, and do not retry blindly.
 
-Pass `display` (1 = primary) to target a specific monitor for both screenshots
-and clicks. The screenshot text states which display it shows. Work one monitor
-at a time.
+- **Wayland on Linux:** the system blocks synthetic input. The person must sign
+  in to an X11 (Xorg) session instead. Capture may be blocked too.
+- **No display, locked or asleep:** a headless server, the login screen or a
+  locked session cannot be seen or driven until a person signs in at the
+  computer.
+- **macOS permissions:** macOS must let OtoDock Satellite see the screen and
+  control the mouse and keyboard (System Settings, Privacy & Security). Your
+  first action makes macOS ask on the Mac's screen. Until the person turns both
+  on, an action macOS would block is refused with a message that names the
+  switch and its list. Pass it on as it is, and tell them to start a new chat on
+  this machine afterwards. A chat that is already open keeps the old answer. On
+  macOS 27 the first screenshot also shows a question about the system private
+  window picker. It blocks nothing. A command that reads Documents, Desktop or
+  Downloads for the first time waits until the person answers macOS's question
+  for that folder. Tell them, or ask them to turn on Full Disk Access for
+  OtoDock Satellite once. If screenshots stay black or clicks do nothing, call
+  `mcp__computer__check_permissions`. It shows both permissions and the app
+  macOS asks on behalf of.
+- **macOS Secure Input:** while a password field has Secure Input on, typed
+  keys are lost. A step that types into such a window fails and says so.
+- **Windows administrator windows:** this tool cannot click or type into a
+  window of a program that runs as administrator, or into a UAC prompt. Such a
+  step fails and says so.

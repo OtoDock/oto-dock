@@ -1,8 +1,8 @@
 {
   "name": "image-gen-mcp",
   "label": "Image Generation",
-  "description": "AI image generation (Nano Banana Pro, GPT Image 1.5)",
-  "version": "1.2.0",
+  "description": "AI image generation (Nano Banana Pro, GPT Image 2.6)",
+  "version": "1.3.1",
   "category": "custom",
   "server": {
     "runtime": "python",
@@ -12,7 +12,11 @@
     "tool_timeout_sec": 600
   },
   "credentials": {
-    "type": "none"
+    "type": "none",
+    "exit": [
+      {"key": "GOOGLE_AI_API_KEY", "header": "x-goog-api-key", "hosts": ["generativelanguage.googleapis.com"], "streams": true},
+      {"key": "OPENAI_IMAGE_API_KEY", "header": "Authorization", "prefix": "Bearer ", "hosts": ["api.openai.com"], "streams": true}
+    ]
   },
   "instances": {
     "delivery": "env",
@@ -46,12 +50,13 @@
     "provider": "image-gen",
     "rules": [
       {"tool": "generate_image", "match": {"model": "nano-banana"}, "amount": 0.134, "multiply_by": "num_images"},
-      {"tool": "generate_image", "match": {"model": "gpt-image", "quality": "high", "aspect_ratio": ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"]}, "amount": 0.25, "multiply_by": "num_images"},
-      {"tool": "generate_image", "match": {"model": "gpt-image", "quality": "high"}, "amount": 0.167, "multiply_by": "num_images"},
-      {"tool": "generate_image", "match": {"model": "gpt-image", "aspect_ratio": ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"]}, "amount": 0.063, "multiply_by": "num_images"},
-      {"tool": "generate_image", "match": {"model": "gpt-image"}, "amount": 0.042, "multiply_by": "num_images"},
-      {"tool": "edit_image_ai", "match": {"model": "gpt-image", "quality": "high"}, "amount": 0.167},
-      {"tool": "edit_image_ai", "match": {"model": "gpt-image"}, "amount": 0.042},
+      {"tool": "generate_image", "match": {"model": "gpt-image", "quality": "high", "aspect_ratio": ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"]}, "amount": 0.0412, "multiply_by": "num_images"},
+      {"tool": "generate_image", "match": {"model": "gpt-image", "quality": "high"}, "amount": 0.0527, "multiply_by": "num_images"},
+      {"tool": "generate_image", "match": {"model": "gpt-image", "aspect_ratio": ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"]}, "amount": 0.034, "multiply_by": "num_images"},
+      {"tool": "generate_image", "match": {"model": "gpt-image"}, "amount": 0.0435, "multiply_by": "num_images"},
+      {"tool": "generate_image", "amount": 0.134, "multiply_by": "num_images"},
+      {"tool": "edit_image_ai", "match": {"model": "gpt-image", "quality": "high"}, "amount": 0.0527},
+      {"tool": "edit_image_ai", "match": {"model": "gpt-image"}, "amount": 0.0435},
       {"tool": "edit_image_ai", "amount": 0.134}
     ]
   },

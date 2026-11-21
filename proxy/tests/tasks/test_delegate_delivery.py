@@ -16,29 +16,34 @@ from __future__ import annotations
 import asyncio
 import json
 
-# The ws rung now has a LIVENESS GATE: queue presence alone no longer routes —
-# the target session must be alive. Tests that exercise the ws route register
-# a fake alive CLI session alongside their notify queue.
+# The ws rung has a LIVENESS GATE: queue presence alone does not route, the
+# target session must be alive. Tests that exercise the ws route plant a live
+# session the platform holds alongside their notify queue.
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 
+from core import placement
 from core.execution_layer import ResumeVerdict
 from services.scheduler import delivery, lanes, scheduler
 from services.scheduler.scheduler import TaskDefinition
 from storage import database as task_store
+from tests._compute import COMPUTE, serve
 from tests._timing import bound
+from tests.fixtures.wake_defaults import WAKE
 
 
 @contextmanager
-def _alive_cli_session(sid):
-    from core.layers.cli import layer as _cli_layer
-    _cli_layer._persistent_sessions[sid] = SimpleNamespace(is_alive=True)
+def _alive_session(sid):
+    """A live session in the pool the platform holds itself (Direct LLM's):
+    on no machine, so it is on its chat's place whatever the chat's pin."""
+    from core.layers.direct import session as _direct
+    _direct._direct_sessions[sid] = SimpleNamespace(mcp_manager=None)
     try:
         yield
     finally:
-        _cli_layer._persistent_sessions.pop(sid, None)
+        _direct._direct_sessions.pop(sid, None)
 
 
 def _task() -> TaskDefinition:
@@ -51,6 +56,7 @@ def ledger(monkeypatch):
     1000 MB sessions, a fresh condition (it binds to this test's loop)."""
     import config
     import core.concurrency as C
+    from core import concurrency_scan
     monkeypatch.setattr(config, "SESSION_EST_HEAVY_MB", 1000)
     monkeypatch.setattr(config, "OTODOCK_MAX_LOCAL_SESSIONS", 0)
     monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 0)
@@ -59,6 +65,8 @@ def ledger(monkeypatch):
                         ("_session_owner", {}), ("_line", []), ("_reserved_mb", 0),
                         ("_parked_tasks", 0), ("_budget_mb", 10_000), ("_floor_mb", 100)):
         monkeypatch.setattr(C, name, value)
+        if hasattr(concurrency_scan, name):  # the ledger's readers there hold the same object
+            monkeypatch.setattr(concurrency_scan, name, value)
     monkeypatch.setattr(C, "_cond", asyncio.Condition())
     monkeypatch.setattr(C, "_live_available_mb", lambda: 100_000)
     return C
@@ -130,7 +138,7 @@ class TestDelegateDelivery:
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-z"] = q
         try:
-            with _alive_cli_session("sess-z"):
+            with _alive_session("sess-z"):
                 asyncio.run(scheduler._do_deliver(
                     "sess-z", "pa", "echo prompt", _task(),
                     chat_id="chat-z", output_text="THE RESULT",
@@ -153,7 +161,7 @@ class TestDelegateDelivery:
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-te"] = q
         try:
-            with _alive_cli_session("sess-te"):
+            with _alive_session("sess-te"):
                 asyncio.run(scheduler._do_deliver(
                     "sess-te", "pa", "echo prompt", _task(),
                     chat_id="chat-te", output_text="half", status="failed",
@@ -193,7 +201,7 @@ class TestDelegateDelivery:
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-s"] = q
         try:
-            with _alive_cli_session("sess-s"):
+            with _alive_session("sess-s"):
                 asyncio.run(scheduler._do_deliver(
                     "sess-s", "pa", "echo prompt", _task(),
                     chat_id="chat-s", output_text="PARTIAL",
@@ -226,6 +234,61 @@ class TestDelegateDelivery:
             "sess-lk", "pa", "echo prompt", user_sub="user-1", role="editor",
             chat_id="chat-lk"))
         assert out is None
+
+
+class TestPersistentRungAsksTheChatsEngine:
+    """A chat on another engine than its agent's default has its live session
+    on that engine: asked of the default, the rung finds nothing alive, the
+    next rung gives way to the tracked id, and a wake waits for the chat's
+    next turn though the session sat idle."""
+
+    def _layers(self, monkeypatch, *, engine_with_the_session: str):
+        from core.session import session_manager
+        asked: list[str] = []
+        ran: list[tuple] = []
+
+        class _Layer:
+            def __init__(self, path):
+                self.path = path
+
+            async def is_session_alive(self, sid):
+                return self.path == engine_with_the_session
+
+        def _get(agent, execution_path="", **kw):
+            path = execution_path or "the-agents-default"
+            asked.append(path)
+            return _Layer(path)
+
+        async def _pumped(layer, sid, chat_id, agent, prompt, *, person="", source=""):
+            ran.append((layer.path, chat_id, person))
+            return ""
+
+        monkeypatch.setattr(session_manager, "get_execution_layer", _get)
+        monkeypatch.setattr(delivery, "_run_echo_turn_pumped", _pumped)
+        return asked, ran
+
+    def test_a_persons_wake_finds_the_session_on_the_chats_engine(self, temp_db, monkeypatch):
+        asked, ran = self._layers(monkeypatch, engine_with_the_session="direct-llm")
+        task_store.create_chat("chat-eng", "user-1", "pa", execution_path="direct-llm")
+        out = asyncio.run(delivery._deliver_via_persistent(
+            "sess-eng", "pa", "wake!", user_sub="user-1", role="editor", chat_id="chat-eng"))
+        assert out == ""
+        assert asked == ["direct-llm"] and ran == [("direct-llm", "chat-eng", "user-1")]
+
+    def test_a_wake_with_no_person_finds_it_too(self, temp_db, monkeypatch):
+        asked, ran = self._layers(monkeypatch, engine_with_the_session="direct-llm")
+        task_store.create_chat("chat-eng-2", "agent::pa", "pa", execution_path="direct-llm")
+        out = asyncio.run(delivery._deliver_via_persistent(
+            "sess-eng-2", "pa", "wake!", user_sub=None, role="manager", chat_id="chat-eng-2"))
+        assert out == ""
+        assert asked == ["direct-llm"] and ran == [("direct-llm", "chat-eng-2", "")]
+
+    def test_a_chat_with_no_engine_of_its_own_asks_the_agents(self, temp_db, monkeypatch):
+        asked, ran = self._layers(monkeypatch, engine_with_the_session="direct-llm")
+        task_store.create_chat("chat-eng-3", "user-1", "pa")
+        out = asyncio.run(delivery._deliver_via_persistent(
+            "sess-eng-3", "pa", "wake!", user_sub="user-1", role="editor", chat_id="chat-eng-3"))
+        assert out is None and asked == ["the-agents-default"] and ran == []
 
 
 class TestEchoOffTheLoop:
@@ -422,7 +485,7 @@ class TestStandingGate:
         asyncio.run(scheduler._do_deliver("sess-g4", "pa", "RESULT", _user_task("user-admin"),
                                           chat_id="chat-g4", output_text="OUT"))
         assert calls and calls[0]["user_sub"] == "user-admin"
-        assert calls[0]["role"] == "viewer"                       # the row reading, as before
+        assert calls[0]["role"] == "admin"                        # the role the dashboard reads
 
     def test_no_durable_wake_for_a_person_who_lost_the_agent_meanwhile(
             self, temp_db, monkeypatch):
@@ -826,10 +889,13 @@ class TestOneshotSecurityContext:
         from services.mcp import mcp_registry
         monkeypatch.setattr(mcp_registry, "build_session_mcp_config",
                             lambda *a, **k: (None, {}, [], {}, []))
+        # The platform's place is served by a compute machine: the one-shot
+        # is built on it.
+        serve(monkeypatch)
 
         out = asyncio.run(scheduler._deliver_via_oneshot(
             "11111111-2222-3333-4444-555555555555", "pa", "result!",
-            user_sub=None, role="manager",
+            user_sub=None, role="manager", **WAKE,
         ))
         assert out == "ok"
         cfg = captured["cfg"]
@@ -838,7 +904,9 @@ class TestOneshotSecurityContext:
         assert ctx is not None
         assert ctx.agent == "pa"
         assert ctx.role == "manager"
-        assert ctx.placement.is_local
+        # The chat's place stays the platform's; the session runs on the machine.
+        assert cfg.execution_target == placement.LOCAL
+        assert (ctx.placement.kind, ctx.placement.machine_id) == (placement.KIND_COMPUTE, COMPUTE["id"])
 
 
 class TestTaskStallWatchdog:
@@ -1668,7 +1736,7 @@ class TestResultFiles:
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-rf"] = q
         try:
-            with _alive_cli_session("sess-rf"):
+            with _alive_session("sess-rf"):
                 asyncio.run(scheduler._do_deliver(
                     "sess-rf", "pa", "echo prompt", _task(),
                     chat_id="chat-rf", output_text="OUT", status="failed",
@@ -1751,9 +1819,9 @@ class TestWorkLeftRunning:
 
     def test_a_parked_run_tells_the_people_who_may_answer(self, monkeypatch):
         """A run's turn waits on a person while nobody views it: a user-scope
-        task's creator is told; an agent-scope run tells the agent's editors
-        and managers, never its members."""
-        import auth.providers as providers
+        task's creator is told; an agent-scope run tells who hears the
+        agent's own work (``visibility.agent_work_audience``): its editors,
+        its managers and every admin, never a viewer."""
         from services.notifications import notification_manager
         told: list[tuple[str, str]] = []
 
@@ -1761,10 +1829,9 @@ class TestWorkLeftRunning:
             told.append((kw["target"], title))
 
         monkeypatch.setattr(notification_manager, "fire_notification", fake_fire)
-        monkeypatch.setattr(lanes.task_store, "get_agent_users", lambda agent: [
-            {"sub": "ed"}, {"sub": "mem"}, {"sub": "mgr"}])
-        roles_by_sub = {"ed": "editor", "mem": "member", "mgr": "manager"}
-        monkeypatch.setattr(providers, "acting_role_of", lambda sub, agent: roles_by_sub[sub])
+        members = (("ed", "editor"), ("view", "viewer"), ("mgr", "manager"), ("root", "admin"))
+        monkeypatch.setattr(notification_manager, "_audience_of",
+                            lambda agent, fan_out: (members, False))
 
         user_task = _task()
         user_task.scope, user_task.created_by = "user", "creator-1"
@@ -1776,7 +1843,7 @@ class TestWorkLeftRunning:
         agent_task = _task()
         agent_task.scope, agent_task.created_by = "agent", ""
         asyncio.run(lanes.tell_run_parked(agent_task, "chat-1"))
-        assert sorted(sub for sub, _ in told) == ["ed", "mgr"]
+        assert sorted(sub for sub, _ in told) == ["ed", "mgr", "root"]
 
 
 class TestWakeReplayAtAPumpsEnd:
@@ -1961,7 +2028,7 @@ class TestReportMissing:
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-rm2"] = q
         try:
-            with _alive_cli_session("sess-rm2"):
+            with _alive_session("sess-rm2"):
                 asyncio.run(scheduler._do_deliver(
                     "sess-rm2", "pa", "echo", _task(), chat_id="chat-rm2", output_text="half",
                     status="failed", report_missing=True, background_pending=2,
@@ -2004,7 +2071,7 @@ class TestWorkerChatOnTheResult:
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-wc2"] = q
         try:
-            with _alive_cli_session("sess-wc2"):
+            with _alive_session("sess-wc2"):
                 asyncio.run(scheduler._do_deliver(
                     "sess-wc2", "pa", "echo", _task(), chat_id="chat-wc2", output_text="done",
                     worker_chat_id="task-run-w1",
@@ -2029,3 +2096,60 @@ class TestWorkerChatOnTheResult:
             "sess-wc3", "pa", "echo", _task(), chat_id="chat-wc3", output_text="done",
         ))
         assert "worker_chat_id" not in json.loads(_delegate_events("chat-wc3")[0]["event_data"])
+
+
+class TestAWakeBuildsTheChat:
+    """A wake of a person's own chat starts the chat's own session (the
+    warm-up's builder, the chat's mode read when it is built, the dashboard
+    kind). A task run's chat, a worker's chat and a chat no person owns keep
+    the unattended build a session nobody drives takes."""
+
+    def _spy_oneshot(self, monkeypatch) -> list[dict]:
+        calls: list[dict] = []
+
+        async def _dead(*a, **k):
+            return None
+
+        async def _oneshot(sid, agent, text, **kw):
+            calls.append(kw)
+            return ""
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _dead)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _oneshot)
+        return calls
+
+    def _words(self, kw: dict) -> tuple:
+        return kw["build"], kw["permission_mode"], kw["client_type"]
+
+    def test_a_result_wakes_a_persons_chat_as_the_chat(self, temp_db, monkeypatch):
+        _owner("user-1", "pa")
+        task_store.create_chat("chat-b1", "user-1", "pa", permission_mode="ask")
+        calls = self._spy_oneshot(monkeypatch)
+        asyncio.run(scheduler._do_deliver("sess-b1", "pa", "RESULT", _user_task("user-1"),
+                                          chat_id="chat-b1", output_text="OUT"))
+        (kw,) = calls
+        assert kw["user_sub"] == "user-1"
+        assert self._words(kw) == ("chat", "chat-own", "dashboard")
+
+    def test_a_stored_wake_replays_into_a_persons_chat_as_the_chat(self, temp_db, monkeypatch):
+        _owner("user-1", "pa")
+        chat = task_store.create_chat("chat-b2", "user-1", "pa")
+        calls = self._spy_oneshot(monkeypatch)
+        asyncio.run(delivery._redeliver_group(chat, ["a wake"], person="user-1", role="editor",
+                                              by="user-1"))
+        (kw,) = calls
+        assert self._words(kw) == ("chat", "chat-own", "dashboard")
+
+    @pytest.mark.parametrize("chat_id,owner,origin", [
+        ("task-b3", "user-1", "dashboard"),     # a task run's chat
+        ("chat-b4", "user-1", "delegated"),     # a delegated worker's chat
+        ("chat-b5", "user-1", "otodock"),       # a machine's own CLI terminal
+    ])
+    def test_a_run_a_worker_or_a_terminal_chat_keeps_the_unattended_build(
+            self, temp_db, monkeypatch, chat_id, owner, origin):
+        _owner("user-1", "pa")
+        source = "task" if chat_id.startswith("task-") else "chat"
+        task_store.create_chat(chat_id, owner, "pa", origin=origin, source_type=source)
+        calls = self._spy_oneshot(monkeypatch)
+        asyncio.run(scheduler._do_deliver("sess-" + chat_id, "pa", "RESULT", _user_task("user-1"),
+                                          chat_id=chat_id, output_text="OUT"))
+        assert [self._words(kw) for kw in calls] == [("wake", "auto", "")]

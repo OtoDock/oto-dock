@@ -38,7 +38,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .._vendored import layout
-from ..config import force_rmtree
 from ..engines import ENGINES
 from ..host import safe_fs, session_retention
 
@@ -376,7 +375,8 @@ def commit(agents_dir: Path, scope: Scope) -> list[dict]:
             safe_fs.unlink_beneath(agents_dir, f"{scope.home_rel}/{rel}", missing_ok=True)
     for d in stale_dirs:
         with contextlib.suppress(OSError):
-            force_rmtree(d)
+            safe_fs.rmtree_beneath(agents_dir, f"{scope.home_rel}/{d.relative_to(home).as_posix()}",
+                                   missing_ok=True)
     placed: list[dict] = []
     for parts, _kind in staged:
         src = f"{scope.staging_rel}/{'/'.join(parts)}"
@@ -396,9 +396,8 @@ def discard(agents_dir: Path, scope: Scope) -> None:
         _uploads.pop(key, None)
     _move_bytes.pop(scope.move_id, None)
     root = agents_dir.joinpath(*scope.staging_rel.split("/"))
-    if session_retention._real_dir(root):
-        with contextlib.suppress(OSError):
-            force_rmtree(root)
+    with contextlib.suppress(OSError):
+        safe_fs.rmtree_beneath(agents_dir, scope.staging_rel, missing_ok=True)
     parent = root.parent
     with contextlib.suppress(OSError, ValueError):
         if session_retention._real_dir(parent) and not any(parent.iterdir()):
@@ -417,11 +416,13 @@ def delete(agents_dir: Path, scope: Scope) -> int:
         with contextlib.suppress(OSError, ValueError):
             safe_fs.unlink_beneath(agents_dir, f"{scope.home_rel}/{f.relative_to(home).as_posix()}")
             gone += 1
-        if sibling is not None and not safe_fs.is_link_like(sibling):
-            for d in session_retention._walk_dirs(sibling):
-                gone += len(session_retention._files(d, suffix=""))
+        if sibling is not None:
+            inside = sum(len(session_retention._files(d, suffix=""))
+                         for d in session_retention._walk_dirs(sibling))
             with contextlib.suppress(OSError):
-                force_rmtree(sibling)
+                safe_fs.rmtree_beneath(agents_dir,
+                                       f"{scope.home_rel}/{sibling.relative_to(home).as_posix()}")
+                gone += inside
     return gone
 
 
@@ -436,7 +437,7 @@ def sweep_staging(agents_dir: Path, agent_slug: str, *, now: float | None = None
     for d in session_retention._subdirs(root):
         with contextlib.suppress(OSError):
             if now - d.lstat().st_mtime >= STAGING_MAX_AGE_S:
-                force_rmtree(d)
+                safe_fs.rmtree_beneath(agents_dir, f"{agent_slug}/{STAGING_DIR}/{d.name}")
                 n += 1
     return n
 

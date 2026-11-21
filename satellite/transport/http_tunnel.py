@@ -61,13 +61,23 @@ _ALLOWLIST_REGEXES = [
         r"^/v1/hooks/(resolve-path|resolve-tool-arg-paths|permission|"
         # The command-line credential git and gh ask for per command
         # (0.5.139), session-JWT gated proxy-side.
-        r"mcp-credentials|session-files|cli-credential|"
+        r"mcp-credentials|cli-credential|"
+        # A tool's saved answers and its start, on its fetch token (0.5.176).
+        r"tool-listing|tool-start|"
+        # The session's SSH agent socket, forwarded by the satellite (0.5.173).
+        r"ssh-agent|"
         r"images|image-generating|image-gen-failed|url|file|media|ui|"
         r"document-preview|tool-result|file-written|subagent|"
         # The Stop hook (turn end, both engines) and the Codex question
         # bridge (request_user_input → the dashboard card), 0.5.121; both
         # session-JWT gated proxy-side like every hook.
-        r"stop|codex-question)$"
+        r"stop|codex-question|"
+        # A terminal's status line report (hooks/usage_report.py), written
+        # into settings.json only when the platform shipped the script.
+        r"usage-report|"
+        # A terminal's start hook asks for the start's riding part (a
+        # satellite that reports start_context_hook).
+        r"start-context)$"
     ),
     # display-mcp pinned apps (pin/unpin/list) — session-JWT gated
     # proxy-side like every hook (verify_session_match + scope from the
@@ -139,8 +149,33 @@ _ALLOWLIST_REGEXES = [
     # the routes judge the session's role proxy-side.
     re.compile(r"^/v1/community/(agents|departments)$"),
     re.compile(r"^/v1/departments$"),
+    # The platform's own tools on a machine (0.5.172): the agent's knowledge
+    # libraries (mcps-mcp), a local tool package's check (mcps-mcp), the
+    # conversations of an external identity, and the phone's call control;
+    # every one session-JWT gated proxy-side.
+    re.compile(r"^/v1/knowledge-libraries(/.*)?$"),
+    re.compile(r"^/v1/mcps/local-package/validate$"),
+    re.compile(r"^/v1/conversations(/.*)?$"),
+    re.compile(r"^/v1/phone/call-control(/.*)?$"),
+    # The credential gateway's path, tunneled from a compute machine alone
+    # (a paired machine serves it itself, above; the proxy admits the row on
+    # a compute machine's link only).
+    re.compile(r"^/v1/mcp-gateway/[A-Za-z0-9_-]+(/.*)?$"),
     re.compile(r"^/mcp/[a-z0-9_-]+/.*$"),
 ]
+
+
+# What an app server may reach through its own listener (compute machines
+# alone, ``LocalTunnelServer.start``): its platform methods, its push and state
+# twins, its outbound calls, the events and the bindings it emits and calls and
+# a handler's own button presses, the same list the platform keeps. Never a
+# hook, a Docker tool's route or anything a session's token opens.
+_APP_ALLOWLIST_REGEXES = [
+    re.compile(r"^/v1/apps/[0-9a-f-]{36}/(api|platform|push|state|egress|events|bindings)(/.*)?$"),
+    re.compile(r"^/v1/apps/[0-9a-f-]{36}/actions/[A-Za-z0-9_-]{1,64}$"),
+]
+# An app route takes 1 MB at most; a little over, for the frame's own framing.
+_APP_MAX_BODY = 4 * 1024 * 1024
 
 
 # Response queue capacity per stream. 64 chunks × 256KB max-per-chunk = 16MB
@@ -167,6 +202,14 @@ def _is_allowed_path(path: str) -> bool:
     if _has_traversal(base):
         return False
     return any(rx.match(base) for rx in _ALLOWLIST_REGEXES)
+
+
+def _is_app_path(path: str) -> bool:
+    """A path an app server may call, judged on the raw path it sent."""
+    base = path.split("?", 1)[0]
+    if _has_traversal(base):
+        return False
+    return any(rx.match(base) for rx in _APP_ALLOWLIST_REGEXES)
 
 
 # The local link's self-check (0.5.168). Answered by this server from its own
@@ -216,21 +259,27 @@ class _SelfCheckAccessFilter(logging.Filter):
         return _SELF_CHECK_PATH not in record.getMessage()
 
 
-def make_loop_exception_handler(tunnel: "LocalTunnelServer", *, quiet_close_resets: bool):
+def make_loop_exception_handler(tunnel: "LocalTunnelServer", *, quiet_close_resets: bool,
+                                exit_listener=None):
     """The satellite loop's exception handler.
 
     An accept failure is never swallowed, whatever its exception: the
     Proactor closes the listening socket right after this handler returns,
     so it is logged and a heal is started (a task, which runs after the
-    close). ``quiet_close_resets`` (Windows) drops the close-time
-    ``ConnectionResetError`` noise of the Proactor's transports, a socket
-    torn down after its peer went. Everything else reaches the default
-    handler.
+    close): the credential exit's when the socket is its listener's
+    (``exit_listener``: ``sessions/credential_exit``, ``owns_socket`` and
+    ``heal_soon``), else the tunnel's. ``quiet_close_resets`` (Windows)
+    drops the close-time ``ConnectionResetError`` noise of the Proactor's
+    transports, a socket torn down after its peer went. Everything else
+    reaches the default handler.
     """
     def handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
         message = str(context.get("message") or "")
         exc = context.get("exception")
         if message.startswith(_ACCEPT_FAILED):
+            if exit_listener is not None and exit_listener.owns_socket(context.get("socket")):
+                exit_listener.heal_soon(_short(exc) if exc is not None else "an accept failure")
+                return
             logger.warning(
                 "tunnel: a listening socket stopped accepting (%s on %s); checking the local link",
                 _short(exc) if exc is not None else "no error", _sock_address(context.get("socket")),
@@ -264,6 +313,9 @@ class LocalTunnelServer:
     def __init__(self, ws_client: "SatelliteWSClient") -> None:
         self.ws_client = ws_client
         self.port: int = 0
+        # The app servers' own listener (compute machines alone), 0 elsewhere.
+        self.app_port: int = 0
+        self._app_runner: web.AppRunner | None = None
         self._runner: web.AppRunner | None = None
         # The listening socket is ours (``SockSite``): a check sees it closed
         # under the server, as the Proactor leaves it after a failed accept.
@@ -294,6 +346,14 @@ class LocalTunnelServer:
         if not any(isinstance(f, _SelfCheckAccessFilter) for f in access.filters):
             access.addFilter(_SelfCheckAccessFilter())
 
+    @property
+    def _compute(self) -> bool:
+        """A compute machine's link: the credential gateway's path rides the
+        tunnel to the platform's own gateway (this machine holds no lease),
+        and an MCP request's body is forwarded as the sandbox wrote it (its
+        paths are the platform's already)."""
+        return bool(getattr(getattr(self.ws_client, "config", None), "compute", False))
+
     async def start(self) -> int:
         """Serve on 127.0.0.1:<ephemeral>. Returns the chosen port."""
 
@@ -315,9 +375,31 @@ class LocalTunnelServer:
 
         port = await self._listen(0)
         self.gateway.start()
+        if self._compute:
+            await self._start_app_listener()
 
         logger.info("Local tunnel server listening on 127.0.0.1:%d", port)
         return port
+
+    async def _start_app_listener(self) -> None:
+        """The app servers' way to the platform: a loopback port of its own,
+        which admits the app routes alone and a body an app route can take,
+        so an app server reaches nothing else a session's tunnel carries."""
+        app = web.Application(client_max_size=_APP_MAX_BODY)
+        app.router.add_route("*", "/{tail:.*}", self._handle_app_request)
+        runner = web.AppRunner(app, handle_signals=False)
+        await runner.setup()
+        sock = socket.create_server(("127.0.0.1", 0), backlog=128)
+        site = web.SockSite(runner, sock, backlog=128)
+        try:
+            await site.start()
+        except BaseException:
+            sock.close()
+            await runner.cleanup()
+            raise
+        self._app_runner = runner
+        self.app_port = sock.getsockname()[1]
+        logger.info("App listener on 127.0.0.1:%d", self.app_port)
 
     async def _listen(self, port: int, *, share: bool = False) -> int:
         """Serve on 127.0.0.1:<port> (0: the OS picks) through a socket of our
@@ -394,6 +476,10 @@ class LocalTunnelServer:
 
             await self.gateway.stop()
             await self._close_site()
+            if self._app_runner is not None:
+                await self._app_runner.cleanup()
+            self._app_runner = None
+            self.app_port = 0
             if self._runner is not None:
                 await self._runner.cleanup()
             self._runner = None
@@ -609,21 +695,35 @@ class LocalTunnelServer:
                 stream_id[:8],
             )
 
-    def fail_all_streams(self, reason: str = "tunnel-disconnected") -> None:
+    def _hold(self) -> dict:
+        """``{"hold_s": n}`` while the platform said it would be away for
+        ``n`` more seconds (``platform_stopping``, 0.5.170): a hook holds
+        its call that long when that is longer than its own two minutes. Empty
+        otherwise."""
+        left = getattr(self.ws_client, "platform_hold_s", lambda: 0)()
+        return {"hold_s": left} if left > 0 else {}
+
+    def fail_all_streams(self, reason: str = "tunnel-disconnected",
+                         unsent: set[str] | frozenset[str] = frozenset()) -> None:
         """Reject every pending stream with a synthetic 502.
 
         Called when the WS reconnects — every in-flight tunneled request
-        gets a clean failure rather than hanging until timeout.
+        gets a clean failure rather than hanging until timeout. A stream
+        whose request never left (``unsent``: still on the link's lane, now
+        dropped) gets the 503 ``tunnel-not-connected`` of a link that is down
+        instead: its caller may send it again, it was never seen.
         """
-        for _stream_id, stream in list(self._streams.items()):
+        for stream_id, stream in list(self._streams.items()):
+            never_sent = stream_id in unsent
             with contextlib.suppress(asyncio.QueueFull):
                 stream.response_queue.put_nowait({
                     "type": "http_response",
-                    "status": 502,
-                    "error": reason,
+                    "status": 503 if never_sent else 502,
+                    "error": "tunnel-not-connected" if never_sent else reason,
                     "headers": {},
                     "body_b64": "",
                     "body_eof": True,
+                    **self._hold(),
                 })
 
     # --- Request handling ---
@@ -646,7 +746,7 @@ class LocalTunnelServer:
         # ahead of the link check so it serves within its lease while the
         # link is down. A dot segment or an encoded separator is refused
         # before anything else, as for every path.
-        if path.startswith(GATEWAY_PATH_PREFIX + "/"):
+        if path.startswith(GATEWAY_PATH_PREFIX + "/") and not self._compute:
             if _has_traversal(path):
                 return web.Response(
                     status=403,
@@ -681,10 +781,45 @@ class LocalTunnelServer:
             self._log_refusal(path)
             return web.Response(
                 status=503,
-                body=json.dumps({"error": "tunnel-not-connected"}).encode(),
+                body=json.dumps({"error": "tunnel-not-connected", **self._hold()}).encode(),
                 content_type="application/json",
             )
 
+        return await self._tunnel(request, path, path_with_query)
+
+    async def _handle_app_request(self, request: web.Request) -> web.StreamResponse:
+        """One app server's call. Judged and forwarded on the raw path: the
+        egress route's contract is the path as the server sent it, and
+        ``request.path`` decodes it."""
+        raw = request.raw_path
+        if (request.content_length or 0) > _APP_MAX_BODY:
+            return web.Response(status=413)
+        if request.headers.get("Upgrade"):
+            # The tunnel carries HTTP alone (the platform's subscription
+            # socket does not run on a compute machine).
+            return web.Response(
+                status=501,
+                body=json.dumps({"error": "websocket-not-tunneled"}).encode(),
+                content_type="application/json",
+            )
+        if not _is_app_path(raw):
+            logger.warning("tunnel: rejected app path: %s", raw.split("?", 1)[0])
+            return web.Response(
+                status=403,
+                body=json.dumps({"error": "path-not-allowlisted"}).encode(),
+                content_type="application/json",
+            )
+        if not self.ws_client._authenticated:
+            return web.Response(
+                status=503,
+                body=json.dumps({"error": "tunnel-not-connected"}).encode(),
+                content_type="application/json",
+            )
+        return await self._tunnel(request, raw.split("?", 1)[0], raw, via="app")
+
+    async def _tunnel(self, request: web.Request, path: str, path_with_query: str,
+                      via: str = "") -> web.StreamResponse:
+        """Frame one admitted request over the link and stream its answer."""
         stream_id = str(uuid.uuid4())
         stream = _PendingStream()
         self._streams[stream_id] = stream
@@ -704,7 +839,7 @@ class LocalTunnelServer:
             # before forwarding. Paths outside the synced tree pass
             # through unchanged — those MCPs will reject the path, which
             # is the current expected limitation (see prompt guidance).
-            if path.startswith("/mcp/") and body:
+            if path.startswith("/mcp/") and body and not self._compute:
                 try:
                     from ..host import path_translator
                     body_text = body.decode("utf-8", errors="strict")
@@ -737,7 +872,7 @@ class LocalTunnelServer:
             # Inline body if ≤ 256KB; else chunk continuation.
             await self._send_request_frames(
                 stream_id, request.method, path_with_query,
-                headers, body, timeout_s,
+                headers, body, timeout_s, via=via,
             )
 
             # Await the first response frame (status + headers + maybe body).
@@ -769,9 +904,10 @@ class LocalTunnelServer:
             if first.get("error"):
                 # Synthetic failure from the platform side (allowlist deny,
                 # upstream connect failure, etc.)
+                held = {"hold_s": first["hold_s"]} if first.get("hold_s") else {}
                 return web.Response(
                     status=first.get("status", 502),
-                    body=json.dumps({"error": first["error"]}).encode(),
+                    body=json.dumps({"error": first["error"], **held}).encode(),
                     content_type="application/json",
                 )
 
@@ -847,6 +983,9 @@ class LocalTunnelServer:
                 await stream_resp.write_eof()
             return stream_resp
 
+        except web.HTTPRequestEntityTooLarge:
+            # A body past the app listener's cap with no Content-Length.
+            return web.Response(status=413)
         except (ConnectionResetError, ConnectionError) as e:
             # Same race for non-streaming responses: client gave up
             # before we could write the response. Log at debug — there's
@@ -922,6 +1061,8 @@ class LocalTunnelServer:
         headers: dict,
         body: bytes,
         timeout_s: int,
+        *,
+        via: str = "",
     ) -> None:
         """Frame an HTTP request as one or more WS messages.
 
@@ -929,6 +1070,7 @@ class LocalTunnelServer:
         Larger bodies use http_request (body_eof=False, no body) followed
         by http_request_chunk frames.
         """
+        extra = {"via": via} if via else {}
         if len(body) <= _MAX_FRAME_BODY:
             await self.ws_client.enqueue_send({
                 "type": "http_request",
@@ -939,6 +1081,7 @@ class LocalTunnelServer:
                 "body_b64": base64.b64encode(body).decode(),
                 "body_eof": True,
                 "timeout_s": timeout_s,
+                **extra,
             })
             return
 
@@ -952,6 +1095,7 @@ class LocalTunnelServer:
             "body_b64": "",
             "body_eof": False,
             "timeout_s": timeout_s,
+            **extra,
         })
         offset = 0
         while offset < len(body):

@@ -1,4 +1,5 @@
 import XCTest
+@testable import OtoDockShell
 import Foundation
 
 /// The app's shape, read from the tree (the twin of the Android app's
@@ -271,6 +272,22 @@ final class AppHardeningTests: XCTestCase {
         let shell = try text("App/App/ShellViewController.swift")
         let table = try Self.block(of: shell, from: "func dispatchNative(", to: "\n    }\n")
         XCTAssertEqual(expected, try Self.names(in: table, pattern: "case \"(\\w+)\":"))
+    }
+
+    /// One back gesture, the shell's own from the left edge, on the rules of
+    /// `BackSwipe`; WebKit's back-forward gesture is never turned on beside
+    /// it. Its edge zone is the dead zone of the dashboard's own swipes.
+    func testTheEdgeSwipeIsTheOnlyBackGesture() throws {
+        let shell = try text("App/App/ShellViewController.swift")
+        XCTAssertTrue(shell.contains("UIScreenEdgePanGestureRecognizer(target: self, action: #selector(edgePanned(_:)))"))
+        XCTAssertTrue(shell.contains("pan.edges = .left"))
+        XCTAssertTrue(shell.contains("showsDashboard(webView.url)"), "never on the setup page or another site's")
+        XCTAssertTrue(shell.contains("BackSwipe.counts(") && shell.contains("evaluateJavaScript(BackSwipe.script)"))
+        for file in try FileManager.default.contentsOfDirectory(atPath: Self.app.path) where file.hasSuffix(".swift") {
+            XCTAssertFalse(try text("App/App/\(file)").contains("allowsBackForwardNavigationGestures = true"), file)
+        }
+        let settings = try String(contentsOf: Self.ios.deletingLastPathComponent().appendingPathComponent("src/components/settings/SettingsShell.tsx"), encoding: .utf8)
+        XCTAssertTrue(settings.contains("const EDGE_DEAD_ZONE_PX = \(Int(BackSwipe.edgeZone))\n"))
     }
 
     /// The text after `start`, up to the first `end` after it.

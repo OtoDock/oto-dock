@@ -137,7 +137,8 @@ def remove_active_participant(meeting_id: str, agent_slug: str, statuses) -> lis
 
 
 def mark_orphaned_meetings_failed() -> int:
-    """Mark meetings stuck in active/pending/concluding as failed (proxy restart recovery).
+    """Mark every meeting that has not ended as failed (proxy restart recovery):
+    pending, active, paused and concluding (``meeting_status.RESTART_FAILS``).
 
     Returns the number of rows updated.  Idempotent — safe to call on every
     startup even if no meetings are orphaned.
@@ -147,7 +148,7 @@ def mark_orphaned_meetings_failed() -> int:
         cur = conn.execute(
             "UPDATE meetings SET status=%s, concluded_at=%s "
             "WHERE status = ANY(%s)",
-            (meeting_status.FAILED, now, sorted(meeting_status.LIVE)),
+            (meeting_status.FAILED, now, sorted(meeting_status.RESTART_FAILS)),
         )
         conn.commit()
         return cur.rowcount

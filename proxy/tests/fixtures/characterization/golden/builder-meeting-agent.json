@@ -13,15 +13,22 @@
     "extra_mcps": [
      "meetings-mcp"
     ],
+    "limits": null,
     "mcp_config_format": "json",
     "meeting_mode": true,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "session_id": "s-meet",
     "target_browser": {},
     "task_mode": true,
     "task_owner": "",
     "task_scope": "agent",
-    "task_username": ""
+    "task_username": "",
+    "user_role": "manager",
+    "username": ""
    }
   },
   {
@@ -82,9 +89,15 @@
     "excluded_mcps": null,
     "execution_path": "claude-code-cli",
     "mount_shared": true,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "role": "manager",
     "sandboxed": true,
+    "session_id": "s-meet",
+    "tool_limits": null,
     "username": ""
    }
   },
@@ -94,6 +107,11 @@
      "agent": "char-agent",
      "config_visible": false,
      "is_admin_agent": false,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
      "role": "manager",
      "session_scope": "agent",
      "username": ""
@@ -106,6 +124,17 @@
      "phone-mcp"
     ],
     "execution_path": "claude-code-cli"
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "ensure_persistent_agent_dir",
+   "kwargs": {
+    "execution_path": "claude-code-cli",
+    "scope": "agent",
+    "username": ""
    }
   },
   {
@@ -136,23 +165,16 @@
      "execution_path": "claude-code-cli",
      "execution_paths": "",
      "execution_target": "local",
+     "history_retention_days": 0,
      "local_only_engines": "",
      "setup_completed_at": null,
      "slug": "char-agent",
+     "team_account": false,
+     "team_account_floor": "editor",
      "updated_at": "<stamp>"
     },
-    "model": "claude-char-1"
-   }
-  },
-  {
-   "args": [
-    "char-agent"
-   ],
-   "call": "ensure_persistent_agent_dir",
-   "kwargs": {
-    "execution_path": "claude-code-cli",
-    "scope": "agent",
-    "username": ""
+    "model": "claude-char-1",
+    "sticky_scope": "local:/char/.claude"
    }
   }
  ],
@@ -175,6 +197,11 @@
    "agent": "char-agent",
    "config_visible": false,
    "is_admin_agent": false,
+   "placement": {
+    "kind": "compute",
+    "label": "Compute",
+    "machine_id": "compute-0123456789ab"
+   },
    "role": "manager",
    "session_scope": "agent",
    "username": ""

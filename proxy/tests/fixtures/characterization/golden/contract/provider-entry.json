@@ -1,0 +1,15 @@
+{
+ "empty": null,
+ "empty_id": null,
+ "hit": {
+  "id": "acme",
+  "label": "first"
+ },
+ "is_the_entry": true,
+ "miss": null,
+ "no_providers": null,
+ "second_kind": {
+  "id": "local",
+  "kind": "local"
+ }
+}

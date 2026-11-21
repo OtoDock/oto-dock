@@ -7,13 +7,16 @@ import asyncio
 import base64
 import contextlib
 import contextvars
+import errno
 import hashlib
 import logging
 import os
 import re
+import stat
 import tempfile
 import unicodedata
 from pathlib import Path
+from typing import BinaryIO
 
 import httpx
 
@@ -174,14 +177,37 @@ async def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | No
 
 
 def _session_subtree(slug: str) -> str | None:
-    """The one container tree this request may touch: the session's own agent
-    folder under the mount, or, for a remote machine's file, the session's own
-    host-cache folder (the cache is per session). None for anything else."""
+    """The one tree this request may touch, as a rel under the mount: the
+    session's own agent folder, or, for a remote machine's file, the
+    session's own host-cache folder (the cache is per session). None for
+    anything else."""
     if slug == HOST_CACHE_SEGMENT:
         session_id = _session_id_var.get()
-        return f"{MOUNT_AGENTS_DIR}/{HOST_CACHE_SEGMENT}/{session_id}" if session_id else None
+        if not _SAFE_SLUG_RE.match(session_id or ""):
+            return None
+        return f"{HOST_CACHE_SEGMENT}/{session_id}"
     if _SAFE_SLUG_RE.match(slug or ""):
-        return f"{MOUNT_AGENTS_DIR}/{slug}"
+        return slug
+    return None
+
+
+def _answer_in_tree(agents_rel: str, agent: str) -> str | None:
+    """The container path of the server's answer when its TEXT stays in the
+    session's own tree, else None. Nothing on disk is consulted: the answer
+    is link-free when given, every part must be a plain name (a ``..``, a
+    ``.`` or an empty part is refused, never folded), and the open that
+    follows refuses any link met on the way."""
+    subtree = _session_subtree(agent)
+    if subtree is None:
+        return None
+    try:
+        rel = safe_fs.rel_under(MOUNT_AGENTS_DIR + "/" + agents_rel.lstrip("/"), MOUNT_AGENTS_DIR)
+    except OSError:
+        return None
+    # The separator matters: a bare prefix test admits a sibling such as
+    # proj-a-evil/x.
+    if rel == subtree or rel.startswith(subtree + "/"):
+        return MOUNT_AGENTS_DIR + "/" + rel
     return None
 
 
@@ -197,26 +223,38 @@ def _unicode_match_on_disk(path: str) -> str:
     ``ί``). Without this fallback, every non-ASCII filename round-tripped
     through a tool result becomes unreadable.
 
+    Looked at beneath the write root with no link followed: whether the name
+    is there is ``kind_beneath``'s answer, and the parent is listed through
+    its own handle. Blocking: run it in a thread.
+
     Falls through with the original path when:
-      - the path exists verbatim (fast path — no listdir)
-      - the parent dir is missing
+      - something sits at the path verbatim (fast path — no listing)
+      - the path is not beneath the root, or its folder cannot be opened
+        without a link (the strict open then answers)
       - no normalized match is found (caller's open() raises a clear error)
     """
-    if os.path.exists(path):
+    root = _write_root()
+    try:
+        rel = safe_fs.rel_under(path, root)
+    except OSError:
         return path
-    parent = os.path.dirname(path)
-    if not os.path.isdir(parent):
-        return path
-    basename = os.path.basename(path)
-    if not basename:
+    parent_rel, _, basename = rel.rpartition("/")
+    if not basename or safe_fs.kind_beneath(root, rel).kind != "missing":
         return path
     target_nfc = unicodedata.normalize("NFC", basename)
     try:
-        for entry in os.listdir(parent):
-            if unicodedata.normalize("NFC", entry) == target_nfc:
-                return os.path.join(parent, entry)
+        fd = safe_fs.open_dir_beneath(root, parent_rel)
     except OSError:
-        pass
+        return path
+    try:
+        entries = os.listdir(fd)
+    except OSError:
+        return path
+    finally:
+        os.close(fd)
+    for entry in entries:
+        if unicodedata.normalize("NFC", entry) == target_nfc:
+            return path.rstrip("/").rpartition("/")[0] + "/" + entry
     return path
 
 
@@ -238,13 +276,16 @@ async def _resolve_path(path: str, writing: bool = False) -> str:
     the parent dir if the exact path doesn't exist on disk (see
     ``_unicode_match_on_disk``).
 
-    The answer is confined to the CALLER'S tree: the slug the proxy echoes
-    names the agent folder, or the session's own host-cache folder, and the
-    resolved path must stay inside it (an answer that names no agent is
-    refused: a slug read off the path would confine to whatever the answer
-    says). The mount holds every agent's tree, so a prefix check on the
-    mount alone would admit another agent's files; the write helpers then
-    open the answer without following a link.
+    The answer is confined to the CALLER'S tree on its text: the slug the
+    proxy echoes names the agent folder, or the session's own host-cache
+    folder, and the answer must be that folder or below it, every part a
+    plain name (an answer that names no agent is refused: a slug read off
+    the path would confine to whatever the answer says). The mount holds
+    every agent's tree, so a prefix check on the mount alone would admit
+    another agent's files. The answer is never resolved again: the server
+    answered the place every link led to, and the readers and writers open
+    it beneath the mount without following a link, so a link put on the
+    way afterwards is refused, never followed.
     """
     # A container-absolute path goes through the proxy like every other
     # form: the mount holds EVERY agent's tree, so the prefix alone says
@@ -260,13 +301,9 @@ async def _resolve_path(path: str, writing: bool = False) -> str:
     if agents_rel and not agent:
         reason = "the proxy answered without the session's agent"
     elif agents_rel:
-        rel = agents_rel.lstrip("/")
-        allowed = _session_subtree(agent)
-        resolved = str(await asyncio.to_thread(Path(MOUNT_AGENTS_DIR + "/" + rel).resolve))
-        # The separator matters: a bare prefix test admits a sibling such as
-        # /agents/proj-a-evil/x.
-        if allowed and (resolved == allowed or resolved.startswith(allowed + "/")):
-            return _unicode_match_on_disk(resolved)
+        container = _answer_in_tree(agents_rel, agent)
+        if container is not None:
+            return await asyncio.to_thread(_unicode_match_on_disk, container)
         reason = "the path leaves this session's agent tree"
 
     # Surface the proxy's real verdict (policy reject / not reachable / out of
@@ -321,6 +358,139 @@ def safe_open_write(container_path: str):
         ) from None
 
 
+# ---------------------------------------------------------------------------
+# Reading an input: the answer opened beneath the mount, no link followed
+# ---------------------------------------------------------------------------
+#
+# A person's file is the server's answer, link-free when given; between the
+# answer and the open a folder on the way can be swapped for a link. Every
+# reader of a person's path opens it here, beneath the write root with no
+# component followed; a pipe or a device is refused at once. The tool's own
+# files outside the mount (its temp copies and renders) open plainly: that
+# is decided on the path's text alone (``rel_under`` refuses it), never by
+# looking at the disk.
+
+def _read_place(path: str | os.PathLike[str]) -> tuple[str, str] | None:
+    """``(root, rel)`` for a path beneath the write root; None for a
+    normalized absolute path outside it (the tool's own file). Anything
+    else (a dot part, a relative path) raises ``SafeFsError``."""
+    root = _write_root()
+    try:
+        return root, safe_fs.rel_under(path, root)
+    except safe_fs.EscapeRefused:
+        text = os.fspath(path)
+        if os.path.isabs(text) and os.path.normpath(text) == text:
+            return None
+        raise
+
+
+def _read_refused(path: str | os.PathLike[str], exc: safe_fs.SafeFsError) -> PermissionError:
+    return PermissionError(f"Cannot read '{_to_agents_relative(os.fspath(path))}': {exc.strerror}")
+
+
+def safe_open_read(path: str | os.PathLike[str]) -> BinaryIO:
+    """``path`` opened for reading as a binary file: a person's file beneath
+    the mount with no component followed through a link (refused with
+    "Cannot read '<path>': <why>"), the tool's own temp outside it plainly.
+    A missing file stays ``FileNotFoundError``. Blocking: a thread or a
+    worker reads it."""
+    try:
+        place = _read_place(path)
+        if place is None:
+            return open(path, "rb")
+        return safe_fs.open_file_for_read(*place)
+    except safe_fs.SafeFsError as exc:
+        raise _read_refused(path, exc) from None
+
+
+@contextlib.contextmanager
+def reading(source: str | os.PathLike[str] | BinaryIO):
+    """``source`` as a binary file, for a reader handed either: a path is
+    opened with ``safe_open_read`` and closed on exit; a file the caller
+    holds (one handle read several times) is rewound and left open."""
+    if isinstance(source, (str, os.PathLike)):
+        with safe_open_read(source) as fh:
+            yield fh
+        return
+    source.seek(0)
+    yield source
+
+
+def safe_read_fd(path: str | os.PathLike[str]) -> tuple[int, os.stat_result]:
+    """``(fd, stat)`` of ``path`` opened as ``safe_open_read`` does, for a
+    library that needs a name: hand it ``safe_fs.fd_path(fd)``. The caller
+    closes ``fd``."""
+    try:
+        place = _read_place(path)
+        if place is None:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                return fd, os.fstat(fd)
+            except BaseException:
+                os.close(fd)
+                raise
+        return safe_fs.open_regular_for_read(*place)
+    except safe_fs.SafeFsError as exc:
+        raise _read_refused(path, exc) from None
+
+
+def safe_kind(path: str | os.PathLike[str]) -> safe_fs.NameKind:
+    """What sits at ``path`` with no link followed (``kind_beneath``
+    beneath the mount; the tool's own file outside it by its ``lstat``):
+    the status check in front of a read."""
+    try:
+        place = _read_place(path)
+    except safe_fs.SafeFsError as exc:
+        raise _read_refused(path, exc) from None
+    if place is not None:
+        return safe_fs.kind_beneath(*place)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return safe_fs.NameKind("missing", None)
+    except OSError:
+        return safe_fs.NameKind("other", None)
+    if stat.S_ISREG(st.st_mode):
+        return safe_fs.NameKind("file", st)
+    return safe_fs.NameKind("dir" if stat.S_ISDIR(st.st_mode) else "other", st)
+
+
+def private_copy(path: str | os.PathLike[str], folder: str, max_size: int) -> str:
+    """A copy of ``path`` read through ``safe_open_read`` at
+    ``folder/<its name>`` (a folder of the call's own), refused past
+    ``max_size`` bytes at the open and while copying
+    (``safe_fs.FileTooLarge``): what a program the tool starts reads instead
+    of the person's file."""
+    target = os.path.join(folder, os.path.basename(os.fspath(path)))
+    with safe_open_read(path) as src:
+        size = os.fstat(src.fileno()).st_size
+        if size > max_size:
+            raise safe_fs.FileTooLarge(errno.EFBIG, "file is over the size cap", os.fspath(path))
+        try:
+            with open(target, "xb") as dst:
+                safe_fs.copy_fd(src, dst, max_size=max_size)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(target)
+            raise
+    return target
+
+
+def sibling_path(caller_path: str, suffix: str) -> str:
+    """The caller's own path string with the suffix of its LAST part changed
+    to ``suffix`` (appended when that part has none, as ``Path.suffix``
+    reads one): a converted copy's or a default output's name, asked of the
+    server as a write in the form the caller gave. Both ``/`` and ``\\``
+    end a part, so a dot in a folder's name (a Windows folder's too) is
+    never cut."""
+    text = caller_path.rstrip("/\\")
+    cut = max(text.rfind("/"), text.rfind("\\")) + 1
+    head, name = text[:cut], text[cut:]
+    dot = name.rfind(".")
+    stem = name[:dot] if 0 < dot < len(name) - 1 else name
+    return head + stem + suffix
+
+
 def safe_mkdirs(container_dir: str) -> None:
     """Create ``container_dir`` and its missing parents beneath the mount, none
     of them reached through a link."""
@@ -351,15 +521,23 @@ def cleanup_partials(container_path: str) -> None:
     temp length) and its temp in the system temp dir; best-effort."""
     with contextlib.suppress(OSError):
         os.unlink(worker_temp_path(container_path, ".pdf"))
-    parent, name = os.path.split(container_path)
+    root = _write_root()
     try:
-        entries = os.listdir(parent)
+        parent_rel, _, name = safe_fs.rel_under(container_path, root).rpartition("/")
+        fd = safe_fs.open_dir_beneath(root, parent_rel)
     except OSError:
         return
-    for entry in entries:
-        if safe_fs.is_partial_of(entry, name):
-            with contextlib.suppress(OSError):
-                os.unlink(os.path.join(parent, entry))
+    try:
+        # Listed and removed through the folder's own handle: a link put in
+        # place of the folder is never followed.
+        for entry in os.listdir(fd):
+            if name and safe_fs.is_partial_of(entry, name):
+                with contextlib.suppress(OSError):
+                    os.unlink(entry, dir_fd=fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------

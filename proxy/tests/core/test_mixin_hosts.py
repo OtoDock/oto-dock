@@ -32,6 +32,8 @@ FAMILIES = [
      "core.remote.remote_host", "RemoteLayerHost"),
     ("core.remote.satellite_connection", "SatelliteConnectionManager",
      "core.remote.satellite_host", "SatelliteManagerHost"),
+    ("core.session.interactive_session", "InteractiveSession",
+     "core.session.interactive_host", "InteractiveHost"),
     ("core.events.stream_pump", "ChatStreamPump", "core.events.pump_host", "PumpHost"),
 ]
 _IDS = [f[1] for f in FAMILIES]

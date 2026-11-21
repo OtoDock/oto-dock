@@ -7,8 +7,9 @@ and keeping shared knowledge flowing. The building blocks:
 
 Installation-wide org structure. A department = a name + ordered **levels** (defaults
 suggest Head/Senior/Junior; up to 8, renameable). Each agent gets a department + level
-in **Agent Settings → Configuration → Department** *(platform admin/creator with
-manager access on the agent)*.
+in **Agent Settings → Configuration → Department** *(a manager of the agent who is an
+admin, the department's creator, or a creator who manages all its agents)*. The list
+offers only the departments that person may add to.
 
 Levels drive **auto-wired delegation**, and each department picks a **mode**: *Off* (no
 automatic wiring), *Down only* (the default for a new department: each level delegates to
@@ -27,24 +28,29 @@ hand-checked targets are never touched. Every agent's prompt states its departme
 and reachable teammates.
 
 Managing: **admins** manage all departments, **creators** the ones they created — from
-the Agents page's **Departments** tab or the map's ⋯ menu. Everyone sees only
-departments they're part of.
+the Agents page's **Departments** tab or the map's ⋯ menu. An admin sees every
+department, anyone else the ones they created and the ones holding an agent they can
+open.
 
-**Department sets (1.9.1).** The community catalog also offers whole departments:
+**Department sets.** The community catalog also offers whole departments:
 a set names its agent templates with their levels, the delegation wiring, the head's
-shared library and the briefing schedules. **Browse Community Agents → Department sets**
-(or the Departments tab's "Browse the department sets" link) installs one in one step
-*(admin/creator)*: the department with its levels, every agent at its level (an agent
-you manage that was installed from the same template and sits in no department is used,
-not copied, and the dialog and the card name it), the head's knowledge folder shared as a
-library named after the department to the others (read only unless the set says
-otherwise), and the schedules listed, paused. A member installed alone stays a standalone
-agent; when a second member of the set is installed later, the install dialog offers
-"Create the <set> department and add both agents to it?". The Agent Creator tool
+shared library and the briefing schedules. **Browse Community** lists them beside the
+agents (**Departments** above the list shows them alone, and the Departments tab's
+**Browse the departments** link opens them). One installs in one step *(admin/creator)*:
+the department with its levels, every agent at its level, the head's knowledge folder
+shared as a library named after the department to the others (read only unless the set
+says otherwise), and the schedules listed, paused. For each agent the person picks
+**Install a new one** or an agent they manage from the same template. That agent is in
+no department, or in one made by hand. When there is one such agent and it is in no
+department, it is picked already. A picked agent from another department moves into the new one. Installed again under
+another name, a set makes a second department with its own agents, for a second boat or
+site, and its apps read its own agents. The same name fills that department again. A
+member installed alone stays in no department. When a second member of the set is
+installed later, the install dialog offers "Create the <set> department and add both
+agents to it?". The Agent Creator tool
 (`search_community_agents`, `propose_install`, `propose_department_install`,
 `propose_move`) proposes the same as a **card in the chat**: the person presses the
-button, the platform acts with their role. One set ships first: Yacht office (five agents
-for a yacht management office). The Settings tool's `show_card` draws the other
+button, the platform acts with their role. The Settings tool's `show_card` draws the other
 department cards the same way: `create_department` (admins and creators) and
 `set_department` (its mode and reach, the admin or the creator who made it). The
 team's cards: `hand_files` (a person's finished files from their space to the team's
@@ -75,12 +81,17 @@ An agent hands work to another agent on its **Delegation Targets** roster (Agent
 wires (locked, "via <Department>") plus the targets a manager ticks by hand *(manager)*;
 the agent's prompt lists them. A worker that runs as the target agent (agent scope) needs
 the person behind the chat to be an **editor+** there; a personal worker runs as that
-person and needs only access. A chat lane may also run on the delegating person's own
+person and needs only access. A chat lane runs on that person's own AI account either
+way, on every agent, Shared only ones included, as their own chat there would. A task
+lane that runs as the target agent uses the subscriptions shared with agents. A chat
+lane may also run on the delegating person's own
 computer when they ask (`machine` on `delegate`). There it works as that person, with
-their role and their own AI account, even when it works for the whole agent. It stops
+their role, even when it works for the whole agent. It stops
 when they lose the editor role on the agent. Workers are visible, first-class sessions —
 a chat lane the
-user can watch and steer, or a background task — and results report back to the delegating
+user can watch and steer (one that runs as the target agent with a manager's right to
+change its knowledge is steered and continued by that agent's managers only), or a
+background task — and results report back to the delegating
 chat. A worker's report shows in the delegating chat as a collapsed card on the right,
 where the person's own messages sit. It has a short preview, the task's name, its files
 as chips and an "Open lane" link to the worker's chat. A click on the card opens it

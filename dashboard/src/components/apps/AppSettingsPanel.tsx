@@ -6,6 +6,7 @@ import Dialog from '../ui/Dialog'
 import Button from '../ui/Button'
 import { DIALOG_PANEL } from '../ui/classes'
 import { Input } from '../ui/Field'
+import { copyText } from '../../lib/copyText'
 
 /**
  * The app's settings (APPS.md "Secrets"): a dialog over the frame, opened
@@ -101,11 +102,10 @@ export default function AppSettingsPanel({ app, agent, onClose }: Props) {
   const origin = typeof window !== 'undefined' ? window.location.origin : ''
 
   const copy = async (name: string, text: string) => {
-    try {
-      await navigator.clipboard.writeText(text)
+    if (await copyText(text)) {
       setCopied(name)
       setTimeout(() => setCopied(''), 1500)
-    } catch {
+    } else {
       setErr('Could not copy. Select the address and copy it by hand.')
     }
   }

@@ -24,10 +24,11 @@ import psycopg
 import config
 from auth import roles
 from auth.providers import acting_role_of
-from core import layout
+from core import drain, layout
 from core.events import chat_writer
 from core.events.common_events import TurnInput, carries_prompt, photos_not_attached
 from core.events.stream_pump import (
+    ChatStreamPump,
     _active_pumps,
     _pending_permissions,
 )
@@ -37,16 +38,15 @@ from core.execution_layer import (
     PERMISSION_MODES,
     PLAN_MODE,
     STORED_ONLY_MODES,
-    current_mode,
     offered_mode,
 )
-from core.sandbox.session_config_dir import (
-    AgentStateRefused,
-    refuse_agent_state_below_editor,
+from core.session import (
+    chat_rebuild,
+    interactive_session,
+    session_kind,
+    visibility as _vis,
 )
-from core.session import interactive_session, session_kind, visibility as _vis
 from core.session.session_manager import (
-    get_execution_layer,
     get_layer_capabilities,
     resolve_execution_path,
 )
@@ -59,14 +59,13 @@ from core.session.session_state import (
     resolve_permission,
     set_session_mode,
 )
-from core.session.visibility import _task_continue_allowed
 from services.infra import safe_fs
 from services.notifications import notification_manager
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.chat.chat_titles import title_from_prompt
 from storage.pg import run_db
-from ws import wire_events as wire
+from ws import dashboard_restart, wire_events as wire
 
 # ws/dashboard.py assembles the connection from the mixins at its end, so
 # its helpers are imported inside the functions that call them: this
@@ -83,7 +82,7 @@ def chat_mode_for_path(word: str, exec_path: str, *, stored: bool = False) -> st
     the warm-up's one check. A word a person sends never names the
     unattended or judge mode (read as no word: Auto); a stored one keeps it."""
     caps = get_layer_capabilities(exec_path) if exec_path else None
-    if not stored and current_mode(word or "") in STORED_ONLY_MODES:
+    if not stored and (word or "") in STORED_ONLY_MODES:
         word = ""
     return offered_mode(word, caps.permission_modes if caps and caps.permission_modes else PERMISSION_MODES)
 
@@ -126,6 +125,10 @@ async def apply_owed_engine_mode(layer, sid: str) -> None:
     owed = take_owed_engine_mode(sid)
     if not owed or layer is None:
         return
+    if get_session_mode(sid) != owed:
+        # The session's mode moved since the pick (a terminal's Shift+Tab
+        # lowered the chat, a later pick): the engine takes the session's.
+        return
     caps = layer.capabilities_for(sid)
     if "set_permission_mode" not in (caps.control_commands if caps.supports_control_commands else []):
         return
@@ -166,7 +169,7 @@ logger = logging.getLogger("otodock")
 # needs the caller's role at all: an ordinary per-user chat pays no store
 # read at its drive frames.
 _CHAT_OWNER_CACHE_MAX = 4096
-_chat_owner_cache: dict[str, tuple[str, str]] = {}
+_chat_owner_cache: dict[str, tuple[str, str, str]] = {}
 
 # Photos are decoded, resized and re-encoded in a thread (a pasted phone
 # photo held the loop for seconds); two at a time across every connection
@@ -177,13 +180,12 @@ _PHOTO_WAIT_S = 30.0
 _photo_slots: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 
 
-PHONE_CHAT_READ_ONLY = "A phone call's conversation is read-only: the call drives it."
 
 
-def _remember_chat(chat: dict) -> tuple[str, str]:
+def _remember_chat(chat: dict) -> tuple[str, str, str]:
     if len(_chat_owner_cache) >= _CHAT_OWNER_CACHE_MAX:
         _chat_owner_cache.clear()
-    entry = (chat.get("user_sub") or "", chat.get("agent") or "")
+    entry = (chat.get("user_sub") or "", chat.get("agent") or "", chat.get("source_type") or "")
     _chat_owner_cache[chat["id"]] = entry
     return entry
 
@@ -261,9 +263,14 @@ def _reattach_saved_photo(agent: str, agent_dir: Path, rel_path: str, expected_p
     if not media_type.startswith("image/"):
         return None
     try:
-        fd, _st = safe_fs.open_regular_for_read(config.AGENTS_DIR, f"{agent}/{rel_path}")
+        # An engine that takes the photo inline gets it under the chat's
+        # image cap, read from the descriptor (a larger file is left out).
+        cap = config.TEMP_IMAGE_MAX_BYTES if with_bytes else None
+        fd, _st = safe_fs.open_regular_for_read(config.AGENTS_DIR, f"{agent}/{rel_path}", max_size=cap)
         with os.fdopen(fd, "rb") as fh:
-            data = fh.read() if with_bytes else b""
+            data = fh.read(cap + 1) if cap is not None else b""
+        if cap is not None and len(data) > cap:
+            return None
     except OSError:
         return None
     return {
@@ -332,6 +339,9 @@ class ChatSupportMixin(_Host):
     deferred_mode: "str"
     deferred_model: "str"
     session_id: "str | None"
+    promised_pump_chat: "str | None"
+    _resume_live: "dict | None"
+    _resume_cards: "ChatStreamPump | None"
 
     def _deterministic_title(self, text: str) -> str:
         """The chat's title at send time, before any model titles it: the
@@ -591,17 +601,20 @@ class ChatSupportMixin(_Host):
         if images:
             # Dedicated subfolder for chat-attached photos so the workspace
             # root stays tidy. Mirrors image-gen-mcp's `generated-assets/` and
-            # the chat-file path's `uploads/files/`. Lazy mkdir on first use
-            # via `_save_base64_image` -> `save_dir.mkdir(parents=True, exist_ok=True)`.
+            # the chat-file path's `uploads/files/`. Made on first use by
+            # `_save_base64_image`'s write.
             if is_agent_scoped:
                 # A photo pasted into a Shared-only chat lands in the shared
                 # workspace: the same workspace-tier gate as the upload
                 # endpoint, else a viewer writes the team's tree by pasting.
                 if any(img.get("data") for img in images):
                     await self._require_shared_photo_authority(agent)
-                img_dir = agent_dir / layout.WORKSPACE / "uploads" / "photos"
+                scope_dir = agent_dir / layout.WORKSPACE
             else:
-                img_dir = layout.user_dir(agent_dir, username) / layout.WORKSPACE / "uploads" / "photos"
+                scope_dir = layout.user_dir(agent_dir, username) / layout.WORKSPACE
+            # The photo folder must resolve inside the person's own scope
+            # folder, the same one the re-attach check reads (_land_photo).
+            img_dir = scope_dir / "uploads" / "photos"
             # each: ({"path", "base64", "media_type"}, agent-relative path)
             saved_images: list[tuple[dict, str]] = []
             # The photos this message wrote: a refusal or a cancel part-way
@@ -619,7 +632,8 @@ class ChatSupportMixin(_Host):
                         # In order, one after another: the paths ride the prompt
                         # in the order the photos were attached.
                         saved = await _save_photo_off_loop(
-                            _save_base64_image, data_url, save_dir=img_dir, late=late)
+                            _save_base64_image, data_url, save_dir=img_dir, scope_dir=scope_dir,
+                            late=late)
                     elif img.get("path"):
                         saved = await _save_photo_off_loop(
                             _reattach_saved_photo, agent, agent_dir, str(img["path"]),
@@ -768,6 +782,37 @@ class ChatSupportMixin(_Host):
             return False
         return True
 
+    async def _onto_chat(self, chat: dict) -> None:
+        """Put this socket on ``chat`` with no session of it (it joins the
+        chat's warmup, or its message waits behind a move): the chat, its
+        agent of record and its own layer, and nothing of the chat the socket
+        was on (its session, its terminal viewer). A send then finds or starts
+        this chat's session, the one its gates judged: it never rides the
+        session the socket held, which may be one this person only watches."""
+        from ws.dashboard import _role_and_layer
+        self._detach_pty_viewer()   # the terminal of the chat the socket was on
+        self.chat_id, self.agent_name = chat["id"], chat["agent"]
+        self.session_id, self.layer = None, None
+        _, layer = await run_db(
+            _role_and_layer, self.user_sub, self.agent_name, chat, fallback_user=self.user,
+        )
+        # A warmup of this socket's own that ended meanwhile adopted its session.
+        if self.session_id is None:
+            self.layer = layer
+
+    def _off_chat(self) -> None:
+        """Put this socket on no chat: the page shows its new-chat view. The
+        chat it was on goes with its session, its terminal viewer and a
+        promised attach, so nothing of that chat counts as viewed here any
+        more (a result, a server turn, a chat's frame). Its notify
+        registrations stay, as on a switch: they serve that chat's kicks."""
+        self._detach_pty_viewer()
+        self.promised_pump_chat = None
+        self._resume_live = None
+        self._resume_cards = None
+        self.chat_id, self.session_id = None, None
+        self._view_only = False
+
     async def _deny_task_continue(self, cid: str | None, chat: dict | None = None,
                                   *, quiet: bool = False) -> str:
         """The drive gate: the chats every assigned user may open but only
@@ -776,87 +821,67 @@ class ChatSupportMixin(_Host):
         they may; every entry point that (re)warms or drives a session stops
         on a refusal. A read frame never asks.
 
-        - A ``task-{run_id}`` chat: the task continue-gate (agent-scoped →
-          editor+; user-scoped → creator/admin, ``_task_continue_allowed``).
-        - A chat owned by the synthetic ``agent::`` owner (a Shared-only
-          agent's pool, an agent-scope delegate worker chat on any agent):
-          it runs as the agent, so it takes the editor tier, the rule its
-          session start applies (``refuse_agent_state_below_editor``) and
-          every frame that reaches an already-warm session applies too.
-        - A phone call's conversation (the ``phone`` owner): refused for
-          everyone, admins included. Its session runs as the person the
-          route is tied to, or as the caller, and only the call drives it;
-          the agent's managers read it.
-        - Every other chat: its owner's, nothing to gate here.
-
-        Before the owner rules (a task-run chat aside), the placement lock: a
-        chat whose live session sits on another person's computer is
-        read-only for this person (``ws/dashboard_chat_move.drive_refusal``),
-        so a live turn's prompt answers, picks and terminal keys, the
-        mid-stream artifact and app actions and ``cancel_queued`` stop here.
+        The rule is ``visibility.drive_refusal``, which every door that drives
+        a chat asks (a task run's chat, a pool chat and its workers, a phone
+        call's conversation, a wrap-up's record). This door's own extras:
+        before the rule (a task run's chat aside), the placement lock: a chat
+        whose live session sits on another person's computer is read-only for
+        this person (``ws/dashboard_chat_move.drive_refusal``), so a live
+        turn's prompt answers, picks and terminal keys, the mid-stream
+        artifact and app actions and ``cancel_queued`` stop here; a person's
+        chat is answered from the cached owner, with no read on every frame;
+        and a task run's chat whose run is gone is refused.
 
         ``chat`` is the row a caller already read; without it the owner is
         read once per chat per process.
         """
         if not cid:
             return ""
-        if session_kind.is_task_chat_id(cid):
-            _rid, _sub, _fb = session_kind.run_id_of_chat(cid), self.user_sub, self.user
-
-            def _gate_job() -> tuple[dict | None, str]:
-                # The run row + the effective role: three reads, one gate, one job.
-                run = task_store.get_run(_rid)
-                if not run:
-                    return None, ""
-                return run, acting_role_of(_sub, run.get("agent") or "", fallback_user=_fb)
-
-            run, eff_role = await run_db(_gate_job)
-            if not run:
-                refusal = "Task run not found"
-            elif not _task_continue_allowed(run, effective_role=eff_role, user_sub=self.user_sub):
-                refusal = "Access denied"
-            else:
-                return ""
-            if not quiet:
-                await self._send_error(refusal)
-            return refusal
-        # The placement lock (ws/dashboard_chat_move.py): a chat whose live
-        # session sits on another person's computer is read-only for this
-        # person, its prompt answers, picks and terminal keys included.
-        from ws import dashboard_chat_move
-        lock = await dashboard_chat_move.drive_refusal(self, cid)
-        if lock:
-            if not quiet:
-                await self._send_error(lock)
-            return lock
+        task_chat = session_kind.is_task_chat_id(cid)
+        if not task_chat:
+            # The placement lock (ws/dashboard_chat_move.py): a chat whose live
+            # session sits on another person's computer is read-only for this
+            # person, its prompt answers, picks and terminal keys included.
+            from ws import dashboard_chat_move
+            lock = await dashboard_chat_move.drive_refusal(self, cid)
+            if lock:
+                if not quiet:
+                    await self._send_error(lock)
+                return lock
         entry = _chat_owner_cache.get(cid)
         if entry is None:
             if chat is None:
                 chat = await run_db(task_store.get_chat, cid)
-            if not chat:
+            if not chat and not task_chat:
                 return ""  # nothing to protect; the caller's write is a no-op
-            entry = _remember_chat(chat)
-        owner, agent = entry
-        if _vis.is_phone_chat_owner(owner):
-            if not quiet:
-                await self._send_error(PHONE_CHAT_READ_ONLY)
-            return PHONE_CHAT_READ_ONLY
-        if not _vis.is_shared_chat_owner(owner):
+            entry = _remember_chat(chat or {"id": cid})
+        owner, agent, source_type = entry
+        row = {"id": cid, "user_sub": owner, "agent": agent, "source_type": source_type}
+        if (not task_chat and owner and not _vis.is_synthetic_owner(owner)
+                and session_kind.of_chat(row) is not session_kind.PHONE):
+            # A person's chat: the open rule (``can_access_chat``) made it
+            # theirs or an admin's, and a worker they own carries their own
+            # run, so the rule answers "" here without a read on every frame.
             return ""
         _sub, _fb = self.user_sub, self.user
 
-        def _standing_job() -> tuple[str, bool]:
-            return (acting_role_of(_sub, agent, fallback_user=_fb),
-                    _vis.is_shared_only(agent))
+        def _gate_job() -> str:
+            # A task run's chat with no run is refused here (nothing says who
+            # may continue it); the effective role and the rule read the
+            # store: one job.
+            ag = agent
+            if task_chat:
+                run = task_store.get_run(session_kind.run_id_of_chat(cid))
+                if not run:
+                    return "Task run not found"
+                ag = ag or (run.get("agent") or "")
+            role = acting_role_of(_sub, ag, fallback_user=_fb)
+            return _vis.drive_refusal({**row, "agent": ag}, _sub or "", role)
 
-        role, shared_only = await run_db(_standing_job)
-        try:
-            refuse_agent_state_below_editor(_vis.SCOPE_AGENT, role, shared_only=shared_only)
-        except AgentStateRefused as e:
-            if not quiet:
-                await self._send_error(str(e))
-            return str(e)
-        return ""
+        refusal = await run_db(_gate_job)
+        if refusal and not quiet:
+            await self._send_error(refusal)
+        return refusal
 
     async def _may_drive_terminal(self, isess) -> bool:
         """Whether this connection may DRIVE a live terminal (type, resize,
@@ -898,15 +923,19 @@ class ChatSupportMixin(_Host):
             return None
         return chat
 
-    async def _echo_pick(self, cid: str, setting: str, chat: dict | None = None) -> None:
+    async def _echo_pick(self, cid: str, setting: str, chat: dict | None = None, *,
+                         refusal: str = "") -> None:
         """Answer a refused pick with the chat's stored value, so the picker
         shows what the chat really runs with. Only after a drive-gate refusal
         on a chat this person may open (``_open_chat_by_id``)."""
         if chat is None:
             chat = await run_db(task_store.get_chat, cid) or {}
         if setting == "mode":
-            await self._send({"type": wire.MODE_CHANGED, "chat_id": cid,
-                              "mode": chat.get("permission_mode") or ASK_MODE})
+            frame = {"type": wire.MODE_CHANGED, "chat_id": cid,
+                     "mode": chat.get("permission_mode") or ASK_MODE}
+            if refusal:
+                frame["refusal"] = refusal  # a pick a live terminal refused (ws/dashboard_restart.py)
+            await self._send(frame)
         elif setting == "model":
             await self._send({"type": wire.MODEL_CHANGED, "chat_id": cid,
                               "model": chat.get("model", "")})
@@ -925,8 +954,33 @@ class ChatSupportMixin(_Host):
         await self._echo_pick(cid, "mode")
         return True
 
+    async def _mode_pick_for_nobody(self, sid: str, cid: str, new_mode: str) -> bool:
+        """A mode pick on a headless session a wake built for nobody
+        (``runs_for_nobody``, a lane's chat aside): its word is never
+        relabelled. The pick goes to the chat's row, the session is closed
+        when no turn runs on it (a running wake's turn ends it by itself), and
+        the person's next start takes the pick. True when handled here."""
+        from core.session.session_state import runs_for_nobody
+        if not runs_for_nobody(sid, cid):
+            return False
+        row = await run_db(task_store.get_chat, cid) or {}
+        if row.get("origin") == "delegated":
+            return False
+        await chat_writer.submit(
+            cid, functools.partial(task_store.update_chat, cid, permission_mode=new_mode),
+            label="mode_change")
+        pump = _active_pumps.get(cid)
+        if (pump is None or pump.is_done) and self.layer is not None:
+            await self.layer.close_session(sid)
+            if cid == self.chat_id:
+                self.session_id = None
+        self.deferred_mode = new_mode
+        self.deferred_for = cid
+        await self._send(mode_frame(new_mode, cid))
+        return True
+
     async def _handle_mode_change(self, msg: dict):
-        new_mode = current_mode(msg.get("mode", ""))
+        new_mode = msg.get("mode", "")
         # The frame names its chat. No chat_id = the dashboard's new-chat
         # state: nothing exists yet but an eager pre-warm, and the socket is
         # still bound to the PREVIOUS chat — whose row and live session the
@@ -934,6 +988,7 @@ class ChatSupportMixin(_Host):
         # socket is not bound to (a pick that raced a reconnect's resume_chat)
         # gets the row write only, never the bound session.
         cid = msg.get("chat_id") or ""
+        theme = msg.get("theme") or ""
         bound = bool(cid) and cid == self.chat_id
         if bound and await self._deny_task_continue(cid, quiet=True):
             await self._echo_pick(cid, "mode")
@@ -947,6 +1002,8 @@ class ChatSupportMixin(_Host):
                 return
             if chat and new_mode not in await run_db(_declared_modes, chat):
                 await self._send_error(f"Invalid mode: {new_mode}")
+                return
+            if await dashboard_restart.pick_on_live_terminal(self, cid, new_mode, theme):
                 return
             await chat_writer.submit(
                 cid,
@@ -979,6 +1036,10 @@ class ChatSupportMixin(_Host):
         if new_mode not in valid_modes:
             await self._send_error(f"Invalid mode: {new_mode}")
             return
+        # The chat's live terminal, whichever socket holds it: a pick starts
+        # it again in the mode (ws/dashboard_restart.py).
+        if bound and await dashboard_restart.pick_on_live_terminal(self, cid, new_mode, theme):
+            return
         if not bound:
             self.deferred_mode = new_mode
             self.deferred_for = ""
@@ -1002,6 +1063,8 @@ class ChatSupportMixin(_Host):
         # it makes, so only whoever may drive it may change it.
         live = interactive_session.get(sid) if bound else None
         if live is not None and live.alive and not await self._may_drive_terminal(live):
+            return
+        if bound and await self._mode_pick_for_nobody(sid, cid, new_mode):
             return
         old_mode = get_session_mode(sid) or ASK_MODE
 
@@ -1232,7 +1295,6 @@ class ChatSupportMixin(_Host):
         dashboard confirms first + defers while a ``-p`` turn streams; the
         interactive ``close()`` tails the transcript so the swapped-in ``-p``
         history is populated. Falls back to persist-only when nothing is live."""
-        from ws.dashboard import _CHAT_PAGE, _build_chat_restore
         # Accepted: "interactive" (on) + "-p" (explicit headless — what the toggle
         # sends for OFF, to override an interactive per-agent default; "" can't,
         # it resolves back to the agent default) + "" (unset). Without "-p"
@@ -1253,8 +1315,11 @@ class ChatSupportMixin(_Host):
             return
         old_sid = chat.get("session_id") or (self.session_id if cid == self.chat_id else None)
         # Killing a live terminal drives it: a read-only viewer of someone
-        # else's terminal may not (the rule a permission answer follows).
-        live = interactive_session.get(old_sid) if old_sid else None
+        # else's terminal may not (the rule a permission answer follows). The
+        # close below ends every terminal of the chat, so the chat's live
+        # terminal is the one judged, whatever id the row holds.
+        live = interactive_session.find_live_for_chat(cid) or (
+            interactive_session.get(old_sid) if old_sid else None)
         if live is not None and live.alive and not live.may_drive(self.user_sub):
             await self._send_pty_read_only(live)
             await self._echo_pick(cid, "execution_mode", chat)
@@ -1265,72 +1330,31 @@ class ChatSupportMixin(_Host):
             cid, functools.partial(task_store.update_chat, cid, execution_mode=new_mode),
             label="exec_mode",
         )
-        agent = chat.get("agent", "")
-        role = await run_db(acting_role_of, self.user_sub, agent, fallback_user=self.user)
 
-        # Kill the current live session, keeping the conversation resumable.
+        # Close the live session where it runs, keeping the conversation
+        # resumable: a terminal's close tails its transcript into the rows, a
+        # headless process goes with its turn (the dashboard's confirm says
+        # the switch stops the current response).
         if old_sid:
-            isess = interactive_session.get(old_sid)
-            if isess is not None and isess.alive:
-                # interactive → -p: close() tails the transcript → DB history.
-                await isess.close(reason="mode-switch")
-            else:
-                # -p → interactive: tear down the headless process (keep JSONL).
-                try:
-                    lyr = get_execution_layer(agent, execution_path=chat.get("execution_path", ""), user_sub=self.user_sub, role=role)
-                    if lyr and await lyr.is_session_alive(old_sid):
-                        await lyr.close_session(old_sid)
-                except Exception:  # noqa: BLE001  # the old engine's teardown on a switch that already happened
-                    logger.warning("switch: headless teardown failed for chat=%s", cid, exc_info=True)
+            try:
+                await chat_rebuild.close_chat_session(
+                    {**chat, "session_id": old_sid}, reason="mode-switch",
+                    require_idle=False, lock=False)
+            except Exception:  # noqa: BLE001  # the old session's teardown on a switch that already happened
+                logger.warning("switch: closing the session failed for chat=%s", cid, exc_info=True)
             if cid == self.chat_id:
                 self.session_id = None
         self._detach_pty_viewer()
 
-        # Reload the conversation into the client (the interactive close() just
-        # tailed it) so the -p view shows the history; harmless when swapping to
-        # the terminal (the messages sit hidden under it).
-        def _switch_history_job():
-            if session_kind.is_task_chat_id(cid):
-                return task_store.get_chat_messages(cid), False, _build_chat_restore(cid)
-            return (*task_store.get_chat_messages_page(cid, _CHAT_PAGE),
-                    _build_chat_restore(cid))
-
-        # Lane job: behind the closed session's last rows.
-        msgs, msgs_has_more, switch_restore = await chat_writer.submit(
-            cid, _switch_history_job, label="switch_history",
-        )
-        await self._send({
-            "type": wire.CHAT_HISTORY, "chat_id": cid, "agent": chat.get("agent", ""),
-            "messages": msgs, "plans": [],
-            "has_more": msgs_has_more,
-            "restore": switch_restore,
-            "total_cost": chat.get("total_cost") or 0,
-            "context_used": chat.get("context_used") or 0,
-            "context_max": chat.get("context_max") or 0,
-            "execution_path": resolve_execution_path(agent, chat.get("execution_path", "")),
-            "execution_mode": new_mode,
-            "model": chat.get("model", ""),
-            "mode": chat.get("permission_mode", ASK_MODE),
-        })
-        self._history_floors = None  # a page with no siblings: no base for a delta
-
-        # Re-warm in the target mode — reuses the full warmup machinery; the now
-        # dead old session falls through to the resume path → spawns the new mode
-        # resuming the JSONL. background=False so warmup_ready (→ UI swap) is sent.
-        await self._handle_warmup({
-            "agent": agent, "chat_id": cid,
-            "permission_mode": chat.get("permission_mode", ASK_MODE),
-            "model": chat.get("model", ""),
-            "execution_path": chat.get("execution_path", ""),
-            "execution_mode": new_mode,
-            "theme": msg.get("theme", ""),
-        }, background=False)
-
+        # The history (the interactive close() tailed it), then the warm-up in
+        # the target mode, resuming the conversation.
+        await dashboard_restart.history_and_rewarm(
+            self, cid, chat, execution_mode=new_mode, theme=msg.get("theme", ""))
 
     async def _handle_implement_plan(self, msg: dict):
 
         plan_path = msg.get("plan_path", "")
-        mode = current_mode(msg.get("mode") or AUTO_REVIEW_MODE)
+        mode = msg.get("mode") or AUTO_REVIEW_MODE
         if not plan_path:
             await self._send_error("plan_path required")
             return
@@ -1341,13 +1365,25 @@ class ChatSupportMixin(_Host):
         # same authority as driving the chat.
         if await self._deny_task_continue(self.chat_id):
             return
-        live = interactive_session.get(self.session_id) if self.session_id else None
+        # Refused before the close: nothing is lost, and the plan waits.
+        if drain.holding():
+            await self._refuse_input(drain.refusal(wire.PLATFORM_UPDATING))
+            return
+        # The close below ends every terminal of the chat: the chat's live
+        # terminal is the one judged, whatever id the socket is bound to.
+        live = (interactive_session.find_live_for_chat(self.chat_id) if self.chat_id else None) or (
+            interactive_session.get(self.session_id) if self.session_id else None)
         if live is not None and live.alive and not await self._may_drive_terminal(live):
             return
 
-        # Close current session (close_session now releases slot + subscription)
+        # Close the bound session: a live terminal of the chat through its own
+        # close, anything else through the layer that holds it, and what a
+        # dead id still holds (its seat and its slot) through the socket's.
         if self.session_id and self.layer:
-            await self.layer.close_session(self.session_id)
+            await chat_rebuild.close_chat_session(
+                {"id": self.chat_id or "", "session_id": self.session_id},
+                reason="implement-plan", require_idle=False, lock=False,
+                fallback_layer=self.layer)
 
         # Preserve model from current chat (the row and the agent's default
         # read in one job, off the loop)

@@ -109,17 +109,19 @@ def test_a_token_older_than_the_users_row_is_refused():
 
 
 def test_the_callback_bearer_carries_the_sessions_user():
-    from auth.session_token import SESSION_JWT_SENTINEL_BEARER, swap_session_jwt_bearer
+    from auth.session_token import CALLBACK_JWT_SENTINEL_BEARER, swap_session_jwt_bearer
     sid = str(uuid.uuid4())
     create_session_token(sid, AGENT, "user-viewer")   # the session's own token
-    swapped = swap_session_jwt_bearer(SESSION_JWT_SENTINEL_BEARER, sid, AGENT)
-    payload = tokens.decode(swapped.split(" ", 1)[1], tokens.SESSION)
+    swapped = swap_session_jwt_bearer(CALLBACK_JWT_SENTINEL_BEARER, sid, AGENT)
+    # The Docker tools' own kind, never a session token.
+    payload = tokens.decode(swapped.split(" ", 1)[1], tokens.TOOL_CALLBACK)
     assert payload["user_sub"] == "user-viewer" and payload["sid"] == sid
+    assert tokens.verify(swapped.split(" ", 1)[1], tokens.SESSION) is None
     # A session with no person keeps a no-user callback bearer.
     other = str(uuid.uuid4())
     create_session_token(other, AGENT, "")
-    payload = tokens.decode(swap_session_jwt_bearer(SESSION_JWT_SENTINEL_BEARER, other, AGENT)
-                            .split(" ", 1)[1], tokens.SESSION)
+    payload = tokens.decode(swap_session_jwt_bearer(CALLBACK_JWT_SENTINEL_BEARER, other, AGENT)
+                            .split(" ", 1)[1], tokens.TOOL_CALLBACK)
     assert payload["user_sub"] == ""
 
 
@@ -182,3 +184,142 @@ def test_every_password_change_closes_the_persons_chats(monkeypatch):
     # The holder cache forgets the person at each change: a pass cached for
     # a token the change just ended does not live out its minute.
     assert forgot == [sub, sub, sub]
+
+
+def _built_at(role: str, sub: str = "user-admin", username: str = "admin") -> str:
+    """A live session token of ``sub`` whose session was built at ``role``."""
+    from auth.path_policy import SecurityContext
+    from core.session import session_state
+    sid = str(uuid.uuid4())
+    token = live_session_token(sid, AGENT, sub)
+    session_state.set_session_security(sid, SecurityContext(
+        role=role, username=username, agent=AGENT, is_admin_agent=False))
+    return token
+
+
+def test_a_session_built_below_its_person_acts_at_that_role_everywhere():
+    from auth import roles
+    p = asyncio.run(_resolve_principal(_req(_built_at(roles.MANAGER))))
+    assert p.sub == "user-admin" and not p.is_admin and not p.is_owner
+    assert p.role == roles.MEMBER
+    assert p.effective_role(AGENT) == roles.MANAGER and p.can_manage_agent(AGENT)
+    assert not p.can_access_agent("another-agent")
+
+
+def test_a_session_at_its_persons_role_keeps_it():
+    from auth import roles
+    p = asyncio.run(_resolve_principal(_req(_built_at(roles.ADMIN))))
+    assert p.is_admin and p.effective_role(AGENT) == roles.ADMIN
+    # A token minted at its person's own role keeps working with no context:
+    # a long-lived session across a platform restart.
+    own = live_session_token(str(uuid.uuid4()), AGENT, "user-admin", role=roles.ADMIN)
+    assert asyncio.run(_resolve_principal(_req(own))).is_admin
+
+
+def test_a_token_carries_the_role_its_session_was_built_with():
+    """The token's own role holds wherever the token is accepted."""
+    from auth import roles
+    from core.session import session_state
+    for mark in ("starting", "closing"):
+        sid = str(uuid.uuid4())
+        token = create_session_token(sid, AGENT, "user-admin", role=roles.MANAGER)
+        if mark == "starting":
+            session_state.mark_starting(sid, 60)
+        else:
+            session_state.mark_closing(sid)
+        p = asyncio.run(_resolve_principal(_req(token)))
+        assert p is not None and not p.is_admin, mark
+        assert p.effective_role(AGENT) == roles.MANAGER, mark
+
+
+def test_a_builders_token_names_the_role_it_built():
+    from auth import roles
+    from auth.session_token import mint_session_env
+    env: dict[str, str] = {}
+    mint_session_env(env, "s-built", AGENT, "user-admin", external="", role=roles.MANAGER)
+    assert tokens.decode(env["PROXY_API_KEY"], tokens.SESSION)["role"] == roles.MANAGER
+    mint_session_env(env, "s-none", AGENT, "", external="", role=roles.MANAGER)
+    assert "role" not in tokens.decode(env["PROXY_API_KEY"], tokens.SESSION)
+
+
+def _creator_on_agent(role: str) -> tuple[str, str]:
+    """A platform creator holding ``role`` on the agent: (sub, username)."""
+    from auth.password import hash_password
+    sub = db.create_local_user(f"c-{uuid.uuid4().hex[:8]}@cap.test", "C", "C", "creator",
+                               hash_password("correct-horse-battery-77"))
+    _stamp_password_change(sub, datetime.now(timezone.utc) - timedelta(minutes=5))
+    db.add_user_agent(sub, AGENT, role, "test")
+    return sub, db.get_user(sub)["username"]
+
+
+def test_a_capped_creator_is_a_platform_member():
+    from auth import roles
+    sub, username = _creator_on_agent(roles.MANAGER)
+    p = asyncio.run(_resolve_principal(_req(_built_at(roles.VIEWER, sub, username))))
+    assert p.role == roles.MEMBER and not p.is_owner
+    assert p.effective_role(AGENT) == roles.VIEWER
+
+
+def _session_built_at(built: str, username: str):
+    from auth.path_policy import SecurityContext
+    from core.session import session_state
+    sid = str(uuid.uuid4())
+    ctx = SecurityContext(role=built, username=username, agent=AGENT, is_admin_agent=False)
+    session_state.set_session_security(sid, ctx)
+    return sid, ctx
+
+
+def test_a_capped_session_lists_placed_apps_at_its_own_role():
+    from api.hooks.pins import placement_identity
+    from auth import roles
+    sub, username = _creator_on_agent(roles.MANAGER)
+    for built in (roles.VIEWER, roles.MANAGER):
+        sid, ctx = _session_built_at(built, username)
+        assert placement_identity(ctx, sid)[0] == built
+
+
+def test_an_app_sees_a_capped_session_at_its_own_role():
+    from api.apps import app_proxy
+    from auth import roles
+    sub, username = _creator_on_agent(roles.MANAGER)
+    for built in (roles.VIEWER, roles.MANAGER):
+        sid, _ctx = _session_built_at(built, username)
+        payload = tokens.decode(live_session_token(sid, AGENT, sub, role=built), tokens.SESSION)
+        ok, user, _name, _placed = app_proxy._agent_principal(
+            payload, {"id": "app-1", "agent": AGENT}, False)
+        assert ok and roles.row_role(user.agent_roles, AGENT) == built
+
+
+def test_an_apps_call_for_a_capped_session_carries_its_own_role():
+    """To another app of the same agent."""
+    from api.apps import app_bindings
+    from auth import roles
+    from services.apps import app_tokens
+    sub, username = _creator_on_agent(roles.MANAGER)
+    for built in (roles.VIEWER, roles.MANAGER):
+        sid, _ctx = _session_built_at(built, username)
+        viewer = {"principal": app_tokens.PRINCIPAL_AGENT, "sub": sub, "role": built,
+                  "agent": AGENT, "session": sid}
+        _claim, role = app_bindings._claim_for_target(
+            {"id": "app-1", "agent": AGENT, "slug": "one"}, {"id": "app-2", "agent": AGENT},
+            viewer, None)
+        assert role == built
+
+
+def test_a_capped_admin_with_no_row_presents_no_more_than_an_uncapped_one():
+    """An app and a placed app see the person's own row on the agent, never
+    an admin's standing: a session built below that never raises it."""
+    from api.apps import app_proxy
+    from api.hooks.pins import placement_identity
+    from auth import roles
+    from auth.password import hash_password
+    sub = db.create_local_user(f"a-{uuid.uuid4().hex[:8]}@cap.test", "A", "A", "admin",
+                               hash_password("correct-horse-battery-77"))
+    _stamp_password_change(sub, datetime.now(timezone.utc) - timedelta(minutes=5))
+    username = db.get_user(sub)["username"]
+    for built in (roles.MANAGER, roles.ADMIN):
+        sid, ctx = _session_built_at(built, username)
+        assert placement_identity(ctx, sid)[0] == roles.VIEWER, built
+        payload = tokens.decode(live_session_token(sid, AGENT, sub, role=built), tokens.SESSION)
+        caller = asyncio.run(app_proxy._agent_caller(payload, {"id": "app-1", "agent": AGENT}))
+        assert caller.role == roles.VIEWER, built

@@ -91,7 +91,7 @@ def list_subscriptions(
         if not include_disabled:
             sql += " AND status != %s"
             params.append(subscription_status.DISABLED)
-        sql += " ORDER BY active_sessions ASC"
+        sql += " ORDER BY active_sessions ASC, created_at, id"
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -120,7 +120,7 @@ def list_platform_pool(layer: str | None = None, provider: str | None = None) ->
         if provider:
             sql += " AND s.provider = %s"
             params.append(provider)
-        sql += " ORDER BY s.active_sessions ASC"
+        sql += " ORDER BY s.active_sessions ASC, s.created_at, s.id"
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -156,7 +156,7 @@ def list_personal(
         if provider:
             sql += " AND provider = %s"
             params.append(provider)
-        sql += " ORDER BY active_sessions ASC"
+        sql += " ORDER BY active_sessions ASC, created_at, id"
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -177,7 +177,7 @@ def list_admin_managed(layer: str | None = None, *, include_disabled: bool = Tru
         if not include_disabled:
             sql += " AND status != %s"
             params.append(subscription_status.DISABLED)
-        sql += " ORDER BY active_sessions ASC"
+        sql += " ORDER BY active_sessions ASC, created_at, id"
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -424,23 +424,26 @@ def get_pool_stats(layer: str) -> dict:
 
 def upsert_session_binding(session_id: str, subscription_id: str, *,
                            layer: str = "", user_sub: str | None = None,
-                           scope_key: str = "") -> None:
+                           scope_key: str = "", model: str = "", bound_at: str | None = None) -> None:
     """Persist one session→subscription binding (mirror of the pool's
     in-memory map — see ``subscription_pool.bind_session``). ``user_sub`` is
     NULL when the spawn path didn't stamp the acquisition context; '' means
-    agent-scope (the in-memory ctx map's exact distinction)."""
+    agent-scope (the in-memory ctx map's exact distinction). ``model`` is NULL
+    when the spawn did not name one. ``bound_at``: the bind's own instant (a
+    restored binding keeps its), now when None."""
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO subscription_session_bindings
-               (session_id, subscription_id, layer, user_sub, scope_key, bound_at)
-               VALUES (%s,%s,%s,%s,%s,%s)
+               (session_id, subscription_id, layer, user_sub, scope_key, bound_at, model)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (session_id) DO UPDATE SET
                    subscription_id = EXCLUDED.subscription_id,
                    layer = EXCLUDED.layer,
                    user_sub = EXCLUDED.user_sub,
                    scope_key = EXCLUDED.scope_key,
-                   bound_at = EXCLUDED.bound_at""",
-            (session_id, subscription_id, layer, user_sub, scope_key, _now()),
+                   bound_at = EXCLUDED.bound_at,
+                   model = EXCLUDED.model""",
+            (session_id, subscription_id, layer, user_sub, scope_key, bound_at or _now(), model or None),
         )
         conn.commit()
 
@@ -569,6 +572,83 @@ def prune_orphan_session_bindings() -> int:
         return deleted
 
 
+def save_rest(account_id: str, scope: str, until_at: float, rested_at: float,
+              window_key: str, hard: bool) -> None:
+    """Persist one usage-limit rest (mirror of the pool's rest structures,
+    see ``subscription_pool.load_rests``). ``scope`` '' is the account-wide
+    rest, else the model scope key; the times are unix seconds."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO subscription_rests
+               (account_id, scope, until_at, rested_at, window_key, hard)
+               VALUES (%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (account_id, scope) DO UPDATE SET
+                   until_at = EXCLUDED.until_at,
+                   rested_at = EXCLUDED.rested_at,
+                   window_key = EXCLUDED.window_key,
+                   hard = EXCLUDED.hard""",
+            (account_id, scope, until_at, rested_at, window_key, hard),
+        )
+        conn.commit()
+
+
+def clear_rest(account_id: str, scope: str | None = None) -> None:
+    """Delete one rest of the account ('' the account-wide one, else a model
+    scope's), or every rest of it when ``scope`` is None."""
+    with get_conn() as conn:
+        if scope is None:
+            conn.execute("DELETE FROM subscription_rests WHERE account_id=%s", (account_id,))
+        else:
+            conn.execute(
+                "DELETE FROM subscription_rests WHERE account_id=%s AND scope=%s",
+                (account_id, scope),
+            )
+        conn.commit()
+
+
+def load_rests(now: float) -> list[dict]:
+    """The rests still running at ``now`` (unix seconds), after deleting the
+    rows that ended and the rows of accounts that no longer exist (no
+    foreign key holds them). Called once at proxy startup."""
+    with get_conn() as conn:
+        conn.execute(
+            """DELETE FROM subscription_rests r
+               WHERE r.until_at <= %s OR NOT EXISTS (
+                   SELECT 1 FROM execution_layer_subscriptions s
+                   WHERE s.id = r.account_id
+               )""",
+            (now,),
+        )
+        rows = conn.execute(
+            """SELECT account_id, scope, until_at, rested_at, window_key, hard
+               FROM subscription_rests ORDER BY account_id, scope""",
+        ).fetchall()
+        conn.commit()
+        return [dict(r) for r in rows]
+
+
+def consumption_of(sub_ids: list[str], since_short: str, since_long: str) -> dict[str, tuple[float, float]]:
+    """``get_subscription_consumption`` over two windows for many accounts in
+    one query: ``{id: (since_short, since_long)}``, 0.0 for an account with
+    none. The lists of accounts read it (``pool_select.display_order``)."""
+    if not sub_ids:
+        return {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT source_key,
+                      COALESCE(SUM(cost_usd) FILTER (WHERE created_at >= %s), 0) AS short,
+                      COALESCE(SUM(cost_usd), 0) AS long
+               FROM usage_records
+               WHERE source_key = ANY(%s) AND created_at >= %s
+               GROUP BY source_key""",
+            (since_short, list(sub_ids), since_long),
+        ).fetchall()
+    out = {i: (0.0, 0.0) for i in sub_ids}
+    for r in rows:
+        out[r["source_key"]] = (float(r["short"]), float(r["long"]))
+    return out
+
+
 def get_subscription_consumption(sub_id: str, since: str) -> float:
     """Total cost_usd attributed to a subscription since an ISO timestamp.
 
@@ -681,7 +761,7 @@ _SAMPLE_COALESCE_S = 60
 
 _SAMPLE_COLS = (
     "id, subscription_id, observed_at, source, five_hour_pct, five_hour_resets_at, "
-    "seven_day_pct, seven_day_resets_at, data"
+    "seven_day_pct, seven_day_resets_at, data, hint"
 )
 
 
@@ -728,16 +808,20 @@ def insert_window_sample(
     seven_day_pct: float | None,
     seven_day_resets_at: str | None,
     data: dict | None = None,
+    hint: bool = False,
 ) -> bool:
     """Append one observation. Returns False when it coalesced into the latest
-    row (same values, observed less than ``_SAMPLE_COALESCE_S`` after it)."""
+    row of the same source (same values, observed less than
+    ``_SAMPLE_COALESCE_S`` after it): a poll is never swallowed by a stream
+    event that read the same. ``hint``: a session's own report, which the
+    readers below leave out unless they ask for it."""
     payload = data or {}
     with get_conn() as conn:
         last = conn.execute(
             f"""SELECT {_SAMPLE_COLS} FROM subscription_window_samples
-                WHERE subscription_id = %s
+                WHERE subscription_id = %s AND source = %s
                 ORDER BY observed_at DESC LIMIT 1""",
-            (sub_id,),
+            (sub_id, source),
         ).fetchone()
         if last is not None:
             same = (
@@ -752,24 +836,26 @@ def insert_window_sample(
         conn.execute(
             """INSERT INTO subscription_window_samples
                (subscription_id, observed_at, source, five_hour_pct, five_hour_resets_at,
-                seven_day_pct, seven_day_resets_at, data)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                seven_day_pct, seven_day_resets_at, data, hint)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (sub_id, observed_at, source, five_hour_pct, five_hour_resets_at or None,
-             seven_day_pct, seven_day_resets_at or None, json.dumps(payload)),
+             seven_day_pct, seven_day_resets_at or None, json.dumps(payload), bool(hint)),
         )
         conn.commit()
         return True
 
 
-def latest_window_samples(sub_ids: list[str], *, source: str | None = None) -> dict[str, dict]:
+def latest_window_samples(sub_ids: list[str], *, source: str | None = None,
+                          hints: bool = False) -> dict[str, dict]:
     """The newest sample per subscription, keyed by subscription id;
     ``source`` restricts it to one kind (the newest poll, which alone
-    carries the per-model windows)."""
+    carries the per-model windows). A session's own reports (``hint``) are
+    left out; ``hints`` asks for those alone, for what the cards show."""
     ids = [s for s in sub_ids if s]
     if not ids:
         return {}
-    where = "subscription_id = ANY(%s)"
-    params: list = [ids]
+    where = "subscription_id = ANY(%s) AND hint = %s"
+    params: list = [ids, bool(hints)]
     if source:
         where += " AND source = %s"
         params.append(source)
@@ -786,16 +872,17 @@ def latest_window_samples(sub_ids: list[str], *, source: str | None = None) -> d
 
 def window_samples_since(sub_id: str, since: str) -> list[dict]:
     """Samples from ``since`` on, oldest first, preceded by the last sample
-    before it (the baseline a consumption delta starts from)."""
+    before it (the baseline a consumption delta starts from). A session's
+    own reports (``hint``) are left out."""
     with get_conn() as conn:
         rows = conn.execute(
             f"""SELECT * FROM (
                     (SELECT {_SAMPLE_COLS} FROM subscription_window_samples
-                     WHERE subscription_id = %s AND observed_at < %s
+                     WHERE subscription_id = %s AND observed_at < %s AND NOT hint
                      ORDER BY observed_at DESC LIMIT 1)
                     UNION ALL
                     (SELECT {_SAMPLE_COLS} FROM subscription_window_samples
-                     WHERE subscription_id = %s AND observed_at >= %s)
+                     WHERE subscription_id = %s AND observed_at >= %s AND NOT hint)
                 ) t ORDER BY observed_at ASC, id ASC""",
             (sub_id, since, sub_id, since),
         ).fetchall()
@@ -1186,9 +1273,11 @@ def remap_retired_model(old_id: str, new_id: str) -> int:
     ``agents.default_model`` (per-agent pin) and ``chats.model`` (per-chat
     override) and ``dynamic_tasks.override_model`` (the per-task pin — since
     2026-08-16 a schedule's model choice PERSISTS, so a retired id would sit
-    on the row until the next fire and then 400 at validation). Delegate
-    spawns need no entry of their own: they write the same column. Plain
-    UPDATEs are idempotent: after the first boot all three match zero rows.
+    on the row until the next fire and then 400 at validation) and
+    ``agent_outside.wrapup_model`` (the wrap-up's pin, which its settings
+    card shows as stored). Delegate spawns need no entry of their own: they
+    write the same column. Plain UPDATEs are idempotent: after the first
+    boot all four match zero rows.
     ``updated_at`` is deliberately NOT bumped (an administrative rewrite must
     not reorder chat lists).
     Returns the total number of rows remapped.
@@ -1196,7 +1285,8 @@ def remap_retired_model(old_id: str, new_id: str) -> int:
     with get_conn() as conn:
         remapped: dict[str, int] = {}
         for table, col in (("agents", "default_model"), ("chats", "model"),
-                           ("dynamic_tasks", "override_model")):
+                           ("dynamic_tasks", "override_model"),
+                           ("agent_outside", "wrapup_model")):
             cur = conn.execute(
                 f"UPDATE {table} SET {col} = %s WHERE {col} = %s",
                 (new_id, old_id),

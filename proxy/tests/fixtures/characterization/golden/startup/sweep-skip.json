@@ -1,0 +1,27 @@
+{
+ "after_second": {
+  "fast": 2,
+  "hung": 1
+ },
+ "after_third": {
+  "fast": 3,
+  "hung": 2
+ },
+ "first": [
+  "char-skip hung",
+  "char-skip fast"
+ ],
+ "logged": [
+  [
+   "WARNING",
+   "char-skip hung still running from the last tick; skipped"
+  ]
+ ],
+ "second": [
+  "char-skip fast"
+ ],
+ "third": [
+  "char-skip hung",
+  "char-skip fast"
+ ]
+}

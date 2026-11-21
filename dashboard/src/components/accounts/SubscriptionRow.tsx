@@ -9,6 +9,7 @@ import { useState } from 'react'
 import { fetchSigningSecret, mcpStateMark, type WebhookSubscription } from '../../api/subscriptions'
 import { isRelayDelivery } from './useDeleteWithConfirm'
 import { BADGE_BASE, BADGE_TONE } from '../ui/classes'
+import { copyOrSay } from '../../lib/copyText'
 
 export function SubscriptionRow({
   sub,
@@ -38,12 +39,9 @@ export function SubscriptionRow({
     : ''
 
   const copy = async (label: string, value: string) => {
-    try {
-      await navigator.clipboard.writeText(value)
+    if (await copyOrSay(value)) {
       setCopied(label)
       setTimeout(() => setCopied(null), 1500)
-    } catch {
-      /* clipboard unavailable — the URL is still selectable */
     }
   }
 

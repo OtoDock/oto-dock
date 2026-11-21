@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import os
 import platform
 import shutil
+import stat
 import sys
 from unittest.mock import AsyncMock, patch
 
@@ -45,6 +47,27 @@ class TestDetectCapabilities:
             caps = sm.detect_capabilities()
         assert "claude-code" in caps["installed_clis"]
         assert "codex" in caps["installed_clis"]
+
+    def test_says_it_streams_between_turns(self, sat_config):
+        assert SessionManager(sat_config).detect_capabilities()["between_turns_stream"] is True
+
+    @pytest.mark.asyncio
+    async def test_stop_turn_passes_the_stream_ask_and_an_older_frame_keeps_the_bound(
+            self, sat_config, tmp_path):
+        """``stream_between_turns`` reaches the session; a frame from an older
+        platform (no such field) keeps the bounded rule."""
+        from satellite.sessions.cli_session import CLISession
+        sm = SessionManager(sat_config)
+        session = CLISession("sess-st", tmp_path, {
+            "cwd_relative": "users/alice", "claude_dir_relative": "users/alice/.claude",
+            "system_prompt": "", "mcp_config": {"mcpServers": {}}, "model": "claude-sonnet-5",
+            "env": {}}, sat_config)
+        sm.sessions["sess-st"] = session
+        await sm.stop_turn({"session_id": "sess-st", "drain_bg": False, "drain_bg_s": 60,
+                            "stream_between_turns": True})
+        assert session._drain_bg and session._drain_bg_s == float("inf")
+        await sm.stop_turn({"session_id": "sess-st", "drain_bg": True, "drain_bg_s": 60})
+        assert session._drain_bg and session._drain_bg_s == 60.0
 
     def test_detects_installed_mcps(self, sat_config):
         sm = SessionManager(sat_config)
@@ -106,6 +129,51 @@ class TestStartSessionReplacement:
         stale.close.assert_awaited_once()
         replacement.start.assert_awaited_once()
         assert sm.sessions["sess-1"] is replacement
+
+    @pytest.mark.asyncio
+    async def test_an_engine_gone_with_no_turn_reading_is_told_to_the_platform(self, sat_config):
+        """The session's own word (``on_exit``) becomes ``session_ended``
+        with the reason, so the platform reads the session dead before the
+        next message. The session stays held: the platform's close cleans up."""
+        sm = SessionManager(sat_config)
+        started = AsyncMock()
+        started.pid, started.session_id = 222, "sess-1"
+        ws = _CapturingWS()
+        with patch("satellite.sessions.cli_session.CLISession", return_value=started):
+            await sm.start_session({"session_id": "sess-1", "execution_path": "claude-code-cli",
+                                    "config": {}, "command_id": "cmd-1", "agent_slug": "test-agent"}, ws)
+        ack = next(m for m in ws.sent if m["type"] == "ack")
+        assert ack["status"] == "ok" and ack["incarnation"] == started.incarnation != ""
+        ws.sent.clear()
+        await started.on_exit(137)
+        assert ws.sent == [{"type": "session_ended", "session_id": "sess-1", "incarnation": started.incarnation,
+                            "reason": "exited", "exit_code": 137}]
+        assert sm.sessions["sess-1"] is started
+        # The memory guard's end is named as such, and a code that is no number is left out.
+        ws.sent.clear()
+        sm.mark_ended_for_memory("sess-1")
+        await started.on_exit(None)
+        assert ws.sent == [{"type": "session_ended", "session_id": "sess-1", "incarnation": started.incarnation,
+                            "reason": "memory"}]
+
+    @pytest.mark.asyncio
+    async def test_a_session_the_platform_closed_or_replaced_tells_nothing(self, sat_config):
+        sm = SessionManager(sat_config)
+        first, second = AsyncMock(), AsyncMock()
+        first.pid, first.session_id, second.pid, second.session_id = 1, "sess-1", 2, "sess-1"
+        ws = _CapturingWS()
+        msg = {"session_id": "sess-1", "execution_path": "claude-code-cli", "config": {},
+               "command_id": "cmd-1", "agent_slug": "test-agent"}
+        with patch("satellite.sessions.cli_session.CLISession", side_effect=[first, second]):
+            await sm.start_session(msg, ws)
+            await sm.start_session(msg, ws)                 # the same id again: the first is replaced
+        ws.sent.clear()
+        await first.on_exit(0)
+        assert ws.sent == []
+        await sm.close_session({"session_id": "sess-1", "command_id": "cmd-2"}, ws)
+        ws.sent.clear()
+        await second.on_exit(0)
+        assert ws.sent == []
 
     @pytest.mark.asyncio
     async def test_same_id_respawn_for_the_codex_engine(self, sat_config):
@@ -394,6 +462,174 @@ class TestCredentialsUpdate:
             assert ws.sent[0]["status"] == "error", f"accepted bad target: {bad}"
 
 
+class TestCredentialsUpdateHomes:
+    """A session in a home of its own (``sessions/session_homes.py``) gets its
+    rotated sign-in in that home; nothing reaches a write through a link
+    (the plan's security rule 4)."""
+
+    SID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    BLOB = {"claudeAiOauth": {"accessToken": "new", "refreshToken": ""}}
+
+    async def _push(self, sm, dir_relative, kind="claude", slug="test-agent"):
+        ws = _CapturingWS()
+        await sm.credentials_update({
+            "command_id": "c", "agent_slug": slug, "dir_relative": dir_relative,
+            "kind": kind, "content": self.BLOB}, ws)
+        self.ack = ws.sent[0]
+        return ws.sent[0]["status"]
+
+    @pytest.mark.asyncio
+    async def test_a_homes_sign_in_is_written_there(self, sat_config):
+        sm = SessionManager(sat_config)
+        sm.sessions[self.SID] = object()
+        home = sat_config.agents_dir / "test-agent" / "users" / "alice" / ".claude" / "own" / self.SID
+        home.mkdir(parents=True)
+        assert await self._push(sm, f"users/alice/.claude/own/{self.SID}") == "ok"
+        assert "note" not in self.ack
+        path = home / ".credentials.json"
+        assert json.loads(path.read_text()) == self.BLOB
+        if os.name != "nt":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert not (home.parent.parent / ".credentials.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_a_live_home_sessions_start_copy_follows_the_rotation(self, sat_config):
+        sm = SessionManager(sat_config)
+        home = sat_config.agents_dir / "test-agent" / "workspace" / ".claude" / "own" / self.SID
+
+        class _Live:
+            config = {"credentials_json": {"claudeAiOauth": {"accessToken": "old"}}}
+            _claude_dir = home.parent.parent
+            _engine_dir = home
+        sm.sessions[self.SID] = _Live()
+        home.mkdir(parents=True)
+        assert await self._push(sm, f"workspace/.claude/own/{self.SID}") == "ok"
+        assert sm.sessions[self.SID].config["credentials_json"] == self.BLOB
+
+    @pytest.mark.asyncio
+    async def test_a_home_no_live_session_of_this_machine_holds_takes_no_sign_in(self, sat_config):
+        """A push that lands while the session's close removes its home, or
+        after it, writes nothing: a token would stay on disk with no session
+        to read it (the home's removal then fails on it)."""
+        from satellite.sessions import close_hold
+        sm = SessionManager(sat_config)
+        home = sat_config.agents_dir / "test-agent" / "workspace" / ".claude" / "own" / self.SID
+        home.mkdir(parents=True)
+        assert await self._push(sm, f"workspace/.claude/own/{self.SID}") == "ok"
+        assert self.ack["note"] == "session gone, not written"
+        assert not (home / ".credentials.json").exists()
+        sm.pty_sessions[self.SID] = object()
+        async with close_hold.closing(self.SID):
+            assert await self._push(sm, f"workspace/.claude/own/{self.SID}") == "ok"
+            assert self.ack["note"] == "session gone, not written"
+        assert not (home / ".credentials.json").exists()
+        assert await self._push(sm, f"workspace/.claude/own/{self.SID}") == "ok"
+        assert json.loads((home / ".credentials.json").read_text()) == self.BLOB
+
+    @pytest.mark.asyncio
+    async def test_a_codex_home_no_live_session_of_this_machine_holds_takes_no_sign_in(self, sat_config):
+        """The same for a Codex home: its push names the Codex kind and folder."""
+        from satellite.sessions import close_hold
+        sm = SessionManager(sat_config)
+        rel = f"workspace/.codex/own/{self.SID}"
+        home = sat_config.agents_dir / "test-agent" / "workspace" / ".codex" / "own" / self.SID
+        home.mkdir(parents=True)
+        assert await self._push(sm, rel, kind="codex") == "ok"
+        assert self.ack["note"] == "session gone, not written"
+        assert not (home / "auth.json").exists()
+        sm.pty_sessions[self.SID] = object()
+        async with close_hold.closing(self.SID):
+            assert await self._push(sm, rel, kind="codex") == "ok"
+            assert self.ack["note"] == "session gone, not written"
+        assert not (home / "auth.json").exists()
+        assert await self._push(sm, rel, kind="codex") == "ok"
+        assert "note" not in self.ack
+        assert (home / "auth.json").is_file()
+
+    @pytest.mark.asyncio
+    async def test_a_person_named_own_is_a_scope_not_a_home(self, sat_config):
+        """``users/own/.claude`` is the scope of a person named ``own``: its
+        sign-in is written, its folder made as any scope's."""
+        sm = SessionManager(sat_config)
+        assert await self._push(sm, "users/own/.claude") == "ok"
+        assert "note" not in self.ack
+        assert (sat_config.agents_dir / "test-agent" / "users" / "own" / ".claude").is_dir()
+
+    @pytest.mark.asyncio
+    async def test_a_push_for_a_gone_home_makes_no_folder_at_all(self, sat_config):
+        """A home in a scope whose engine folder is not there: nothing is
+        made, not the scope's folder either."""
+        sm = SessionManager(sat_config)
+        assert await self._push(sm, f"users/bob/.claude/own/{self.SID}") == "ok"
+        assert self.ack["note"] == "session gone, not written"
+        assert not (sat_config.agents_dir / "test-agent" / "users" / "bob").exists()
+
+    @pytest.mark.asyncio
+    async def test_a_renewal_after_the_close_makes_no_home(self, sat_config):
+        """The close removed the home before the platform let go of its
+        target: the renewal writes nothing, makes no folder, and says so."""
+        sm = SessionManager(sat_config)
+        store = sat_config.agents_dir / "test-agent" / "workspace" / ".claude"
+        assert await self._push(sm, f"workspace/.claude/own/{self.SID}") == "ok"
+        assert self.ack["note"] == "session gone, not written"
+        assert not (store / "own" / self.SID).exists()
+        assert not (store / ".credentials.json").exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [
+        "users/alice/.claude/own/not an id",
+        "users/alice/.claude/own/short",
+        f"users/alice/.claude/own/{SID}/deeper",
+        f"users/alice/.claude/elsewhere/{SID}",
+        f"users/alice/.codex/own/{SID}",
+    ])
+    async def test_other_shapes_are_refused(self, sat_config, bad):
+        sm = SessionManager(sat_config)
+        assert await self._push(sm, bad) == "error"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name == "nt", reason="links stand in for junctions on POSIX")
+    @pytest.mark.parametrize("linked", ["own", "home", "store"])
+    async def test_a_link_on_the_path_is_refused(self, sat_config, tmp_path, linked):
+        sm = SessionManager(sat_config)
+        sm.sessions[self.SID] = object()
+        store = sat_config.agents_dir / "test-agent" / "workspace" / ".claude"
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        if linked == "store":
+            store.parent.mkdir(parents=True)
+            os.symlink(elsewhere, store)
+        else:
+            (store / "own").mkdir(parents=True)
+            if linked == "own":
+                os.rmdir(store / "own")
+                os.symlink(elsewhere, store / "own")
+            else:
+                os.symlink(elsewhere, store / "own" / self.SID)
+        assert await self._push(sm, f"workspace/.claude/own/{self.SID}") == "error"
+        assert list(elsewhere.rglob("*")) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name == "nt", reason="links stand in for junctions on POSIX")
+    async def test_a_link_at_the_files_name_is_replaced_never_followed(self, sat_config, tmp_path):
+        sm = SessionManager(sat_config)
+        store = sat_config.agents_dir / "test-agent" / "workspace" / ".claude"
+        store.mkdir(parents=True)
+        victim = tmp_path / "victim.json"
+        victim.write_text("untouched")
+        os.symlink(victim, store / ".credentials.json")
+        assert await self._push(sm, "workspace/.claude") == "ok"
+        assert victim.read_text() == "untouched"
+        assert not (store / ".credentials.json").is_symlink()
+
+    def test_the_satellite_reports_that_it_makes_homes(self, sat_config):
+        caps = SessionManager(sat_config).detect_capabilities()
+        assert caps["session_homes"] is True
+        # Each engine folder it makes homes in (a platform reads Claude Code's
+        # alone from a report of ``session_homes`` without this list).
+        assert caps["session_home_dirs"] == [".claude", ".codex"]
+
+
 class TestSendMessageDeadCLI:
     """A dead persistent CLI must come back as an ACK error
     (not a session_event) so the proxy's cli_dead → auto-resume path fires."""
@@ -458,6 +694,25 @@ class TestModeCTurnRetention:
         assert sm.turn_state["s1"]["active"] is False
 
     @pytest.mark.asyncio
+    async def test_the_starts_data_reaches_the_session_only_when_sent(self, sat_config):
+        """The proxy's ``start_context`` on a send goes to the session's turn
+        (Claude Code writes it as its own message); a send without it hands
+        the session no such argument, as every engine's turn takes."""
+        seen: list[dict] = []
+
+        class _Recording(_FakeCLISession):
+            async def run_turn(self, message, *, inject_time=False, forward, **kw):
+                seen.append(kw)
+                await super().run_turn(message, inject_time=inject_time, forward=forward)
+
+        sm = SessionManager(sat_config)
+        sm.sessions["s1"] = _Recording([{"type": "result", "subtype": "success"}])
+        await sm.send_message({"session_id": "s1", "command_id": "cmd-1", "message": "hi",
+                               "start_context": "<start-context>X</start-context>"}, _CapturingWS())
+        await sm.send_message({"session_id": "s1", "command_id": "cmd-2", "message": "hi"}, _CapturingWS())
+        assert seen == [{"start_context": "<start-context>X</start-context>"}, {}]
+
+    @pytest.mark.asyncio
     async def test_turn_ended_precedes_file_scan_frames(self, sat_config):
         # turn_ended must be sent BEFORE the end-of-turn file scan: on a big
         # workspace the scan outlives the proxy's post-stop drain budget, and
@@ -478,6 +733,76 @@ class TestModeCTurnRetention:
         types = [m["type"] for m in ws.sent]
         assert "turn_ended" in types and "file_changed" in types
         assert types.index("turn_ended") < types.index("file_changed")
+
+    @pytest.mark.asyncio
+    async def test_the_turn_end_scan_runs_off_the_loop(self, sat_config):
+        """A turn's end scans the agent's folder in a worker thread: a large
+        folder never holds the socket's loop."""
+        import threading
+        scanned: list = []
+
+        class _ScanningSession(_FakeCLISession):
+            def detect_file_changes(self):
+                scanned.append(threading.get_ident())
+                return []
+
+        sm = SessionManager(sat_config)
+        sm.sessions["s1"] = _ScanningSession([{"type": "result", "subtype": "success"}])
+        await sm.send_message({"session_id": "s1", "command_id": "cmd-1", "message": "hi"}, _CapturingWS())
+        assert scanned and scanned[0] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_the_guards_end_is_told_by_the_turn_it_ended_alone(self, sat_config):
+        """Ended inside a turn: that turn's end says ``memory``. A Codex
+        session ended between turns re-warms in place, and its next turn,
+        which answered, says nothing of it (mutation: a flag never cleared)."""
+        sm = SessionManager(sat_config)
+
+        class _Ended(_FakeCLISession):
+            async def run_turn(self, message, *, inject_time=False, forward):
+                sm.mark_ended_for_memory("s1")
+                await forward({"type": "result", "subtype": "error_during_execution"})
+
+        sm.sessions["s1"] = _Ended([])
+        ws = _CapturingWS()
+        await sm.send_message({"session_id": "s1", "command_id": "cmd-1", "message": "hi"}, ws)
+        ended = [m for m in ws.sent if m["type"] == "turn_ended"]
+        assert [m.get("reason") for m in ended] == ["memory"]
+
+        codex = _FakeCLISession([{"type": "result", "subtype": "success"}])
+        codex.execution_path = "codex-cli"
+        sm.sessions["s2"] = codex
+        sm.mark_ended_for_memory("s2")          # between turns: the engine re-warms at the next
+        ws = _CapturingWS()
+        await sm.send_message({"session_id": "s2", "command_id": "cmd-2", "message": "hi"}, ws)
+        await sm.send_message({"session_id": "s1", "command_id": "cmd-3", "message": "again"}, ws)
+        ended = [m for m in ws.sent if m["type"] == "turn_ended"]
+        assert [m.get("reason") for m in ended] == [None, "memory"]
+
+    @pytest.mark.asyncio
+    async def test_a_turns_end_says_why_the_session_ended_it(self, sat_config):
+        """A session that ended its turn itself says why, once (a Codex
+        daemon dropped for an interrupt it did not take): the reason rides
+        that turn's end and no later one. The memory guard's end comes first."""
+        sm = SessionManager(sat_config)
+
+        class _Dropped(_FakeCLISession):
+            ends = [{"reason": "interrupted"}, {}, {"reason": "interrupted"}]
+
+            def take_turn_end(self):
+                return self.ends.pop(0)
+
+            async def run_turn(self, message, *, inject_time=False, forward):
+                if message == "guarded":
+                    sm.mark_ended_for_memory("s1")
+
+        sm.sessions["s1"] = _Dropped([])
+        ws = _CapturingWS()
+        for n, message in enumerate(("hi", "hi", "guarded")):
+            await sm.send_message({"session_id": "s1", "command_id": f"cmd-{n}", "message": message}, ws)
+        ended = [m for m in ws.sent if m["type"] == "turn_ended"]
+        assert [m.get("reason") for m in ended] == ["interrupted", None, "memory"]
+        assert all(set(m) <= {"type", "session_id", "command_id", "reason"} for m in ended)
 
     def test_sessions_alive_report(self, sat_config):
         sm = SessionManager(sat_config)
@@ -916,6 +1241,93 @@ class TestCheckSessionResumable:
         assert fake_ws.sent[0]["resumable"] is True
 
 
+class TestResumeProbeBeneathTheAgentFolder:
+    """The probe lists ``projects`` and opens the transcript beneath the
+    agent's folder: a linked project folder is not searched; a link or a
+    special file at the transcript's name is a definite no; a ``projects``
+    folder past its cap is an error the platform asks again on; a record
+    over 64 MiB is read past."""
+
+    @staticmethod
+    async def _probe(sm, sid="sess-P"):
+        class _WS:
+            sent: list = []
+
+            async def enqueue_send(self, msg):
+                self.sent.append(msg)
+        ws = _WS()
+        ws.sent = []
+        await sm.check_session_resumable({"command_id": "c", "session_id": sid,
+                                          "agent_slug": "agent-1", "username": "alice"}, ws)
+        return ws.sent[0]
+
+    @staticmethod
+    def _projects(sat_config):
+        d = sat_config.agents_dir / "agent-1" / "users" / "alice" / ".claude" / "projects"
+        d.mkdir(parents=True)
+        return d
+
+    @pytest.mark.asyncio
+    async def test_a_linked_project_folder_is_not_searched(self, sat_config, tmp_path):
+        projects = self._projects(sat_config)
+        stand_in = tmp_path / "outside"
+        stand_in.mkdir()
+        (stand_in / "sess-P.jsonl").write_text('{"type":"user"}\n')
+        (projects / "-linked").symlink_to(stand_in, target_is_directory=True)
+        ack = await self._probe(SessionManager(sat_config))
+        assert (ack["status"], ack["resumable"], ack["reason"]) == ("ok", False, "missing")
+
+    @pytest.mark.asyncio
+    async def test_a_link_or_a_pipe_at_the_name_is_unreadable(self, sat_config, tmp_path):
+        projects = self._projects(sat_config)
+        (projects / "-p").mkdir()
+        stand_in = tmp_path / "outside.jsonl"
+        stand_in.write_text('{"type":"user"}\n')
+        (projects / "-p" / "sess-P.jsonl").symlink_to(stand_in)
+        ack = await self._probe(SessionManager(sat_config))
+        assert (ack["status"], ack["resumable"], ack["reason"]) == ("ok", False, "unreadable")
+        (projects / "-p" / "sess-P.jsonl").unlink()
+        os.mkfifo(projects / "-p" / "sess-P.jsonl")
+        # A writer holds the pipe with a line in it, so a read by name would
+        # not wait: the answer is about the kind of the name, not its bytes.
+        held = os.open(projects / "-p" / "sess-P.jsonl", os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.write(held, b'{"type":"user"}\n')
+            ack = await self._probe(SessionManager(sat_config))
+        finally:
+            os.close(held)
+        assert (ack["status"], ack["resumable"], ack["reason"]) == ("ok", False, "unreadable")
+
+    @pytest.mark.asyncio
+    async def test_a_linked_projects_folder_is_unreadable(self, sat_config, tmp_path):
+        claude = self._projects(sat_config).parent
+        (claude / "projects").rmdir()
+        stand_in = tmp_path / "outside" / "-p"
+        stand_in.mkdir(parents=True)
+        (stand_in / "sess-P.jsonl").write_text('{"type":"user"}\n')
+        (claude / "projects").symlink_to(stand_in.parent, target_is_directory=True)
+        ack = await self._probe(SessionManager(sat_config))
+        assert (ack["status"], ack["resumable"], ack["reason"]) == ("ok", False, "unreadable")
+
+    @pytest.mark.asyncio
+    async def test_a_projects_folder_past_its_cap_could_not_tell(self, sat_config):
+        projects = self._projects(sat_config)
+        for i in range(10_001):
+            (projects / f"-{i}").mkdir()
+        (projects / "-0" / "sess-P.jsonl").write_text('{"type":"user"}\n')
+        ack = await self._probe(SessionManager(sat_config))
+        assert ack["status"] == "error" and "resumable" not in ack
+
+    @pytest.mark.asyncio
+    async def test_a_record_over_64_mib_is_read_past(self, sat_config):
+        projects = self._projects(sat_config)
+        (projects / "-p").mkdir()
+        (projects / "-p" / "sess-P.jsonl").write_bytes(
+            b'{"type":"user","content":"' + b"x" * (64 * 1024 * 1024) + b'"}\n{"type":"assistant"}\n')
+        ack = await self._probe(SessionManager(sat_config))
+        assert (ack["status"], ack["resumable"], ack["reason"]) == ("ok", False, "empty")
+
+
 class TestFixWindowsExePathsAfterSwap:
     """Verifies pip/distlib .exe wrappers get their embedded python.exe path
     rewritten after the ``<X>.new/`` → ``<X>/`` rename on Windows.
@@ -1300,6 +1712,13 @@ class TestSyncMcpsCategoryGate:
         assert "core" in MCP_CATEGORIES  # the platform's own MCPs
 
     @pytest.mark.asyncio
+    async def test_a_tool_installs_on_a_python_without_the_tar_filter(self, sat_config,
+                                                                      python_without_tar_filter):
+        ack = await self._run(sat_config, [self._spec("plain-mcp", "core")])
+        assert ack["results"]["plain-mcp"]["status"] == "ok", ack["results"]["plain-mcp"]
+        assert (sat_config.mcps_dir / "core" / "plain-mcp" / "manifest.json").is_file()
+
+    @pytest.mark.asyncio
     async def test_unknown_category_and_bad_name_are_refused(self, sat_config):
         specs = [
             self._spec("escaper", "../outside"),
@@ -1437,30 +1856,47 @@ class TestEngineTableDispatch:
         assert dead.turns == ["hi"]
 
     @pytest.mark.asyncio
-    async def test_codex_events_ride_untagged_and_unbuffered(self, sat_config):
-        """No Mode C retention for an engine without turn replay: its
-        persistent forwarder crosses turns by design, so its events carry no
-        _command_id / _seq and nothing is buffered for a replay."""
+    async def test_a_codex_turn_is_kept_and_its_later_events_ride_plain(self, sat_config):
+        """A Codex turn's events are tagged and kept for a replay as a Claude
+        turn's are (0.5.171). The persistent forwarder outlives the turn: an
+        event it forwards after the turn (a background sub-agent's) is
+        neither tagged nor kept, and waits on no replay's pause."""
         class _Codex:
             execution_path = "codex-cli"
             is_alive = True
             agent_slug = "agent-1"
 
+            def __init__(self):
+                self.forward = None
+
             async def run_turn(self, message, *, inject_time=False, forward):
+                self.forward = forward
                 await forward({"method": "item/started", "params": {}})
+                await forward({"method": "turn/completed", "params": {}})
 
             def detect_file_changes(self):
                 return []
 
         sm = SessionManager(sat_config)
-        sm.sessions["sess-c"] = _Codex()
+        codex = sm.sessions["sess-c"] = _Codex()
         ws = _CapturingWS()
         await sm.send_message({"session_id": "sess-c", "command_id": "cmd-1",
                                "message": "hi"}, ws)
         events = [m["event"] for m in ws.sent if m["type"] == "session_event"]
-        assert events == [{"method": "item/started", "params": {}}]
-        assert "sess-c" not in sm.turn_buffers and "sess-c" not in sm.turn_state
+        assert [e["_command_id"] for e in events] == ["cmd-1", "cmd-1"]
+        assert [e["_seq"] for e in events] == [1, 2]
+        kept = list(sm.turn_buffers["sess-c"])
+        assert [e.get("method") or e.get("type") for e in kept] == [
+            "item/started", "turn/completed", "_turn_sentinel"]
+        assert sm.turn_state["sess-c"]["active"] is False
         assert [m["type"] for m in ws.sent][-1] == "turn_ended"
+        # After the turn: a background sub-agent's event, plain, even while
+        # a replay holds the forwarder.
+        sm.forward_paused["sess-c"] = asyncio.Event()
+        await asyncio.wait_for(codex.forward({"method": "item/completed", "params": {"threadId": "sub"}}), 1.0)
+        late = ws.sent[-1]["event"]
+        assert late == {"method": "item/completed", "params": {"threadId": "sub"}}
+        assert len(sm.turn_buffers["sess-c"]) == 3
 
     @pytest.mark.asyncio
     async def test_resume_replay_names_the_engine_from_the_turn_state(self, sat_config):
@@ -1479,6 +1915,11 @@ class TestEngineTableDispatch:
 
 
 class TestStateDirectoriesReported:
+    def test_capabilities_say_the_start_hook_runs(self, sat_config):
+        """The platform sends a terminal's start data to a satellite that
+        says so, and puts it in the text of one that does not."""
+        assert SessionManager(sat_config).detect_capabilities()["start_context_hook"] is True
+
     def test_capabilities_carry_the_state_root_and_the_mcps_folder(self, sat_config):
         from satellite import config
         caps = SessionManager(sat_config).detect_capabilities()
@@ -1562,13 +2003,13 @@ class TestManifestPaging:
     async def test_skips_are_listed_only_for_a_proxy_that_asks(self, sat_config, monkeypatch):
         from satellite.transport import file_sync
         self._tree(sat_config, 2)
-        real = file_sync._hash_file
+        real = file_sync._open_listed
 
-        def hash_file(path):
+        def open_listed(root, rel, path, cap):
             if path.name == "f0.txt":
                 raise PermissionError(13, "locked")
-            return real(path)
-        monkeypatch.setattr(file_sync, "_hash_file", hash_file)
+            return real(root, rel, path, cap)
+        monkeypatch.setattr(file_sync, "_open_listed", open_listed)
         sm = SessionManager(sat_config)
         plain, asked = _CapturingWS(), _CapturingWS()
         await sm.request_manifest({"agent_slug": "test-agent", "command_id": "c1"}, plain)
@@ -1726,3 +2167,330 @@ class TestSyncMcpsRemovals:
                                 "mcps_to_remove": ["old-mcp"]}, AsyncMock())
         assert not d.exists()
         assert "sync_mcps: removed custom/old-mcp" in caplog.text
+
+
+class TestWhatThePlatformReplays:
+    """The connect report lists a live session with its turn only for an
+    engine the platform signed in replays (``replays_turns_of``); Claude
+    Code alone under a platform that names none."""
+
+    def test_codex_is_in_the_other_list_under_a_platform_that_names_none(self, sat_config):
+        from satellite.sessions import alive_report
+        sm = SessionManager(sat_config)
+        sm.sessions["c-idle"] = _HeldCodexSession()
+        assert sm.headless_sessions_alive() == []
+        assert [e["session_id"] for e in alive_report.other_sessions_held(sm)] == ["c-idle"]
+
+    def test_codex_is_in_the_turn_list_under_a_platform_that_replays_it(self, sat_config):
+        from satellite.sessions import alive_report
+        sm = SessionManager(sat_config)
+        sm.replays_turns_of = frozenset({"claude-code-cli", "codex-cli"})
+        sm.sessions["c-idle"] = _HeldCodexSession()
+        sm.sessions["c-dead"] = _HeldCodexSession(alive=False)
+        sm.turn_state["c-idle"] = {"active": True, "command_id": "cmd-9", "seq": 3}
+        [entry] = sm.headless_sessions_alive()
+        assert entry["session_id"] == "c-idle" and entry["turn_active"] is True
+        assert (entry["resume_handle"], entry["model"], entry["mcp_servers"]) == (
+            "th-1", "gpt-6.1-sol", ["file-tools", "memory"])
+        assert entry["command_id"] == "cmd-9"
+        assert [e["session_id"] for e in alive_report.other_sessions_held(sm)] == ["c-dead"]
+
+    def test_a_claude_entry_carries_its_tools_and_an_empty_handle(self, sat_config):
+        sm = SessionManager(sat_config)
+        live = _FakeCLISession([])
+        live.config = {"model": "claude-sonnet-5-5",
+                       "mcp_config": {"mcpServers": {"memory": {}, "display": {}}}}
+        live.mcp_server_names = ["display", "memory"]
+        sm.sessions["s1"] = live
+        [entry] = sm.headless_sessions_alive()
+        assert (entry["resume_handle"], entry["model"], entry["mcp_servers"]) == (
+            "", "claude-sonnet-5-5", ["display", "memory"])
+
+    def test_the_auth_answer_names_the_engines(self):
+        from unittest.mock import MagicMock
+
+        from satellite.transport.ws_client import SatelliteWSClient
+        client = SatelliteWSClient.__new__(SatelliteWSClient)
+        client.sm = MagicMock()
+        client._note_replays_turns_of({"replays_turns_of": ["claude-code-cli", "codex-cli", 7]})
+        assert client.sm.replays_turns_of == frozenset({"claude-code-cli", "codex-cli"})
+        client._note_replays_turns_of({})
+        assert client.sm.replays_turns_of == frozenset({"claude-code-cli"})
+
+
+class TestCapabilitiesCount:
+    def test_the_capabilities_carry_the_live_count(self, sat_config):
+        sm = SessionManager(sat_config)
+        sm.sessions["h"] = _FakeCLISession([])
+        sm.pty_sessions["t"] = object()
+        assert sm.detect_capabilities()["active_sessions"] == 2
+
+
+class TestCredentialsReachALiveSession:
+    @pytest.mark.asyncio
+    async def test_a_rotated_codex_token_reaches_the_sessions_own_config(self, sat_config, tmp_path):
+        """A Codex session re-warms its daemon from its start config: the
+        rotated token replaces the copy there too, so a revive writes the
+        current one."""
+        from types import SimpleNamespace
+        sm = SessionManager(sat_config)
+        home = sat_config.agents_dir / "agent-c" / "users" / "alice" / ".codex"
+        home.mkdir(parents=True)
+        other = sat_config.agents_dir / "agent-c" / "users" / "bob" / ".codex"
+        other.mkdir(parents=True)
+        mine = SimpleNamespace(_codex_dir=home, config={"auth_json": {"tokens": {"access_token": "old"}}})
+        bobs = SimpleNamespace(_codex_dir=other, config={"auth_json": {"tokens": {"access_token": "bob"}}})
+        sm.sessions["mine"], sm.sessions["bobs"] = mine, bobs
+        ws = _CapturingWS()
+        await sm.credentials_update({
+            "command_id": "c1", "agent_slug": "agent-c", "dir_relative": "users/alice/.codex",
+            "kind": "codex", "content": {"tokens": {"access_token": "new"}},
+        }, ws)
+        assert ws.sent[-1]["status"] == "ok"
+        assert mine.config["auth_json"] == {"tokens": {"access_token": "new"}}
+        assert bobs.config["auth_json"] == {"tokens": {"access_token": "bob"}}
+
+
+class TestTheTokenPerOpen:
+    """A ``pty_open`` carries the platform's token for that open: the ack and
+    the exit name it, a close or a death under another token leaves the live
+    PTY alone, and a PTY an open replaced leaves its successor's files."""
+
+    def _session(self, token=""):
+        from unittest.mock import AsyncMock
+        s = AsyncMock()
+        s.pid = 5
+        s.open_token = token
+        s.superseded = False
+        return s
+
+    @pytest.mark.asyncio
+    async def test_the_ack_names_the_token_and_a_replaced_pty_is_closed_first(self, sat_config):
+        sm = SessionManager(sat_config)
+        old = self._session("tok-old")
+        sm.pty_sessions["t1"] = old
+        new = self._session()
+        ws = _CapturingWS()
+        with patch("satellite.terminal.pty_session.PtySession", return_value=new):
+            await sm.pty_open({"session_id": "t1", "command_id": "c1", "agent_slug": "agent-c",
+                               "config": {}, "execution_path": "claude-code-cli",
+                               "open_token": "tok-new"}, ws)
+        old.close.assert_awaited_once()
+        assert old.superseded is True
+        assert sm.pty_sessions["t1"] is new and new.open_token == "tok-new"
+        assert ws.sent[-1] == {"type": "ack", "command_id": "c1", "status": "ok", "pid": 5,
+                               "open_token": "tok-new"}
+
+    @pytest.mark.asyncio
+    async def test_a_close_and_a_death_under_another_token_leave_the_live_pty(self, sat_config):
+        sm = SessionManager(sat_config)
+        live = self._session("tok-new")
+        sm.pty_sessions["t1"] = live
+        await sm.pty_close({"session_id": "t1", "open_token": "tok-old"})
+        assert sm.pty_sessions["t1"] is live
+        live.close.assert_not_awaited()
+        sm._on_pty_dead("t1", "tok-old")
+        assert sm.pty_sessions["t1"] is live
+        sm._on_pty_dead("t1", "tok-new")
+        assert "t1" not in sm.pty_sessions
+
+    @pytest.mark.asyncio
+    async def test_a_close_with_the_right_token_or_none_closes(self, sat_config):
+        sm = SessionManager(sat_config)
+        live = self._session("tok-new")
+        sm.pty_sessions["t1"] = live
+        await sm.pty_close({"session_id": "t1", "open_token": "tok-new"})
+        live.close.assert_awaited_once()
+        assert "t1" not in sm.pty_sessions
+        again = self._session("tok-x")
+        sm.pty_sessions["t2"] = again
+        await sm.pty_close({"session_id": "t2"})
+        again.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_replaced_ptys_close_keeps_the_successors_files(self, tmp_path):
+        from types import SimpleNamespace
+
+        from satellite.sessions import session_files
+        from satellite.terminal.pty_session_base import BasePtySession
+        ws = _CapturingWS()
+        sess = BasePtySession("t9", tmp_path / "agent", config={}, sat_config=SimpleNamespace(), ws=ws)
+        wiped = []
+        with patch.object(session_files, "wipe", side_effect=wiped.append):
+            sess.superseded = True
+            await sess.close()
+            assert wiped == []
+            sess.superseded = False
+            await sess.close()
+            assert wiped == ["t9"]
+
+    def test_the_exit_frame_names_the_token(self, tmp_path):
+        from types import SimpleNamespace
+
+        from satellite.terminal.pty_session_base import BasePtySession
+        sent = []
+
+        class _WS:
+            async def enqueue_send(self, msg):
+                sent.append(msg)
+
+            async def enqueue_pty(self, msg):
+                sent.append(msg)
+
+        sess = BasePtySession("t3", tmp_path / "agent", config={}, sat_config=SimpleNamespace(), ws=_WS())
+        sess.open_token = "tok-3"
+        captured = {}
+
+        def spawn_pty(cmd, *, env, cwd, rows, cols, on_output, on_exit):
+            captured["on_exit"] = on_exit
+            return SimpleNamespace(pid=1)
+
+        from satellite.terminal import pty_relay
+        with patch.object(pty_relay, "spawn_pty", spawn_pty), \
+                patch("satellite.transport.file_sync.snapshot_agent_dir", return_value={}):
+            (tmp_path / "agent").mkdir()
+            asyncio.run(sess._wire_and_spawn(["true"], {}, str(tmp_path)))
+            sess._tail_task.cancel()
+            asyncio.run(captured["on_exit"](0))
+        assert sent[-1] == {"type": "pty_exit", "session_id": "t3", "code": 0, "open_token": "tok-3"}
+        # The memory guard ended the terminal's engine: its exit says so.
+        sess.ended_for_memory = True
+        asyncio.run(captured["on_exit"](-9))
+        assert sent[-1] == {"type": "pty_exit", "session_id": "t3", "code": -9, "open_token": "tok-3",
+                            "reason": "memory"}
+
+
+class TestTheLastStartCheck:
+    """``_check_capacity``: an id the machine holds always passes; a machine
+    whose memory guard runs refuses by its own reading, with a reason the
+    platform shows; elsewhere the count stays."""
+
+    def test_an_id_it_holds_always_passes(self, sat_config, monkeypatch):
+        from satellite.sessions import memory_guard
+        sm = SessionManager(sat_config)
+        sm.sessions["s-1"] = object()
+        monkeypatch.setattr(memory_guard, "running", lambda: True)
+        monkeypatch.setattr(memory_guard, "start_refusal", lambda: memory_guard.START_REFUSAL)
+        sm._check_capacity("s-1")   # a replacing start after a platform restart
+        with pytest.raises(memory_guard.MachineMemoryRefused) as refused:
+            sm._check_capacity("s-2")
+        assert str(refused.value) == memory_guard.START_REFUSAL
+        assert refused.value.reason == "machine_memory"
+
+    def test_with_the_guard_the_count_no_longer_caps(self, sat_config, monkeypatch):
+        from satellite.sessions import memory_guard
+        sm = SessionManager(sat_config)
+        for i in range(100):
+            sm.sessions[f"s-{i}"] = object()
+        monkeypatch.setattr(memory_guard, "running", lambda: True)
+        monkeypatch.setattr(memory_guard, "start_refusal", lambda: None)
+        sm._check_capacity("s-new")
+
+    def test_without_the_guard_the_count_caps_as_before(self, sat_config, monkeypatch):
+        from satellite.sessions import memory_guard, session_manager as smod
+        sm = SessionManager(sat_config)
+        monkeypatch.setattr(memory_guard, "running", lambda: False)
+        monkeypatch.setattr(smod, "_recommended_max_sessions", lambda: 1)
+        sm.sessions["s-1"] = object()
+        with pytest.raises(RuntimeError, match="at capacity"):
+            sm._check_capacity("s-2")
+
+    def test_a_refused_start_names_its_reason_in_the_ack(self, sat_config, monkeypatch):
+        from satellite.sessions import memory_guard
+        sm = SessionManager(sat_config)
+        monkeypatch.setattr(memory_guard, "running", lambda: True)
+        monkeypatch.setattr(memory_guard, "start_refusal", lambda: memory_guard.START_REFUSAL)
+        ws = AsyncMock()
+        sent: list[dict] = []
+        ws.enqueue_send = AsyncMock(side_effect=sent.append)
+        asyncio.run(sm.start_session({"command_id": "c-1", "session_id": "s-9", "agent_slug": "a",
+                                      "execution_path": "claude-code-cli", "config": {}}, ws))
+        ack = [f for f in sent if f.get("type") == "ack"][-1]
+        assert ack["status"] == "error" and ack["reason"] == "machine_memory"
+        assert ack["error"] == memory_guard.START_REFUSAL
+
+
+class TestMemoryUnits:
+    def test_every_table_gives_its_units(self, sat_config):
+        from types import SimpleNamespace
+
+        sm = SessionManager(sat_config)
+        sm.sessions["s-1"] = SimpleNamespace(pid=11, execution_path="claude-code-cli")
+        sm.sessions["s-2"] = SimpleNamespace(pid=None, execution_path="claude-code-cli")
+        sm.pty_sessions["t-1"] = SimpleNamespace(pid=12, execution_path="codex-cli")
+        sm.app_servers.servers["a-1"] = SimpleNamespace(proc=SimpleNamespace(pid=13))
+        sm._steps["st-1"] = SimpleNamespace(pid=14)
+        units = {(u.pid, u.session_id, u.kind, u.engine) for u in sm.memory_units()}
+        assert units == {(11, "s-1", "session", "claude"), (12, "t-1", "terminal", "codex"),
+                         (13, "", "app", ""), (14, "", "step", "")}
+
+    def test_the_guards_end_marks_the_session(self, sat_config):
+        from types import SimpleNamespace
+
+        sm = SessionManager(sat_config)
+        held = SimpleNamespace()
+        sm.sessions["s-1"] = held
+        sm.mark_ended_for_memory("s-1")
+        sm.mark_ended_for_memory("gone")
+        assert held.ended_for_memory is True
+
+
+class TestACloseInFlightHoldsTheNextStart:
+    """A close of an id still running (a terminal's close is never
+    acknowledged; a headless close may outlast the platform's wait) and a
+    start of the same id arriving behind it: the start waits for the close,
+    so the old close never removes the home the new start just made."""
+
+    SID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+    class _Session:
+        def __init__(self, sid, agent_dir, config, sat_config, ws=None, rows=24, cols=80):
+            self.home = agent_dir / "users" / "alice" / ".claude" / "own" / sid
+            self.open_token, self.pid, self.superseded, self.incarnation = "", 1, False, ""
+
+        async def start(self):
+            self.home.mkdir(parents=True, exist_ok=True)
+
+        async def close(self):
+            await asyncio.sleep(0.2)   # the transcript's last flush, the folder's scan
+            shutil.rmtree(self.home, ignore_errors=True)
+
+    def _engine(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from satellite.sessions import session_manager as sm_mod
+        engine = SimpleNamespace(pty_cls=lambda: self._Session, headless_cls=lambda: self._Session)
+        monkeypatch.setattr(sm_mod, "engine_for", lambda path: engine)
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_opened_behind_its_close(self, sat_config, monkeypatch):
+        self._engine(monkeypatch)
+        sm = SessionManager(sat_config)
+        old = self._Session(self.SID, sat_config.agents_dir / "pa", {}, sat_config)
+        await old.start()
+        sm.pty_sessions[self.SID] = old
+        closing = asyncio.create_task(sm.pty_close({"session_id": self.SID}))
+        await asyncio.sleep(0)
+        ws = _CapturingWS()
+        await sm.pty_open({"session_id": self.SID, "command_id": "c", "agent_slug": "pa", "config": {},
+                           "execution_path": "claude-code-cli"}, ws)
+        await closing
+        assert ws.sent[-1]["status"] == "ok"
+        assert old.home.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_a_session_started_behind_its_close(self, sat_config, monkeypatch):
+        self._engine(monkeypatch)
+        sm = SessionManager(sat_config)
+        old = self._Session(self.SID, sat_config.agents_dir / "pa", {}, sat_config)
+        await old.start()
+        sm.sessions[self.SID] = old
+        closing = asyncio.create_task(sm.close_session({"session_id": self.SID, "command_id": "x"},
+                                                       _CapturingWS()))
+        await asyncio.sleep(0)
+        ws = _CapturingWS()
+        await sm.start_session({"session_id": self.SID, "command_id": "c", "agent_slug": "pa", "config": {},
+                                "execution_path": "claude-code-cli"}, ws)
+        await closing
+        assert ws.sent[0]["status"] == "ok", ws.sent
+        assert old.home.is_dir()

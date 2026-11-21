@@ -170,10 +170,11 @@ class TestPrincipal:
         assert u is not None and not u.is_external and u.external_claim == ""
 
     @pytest.mark.asyncio
-    async def test_malformed_claim_is_ignored(self, temp_db):
+    async def test_malformed_claim_refuses_the_token(self, temp_db):
+        """A damaged identity claim names nobody: never a demotion to the
+        no-user principal."""
         token = live_session_token(str(uuid.uuid4()), "support", external="phone:not a number")
-        u = await get_current_user(_request_with_bearer(token))
-        assert u is not None and not u.is_external and u.external_claim == ""
+        assert await get_current_user(_request_with_bearer(token)) is None
 
     def test_property_shapes(self):
         ext = UserContext(sub="session:abc", email="", name="", role="agent",

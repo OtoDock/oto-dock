@@ -4,6 +4,7 @@ engines; the interceptor wrap takes the same isolation flag. The scripts
 are stdlib-only, so isolated mode runs them. Satellites are unchanged.
 """
 
+import re
 import sys
 
 from tests._paths import PROXY_DIR
@@ -35,7 +36,8 @@ def test_claude_hooks_run_python3_isolated_quoting_the_script():
     from core.sandbox.session_config_dir import sandbox_python
     for c in cmds:
         assert c.startswith(f'{sandbox_python()} -I "/users/alice/.claude/')
-        assert c.endswith('.py"')
+        # The script quoted; the start hook names its part after it.
+        assert c.endswith('.py"') or re.search(r'start_context\.py" \d+ \d+$', c)
     assert any("permission_gate.py" in c for c in cmds)
 
 

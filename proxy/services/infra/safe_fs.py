@@ -53,7 +53,7 @@ import shutil
 import stat
 import sys
 from collections.abc import Callable, Generator, Iterable, Iterator
-from typing import BinaryIO, cast
+from typing import BinaryIO, NamedTuple, cast
 
 __all__ = [
     "SafeFsError", "UnsafePathError", "SymlinkRefused", "EscapeRefused",
@@ -100,7 +100,7 @@ class FileTooLarge(SafeFsError):
 
 class TooManyEntries(SafeFsError):
     """A copy would pass the caller's cap on the number of entries (files,
-    directories and links)."""
+    directories and links), or one folder's listing would pass a walk's cap."""
 
 
 RESOLVE_NO_MAGICLINKS = 0x02
@@ -484,6 +484,33 @@ def lstat_beneath(root, rel) -> os.stat_result:
             os.close(parent)
 
 
+class NameKind(NamedTuple):
+    """What sits at a name, looked at with no link followed: ``kind`` is
+    ``"file"`` (a regular file), ``"dir"``, ``"missing"`` or ``"other"`` (a
+    link, a special file, or a link or a file on the way); ``st`` is the
+    name's own status when it was reached, else None."""
+    kind: str
+    st: os.stat_result | None
+
+    @property
+    def is_file(self) -> bool:
+        return self.kind == "file"
+
+
+def kind_beneath(root, rel) -> NameKind:
+    """The kind of ``rel`` beneath ``root``, never followed and never raising
+    for what sits there: a refusal on the way reads as ``"other"``."""
+    try:
+        st = lstat_beneath(root, rel)
+    except FileNotFoundError:
+        return NameKind("missing", None)
+    except OSError:
+        return NameKind("other", None)
+    if stat.S_ISREG(st.st_mode):
+        return NameKind("file", st)
+    return NameKind("dir" if stat.S_ISDIR(st.st_mode) else "other", st)
+
+
 def readlink_beneath(root, rel) -> str:
     """The target text of the symlink at ``rel`` (never followed)."""
     with open_root(root) as rootfd:
@@ -719,10 +746,14 @@ class WalkStep:
         return f"{self.rel}/{name}" if self.rel else name
 
 
-def _list_dir(fd: int, rel: str) -> WalkStep:
+def _list_dir(fd: int, rel: str, max_entries: int | None = None) -> WalkStep:
     step = WalkStep(rel, fd)
+    seen = 0
     with os.scandir(fd) as it:
         for entry in it:
+            seen += 1
+            if max_entries is not None and seen > max_entries:
+                raise TooManyEntries(errno.EFBIG, "more entries than the listing's cap", rel)
             try:
                 if entry.is_symlink():
                     step.symlinks.append(entry.name)
@@ -740,14 +771,17 @@ def _list_dir(fd: int, rel: str) -> WalkStep:
 
 
 def walk_beneath(root, rel: str = "", *,
-                 onerror: Callable[[OSError], None] | None = None) -> Generator[WalkStep, None, None]:
+                 onerror: Callable[[OSError], None] | None = None,
+                 max_entries: int | None = None) -> Generator[WalkStep, None, None]:
     """``os.walk`` beneath ``root``, top-down, holding one directory handle
     per level (a wide tree cannot run the process out of descriptors). A
     directory is entered from its parent's handle without following: one
     that vanished or was swapped for a link since the listing is skipped;
     any other failure to enter one (a descriptor limit, a directory made
     unreadable) raises, or goes to ``onerror`` and is skipped, so a caller
-    never mistakes a partial walk for a whole one."""
+    never mistakes a partial walk for a whole one. ``max_entries`` bounds one
+    folder's listing as it is read: a wider folder raises ``TooManyEntries``
+    before its names are held or sorted."""
     with open_root(root) as rootfd:
         pending: int | None = _open_parts(rootfd, _components(rel), _DIR_LIST)
     here = rel
@@ -757,7 +791,7 @@ def walk_beneath(root, rel: str = "", *,
             if pending is not None:
                 fd, pending = pending, None
                 stack.append((fd, here, iter(())))
-                step = _list_dir(fd, here)
+                step = _list_dir(fd, here, max_entries)
                 try:
                     yield step
                 finally:
@@ -1018,6 +1052,31 @@ def unlink_beneath(root, rel, *, missing_ok: bool = False) -> None:
         except FileNotFoundError:
             if not missing_ok:
                 raise
+        finally:
+            os.close(parent)
+
+
+def rmdir_beneath(root, rel, *, missing_ok: bool = False) -> None:
+    """Remove the EMPTY directory at ``rel`` with ``rmdir`` from its
+    parent's handle: a symlink in its place is refused, a directory that is
+    not empty stays (``OSError`` ENOTEMPTY)."""
+    with open_root(root) as rootfd:
+        try:
+            parent, name = _leaf(rootfd, rel)
+        except FileNotFoundError:
+            if missing_ok:
+                return
+            raise
+        try:
+            try:
+                st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                if missing_ok:
+                    return
+                raise
+            if stat.S_ISLNK(st.st_mode):
+                raise SymlinkRefused(errno.ELOOP, "symlink refused", os.fspath(rel))
+            os.rmdir(name, dir_fd=parent)
         finally:
             os.close(parent)
 

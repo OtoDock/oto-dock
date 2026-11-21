@@ -26,7 +26,16 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from api.remote import chat_placement as _chat_placement
+from api.remote import (
+    chat_placement as _chat_placement,
+    compute_machines as _compute_machines,
+)
+from api.remote.machine_update import (
+    UpdateRefused,
+    machine_update_state,
+    update_refusal,
+)
+from auth import lan_check
 from auth.providers import (
     UserContext,
     get_current_user,
@@ -35,10 +44,19 @@ from auth.providers import (
 )
 from core import host_os, placement
 from core.background import spawn
+from core.config import deployment
+from services.remote import machine_away, tools_ahead
 from services.remote.remote_status import get_live_machine_status
 from storage import remote_store
 from storage.agents import agent_store
 from storage.pg import run_db
+
+
+def _refuse_compute_row(machine: dict) -> None:
+    """A route that checks the row's scope before the store does: a compute
+    machine answers with its own sentence, never another machine's."""
+    if placement.machine_is_compute(machine):
+        raise remote_store.ComputeMachineRefused(remote_store.COMPUTE_SETTING_REFUSED)
 
 
 def _merge_live_status(machine: dict) -> dict:
@@ -60,24 +78,28 @@ def _merge_live_status(machine: dict) -> dict:
     machine["link_error"] = live["link_error"]
     if live["last_seen_iso"]:
         machine["last_seen"] = live["last_seen_iso"]
+    machine["tools_ahead"] = tools_ahead.card(machine["id"])  # what its card says is installing
+    from core.remote.satellite_connection import get_connection_manager
+    machine["update_state"] = machine_update_state(
+        machine["id"], machine, get_connection_manager().get_connection(machine["id"]))
     return machine
 
 logger = logging.getLogger("otodock.remote-machines")
 router = APIRouter()
 # Where a chat runs and its move (api/remote/chat_placement.py).
 router.include_router(_chat_placement.router)
+# A compute machine, registered with no owner (api/remote/compute_machines.py).
+router.include_router(_compute_machines.router)
 
 
-def _cli_pins_by_binary(satellite_version: str = "") -> dict[str, str]:
+def _cli_pins_by_binary() -> dict[str, str]:
     """``{binary: pinned version}`` for every engine with a CLI — the machine
     cards judge ``capabilities.cli_status`` (keyed by binary name) against
     these: the pin the machine's satellite was sent (``_cli_pins`` in the
-    satellite socket), so a machine kept on an older CLI until its satellite
-    updates is not shown out of step. Read at call time, never frozen at
-    import."""
+    satellite socket). Read at call time, never frozen at import."""
     from core.session.session_manager import get_all_layers
     return {
-        layer.capabilities.runtime.binary: layer.pinned_cli_version_for(satellite_version)
+        layer.capabilities.runtime.binary: layer.pinned_cli_version()
         for layer in get_all_layers().values()
         if layer.capabilities.runtime.binary
     }
@@ -100,6 +122,7 @@ def _kick_presync(machine_id: str, agent_slug: str) -> None:
             )
 
     spawn(_run(), name="enable_presync", owner="remote_machines")
+    tools_ahead.after_assignment(machine_id)  # and the agent's tools, a minute later
 
 
 # --- Satellite installer assets ---
@@ -124,7 +147,7 @@ _TARBALL_CACHE: dict = {"bytes": b"", "built_at": 0.0, "sha256": ""}
 # (see `if p.exists()` below), so bin/otodock.ico absent in a dev checkout
 # is harmless.
 _TARBALL_EXTRAS = (
-    "requirements.txt",
+    "requirements.txt", "requirements-exit.txt",  # the second: the credential exit's, best effort on a computer
     "uninstall.sh",       # Linux/macOS
     "uninstall.ps1",      # Windows
     "runner.ps1",         # Windows logon-task entry point + auto-update swap
@@ -185,7 +208,7 @@ def _build_satellite_tarball() -> bytes:
         $SATELLITE_DIR/
             satellite/__init__.py, __main__.py, config.py
             satellite/transport/…, sessions/…, terminal/…, host/…, _vendored/…
-            requirements.txt
+            requirements.txt, requirements-exit.txt
             uninstall.sh, uninstall.ps1, runner.ps1
             bin/otodock.ico, bin/README.md
 
@@ -285,11 +308,12 @@ async def serve_bootstrap(request: Request):
         bash <(curl -sL -H "X-Pairing-Token: <tok>" \\
             https://<platform>/v1/satellite/bootstrap?os=linux)
 
-        # Windows:
-        powershell -ExecutionPolicy Bypass -Command "& { $r = iwr \\
+        # Windows (the bootstrap is saved to a file and run as one; see
+        # _build_install_commands for the exact command):
+        powershell -ExecutionPolicy Bypass -Command "& { iwr \\
             -Headers @{'X-Pairing-Token'='<tok>'} \\
-            'https://<platform>/v1/satellite/bootstrap?os=windows'; \\
-            iex $r.Content }"
+            'https://<platform>/v1/satellite/bootstrap?os=windows' \\
+            -OutFile <temp>\\otodock-pair.ps1; & <temp>\\otodock-pair.ps1 }"
     """
     _require_satellite_source()
     token = request.headers.get("X-Pairing-Token", "").strip()
@@ -311,33 +335,25 @@ async def serve_bootstrap(request: Request):
             detail=f"Unsupported os: {os_hint!r}. Expected linux, macos, or windows.",
         )
 
+    # A compute machine's token gets its own install script and nothing is
+    # exchanged here: the script exchanges after its checks.
+    row = await run_db(remote_store.pairing_row, token)
+    if row and row["pairing_scope"] == placement.PAIRING_COMPUTE:
+        return await _compute_machines.bootstrap_response(row["id"], token, family, row["expired"])
+
     # Atomic exchange: validates token, returns machine_secret, clears
     # the pairing token from the DB (one-time use). Failure modes:
     # invalid token, expired token, already-exchanged token.
-    def _exchange() -> tuple[str, str] | None:
-        import hashlib as _h
-        token_hash = _h.sha256(token.encode()).hexdigest()
-        with __import__("storage.pg", fromlist=["get_conn"]).get_conn() as conn:
-            row = conn.execute(
-                "SELECT id FROM remote_machines WHERE pairing_token_hash = %s",
-                (token_hash,),
-            ).fetchone()
-        if not row:
-            return None
-        return row["id"], remote_store.exchange_pairing_token(
-            machine_id=row["id"], pairing_token=token,
-        )
-
-    try:
-        exchanged = await run_db(_exchange)
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e)) from e
-    if not exchanged:
+    if not row:
         raise HTTPException(
             status_code=401,
             detail="Invalid or already-exchanged pairing token",
         )
-    machine_id, machine_secret = exchanged
+    try:
+        machine_secret = await run_db(remote_store.exchange_pairing_token, machine_id=row["id"], pairing_token=token)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
+    machine_id = row["id"]
 
     import config as _cfg
     public_host = _cfg.get_platform_public_url()
@@ -349,7 +365,8 @@ async def serve_bootstrap(request: Request):
                 "it before satellites can pair."
             ),
         )
-    platform_url = f"wss://{public_host}/v1/satellite"
+    _, ws_scheme = deployment.link_schemes()
+    platform_url = f"{ws_scheme}://{public_host}/v1/satellite"
 
     body = await __import__("asyncio").to_thread(
         _build_bootstrap_script,
@@ -363,7 +380,7 @@ async def serve_bootstrap(request: Request):
     return Response(
         content=body,
         media_type=media_type,
-        headers={"Cache-Control": "no-cache"},
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -507,10 +524,9 @@ def _build_install_commands(
 
     ``bash <(curl ...)`` (process substitution) keeps the script's stdin
     connected to the terminal — essential for ``sudo -v`` prompts inside
-    install.sh. ``iex $r.Content`` is the PowerShell idiom for
-    ``curl | bash``.
+    install.sh. Windows saves the bootstrap to a file and runs the file.
     """
-    bootstrap_url = f"https://{public_host}/v1/satellite/bootstrap"
+    bootstrap_url = deployment.bootstrap_url(public_host)
     bash_cmd = (
         f'bash <(curl -sL -H "X-Pairing-Token: {pairing_token}" '
         f'"{bootstrap_url}?os=linux")'
@@ -519,15 +535,19 @@ def _build_install_commands(
     # this invocation only. Runs in a NORMAL (non-admin) PowerShell — the
     # per-user install registers a logon Scheduled Task, no service/HKLM.
     #
-    # We use the parenthesized `iex (iwr ...).Content` form rather than
-    # `$r = iwr ...; iex $r.Content` because when the user pastes the
-    # one-liner into PowerShell, the OUTER shell would expand `$r` to
-    # empty before passing the script to the inner shell, producing
-    # `= iwr ...` and `.Content` errors. No `$` in this form = no
-    # outer-shell interpolation problem.
+    # The bootstrap is saved to a file and run as a file, never `iex`'d:
+    # Windows' antimalware scan (AMSI) reads every command line before it
+    # runs and refuses the download-and-run shape (`iex (iwr ...).Content`)
+    # as a download cradle, whatever the fetched script holds. The script
+    # itself is scanned when the file runs, as it always was.
+    #
+    # No `$` anywhere: when the user pastes the one-liner into PowerShell,
+    # the OUTER shell would expand a variable to empty before the inner
+    # shell sees it. The temp folder is read from .NET instead, twice.
+    ps_script = "(Join-Path ([IO.Path]::GetTempPath()) 'otodock-pair.ps1')"
     ps_inner = (
-        f"iex (iwr -Headers @{{'X-Pairing-Token'='{pairing_token}'}} "
-        f"'{bootstrap_url}?os=windows').Content"
+        f"iwr -Headers @{{'X-Pairing-Token'='{pairing_token}'}} "
+        f"'{bootstrap_url}?os=windows' -OutFile {ps_script}; & {ps_script}"
     )
     windows_cmd = (
         f'powershell -ExecutionPolicy Bypass -Command "& {{ {ps_inner} }}"'
@@ -550,9 +570,9 @@ def _build_powershell_header(
     # IMPORTANT: large payloads (tarball, baseline) go into PowerShell
     # *script variables*, NOT $env:* — Windows enforces a 32,767-char
     # per-environment-variable limit, and our tarball is ~480 KB base64.
-    # Script vars (the bootstrap is `iex`-evaluated as one big script,
-    # so vars set in this header are visible to install.ps1 below) are
-    # RAM-bound with no such limit.
+    # Script vars (the bootstrap runs as one script file, so vars set in
+    # this header are visible to install.ps1 below) are RAM-bound with no
+    # such limit.
     def _esc(v: str) -> str:
         return v.replace("'", "''")
 
@@ -565,7 +585,7 @@ def _build_powershell_header(
     )
     return (
         "# Auto-generated by /v1/satellite/bootstrap?os=windows.\n"
-        "# Do not edit — runs via `iex` in a normal (non-admin) PowerShell.\n"
+        "# Do not edit -- runs as a saved script in a normal (non-admin) PowerShell.\n"
         "Set-StrictMode -Version Latest\n"
         "$ErrorActionPreference = 'Stop'\n"
         "\n"
@@ -578,7 +598,7 @@ def _build_powershell_header(
         "\n"
         # Large payloads — script variables, NOT $env:*. install.ps1
         # reads `$BASELINE_TOOLS_B64` / `$SATELLITE_TARBALL_B64` from
-        # the parent scope (same iex'd script).\n"
+        # the parent scope (the same script file).\n"
         f"$BASELINE_TOOLS_B64 = '{baseline_b64}'\n"
         f"$SATELLITE_TARBALL_B64 = '{tarball_b64}'\n"
         "\n"
@@ -737,16 +757,40 @@ async def list_machines(user: UserContext | None = Depends(get_current_user)):
     # Per-machine (not top-level): the dashboard's useRemoteMachines hook
     # returns data.machines and would drop an envelope key. Lets the cards
     # judge capabilities.cli_status against the platform's pinned versions.
+    from core import concurrency, drain
+    from services.remote import compute_bootstrap, compute_pairing
+    from storage import compute_store
+    boxes = {b["machine_id"]: b for b in concurrency.compute_stats()}
+    holding = drain.holding()
+    own = await run_db(compute_bootstrap.own_machine_id)
+    pairing = await run_db(compute_store.pairing_states)
     for m in machines:
         try:
             m["capabilities"] = json.loads(m.get("capabilities", "{}") or "{}")
         except (json.JSONDecodeError, TypeError):
             m["capabilities"] = {}
+        if placement.machine_is_compute(m):
+            # The sessions it holds a slot for, its memory as admission
+            # reads it, and whether new work waits (the page's Compute card
+            # reads them).
+            box = boxes.get(m["id"]) or {}
+            m["compute"] = {
+                "own": bool(own) and m["id"] == own,
+                "sessions": box.get("sessions", 0),
+                "memory": ({k: box[k] for k in ("total_mb", "available_mb", "reserved_mb", "capped")}
+                           if box.get("reported") else None),
+                "holding": holding,
+                **pairing.get(m["id"], {"paired": False, "waiting": False}),
+                "refused_from": compute_pairing.refused_from(m["id"]),
+                # An address a lock cannot hold on; a host that predates this platform's.
+                "shared": bool(m.get("compute_address")) and lan_check.address_is_shared(m["compute_address"]),
+                "host_behind": compute_pairing.host_behind(m["capabilities"]),
+            }
         # device_grants is a TEXT JSON-array column → parse to a list so the
         # dashboard receives string[].
         m["device_grants"] = sorted(placement.parse_device_grants(m.get("device_grants")))
         _shape_browser_fields(m)
-        m["cli_pins"] = _cli_pins_by_binary(str(m.get("satellite_version") or ""))
+        m["cli_pins"] = _cli_pins_by_binary()
         _merge_live_status(m)
     return {"machines": machines}
 
@@ -777,7 +821,7 @@ async def get_machine(
     machine["device_grants"] = sorted(placement.parse_device_grants(machine.get("device_grants")))
     _shape_browser_fields(machine)
     machine["assigned_agents"] = assigned_agents
-    machine["cli_pins"] = _cli_pins_by_binary(str(machine.get("satellite_version") or ""))
+    machine["cli_pins"] = _cli_pins_by_binary()
     _merge_live_status(machine)
     return machine
 
@@ -824,8 +868,27 @@ async def delete_machine(
     machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
-    await _trigger_self_uninstall(machine_id)
+    from services.remote import compute_bootstrap, compute_pairing
+    if await run_db(compute_bootstrap.is_own, machine_id):
+        raise HTTPException(status_code=400, detail="This machine's sign-in is kept by the install itself.")
+    if not placement.machine_is_compute(machine):
+        await _trigger_self_uninstall(machine_id)
+    else:
+        # Its removal empties a server: a person's act. Its sessions close and
+        # its link drops (exit 75 there); its next sign-in finds no row, and a
+        # machine on another server then has its host remove it. A link that
+        # signed in before the delete committed is dropped after it.
+        require_human(u)
+        await compute_bootstrap.unlink(machine_id)
+        from storage import compute_store
+        await run_db(compute_store.record_removal, machine_id)
     await run_db(remote_store.delete_remote_machine, machine_id)
+    tools_ahead.forget(machine_id)
+    machine_away.clear_refused(machine_id)
+    if placement.machine_is_compute(machine):
+        await compute_bootstrap.unlink(machine_id)
+        compute_pairing.forget_refused(machine_id)
+        await run_db(compute_bootstrap.load_addresses)
     owner = machine.get("registered_by") or ""
     if machine.get("pairing_scope") == placement.PAIRING_USER and owner and owner != u.sub:
         await _notify_owner_machine_removed(machine, owner)
@@ -857,14 +920,20 @@ async def self_uninstall_notify(
     telling it to do so.
     """
     def _job() -> str:
-        if remote_store.get_remote_machine(machine_id) is None:
+        row = remote_store.get_remote_machine(machine_id)
+        if row is None:
             return "missing"
+        if placement.machine_is_compute(row):
+            return "platform_machine"
         if not remote_store.verify_machine_secret(machine_id, x_machine_secret):
             return "bad_secret"
         remote_store.delete_remote_machine(machine_id)
         return "deleted"
 
     outcome = await run_db(_job)
+    if outcome == "deleted":
+        tools_ahead.forget(machine_id)
+        machine_away.clear_refused(machine_id)
     if outcome == "missing":
         # Already deleted (or never existed). Return success — the
         # satellite's local cleanup already proceeded; we just confirm
@@ -872,6 +941,8 @@ async def self_uninstall_notify(
         return {"ok": True, "deleted": False}
     if outcome == "bad_secret":
         raise HTTPException(status_code=401, detail="Invalid machine secret")
+    if outcome == "platform_machine":
+        raise HTTPException(status_code=403, detail="A compute machine is removed by an admin.")
     return {"ok": True, "deleted": True}
 
 
@@ -898,9 +969,12 @@ async def sync_mcps_now(
     # hadn't installed it yet. Cost: the satellite installs MCPs that may
     # never be enabled. Acceptable for v1.
     def _job() -> set[str] | None:
-        if not remote_store.get_remote_machine(machine_id):
+        machine = remote_store.get_remote_machine(machine_id)
+        if not machine:
             return None
-        union: set[str] = set()
+        if placement.machine_is_compute(machine):
+            raise HTTPException(status_code=400, detail=remote_store.COMPUTE_SETTING_REFUSED)
+        union: set[str] = set(tools_ahead.desired_for(machine_id, row=machine))  # never what ahead installed
         for slug in remote_store.get_agents_for_machine(machine_id):
             for manifest in mcp_registry.get_visible_mcps_for_agent(slug):
                 union.add(manifest.name)
@@ -912,7 +986,7 @@ async def sync_mcps_now(
 
     result = await mcp_sync.sync_mcps_for_session(
         machine_id, session_id="", agent_assigned_mcps=list(assigned_union),
-        force=False,
+        force=False, remove_unwanted=True,
     )
     return {
         "ok": result.ok,
@@ -1002,7 +1076,8 @@ async def admin_set_all_roles(
 ):
     """Whether every role of the agents whose default place is this ADMIN
     machine runs there (``{enabled}``); off, a role below the owner tier runs
-    on the platform host. A personal machine is its owner's (403). Nothing
+    in the platform's place, on its compute machines. A personal machine is
+    its owner's (403). Nothing
     live: each session's next start reads it."""
     u = require_admin(user)
 
@@ -1010,6 +1085,7 @@ async def admin_set_all_roles(
         machine = remote_store.get_remote_machine(machine_id)
         if not machine:
             raise HTTPException(status_code=404, detail="Machine not found")
+        _refuse_compute_row(machine)
         if not placement.machine_is_admin_paired(machine):
             raise HTTPException(status_code=403, detail=(
                 "This setting is for the machines an admin paired for the platform. "
@@ -1073,6 +1149,7 @@ async def user_set_allow_full_fs(
         machine = remote_store.get_remote_machine(machine_id)
         if not machine:
             raise HTTPException(status_code=404, detail="Machine not found")
+        _refuse_compute_row(machine)
         if machine.get("pairing_scope") != placement.PAIRING_USER:
             raise HTTPException(
                 status_code=403,
@@ -1160,6 +1237,7 @@ async def user_set_device_grants(
         machine = remote_store.get_remote_machine(machine_id)
         if not machine:
             raise HTTPException(status_code=404, detail="Machine not found")
+        _refuse_compute_row(machine)
         if machine.get("pairing_scope") != placement.PAIRING_USER:
             raise HTTPException(
                 status_code=403,
@@ -1227,6 +1305,7 @@ def _browser_machine_for_admin(machine_id: str, user: UserContext | None) -> dic
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
+    _refuse_compute_row(machine)
     if machine.get("pairing_scope") == placement.PAIRING_USER:
         raise HTTPException(
             status_code=403,
@@ -1243,6 +1322,7 @@ def _browser_machine_for_owner(machine_id: str, user: UserContext | None) -> dic
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
+    _refuse_compute_row(machine)
     if machine.get("pairing_scope") != placement.PAIRING_USER:
         raise HTTPException(
             status_code=403,
@@ -1465,7 +1545,8 @@ async def _push_policy_update(machine_id: str) -> None:
     """Notify a connected satellite + refresh warm sessions when this machine's
     policy (``allow_full_fs`` and/or ``device_grants``) changes. Reads the
     CURRENT persisted values, so callers just persist (``set_allow_full_fs`` /
-    ``set_device_grants``) then call this with the machine_id.
+    ``set_device_grants``) then call this with the machine_id. A device grant
+    changes the machine's tools: install ahead runs again.
 
     The satellite caches policy locally for defense-in-depth re-checks; without
     this push the local copy stays stale until the next WS reconnect (where it
@@ -1481,6 +1562,7 @@ async def _push_policy_update(machine_id: str) -> None:
     send stay on it.
     """
     machine = await run_db(remote_store.get_remote_machine, machine_id) or {}
+    tools_ahead.after_assignment(machine_id)
     allow_full_fs = bool(machine.get("allow_full_fs") or False)
     device_grants = sorted(placement.parse_device_grants(machine.get("device_grants")))
     try:
@@ -1516,31 +1598,6 @@ async def _push_policy_update(machine_id: str) -> None:
         )
 
 
-#: The refusal of an update to a machine on a plaintext link, in the words of
-#: the auth path's (``ws/satellite.py``): the satellite takes no code over it.
-_PLAINTEXT_UPDATE_REFUSAL = (
-    "This machine's link is plaintext, so no update is pushed to it: "
-    "re-run the installer there."
-)
-
-
-def _plaintext_link(conn, machine: dict) -> bool:
-    """Whether the machine runs on a plaintext link it opted into
-    (``insecure_transport``): the live connection's capabilities, else the
-    ones it last reported (the row's JSON column)."""
-    if conn is not None:
-        caps = getattr(conn, "capabilities", None) or {}
-    else:
-        caps = machine.get("capabilities") or {}
-        if isinstance(caps, str):
-            import json
-            try:
-                caps = json.loads(caps)
-            except ValueError:
-                caps = {}
-    return isinstance(caps, dict) and bool(caps.get("insecure_transport"))
-
-
 async def _note_online_push(machine_id: str, machine: dict, conn, ack) -> None:
     """Count an online push for the rollback check: at once for a satellite
     that sends no acknowledgement; for one that does, when it comes, or
@@ -1572,14 +1629,14 @@ async def _note_online_push(machine_id: str, machine: dict, conn, ack) -> None:
         )
 
 
-async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
-    """Shared logic for the admin and user "Update now" endpoints.
-    Pushes the tarball if connected, else sets pending_update for next
-    reconnect. A machine on a plaintext link it opted into takes no code
-    over it (the satellite refuses ``update_required``, and the auth path
-    never pushes to it): 409, nothing sent, queued or announced. Caller is
-    responsible for authorization."""
-    _require_satellite_source()
+async def push_update_online(machine_id: str, machine: dict) -> bool:
+    """The update pushed to a connected machine over its socket: the tarball,
+    then the rollback bookkeeping. Same rollback detection and budget as the
+    push at the sign-in: a satellite that comes back below the target is
+    recorded and announced at its next reconnect (``ws/satellite.py``); one
+    that acknowledges is counted once it read the push (in the background:
+    the caller answers now). False when the machine is not connected;
+    ``UpdateRefused`` when it runs the newest version or an update runs."""
     import base64 as _b64
 
     from core.remote.satellite_connection import get_connection_manager
@@ -1590,38 +1647,71 @@ async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
     )
 
     cm = get_connection_manager()
+    conn = cm.get_connection(machine_id) if cm.is_connected(machine_id) else None
+    if conn is None or placement.machine_is_compute(machine):
+        # A compute machine's version is its image's: nothing is pushed to it.
+        return False
+    refused = update_refusal(machine_update_state(machine_id, machine, conn))
+    if refused:
+        raise UpdateRefused(refused)
+    tarball_bytes, expected_sha256 = get_satellite_tarball_with_hash()
+    acks = _version_at_least(str(getattr(conn, "satellite_version", "") or ""),
+                             UPDATE_ACK_SATELLITE_VERSION)
+    ack = cm.expect_update_ack(machine_id) if acks else None
+    # Marked before the first await, so a second press finds it running; the
+    # update no longer waits for an idle moment.
+    cm.links.update_waits(machine_id, "")
+    cm.links.update_sent(machine_id, cast("str", SATELLITE_VERSION_LATEST), conn)
+    try:
+        await conn.enqueue_send({
+            "type": "update_required",
+            "target_version": SATELLITE_VERSION_LATEST,
+            "tarball_b64": _b64.b64encode(tarball_bytes).decode(),
+            "expected_sha256": expected_sha256,
+            "previous_version": machine.get("satellite_version") or "",
+        })
+    except Exception:
+        cm.links.update_sent(machine_id, "")
+        raise
+    if ack is None:
+        await _note_online_push(machine_id, machine, conn, None)
+    else:
+        spawn(_note_online_push(machine_id, machine, conn, ack),
+              name="note_online_push", owner="remote_machines")
+    return True
+
+
+async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
+    """Shared logic for the admin and user "Update now" endpoints.
+    Pushes the tarball if connected (``push_update_online``), else sets
+    pending_update for next reconnect. A press the machine's update state
+    refuses answers 409 with nothing sent, queued or announced: a machine on
+    the newest version, one an update already runs on or is queued for, and
+    one on a plaintext link it opted into (the satellite refuses
+    ``update_required``, and the auth path never pushes to it). Caller is
+    responsible for authorization."""
+    _require_satellite_source()
+    from core.remote.satellite_connection import get_connection_manager
+
+    if placement.machine_is_compute(machine):
+        # Its version is its image's: the one sentence every compute refusal of
+        # a setting or an update carries.
+        raise HTTPException(status_code=400, detail=remote_store.COMPUTE_SETTING_REFUSED)
+    cm = get_connection_manager()
     connected = cm.is_connected(machine_id)
     live = cm.get_connection(machine_id) if connected else None
-    if _plaintext_link(live, machine):
-        raise HTTPException(status_code=409, detail=_PLAINTEXT_UPDATE_REFUSAL)
+    refused = update_refusal(machine_update_state(machine_id, machine, live))
+    if refused:
+        raise HTTPException(status_code=409, detail=refused)
     if connected:
-        tarball_bytes, expected_sha256 = get_satellite_tarball_with_hash()
-        conn = cm.get_connection(machine_id)
-        if conn is not None:
-            acks = _version_at_least(str(getattr(conn, "satellite_version", "") or ""),
-                                     UPDATE_ACK_SATELLITE_VERSION)
-            try:
-                ack = cm.expect_update_ack(machine_id) if acks else None
-                await conn.enqueue_send({
-                    "type": "update_required",
-                    "target_version": SATELLITE_VERSION_LATEST,
-                    "tarball_b64": _b64.b64encode(tarball_bytes).decode(),
-                    "expected_sha256": expected_sha256,
-                    "previous_version": machine.get("satellite_version") or "",
-                })
-                # Same rollback detection + budget as the automatic push: if
-                # the satellite comes back below the target, the next
-                # reconnect records/announces it (ws/satellite.py). One that
-                # acknowledges is counted once it read the push (in the
-                # background: the request answers now).
-                if ack is None:
-                    await _note_online_push(machine_id, machine, conn, None)
-                else:
-                    spawn(_note_online_push(machine_id, machine, conn, ack),
-                          name="note_online_push", owner="remote_machines")
-            except Exception as e:
-                logger.exception("update-now push failed for %s", machine_id[:8])
-                raise HTTPException(status_code=500, detail=str(e)) from e
+        try:
+            pushed = await push_update_online(machine_id, machine)
+        except UpdateRefused as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except Exception as e:
+            logger.exception("update-now push failed for %s", machine_id[:8])
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        if pushed:
             return {"ok": True, "queued": False, "pushed_now": True}
 
     # Offline: set pending_update so the next reconnect triggers the
@@ -1663,6 +1753,8 @@ async def assign_agent(
         machine = remote_store.get_remote_machine(machine_id)
         if not machine:
             raise HTTPException(status_code=404, detail="Machine not found")
+        if placement.machine_is_compute(machine):
+            raise remote_store.ComputeMachineRefused(remote_store.COMPUTE_PLACE_REFUSED)
 
         # Per-user satellite isolation: agent default execution targets must
         # point at admin-paired machines. User-paired machines belong to one
@@ -1849,6 +1941,9 @@ async def delete_my_machine(
     machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
+    if placement.machine_is_compute(machine):
+        raise HTTPException(status_code=403, detail=(
+            "A compute machine is removed from the admin Remote Machines page."))
     if machine.get("pairing_scope") != placement.PAIRING_USER:
         raise HTTPException(
             status_code=403,
@@ -1861,6 +1956,7 @@ async def delete_my_machine(
         raise HTTPException(status_code=403, detail="Not your machine")
     await _trigger_self_uninstall(machine_id)
     await run_db(remote_store.delete_remote_machine, machine_id)
+    tools_ahead.forget(machine_id)
     return {"ok": True}
 
 

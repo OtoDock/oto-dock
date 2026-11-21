@@ -118,7 +118,7 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
     if (sourceType === 'vendor') {
       if (!subscriptionId.trim()) {
         setFormError(scope === 'agent'
-          ? "A vendor source needs one of this agent's subscriptions. Add one in the agent's MCPs. On the MCP, click Subscribe to events for this agent."
+          ? "A vendor source needs one of this agent's subscriptions. Add one in the agent's MCPs, under one of its accounts."
           : 'A vendor source needs one of your subscriptions. Add one in User Settings, Integrations, Connected Accounts.')
         return
       }
@@ -203,7 +203,7 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
             <Field
               label="Subscription"
               info={scope === 'agent'
-                ? "One of this agent's subscriptions. Add one in the agent's MCPs. On the MCP, click Subscribe to events for this agent."
+                ? "One of this agent's subscriptions. Add one in the agent's MCPs, under one of its accounts."
                 : 'One of your personal subscriptions. Add one in User Settings, Integrations, Connected Accounts. Expand the account and click Subscribe to events.'}
               hint={chosenMarkHint(linkableSubs, subscriptionChoice)}
             >
@@ -231,7 +231,7 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
               {!subsQuery.isLoading && linkableSubs.length === 0 && (
                 <p className="text-xs text-status-warning-fg mt-1">
                   {scope === 'agent'
-                    ? "No agent subscriptions yet. Add one in the agent's MCPs. On the MCP, click Subscribe to events for this agent."
+                    ? "No agent subscriptions yet. Add one in the agent's MCPs, under one of its accounts."
                     : 'No personal subscriptions yet. Add one in User Settings, Integrations, Connected Accounts. Expand the account and click Subscribe to events.'}
                 </p>
               )}
@@ -408,7 +408,7 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
         <Field
           label="Vendor subscription"
           info={trigger.scope === 'agent'
-            ? "The agent's subscription this trigger fires from. Add one in the agent's MCPs. On the MCP, click Subscribe to events for this agent."
+            ? "The agent's subscription this trigger fires from. Add one in the agent's MCPs, under one of its accounts."
             : 'The personal subscription this trigger fires from. Add one in User Settings, Integrations, Connected Accounts. Expand the account and click Subscribe to events.'}
           hint={chosenMarkHint(linkableSubs, subscriptionId) ?? 'None means only the generic webhook URL fires it.'}
         >

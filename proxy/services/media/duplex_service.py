@@ -24,7 +24,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from core.session import session_kind
 from storage import database as task_store
 
 if TYPE_CHECKING:
@@ -35,34 +34,15 @@ logger = logging.getLogger("otodock")
 
 def chat_access_denied_reason(chat_id: str, user: UserContext | None) -> str | None:
     """None when ``user`` may drive this chat over a duplex session; else the
-    refusal reason. Both gates, always. Synchronous: call it on the DB
-    executor."""
-    from auth.providers import acting_role_of
-    from core.session.visibility import _task_continue_allowed, can_access_chat
+    refusal reason: may they open it (``can_access_chat``), and may they
+    drive it (``visibility.drive_refusal``, the rule every door asks).
+    Synchronous: call it on the DB executor."""
+    from core.session.visibility import can_access_chat, drive_refusal_for
 
     chat = task_store.get_chat(chat_id)
     if not chat:
         return "Chat not found"
-    if user is None or not can_access_chat(user, chat):
+    # The voice is a person's: a session or the master key speaks for nobody.
+    if user is None or user.acting_sub is None or not can_access_chat(user, chat):
         return "Access denied"
-    if session_kind.is_task_chat_id(chat_id):
-        run = task_store.get_run(session_kind.run_id_of_chat(chat_id))
-        if not run:
-            return "Task run not found"
-        eff_role = acting_role_of(user.sub, run.get("agent") or "")
-        if not _task_continue_allowed(run, effective_role=eff_role, user_sub=user.sub):
-            return "Access denied"
-    from core.session import visibility
-    if visibility.is_shared_chat_owner(chat.get("user_sub")):
-        from core.sandbox.session_config_dir import (
-            AgentStateRefused,
-            refuse_agent_state_below_editor,
-        )
-        agent = chat.get("agent") or ""
-        try:
-            refuse_agent_state_below_editor(
-                visibility.SCOPE_AGENT, user.acting_role(agent),
-                shared_only=visibility.is_shared_only(agent))
-        except AgentStateRefused as e:
-            return str(e)
-    return None
+    return drive_refusal_for(user, chat) or None

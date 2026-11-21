@@ -32,7 +32,8 @@ def test_the_satellite_pull_stream_keeps_its_fields():
         ("machine_id", missing), ("dest_path", missing), ("partial_path", missing),
         ("future", missing), ("hasher", missing), ("rootfd", -1), ("dest_rel", ""),
         ("partial_rel", ""), ("handle", None), ("received_bytes", 0), ("max_bytes", 0),
-        ("expected_hash", ""), ("conn", None), ("started", 0.0), ("first_chunk_at", 0.0),
+        ("expected_hash", ""), ("committed_hash", ""), ("conn", None), ("started", 0.0),
+        ("first_chunk_at", 0.0),
         ("last_chunk_at", 0.0), ("total_chunks", 0), ("ended", False), ("abandoned", False),
         ("in_agents_tree", False), ("progress_cb", None),
     ]
@@ -110,6 +111,6 @@ def test_the_cli_translator_keeps_its_slots():
         "interrupted", "has_emitted_text", "_emitted_note", "_tool_inputs", "_tool_input_names",
         "agents_spawned", "last_turn_context", "_cc_tasks", "_pending_task_creates",
         "_bg_bash_commands", "_foreground_bash", "_in_settle", "ending_emitted", "_limit_notice",
-        "_limit_resets_at", "_limit_window",
+        "_limit_resets_at", "_limit_window", "_refused_sign_in", "_hook_failure_logged",
     )
     assert not hasattr(ClaudeCLIEventTranslator("s"), "__dict__")

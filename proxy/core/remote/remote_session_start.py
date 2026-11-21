@@ -1,11 +1,10 @@
 """Remote session start: capacity, provisioning, sync, spawn (mixin).
 
 ``start_session`` for a satellite target: the capacity pre-check with idle
-eviction, the credential and session-file brokers, the workspace sync and
-MCP install lifecycle behind one install-registry bar, the ``start_session``
-command (or the interactive PTY branch), the subscription bind. The
-pairing-scope isolation helpers (``_machine_sync_role``,
-``_collect_session_files``) live here with their caller. Mixed into
+eviction, the credential broker, the workspace sync and MCP install
+lifecycle behind one install-registry bar, the ``start_session`` command (or
+the interactive PTY branch), the subscription bind. The pairing-scope
+isolation helper (``_machine_sync_role``) lives here with its caller. Mixed into
 RemoteExecutionLayer; split out of remote_execution.py.
 """
 
@@ -20,7 +19,7 @@ from core import placement
 from core.execution_layer import AgentConfig
 from core.remote import tunnel_state
 from core.remote.remote_session_info import RemoteSessionInfo
-from core.session import session_state as _state
+from core.session import session_closing, session_state as _state
 from core.session.session_state import (
     REMOTE_START_MARK_TTL_S,
     _record_session_use,
@@ -30,6 +29,7 @@ from core.session.session_state import (
     register_session_state,
     session_is_held,
 )
+from storage import remote_store
 from storage.pg import run_db
 from ws import wire_events as wire
 
@@ -54,78 +54,13 @@ def _machine_sync_role(
     like a viewer — personal dirs only).
     """
     from storage import database as _db
-    if not machine or placement.machine_is_admin_paired(machine):
+    if not machine or placement.machine_is_admin_paired(machine) or placement.machine_is_compute(machine):
+        # A compute machine is the platform's: every person's sessions run
+        # there, each synced with its own role.
         return session_role
     owner_sub = machine.get("registered_by", "") or ""
     # The owner's row alone — never their platform role (the docstring says why).
     return row_role(_db.get_user_agent_roles(owner_sub) if owner_sub else {}, agent_slug)
-
-
-def _collect_session_files(
-    config: AgentConfig,
-    machine: dict | None,
-    target_username: str | None,
-) -> dict:
-    """Build the per-session secret-FILE map for the session-file broker.
-
-    Two sources, two key shapes:
-      - ``ssh/<key_name>`` — ssh-hosts private keys, materialized under the
-        satellite's session-secrets dir (env: ``OTO_SSH_KEY_DIR``).
-        ADMIN-PAIRED machines only — infra key material never reaches a
-        user-paired satellite, mirroring the agent-scope-credentials rule.
-      - ``/users/{u}/.credentials/…`` / ``/knowledge/.credentials/…`` —
-        OAuth token files for credentials_dir MCPs, keyed by the
-        sandbox-virtual path the MCP's env already points at; the satellite
-        path-translates and lands them inside the agent tree. Delivered to
-        admin-paired machines for any session scope; to user-paired
-        machines ONLY for the owner's own user-scope sessions (exactly
-        what the old persistent `.credentials` sync used to deliver —
-        agent-scope service tokens never land on user hardware).
-    """
-    import base64
-
-    from core.credentials import mcp_broker
-    from core.sandbox.session_config_dir import (
-        collect_authorized_ssh_keys,
-        session_takes_ssh_keys,
-    )
-    from services.oauth import credential_resolver
-
-    admin_paired = placement.machine_is_admin_paired(machine)
-    files: dict[str, mcp_broker.SessionFile] = {}
-
-    if admin_paired and session_takes_ssh_keys(config.security_context):
-        for name, src in collect_authorized_ssh_keys(config.agent_name).items():
-            files[f"ssh/{name}"] = mcp_broker.SessionFile(
-                content_b64=base64.b64encode(src.read_bytes()).decode(),
-            )
-
-    ctx = config.security_context
-    username = getattr(ctx, "username", "") or ""
-    user_sub = getattr(config, "user_sub", "") or ""
-    # Credentials follow the MOUNT scope — the same invariant the config
-    # builders enforce (config_builder passes task_scope=vis.mount_scope):
-    # user-scope sessions resolve the engaging user's accounts under
-    # /users/{u}/.credentials, agent-scope sessions (Shared-only chats,
-    # tasks, phone) resolve the agent's bound SERVICE account under
-    # /knowledge/.credentials. SecurityContext.session_scope IS that mount
-    # scope, so keying on it keeps the delivered file and the MCP's
-    # credentials_dir env pointing at the same path.
-    scope = getattr(ctx, "session_scope", "") or "user"
-    allow_tokens = admin_paired or (
-        scope == "user" and bool(username) and username == (target_username or "")
-    )
-    if allow_tokens:
-        token_files = credential_resolver.collect_oauth_token_files(
-            config.agent_name,
-            user_sub=user_sub,
-            session_scope=scope,
-        )
-        for vpath, content in token_files.items():
-            files[vpath] = mcp_broker.SessionFile(
-                content_b64=base64.b64encode(content).decode(),
-            )
-    return files
 
 
 if TYPE_CHECKING:
@@ -133,6 +68,23 @@ if TYPE_CHECKING:
     from core.remote.remote_host import RemoteLayerHost as _Host
 else:
     _Host = object
+
+
+def compute_placement_of(config: AgentConfig):
+    """The config's placement when it is a compute one (``KIND_COMPUTE`` with
+    its machine), else None."""
+    pl = getattr(config.security_context, "placement", None)
+    if pl is not None and pl.kind == placement.KIND_COMPUTE and pl.machine_id:
+        return pl
+    return None
+
+
+def machine_of_config(config: AgentConfig) -> str:
+    """The machine a config's session runs on: a compute placement's own
+    (the config's target stays ``local``, so no reader of a stored pin
+    learns the id), else the config's target."""
+    pl = compute_placement_of(config)
+    return pl.machine_id if pl is not None else (config.execution_target or "")
 
 
 def placement_refuses(machine_id: str, config: AgentConfig) -> bool:
@@ -206,7 +158,7 @@ async def _tell_tools_installing(chat_id: str, place: str, installing: list[str]
             pin = (chat or {}).get("execution_target")
             if chat is None or (pin and placement.machine_of(pin) != w.machine_id):
                 logger.info("chat %s: moved off %s, no line for its tools", chat_id[:8],
-                            w.machine_id[:8])
+                            placement.log_id(w.machine_id))
                 return
             await _tools_row(chat_id, mcp_sync.finished_sentence(
                 mcp_sync.tool_labels(ok), mcp_sync.tool_labels(failed), place))
@@ -221,28 +173,56 @@ class RemoteSessionStartMixin(_Host):
 
     @staticmethod
     async def _provision_gateway(session_id: str, config: AgentConfig, payload: dict,
-                                 machine_id: str, plan) -> None:
+                                 machine_id: str) -> None:
+        """The session's gateway descriptor, and its vendor tokens and
+        credential exit values pushed to the machine before the spawn frame.
+        A compute machine holds no gateway lease (its sessions' gateway
+        requests ride the tunnel to the platform's gateway) and takes the
+        exit's values alone: ``push_session`` makes that cut."""
         from auth.session_token import validate_session_token
         from core.credentials import mcp_gateway
+        from core.credentials.credential_files import session_account_choices
         from core.remote import mcp_gateway_push
+        from services.oauth.credential_resolver import choice_kw
         creds = mcp_gateway.credentials_of(session_id)
         cli = mcp_gateway.cli_credentials_of(session_id)
-        if not creds and not cli:
+        token_creds = mcp_gateway.token_credentials_of(session_id)
+        exits = mcp_gateway.exit_credentials_of(session_id)
+        envs = mcp_gateway.env_names_of(session_id)
+        accounts = mcp_gateway.accounts_of(session_id)
+        if not creds and not cli and not token_creds and not exits and not envs:
             return
         token = str((payload.get("env") or {}).get("PROXY_API_KEY") or "")
         claims = validate_session_token(token) or {}
         token_hash = mcp_gateway_push.token_hash_of(token) if token else ""
         sec = getattr(config, "security_context", None)
-        try:
-            await asyncio.to_thread(
-                mcp_gateway.write_descriptor, session_id, creds, cli=cli,
+
+        def _write() -> None:
+            # A session taken back after a restart re-resolves its static
+            # values for the identity its credentials resolve in (the agent's
+            # on a chat that runs on the agent's accounts, whatever person the
+            # token names: ``account_context.credential_identity``, the session
+            # build's own answer), for the account the chat chose and only on
+            # the account each tool was built on: the descriptor records all
+            # three.
+            from services.mcp import account_context
+            ident = account_context.credential_identity(
+                config.agent_name, str(claims.get("user_sub") or "") or None,
+                mount_scope=str(getattr(sec, "session_scope", "") or "") if sec else "",
+                role=str(getattr(sec, "role", "") or "") if sec else "")
+            mcp_gateway.write_descriptor(
+                session_id, creds, cli=cli, tokens=token_creds, exits=exits,
                 machine_id=machine_id, token_hash=token_hash, agent=config.agent_name,
-                user_sub=str(claims.get("user_sub") or ""),
-                task_scope=str(getattr(sec, "session_scope", "") or "") if sec else "",
+                user_sub=ident.sub or "", task_scope=ident.scope,
+                person_sub=str(claims.get("user_sub") or ""), envs=envs, accounts=accounts,
+                **choice_kw(session_account_choices(config)),
             )
+
+        try:
+            await asyncio.to_thread(_write)
         except Exception:
             logger.exception("gateway descriptor of %s not written", session_id[:8])
-        if getattr(plan, "gateway_mode", False) and token_hash and creds:
+        if token_hash and (creds or exits):
             try:
                 await mcp_gateway_push.push_session(session_id, machine_id, token_hash)
             except Exception:
@@ -260,17 +240,46 @@ class RemoteSessionStartMixin(_Host):
         registered, or a failed re-warm of a session the layer still holds,
         leaves that session's state alone.
         """
+        await session_closing.wait_closed(session_id)
         held = session_is_held(session_id)
+        if not held:
+            # A new life of the id (a dead record dropped with no close) is
+            # nobody's key turn.
+            from core.session import key_rows
+            key_rows.forget_session(session_id)
         registered: list[bool] = []
         mark_starting(session_id, REMOTE_START_MARK_TTL_S)
         self._spawning.add(session_id)
+        # On its way to the machine: a waiting update is not pushed under it.
+        machine = machine_of_config(config)
+        machine = "" if placement.is_local(machine) else machine
+        if machine:
+            self._cm.links.start_begins(machine)
         try:
             await self._start_session_impl(session_id, config, registered)
-        except BaseException:
+        except BaseException as exc:
             if registered and not held:
-                cleanup_session_permission_state(session_id)
+                # The machine may run the process already: the removal is on
+                # disk before the failure is told, never awaited by a cancel.
+                if isinstance(exc, asyncio.CancelledError):
+                    cleanup_session_permission_state(session_id)
+                else:
+                    await _state.forget_session(session_id)
+            if not held and config.session_home and compute_placement_of(config) is not None:
+                # The platform made the session's home and wrote its sign-in
+                # there. Nothing is bound to it, so no close would find it.
+                from core import file_commit
+                from core.background import spawn
+                from core.sandbox.session_config_dir import drop_unstarted_home
+                drop = file_commit.run_in("session-homes", drop_unstarted_home, session_id, config.session_home)
+                if isinstance(exc, asyncio.CancelledError):
+                    spawn(drop, name="drop_unstarted_home", owner="remote_session_start")
+                else:
+                    await drop
             raise
         finally:
+            if machine:
+                self._cm.links.start_ends(machine)
             self._spawning.discard(session_id)
             clear_starting(session_id)
 
@@ -278,18 +287,26 @@ class RemoteSessionStartMixin(_Host):
         """A start needs the machine connected and its local link answering:
         a machine whose link is down (satellite 0.5.168 reports it) would
         spawn a session whose every hook and MCP call fails, so it is refused
-        with the reason, before anything is evicted for it."""
+        with the reason, before anything is evicted for it. A machine still
+        in its update is away with the update's sentence: its build waited
+        for it before (``machine_away.settled_placement``), so only a start
+        built before the update was sent meets it here."""
+        from services.remote import machine_away
+        if machine_away.finishing_update(machine_id):
+            raise machine_away.MachineAway(machine_away.away_sentence(
+                machine_id, self._cm.satellite_name(machine_id), ""))
         if not self._cm.is_connected(machine_id):
             raise RuntimeError(
-                f"Satellite {machine_id[:8]} is not connected"
+                f"Satellite {placement.log_id(machine_id)} is not connected"
             )
         if self._cm.tunnel_ok(machine_id) is False:
             raise tunnel_state.TunnelDown(tunnel_state.refusal(
-                self._cm.satellite_name(machine_id) or f"The machine {machine_id[:8]}"))
+                self._cm.satellite_name(machine_id) or f"The machine {placement.log_id(machine_id)}"))
 
     async def _start_session_impl(self, session_id: str, config: AgentConfig,
                                   registered: list[bool]) -> None:
-        machine_id = config.execution_target
+        compute = compute_placement_of(config)
+        machine_id = machine_of_config(config)
         if placement.is_local(machine_id):
             raise RuntimeError("RemoteExecutionLayer called with local target")
         # A machine has no mount to mask the agent's CLI state with: below
@@ -300,8 +317,9 @@ class RemoteSessionStartMixin(_Host):
         # use (a shared chat another person placed on their computer, a task's
         # stale machine, an admin machine below the owner tier unless its
         # every-role switch admits the agent's chats). The chat builder names
-        # the place first; this holds every other spawn.
-        if await asyncio.to_thread(placement_refuses, machine_id, config):
+        # the place first; this holds every other spawn. A compute machine
+        # serves the platform's place, which every session may use.
+        if compute is None and await asyncio.to_thread(placement_refuses, machine_id, config):
             raise placement.PlacementRefused(placement.REFUSED_SENTENCE)
 
         self._refuse_unready_machine(machine_id)
@@ -316,11 +334,13 @@ class RemoteSessionStartMixin(_Host):
         # --resume exactly like an idle-reaped one, so a new session beats a
         # hard refusal (operator-requested parity with local eviction,
         # 2026-08-12).
-        if self._cm.machine_at_capacity(machine_id):
+        # A compute machine's sessions are admitted by the platform's memory
+        # gates (``core/concurrency``), never by a session count.
+        if compute is None and self._cm.machine_at_capacity(machine_id):
             await self._evict_idle_on_machine(machine_id)
-        if self._cm.machine_at_capacity(machine_id):
+        if compute is None and self._cm.machine_at_capacity(machine_id):
             raise RuntimeError(
-                f"Remote machine {machine_id[:8]} is at capacity — too many active sessions"
+                f"Remote machine {placement.log_id(machine_id)} is at capacity — too many active sessions"
             )
 
         # The engine this session runs: the config's (set by the builders from
@@ -336,13 +356,12 @@ class RemoteSessionStartMixin(_Host):
         if not _rcaps.runtime.supports_remote_execution:
             raise RuntimeError(f"{_rcaps.display_name} cannot run remotely")
         # The satellite must have said it can run this engine: no frame
-        # reaches a machine whose code cannot dispatch it (a fielded satellite
-        # that reports no ``engines`` runs the two it always has).
+        # reaches a machine whose code cannot dispatch it.
         engines = self._cm.satellite_engines(machine_id)
         if execution_path not in engines:
             raise RuntimeError(
                 f"{_rcaps.display_name} is not available on "
-                f"{self._cm.satellite_name(machine_id) or machine_id[:8]} — its satellite "
+                f"{self._cm.satellite_name(machine_id) or placement.log_id(machine_id)} — its satellite "
                 f"({self._cm.satellite_version(machine_id) or 'unknown version'}) runs "
                 f"{', '.join(sorted(engines)) or 'no engine'}. Update the satellite or "
                 "run this agent on the server."
@@ -355,8 +374,20 @@ class RemoteSessionStartMixin(_Host):
                                token_minted_at=config.token_minted_at)
         registered.append(True)
 
+        # A compute machine reads the platform's folder itself: the engine's
+        # own layer readies the session's files there (the resolve, the
+        # credential file, the MCP copy, the prompt or ``config.toml``) and
+        # plans the spawn the machine renders in its own sandbox.
+        spawn = None
+        if compute is not None:
+            # A tool the session's build left out because this machine has
+            # not built it yet: its install is asked for, never waited for.
+            from services.remote import machine_tools
+            machine_tools.ask(machine_id)
+            spawn = await get_layer_by_path(execution_path).prepare_spawn(session_id, config)
+
         # Build layer-specific config payload for satellite
-        plan = await self._build_start_payload(session_id, config, execution_path)
+        plan = await self._build_start_payload(session_id, config, execution_path, spawn=spawn)
         payload = plan.payload
 
         # Credential broker: provision THIS session's per-MCP secrets so
@@ -368,12 +399,140 @@ class RemoteSessionStartMixin(_Host):
         from core.credentials import mcp_broker
         mcp_broker.provision(session_id, config.mcp_secret_bundles or {})
 
-        # Derive the set of MCP names the engine will try to launch on the
-        # satellite (its adapter reads its own config format). mcp_sync
-        # reconciles this against what's already installed so missing /
-        # out-of-date MCPs are shipped + installed before the CLI starts.
-        assigned_mcps = adapter.mcp_names(payload)
+        # The MCPs the engine launches: what the machine's MCP sync
+        # reconciles against (a paired computer) and the record's set. A
+        # compute machine reads the platform's config, so the plan names
+        # them.
+        assigned_mcps = set(spawn.mcp_names) if spawn is not None else adapter.mcp_names(payload)
+        own_copy = compute is not None and compute.own_copy
+        if spawn is None or own_copy:
+            payload, assigned_mcps = await self._sync_machine_files(
+                session_id, config, machine_id, payload, adapter, assigned_mcps, own_copy=own_copy)
+        if spawn is not None and own_copy:
+            # A compute machine on another host has its own copy: what the
+            # platform prepared for the session goes through the broker
+            # after the tools' sync (``compute_files``).
+            await self._send_prepared_files(session_id, config, spawn, payload)
 
+
+        # Remote interactive: instead of the -p pump (event queue +
+        # start_session + RemoteSessionInfo), register an InteractiveSession
+        # backed by a RemotePtyProcess — it opens a PTY on the satellite
+        # (pty_open) with the SAME `payload` and streams bytes both ways. ALL the
+        # interactive intelligence stays on the proxy (dumb-pipe satellite). The
+        # payload build + MCP/workspace sync above are shared with the -p path.
+        # The satellite's ack (or the PTY open) may take the plan's start
+        # timeout: the starting mark covers it.
+        mark_starting(session_id, plan.start_timeout_s + 60)
+
+        # The credential gateway: the session's descriptor records its
+        # credentialed HTTP MCPs by reference (a re-adoption after a proxy
+        # restart re-provisions exactly that set), and the vendor tokens and
+        # the exit's values are pushed to the machine before the spawn frame
+        # so the first request finds them. A sidecar's token stays here (the
+        # tunnel's forward adds it).
+        await self._provision_gateway(session_id, config, payload, machine_id)
+
+        if config.interactive:
+            await self._start_interactive_remote(
+                session_id, config, execution_path, payload, machine_id,
+                first_prompt_via_argv=_rcaps.runtime.interactive_first_prompt_via_argv,
+                credential_file_delivered=plan.credential_file_delivered,
+                local_file=spawn is not None and not own_copy,
+            )
+            if config.chat_id:
+                await run_db(remote_store.set_chat_compute_machine, config.chat_id,
+                             machine_id if own_copy else "")
+            return
+
+        # Create event queue
+        queue = self._cm.create_session_queue(
+            machine_id, session_id, execution_path
+        )
+
+        # Send start_session command to satellite. The satellite acks AFTER the
+        # session started; the engine's plan says how long that may take (a
+        # Codex session on a local model waits out its MCP warm gate first).
+        try:
+            ack = await self._cm.send_command(machine_id, {
+                "type": "start_session",
+                "session_id": session_id,
+                "agent_slug": config.agent_name,
+                "execution_path": execution_path,
+                "config": payload,
+            }, timeout=plan.start_timeout_s)
+        except Exception:
+            self._cm.remove_session_queue(machine_id, session_id)
+            raise
+        if isinstance(ack, dict) and ack.get("resume_refused"):
+            # The engine refused the session the chat names (a Codex thread,
+            # satellite 0.5.156): a new conversation holds none of the start's
+            # data, and its first turn restores the history.
+            from core.session import start_context
+            start_context.reset(session_id)
+            if config.chat_id:
+                from core.session.history_seed import mark_resume_refused
+                await run_db(mark_resume_refused, config.chat_id)
+
+        # Register session info
+        info = RemoteSessionInfo(
+            session_id=session_id,
+            machine_id=machine_id,
+            agent_name=config.agent_name,
+            execution_path=execution_path,
+            event_queue=queue,
+            use_native_permissions=config.use_native_permissions,
+            allow_full_fs=bool(
+                config.security_context is not None
+                and cast("SecurityContext", config.security_context).placement.allow_full_fs
+            ),
+            model=config.model,
+            mode=config.permission_mode,
+            used_mcps=set(assigned_mcps),
+            fallback_reason=getattr(config, "fallback_reason", None),
+            resume_handle=config.resume_handle,
+            tunnel_port=tunnel_state.payload_port(payload),
+            files_synced=spawn is None or own_copy,
+            compute=spawn is not None,
+            prompt_file=spawn.prompt_file if spawn is not None else "",
+            incarnation=str(ack.get("incarnation") or "") if isinstance(ack, dict) else "",
+        )
+        # The engine's own per-session state (a translator, a router that
+        # consumes the event queue — whatever the engine keeps across turns).
+        adapter.init_session(info, config, self._cm)
+
+        await self._insert_session(info)
+
+        _record_session_use(session_id, client_type=config.client_type, agent=config.agent_name)
+        bound = self._bind_subscription(
+            session_id, config, execution_path, plan.credential_file_delivered,
+            local_file=spawn is not None and not own_copy,
+        )
+        if bound is not None:
+            await asyncio.wrap_future(bound)
+        if config.chat_id:
+            # The chat stays where its engine record lives: this machine when
+            # it keeps its own copy, else not a machine on another host.
+            await run_db(remote_store.set_chat_compute_machine, config.chat_id,
+                         machine_id if own_copy else "")
+
+        logger.info(
+            "Remote session %s started on %s %s (path=%s)",
+            session_id[:8], "compute machine" if spawn is not None else "satellite",
+            placement.log_id(machine_id), execution_path,
+        )
+
+    async def _sync_machine_files(self, session_id: str, config: AgentConfig, machine_id: str,
+                                  payload: dict, adapter, assigned_mcps: set[str], *,
+                                  own_copy: bool = False) -> tuple[dict, set[str]]:
+        """What a paired computer is sent before its session starts: the
+        workspace sync and the MCP install behind one install-registry bar. The payload comes back
+        without the MCPs that failed to install, with the set it launches.
+        A compute machine beside the platform reads its folder itself and
+        gets none of this. One on another host (``own_copy``) gets the sync
+        with the session's own identity and waits for every install: its
+        tool config is the platform's prepared file, which no payload
+        trimming reaches."""
         # Initial workspace sync: push platform-side files (workspace,
         # config/, .claude/, .codex/, users/) to the satellite before the
         # CLI starts so the agent on the satellite sees the same workspace
@@ -389,7 +548,12 @@ class RemoteSessionStartMixin(_Host):
         from storage import database as _db, remote_store as _rs
         target_username: str | None = None
         machine = await run_db(_rs.get_remote_machine, machine_id)
-        if machine and not placement.machine_is_admin_paired(machine):
+        if own_copy:
+            # Any person's session may run on a compute machine: this merge
+            # carries this session's person's folder alone and leaves the
+            # other people's there to theirs (``shared_by_many``).
+            target_username = (getattr(config.security_context, "mount_username", "") or "")
+        elif machine and not placement.machine_is_admin_paired(machine):
             # User-paired (or orphaned-owner) machine. Resolve the owner's
             # username so the sync filter scopes data to that one user;
             # coerce to empty string when the user record has been deleted
@@ -400,37 +564,6 @@ class RemoteSessionStartMixin(_Host):
             target_username = (
                 await run_db(_db.get_username_by_sub, owner_sub) if owner_sub else None
             ) or ""
-        # Session-file broker: provision per-session secret FILES (SSH keys
-        # for ssh-hosts + OAuth token files for credentials_dir MCPs) and
-        # hand the satellite a one-shot capability token. The satellite
-        # fetches over the tunnel BEFORE the CLI spawns, materializes 0600
-        # (ssh keys under its session-secrets dir; token files at their
-        # virtual credentials_dir target inside the agent tree), and wipes
-        # everything at session close. The token rides the payload but never
-        # enters the spawned agent env. Gating lives in
-        # _collect_session_files: SSH keys are admin-paired-only; OAuth
-        # token files reach user-paired machines only for the owner's own
-        # user-scope sessions. `.credentials` is NOT part of the persistent
-        # file sync, so this channel is the ONLY way tokens reach a
-        # satellite disk — transiently, by design.
-        try:
-            session_files = _collect_session_files(
-                config, machine, target_username,
-            )
-            if session_files:
-                mcp_broker.provision_session_files(session_id, session_files)
-                payload["session_files_token"] = mcp_broker.mint_files_token(
-                    session_id,
-                )
-                if any(p.startswith("ssh/") for p in session_files):
-                    # env var → subdir under the satellite's materialized
-                    # session-secrets dir. The satellite resolves and injects.
-                    payload["session_files_env"] = {"OTO_SSH_KEY_DIR": "ssh"}
-        except Exception:
-            logger.exception(
-                "session-file provisioning failed for %s — session "
-                "starts without SSH keys / OAuth token files", session_id[:8],
-            )
 
         # Per-agent role drives the config/ filter — editor and
         # viewer satellite sessions never receive the agent's prompt /
@@ -572,6 +705,7 @@ class RemoteSessionStartMixin(_Host):
                     session_knowledge_rw=bool(getattr(
                         config.security_context, "knowledge_rw", False)),
                     progress_cb=_sync_progress,
+                    shared_by_many=own_copy,
                 )
             except Exception as e:  # noqa: BLE001  # workspace sync spans disk, db and satellite: the session starts anyway
                 logger.warning(
@@ -590,7 +724,7 @@ class RemoteSessionStartMixin(_Host):
                 sync_result = await mcp_sync.sync_mcps_for_session(
                     machine_id, session_id, list(assigned_mcps), also_wanted=lifted,
                     plan_cb=_on_plan, progress_cb=_on_progress,
-                    early_start_s=mcp_sync.early_start_for(config.client_type),
+                    early_start_s=None if own_copy else mcp_sync.early_start_for(config.client_type),
                 )
                 installing = sorted(sync_result.still_installing & set(assigned_mcps))
                 not_failed = sync_result.still_installing | sync_result.not_installed
@@ -599,7 +733,7 @@ class RemoteSessionStartMixin(_Host):
                 if lifted_failed or lifted_cold:
                     logger.info(
                         "sync_mcps: MCP(s) this session does not launch failed on %s: "
-                        "install %s, warm-up %s", machine_id[:8],
+                        "install %s, warm-up %s", placement.log_id(machine_id),
                         {n: sync_result.failed.get(n, "install failed") for n in sorted(lifted_failed)},
                         {n: sync_result.warmup_failed[n] for n in sorted(lifted_cold)},
                     )
@@ -685,99 +819,35 @@ class RemoteSessionStartMixin(_Host):
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 hb_task.cancel()
             await install_registry.unregister(machine_id, config.agent_name)
+        return payload, assigned_mcps
 
-        # Remote interactive: instead of the -p pump (event queue +
-        # start_session + RemoteSessionInfo), register an InteractiveSession
-        # backed by a RemotePtyProcess — it opens a PTY on the satellite
-        # (pty_open) with the SAME `payload` and streams bytes both ways. ALL the
-        # interactive intelligence stays on the proxy (dumb-pipe satellite). The
-        # payload build + MCP/workspace sync above are shared with the -p path.
-        # The satellite's ack (or the PTY open) may take the plan's start
-        # timeout: the starting mark covers it.
-        mark_starting(session_id, plan.start_timeout_s + 60)
-
-        # The credential gateway: the session's descriptor records its
-        # credentialed HTTP MCPs by reference (a re-adoption after a proxy
-        # restart re-provisions exactly that set), and on a machine that
-        # runs the gateway the vendor tokens are pushed before the spawn
-        # frame so the first MCP request finds them; a sidecar's token stays
-        # here (the tunnel's forward adds it).
-        await self._provision_gateway(session_id, config, payload, machine_id, plan)
-
-        if config.interactive:
-            await self._start_interactive_remote(
-                session_id, config, execution_path, payload, machine_id,
-                first_prompt_via_argv=_rcaps.runtime.interactive_first_prompt_via_argv,
-                credential_file_delivered=plan.credential_file_delivered,
-            )
-            return
-
-        # Create event queue
-        queue = self._cm.create_session_queue(
-            machine_id, session_id, execution_path
-        )
-
-        # Send start_session command to satellite. The satellite acks AFTER the
-        # session started; the engine's plan says how long that may take (a
-        # Codex session on a local model waits out its MCP warm gate first).
+    @staticmethod
+    async def _send_prepared_files(session_id: str, config: AgentConfig, spawn, payload: dict) -> None:
+        """A session on a compute machine on another host: the files the
+        platform prepared for it (``compute_files``) ride its start frame,
+        as a paired machine's prompt, login file and tool config do; the
+        machine writes them under its agent folder before the render. The SSH
+        agent's public halves ride the payload, as a paired machine's do."""
+        from core.agent_folder import agent_root
+        from core.remote import compute_files
+        agent_dir = agent_root(config.agent_name)
         try:
-            ack = await self._cm.send_command(machine_id, {
-                "type": "start_session",
-                "session_id": session_id,
-                "agent_slug": config.agent_name,
-                "execution_path": execution_path,
-                "config": payload,
-            }, timeout=plan.start_timeout_s)
-        except Exception:
-            self._cm.remove_session_queue(machine_id, session_id)
-            raise
-        if isinstance(ack, dict) and ack.get("resume_refused") and config.chat_id:
-            # The engine refused the session the chat names (a Codex thread,
-            # satellite 0.5.156): its first turn restores the history.
-            from core.session.history_seed import mark_resume_refused
-            await run_db(mark_resume_refused, config.chat_id)
-
-        # Register session info
-        info = RemoteSessionInfo(
-            session_id=session_id,
-            machine_id=machine_id,
-            agent_name=config.agent_name,
-            execution_path=execution_path,
-            event_queue=queue,
-            use_native_permissions=config.use_native_permissions,
-            allow_full_fs=bool(
-                config.security_context is not None
-                and cast("SecurityContext", config.security_context).placement.allow_full_fs
-            ),
-            model=config.model,
-            mode=config.permission_mode,
-            used_mcps=set(assigned_mcps),
-            fallback_reason=getattr(config, "fallback_reason", None),
-            resume_handle=config.resume_handle,
-            tunnel_port=tunnel_state.payload_port(payload),
-        )
-        # The engine's own per-session state (a translator, a router that
-        # consumes the event queue — whatever the engine keeps across turns).
-        adapter.init_session(info, config, self._cm)
-
-        await self._insert_session(info)
-
-        _record_session_use(session_id, client_type=config.client_type, agent=config.agent_name)
-        bound = self._bind_subscription(
-            session_id, config, execution_path, plan.credential_file_delivered,
-        )
-        if bound is not None:
-            await asyncio.wrap_future(bound)
-
-        logger.info(
-            "Remote session %s started on satellite %s (path=%s)",
-            session_id[:8], machine_id[:8], execution_path,
-        )
+            payload["host_files"] = await asyncio.to_thread(
+                compute_files.collect, agent_dir, spawn.config_dir, spawn.prompt_file, session_id,
+                spawn.sandbox)
+            payload["host_folders"] = await asyncio.to_thread(compute_files.folders, agent_dir, spawn.sandbox)
+        except compute_files.TooMuchToSend as e:
+            raise RuntimeError(f"The session's files are too large to send to the compute machine: {e}") from e
+        if payload.get("ssh_agent") is not None:
+            from core.remote.remote_start_payload import ssh_agent_payload
+            halves = await ssh_agent_payload(config)
+            if halves:
+                payload["ssh_agent"] = halves
 
     @staticmethod
     def _bind_subscription(
         session_id: str, config: AgentConfig, execution_path: str,
-        credential_file_delivered: bool,
+        credential_file_delivered: bool, *, local_file: bool = False,
     ) -> "Future | None":
         """Bind the acquired subscription + register the session's satellite
         credential file for rotation fan-out. Mirrors the local layers' bind at
@@ -786,66 +856,90 @@ class RemoteSessionStartMixin(_Host):
         binding to decrement) and was invisible to the turn-start guard and
         the freshness fan-out. ``credential_file_delivered`` is the payload
         builder's word (``RemoteStartPlan``) that the engine wrote its login
-        into the start payload — the file the satellite now holds."""
+        into the start payload — the file the satellite now holds. A compute
+    session's file (``local_file``) is the platform's own, in the engine's
+    host config dir, rewritten as a local session's is."""
         if not config.subscription_id:
             return None
-        from services.engines.subscription_pool import (
-            bind_session,
-            credential_scope_key,
-        )
+        from services.engines.subscription_pool import bind_session, scope_key_for
         # The binding writer's future: the start awaits it so the row is
         # durable before the session runs.
         bound = bind_session(
             session_id, config.subscription_id,
             layer=execution_path, user_sub=config.subscription_user_sub,
-            scope_key=credential_scope_key(
-                config.execution_target or placement.LOCAL,
-                config.sandbox_host_claude_dir,
-            ),
+            scope_key=scope_key_for(config.execution_target or placement.LOCAL,
+                                    config.sandbox_host_claude_dir, config.session_home),
+            model=config.model or "",
         )
         # The engine's credential-file declaration says where the file lives
         # on the satellite — the scope root the payload builder used + the
         # declared dirname, the same tree the satellite clamps the file to;
         # the builder said whether this session has one to rewrite.
         if not credential_file_delivered:
-            return bound  # env-delivered credentials or an API-key session — nothing to rewrite
+            return bound  # credentials in the session's environment — nothing to rewrite
         from core.session.session_manager import capabilities_for_path
         spec = capabilities_for_path(execution_path).auth.credential_file
         if spec is None:
             return bound
         from core import layout
+        from core.sandbox import session_home
         from services.engines import token_fanout
+        if local_file:
+            token_fanout.register_session_target(
+                session_id,
+                token_fanout.CredentialFileTarget(
+                    layer=execution_path, host_dir=config.session_home or config.sandbox_host_claude_dir,
+                ),
+            )
+            return bound
         mount_username = (
             getattr(config.security_context, "mount_username", "")
             if config.security_context else ""
         )
+        # A session in a home of its own reads the sign-in file there, and
+        # the machine accepts a write to that one folder (``own/<id>``).
+        own = f"/{session_home.relative(session_id)}" if config.session_home else ""
         token_fanout.register_session_target(
             session_id,
             token_fanout.CredentialFileTarget(
                 layer=execution_path,
-                machine_id=config.execution_target,
+                machine_id=machine_of_config(config),
                 agent_name=config.agent_name,
-                dir_relative=f"{layout.scope_root(mount_username)}/{spec.dirname}",
+                dir_relative=f"{layout.scope_root(mount_username)}/{spec.dirname}{own}",
             ),
         )
         return bound
 
-    async def _evict_idle_on_machine(self, machine_id: str) -> int:
+    def idle_count_on_machine(self, machine_id: str) -> int:
+        """How many sessions this proxy holds idle on the machine past the
+        eviction floor's shortest bound (never a turn in flight)."""
+        import config as app_config
+        now = time.monotonic()
+        return sum(1 for i in list(self._sessions.values())
+                   if i.machine_id == machine_id and i.alive and not i.turn_active
+                   and now - i.last_activity >= app_config.SESSION_EVICT_FLOOR_S)
+
+    async def _evict_idle_on_machine(self, machine_id: str, *, short=None, on_close=None) -> int:
         """Capacity twin of the local ``_admit_with_eviction``: a satellite at
         its session ceiling closes its most-idle idle sessions (this proxy's
         view; never a turn in flight) until the cached count shows headroom
-        or nothing evictable remains. Same floor as local —
+        or nothing evictable remains. ``short`` replaces the count as the
+        condition (admission's memory test for a paired machine) and
+        ``on_close`` runs after each close (its credit until the next report). Same floor as local —
         ``min(SESSION_EVICT_FLOOR_S, idle_timeout)`` — so a *just*-parked
-        session isn't sacrificed. Headless sessions only in v1 (evicting a
-        remote interactive PTY kills a terminal someone may be looking at).
-        Best-effort: the satellite's hard capacity check remains the
-        authoritative backstop."""
+        session isn't sacrificed. A terminal goes only after every headless
+        session, when nobody has it open and only its background report keeps
+        it (``interactive_session.held_on_machine``); any other may be one
+        someone is looking at. Best-effort: the satellite's hard capacity
+        check remains the authoritative backstop."""
         import config as app_config
-        floor_age = min(
-            app_config.SESSION_EVICT_FLOOR_S, await _state.cached_idle_timeout(),
-        )
+        idle_timeout = await _state.cached_idle_timeout()
+        floor_age = min(app_config.SESSION_EVICT_FLOOR_S, idle_timeout)
         evicted = 0
-        while self._cm.machine_at_capacity(machine_id):
+        if short is None:
+            def short() -> bool:
+                return self._cm.machine_at_capacity(machine_id)
+        while short():
             now = time.monotonic()
             candidates = [
                 (now - i.last_activity, sid)
@@ -855,17 +949,36 @@ class RemoteSessionStartMixin(_Host):
                 and (now - i.last_activity) >= floor_age
             ]
             if not candidates:
-                break
+                from core.session import interactive_session
+                held = interactive_session.held_on_machine(machine_id, idle_timeout)
+                if held is None:
+                    break
+                logger.info(
+                    "Remote eviction: closing terminal %s on %s (idle %.0fs, only its "
+                    "background report keeps it) to make room for a new spawn",
+                    held.session_id[:8], placement.log_id(machine_id), held.idle_seconds,
+                )
+                # A terminal's close does not debit the cached count. Debited
+                # before the close's awaits: a spawn asking meanwhile sees the
+                # room and ends no second terminal's work.
+                self._cm.debit_reported_session(machine_id)
+                await held.close(reason="evicted_for_capacity")
+                evicted += 1
+                if on_close is not None:
+                    on_close()
+                continue
             idle_s, victim = max(candidates)
             logger.info(
                 "Remote eviction: closing idle session %s on %s (idle %.0fs) "
-                "to make room for a new spawn", victim[:8], machine_id[:8],
+                "to make room for a new spawn", victim[:8], placement.log_id(machine_id),
                 idle_s,
             )
             # close_session debits the cached heartbeat count, so the loop
             # condition observes the reclaimed headroom immediately.
             await self.close_session(victim)
             evicted += 1
+            if on_close is not None:
+                on_close()
         return evicted
 
     async def _start_interactive_remote(
@@ -878,6 +991,7 @@ class RemoteSessionStartMixin(_Host):
         *,
         first_prompt_via_argv: bool,
         credential_file_delivered: bool,
+        local_file: bool = False,
     ) -> None:
         """Remote interactive spawn: register an InteractiveSession whose
         PTY runs on the satellite (``pty_open``), reusing the already-built
@@ -920,16 +1034,18 @@ class RemoteSessionStartMixin(_Host):
             username=(getattr(ctx, "username", "") or ""),
             prompt_in_argv=prompt_in_argv,
             tui_theme=getattr(config, "interactive_theme", "") or "dark",
+            payer=getattr(config, "subscription_user_sub", "") or "",
         )
         # Subscription binding + fan-out target (InteractiveSession.close()
         # releases the seat, mirroring the local interactive branches).
         bound = self._bind_subscription(
             session_id, config, execution_path, credential_file_delivered,
+            local_file=local_file,
         )
         if bound is not None:
             await asyncio.wrap_future(bound)
         logger.info(
             "Remote INTERACTIVE session %s started on satellite %s (path=%s)",
-            session_id[:8], machine_id[:8], execution_path,
+            session_id[:8], placement.log_id(machine_id), execution_path,
         )
 

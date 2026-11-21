@@ -31,6 +31,7 @@ import contextlib
 import json
 import logging
 import threading
+from collections.abc import Mapping
 from typing import Any
 
 import psycopg
@@ -57,6 +58,7 @@ async def execute_builder(
     mcp_name: str,
     agent_name: str,
     user_sub: str = "",
+    account_choices: Mapping[str, str] | None = None,
 ) -> str | None:
     """Invoke a builder block's MCP tool and render its template.
 
@@ -76,6 +78,9 @@ async def execute_builder(
         agent_name: the session's agent — used for ``pick_account`` to
             resolve which bound account answers this MCP.
         user_sub: session's user_sub. Empty string = agent-scope session.
+        account_choices: the chat's choice of account per MCP
+            (``{mcp_name: account_label}``), user scope only: the tool's
+            credential is that account's when the agent's set holds it.
     """
     builder = block.builder
     if builder is None:
@@ -133,7 +138,10 @@ async def execute_builder(
     # added here, since the builder dials the server itself. No-op for
     # infra-credential MCPs (which carry their own auth in the container's
     # env); an MCP the gateway would leave out of a session is skipped.
-    task_scope = "user" if user_sub else "agent"
+    from services.mcp import account_context
+    from services.oauth.credential_resolver import choice_kw
+    task_scope, _person = await asyncio.to_thread(account_context.reader_scope, agent_name, user_sub)
+    chosen = choice_kw(account_choices)
     headers = dict(entry.get("headers") or {})
     # A header-style key's value comes from the values the session bundle
     # carries (``build_session_mcp_config``): the resolver's per-MCP env
@@ -144,7 +152,7 @@ async def execute_builder(
         from services.oauth import credential_resolver
         resolved = await asyncio.to_thread(
             credential_resolver.resolve_credentials,
-            agent_name, user_sub or None, task_scope=task_scope,
+            agent_name, user_sub or None, task_scope=task_scope, **chosen,
         )
         bundle_env = {
             k: v for k, v in resolved.env_by_mcp.get(tool_mcp.name, {}).items()
@@ -158,59 +166,78 @@ async def execute_builder(
         mcp_registry.gateway_entry,
         dict(entry), tool_mcp, srv_key=tool_mcp.server_name or tool_mcp.name,
         user_sub=user_sub or None, agent_name=agent_name, task_scope=task_scope,
-        bundle_env=bundle_env,
+        bundle_env=bundle_env, **chosen,
     )
     if reason:
         logger.warning("builder on '%s': %s — skipped", mcp_name, reason)
         return None
-    if cred is not None:
-        from core.credentials import mcp_gateway
-        res = await asyncio.to_thread(mcp_gateway.resolve_credential, cred)
-        if isinstance(res, mcp_gateway.Refusal):
-            logger.warning("builder on '%s': %s — skipped", mcp_name, res.detail)
+    holding = contextlib.ExitStack()
+    try:
+        proxy_local: bool | None = None
+        if cred is not None:
+            from core.credentials import mcp_gateway
+            res = await asyncio.to_thread(mcp_gateway.resolve_credential, cred)
+            if isinstance(res, mcp_gateway.Refusal):
+                logger.warning("builder on '%s': %s — skipped", mcp_name, res.detail)
+                return None
+            if cred.kind == mcp_gateway.CONTAINER:
+                # The gateway's order: the sign-in first, then a Docker tool
+                # is in use from here to the call's end, woken inside the
+                # builder's own limit when it sleeps.
+                from services.containers import door
+                holding.enter_context(door.hold(tool_mcp))
+                sentence = await door.ready(tool_mcp, budget_s=float(builder.timeout_seconds))
+                if sentence:
+                    logger.warning("builder on '%s': %s — skipped", mcp_name, sentence)
+                    return None
+            if res.header:
+                headers[res.header] = res.value
+            url = f"{res.upstream}{res.path}"
+            proxy_local = res.proxy_local
+        policy = _dial_policy(url, tool_mcp, proxy_local)
+
+        # 4. Substitute ``${ns.key}`` in the args dict — walks strings inside
+        # nested dicts/lists, preserves non-string scalars. Result tokens
+        # aren't available yet (this *is* the call that fills them).
+        try:
+            resolved_args = dynamic_context.substitute_in_json(
+                builder.args, tokens, trigger_payload,
+            )
+        except (TypeError, ValueError) as e:
+            logger.warning(
+                "builder on '%s' arg substitution failed: %s", mcp_name, e,
+            )
             return None
-        headers[res.header] = res.value
-        url = f"{res.upstream}{res.path}"
 
-    # 4. Substitute ``${ns.key}`` in the args dict — walks strings inside
-    # nested dicts/lists, preserves non-string scalars. Result tokens
-    # aren't available yet (this *is* the call that fills them).
-    try:
-        resolved_args = dynamic_context.substitute_in_json(
-            builder.args, tokens, trigger_payload,
-        )
-    except (TypeError, ValueError) as e:
-        logger.warning(
-            "builder on '%s' arg substitution failed: %s", mcp_name, e,
-        )
-        return None
+        # 5. Tool short name = strip ``mcp__<server>__`` prefix. The regex
+        # in ``_parse_builder_block`` already validated the shape, so split
+        # is safe.
+        tool_short = builder.tool.split("__", 2)[2]
 
-    # 5. Tool short name = strip ``mcp__<server>__`` prefix. The regex
-    # in ``_parse_builder_block`` already validated the shape, so split
-    # is safe.
-    tool_short = builder.tool.split("__", 2)[2]
+        # 6. Open the MCP session and call the tool with a hard timeout.
+        # Timeout bounds: 1-30s, enforced at parse time. Phone-call latency
+        # budget needs the lower end (≤5s default) — exceed and the caller
+        # waits while the user listens to silence.
+        try:
+            result_text = await _invoke_quarantined(
+                url, headers, tool_short, resolved_args,
+                timeout=float(builder.timeout_seconds), policy=policy,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "builder on '%s' tool=%s timed out after %ds — skipped",
+                mcp_name, builder.tool, builder.timeout_seconds,
+            )
+            return None
+        except Exception as e:  # noqa: BLE001  # the mcp client raises exception groups and its transport's errors
+            logger.warning(
+                "builder on '%s' tool=%s failed: %s: %s",
+                mcp_name, builder.tool, type(e).__name__, e,
+            )
+            return None
 
-    # 6. Open the MCP session and call the tool with a hard timeout.
-    # Timeout bounds: 1-30s, enforced at parse time. Phone-call latency
-    # budget needs the lower end (≤5s default) — exceed and the caller
-    # waits while the user listens to silence.
-    try:
-        result_text = await _invoke_quarantined(
-            url, headers, tool_short, resolved_args,
-            timeout=float(builder.timeout_seconds),
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "builder on '%s' tool=%s timed out after %ds — skipped",
-            mcp_name, builder.tool, builder.timeout_seconds,
-        )
-        return None
-    except Exception as e:  # noqa: BLE001  # the mcp client raises exception groups and its transport's errors
-        logger.warning(
-            "builder on '%s' tool=%s failed: %s: %s",
-            mcp_name, builder.tool, type(e).__name__, e,
-        )
-        return None
+    finally:
+        holding.close()
 
     if not result_text:
         return None
@@ -251,6 +278,7 @@ async def _invoke_quarantined(
     args: dict[str, Any],
     *,
     timeout: float,
+    policy=None,
 ) -> str:
     """Run one builder invocation on a private event loop in its own thread.
 
@@ -285,7 +313,7 @@ async def _invoke_quarantined(
         try:
             result = asyncio.run(
                 asyncio.wait_for(
-                    _invoke(url, headers, tool_short, args), timeout,
+                    _invoke(url, headers, tool_short, args, policy), timeout,
                 )
             )
         except BaseException as e:  # noqa: BLE001  # a thread target: its exception is handed to the waiting future
@@ -301,8 +329,28 @@ async def _invoke_quarantined(
     return await asyncio.wait_for(outcome, timeout + 5.0)
 
 
+def _dial_policy(url: str, tool_mcp, proxy_local: bool | None):
+    """How the builder's dial is checked: the platform's own sidecar keeps
+    the SDK's client (None), except on a hosted install, where it is dialled
+    only inside the install's tool networks (``docker_tool``); a
+    credentialed vendor is dialled on the gateway's rule
+    (``control_plane``), as the gateway's vendor pool would; any other
+    remote MCP on ``admin_host``. Both are public only on a hosted
+    install."""
+    from urllib.parse import urlsplit
+
+    from core.config import deployment
+    from services.infra import pinned_http
+    if proxy_local is None:
+        host = urlsplit(url).hostname or ""
+        if deployment.is_proxy_local_mcp_host(host, tool_mcp):
+            return pinned_http.tool_policy()
+        return pinned_http.admin_host
+    return pinned_http.tool_policy() if proxy_local else pinned_http.control_plane
+
+
 async def _invoke(
-    url: str, headers: dict[str, str], tool_short: str, args: dict[str, Any],
+    url: str, headers: dict[str, str], tool_short: str, args: dict[str, Any], policy=None,
 ) -> str:
     """Open a streamable-HTTP MCP session and call one tool.
 
@@ -311,8 +359,12 @@ async def _invoke(
     of the result. Errors propagate to the caller (which logs + returns
     None).
     """
+    factory: dict = {}
+    if policy is not None:
+        from services.infra import pinned_http
+        factory["httpx_client_factory"] = pinned_http.mcp_client_factory(policy)
     async with streamablehttp_client(
-        url, headers=headers or None,
+        url, headers=headers or None, **factory,
     ) as (read_stream, write_stream, _get_session_id):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()

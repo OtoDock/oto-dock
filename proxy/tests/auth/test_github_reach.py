@@ -100,6 +100,44 @@ def test_a_call_naming_no_repository_is_refused_unless_it_reads_who_the_account_
     assert "names none" in _judge(SUBSET, _call("list_gists", query="anything")).refusal
 
 
+REVIEW = "pull_request_review_write"
+
+
+@pytest.mark.parametrize("arguments", [
+    {"method": "resolve_thread", "threadId": "PRRT_x"},
+    {"method": "unresolve_thread", "threadId": "PRRT_x"},
+    {"method": "Resolve_Thread", "threadId": "PRRT_x"},
+    {"method": " unresolve_thread "},
+    {"method": "RESOLVE_THREAD"},
+    {"method": "create", "threadId": "PRRT_x"},
+    {"method": "submit_pending", "thread_id": "PRRT_x"},
+    {"method": "delete_pending", "ThreadID": 7},
+    {"method": "create", "threadId": " "},
+    {"method": "resolve_thread", "threadId": ""},
+])
+def test_a_review_thread_is_not_resolved_under_a_list(arguments):
+    """The tool resolves a thread by its id alone and reads no repository
+    for it, so the listed repository the call names beside it says nothing."""
+    refusal = _judge(SUBSET, _call(REVIEW, owner="octo", repo="hello", pullNumber=3, **arguments)).refusal
+    assert refusal == f"{gr._only(SUBSET)} The tool {REVIEW} may not resolve a review thread for it."
+
+
+def test_a_review_is_written_under_a_list_and_a_thread_resolved_with_nothing_chosen():
+    # An engine fills a field it does not use with nothing or with an empty text.
+    for arguments in ({"method": "create", "event": "APPROVE"}, {"method": "submit_pending", "body": "ok"},
+                      {"method": "delete_pending"}, {"method": "create", "threadId": None},
+                      {"method": "create", "threadId": ""}, {"method": "submit_pending", "thread_id": ""}):
+        assert _passes(SUBSET, _call(REVIEW, owner="octo", repo="hello", pullNumber=3, **arguments))
+    # Another tool with such a key is judged by what it names, as before.
+    assert _passes(SUBSET, _call("add_comment_to_pending_review", owner="octo", repo="hello", threadId="x"))
+    # No list: nothing changes. Read only refuses it as it refuses every write.
+    resolve = _call(REVIEW, owner="any", repo="repo", pullNumber=3, method="resolve_thread", threadId="PRRT_x")
+    assert not _judge(gr.reach_of([], False), resolve).refusal
+    assert _passes(READ_ONLY, resolve)
+    assert _judge(READ_ONLY, resolve, writes=lambda _tool: True).refusal \
+        == gr.read_only_sentence(READ_ONLY, f"The tool {REVIEW}")
+
+
 def test_a_search_is_held_to_its_repo_qualifiers():
     assert _passes(SUBSET, _call("search_code", query="foo REPO:octo/hello"))
     for wild in ("foo repo:octo/*", "foo repo:octo/hello,octo/secret", "foo repo:octo"):
@@ -352,6 +390,165 @@ def test_gh_repo_search_api_and_its_environment():
         assert gr.judge_gh(gr.Reach(), argv, []) == ""
 
 
+# What gh sends, by a capture of gh 2.103.3 at a stand-in: the working
+# directory's remote is acme/here, and each source names acme/there.
+HERE = ["https://github.com/acme/here.git"]
+THERE = gr.reach_of(["acme/there"], False)
+HERE_ONLY = gr.reach_of(["acme/here"], False)
+BOTH_LISTED = gr.reach_of(["acme/there", "acme/here"], False)
+ADDRESS = "https://github.com/acme/there"
+
+
+@pytest.mark.parametrize("argv", [
+    ["issue", "list", "--search", "repo:acme/there bug"],
+    ["issue", "list", "-S", "repo:acme/there"],
+    ["pr", "list", "--search", "repo:acme/there"],
+    ["pr", "list", "-S", "repo:acme/there is:open"],
+])
+def test_gh_judges_the_folders_repository_beside_a_search_in_it(argv):
+    """gh adds the repository it works in to the search it sends, so a
+    repository named in the search does not take its place."""
+    assert gr.judge_gh(THERE, argv, HERE) == gr.outside_sentence(THERE, "acme/here")
+    assert gr.judge_gh(BOTH_LISTED, argv, HERE) == ""
+    assert gr.judge_gh(THERE, argv, [], gh_repo="acme/there") == ""
+    assert gr.judge_gh(THERE, [*argv, "-R", "acme/there"], HERE) == ""
+    assert gr.judge_gh(THERE, argv, []).endswith("This gh command names none of them.")
+    assert gr.judge_gh(HERE_ONLY, argv, []) == gr.outside_sentence(HERE_ONLY, "acme/there")
+
+
+@pytest.mark.parametrize("argv", [
+    ["label", "create", ADDRESS],
+    ["release", "view", f"{ADDRESS}/releases/tag/v1"],
+    ["release", "delete-asset", "v1", ADDRESS, "--yes"],
+    ["run", "view", f"{ADDRESS}/actions/runs/5"],
+    ["workflow", "view", f"{ADDRESS}/blob/main/.github/workflows/ci.yml"],
+    ["workflow", "run", ADDRESS],
+    ["cache", "delete", ADDRESS],
+    ["secret", "delete", ADDRESS],
+    ["variable", "get", ADDRESS],
+    ["browse", ADDRESS, "--no-browser"],
+    ["repo", "read-file", f"{ADDRESS}/blob/main/README.md"],
+    ["issue", "transfer", "1", ADDRESS],
+])
+def test_gh_judges_the_folders_repository_beside_an_address_it_does_not_work_in(argv):
+    """An address that is a label's name, a tag, a file or where an issue
+    moves to: gh works in the directory's repository all the same."""
+    assert gr.judge_gh(THERE, argv, HERE) == gr.outside_sentence(THERE, "acme/here")
+    assert gr.judge_gh(BOTH_LISTED, argv, HERE) == ""
+    assert gr.judge_gh(THERE, [*argv, "-R", "acme/there"], HERE) == ""
+    assert gr.judge_gh(THERE, argv, []).endswith("This gh command names none of them.")
+    assert gr.judge_gh(HERE_ONLY, argv, []) == gr.outside_sentence(HERE_ONLY, "acme/there")
+
+
+@pytest.mark.parametrize("argv", [
+    ["issue", "transfer", "1", "acme/there"],
+    ["issue", "transfer", "1", "github.com/acme/there"],
+    ["issue", "transfer", "https://github.com/acme/here/issues/1", "acme/there"],
+    ["label", "clone", "acme/there"],
+    ["label", "clone", "acme/there", "--force"],
+    ["issue", "develop", "1", "--branch-repo", "acme/there", "--name", "b"],
+    ["issue", "develop", "1", f"--branch-repo={ADDRESS}"],
+    ["issue", "close", "1", "--duplicate-of", f"{ADDRESS}/issues/2"],
+])
+def test_gh_judges_a_second_repository_a_command_names(argv):
+    """Where an issue moves to, where labels are copied from, where a linked
+    branch is made and the issue a closed one duplicates: gh reaches that
+    repository beside the one it works in."""
+    here = HERE_ONLY
+    assert gr.judge_gh(here, argv, HERE) == gr.outside_sentence(here, "acme/there")
+    assert gr.judge_gh(here, argv, [], gh_repo="acme/here") == gr.outside_sentence(here, "acme/there")
+    assert gr.judge_gh(BOTH_LISTED, argv, HERE) == ""
+
+
+def test_gh_a_second_repository_without_its_owner_is_refused():
+    here = HERE_ONLY
+    for argv in (["issue", "transfer", "1", "there"], ["label", "clone", "there"],
+                 ["issue", "develop", "1", "--branch-repo", "there"]):
+        assert gr.judge_gh(here, argv, HERE) == (
+            f"{gr._only(here)} there names no owner. Write it as owner/name."), argv
+    assert gr.judge_gh(here, ["issue", "close", "1", "--duplicate-of", "2"], HERE) == ""
+    assert gr.judge_gh(here, ["issue", "close", "1", "--duplicate-of=#2"], HERE) == ""
+
+
+@pytest.mark.parametrize("argv", [
+    ["search", "issues", ADDRESS],
+    ["search", "code", "x", f"{ADDRESS}/blob/main/a.py"],
+    ["search", "prs", f"{ADDRESS}/pull/1", "is:open"],
+])
+def test_gh_search_is_held_to_its_repo_qualifiers_not_an_address(argv):
+    """An address among a search's words is a word to look for, not a
+    repository the search is held to."""
+    assert gr.judge_gh(THERE, argv, HERE).endswith("This gh command names none of them.")
+    assert gr.judge_gh(THERE, [*argv, "repo:acme/there"], HERE) == ""
+    assert gr.judge_gh(THERE, [*argv, "-R", "acme/there"], HERE) == ""
+    assert gr.judge_gh(THERE, [*argv, "repo:acme/here"], HERE) == gr.outside_sentence(THERE, "acme/here")
+
+
+@pytest.mark.parametrize(("argv", "gh_repo"), [
+    (["pr", "view", f"{ADDRESS}/pull/1"], ""),
+    (["pr", "diff", f"{ADDRESS}/pull/1"], ""),
+    (["pr", "comment", f"{ADDRESS}/pull/1", "--body", "hi"], ""),
+    (["pr", "merge", f"{ADDRESS}/pull/1", "--squash"], ""),
+    (["pr", "checkout", f"{ADDRESS}/pull/1"], ""),
+    (["issue", "view", f"{ADDRESS}/issues/1"], ""),
+    (["issue", "close", f"{ADDRESS}/issues/1"], ""),
+    (["issue", "edit", "1", f"{ADDRESS}/issues/2", "--title", "x"], ""),
+    (["issue", "edit", f"{ADDRESS}/issues/2", "1", "--title", "x"], ""),
+    (["issue", "develop", f"{ADDRESS}/issues/1", "--name", "b"], ""),
+    (["issue", "transfer", f"{ADDRESS}/issues/1", f"{ADDRESS}"], ""),
+    (["pr", "list", "-R", "acme/there"], ""),
+    (["pr", "status", "--repo=acme/there"], ""),
+    (["issue", "create", "-R", "acme/there", "--title", "T", "--body", "B"], ""),
+    (["pr", "list"], "acme/there"),
+    (["issue", "list", "--search", "repo:acme/there"], "acme/there"),
+    (["repo", "view", "acme/there"], ""),
+    (["repo", "edit", ADDRESS, "--description", "x"], ""),
+    (["repo", "sync", "--source", "acme/there"], ""),
+    (["repo", "read-file", "README.md", "-R", "acme/there"], ""),
+    (["label", "clone", "acme/there", "-R", "acme/there"], ""),
+    (["release", "view", "v1", "-R", "acme/there"], ""),
+    (["browse", "-R", "acme/there", "--no-browser"], ""),
+    (["api", "repos/{owner}/{repo}/issues"], "acme/there"),
+    (["api", "repos/acme/there/issues"], ""),
+    (["search", "issues", "repo:acme/there", "bug"], ""),
+    (["search", "prs", "--repo", "acme/there", "x"], ""),
+    (["search", "issues", ADDRESS, "repo:acme/there"], ""),
+    (["extension", "install", "https://github.com/acme/there"], ""),
+])
+def test_gh_a_source_gh_works_in_still_replaces_the_folders_repository(argv, gh_repo):
+    """The capture's rows that stay: gh works in the repository these name,
+    in place of the directory's, so the directory's is not judged."""
+    assert gr.judge_gh(THERE, argv, HERE, gh_repo=gh_repo) == ""
+
+
+@pytest.mark.parametrize("argv", [
+    ["issue", "list", "--search", "repo:acme/there"],
+    ["release", "view", f"{ADDRESS}/releases/tag/v1"],
+    ["search", "issues", ADDRESS],
+    ["label", "clone", "there"],
+    ["issue", "transfer", "1", ADDRESS],
+    ["issue", "develop", "1", "--branch-repo", "acme/there"],
+])
+def test_gh_an_agent_with_nothing_chosen_meets_no_change(argv):
+    """No repository chosen: nothing above is judged, and Read only alone
+    judges the verb as before."""
+    for remotes in ([], HERE):
+        assert gr.judge_gh(gr.Reach(), argv, remotes) == ""
+        reading = argv[0] in ("search", "release") or argv[1] == "list"
+        assert gr.judge_gh(READ_ONLY, argv, remotes) == ("" if reading else gr.read_only_sentence(
+            READ_ONLY, "This gh command", "it did not run"))
+
+
+def test_gh_the_folders_repository_alone_where_no_other_is_named():
+    here = HERE_ONLY
+    for argv in (["issue", "list", "--search", "bug"], ["issue", "close", "1", "--duplicate-of", "2"],
+                 ["label", "list", "--search", "repo:acme/there"],
+                 ["pr", "create", "--head", "acme2:feature", "--title", "T", "--body", "B"],
+                 ["repo", "view"], ["repo", "read-file", "README.md"], ["api", "repos/{owner}/{repo}/issues"]):
+        assert gr.judge_gh(here, argv, HERE) == "", argv
+        assert gr.judge_gh(THERE, argv, HERE) == gr.outside_sentence(THERE, "acme/here"), argv
+
+
 def test_gh_under_read_only_runs_reading_commands_alone():
     for argv in (["pr", "list"], ["repo", "view"], ["api", "repos/a/b"], ["api", "-X", "GET", "repos/a/b"],
                  ["search", "code", "x"], ["run", "view", "1"], ["auth", "status"]):
@@ -448,3 +645,107 @@ def test_a_user_scope_session_is_told_who_narrowed_it():
         "This agent may only read on GitHub. Every change (a commit, a push, an issue, a comment, "
         "a merge) is refused.",
     ]
+
+
+# ---------------------------------------------------------------------------
+# One rule for a REST address: gh api asks the request's rule
+# ---------------------------------------------------------------------------
+
+def test_gh_api_asks_the_rule_that_judges_the_request_it_becomes(monkeypatch):
+    """The command check and the exit hold one rule for a REST address under
+    a list (``judge_request``): what the rule refuses for the request, the
+    command check refuses for the command."""
+    reach = gr.reach_of(["acme/app"], False)
+    asked: list[tuple] = []
+    real = gr.judge_request
+
+    def recorded(reach_, method, host, target, **more):
+        asked.append((method, host, target, reach_.read_only))
+        return real(reach_, method, host, target, **more)
+
+    monkeypatch.setattr(gr, "judge_request", recorded)
+    assert gr.judge_gh(reach, ["api", "repos/acme/app/issues"], []) == ""
+    assert gr.judge_gh(reach, ["api", "-X", "POST", "/repos/Acme/App/issues/", "-f", "title=x"], []) == ""
+    assert gr.judge_gh(reach, ["api", "user"], []) == ""
+    assert gr.judge_gh(reach, ["api", "repos/{owner}/{repo}/pulls"], ["https://github.com/acme/app.git"]) == ""
+    assert asked == [("GET", "api.github.com", "/repos/acme/app/issues", False),
+                     ("POST", "api.github.com", "/repos/Acme/App/issues", False),
+                     ("GET", "api.github.com", "/user", False),
+                     ("GET", "api.github.com", "/repos/acme/app/pulls", False)]
+    # The same sentence as the exit's, for the same address.
+    outside = gr.judge_gh(reach, ["api", "repos/other/repo/issues"], [])
+    assert outside == gr.judge_request(reach, "GET", "api.github.com", "/repos/other/repo/issues").refusal
+    assert outside == gr.outside_sentence(reach, "other/repo")
+
+
+def test_gh_api_refuses_what_the_requests_rule_refuses():
+    reach = gr.reach_of(["acme/app"], False)
+    remote = ["https://github.com/acme/app.git"]
+    # A new repository is outside any list, by the address as by gh repo fork.
+    for argv in (["api", "-X", "POST", "repos/acme/app/forks"], ["api", "repos/acme/app/generate", "-f", "name=x"],
+                 ["api", "--method", "POST", "repos/{owner}/{repo}/forks"]):
+        assert "A new repository is outside them." in gr.judge_gh(reach, argv, remote)
+    assert gr.judge_gh(reach, ["api", "repos/acme/app/forks"], remote) == ""
+    # Who the account is, for a read alone.
+    for argv in (["api", "-X", "PATCH", "user", "-f", "bio=x"], ["api", "user", "-f", "bio=x"],
+                 ["api", "-X", "DELETE", "user"]):
+        assert gr.judge_gh(reach, argv, remote).endswith("names none of them.")
+    assert gr.judge_gh(reach, ["api", "-X", "HEAD", "user"], remote) == ""
+    # A change of an issue's sub-issues, by the address as by the tool.
+    for argv in (["api", "-X", "POST", "repos/acme/app/issues/7/sub_issues", "-F", "sub_issue_id=9"],
+                 ["api", "repos/{owner}/{repo}/issues/7/sub_issue", "-X", "DELETE"],
+                 ["api", "--method", "PATCH", "repos/acme/app/issues/7/sub_issues/priority"],
+                 ["api", "repos/acme/app/issues/7/sub_issues", "-f", "sub_issue_id=9"]):
+        assert gr.judge_gh(reach, argv, remote) == f"{gr._only(reach)} {gr.LINKS_REFUSED}"
+    assert gr.judge_gh(reach, ["api", "repos/acme/app/issues/7/sub_issues"], remote) == ""
+    # The issues that block one, and its related issues, by the address too.
+    for argv in (["api", "-X", "POST", "repos/acme/app/issues/7/dependencies/blocked_by", "-F", "issue_id=9"],
+                 ["api", "repos/{owner}/{repo}/issues/7/dependencies/blocked_by/9", "-X", "DELETE"],
+                 ["api", "repos/acme/app/issues/7/relates_to", "-F", "issue_id=9"],
+                 ["api", "--method", "DELETE", "repos/{owner}/{repo}/issues/7/relates_to/9"]):
+        assert gr.judge_gh(reach, argv, remote) == f"{gr._only(reach)} {gr.LINKS_REFUSED}"
+    for argv in (["api", "repos/acme/app/issues/7/dependencies/blocked_by"],
+                 ["api", "repos/{owner}/{repo}/issues/7/relates_to"]):
+        assert gr.judge_gh(reach, argv, remote) == ""
+    # An advisory's temporary fork is a new repository.
+    for argv in (["api", "-X", "POST", "repos/acme/app/security-advisories/GHSA-abcd-1234-efgh/forks"],
+                 ["api", "repos/{owner}/{repo}/security-advisories/GHSA-abcd-1234-efgh/forks", "-f", "x=1"]):
+        assert "A new repository is outside them." in gr.judge_gh(reach, argv, remote)
+    assert gr.judge_gh(reach, ["api", "repos/acme/app/security-advisories/GHSA-abcd-1234-efgh/forks"], remote) == ""
+    assert gr.judge_gh(reach, ["api", "-X", "POST", "repos/acme/app/issues/7/labels"], remote) == ""
+    # An empty segment.
+    assert gr.judge_gh(reach, ["api", "repos/acme/app//issues"], remote) == gr.PATH_REFUSED
+    assert gr.judge_gh(reach, ["api", "repos/{owner}/{repo}//issues"], remote) == gr.PATH_REFUSED
+    # Under read only the command check's own rule still comes first.
+    both = gr.reach_of(["acme/app"], True)
+    assert gr.judge_gh(both, ["api", "-X", "POST", "repos/acme/app/forks"], remote) \
+        == gr.read_only_sentence(both, "This gh command", "it did not run")
+    assert gr.judge_gh(both, ["api", "repos/acme/app/forks"], remote) == ""
+
+
+@pytest.mark.parametrize("argv", [
+    ["api", "/"],
+    ["api", ""],
+    ["api", "search/issues?q=repo:acme/app+bug"],
+    ["api", "-X", "GET", "search/issues", "-f", "q=repo:acme/app bug"],
+    ["api", "repos/acme/app/contents/a%20b.md"],
+    ["api", "https://api.github.com/repos/acme/app/issues"],
+    ["api", "https://uploads.github.com/repos/acme/app/releases/7/assets?name=x"],
+    ["api", "repositories/1/issues"],
+    ["api", "graphql", "-f", "query={viewer{login}}"],
+    ["api", "user/repos"],
+    ["api", "repos/acme"],
+    ["api", "repos/acme/app#x/issues"],
+    ["api", "repos/ac\tme/app/issues"],
+    ["api", "repos/acme/ap\rp/issues"],
+    ["api", "repos/acme\n/app/issues"],
+    ["api", "repos/{owner}/{repo}/issues#x"],
+])
+def test_gh_api_stays_stricter_than_the_exit_where_it_was(argv):
+    """The command check is the only check on a paired macOS or Windows
+    computer, so it takes nothing it refused before: a percent
+    sign, the root, a search, a whole address and every address that is not
+    under ``repos/`` stay refused, also where the exit's rule would let the
+    request go."""
+    reach = gr.reach_of(["acme/app"], False)
+    assert gr.judge_gh(reach, argv, ["https://github.com/acme/app.git"]) != ""

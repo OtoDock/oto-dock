@@ -67,15 +67,36 @@ class TestCodex:
     blob = {"auth_mode": "chatgpt", "tokens": {"id_token": "ID", "access_token": "OLD",
                                               "refresh_token": "RFR", "account_id": "ACC"}}
 
-    def test_api_key_and_local_key_ride_different_variables(self):
-        assert self.layer.subscription_env(_handle("codex-cli", provider="openai",
-                                                   api_key="sk-o")) == {"CODEX_API_KEY": "sk-o"}
+    def test_an_openai_key_rides_as_the_sign_in_file_and_a_local_key_as_a_variable(self):
+        # The file Codex's own ``login --with-api-key`` writes, and no key in
+        # the environment: the app-server ignores one there, so a session
+        # with only the variable never signed in.
+        key_file = {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-o"}
+        env = self.layer.subscription_env(_handle("codex-cli", provider="openai", api_key="sk-o"))
+        assert set(env) == {"_CODEX_AUTH_JSON"}
+        assert json.loads(env["_CODEX_AUTH_JSON"]) == key_file
+        assert self.layer.credential_file_from_env(env) == key_file and env == {}
         env = self.layer.subscription_env(_handle(
             "codex-cli", provider="openai_compatible", auth_type="local_endpoint",
             api_key="k", endpoint_url="http://h:8080/v1"))
-        assert env["_CODEX_LOCAL_API_KEY"] == "k" and "CODEX_API_KEY" not in env
+        # A local server's key is its provider's, never Codex's own sign-in.
+        assert env["_CODEX_LOCAL_API_KEY"] == "k"
+        assert "_CODEX_AUTH_JSON" not in env and "CODEX_API_KEY" not in env
         assert env["_CODEX_ENDPOINT_URL"] == "http://h:8080/v1"
         assert env["_CODEX_ENDPOINT_PROVIDER"] == "openai_compatible"
+
+    def test_a_key_on_a_local_providers_row_is_never_the_openai_sign_in(self):
+        # The admin route accepts ``auth_type=api_key`` on a local provider:
+        # as Codex's sign-in that server's key would be sent to OpenAI.
+        for provider in ("openai_compatible", "ollama"):
+            env = self.layer.subscription_env(_handle("codex-cli", provider=provider, api_key="local-key"))
+            assert "local-key" not in json.dumps(env), provider
+        # A row from before providers were recorded is the vendor's.
+        assert "_CODEX_AUTH_JSON" in self.layer.subscription_env(_handle("codex-cli", api_key="sk-o"))
+
+    def test_a_key_stored_with_a_space_or_a_line_end_is_sent_without_it(self):
+        env = self.layer.subscription_env(_handle("codex-cli", provider="openai", api_key=" sk-o\n"))
+        assert json.loads(env["_CODEX_AUTH_JSON"])["OPENAI_API_KEY"] == "sk-o"
 
     def test_login_rides_as_the_full_auth_json(self):
         env = self.layer.subscription_env(_handle(

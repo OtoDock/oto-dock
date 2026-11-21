@@ -9,11 +9,13 @@ return the right response back to the caller.
 import asyncio
 import base64
 import json
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
 import pytest_asyncio
 
+from satellite.transport import http_tunnel
 from satellite.transport.http_tunnel import LocalTunnelServer
 
 
@@ -83,6 +85,15 @@ def test_cli_credential_hook_is_allowlisted():
     assert _is_allowed_path("/v1/hooks/cli-credential")
     assert not _is_allowed_path("/v1/hooks/cli-credential/x")
     assert not _is_allowed_path("/v1/hooks/cli-credentials")
+
+
+def test_ssh_agent_hook_is_allowlisted():
+    """The session's SSH agent socket forwards each message to the proxy's
+    signer through the tunnel (0.5.173): the exact path, nothing beside."""
+    from satellite.transport.http_tunnel import _is_allowed_path
+    assert _is_allowed_path("/v1/hooks/ssh-agent")
+    assert not _is_allowed_path("/v1/hooks/ssh-agent/x")
+    assert not _is_allowed_path("/v1/hooks/ssh-agents")
 
 
 def test_audio_tts_generate_is_allowlisted():
@@ -319,6 +330,31 @@ async def test_fail_all_streams_on_reconnect(tunnel_pair):
 
 
 @pytest.mark.asyncio
+async def test_a_request_that_never_left_is_answered_as_never_sent(tunnel_pair):
+    """A request still queued when the link dropped never reached the
+    platform: its caller gets the 503 ``tunnel-not-connected`` of a link
+    that is down, which every hook reads as "never reached" and may send
+    again. One that left gets the 502 it got before."""
+    ws, tunnel, port = tunnel_pair
+
+    async def make_request(path):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"http://127.0.0.1:{port}{path}", json={}) as resp:
+                return resp.status, await resp.json()
+
+    stop = asyncio.create_task(make_request("/v1/hooks/stop"))
+    sent = asyncio.create_task(make_request("/v1/hooks/permission"))
+    for _ in range(200):
+        if len(tunnel._streams) == 2 and len(ws.sent) == 2:
+            break
+        await asyncio.sleep(0.01)
+    queued = next(f["stream_id"] for f in ws.sent if f["path"] == "/v1/hooks/stop")
+    tunnel.fail_all_streams("tunnel-disconnected", unsent={queued})
+    assert await asyncio.wait_for(stop, timeout=5) == (503, {"error": "tunnel-not-connected"})
+    assert await asyncio.wait_for(sent, timeout=5) == (502, {"error": "tunnel-disconnected"})
+
+
+@pytest.mark.asyncio
 async def test_dispatch_response_to_unknown_stream_drops(tunnel_pair):
     """A response with a stream_id we don't track is dropped silently
     (e.g., late arrival after timeout)."""
@@ -456,3 +492,121 @@ def test_checks_routes_are_allowlisted():
     assert _is_allowed_path("/v1/agents/dev/checks")
     assert not _is_allowed_path("/v1/checks")
     assert not _is_allowed_path("/v1/checks/run/../admin")
+
+
+# ── The app servers' own listener (a compute machine alone) ─────────────────
+
+
+@pytest_asyncio.fixture
+async def compute_tunnel():
+    ws = FakeWSClient()
+    ws.config = SimpleNamespace(compute=True)
+    tunnel = LocalTunnelServer(ws)
+    ws.tunnel = tunnel
+    await tunnel.start()
+    yield ws, tunnel
+    await tunnel.stop()
+
+
+async def _answer_first_frame(ws, tunnel, status=200) -> None:
+    """Answer the request frame the listener sent, as the platform would."""
+    for _ in range(200):
+        if ws.sent:
+            break
+        await asyncio.sleep(0.01)
+    tunnel.dispatch_response({"type": "http_response", "stream_id": ws.sent[0]["stream_id"], "status": status,
+                                  "headers": {}, "body_b64": "", "body_eof": True})
+
+
+APP_ID = "00000000-0000-4000-8000-000000000001"
+
+
+@pytest.mark.asyncio
+async def test_a_paired_machine_opens_no_app_listener(tunnel_pair):
+    _ws, tunnel, _port = tunnel_pair
+    assert tunnel.app_port == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["platform/notifications.create", "egress/api.stripe.com/v1/x", "events",
+                                   "bindings/orders/call", "push", "state", "api/x", "actions/press-1"])
+async def test_the_app_listener_carries_an_app_servers_routes(compute_tunnel, route):
+    ws, tunnel = compute_tunnel
+    assert tunnel.app_port > 0
+    async with aiohttp.ClientSession() as session:
+        call = asyncio.create_task(session.post(f"http://127.0.0.1:{tunnel.app_port}/v1/apps/{APP_ID}/{route}", data=b"{}"))
+        await _answer_first_frame(ws, tunnel)
+        resp = await call
+        assert resp.status == 200
+        resp.release()
+    assert ws.sent[0]["via"] == "app"
+    assert ws.sent[0]["path"] == f"/v1/apps/{APP_ID}/{route}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/mcp/file-tools/mcp", "/v1/hooks/permission", "/v1/tasks", "/v1/agents/a",
+                                  "/v1/mcp-gateway/x/y", f"/v1/apps/{APP_ID}/client/abc/", f"/v1/apps/{APP_ID}/ws/x",
+                                  f"/v1/apps/{APP_ID}/actions/batch/extra"])
+async def test_the_app_listener_refuses_every_other_route(compute_tunnel, path):
+    ws, tunnel = compute_tunnel
+    async with aiohttp.ClientSession() as session, \
+            session.post(f"http://127.0.0.1:{tunnel.app_port}{path}") as resp:
+        assert resp.status == 403
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_the_app_listener_forwards_the_raw_path_and_query(compute_tunnel):
+    """The egress route's contract is the path as the server sent it."""
+    ws, tunnel = compute_tunnel
+    raw = f"/v1/apps/{APP_ID}/egress/api.example.com/a%20b%23c?q=1%2B2+3"
+    reader, writer = await asyncio.open_connection("127.0.0.1", tunnel.app_port)
+    writer.write(f"GET {raw} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+    await writer.drain()
+    await _answer_first_frame(ws, tunnel)
+    await reader.read()
+    writer.close()
+    assert ws.sent[0]["path"] == raw
+
+
+@pytest.mark.asyncio
+async def test_the_app_listener_refuses_a_traversal_and_an_encoded_separator(compute_tunnel):
+    ws, tunnel = compute_tunnel
+    for raw in (f"/v1/apps/{APP_ID}/egress/x/../../hooks", f"/v1/apps/{APP_ID}/egress/a%2Fb"):
+        reader, writer = await asyncio.open_connection("127.0.0.1", tunnel.app_port)
+        writer.write(f"GET {raw} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+        await writer.drain()
+        head = await reader.read()
+        writer.close()
+        assert b" 403 " in head.split(b"\r\n")[0]
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_the_app_listener_refuses_a_websocket(compute_tunnel):
+    ws, tunnel = compute_tunnel
+    async with aiohttp.ClientSession() as session, session.get(
+            f"http://127.0.0.1:{tunnel.app_port}/v1/apps/{APP_ID}/platform/ws",
+            headers={"Connection": "Upgrade", "Upgrade": "websocket"}) as resp:
+        assert resp.status == 501
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_the_app_listener_caps_a_body_at_what_an_app_route_takes(compute_tunnel):
+    ws, tunnel = compute_tunnel
+    big = b"x" * (http_tunnel._APP_MAX_BODY + 1024)
+    async with aiohttp.ClientSession() as session, session.post(
+            f"http://127.0.0.1:{tunnel.app_port}/v1/apps/{APP_ID}/platform/x", data=big) as resp:
+        assert resp.status == 413
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_the_app_listener_answers_503_while_the_link_is_down(compute_tunnel):
+    ws, tunnel = compute_tunnel
+    ws._authenticated = False
+    async with aiohttp.ClientSession() as session, session.post(
+            f"http://127.0.0.1:{tunnel.app_port}/v1/apps/{APP_ID}/platform/x", data=b"{}") as resp:
+        assert resp.status == 503
+    assert ws.sent == []

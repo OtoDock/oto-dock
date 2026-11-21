@@ -46,7 +46,7 @@ def applies_without_session(session_id: str, chat_row: dict | None) -> bool:
 
 
 async def run_echo(layer, new_sid: str, old_sid: str, chat_id: str, agent: str,
-                   result_prompt: str, *, person: str) -> str | None:
+                   result_prompt: str, *, person: str, source: str = "") -> str | None:
     """The wake's turn on the started fresh session: "" when it ran, None
     when the chat was busy (the new session is closed; the caller stores the
     wake). ``old_sid`` empty: the chat had no session, and its pending seed
@@ -54,8 +54,10 @@ async def run_echo(layer, new_sid: str, old_sid: str, chat_id: str, agent: str,
     from core.events import input_queue
     from core.events.stream_pump import _active_pumps
     from core.session.history_seed import consume_pending_seed
+    from core.session.session_manager import record_chat_place
     from services.engines import subscription_pool
     from services.scheduler.lanes import _run_echo_turn_pumped
+    from storage import remote_store
     from storage.pg import run_db
 
     q = input_queue.get(chat_id)
@@ -64,12 +66,14 @@ async def run_echo(layer, new_sid: str, old_sid: str, chat_id: str, agent: str,
         if claim is None or _active_pumps.get(chat_id) is not None:
             await _close(layer, new_sid)
             return None
-        seed = wire.SEED_RESUME_FAILED
-        if not old_sid:
-            seed = ((await run_db(task_store.get_chat, chat_id)) or {}).get(
-                "pending_history_seed") or ""
+        row = (await run_db(task_store.get_chat, chat_id)) or {}
+        seed = wire.SEED_RESUME_FAILED if old_sid else (row.get("pending_history_seed") or "")
+        # Where the chat's record was, for the undo: the fresh session's
+        # place replaces it (a wake builds with no chat, so no start wrote it).
+        place_before = str(row.get("compute_machine") or "")
         await run_db(task_store.update_chat, chat_id, session_id=new_sid,
                      codex_thread_id=None, context_used=0, pending_history_seed=seed)
+        await run_db(record_chat_place, chat_id, new_sid)
         if old_sid:
             subscription_pool.release_subscription(old_sid)
         prompt, _notice = await run_db(consume_pending_seed, chat_id, result_prompt)
@@ -77,13 +81,14 @@ async def run_echo(layer, new_sid: str, old_sid: str, chat_id: str, agent: str,
                     "conversation, continued on a fresh session %s",
                     chat_id[:8], old_sid[:8] or "(none)", new_sid[:8])
         out = await _run_echo_turn_pumped(layer, new_sid, chat_id, agent, prompt,
-                                          person=person, claim=claim)
+                                          person=person, claim=claim, source=source)
         if out is None:
             # Not run after all (a starter that takes no claim registered a
             # pump meanwhile): the chat goes back to its own session (or to
             # none), and its next turn restores the history instead.
             await run_db(task_store.update_chat, chat_id, session_id=old_sid or None,
                          pending_history_seed=seed)
+            await run_db(remote_store.set_chat_compute_machine, chat_id, place_before)
             await _close(layer, new_sid)
         return out
     finally:

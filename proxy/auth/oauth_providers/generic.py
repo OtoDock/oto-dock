@@ -79,6 +79,16 @@ def _error_code(payload: dict, status: int) -> str:
     return _ERROR_WORDS.get(word, word)
 
 
+
+def _client(timeout: float) -> httpx.AsyncClient:
+    """The sign-in calls of a manifest's provider (its token, userinfo,
+    revoke and device URLs, which carry the client's secret and the
+    person's tokens): dialled at a checked address (``admin_host``: an
+    identity provider on this machine or the LAN passes, a hosted install
+    reaches public ones only)."""
+    from services.infra import pinned_http
+    return pinned_http.checked_pool(pinned_http.admin_host, timeout=timeout)
+
 class GenericOAuthProvider(OAuthProvider):
     """Manifest-driven OAuth provider.
 
@@ -167,7 +177,7 @@ class GenericOAuthProvider(OAuthProvider):
         }
         if code_verifier:
             data["code_verifier"] = code_verifier
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _client(30) as client:
             resp = await client.post(self.token_url, data=data, headers=_ACCEPT_JSON)
         payload = _token_payload(resp)
         if resp.status_code != 200 or "error" in payload:
@@ -184,7 +194,7 @@ class GenericOAuthProvider(OAuthProvider):
         client_id: str,
         client_secret: str,
     ) -> TokenSet:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _client(30) as client:
             resp = await client.post(
                 self.token_url,
                 data={
@@ -221,7 +231,7 @@ class GenericOAuthProvider(OAuthProvider):
                 else f"Bearer {access_token}"
             ),
         }
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with _client(15) as client:
             if self.userinfo_method == "POST":
                 resp = await client.post(
                     self.userinfo_url, headers=headers, json=self.userinfo_body,
@@ -274,7 +284,7 @@ class GenericOAuthProvider(OAuthProvider):
             )
             return False
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with _client(15) as client:
                 resp = await client.post(
                     self.revoke_url,
                     data={
@@ -315,7 +325,7 @@ class GenericOAuthProvider(OAuthProvider):
         }
         if extra:
             data.update(extra)
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _client(30) as client:
             resp = await client.post(self.device_authorization_url, data=data, headers=_ACCEPT_JSON)
         payload = _token_payload(resp)
         if resp.status_code != 200 or "error" in payload:
@@ -330,7 +340,7 @@ class GenericOAuthProvider(OAuthProvider):
         client_id: str,
         client_secret: str,
     ) -> TokenSet | None:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _client(30) as client:
             resp = await client.post(
                 self.token_url,
                 data={
@@ -373,7 +383,7 @@ class GenericOAuthProvider(OAuthProvider):
             data["scope"] = " ".join(scopes)
         if extra:
             data.update(extra)
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _client(30) as client:
             resp = await client.post(self.token_url, data=data, headers=_ACCEPT_JSON)
         payload = _token_payload(resp)
         if resp.status_code != 200 or "error" in payload:

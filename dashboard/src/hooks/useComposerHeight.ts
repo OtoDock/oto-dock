@@ -9,6 +9,11 @@ export const HEIGHT_TRANSITION = 'height 250ms ease-out'
 /** A press counts for the focus change that follows it this long: on touch
  * the focus moves after `pointerup`, from the compatibility mousedown. */
 const PRESS_FRESH_MS = 1000
+/** A press inside a frame never reaches the page and a mouse moves the focus
+ * at the press: the shrink waits this long so the click lands before the
+ * frame moves under it (a shrink on the next task lost a 30 ms click on a
+ * centred button). */
+export const FRAME_PRESS_MS = 500
 
 /** Height of `rows` lines of the box, from its computed line height (24 px
  * lines on a touch screen, 20 px on a desktop) and padding. */
@@ -34,15 +39,19 @@ type Press = { inside: boolean; onBox: boolean; down: boolean; at: number }
  * two. What counts as leaving, and when the change runs:
  *
  * - Focus moving to a control of the composer's own bar (the region marked
- *   `data-composer-bar`: Send, Dictate, the pickers, the chips) or into an
- *   iframe (an artifact, an app, Collabora) keeps it open, until a later
- *   press or focus elsewhere in the page.
+ *   `data-composer-bar`: Send, Dictate, the pickers, the chips) keeps it
+ *   open, until a later press or focus elsewhere in the page.
  * - A press elsewhere shrinks it on the task after its `pointerup`, so the
  *   click that release produces lands before the history moves under it; a
  *   `pointercancel` (a scroll, a drag) shrinks nothing.
+ * - Focus moving into a frame (an app, an artifact, a document, a video) is
+ *   leaving it too. The page sees only the focus move, never the press, so
+ *   with a fine primary pointer it shrinks FRAME_PRESS_MS later; with a
+ *   coarse one the focus moved after the release and it shrinks on the next
+ *   task. Back in the box or on the bar by then, it stays.
  * - A press on the collapsed box grows it the same way, after the caret has
  *   landed; on touch the focus arrives after the release and it grows at once.
- * - The window losing focus changes nothing.
+ * - The window losing the focus to another window or tab changes nothing.
  *
  * Every other height write (typing, dictation, a draft restored, a send) is
  * instant: `fit` clears the transition first, so the first paint and typing
@@ -51,7 +60,7 @@ type Press = { inside: boolean; onBox: boolean; down: boolean; at: number }
 export function useComposerHeight(
   textareaRef: RefObject<HTMLTextAreaElement | null>,
   rootRef: RefObject<HTMLElement | null>,
-  opts: { animate: boolean; holdOpen: boolean },
+  opts: { animate: boolean; holdOpen: boolean; touchPrimary: boolean },
 ) {
   const expandedRef = useRef(false)
   const optsRef = useRef(opts)
@@ -74,9 +83,9 @@ export function useComposerHeight(
       const p = pressRef.current
       return p && Date.now() - p.at < PRESS_FRESH_MS ? p : null
     }
-    const later = (fn: () => void) => {
+    const later = (fn: () => void, ms = 0) => {
       if (timerRef.current) clearTimeout(timerRef.current)
-      timerRef.current = setTimeout(() => { timerRef.current = null; fn() }, 0)
+      timerRef.current = setTimeout(() => { timerRef.current = null; fn() }, ms)
     }
 
     const fit = () => {
@@ -107,6 +116,12 @@ export function useComposerHeight(
       if (focused() || optsRef.current.holdOpen) return
       setExpanded(false)
     }
+    const leaveForFrame = () => {
+      later(() => {
+        if (inRegion(document.activeElement)) return
+        shrink()
+      }, optsRef.current.touchPrimary ? 0 : FRAME_PRESS_MS)
+    }
 
     return {
       fit,
@@ -120,7 +135,8 @@ export function useComposerHeight(
       onBlur: (e: ReactFocusEvent<HTMLTextAreaElement>) => {
         if (pendingRef.current === 'grow') pendingRef.current = null
         const to = e.relatedTarget
-        if (to && (inRegion(to) || isFrame(to))) return
+        if (isFrame(to)) { leaveForFrame(); return }
+        if (to && inRegion(to)) return
         // A press on a control of the bar keeps it open; a press on the box
         // itself does not (the iOS keyboard's Done right after a tap).
         const p = freshPress()
@@ -128,7 +144,8 @@ export function useComposerHeight(
         if (p?.down) { pendingRef.current = 'shrink'; return }
         later(() => {
           const a = document.activeElement
-          if (a === textareaRef.current || isFrame(a) || inRegion(a)) return
+          if (isFrame(a)) { leaveForFrame(); return }
+          if (a === textareaRef.current || inRegion(a)) return
           shrink()
         })
       },
@@ -140,7 +157,7 @@ export function useComposerHeight(
       onDown: (e: PointerEvent) => {
         const inside = inRegion(e.target)
         pressRef.current = { inside, onBox: e.target === textareaRef.current, down: true, at: Date.now() }
-        if (expandedRef.current && !focused() && !inside && !isFrame(e.target)) pendingRef.current = 'shrink'
+        if (expandedRef.current && !focused() && !inside) pendingRef.current = 'shrink'
       },
       onUp: () => {
         if (pressRef.current) pressRef.current.down = false
@@ -158,13 +175,17 @@ export function useComposerHeight(
       onFocusIn: (e: FocusEvent) => {
         const t = e.target
         if (!expandedRef.current || t === textareaRef.current || pressRef.current?.down) return
-        if (isFrame(t) || inRegion(t)) return
+        if (isFrame(t)) { leaveForFrame(); return }
+        if (inRegion(t)) return
         shrink()
       },
       onWindowBlur: () => {
         if (pressRef.current) pressRef.current.down = false
         if (pendingRef.current === 'grow') grow()
         pendingRef.current = null
+        // The window blurs when the focus goes into a frame, from the box or
+        // from a control of the bar; otherwise another window took it.
+        if (isFrame(document.activeElement)) leaveForFrame()
       },
     }
   }, [textareaRef, rootRef])

@@ -92,14 +92,19 @@ def _add(found: dict[str, Loss], what: str, *, where: str = "", refuse: bool = T
         loss.parts.append(part)
 
 
-def scan(path: str) -> list[Loss]:
+def scan(path: str, held=None) -> list[Loss]:
     """What an edit of the workbook at ``path`` would lose; empty for a
-    file that is not a readable package (the load reports that)."""
-    try:
-        with zipfile.ZipFile(path) as zf:
-            return scan_zip(zf, Path(path).suffix.lower())
-    except (OSError, zipfile.BadZipFile):
-        return []
+    file that is not a readable package (the load reports that). Read from
+    ``held`` when the caller holds the file open, else opened with
+    ``shared.safe_open_read``; the name's suffix says what a save keeps."""
+    import shared
+
+    with shared.reading(path if held is None else held) as fh:
+        try:
+            with zipfile.ZipFile(fh) as zf:
+                return scan_zip(zf, Path(path).suffix.lower())
+        except (OSError, zipfile.BadZipFile):
+            return []
 
 
 def scan_zip(zf: zipfile.ZipFile, ext: str) -> list[Loss]:

@@ -1,0 +1,65 @@
+{
+ "bg_tasks_left": 0,
+ "logged": [
+  [
+   "info",
+   "Shutdown cleanup: marked 2 run(s) and 1 meeting(s) as failed; left 2 recoverable run(s) running"
+  ],
+  [
+   "info",
+   "Shutdown: ended 1 Docker compose run(s)"
+  ],
+  [
+   "info",
+   "Shutdown: cancelled 3 background task(s) still running after 2 s"
+  ],
+  [
+   "info",
+   "Shutdown: the clean stop is recorded, open at the stop: {'turns': 0, 'runs': 0, 'calls': 0, 'duplex': 0, 'meetings': 0, 'terminals': 0, 'moves': 0, 'background': 0}"
+  ]
+ ],
+ "order": [
+  "abort s-open",
+  "list_orphaned_runs",
+  {
+   "call": "mark_orphaned_runs_failed",
+   "kwargs": {
+    "exclude_ids": [
+     "run-replayed",
+     "run-reopens"
+    ]
+   }
+  },
+  "mark_orphaned_meetings_failed",
+  "end_running_compose",
+  "a background loop was cancelled",
+  {
+   "call": "cancel_all",
+   "kwargs": {
+    "grace": 2.0,
+    "timeout": 1.0
+   }
+  },
+  "scheduler.stop",
+  {
+   "call": "drain_persists",
+   "timeout": 2.0
+  },
+  {
+   "call": "drain_all",
+   "kwargs": {
+    "timeout": 3.0
+   }
+  },
+  "flush_session_index",
+  "note_clean_stop",
+  "loop_watchdog.stop",
+  "close_binding_writes",
+  "shutdown_db_executor",
+  "close_pool",
+  "stop_mcp_thread"
+ ],
+ "wait_for_timeouts": [
+  35.0
+ ]
+}

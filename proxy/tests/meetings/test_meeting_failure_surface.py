@@ -34,6 +34,17 @@ def _make_meeting(chat_id: str = "chat-mf-1", scope: str = "user",
 
 
 @pytest.mark.asyncio
+async def test_a_refusal_carries_its_reason_to_the_card(monkeypatch):
+    """The card offers to connect an engine only for a person-fixable
+    refusal: the word rides the persisted event."""
+    monkeypatch.setattr(MO, "_FAIL_PUMP_LINGER_S", 0.05)
+    mid = _make_meeting()
+    await MO._notify_meeting_failed(mid, "The meeting could not start: connect one.", refusal="auth_off")
+    rows = [r for r in task_store.get_chat_messages("chat-mf-1") if r.get("event_type") == "system"]
+    assert json.loads(rows[-1]["event_data"])["reason"] == "auth_off"
+
+
+@pytest.mark.asyncio
 async def test_notify_persists_event_and_fails_row(monkeypatch):
     monkeypatch.setattr(MO, "_FAIL_PUMP_LINGER_S", 0.2)
     mid = _make_meeting()
@@ -270,7 +281,33 @@ async def test_participant_pool_refusal_is_the_meeting_reason():
 
     notify.assert_awaited_once_with(
         "m1", "The meeting could not start: The agent pool's Claude subscription cap is reached: x.",
-        claim=ANY)
+        claim=ANY, refusal="pool_cap")
+
+
+@pytest.mark.asyncio
+async def test_a_meeting_with_no_compute_machine_is_refused_with_the_sentence(caplog):
+    """No compute machine can take a participant: the meeting does not
+    start, the chat reads the one sentence as the reason, and nothing is
+    logged as an error (a refusal is no crash)."""
+    import logging
+
+    from core import placement
+    notify = AsyncMock()
+    with patch.object(MO.task_store, "get_meeting",
+                      return_value=_pending_meeting_row()), \
+         patch.object(MO.task_store, "get_chat", return_value={}), \
+         patch.object(MO.task_store, "update_meeting"), \
+         patch.object(MO.task_store, "update_meeting_if", return_value=True), \
+         patch.object(MO, "build_meeting_agent_config",
+                      new=AsyncMock(side_effect=placement.NoComputeMachine())), \
+         patch.object(MO, "_notify_meeting_failed", new=notify), \
+         caplog.at_level(logging.INFO):
+        await MO.start_meeting("m1")
+
+    notify.assert_awaited_once_with(
+        "m1", "The meeting could not start: " + placement.NO_COMPUTE_SENTENCE, claim=ANY)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("has no place to run" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -345,3 +382,31 @@ async def test_a_meeting_whose_chat_stays_busy_fails_with_the_reason(monkeypatch
     finally:
         q.release(held)
         input_queue._registry.pop("chat-x", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait", [True, False])
+async def test_a_meeting_with_no_parent_chat_fails_on_its_row_alone(monkeypatch, wait):
+    """A meeting made through the API has no requesting chat: its failure is
+    the row's status and summary, and nothing is written to a chat."""
+    from core.events import chat_writer, input_queue
+    from core.session import session_state
+    monkeypatch.setattr(MO, "_FAIL_PUMP_LINGER_S", 0.05)
+    monkeypatch.setattr(MO, "_FAIL_CLAIM_WAIT_S", 0.1)
+    written: list = []
+    monkeypatch.setattr(chat_writer, "submit", lambda cid, *a, **k: written.append(cid))
+    monkeypatch.setattr(session_state, "broadcast_chat_frame", lambda cid, f: written.append(cid))
+    m = task_store.create_meeting(
+        "mtg-mf-none", "topic", json.dumps(["a1", "a2"]), "a1",
+        "directed", 30, "", None, None, "user", None,
+    )
+    try:
+        await MO._notify_meeting_failed(m["id"], "The meeting could not start.", wait=wait)
+        meeting = task_store.get_meeting(m["id"])
+        assert meeting["status"] == "failed"
+        assert meeting["summary"] == "The meeting could not start."
+        assert written == []
+        assert "" not in _active_pumps
+        assert "" not in input_queue._registry
+    finally:
+        input_queue._registry.pop("", None)

@@ -1,8 +1,7 @@
 """The allowlist widening (``storage/agents/schema.migrate_agents``) and the
-two 1.9.1 columns: every existing agent gains the registered engines it
-lacked, once, keeping what it had; a boot that names no engines widens
-nothing; the users row gains ``preferred_execution_path``, read only now as
-the seed of the engine order by use.
+1.9.1 column ``agents.local_only_engines``: every existing agent gains the
+registered engines it lacked, once, keeping what it had; a boot that names no
+engines widens nothing.
 """
 
 from __future__ import annotations
@@ -78,9 +77,6 @@ def test_the_columns_exist_with_their_defaults(temp_db):
     assert agent_store._get_local_only_engines(agent_store.get_agent("one")) == [CODEX]
     agent_store.update_agent("one", local_only_engines="not json")
     assert agent_store._get_local_only_engines(agent_store.get_agent("one")) == []
-    from storage import database as task_store
-    # Read only now: the seed of the engine order by use.
-    assert task_store.get_user("user-admin")["preferred_execution_path"] == ""
 
 
 def test_a_new_agent_stores_the_extras_it_is_given(temp_db):

@@ -584,3 +584,62 @@ async def test_the_resume_probe_refuses_unsafe_names(sat, slug, sid, user):
     await SessionManager(sat).check_session_resumable(
         {"command_id": "c", "session_id": sid, "agent_slug": slug, "username": user}, ws)
     assert ws.sent[0]["resumable"] is False and ws.sent[0]["reason"] == "missing"
+
+
+# -- the tree removals stay beneath the agents folder ---------------------------
+
+def _linked(path: Path, stand_in: Path) -> None:
+    """``path`` becomes a link to ``stand_in`` (a folder of the test's own)."""
+    import shutil
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.symlink_to(stand_in, target_is_directory=True)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX links")
+def test_a_commit_removes_no_folder_through_a_linked_home(agents, tmp_path):
+    sid = _uuid()
+    stand_in = tmp_path / "outside" / "users"
+    old_file, side = _plant_claude(stand_in / "alice", sid, key="-old")
+    _linked(agents / "alpha" / "users", stand_in)
+    scope = _scope(refs=[sid])
+    (agents / "alpha" / mv.STAGING_DIR / scope.move_id / ".claude" / "projects" / "-new").mkdir(parents=True)
+    (agents / "alpha" / mv.STAGING_DIR / scope.move_id / ".claude" / "projects" / "-new" / f"{sid}.jsonl"
+     ).write_bytes(b"fresh")
+    with pytest.raises(OSError):
+        mv.commit(agents, scope)
+    assert old_file.read_bytes() == b"claude transcript" and side.read_bytes() == b"sidecar"
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX links")
+def test_discard_removes_nothing_through_a_linked_staging_folder(agents, tmp_path):
+    scope = _scope(refs=[_uuid()])
+    stand_in = tmp_path / "outside" / mv.STAGING_DIR
+    (stand_in / scope.move_id).mkdir(parents=True)
+    (stand_in / scope.move_id / "kept.txt").write_bytes(b"keep")
+    _linked(agents / "alpha" / mv.STAGING_DIR, stand_in)
+    mv.discard(agents, scope)
+    assert (stand_in / scope.move_id / "kept.txt").read_bytes() == b"keep"
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX links")
+def test_delete_removes_no_folder_through_a_linked_home(agents, tmp_path):
+    sid = _uuid()
+    stand_in = tmp_path / "outside" / "users"
+    main, side = _plant_claude(stand_in / "alice", sid)
+    _linked(agents / "alpha" / "users", stand_in)
+    assert mv.delete(agents, _scope(refs=[sid], move=False)) == 0
+    assert main.exists() and side.read_bytes() == b"sidecar"
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX links")
+def test_a_sweep_removes_nothing_through_a_linked_agent_folder(agents, tmp_path):
+    stand_in = tmp_path / "elsewhere"
+    old = stand_in / mv.STAGING_DIR / _uuid()
+    old.mkdir(parents=True)
+    (old / "kept.txt").write_bytes(b"keep")
+    os.utime(old, (0.0, 0.0))
+    _linked(agents / "gamma", stand_in)
+    assert mv.sweep_staging(agents, "gamma") == 0
+    assert (old / "kept.txt").read_bytes() == b"keep"

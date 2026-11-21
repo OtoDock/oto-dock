@@ -22,27 +22,45 @@ subclass adds only the Codex-specific bits:
 """
 from __future__ import annotations
 
-import glob
+import asyncio
+import contextlib
+import errno
+import fnmatch
 import json
 import logging
 import os
+import re
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
-from .._vendored import layout
+from .._vendored import layout, session_text
 from .._vendored.codex_approvals import approval_for_sandbox, tui_reviewer_flags
-from ..config import otodock_dir, session_tools_env, write_command_wrappers
-from ..host import path_translator
-from ..sessions.codex_session import (
+from ..config import (
+    otodock_dir,
+    session_tools_env,
+    write_command_wrappers,
+    write_if_changed,
+)
+from ..host import path_translator, safe_fs
+from ..sessions import session_homes
+from ..sessions.codex_files import (
     CODEX_TOOLS_TABLE,
     _validate_config_toml,
-    _write_codex_hook_scripts,
-    _write_codex_hooks,
     chmod_private,
+    configured_provider,
+    drop_store_leftovers,
     local_provider_toml,
+    runs_on_local_model,
     write_or_drop_auth_json,
     write_or_drop_model_catalog,
+)
+from ..sessions.codex_session import (
+    _write_codex_hook_scripts,
+    _write_codex_hooks,
+    session_text_mode,
+    session_text_of,
 )
 from .pty_session_base import BasePtySession
 
@@ -64,23 +82,97 @@ _RESOLVE_MTIME_MARGIN_S = 5.0
 # proxy tailer's ``_resolved``/``others`` exclusion.
 _pinned_rollouts: set[str] = set()
 
+# What a search of the rollouts answers (the platform's
+# ``codex_rollout_tailer.find_rollout``).
+_FOUND, _MISSING, _UNDECIDED = "found", "missing", "undecided"
+# A thread id names a file: Codex's ids are UUIDs.
+_THREAD_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+# How many entries a search reads before it answers "could not tell".
+_FIND_MAX_ENTRIES = 100_000
+# A rollout sits three folders below ``sessions`` (YYYY/MM/DD): deeper
+# folders are not entered.
+_FIND_MAX_DEPTH = 8
+# A ``session_meta`` record is under 2 KiB; a longer first record reads as
+# unknown.
+_META_MAX_BYTES = 64 * 1024
 
-def _read_session_meta(path: str) -> dict | None:
-    """Parse the first line (session_meta payload) of a rollout, or None."""
+
+def _read_session_meta(root, rel: str) -> dict | None:
+    """The first record's ``session_meta`` payload of the rollout at ``rel``
+    beneath ``root`` (a regular file with no link on the way, a pipe refused
+    at once), read up to ``_META_MAX_BYTES``; None otherwise."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            first = fh.readline()
-        obj = json.loads(first)
-    except (OSError, json.JSONDecodeError, ValueError):
+        fd, _st = safe_fs.open_regular_for_read(root, rel)
+    except OSError:
         return None
-    if obj.get("type") == "session_meta":
-        return obj.get("payload") or {}
-    return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            first = fh.readline(_META_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(first) > _META_MAX_BYTES:
+        return None
+    try:
+        obj = json.loads(first.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or obj.get("type") != "session_meta":
+        return None
+    payload = obj.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+#: A walk cut at its cap that took nothing is not run again for this long:
+#: the poll runs on the event loop every 0.8 s.
+_CAPPED_RETRY_S = 60.0
+
+
+def _walk_rollouts(root, base: str, unread: list[OSError],
+                   linked: list[str] | None = None) -> Iterator[tuple[safe_fs.Root, str, str]]:
+    """``(folder, folder_rel, name)`` for each ``rollout-*.jsonl`` regular
+    file beneath ``base``: the newest dated folders first, none entered
+    through a link or more than ``_FIND_MAX_DEPTH`` below ``base``; the
+    ``folder`` handle is valid until the walk moves on. A missing ``base`` or
+    a link at it or above it yields nothing; a folder that could not be read
+    goes to ``unread``, and a link met on the way to ``linked`` when given;
+    past ``_FIND_MAX_ENTRIES`` entries, in all or in one folder, raises
+    ``TooManyEntries``."""
+    seen = 0
+    pending = [(base, 0)]
+    while pending:
+        rel, depth = pending.pop()
+        with contextlib.ExitStack() as held:
+            try:
+                folder = held.enter_context(safe_fs.open_root(root, rel))
+                listing = safe_fs.list_beneath(folder, max_entries=_FIND_MAX_ENTRIES)
+            except safe_fs.TooManyEntries:
+                raise
+            except safe_fs.SymlinkRefused:
+                if linked is not None:
+                    linked.append(rel)
+                continue
+            except (FileNotFoundError, NotADirectoryError):
+                continue  # missing, or gone since its parent's listing
+            except OSError as exc:
+                if rel != base or not isinstance(exc, safe_fs.SafeFsError):
+                    unread.append(exc)
+                continue
+            if linked is not None:
+                linked.extend(f"{rel}/{name}" for name in listing.links)
+            seen += len(listing.dirs) + len(listing.files) + len(listing.links) + len(listing.other)
+            if seen > _FIND_MAX_ENTRIES:
+                raise safe_fs.TooManyEntries(errno.EFBIG, "more entries than the search's cap", base)
+            for name in listing.files:
+                if fnmatch.fnmatchcase(name, "rollout-*.jsonl"):
+                    yield folder, rel, name
+            if depth < _FIND_MAX_DEPTH:
+                # Popped last-in first: the newest name (YYYY, MM, DD) first.
+                pending.extend((f"{rel}/{d}", depth + 1) for d in listing.dirs)
 
 
 def _build_codex_config_toml(
     trusted_cwd: str, mcp_toml: str, local_provider: dict | None = None,
-    codex_dir: Path | None = None,
+    codex_dir: Path | None = None, catalog_dir: Path | None = None,
 ) -> str:
     """Build the interactive `codex` config.toml — satellite twin of the proxy's
     ``core.layers.codex.layer._write_config_toml(interactive=True, trusted_cwd=…)``.
@@ -104,9 +196,11 @@ def _build_codex_config_toml(
         contents of this directory?" startup prompt. Keyed by the SATELLITE-absolute cwd
         (the satellite owns it — no path translation needed), under BOTH separator forms
         (Windows codex may normalise to forward slashes; the set collapses to one on Unix).
-    KEEP IN SYNC with the proxy's ``_write_config_toml``.
+    KEEP IN SYNC with the proxy's ``_write_config_toml``. ``catalog_dir`` is
+    the folder the engine reads (a session's home), where its model catalog
+    is; the worktrees stay beside ``codex_dir``, the store.
     """
-    root_line, provider_table = local_provider_toml(local_provider, codex_dir)
+    root_line, provider_table = local_provider_toml(local_provider, catalog_dir or codex_dir)
     parts = [
         "project_doc_max_bytes = 300000",
         # Root keys stay above the first [table] header. check_for_update
@@ -149,6 +243,9 @@ def _build_codex_config_toml(
         esc_root = root.replace("\\", "\\\\").replace('"', '\\"')
         parts.append("[desktop]")
         parts.append(f'git-worktree-root = "{esc_root}"')
+    # No model picker in place of the composer near a usage limit: text the
+    # platform types would choose in it (twin of the proxy's writer).
+    parts += ["[notice]", "hide_rate_limit_model_nudge = true"]
     if provider_table:
         parts.append(provider_table)
     if mcp_toml.strip():
@@ -195,10 +292,16 @@ class CodexPtySession(BasePtySession):
     """A Codex Ratatui TUI subprocess on a PTY, driven by the proxy over the WS."""
 
     execution_path = "codex-cli"
+    #: Until when a rollout search that was cut at its cap and took nothing waits.
+    _capped_until = 0.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._codex_dir: Path | None = None
+        # The folder the engine reads: the session's home when the start asks
+        # for one, else the store (``credentials_update`` writes a pushed
+        # sign-in there).
+        self._engine_dir: Path | None = None
         self._started_at = 0.0  # spawn time → excludes a sibling chat's older rollout
         self._thread_id = (self.config.get("thread_id") or "").strip()
         # Resume iff the proxy said so AND a thread id is known (codex resume <tid>).
@@ -207,31 +310,94 @@ class CodexPtySession(BasePtySession):
         # proxy DB) → skip past it on first locate and forward only new lines.
         self._transcript_skip_existing = self._resume
         self._transcript_pin: str | None = None
+        # The platform gives the session its own profile (``session_text``).
+        self._own_text = False
+
+    async def _start_compute(self) -> None:
+        """A Codex terminal on a compute machine: the platform wrote the
+        ``config.toml``, the session's profile and login file into the shared folder
+        and planned the TUI's argv (``resume <thread>`` or the flags with the
+        cold prompt); this machine renders the sandbox and spawns the plan.
+        The rollout is found by the sandbox's cwd the plan names; no state
+        reset of its own (the platform's spawn runs the same files)."""
+        from ..sessions import credential_exit, sandbox_host, ssh_agent
+        self._own_copy = await sandbox_host.ready_own_copy(self.config, self.sat_config,
+                                                           self.session_id, self.agent_dir)
+        self._codex_dir = self.agent_dir / self.config["codex_dir_relative"]
+        self._engine_dir = session_homes.home_path(self._codex_dir, self.session_id,
+                                                   self.config.get("session_home"))
+        if session_text_mode(self.config):
+            # An own copy may still hold an AGENTS.md from before the
+            # session's own text; the plan's argv names the session's profile.
+            session_text.remove_shared_text(self._codex_dir)
+            if not session_text.profile_path(self._engine_dir, self.session_id).is_file():
+                logger.error("Codex compute terminal %s: its own profile is missing", self.session_id[:8])
+                raise RuntimeError("the session's own profile is missing")
+        self._apply_resume_guard()
+        # The session's SSH agent socket before the render, which binds it;
+        # the credential exit's door before it too (the render binds the bundle).
+        agent_env = await asyncio.to_thread(ssh_agent.start, self.session_id, self.config)
+        await asyncio.to_thread(credential_exit.start, self.session_id, self.config)
+        cmd = await sandbox_host.spawn_command(self.config, self.sat_config, "codex", for_pty=True)
+        if self._resume_degraded and cmd and "resume" in cmd:
+            # The plan resumes a thread this folder cannot resume: the flags
+            # alone, as the platform's own degraded start spawns.
+            i = cmd.index("resume")
+            cmd = cmd[:i] + cmd[i + 2:]
+        env = sandbox_host.spawn_env(self.config)
+        ssh_agent.merge_env(env, agent_env, self.config)
+        self._started_at = time.time()
+        await self._wire_and_spawn(cmd, env, None)
+        self._say_degraded()
+
+    def _say_degraded(self) -> None:
+        if self._resume_degraded and self.pty is not None:
+            # Visible, replay-surviving notice (scrollback-backed) — the user
+            # must know why the conversation isn't continuing in the TUI. The
+            # full chat history still lives in the platform DB/chat view.
+            why = (b"was recorded with another model provider, so a fresh CLI "
+                   b"session starts" if self._resume_degraded == _DEGRADED_PROVIDER
+                   else b"isn't on this machine \xe2\x80\x94 starting a fresh CLI "
+                        b"session")
+            self.pty.inject_output(
+                b"\r\n\x1b[2m\xe2\x9a\xa0 This conversation's Codex history " + why
+                + b" (chat history is still in the dashboard).\x1b[0m\r\n\r\n"
+            )
 
     async def start(self) -> None:
         """Write the .codex config tree + spawn the interactive Codex TUI under a PTY."""
+        if self._compute:
+            await self._start_compute()
+            return
         # cwd may be an arbitrary absolute folder (otodock-CLI); the .codex
         # dir stays agent_dir-rooted via codex_dir_relative regardless.
         self._cwd = self._resolve_work_cwd()
         self._codex_dir = self.agent_dir / self.config["codex_dir_relative"]
         self._codex_dir.mkdir(parents=True, exist_ok=True)
+        # The session's home when the start asks for one (its settings, hooks,
+        # model catalog, profile and sign-in); the rollouts the guard reads,
+        # the scripts and the databases stay the store's.
+        self._engine_dir = session_homes.open_home(self._codex_dir, self.session_id,
+                                                   self.config.get("session_home"))
+        in_home = self._engine_dir != self._codex_dir
+        if in_home:
+            drop_store_leftovers(self.agent_dir, self.config["codex_dir_relative"])
         self._apply_resume_guard()
-        # Self-heal a foreign/stale codex state DB BEFORE launch. The bare `codex`
-        # TUI aborts with an INTERACTIVE "migration N … has been modified / Repair
-        # Codex local data? [y/N]" prompt when CODEX_HOME holds a state DB written
-        # by a different codex version (or the app-server vs bare-TUI schema) —
-        # which would hang the PTY waiting for a y/N we can't supply. The app-server
-        # path self-heals this reactively (codex_session._reset_codex_state); the
-        # TUI can't, so we reset proactively. Regenerable + host-local (never
-        # synced); the rollouts in sessions/ are untouched, so history/resume survive.
-        self._reset_codex_state()
 
         # --- write the .codex/ config tree (mirror CodexSession.start) --------
         _write_codex_hook_scripts(self._codex_dir, self.config.get("hook_scripts", {}))
         write_command_wrappers(self._codex_dir, self.config.get("command_wrappers", {}))
-        (self._codex_dir / "AGENTS.md").write_text(
-            self.config.get("agents_md_content", self.config.get("system_prompt", ""))
-        )
+        self._own_text = session_text_mode(self.config)
+        if self._own_text:
+            # The session's own profile (``-p <session>``, its text as
+            # developer_instructions), never a file every session of the
+            # home reads.
+            session_text.remove_shared_text(self._codex_dir)
+            session_text.write_session_files(
+                self._engine_dir, self.session_id, text=session_text_of(self.config),
+                config={}, profile="", writer=write_if_changed)
+        else:
+            (self._codex_dir / "AGENTS.md").write_text(session_text_of(self.config))
         toml_content = self.config.get("mcp_config_toml", "")
         if toml_content:
             otodock_fwd = str(otodock_dir()).replace("\\", "/")
@@ -263,14 +429,16 @@ class CodexPtySession(BasePtySession):
         local_provider = self.config.get("local_model_provider")
         config_toml_text = _build_codex_config_toml(
             str(self._cwd), toml_content,
-            local_provider=local_provider, codex_dir=self._codex_dir,
+            local_provider=local_provider, codex_dir=self._codex_dir, catalog_dir=self._engine_dir,
         )
-        _validate_config_toml(config_toml_text, self._codex_dir / "config.toml")
-        write_or_drop_model_catalog(self._codex_dir, local_provider)
-        (self._codex_dir / "config.toml").write_text(config_toml_text)
-        chmod_private(self._codex_dir / "config.toml")
-        write_or_drop_auth_json(self._codex_dir, self.config.get("auth_json"))
-        _write_codex_hooks(self._codex_dir)
+        _validate_config_toml(config_toml_text, self._engine_dir / "config.toml")
+        write_or_drop_model_catalog(self._engine_dir, local_provider)
+        (self._engine_dir / "config.toml").write_text(config_toml_text)
+        chmod_private(self._engine_dir / "config.toml")
+        write_or_drop_auth_json(self._engine_dir, self.config.get("auth_json"))
+        _write_codex_hooks(self._engine_dir, session_text_hook=self._own_text,
+                           start_context=bool(self.config.get("start_context_parts")),
+                           scripts_dir=self._codex_dir)
 
         # --- env (mirror CodexSession + the bare-TUI interactive vars) --------
         # The shared base set OTO_SESSION_ID + UTF-8 + TERM. Add CODEX_HOME and the
@@ -281,8 +449,11 @@ class CodexPtySession(BasePtySession):
         # (Codex's PreToolUse hook rejects permissionDecision:"allow", so the gate
         # emits JSON only to DENY; the hard-deny FLOOR still enforces).
         env = self._base_env()
-        env.update(await self._materialize_session_files())
-        env["CODEX_HOME"] = str(self._codex_dir)
+        env.update(await self._session_agent_env())
+        env["CODEX_HOME"] = str(self._engine_dir)
+        if in_home:
+            # The databases stay the store's, as the rollouts do (its link).
+            env["CODEX_SQLITE_HOME"] = str(self._codex_dir)
         env["OTO_INTERACTIVE"] = "1"
         env["OTO_HOOK_DENY_ONLY"] = "1"
         # Interpreter for the Windows .cmd hook wrappers (codex_hook_command)
@@ -333,6 +504,8 @@ class CodexPtySession(BasePtySession):
         effort = self.config.get("effort", "")  # already codex-mapped by the proxy
         if effort:
             flags += ["-c", f'model_reasoning_effort="{effort}"']
+        if self._own_text:
+            flags += ["-p", session_text.checked_name(self.session_id)]
         if self._resume:
             # Resume the existing rollout/thread; the continuation prompt arrives via
             # the PTY flush (proxy write_input), not argv.
@@ -359,35 +532,11 @@ class CodexPtySession(BasePtySession):
         # Record spawn time BEFORE the PTY starts so rollout discovery can exclude a
         # sibling chat's older rollout (the rollout is written ~1s after spawn).
         self._started_at = time.time()
-        await self._wire_and_spawn(cmd, env, str(self._cwd))
-        if self._resume_degraded and self.pty is not None:
-            # Visible, replay-surviving notice (scrollback-backed) — the user
-            # must know why the conversation isn't continuing in the TUI. The
-            # full chat history still lives in the platform DB/chat view.
-            why = (b"was recorded with another model provider, so a fresh CLI "
-                   b"session starts" if self._resume_degraded == _DEGRADED_PROVIDER
-                   else b"isn't on this machine \xe2\x80\x94 starting a fresh CLI "
-                        b"session")
-            self.pty.inject_output(
-                b"\r\n\x1b[2m\xe2\x9a\xa0 This conversation's Codex history " + why
-                + b" (chat history is still in the dashboard).\x1b[0m\r\n\r\n"
-            )
+        from ..sessions import sandbox_host
+        await self._wire_and_spawn(sandbox_host.paired_command(cmd), env, str(self._cwd))
+        self._say_degraded()
 
     # --- transcript forwarding (Codex: discover the rollout) -----------------
-    def _reset_codex_state(self) -> None:
-        """Delete codex's per-machine SQLite state/log DBs in CODEX_HOME (regenerable;
-        rollouts in ``sessions/`` are untouched). Mirrors
-        ``codex_session.CodexAppServerSession._reset_codex_state`` + the
-        ``file_sync._CODEX_RUNTIME_GLOBS`` host-local set. No-op if CODEX_HOME is unset."""
-        if self._codex_dir is None:
-            return
-        for pattern in ("state_*.sqlite*", "logs_*.sqlite*"):
-            for path in self._codex_dir.glob(pattern):
-                try:
-                    path.unlink()
-                except OSError as e:
-                    logger.warning("codex state reset: couldn't delete %s: %s", path.name, e)
-
     def _apply_resume_guard(self) -> None:
         """Degrade a resume to a COLD start when the thread's rollout isn't in
         THIS machine's CODEX_HOME. ``codex resume <tid>`` HARD-EXITS (code 1)
@@ -396,13 +545,18 @@ class CodexPtySession(BasePtySession):
         synced) — and its one-line error drowns in the TUI teardown escapes,
         so the terminal just looks dead. A cold start re-reports the fresh
         thread id to the proxy; a visible notice is injected post-spawn.
-        Codex 0.166 also refuses a thread recorded with another model
-        provider (``modelProviderMismatch``: a chat moved between a local
-        model and OpenAI while no session ran): the same cold start."""
+        A thread recorded with another model provider (a chat moved between
+        a local model and OpenAI while no session ran) gets the same cold
+        start. It is the only check on a terminal's provider: from 0.168
+        ``codex resume <tid>`` resumes on the recorded provider, whatever
+        ``config.toml`` names, with no notice (0.166 exited, 0.167 parked on
+        a notice). A rollout that names no provider resumes on its old one."""
         self._resume_degraded = ""
         if not self._resume:
             return
-        if not self._rollout_on_disk(self._thread_id):
+        # One search; one that could not tell keeps the resume (logged there).
+        found, rel = self._find_rollout(self._thread_id)
+        if found == _MISSING:
             logger.warning(
                 "codex resume: no rollout for thread %s in %s — starting a "
                 "fresh session instead",
@@ -410,9 +564,9 @@ class CodexPtySession(BasePtySession):
                 (self._codex_dir / "sessions") if self._codex_dir else "?",
             )
             self._resume_degraded = _DEGRADED_MISSING
-        else:
-            recorded = self._rollout_provider(self._thread_id)
-            current = "oto_local" if self.config.get("local_model_provider") else "openai"
+        elif rel is not None:
+            recorded = self._rollout_provider(rel)
+            current = configured_provider(runs_on_local_model(self.config))
             if recorded and recorded != current:
                 logger.warning("codex resume: thread %s was recorded with provider %s, this "
                                "spawn writes %s; starting a fresh session instead",
@@ -422,105 +576,181 @@ class CodexPtySession(BasePtySession):
             self._resume = False
             self._transcript_skip_existing = False
 
-    def _rollout_provider(self, thread_id: str) -> str:
-        """The model provider the thread's rollout recorded (its first line,
-        ``session_meta``), or "" when it cannot be read."""
-        if not thread_id or self._codex_dir is None:
-            return ""
-        try:
-            paths = glob.glob(str(self._codex_dir / "sessions" / "**" / f"rollout-*-{thread_id}.jsonl"),
-                              recursive=True)
-            if not paths:
-                return ""
-            with open(paths[0], encoding="utf-8", errors="replace") as fh:
-                meta = json.loads(fh.readline() or "{}")
-        except (OSError, ValueError):
-            return ""
-        payload = meta.get("payload") if isinstance(meta, dict) else None
-        provider = payload.get("model_provider") if isinstance(payload, dict) else None
+    def _rollout_provider(self, rel: str) -> str:
+        """The model provider the rollout at ``rel`` (beneath the agent's
+        folder) recorded in its first line, ``session_meta``, or "" when it
+        cannot be read."""
+        meta = _read_session_meta(self.agent_dir, rel)
+        provider = meta.get("model_provider") if meta else None
         return provider if isinstance(provider, str) else ""
 
-    def _rollout_on_disk(self, thread_id: str) -> bool:
-        """True iff a rollout for ``thread_id`` exists under this CODEX_HOME —
-        the precondition for ``codex resume <tid>``, which HARD-EXITS when the
-        rollout is missing (same by-name suffix ``_locate_transcript_file``
-        uses for the resume pin)."""
-        if not thread_id or self._codex_dir is None:
-            return False
-        sessions_dir = self._codex_dir / "sessions"
-        if not sessions_dir.is_dir():
-            return False
+    def _sessions_rel(self) -> str | None:
+        """CODEX_HOME's ``sessions`` as a path beneath the agent's folder."""
+        if self._codex_dir is None:
+            return None
         try:
-            return bool(glob.glob(
-                str(sessions_dir / "**" / f"rollout-*-{thread_id}.jsonl"),
-                recursive=True,
-            ))
-        except OSError:
-            return False
+            return f"{self._codex_dir.relative_to(self.agent_dir).as_posix()}/sessions"
+        except ValueError:
+            return None
 
-    def _locate_transcript_file(self) -> Path | None:
-        """Discover THIS session's rollout JSONL under ``CODEX_HOME`` — satellite
-        twin of ``codex_rollout_tailer.resolve_rollout_path``. The rollout is named
+    def _find_rollout(self, thread_id: str) -> tuple[str, str | None]:
+        """Where the rollout of ``thread_id`` is beneath the agent's folder:
+        ``(_FOUND, rel)``, ``(_MISSING, None)`` or ``(_UNDECIDED, None)``. The
+        first ``rollout-*-<thread>.jsonl`` regular file of ``_walk_rollouts``;
+        an id that cannot name a file, a missing folder or a link at
+        ``sessions`` or above it is MISSING; a search past its cap or one that
+        met a folder it could not read could not tell."""
+        base = self._sessions_rel()
+        if base is None or not _THREAD_RE.fullmatch(thread_id or ""):
+            return _MISSING, None
+        pattern = f"rollout-*-{thread_id}.jsonl"
+        unread: list[OSError] = []
+        try:
+            with safe_fs.open_root(self.agent_dir) as root:
+                for _folder, rel, name in _walk_rollouts(root, base, unread):
+                    if fnmatch.fnmatchcase(name, pattern):
+                        return _FOUND, f"{rel}/{name}"
+        except safe_fs.TooManyEntries:
+            logger.warning("codex rollout of thread %s: the search passed %d entries in %s",
+                           thread_id[:8], _FIND_MAX_ENTRIES, base)
+            return _UNDECIDED, None
+        except (FileNotFoundError, NotADirectoryError):
+            return _MISSING, None
+        except OSError:
+            logger.warning("codex rollout of thread %s: %s could not be searched", thread_id[:8], base,
+                           exc_info=True)
+            return _UNDECIDED, None
+        if unread:
+            logger.warning("codex rollout of thread %s: %d folder(s) of %s could not be read",
+                           thread_id[:8], len(unread), base)
+            return _UNDECIDED, None
+        return _MISSING, None
+
+    def _rollout_on_disk(self, thread_id: str) -> bool:
+        """Whether a rollout for ``thread_id`` may be under this CODEX_HOME —
+        the precondition for ``codex resume <tid>``, which HARD-EXITS when the
+        rollout is missing. A search that could not tell answers True: the
+        resume stays."""
+        return self._find_rollout(thread_id)[0] != _MISSING
+
+    def _locate_transcript_file(self) -> str | None:
+        """Discover THIS session's rollout JSONL under ``CODEX_HOME``, as a path
+        beneath the agent's folder — satellite twin of
+        ``codex_rollout_tailer.resolve_rollout_path``. The rollout is named
         ``rollout-<ts>-<thread_uuid>.jsonl`` (NOT by our session id), and CODEX_HOME
         is per-(user, agent) scope, so on resume we prefer the thread's own rollout;
         otherwise the newest ``codex-tui`` rollout for this cwd created after spawn,
-        never one already pinned by a sibling live session."""
-        if self._codex_dir is None:
+        never one already pinned by a sibling live session. One bounded walk
+        (``_walk_rollouts``): a folder it could not read is passed over. A
+        walk cut at its cap keeps the newest fresh rollout it met, takes no
+        other session's for a resume, and when it took nothing the next walk
+        waits ``_CAPPED_RETRY_S``."""
+        if time.monotonic() < self._capped_until:
             return None
-        sessions_dir = self._codex_dir / "sessions"
-        if not sessions_dir.is_dir():
+        base = self._sessions_rel()
+        if base is None:
             return None
-        try:
-            candidates = glob.glob(
-                str(sessions_dir / "**" / "rollout-*.jsonl"), recursive=True
-            )
-        except OSError:
-            return None
-        cwd_str = str(self._cwd) if self._cwd else ""
+        # A compute session's rollout recorded the sandbox's folder.
+        cwd_str = (str(self.config.get("cwd") or "") if self._compute
+                   else str(self._cwd) if self._cwd else "")
         others = {p for p in _pinned_rollouts if p != self._transcript_pin}
-
         # Resume: the thread's own rollout (codex resume <tid> appends to it).
-        if self._thread_id:
-            suffix = f"-{self._thread_id}.jsonl"
-            for path in candidates:
-                if path in others or not path.endswith(suffix):
-                    continue
-                meta = _read_session_meta(path)
-                if meta and meta.get("thread_source") != "subagent":
-                    return self._pin(path)
-
-        # Fresh (or a resume whose rollout wasn't found by name): the newest
-        # codex-tui rollout for this cwd created after spawn.
+        # A resume the guard made a cold start writes a new rollout: the old
+        # one holds history the chat already shows.
+        own = (f"rollout-*-{self._thread_id}.jsonl"
+               if self._resume and _THREAD_RE.fullmatch(self._thread_id or "") else "")
         best: str | None = None
         best_mtime = -1.0
-        for path in candidates:
-            if path in others:
-                continue
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                continue
-            if not self._thread_id and mtime < self._started_at - _RESOLVE_MTIME_MARGIN_S:
-                continue
-            meta = _read_session_meta(path)
-            if not meta:
-                continue
-            if meta.get("originator") != "codex-tui":
-                continue
-            if meta.get("thread_source") == "subagent":
-                continue
-            if cwd_str and not _cwd_match(meta.get("cwd", ""), cwd_str):
-                continue
-            if mtime > best_mtime:
-                best, best_mtime = path, mtime
+        later: list[str] = []
+        unread: list[OSError] = []
+        linked: list[str] = []
+        capped = False
+        try:
+            with safe_fs.open_root(self.agent_dir) as root:
+                try:
+                    for folder, rel, name in _walk_rollouts(root, base, unread, linked):
+                        path = f"{rel}/{name}"
+                        if self._pin_key(path) in others:
+                            continue
+                        if self._resume:
+                            if own and fnmatch.fnmatchcase(name, own):
+                                meta = _read_session_meta(folder, name)
+                                if meta and meta.get("thread_source") != "subagent":
+                                    return self._pin(path)
+                            later.append(path)
+                            continue
+                        mtime = self._fresh_rollout(folder, name, cwd_str)
+                        if mtime is not None and mtime > best_mtime:
+                            best, best_mtime = path, mtime
+                except safe_fs.TooManyEntries:
+                    capped = True
+                    if own:
+                        self._warn_once("cap", "Codex PTY %s: the rollout search stopped at %d entries in %s "
+                                        "before it met this terminal's own rollout: its history does not "
+                                        "reach the chat", self.session_id[:8], _FIND_MAX_ENTRIES, base)
+                    else:
+                        # The newest folders come first: a new rollout is
+                        # met before the cap.
+                        self._warn_once("cap", "Codex PTY %s: the rollout search stopped at %d entries in %s; "
+                                        "the newest rollouts it met are used",
+                                        self.session_id[:8], _FIND_MAX_ENTRIES, base)
+                # A resume whose rollout wasn't found by name: the newest
+                # codex-tui rollout for this cwd, at any time. A walk cut
+                # short never met that rollout, and the newest one it met is
+                # another session's.
+                if not (capped and own):
+                    for path in later:
+                        mtime = self._fresh_rollout(root, path, cwd_str)
+                        if mtime is not None and mtime > best_mtime:
+                            best, best_mtime = path, mtime
+        except OSError:
+            logger.debug("Codex PTY %s: rollout search failed", self.session_id[:8], exc_info=True)
+            return None
+        if linked:
+            self._warn_once("link", "Codex PTY %s: %s is a link, which the terminal does not follow: "
+                            "rollouts there do not reach the chat", self.session_id[:8], linked[0])
         if best:
             return self._pin(best)
+        if capped:
+            self._capped_until = time.monotonic() + _CAPPED_RETRY_S
         return None
 
-    def _pin(self, path: str) -> Path:
-        _pinned_rollouts.add(path)
-        self._transcript_pin = path
-        return Path(path)
+    def _fresh_rollout(self, where, rel: str, cwd_str: str) -> float | None:
+        """The modification time of the rollout at ``rel`` beneath ``where``
+        when it is a ``codex-tui`` rollout of this cwd (on a fresh start, one
+        written since the spawn), else None."""
+        try:
+            st = safe_fs.lstat_beneath(where, rel)
+        except OSError:
+            return None
+        if not self._resume and st.st_mtime < self._started_at - _RESOLVE_MTIME_MARGIN_S:
+            return None
+        meta = _read_session_meta(where, rel)
+        if not meta or meta.get("originator") != "codex-tui" or meta.get("thread_source") == "subagent":
+            return None
+        if cwd_str and not _cwd_match(meta.get("cwd", ""), cwd_str):
+            return None
+        return st.st_mtime
+
+    def _pin_key(self, rel: str) -> str:
+        """The rollout's identity in ``_pinned_rollouts``: its path as text."""
+        return str(self.agent_dir.joinpath(*rel.split("/")))
+
+    def _pin(self, rel: str) -> str:
+        key = self._pin_key(rel)
+        _pinned_rollouts.add(key)
+        self._transcript_pin = key
+        return rel
+
+    async def close(self) -> None:
+        try:
+            await super().close()
+        finally:
+            # The session's home goes once its process is gone (whatever the
+            # close above raised), unless a later open of the same id
+            # replaced this terminal (the home is its now).
+            if not self._compute and not self.superseded and self._codex_dir is not None:
+                session_homes.close_home(self._codex_dir, self.session_id, self.config.get("session_home"))
 
     def _on_close(self) -> None:
         if self._transcript_pin is not None:

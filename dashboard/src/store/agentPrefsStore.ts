@@ -11,7 +11,11 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import { apiFetch } from '../api/auth'
-import { currentMode } from '../lib/engines/modes'
+import { ASK_MODE, AUTO_REVIEW_MODE } from '../lib/engines/modes'
+
+/** The mode words a dashboard before 1.9 remembered in this browser. The
+ *  server rewrote its own copies; this storage is the one it cannot reach. */
+const MODES_BEFORE_1_9: Readonly<Record<string, string>> = { default: ASK_MODE, acceptEdits: AUTO_REVIEW_MODE }
 
 /** Persisted prefs from an earlier version, brought to the current one: the
  *  remembered permission modes in the current words. */
@@ -19,7 +23,7 @@ export function migratePrefs(persisted: unknown, version: number): AgentPrefsSta
   const state = (persisted ?? {}) as AgentPrefsState
   if (version < 1 && state.lastMode) {
     state.lastMode = Object.fromEntries(
-      Object.entries(state.lastMode).map(([agent, mode]) => [agent, currentMode(mode)]))
+      Object.entries(state.lastMode).map(([agent, mode]) => [agent, MODES_BEFORE_1_9[mode] ?? mode]))
   }
   return state
 }
@@ -54,7 +58,7 @@ export const useAgentPrefsStore = create<AgentPrefsState>()(
         set((s) => ({ lastModel: { ...s.lastModel, [agent]: model } })),
 
       setLastMode: (agent, mode) =>
-        set((s) => ({ lastMode: { ...s.lastMode, [agent]: currentMode(mode) } })),
+        set((s) => ({ lastMode: { ...s.lastMode, [agent]: mode } })),
 
       setLastInteractive: (agent, mode) => {
         set((s) => ({ lastInteractive: { ...s.lastInteractive, [agent]: mode } }))

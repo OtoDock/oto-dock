@@ -457,7 +457,7 @@ def _archive_trees(username: str) -> int:
     how many trees are still in place (a boundary the rename cannot cross,
     a destination already taken): those are logged and retried at boot.
     Synchronous, filesystem only."""
-    from services.infra import safe_fs
+    from services.infra import git_writer, safe_fs
     root = config.AGENTS_DIR
     remaining = 0
     for agent in _agent_dirs():
@@ -475,6 +475,9 @@ def _archive_trees(username: str) -> int:
             safe_fs.mkdirs_beneath(root, f"{ARCHIVE_DIRNAME}/{username}", mode=0o700)
             safe_fs.rename_beneath(root, rel, dst)
             logger.info("offboarding: archived %s as %s", rel, dst)
+            # The folder's history leaves with it: the name given out again
+            # meets none (services/infra/git_writer.py).
+            git_writer.archive_person(agent, username)
         except FileExistsError:
             logger.warning("offboarding: %s already exists; %s stays in place", dst, rel)
             remaining += 1

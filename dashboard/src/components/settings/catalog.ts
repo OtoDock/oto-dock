@@ -197,14 +197,14 @@ const INTEGRATIONS: readonly CatalogEntry[] = [
     id: 'user.integrations.account', group: 'Connected Accounts', label: 'Connected account',
     names: ['Set as default', 'This is the default account', 'Edit', 'Close', 'Connect', 'Reconnect', 'Disconnect', 'Remove', 'Save', 'Add account', 'Save token', 'Grant for whole tenant', 'Get device code'],
     kind: KIND.ITEM, item: 'a connected account of a service',
-    help: 'One account of a service: its label, the services it reaches, the default star, and Reconnect, Disconnect or Remove. Agents not bound to another account use the default.',
+    help: 'One account of a service: its label, the services it reaches, the default star, and Reconnect, Disconnect or Remove. An agent you gave no account of the service uses the default.',
     note: 'A personal access token takes an optional account label. An account whose sign-in can no longer be renewed shows Reconnect needed with the reason.',
   }),
   user('integrations', {
     id: 'user.integrations.agent-binding', group: 'Use this account for specific agents', label: 'Use this account for specific agents',
-    names: ['Change', 'Read only', 'All repositories the account reaches', 'Search repositories'],
+    names: ['Make default', 'Change', 'Read only', 'All repositories the account reaches', 'Search repositories'],
     kind: KIND.ITEM, item: 'an agent the account serves',
-    help: 'Binds one of your agents to this account. On GitHub you can limit the repositories the agent reaches in your chats, or make it read only.',
+    help: 'Lets one of your agents use this account. An agent can have several accounts of a service and starts on its default one. On GitHub you can limit the repositories the agent reaches in your chats, or make it read only.',
   }),
   user('integrations', {
     id: 'user.integrations.installations', group: 'Installations', label: 'Install on GitHub', names: ['Change on GitHub', 'Refresh'],
@@ -225,8 +225,8 @@ const INTEGRATIONS: readonly CatalogEntry[] = [
   }),
   user('integrations', {
     id: 'user.integrations.create-api-key', group: 'API Keys', label: '+ Create key',
-    names: ['Create', 'Name', 'triggers: fire your own webhook triggers', 'Copy to clipboard'], kind: KIND.ACTION,
-    help: 'Makes a personal API key for your webhook triggers. The key shows once.',
+    names: ['Create', 'Name', 'Which agents', 'It ends after', 'May run without asking', 'Copy to clipboard'], kind: KIND.ACTION,
+    help: 'Makes a personal API key: what it may do, on which agents, and when it ends. The key shows once.',
   }),
   user('integrations', {
     id: 'user.integrations.api-key', group: 'API Keys', label: 'API key', names: ['Revoke'], kind: KIND.ITEM, item: 'a personal API key',
@@ -258,7 +258,7 @@ const REMOTE_MACHINES: readonly CatalogEntry[] = [
   }),
   user('remote-machines', {
     id: 'user.remote-machines.browser-mode', group: 'Device control', label: 'Browser mode',
-    names: ['Playwright Extension token', 'Save token', 'Clear', 'Browser profile', 'Also let unattended runs like scheduled tasks, triggers, calls and meetings use this browser. Off, they cannot use it at all.'],
+    names: ['Playwright Extension token', 'Save token', 'Clear', 'Browser profile', 'Also let unattended runs like scheduled tasks, triggers, calls, meetings and API keys use this browser. Off, they cannot use it at all.'],
     kind: KIND.ITEM, item: 'a machine with browser control',
     help: 'A dedicated profile, or your own browser through the Playwright Extension and its token. Browser profile names the profile that has the extension. With a saved token you can also let unattended runs use it.',
     note: 'Shown once browser control is granted.',
@@ -445,6 +445,11 @@ const ADMIN: readonly CatalogEntry[] = [
     value: platformToggle('session_retention_enabled', 'On, chats left untouched for the set period lose their session files, here and on the machines they ran on. Their history stays. Off keeps every file.', true, true),
   }),
   admin({
+    id: 'admin.platform.working-files-cleanup', tab: 'System Settings', group: 'Storage and Retention', label: 'Clean up old uploads', kind: KIND.TOGGLE,
+    help: 'Uploads left untouched for the set period spend 7 days in the Recover bin, then go for good.',
+    value: platformToggle('working_files_retention_enabled', 'On, old uploads go to the Recover bin after the set period. Off keeps them all.', true, true),
+  }),
+  admin({
     id: 'admin.platform.archive-cleanup', tab: 'System Settings', group: 'Archive of removed people', label: 'Archive of removed people', names: ['Enabled'], kind: KIND.TOGGLE,
     help: 'A removed person\'s folders are kept in an archive for the set number of days, then deleted.',
     value: platformToggle('offboarded_retention_enabled', 'On, a removed person\'s archived folders are deleted after the set number of days. Off keeps every archive for ever.', true, true),
@@ -453,21 +458,6 @@ const ADMIN: readonly CatalogEntry[] = [
     id: 'admin.platform.mcp-auto-updates', tab: 'System Settings', group: 'Automatic MCP Updates', label: 'Automatic MCP Updates', names: ['Enabled'], kind: KIND.TOGGLE,
     help: 'Once a week, in a quiet window, OtoDock applies available updates to community MCPs. Only failures notify admins.',
     value: platformToggle('mcp_auto_update_enabled', 'On, community MCPs update once a week on their own. Off, every update waits for an admin.', true),
-  }),
-  admin({
-    id: 'admin.platform.store-review', tab: 'System Settings', group: 'Mobile apps', label: 'Ask for a store rating', kind: KIND.TOGGLE,
-    help: 'The Android and iOS apps ask each person to rate OtoDock in Google Play or the App Store. They ask twice at most, after something went well.',
-    value: platformToggle('store_review_enabled', 'On, the Android and iOS apps ask each person for a store rating twice at most. Off, they never ask.', true),
-  }),
-  admin({
-    id: 'admin.platform.store-review-days', tab: 'System Settings', group: 'Mobile apps', label: 'Days before the second ask', kind: KIND.NUMBER,
-    help: 'The second store rating ask comes at least this many days after the first. From 30 to 730.',
-    value: {
-      read: { path: PLATFORM_SETTINGS, field: 'store_review_days' },
-      write: { path: PLATFORM_SETTINGS, field: 'store_review_days' },
-      default: 90,
-      confirm: 'The second ask comes at least this many days after the first.',
-    },
   }),
   admin({
     id: 'admin.users.add-user', section: 'users', group: 'Users', label: 'Add User', names: ['Invite link', 'Temporary password'], kind: KIND.ACTION,
@@ -484,6 +474,16 @@ const ADMIN: readonly CatalogEntry[] = [
   admin({
     id: 'admin.mcp-servers.server', section: 'mcp-servers', group: 'MCP Servers', label: 'MCP server', names: ['Check Updates', 'Install', 'Browse Community', 'Update', 'Switch', 'Revert to catalog', 'Forget'], kind: KIND.ITEM, item: 'an installed MCP',
     help: 'Every installed tool with its switch, settings, instances and updates. Install takes a ZIP, Browse Community the catalog.',
+  }),
+  admin({
+    id: 'admin.mcp-servers.keep-running', section: 'mcp-servers', group: 'MCP Servers', label: 'Keep running', kind: KIND.ITEM, item: 'a tool in its own container',
+    help: 'A tool in its own container stops after 15 idle minutes by default. It starts again at its next use. Keep running keeps it up and uses memory all the time.',
+    note: 'Not on a hosted install, where every tool sleeps when idle. A tool that runs with the platform has no switch.',
+  }),
+  admin({
+    id: 'admin.mcp-servers.browser-local-network', section: 'mcp-servers', group: 'Local network', label: 'Let the browser open pages on your local network', kind: KIND.TOGGLE,
+    help: 'Turned on, the browser reaches what this server reaches. Changing it restarts the browser.',
+    note: 'Not on a hosted install. Callers and outside people lose the browser while it is on.',
   }),
   admin({
     id: 'admin.skills.package', section: 'skills', group: 'Skills', label: 'Skill package', names: ['Check Updates', 'Update', 'Delete', 'Browse Community Skills'], kind: KIND.ITEM, item: 'an installed skill package',
@@ -505,6 +505,16 @@ const ADMIN: readonly CatalogEntry[] = [
     id: 'admin.remote-machines.all-roles', section: 'remote-machines', group: 'Who runs here', label: 'Every role of its agents runs here', kind: KIND.ITEM, item: 'a machine an admin paired',
     help: 'Off, the chats of editors, contributors and viewers run on the OtoDock platform, as the machine has no sandbox. On, they run on the machine with its access. An outside caller always runs on the platform.',
     note: 'Only the agents whose default place is this machine. Turning it on asks first.',
+  }),
+  admin({
+    id: 'admin.remote-machines.compute-add', section: 'remote-machines', group: 'Compute machines', label: 'Add a compute machine', names: ['Add machine'], kind: KIND.ACTION,
+    help: 'Adds a server you control as a compute machine. You give it a name, then run one command on that server.',
+    note: 'Only an install that runs in Docker can add one. Otherwise the card says why.',
+  }),
+  admin({
+    id: 'admin.remote-machines.compute-machine', section: 'remote-machines', group: 'Compute machines', label: 'Compute machine', names: ['Pair again', 'Lock to this address', 'Remove'], kind: KIND.ITEM, item: 'a compute machine',
+    help: 'A machine the platform runs itself, with no owner. Chats, terminals, tasks, calls and meetings on the platform run on these machines. Apps run on the one beside the platform.',
+    note: 'The one beside the platform cannot be removed. Lock to this address refuses a sign-in from another address and tells every admin.',
   }),
   admin({
     id: 'admin.shares.share', section: 'shares', group: 'Shares', label: 'Share', names: ['Revoke'], kind: KIND.ITEM, item: 'a share or link',

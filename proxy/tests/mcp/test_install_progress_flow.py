@@ -12,6 +12,7 @@ keep tests fast and deterministic.
 import asyncio
 import sys
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -203,6 +204,7 @@ async def test_mcp_sync_invokes_plan_cb(monkeypatch):
 
     fake_cm = MagicMock()
     fake_cm.is_connected = MagicMock(return_value=True)
+    fake_cm.builds_own_tools = MagicMock(return_value=False)
     fake_cm.get_install_lock = MagicMock(return_value=_async_ctx())
     fake_cm.send_command = AsyncMock(return_value={"results": {}})
     fake_cm.register_install_progress = MagicMock()
@@ -282,6 +284,7 @@ async def test_mcp_sync_skips_plan_cb_when_no_install_needed(monkeypatch):
 
     fake_cm = MagicMock()
     fake_cm.is_connected = MagicMock(return_value=True)
+    fake_cm.builds_own_tools = MagicMock(return_value=False)
     fake_cm.get_install_lock = MagicMock(return_value=_async_ctx())
 
     fake_layer = MagicMock()
@@ -332,6 +335,7 @@ async def test_sync_result_captures_warmup_failures(monkeypatch):
 
     fake_cm = MagicMock()
     fake_cm.is_connected = MagicMock(return_value=True)
+    fake_cm.builds_own_tools = MagicMock(return_value=False)
     fake_cm.get_install_lock = MagicMock(return_value=_async_ctx())
     fake_cm.register_install_progress = MagicMock()
     fake_cm.unregister_install_progress = MagicMock()
@@ -347,8 +351,10 @@ async def test_sync_result_captures_warmup_failures(monkeypatch):
     async def _fake_fetch(cm, machine_id):
         return {}
 
-    def _mk_manifest():
+    def _mk_manifest(name):
         m = MagicMock()
+        m.name = name
+        m.mcp_dir = Path("/mcps/custom") / name
         m.server.runtime = "python"
         m.server.source = "pypi:x@1"
         m.category = "custom"
@@ -362,11 +368,12 @@ async def test_sync_result_captures_warmup_failures(monkeypatch):
     fake_tb.tarball_b64 = ""
     fake_tb.version_hash = "h"
 
+    # One registry for both lookups: the sync reads a machine's answer
+    # against all of it, so the process's own registry must not show through.
+    manifests = {name: _mk_manifest(name) for name in ("file-tools", "google-maps")}
     monkeypatch.setattr(mcp_sync, "_fetch_satellite_state", _fake_fetch)
-    monkeypatch.setattr(
-        "services.mcp.mcp_registry.get_manifest",
-        lambda name: _mk_manifest() if name in ("file-tools", "google-maps") else None,
-    )
+    monkeypatch.setattr("services.mcp.mcp_registry.get_manifest", manifests.get)
+    monkeypatch.setattr("services.mcp.mcp_registry.get_all_manifests", lambda: manifests)
     monkeypatch.setattr("services.mcp.mcp_tarball.build_tarball", lambda name: fake_tb)
     monkeypatch.setattr(
         "core.remote.satellite_connection.get_connection_manager", lambda: fake_cm)
@@ -425,6 +432,7 @@ def _memo_env(monkeypatch, *, results, version_hash="hash1"):
 
     fake_cm = MagicMock()
     fake_cm.is_connected = MagicMock(return_value=True)
+    fake_cm.builds_own_tools = MagicMock(return_value=False)
     fake_cm.get_install_lock = MagicMock(return_value=_async_ctx())
     fake_cm.send_command = AsyncMock(return_value={"results": results})
     fake_cm.register_install_progress = MagicMock()
@@ -616,6 +624,27 @@ async def test_a_network_failure_in_a_build_is_never_memoized(monkeypatch, log, 
     _, plan_cb, _ = _memo_env(monkeypatch, results={"music-gen-mcp": {"status": "error", "error": cause}})
     await mcp_sync.sync_mcps_for_session("machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb)
     assert (("machine-1", "music-gen-mcp") in mcp_sync._unsatisfiable_installs) is memoized, cause
+    mcp_sync._unsatisfiable_installs.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_build_the_memory_guard_stopped_is_told_and_never_memoized(monkeypatch):
+    """The machine was short of memory, not the tool broken: the admin reads
+    the guard's sentence and the next start builds again (mutation: a build
+    error beside it memoizes the failure for the hour)."""
+    from services.mcp import mcp_sync
+    _satellite_cause("")
+    from satellite.sessions.memory_guard import SENTENCES
+
+    cause = _satellite_cause(f"  × Failed to build `x==1`\n  ╰─▶ The build backend returned an error\n\n"
+                             f"{SENTENCES['own']}\n")
+    mcp_sync._unsatisfiable_installs.clear()
+    fake_cm, plan_cb, _ = _memo_env(monkeypatch, results={"music-gen-mcp": {"status": "error", "error": cause}})
+    r = await mcp_sync.sync_mcps_for_session("machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb)
+    assert r.failed["music-gen-mcp"].startswith("The build used too much memory and was stopped.")
+    assert not mcp_sync._unsatisfiable_installs
+    await mcp_sync.sync_mcps_for_session("machine-1", "s2", ["music-gen-mcp"], plan_cb=plan_cb)
+    assert fake_cm.send_command.await_count == 2
     mcp_sync._unsatisfiable_installs.clear()
 
 
@@ -840,17 +869,17 @@ def _platform(monkeypatch, folder: _McpFolder, shipped: dict[str, str]):
         m = MagicMock()
         m.name = name
         m.category = cat
+        m.mcp_dir = Path("/opt/otodock/mcps") / cat / name
         m.server.runtime = "python"
         m.server.transport = "stdio"
         manifests[name] = m
     cm = MagicMock()
     cm.is_connected = MagicMock(return_value=True)
+    cm.builds_own_tools = MagicMock(return_value=False)
     cm.get_install_lock = MagicMock(side_effect=lambda mid: _async_ctx())
     cm.send_command = AsyncMock(side_effect=folder.send_command)
     cm.get_connection = MagicMock(return_value=SimpleNamespace(
         satellite_version=folder.version, capabilities={}))
-    cm._satellite_at_least = lambda mid, v: tuple(
-        int(p) for p in folder.version.split(".")) >= v
 
     async def _hashes(names, *, force=False):
         return {n: "h" for n in names}
@@ -893,26 +922,17 @@ async def test_a_task_session_then_a_chat_session_installs_nothing(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_round_trip_for_a_core_leftover_on_an_old_satellite(monkeypatch):
+async def test_a_session_sync_removes_a_retired_mcp_from_any_known_category(monkeypatch, caplog):
     from services.mcp import mcp_sync
-    folder = _McpFolder({**_SHIPPED, "retired-core": "core", "odd": "extras"}, "0.5.136")
-    _platform(monkeypatch, folder, _SHIPPED)
-    result = await mcp_sync.sync_mcps_for_session("m-1", "s-1", ["file-x"])
-    assert folder.frames == []         # it would answer not_found every start
-    assert result.ok
-
-
-@pytest.mark.asyncio
-async def test_a_0_5_137_satellite_removes_a_retired_mcp_from_any_category(monkeypatch, caplog):
-    from services.mcp import mcp_sync
-    folder = _McpFolder({**_SHIPPED, "retired-core": "core", "retired": "community"}, "0.5.137")
+    folder = _McpFolder({**_SHIPPED, "retired-core": "core", "retired": "community",
+                         "odd": "extras"}, "0.5.137")
     _platform(monkeypatch, folder, _SHIPPED)
     with caplog.at_level("INFO", logger="otodock.mcp-sync"):
         result = await mcp_sync.sync_mcps_for_session("m-1", "s-1", ["file-x"])
     [frame] = folder.frames
     assert frame["remove_any_category"] is True
     assert sorted(frame["mcps_to_remove"]) == ["retired", "retired-core"]
-    assert folder.installed == _SHIPPED
+    assert folder.installed == {**_SHIPPED, "odd": "extras"}
     assert sorted(result.removed) == ["retired", "retired-core"]
     assert "sync_mcps plan m-1: install=[] update=[] remove=['retired', 'retired-core']" in caplog.text
 
@@ -929,6 +949,20 @@ async def test_sync_now_keeps_its_reach(monkeypatch):
     assert "remove_any_category" not in frame
     assert frame["mcps_to_remove"] == ["image-gen-mcp"]
     assert folder.installed == {"file-x": "custom", "agent-config-mcp": "core"}
+    assert "hosted" not in frame
+
+
+@pytest.mark.asyncio
+async def test_a_hosted_install_says_so_in_its_sync_frame(monkeypatch):
+    """A compute machine's own builds block a hosted install's ranges too."""
+    import config
+    from services.mcp import mcp_sync
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
+    folder = _McpFolder(_SHIPPED, "0.5.177")
+    _platform(monkeypatch, folder, _SHIPPED)
+    await mcp_sync.sync_mcps_for_session("m-1", "", ["file-x"])
+    [frame] = folder.frames
+    assert frame["hosted"] is True
 
 
 @pytest.mark.asyncio
@@ -1020,6 +1054,9 @@ class _Satellite:
     def is_connected(self, mid):
         return True
 
+    def builds_own_tools(self, mid):
+        return False
+
     def get_install_lock(self, mid):
         return self.lock
 
@@ -1031,9 +1068,6 @@ class _Satellite:
 
     def get_connection(self, mid):
         return self.conn
-
-    def _satellite_at_least(self, mid, version):
-        return True
 
     async def send_command(self, mid, frame, *, timeout=30.0, command_id=None):
         if frame["type"] != "sync_mcps":
@@ -1373,7 +1407,7 @@ async def test_a_remote_start_leaves_out_the_tools_still_installing(monkeypatch)
     layer = RemoteExecutionLayer(cm)
     servers = {n: {"command": "python", "args": [f"{n}.py"]} for n in ("memory", "blender", "schedules")}
 
-    async def _payload(session_id, config, execution_path):
+    async def _payload(session_id, config, execution_path, spawn=None):
         return RemoteStartPlan(payload={"mcp_config": {"mcpServers": dict(servers)},
                                         "system_prompt": "PROMPT"})
 
@@ -1400,7 +1434,7 @@ async def test_a_remote_start_leaves_out_the_tools_still_installing(monkeypatch)
     class _Stop(Exception):
         pass
 
-    async def _gateway(session_id, config, payload, machine_id, plan):
+    async def _gateway(session_id, config, payload, machine_id, push=True):
         seen["payload"] = payload
         raise _Stop
 
@@ -1658,3 +1692,33 @@ def test_each_kind_of_start_waits_its_own_while():
     assert mcp_sync.early_start_for(session_kind.PHONE.name) == mcp_sync.PHONE_EARLY_START_S == 45.0
     for kind in (session_kind.TASK, session_kind.MEETING, session_kind.TRIGGER):
         assert mcp_sync.early_start_for(kind.name) is None
+
+
+@pytest.mark.asyncio
+async def test_an_ahead_sync_removes_nothing(monkeypatch):
+    """Install ahead never removes a tool: not one no agent wants, not one the
+    platform no longer ships."""
+    from services.mcp import mcp_sync
+    folder = _McpFolder({**_SHIPPED, "retired": "community"}, "0.5.137")
+    _platform(monkeypatch, folder, _SHIPPED)
+    result = await mcp_sync.sync_mcps_for_session("m-1", "", ["file-x"], remove_unwanted=False)
+    assert folder.frames == [] and result.ok
+    assert folder.installed == {**_SHIPPED, "retired": "community"}
+
+
+@pytest.mark.asyncio
+async def test_a_chat_beside_an_ahead_run_is_promised_only_what_a_watch_follows(monkeypatch):
+    """A chat that starts while install ahead holds the machine reads the
+    tool the running sync installs as still installing, with that sync's
+    watch (so it hears when it ends), and the run's other tools as not
+    installed yet: nothing follows those, so nothing is promised."""
+    from services.mcp import mcp_sync
+    folder = _McpFolder({"file-x": "custom"}, "0.5.137")
+    _platform(monkeypatch, folder, _SHIPPED)
+    from core.remote.satellite_connection import get_connection_manager
+    watch = mcp_sync.InstallWatch("m-1", ["image-gen-mcp"], {"image-gen-mcp": 60.0}, {"image-gen-mcp"})
+    monkeypatch.setitem(mcp_sync._watches, "m-1", watch)
+    result = await mcp_sync._beside_running_sync(
+        get_connection_manager(), "m-1", {"file-x", "image-gen-mcp", "agent-config-mcp"}, force=False)
+    assert result.still_installing == {"image-gen-mcp"} and result.watch is watch
+    assert result.not_installed == {"agent-config-mcp"}

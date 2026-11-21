@@ -24,7 +24,7 @@ from tests.mcp.test_meeting_mcp_exclusion import _catalog_manifest, _manifest
 
 
 def _contexts(**kw) -> set[str]:
-    from services.mcp.mcp_registry import _exclusion_contexts
+    from services.mcp.mcp_session_filter import _exclusion_contexts
     args = dict(phone_mode=False, task_mode=False, interactive_local=False, meeting_mode=False, external=False)
     args.update(kw)
     return _exclusion_contexts(**args)
@@ -53,7 +53,7 @@ def test_the_config_build_leaves_the_manifest_out_and_the_prompt_agrees(monkeypa
     """An agent-scope mount implies the context (the Direct LLM pool builds
     with the scope alone), and the prompt catalog and skills, asked with the
     same fact, advertise exactly what the config loads."""
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_agent_skills, mcp_registry
 
     manifests = [
         _catalog_manifest("always-on", [], skill=[], tmp_path=tmp_path),
@@ -63,7 +63,7 @@ def test_the_config_build_leaves_the_manifest_out_and_the_prompt_agrees(monkeypa
     ]
     by_name = {m.name: m for m in manifests}
     _stub_assembly(monkeypatch, manifests, env_by_mcp={}, tmp_path=tmp_path)
-    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: list(manifests))
+    monkeypatch.setattr(mcp_agent_skills, "get_agent_mcps", lambda *a, **k: list(manifests))
 
     path, _env, excluded, _bundles, _bash = mcp_registry.build_session_mcp_config("agent", None, **kwargs)
     loaded = set(json.loads(path.read_text())["mcpServers"])
@@ -93,13 +93,13 @@ def test_a_chat_lane_loads_the_settings_tool_and_a_task_lane_does_not(monkeypatc
     ``shared_chat=True``) and loads the shipped settings-mcp: its cards ask
     the delegator, who is present. A task lane keeps the task context and
     goes without it; the cards routes refuse where nobody can press."""
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_agent_skills, mcp_registry
     from services.mcp.mcp_manifest_parse import _parse_manifest
     shipped = _parse_manifest(PROXY_DIR.parent / "mcps" / "custom" / "settings-mcp" / "manifest.json")
     assert mcp_registry.SHARED_CHAT_CONTEXT not in shipped.exclude_from
     manifests = [_catalog_manifest("settings-mcp", shipped.exclude_from)]
     _stub_assembly(monkeypatch, manifests, env_by_mcp={}, tmp_path=tmp_path)
-    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: list(manifests))
+    monkeypatch.setattr(mcp_agent_skills, "get_agent_mcps", lambda *a, **k: list(manifests))
     path, _env, excluded, _bundles, _bash = mcp_registry.build_session_mcp_config(
         "agent", None, task_mode=True, chat_worker=True, shared_chat=True)
     assert "settings-mcp" in set(json.loads(path.read_text())["mcpServers"])
@@ -145,7 +145,10 @@ def _prompt_calls(rig) -> list[dict]:
 
 @pytest.fixture
 def rig(temp_db, monkeypatch, tmp_path):
+    from tests._compute import serve
     from tests.fixtures.loop_builder_rig import install
+    # A compute machine serves the platform's place: the chats build on it.
+    serve(monkeypatch)
     return install(monkeypatch, tmp_path)
 
 

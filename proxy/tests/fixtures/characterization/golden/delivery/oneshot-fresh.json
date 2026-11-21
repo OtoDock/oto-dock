@@ -1,0 +1,74 @@
+{
+ "answer": "",
+ "chat_session": "<uuid>",
+ "configs": [
+  {
+   "resume": false,
+   "resume_handle": ""
+  }
+ ],
+ "rows": [
+  {
+   "content": "",
+   "event_data": {
+    "machine_name": "",
+    "message": "The previous session could not be resumed — this chat continued with a fresh session. The conversation was restored from history; the previous session's working files may no longer be available.",
+    "reason": "resume_failed",
+    "subtype": "session_reseeded",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "content": "ECHO TEXT",
+   "event_data": null,
+   "event_type": "",
+   "role": "assistant"
+  }
+ ],
+ "seen": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<uuid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<uuid>"
+   ],
+   [
+    "send_message",
+    "<uuid>",
+    "WAKE"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ }
+}

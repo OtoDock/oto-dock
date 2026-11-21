@@ -252,3 +252,40 @@ class TestListMatch:
         ])
         assert evaluate("m", "t", {"k": "v"}, block).amount == 1.0
         assert evaluate("m", "t", {"k": "other"}, block) is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# result_has: a default that hangs on a credential. The arguments cannot say
+# which model ran, so the tool's answer does.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestResultHas:
+    def _block(self) -> CostsBlock:
+        return CostsBlock(currency="USD", provider="x", rules=[
+            CostRule(tool="t", match={"model": "b"}, amount=0.07, multiply_by="n"),
+            CostRule(tool="t", amount=0.07, multiply_by="n", result_has="with B."),
+            CostRule(tool="t", amount=0.18, multiply_by="n"),
+        ])
+
+    def test_the_answer_picks_the_rule(self):
+        hit = evaluate("m", "t", {"n": 5}, self._block(), tool_result="Made 5s with B.")
+        assert hit.amount == pytest.approx(0.35)
+
+    def test_another_answer_falls_through(self):
+        hit = evaluate("m", "t", {"n": 5}, self._block(), tool_result="Made 5s with A.")
+        assert hit.amount == pytest.approx(0.9)
+
+    def test_an_unknown_answer_never_matches_it(self):
+        assert evaluate("m", "t", {"n": 5}, self._block()).amount == pytest.approx(0.9)
+        assert evaluate("m", "t", {"n": 5}, self._block(), tool_result=None).amount == pytest.approx(0.9)
+
+    def test_words_past_the_first_sentence_do_not_count(self):
+        # A save path the caller chose sits after the first sentence: its words
+        # never price the call.
+        answer = "Made 5s with A. Saved to: /work/made with B./clip.mp4"
+        assert evaluate("m", "t", {"n": 5}, self._block(), tool_result=answer).amount == pytest.approx(0.9)
+
+    def test_the_arguments_still_come_first(self):
+        hit = evaluate("m", "t", {"model": "b", "n": 2}, self._block(), tool_result="Made 2s with A.")
+        assert hit.amount == pytest.approx(0.14)

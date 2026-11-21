@@ -1,0 +1,49 @@
+{
+ "an_older_push_failing_under_a_newer_mark": {
+  "sat-one-0|flow-agent|workspace/p.txt": {
+   "in_flight_until": 0.0,
+   "machine": null,
+   "mtime_ns": 100,
+   "retry_at": 0.0,
+   "size": 10,
+   "stale": false
+  }
+ },
+ "no_answer_takes_the_fallback": {
+  "sat-one-0|flow-agent|workspace/p.txt": {
+   "in_flight_until": 0.0,
+   "machine": {
+    "exists": true,
+    "mtime_ns": 2,
+    "size": 1
+   },
+   "mtime_ns": 100,
+   "retry_at": 0.0,
+   "size": 10,
+   "stale": false
+  }
+ },
+ "probe_frames": [
+  {
+   "agent_slug": "flow-agent",
+   "command_id": "<id>",
+   "path": "workspace/p.txt",
+   "path_kind": "agent_tree",
+   "type": "file_stat"
+  }
+ ],
+ "probed": {
+  "sat-one-0|flow-agent|workspace/p.txt": {
+   "in_flight_until": 0.0,
+   "machine": {
+    "exists": true,
+    "mtime_ns": 55,
+    "size": 10
+   },
+   "mtime_ns": 100,
+   "retry_at": 0.0,
+   "size": 10,
+   "stale": false
+  }
+ }
+}

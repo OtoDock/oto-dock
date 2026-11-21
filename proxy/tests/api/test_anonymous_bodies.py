@@ -151,6 +151,7 @@ OPEN_ROUTES = {
     "/auth/passkey/options": _SIGN_IN, "/auth/passkey/verify": _SIGN_IN,
     "/auth/passkey/native/start": _SIGN_IN, "/auth/passkey/native/exchange": _SIGN_IN,
     "/health": "liveness for the edge and the installer, no data",
+    "/health/ready": "the readiness probe for a load balancer or a waking scheduler, the /health body",
     "/v1/csp-report": "the browser's script-policy reports",
     "/v1/webhooks/relay/{provider_id}": "vendor deliveries through the relay, signed per vendor",
     "/v1/webhooks/{provider_id}/{subscription_id}": "vendor deliveries, signed per subscription",
@@ -160,6 +161,8 @@ OPEN_ROUTES = {
     "/v1/webhooks/{provider_id}/app": "a GitHub App's deliveries, signed with the app secret",
     "/v1/oauth/microsoft/admin-consent/callback": "Microsoft's admin-consent redirect back",
     "/v1/images/temp/{token}": "a temporary image by its unguessable token",
+    "/v1/apps/{app_id}/client/media": "an app's media link: the secret names a link a signed-in page was "
+                                      "given, and every gate of the mint is run again before a byte is sent",
     "/v1/twilio/inbound/{server_id}": "Twilio's signed call webhook",
     "/v1/twilio/status/{server_id}": "Twilio's signed status webhook",
     "/v1/twilio/transfer/{server_id}": "Twilio's signed action callback of a transfer's Dial",

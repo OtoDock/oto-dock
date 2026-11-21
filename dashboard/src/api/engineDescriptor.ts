@@ -89,7 +89,6 @@ export interface EngineRuntime {
 export interface EngineBehaviour {
   rebuilds_history_from_db: boolean
   attach_images_inline: boolean
-  phone_http_mcps: boolean
   skills_delivery: 'materialized_dir' | 'prompt_catalog' | string
   supports_bash: boolean
   supports_plans_dir: boolean

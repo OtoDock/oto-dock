@@ -1,0 +1,625 @@
+[
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-title-chars",
+    {
+     "agent": "term-title"
+    }
+   ]
+  ],
+  "slot_acquired": [
+   [
+    "sid-title-chars",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-title-chars": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "below the characters' threshold",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-title-chars",
+    {
+     "agent": "term-title"
+    }
+   ]
+  ],
+  "state": {
+   "sid-title-chars": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the characters' threshold",
+  "title": [
+   [
+    "chat-title-chars",
+    ""
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-title-chars",
+    {
+     "agent": "term-title"
+    }
+   ]
+  ],
+  "state": {
+   "sid-title-chars": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "once"
+ },
+ {
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_released": [
+   "sid-title-chars"
+  ],
+  "state": {
+   "sid-title-chars": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "closed"
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-title-tools",
+    {
+     "agent": "term-title"
+    }
+   ]
+  ],
+  "slot_acquired": [
+   [
+    "sid-title-tools",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-title-tools": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "the tools' threshold",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ],
+  "title": [
+   [
+    "chat-title-tools",
+    ""
+   ]
+  ]
+ },
+ {
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_released": [
+   "sid-title-tools"
+  ],
+  "state": {
+   "sid-title-tools": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "closed"
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-title-timer",
+    "streaming",
+    {
+     "agent": "term-title"
+    }
+   ]
+  ],
+  "slot_acquired": [
+   [
+    "sid-title-timer",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-title-timer": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [
+     "_run_midturn_tail"
+    ],
+    "title_armed": false,
+    "turn_open": true
+   }
+  },
+  "step": "the early timer of the first open",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_fire_title_timer",
+    30.0
+   ],
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ],
+  "title": [
+   [
+    "chat-title-timer",
+    ""
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-title-timer",
+    "ready",
+    {
+     "agent": "term-title"
+    }
+   ]
+  ],
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_released": [
+   "sid-title-timer"
+  ],
+  "state": {
+   "sid-title-timer": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "closed",
+  "turn_end": [
+   [
+    "sid-title-timer",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-title-young",
+    {
+     "agent": "term-title"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-title-young",
+    "ready",
+    {
+     "agent": "term-title"
+    }
+   ]
+  ],
+  "slot_acquired": [
+   [
+    "sid-title-young",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-title-young": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a young terminal titles but gives no notice",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ],
+  "title": [
+   [
+    "chat-title-young",
+    "m"
+   ]
+  ],
+  "turn_end": [
+   [
+    "sid-title-young",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "pty_close": [
+   {
+    "signal_child": true
+   }
+  ],
+  "slot_released": [
+   "sid-title-young"
+  ],
+  "state": {
+   "sid-title-young": {
+    "alive": false,
+    "closing": true,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "closed"
+ },
+ {
+  "broadcast_chat_rows": [
+   [
+    "user-admin",
+    "chat-titled",
+    {
+     "agent": "term-title"
+    }
+   ]
+  ],
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-titled",
+    "ready",
+    {
+     "agent": "term-title"
+    }
+   ],
+   [
+    "user-admin",
+    "chat-titled",
+    "ready",
+    {
+     "agent": "term-title"
+    }
+   ]
+  ],
+  "ephemeral": [
+   {
+    "body": "Response ready",
+    "chat_id": "chat-titled",
+    "cli_attached": false,
+    "interactive": true,
+    "title": "WS Dash Test finished",
+    "user_sub": "user-admin"
+   }
+  ],
+  "library_reconcile": [
+   "term-title"
+  ],
+  "slot_acquired": [
+   [
+    "sid-titled",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-titled": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": false,
+    "timers": [],
+    "title_armed": false,
+    "turn_open": false
+   }
+  },
+  "step": "a titled chat never asks again",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ]
+  ],
+  "turn_end": [
+   [
+    "sid-titled",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ }
+]

@@ -73,23 +73,11 @@ class Target:
     why_not: str
     owner_sub: str = ""
     allowed: bool = True   # the guard passed (a pick may still wait for the machine)
-    moves_files: bool = True   # its satellite moves a chat's session files (moves_files)
 
     def view(self) -> dict:
         d = asdict(self)
         d.pop("owner_sub", None)
         return d
-
-
-def moves_files(place: str) -> bool:
-    """A move from or to ``place`` can carry the chat's session files: the
-    platform always, a machine whose connected satellite moves them
-    (``session_move``). A move with a place that cannot continues from a
-    summary of the conversation."""
-    if placement.is_local(place):
-        return True
-    from core.remote.satellite_connection import get_connection_manager
-    return get_connection_manager().satellite_supports_session_move(place)
 
 
 def label_of(target: str | None, machine: dict | None = None) -> str:
@@ -180,6 +168,8 @@ def offered(agent: str, person: RunPerson, *, engine_path: str,
             rows[default] = default_row
     for mid, m in sorted(rows.items(), key=lambda kv: (kv[1].get("pairing_scope") != placement.PAIRING_USER,
                                                        str(kv[1].get("name") or ""))):
+        if placement.machine_is_compute(m):
+            continue  # the platform's own machine serves the platform's place, never by its id
         if not allowed_user and not placement.machine_is_admin_paired(m):
             continue  # personal computers are turned off on this platform
         live = remote_status.get_live_machine_status(mid, machine=m)
@@ -190,15 +180,15 @@ def offered(agent: str, person: RunPerson, *, engine_path: str,
         if not guard:
             why = f"You can't run this chat on {name}."
         elif not live["reachable"]:
-            why = f"{name} is offline."
+            from services.remote import machine_away
+            why = machine_away.away_sentence(mid, name, f"{name} is offline.")
         elif not _engines_ok(mid, engine_path):
             why = f"{name} can't run this chat's engine."
         pairing = (placement.PAIRING_ADMIN if placement.machine_is_admin_paired(m)
                    else placement.PAIRING_USER)
         out.append(Target(mid, name, pairing, live["state"], bool(live["reachable"]),
                           mid == default, not why, why,
-                          owner_sub=str(m.get("registered_by") or ""), allowed=guard,
-                          moves_files=moves_files(mid)))
+                          owner_sub=str(m.get("registered_by") or ""), allowed=guard))
     return default, out
 
 

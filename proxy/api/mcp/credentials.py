@@ -9,12 +9,12 @@ Auth: OAuth2 session cookie (dashboard users).
 import asyncio
 import functools
 import logging
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from api.mcp import account_sets, service_account_set as service_account_set_api
 from auth import github_reach
 from auth.oauth_providers import github_app
 from auth.providers import (
@@ -24,11 +24,15 @@ from auth.providers import (
     require_auth,
     require_user,
 )
-from services.mcp import mcp_registry
+from services.mcp import account_context, mcp_registry
 from services.oauth import credential_resolver, github_apps, oauth_account_store
 from storage import database as task_store
 from storage.agents import agent_store
-from storage.identity import credential_store, oauth_app_kinds
+from storage.identity import (
+    credential_store,
+    oauth_app_kinds,
+    service_account_set as service_account_set_store,
+)
 from storage.mcp import mcp_store
 
 if TYPE_CHECKING:
@@ -36,6 +40,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("otodock.credential-api")
 router = APIRouter(dependencies=[Depends(require_user)])
+# An agent's set of a person's accounts (``proxy/app.py`` mounts only this
+# router).
+router.include_router(account_sets.router)
+router.include_router(service_account_set_api.router)
 
 
 # --- Request models ---
@@ -65,26 +73,6 @@ class SetAgentBindingRequest(BaseModel):
     account_label: str
     # The person's own GitHub reach for the agent with this account
     # (``auth/github_reach``): absent = keep what the choice holds.
-    repositories: list[str] | None = Field(default=None, max_length=github_reach.MAX_REPOSITORIES)
-    read_only: bool | None = None
-
-
-class SetServiceBindingRequest(BaseModel):
-    """Body for the agent → service-account binding endpoint.
-
-    Binds the agent to the CALLER's own connected account (``account_label``)
-    as its service identity — agent-scope sessions then read the caller's
-    tokens. The owner is always the caller (derived server-side); the caller
-    must have per-agent manager/admin role on the agent.
-    """
-
-    account_label: str
-    # A GitHub App installation of that account as the identity; absent =
-    # keep what the binding holds, "" = the account itself.
-    installation_id: str | None = None
-    # The agent's GitHub reach (``auth/github_reach``): the repositories it may
-    # reach as ``owner/name`` ([] = every one) and whether it may only read;
-    # absent = keep what the binding holds.
     repositories: list[str] | None = Field(default=None, max_length=github_reach.MAX_REPOSITORIES)
     read_only: bool | None = None
 
@@ -215,29 +203,27 @@ async def list_my_integrations(
         user_agents = agent_store.get_agent_slugs()
 
     needed_mcps: set[str] = set()
-    mcps_with_overridable_config: set[str] = set()
     manifest: McpManifest | None
     # Only surface MCPs that are ACTIVELY ENABLED (manager-enabled + admin-
     # authorized + platform-enabled) on at least one of the user's agents.
     # An MCP that's merely visible-but-not-enabled doesn't need user creds
-    # yet — surfacing it adds noise to the Integrations page.
+    # yet — surfacing it adds noise to the Integrations page. Every placement:
+    # a tool that loads only on a remote machine (an app connector) needs the
+    # person's account as much as any other. A tool with no account of its
+    # own is not listed: a person has nothing to set on its card (a
+    # ``user_overridable`` config row is listed on an account's card but
+    # nothing stores a person's value for it).
     for agent_name in user_agents:
         enabled = await asyncio.to_thread(
-            mcp_registry.get_agent_mcps, agent_name,
+            mcp_registry.get_agent_mcps_all_placements, agent_name,
         )
         for manifest in enabled:
-            mcp_name = manifest.name
-            cred_schema = _get_cred_schema(mcp_name)
+            cred_schema = _get_cred_schema(manifest.name)
             if cred_schema and cred_schema.get("type") == "per_user":
-                needed_mcps.add(mcp_name)
-            if any(f.user_overridable for f in manifest.config):
-                mcps_with_overridable_config.add(mcp_name)
-
-    # Merge: MCPs with per-user creds OR user-overridable config
-    all_mcps = needed_mcps | mcps_with_overridable_config
+                needed_mcps.add(manifest.name)
 
     result = []
-    for mcp_name in sorted(all_mcps):
+    for mcp_name in sorted(needed_mcps):
         cred_info = _get_cred_schema(mcp_name)
         manifest = mcp_registry.get_manifest(mcp_name)
 
@@ -252,13 +238,17 @@ async def list_my_integrations(
         agent_bindings = await asyncio.to_thread(
             credential_store.list_agent_account_bindings, user.sub, mcp_name,
         )
-        # group bindings by account_label
+        # group the agents' set rows by account_label (an agent whose set
+        # holds several accounts is under each of them)
         bindings_by_account: dict[str, list[str]] = {}
+        defaults_by_account: dict[str, list[str]] = {}
         reaches_by_account: dict[str, list[dict]] = {}
         for b in agent_bindings:
             bindings_by_account.setdefault(b["account_label"], []).append(
                 b["agent_name"]
             )
+            if b["is_default"]:
+                defaults_by_account.setdefault(b["account_label"], []).append(b["agent_name"])
             reaches_by_account.setdefault(b["account_label"], []).append({
                 "agent": b["agent_name"], "repositories": b["repositories"], "read_only": b["read_only"],
             })
@@ -270,9 +260,10 @@ async def list_my_integrations(
         email_key, services_key = oauth_account_store.resolve_account_credential_keys(
             oauth_block, provider_id,
         )
-        # Agents whose service identity is one of THIS user's accounts: the
-        # Connected Accounts card offers "Subscribe as <agent>" from them,
-        # so the option never rests on a client-side role guess.
+        # Agents whose own set holds one of THIS user's accounts: the
+        # Connected Accounts card offers "Subscribe as <agent>" on each, since
+        # every account of the set keeps its own subscriptions, so the option
+        # never rests on a client-side role guess.
         service_rows = await asyncio.to_thread(
             credential_store.list_service_agent_bindings, mcp_name,
         )
@@ -328,11 +319,15 @@ async def list_my_integrations(
                     else credential_resolver.missing_required_labels(cred_info, acc_creds)
                 ),
                 "connected_services": connected_services,
+                # Every agent whose set holds this account.
                 "agent_overrides": sorted(
                     bindings_by_account.get(acc["account_label"], [])
                 ),
+                # The agents of ``agent_overrides`` whose set's default it is.
+                "agent_defaults": sorted(defaults_by_account.get(acc["account_label"], [])),
                 # The person's own GitHub reach for each agent of
-                # ``agent_overrides`` (``[]`` and false: everything).
+                # ``agent_overrides`` with this account (``[]`` and false:
+                # everything).
                 "agent_reaches": reaches_by_account.get(acc["account_label"], []),
                 "missing_scopes": missing_scopes,
                 "service_bindings": service_bindings,
@@ -370,18 +365,27 @@ async def list_my_integrations(
         candidate_agents = []
         for agent in user_assigned_agents:
             enabled = await asyncio.to_thread(
-                mcp_registry.get_agent_mcps, agent,
+                mcp_registry.get_agent_mcps_all_placements, agent,
             )
             if any(m.name == mcp_name for m in enabled):
                 candidate_agents.append(agent)
 
-        # A Shared-only agent's chats resolve as the agent (its own service
-        # binding and its reach): a person's choice for it never applies, so
-        # the card offers no repositories for it.
-        shared_only_agents: list[str] = []
-        if _reach_supported(mcp_name):
-            from core.session.visibility import is_shared_only
-            shared_only_agents = [a for a in candidate_agents if await asyncio.to_thread(is_shared_only, a)]
+        # An agent whose people's chats run on its own accounts (a Shared-only
+        # one, a team account): a person's choice for it never applies, so
+        # the card offers none and names the account its chats use.
+        from services.mcp import account_context
+        agents_on_own_accounts = [
+            a for a in candidate_agents
+            if await asyncio.to_thread(account_context.people_use_agents_accounts, a)]
+        agent_accounts = await service_account_set_api.accounts_in_use(mcp_name, agents_on_own_accounts)
+        # Of those, the agents whose team account floor this person is
+        # below: their chats there get no account at all.
+        from auth.providers import acting_role_of
+        agents_below_floor = []
+        for a in agents_on_own_accounts:
+            role = await asyncio.to_thread(acting_role_of, user.sub, a)
+            if await asyncio.to_thread(account_context.team_floor_refusal, a, role):
+                agents_below_floor.append(a)
 
         oauth_meta = dict(cred_info.get("oauth_meta", {}) if cred_info else {})
         if cred_info and cred_info.get("app_kinds"):
@@ -430,12 +434,27 @@ async def list_my_integrations(
             "candidate_agents": candidate_agents,
             # A choice of account for an agent may narrow its GitHub reach.
             "reach_supported": _reach_supported(mcp_name),
-            "shared_only_agents": shared_only_agents,
+            "agents_on_own_accounts": agents_on_own_accounts,
+            "agent_accounts": agent_accounts,
+            "agents_below_floor": agents_below_floor,
         }
 
         result.append(entry)
 
     return result
+
+
+# A new account's label: the person's own word for it, which their agents
+# read in their prompt (the accounts a chat may switch between).
+_LABEL_MAX = 64
+
+
+def _check_new_label(label: str) -> None:
+    if (not label or len(label) > _LABEL_MAX or "`" in label
+            or any(not ch.isprintable() for ch in label)):
+        raise HTTPException(
+            400, f"An account's label is one line of up to {_LABEL_MAX} characters, "
+                 "with no backtick.")
 
 
 @router.put("/v1/users/me/integrations/{mcp_name}")
@@ -466,6 +485,8 @@ async def set_my_integration(
     stored = await asyncio.to_thread(
         credential_store.get_user_credentials, user.sub, mcp_name, label,
     )
+    if not stored:
+        _check_new_label(label)
     required = set(credential_resolver.required_field_keys(cred_info))
     missing = required - set(body.credentials) - set(stored or {})
     if missing:
@@ -509,6 +530,12 @@ async def delete_my_integration(
     if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
 
+    # An agent's own set lends this account: it leaves as at an OAuth
+    # disconnect, while its values still exist.
+    from services.agents import offboarding_bindings
+    for row in await asyncio.to_thread(credential_store.list_service_agent_bindings_for_owner, user.sub):
+        if row["mcp_name"] == mcp_name and row["account_label"] == account_label:
+            await offboarding_bindings.clear_binding(row, user.sub)
     await asyncio.to_thread(
         credential_store.delete_user_credentials,
         user.sub, mcp_name, account_label,
@@ -549,44 +576,13 @@ async def set_agent_binding(
     body: SetAgentBindingRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    """Pin an agent to a specific account.
+    """Make the agent's set of the caller's accounts exactly this one, its
+    default (the meaning an open 1.9.1 page gives it; a set of several is
+    written through ``api/mcp/account_sets.py``).
 
-    Two gates (matching the candidate-agents filter in
-    ``list_my_integrations`` — applied server-side too as defense in depth
-    against a UI bypass):
-
-    1. The agent must be in the caller's DIRECTLY ASSIGNED list. Admin
-       role does NOT extend this check — binding a personal OAuth account
-       to an agent the admin isn't assigned to is a personal-use decision
-       that shouldn't be triggered by management role alone.
-    2. The MCP must be ENABLED on that agent (manager has actively turned
-       it on). A binding to an agent where the MCP isn't running would
-       never resolve at session start, so reject up-front.
+    The gates are ``_own_choice_gates``'s.
     """
-    if require_auth(user).is_api_key:
-        raise HTTPException(403, "Dashboard only")
-    user_assigned_agents = await asyncio.to_thread(
-        task_store.get_user_agents, user.sub,
-    )
-    if body.agent_name not in user_assigned_agents:
-        raise HTTPException(
-            403,
-            f"Agent {body.agent_name!r} is not in your assigned agents. "
-            f"Per-agent account bindings are limited to agents you actively use.",
-        )
-    enabled = await asyncio.to_thread(
-        mcp_registry.get_agent_mcps, body.agent_name,
-    )
-    if not any(m.name == mcp_name for m in enabled):
-        raise HTTPException(
-            400,
-            f"MCP {mcp_name!r} is not enabled on agent {body.agent_name!r}",
-        )
-    accounts = await asyncio.to_thread(credential_store.list_user_accounts, user.sub, mcp_name)
-    if not any(a["account_label"] == body.account_label for a in accounts):
-        raise HTTPException(
-            404, f"Account '{body.account_label}' not found for {mcp_name}",
-        )
+    await _own_choice_gates(user, mcp_name, body.agent_name, body.account_label)
     await _check_own_reach(body, mcp_name, user)
     ok = await asyncio.to_thread(
         functools.partial(
@@ -601,6 +597,7 @@ async def set_agent_binding(
         )
     row = await asyncio.to_thread(
         credential_store.get_account_agent_binding, user.sub, mcp_name, body.agent_name,
+        body.account_label,
     )
     return {
         "status": "ok",
@@ -609,19 +606,70 @@ async def set_agent_binding(
     }
 
 
+async def _assigned_gate(user: UserContext, agent_name: str) -> None:
+    """A person's own choice of account is limited to the agents they are
+    DIRECTLY assigned. Admin role does NOT extend this check: binding a
+    personal account to an agent the admin isn't assigned to is a
+    personal-use decision, not an administrative one."""
+    if require_auth(user).is_api_key:
+        raise HTTPException(403, "Dashboard only")
+    user_assigned_agents = await asyncio.to_thread(
+        task_store.get_user_agents, user.sub,
+    )
+    if agent_name not in user_assigned_agents:
+        raise HTTPException(
+            403,
+            f"Agent {agent_name!r} is not in your assigned agents. "
+            f"You choose accounts only for the agents you use.",
+        )
+
+
+async def _own_choice_gates(user: UserContext, mcp_name: str, agent_name: str, account_label: str) -> None:
+    """The gates of a write of a person's own account for an agent
+    (matching the candidate-agents filter in ``list_my_integrations``,
+    applied server-side too as defense in depth against a UI bypass): the
+    assigned-agent gate (``_assigned_gate``); the MCP ENABLED on that agent
+    (a manager turned it on: a choice for an agent where the MCP isn't
+    running would never resolve at session start); the account one of the
+    caller's own."""
+    await _assigned_gate(user, agent_name)
+    from services.mcp import account_context
+    if await asyncio.to_thread(account_context.people_use_agents_accounts, agent_name):
+        raise HTTPException(409, service_account_set_api.AGENTS_OWN)
+    enabled = await asyncio.to_thread(
+        mcp_registry.get_agent_mcps_all_placements, agent_name,
+    )
+    if not any(m.name == mcp_name for m in enabled):
+        raise HTTPException(
+            400,
+            f"MCP {mcp_name!r} is not enabled on agent {agent_name!r}",
+        )
+    accounts = await asyncio.to_thread(credential_store.list_user_accounts, user.sub, mcp_name)
+    if not any(a["account_label"] == account_label for a in accounts):
+        raise HTTPException(
+            404, f"Account '{account_label}' not found for {mcp_name}",
+        )
+
+
 _NO_OWN_LIST = (
     "This account has no list of repositories to pick from. You can still make an "
     "agent read only."
 )
 
 
-async def _check_own_reach(body: SetAgentBindingRequest, mcp_name: str, user: UserContext) -> None:
+async def _check_own_reach(
+    body: SetAgentBindingRequest | account_sets.AgentAccountRequest, mcp_name: str, user: UserContext, *,
+    replaces_set: bool = True,
+) -> None:
     """The person's own reach for an agent, refused in plain words when it
     cannot hold, as the service PUT refuses one: a narrowing on GitHub only,
     a list only on a GitHub-App account, a name the account does not reach.
     Only names the choice does not hold yet are looked up; a list kept onto
     another account is looked up on it (a token account keeps it as it is:
-    it only narrows)."""
+    it only narrows). The choice held is the named account's own row; with
+    ``replaces_set`` (the write that makes the set this one account), the
+    set's default when the set does not hold the account, whose reach that
+    write keeps."""
     names = body.repositories or []
     if not _reach_supported(mcp_name):
         if names or body.read_only:
@@ -630,7 +678,12 @@ async def _check_own_reach(body: SetAgentBindingRequest, mcp_name: str, user: Us
     _refuse_unreadable(names)
     prior = await asyncio.to_thread(
         credential_store.get_account_agent_binding, user.sub, mcp_name, body.agent_name,
+        body.account_label,
     )
+    if prior is None and replaces_set:
+        prior = await asyncio.to_thread(
+            credential_store.get_account_agent_binding, user.sub, mcp_name, body.agent_name,
+        )
     same_account = prior is not None and prior.account_label == body.account_label
     kept = body.repositories is None
     if kept:
@@ -679,23 +732,15 @@ async def remove_agent_binding(
     agent_name: str,
     user: UserContext = Depends(get_current_user),
 ):
-    """Drop the per-agent override (agent reverts to user's default account).
+    """Empty the agent's set of the caller's accounts (the agent reverts to
+    the user's default account), the meaning an open 1.9.1 page gives it.
 
     Same assigned-agents gate as ``set_agent_binding`` — admin role does
-    NOT bypass; the binding is owned by the caller and can only be removed
-    by the caller if they're assigned to the agent. Safe to call when no
-    binding exists (idempotent).
+    NOT bypass; the set is owned by the caller and can only be emptied
+    by the caller if they're assigned to the agent. Safe to call when the
+    set is empty (idempotent).
     """
-    if require_auth(user).is_api_key:
-        raise HTTPException(403, "Dashboard only")
-    user_assigned_agents = await asyncio.to_thread(
-        task_store.get_user_agents, user.sub,
-    )
-    if agent_name not in user_assigned_agents:
-        raise HTTPException(
-            403,
-            f"Agent {agent_name!r} is not in your assigned agents.",
-        )
+    await _assigned_gate(user, agent_name)
     await asyncio.to_thread(
         credential_store.remove_account_agent_binding,
         user.sub, mcp_name, agent_name,
@@ -709,47 +754,37 @@ async def remove_agent_binding(
 # against the bound account's owner_sub.
 
 
+async def _service_gates(user: UserContext, agent_name: str, mcp_name: str) -> None:
+    """The gates of every write and read of an agent's own accounts: the
+    dashboard, a manager of the agent, an agent with accounts of its own (not
+    Personal only), a tool that takes a service account and is in the
+    agent's visible set."""
+    if require_auth(user).is_api_key:
+        raise HTTPException(403, "Dashboard only")
+    if not user.can_manage_agent(agent_name):
+        raise HTTPException(403, f"Manager role on agent {agent_name!r} required")
+    if not await asyncio.to_thread(account_context.holds_own_accounts, agent_name):
+        raise HTTPException(409, account_context.PERSONAL_ONLY)
+    cred_info = _get_cred_schema(mcp_name)
+    if not cred_info or not cred_info.get("has_service_account"):
+        raise HTTPException(400, f"'{mcp_name}' is not a service-account-capable MCP")
+    visible = await asyncio.to_thread(mcp_registry.get_visible_mcps_for_agent, agent_name)
+    if not any(m.name == mcp_name for m in visible):
+        raise HTTPException(400, f"MCP {mcp_name!r} is not visible to agent {agent_name!r}")
+
+
 @router.get("/v1/agents/{agent_name}/mcps/{mcp_name}/service-account-options")
 async def get_agent_service_account_options(
     agent_name: str,
     mcp_name: str,
     user: UserContext = Depends(get_current_user),
 ):
-    """Return the dropdown data for binding an agent to a service account.
-
-    Manager+ of the agent only. The dropdown shows ``my_accounts`` — the
-    caller's connected ``user_credential_accounts`` rows for this MCP. A
-    manager binding their own account makes it double as the agent's service
-    identity.
-
-    Response shape:
-      {
-        "my_accounts":     [...],
-        "current_binding": {label, owner_sub, owner_name, owner_email,
-                            set_by, set_at} | null,
-      }
-    """
-    if require_auth(user).is_api_key:
-        raise HTTPException(403, "Dashboard only")
-    if not user.can_manage_agent(agent_name):
-        raise HTTPException(
-            403, f"Manager role on agent {agent_name!r} required",
-        )
-
-    cred_info = _get_cred_schema(mcp_name)
-    if not cred_info or not cred_info.get("has_service_account"):
-        raise HTTPException(
-            400, f"'{mcp_name}' is not a service-account-capable MCP",
-        )
-
-    # Visibility gate — the MCP must be in the agent's visible set.
-    visible = await asyncio.to_thread(
-        mcp_registry.get_visible_mcps_for_agent, agent_name,
-    )
-    if not any(m.name == mcp_name for m in visible):
-        raise HTTPException(
-            400, f"MCP {mcp_name!r} is not visible to agent {agent_name!r}",
-        )
+    """What the agent's accounts panel shows for one tool: the agent's own
+    set (``accounts``, each with whose it is, how it acts and its GitHub
+    reach, the default first), the caller's connected accounts it may add
+    (``my_accounts``, with a GitHub-App account's installations) and whether
+    the tool takes a GitHub reach. Manager of the agent only."""
+    await _service_gates(user, agent_name, mcp_name)
 
     # Caller's own connected user accounts for this MCP.
     my_accounts = (
@@ -758,65 +793,6 @@ async def get_agent_service_account_options(
         )
         if user.sub else []
     )
-
-    binding = await asyncio.to_thread(
-        credential_store.get_service_agent_binding, mcp_name, agent_name,
-    )
-    current_binding = None
-    if binding is not None:
-        bound_label, bound_owner = binding.account_label, binding.account_owner_sub
-        owner_name = bound_owner
-        owner_email = ""
-        bound_display_email = ""
-        owner_row = await asyncio.to_thread(task_store.get_user, bound_owner)
-        if owner_row:
-            owner_name = (
-                owner_row.get("display_name")
-                or owner_row.get("name")
-                or owner_row.get("username")
-                or bound_owner
-            )
-            owner_email = owner_row.get("email") or ""
-        # Display email comes from user_credential_accounts(bound_owner, mcp, bound_label).
-        bound_accounts = await asyncio.to_thread(
-            credential_store.list_user_accounts, bound_owner, mcp_name,
-        )
-        bound_row = next(
-            (a for a in bound_accounts if a["account_label"] == bound_label),
-            None,
-        )
-        bound_display_email = (bound_row or {}).get("display_email", "")
-        bound_meta = (bound_row or {}).get("meta") or {}
-        installation = oauth_app_kinds.installation_in(bound_meta, binding.installation_id) or {}
-        current_binding = {
-            "label": bound_label,
-            "owner_sub": bound_owner,
-            "owner_name": owner_name,
-            "owner_email": owner_email or bound_display_email,
-            "set_by": "",
-            "set_at": "",
-            "installation_id": binding.installation_id,
-            "installation_account": str(installation.get("account") or ""),
-            "repositories": list(binding.repositories),
-            "read_only": binding.read_only,
-            # A hosted installation binding left from before: what the card says.
-            "problem": (
-                credential_resolver.reconnect_wording(oauth_app_kinds.INSTALLATION_HOSTED)
-                if binding.installation_id and (
-                    oauth_app_kinds.is_hosted_app_meta(bound_meta)
-                    or await asyncio.to_thread(github_apps.hosted, mcp_name))
-                else ""
-            ),
-        }
-        # Reach back into the full bindings list to surface set_by/set_at.
-        agent_bindings = await asyncio.to_thread(
-            credential_store.list_service_agent_bindings, mcp_name,
-        )
-        for b in agent_bindings:
-            if b["agent_name"] == agent_name:
-                current_binding["set_by"] = b.get("set_by") or ""
-                current_binding["set_at"] = b.get("set_at") or ""
-                break
 
     def _shape(rows: list[dict]) -> list[dict]:
         out = []
@@ -848,9 +824,10 @@ async def get_agent_service_account_options(
     hosted = await asyncio.to_thread(github_apps.hosted, mcp_name)
     return {
         "my_accounts": _shape(my_accounts),
-        "current_binding": current_binding,
-        # The binding may carry a GitHub reach (a repository list, read only).
+        # Each account may carry a GitHub reach (a repository list, read only).
         "reach_supported": _reach_supported(mcp_name),
+        # The agent's own set (``api/mcp/service_account_set.py``).
+        **await service_account_set_api.set_answer(agent_name, mcp_name, user.sub or ""),
     }
 
 
@@ -904,44 +881,33 @@ async def _repositories_answer(user_sub: str, mcp_name: str, account_label: str,
 
 
 async def _check_reach(
-    body: SetServiceBindingRequest, mcp_name: str, agent_name: str, user: UserContext,
+    body: service_account_set_api.ServiceAccountRequest | service_account_set_api.ServiceReachRequest,
+    mcp_name: str, user: UserContext, *, held: credential_store.ServiceBinding | None,
 ) -> None:
-    """The reach a PUT asks for, refused in plain words when it cannot
-    hold: a narrowing reach on an MCP that is not GitHub, a list on an
-    account with none, a name the identity does not reach. Only names the
-    same identity does not hold yet are looked up (a narrowing change never
-    waits on GitHub); a new identity has the list it keeps looked up too
-    (GitHub narrows an installation's token to names of its own account)."""
+    """The reach a write of one of the caller's own accounts of the agent asks
+    for, refused in plain words when it cannot hold: a narrowing reach on an
+    MCP that is not GitHub, a list on an account with none, a name the
+    account (or the installation it acts as) does not reach. Only names the
+    row does not hold yet are looked up (a narrowing change never waits on
+    GitHub); ``held`` is the row (the same account and identity), None for a
+    new one."""
     names = body.repositories or []
     if not _reach_supported(mcp_name):
         if names or body.read_only:
             raise HTTPException(400, _ONLY_GITHUB)
         return
     _refuse_unreadable(names)
-    prior = await asyncio.to_thread(credential_store.get_service_agent_binding, mcp_name, agent_name)
-    same_account = prior is not None and (prior.account_owner_sub, prior.account_label) == (
-        user.sub, body.account_label)
-    installation = body.installation_id if body.installation_id is not None else (
-        prior.installation_id if prior is not None and same_account else "")
-    same_identity = prior is not None and same_account and prior.installation_id == installation
-    kept = body.repositories is None
-    if kept:
-        names = [] if same_identity or prior is None else list(prior.repositories)
     if not names:
         return
     meta = await asyncio.to_thread(credential_store.get_account_meta, user.sub, mcp_name, body.account_label)
     if not oauth_app_kinds.is_github_app_meta(meta):
-        if kept:
-            return                          # a token account keeps the list as it is
         raise HTTPException(400, _NO_LIST)
-    held = {github_reach.normalize(n) for n in prior.repositories} if prior and same_identity else set()
-    added = [n for n in names if github_reach.normalize(n) not in held]
+    kept = {github_reach.normalize(n) for n in held.repositories} if held is not None else set()
+    added = [n for n in names if github_reach.normalize(n) not in kept]
     if not added:
         return
-    missing = await _unreached(user.sub, mcp_name, body.account_label, installation or "", added, no_list=_NO_LIST)
-    if missing and kept:
-        raise HTTPException(400, f"The agent's GitHub reach names {missing[0]}, which this choice does not "
-                                 "reach. Change the repositories first, then choose it again.")
+    missing = await _unreached(user.sub, mcp_name, body.account_label, body.installation_id, added,
+                               no_list=_NO_LIST)
     if missing:
         raise HTTPException(400, _NOT_REACHED.format(name=missing[0]))
 
@@ -963,224 +929,36 @@ async def get_agent_service_repositories(
         raise HTTPException(403, "Dashboard only")
     if not user.can_manage_agent(agent_name):
         raise HTTPException(403, f"Manager role on agent {agent_name!r} required")
+    if not await asyncio.to_thread(account_context.holds_own_accounts, agent_name):
+        raise HTTPException(409, account_context.PERSONAL_ONLY)
     if not _reach_supported(mcp_name):
         raise HTTPException(400, _ONLY_GITHUB_LIST)
     return await _repositories_answer(user.sub, mcp_name, account_label, installation_id)
 
 
-@router.put("/v1/agents/{agent_name}/mcps/{mcp_name}/service-binding")
-async def set_agent_service_binding(
-    agent_name: str,
-    mcp_name: str,
-    body: SetServiceBindingRequest,
-    user: UserContext = Depends(get_current_user),
-):
-    """Pin an agent to the caller's OWN connected account as its service identity.
-
-    The caller must have per-agent manager/admin role on ``agent_name``. The
-    bound account is always the caller's own ``user_credential_accounts`` row
-    (``owner_sub = caller.sub``) — agent-scope sessions then read the caller's
-    tokens directly.
-
-    Visibility gate: the MCP must be in the agent's visible set.
-    """
-    if require_auth(user).is_api_key:
-        raise HTTPException(403, "Dashboard only")
-    if not user.can_manage_agent(agent_name):
-        raise HTTPException(
-            403, f"Manager role on agent {agent_name!r} required",
-        )
-    if not user.sub:
-        raise HTTPException(403, "A user session is required to bind an account")
-
-    cred_info = _get_cred_schema(mcp_name)
-    if not cred_info or not cred_info.get("has_service_account"):
-        raise HTTPException(
-            400, f"'{mcp_name}' is not a service-account-capable MCP",
-        )
-    visible = await asyncio.to_thread(
-        mcp_registry.get_visible_mcps_for_agent, agent_name,
-    )
-    if not any(m.name == mcp_name for m in visible):
-        raise HTTPException(
-            400, f"MCP {mcp_name!r} is not visible to agent {agent_name!r}",
-        )
-
-    if body.installation_id:
-        meta = await asyncio.to_thread(
-            credential_store.get_account_meta, user.sub, mcp_name, body.account_label,
-        )
-        # OtoDock's app through the relay serves user tokens only.
-        if oauth_app_kinds.is_hosted_app_meta(meta) or await asyncio.to_thread(github_apps.hosted, mcp_name):
-            raise HTTPException(400, "Hosted sign-in has no app identity. Bind the account itself.")
-        # An installation stands only while the caller owns its target.
-        standing = oauth_app_kinds.installation_standing(meta, body.installation_id)
-        if standing:
-            raise HTTPException(
-                404, f"Installation {body.installation_id} cannot be this agent's identity: "
-                f"{credential_resolver.bind_wording(standing)}",
-            )
-    await _check_reach(body, mcp_name, agent_name, user)
-    repositories, read_only = body.repositories, body.read_only
-    own = await asyncio.to_thread(_own_reach_to_copy, body, mcp_name, agent_name, user.sub)
-    if own is not None:
-        repositories, read_only = list(own.repositories), own.read_only
-    prior = await asyncio.to_thread(
-        credential_store.get_service_agent_binding, mcp_name, agent_name,
-    )
-    ok = await asyncio.to_thread(
-        functools.partial(
-            credential_store.set_service_agent_binding,
-            mcp_name, agent_name,
-            account_label=body.account_label,
-            owner_sub=user.sub,
-            set_by=user.sub,
-            installation_id=body.installation_id,
-            repositories=repositories,
-            read_only=read_only,
-        ),
-    )
-    if not ok:
-        raise HTTPException(
-            404,
-            f"Account '{body.account_label}' not found among your connected "
-            f"{mcp_name} accounts",
-        )
-    binding = await asyncio.to_thread(
-        credential_store.get_service_agent_binding, mcp_name, agent_name,
-    )
-    answer = {
-        "status": "ok",
-        "agent_name": agent_name,
-        "mcp_name": mcp_name,
-        "account_label": body.account_label,
-        "owner_sub": user.sub,
-        "installation_id": binding.installation_id if binding else "",
-        "repositories": list(binding.repositories) if binding else [],
-        "read_only": binding.read_only if binding else False,
-        # The binding started from the caller's own reach for the agent.
-        "reach_copied": own is not None,
-    }
-    provider_id = str(((mcp_registry.get_manifest(mcp_name) or _NO_MANIFEST).credentials.oauth or {}).get("provider_id") or "")
-    if prior is not None and binding is not None and prior.installation_id != binding.installation_id:
-        # The agent's installation subscriptions followed the old identity.
-        await _drop_other_installation_subscriptions(
-            mcp_name, agent_name, keep=binding.installation_id,
-        )
-    if prior is not None and prior.installation_id and (
-            binding is None or (prior.installation_id, github_apps.binding_reach_of(prior).digest())
-            != (binding.installation_id, github_apps.binding_reach_of(binding).digest())):
-        # The file the old identity or reach was served from goes with it.
-        await asyncio.to_thread(github_apps.reap_if_orphan, provider_id, prior.installation_id)
-    if binding is not None and binding.installation_id:
-        # The first token now, so the first session does not wait on GitHub.
-        try:
-            reach = github_apps.binding_reach_of(binding)
-            await asyncio.to_thread(
-                functools.partial(
-                    github_apps.ensure_installation_token,
-                    mcp_name, user.sub, body.account_label, binding.installation_id,
-                    reach=reach if reach.narrows else None,
-                ),
-            )
-        except (credential_resolver.AccountNeedsReconnect, credential_resolver.CredentialUnavailable) as why:
-            answer["warning"] = (
-                credential_resolver.reconnect_wording(str(why))
-                if isinstance(why, credential_resolver.AccountNeedsReconnect) else str(why)
-            )
-    return answer
-
-
-_NO_MANIFEST = SimpleNamespace(credentials=SimpleNamespace(oauth={}))
-
-
 def _own_reach_to_copy(
-    body: SetServiceBindingRequest, mcp_name: str, agent_name: str, user_sub: str,
+    body: service_account_set_api.ServiceAccountRequest, mcp_name: str, agent_name: str, user_sub: str,
 ) -> credential_store.AccountAgentBinding | None:
-    """The caller's own reach for the agent a NEW service binding starts
-    from: no binding row at all (a row whose owner stopped managing the
-    agent still holds a reach of its own), a PUT naming no reach, the
-    account itself (an installation is another identity, narrowed by GitHub
-    to its own account's repositories), and the caller's own choice for the
-    agent naming that account and narrowing. A copy, never a link: each
-    reach is changed where it lives. No lookup: the names are the same
-    account's, looked up when the person chose them."""
+    """The caller's own reach for the agent a NEW row of the agent's set
+    starts from: an account the set holds no row of (a row whose owner
+    stopped managing the agent still holds a reach of its own), a body
+    naming no reach, the account itself (an installation is another
+    identity, narrowed by GitHub to its own account's repositories), and the
+    row of that account in the caller's own set for the agent, narrowing (a
+    non-default account's own reach, never the default's). A copy, never a
+    link: each reach is changed where it lives. No lookup: the names are the
+    same account's, looked up when the person chose them."""
     if body.repositories is not None or body.read_only is not None or body.installation_id:
         return None
     if not _reach_supported(mcp_name):
         return None
-    if credential_store.service_agent_binding_row_exists(mcp_name, agent_name):
+    if any(r.account_label == body.account_label for r in service_account_set_store.list_service_agent_set(
+            mcp_name, agent_name, standing_only=False)):
         return None
-    own = credential_store.get_account_agent_binding(user_sub, mcp_name, agent_name)
-    if own is None or own.account_label != body.account_label:
+    own = credential_store.get_account_agent_binding(user_sub, mcp_name, agent_name, body.account_label)
+    if own is None:
         return None
     return own if github_reach.reach_of(own.repositories, own.read_only).narrows else None
-
-
-async def _drop_other_installation_subscriptions(mcp_name: str, agent_name: str, *, keep: str) -> None:
-    """The agent's service-scope subscriptions on another installation
-    than its identity go: they would keep firing for the old one."""
-    from services.webhooks import subscription_manager
-    from storage.automation import webhook_subscription_store
-    rows = await asyncio.to_thread(
-        webhook_subscription_store.list_subscriptions, scope="service", agent=agent_name, mcp_name=mcp_name,
-    )
-    for row in rows:
-        if row.get("target_kind") != oauth_app_kinds.INSTALLATION_TARGET_KIND:
-            continue
-        if keep and str(row.get("vendor_target") or "") == keep:
-            continue
-        try:
-            await subscription_manager.delete_subscription(subscription_id=row["id"])
-        except Exception:
-            logger.exception("the installation subscription %s of %s was not removed", row.get("id"), agent_name)
-
-
-@router.delete("/v1/agents/{agent_name}/mcps/{mcp_name}/service-binding")
-async def clear_agent_service_binding(
-    agent_name: str,
-    mcp_name: str,
-    user: UserContext = Depends(get_current_user),
-):
-    """Clear the agent → service-account binding (the agent then has no bound
-    credential for this MCP in agent scope; there is no platform default).
-
-    Same per-agent manager/admin gate as the PUT. Idempotent.
-    """
-    if require_auth(user).is_api_key:
-        raise HTTPException(403, "Dashboard only")
-    if not user.can_manage_agent(agent_name):
-        raise HTTPException(
-            403, f"Manager role on agent {agent_name!r} required",
-        )
-    # The agent's service-scope subscriptions resolve their vendor token
-    # through this binding: unregister them while it still resolves, or a
-    # later re-bind makes their delete read the new owner's dir at the old
-    # label and the vendor hook leaks.
-    binding = await asyncio.to_thread(
-        credential_store.get_service_agent_binding, mcp_name, agent_name,
-    )
-    if binding is not None:
-        bound_label, bound_owner = binding.account_label, binding.account_owner_sub
-        try:
-            from services.webhooks import subscription_manager
-            await subscription_manager.cleanup_account_subscriptions(
-                scope="service", owner=bound_owner, mcp_name=mcp_name,
-                account_label=bound_label, agent=agent_name,
-            )
-        except Exception:
-            logger.exception(
-                "Subscription cleanup raised while clearing the %s binding of %s "
-                "(continuing)", mcp_name, agent_name,
-            )
-    await asyncio.to_thread(
-        credential_store.remove_service_agent_binding,
-        mcp_name, agent_name,
-    )
-    if binding is not None and binding.installation_id:
-        provider_id = str(((mcp_registry.get_manifest(mcp_name) or _NO_MANIFEST).credentials.oauth or {}).get("provider_id") or "")
-        await asyncio.to_thread(github_apps.reap_if_orphan, provider_id, binding.installation_id)
-    return {"status": "ok", "agent_name": agent_name, "mcp_name": mcp_name}
 
 
 # --- Admin: Infrastructure Credentials ---

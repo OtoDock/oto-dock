@@ -147,6 +147,16 @@ def borrow_terminal(chat_id: str):
     return live
 
 
+def terminal_ending(isess):
+    """The typed ending a run reads from a terminal it drove or borrowed, with
+    no pump of its own: its limit while the limit holds, else the last turn's
+    ending (None for a turn that ended clean)."""
+    if isess is None:
+        return None
+    mark = isess.limit_mark
+    return mark.ending if mark is not None and mark.holds() else isess.last_ending
+
+
 async def _run_borrowed_terminal_turn(
     isess, prompt: str, *, persist_row: Callable[[], Awaitable[int]] | None = None,
 ) -> int:
@@ -162,6 +172,10 @@ async def _run_borrowed_terminal_turn(
     read the prompt, and the tailer skips the journaled copy (the queued
     item is noted). Returns the row's id, 0 when none was written. A cancel
     drops the prompt if it is still queued and leaves the terminal alone."""
+    if isess.limit_ending() is not None:
+        # The terminal is at its usage limit: the follow-up is not typed, and
+        # the round ends with the limit (the run reads it before it asks).
+        return 0
     injected = asyncio.Event()
     done = asyncio.Event()
     rows: list[Awaitable[int]] = []

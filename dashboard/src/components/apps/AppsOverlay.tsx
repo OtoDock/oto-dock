@@ -95,7 +95,7 @@ export function RollbackConfirm({ app, busy, onConfirm, onCancel }: {
       <span className="text-primary">
         Roll back “{title}” to the previous release? Everyone switches at once.
         {appKind(app).keepsData && (
-          <> Its data goes back to before this release. Newer changes are kept in a snapshot.</>
+          <> Its data goes back too. The newer data is kept as a backup.</>
         )}
       </span>
       <div className="ml-auto flex shrink-0 items-center gap-2">

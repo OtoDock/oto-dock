@@ -17,7 +17,7 @@ from tests._paths import PROXY_DIR, REPO_ROOT
 if str(PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(PROXY_DIR))
 
-from services.mcp import mcp_registry
+from services.mcp import mcp_agent_skills, mcp_egress, mcp_registry
 from services.mcp.mcp_manifest_types import SKILL_AUDIENCES
 
 
@@ -84,7 +84,7 @@ def test_the_session_config_leaves_the_mcp_out_for_a_person_below_the_tier(monke
 def test_the_prompt_catalog_stops_listing_it_for_a_viewer(monkeypatch):
     ssh = SimpleNamespace(name="ssh-hosts", label="SSH", description="hosts", audience="editor",
                           category="custom", exclude_from=[], server=SimpleNamespace(transport="stdio"))
-    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [ssh])
+    monkeypatch.setattr(mcp_agent_skills, "get_agent_mcps", lambda *a, **k: [ssh])
     assert "SSH" in mcp_registry.build_available_mcps_section("agent", user_role="editor")
     assert "SSH" in mcp_registry.build_available_mcps_section("agent")
     assert mcp_registry.build_available_mcps_section("agent", user_role="viewer") == ""
@@ -103,7 +103,8 @@ def test_build_agent_prompt_drops_it_from_a_viewers_catalog(temp_db, monkeypatch
     ssh = SimpleNamespace(name="ssh-hosts", label="SSH Hosts", description="Reach hosts.",
                           audience="editor", category="custom", exclude_from=[],
                           server=SimpleNamespace(transport="stdio"))
-    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [ssh])
+    for module in (mcp_registry, mcp_agent_skills):
+        monkeypatch.setattr(module, "get_agent_mcps", lambda *a, **k: [ssh])
     monkeypatch.setattr(mcp_registry, "get_skills_for_agent", lambda *a, **k: [])
     monkeypatch.setattr(mcp_registry, "get_skill_catalog_for_agent", lambda *a, **k: [])
     viewer = app_config.build_agent_prompt("sshbot", role="viewer", user_role="viewer") or ""
@@ -121,13 +122,13 @@ def test_the_egress_carve_skips_it_for_a_viewer(monkeypatch):
                                            port_default=22)],
         server=SimpleNamespace(runtime="python", transport="stdio", port=0, url_template=""),
     )
-    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [ssh])
-    monkeypatch.setattr(mcp_registry, "manifest_capability_available", lambda m: True)
-    monkeypatch.setattr(mcp_registry, "network_access_enabled", lambda m: True)
-    monkeypatch.setattr(mcp_registry, "enumerate_mcp_network_targets",
+    monkeypatch.setattr(mcp_egress, "get_agent_mcps", lambda *a, **k: [ssh])
+    monkeypatch.setattr(mcp_egress, "manifest_capability_available", lambda m: True)
+    monkeypatch.setattr(mcp_egress, "network_access_enabled", lambda m: True)
+    monkeypatch.setattr(mcp_egress, "enumerate_mcp_network_targets",
                         lambda m, a, **k: [("203.0.113.9", 22)])
-    monkeypatch.setattr(mcp_registry, "_resolve_to_ips", lambda h: [h])
-    monkeypatch.setattr(mcp_registry, "_is_local_host_ip", lambda ip: False)
+    monkeypatch.setattr(mcp_egress, "_resolve_to_ips", lambda h: [h])
+    monkeypatch.setattr(mcp_egress, "_is_local_host_ip", lambda ip: False)
     roles = {"u-editor": "editor", "u-viewer": "viewer"}
     monkeypatch.setattr(providers, "effective_role_of", lambda sub, agent: roles[sub])
     _fw, allow = mcp_registry.resolve_sandbox_egress("agent", user_sub="u-editor")

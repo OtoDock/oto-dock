@@ -14,7 +14,7 @@ from core.layers.codex.helpers import LOCAL_ENDPOINT_STREAM_IDLE_TIMEOUT_MS
 
 # codex-rs/models-manager/prompt.md at rust-v0.149.1 == rust-v0.153.4 ==
 # rust-v0.156.1 == rust-v0.160.0 == rust-v0.162.1 == rust-v0.163.0 == rust-v0.166.0
-# (the pin),
+# == rust-v0.169.0 == rust-v0.169.1 == rust-v0.170.0 (the pin),
 # and the ``instructions`` field of a fallback (no-catalog) request captured on
 # 0.149.1 (20,751 chars; since 0.162 the same text rides as the request's first
 # input item). A Codex bump that refreshes the data file updates these two
@@ -48,7 +48,7 @@ def test_entry_mirrors_the_fallback_and_turns_on_deferral():
     e0 = cat.local_model_catalog_entry("m", 0)
     assert e0["context_window"] == e0["max_context_window"] == cat.FALLBACK_CONTEXT_WINDOW == 272_000
     # The fallback's shape (model_info_from_slug, the same on 0.149.1, 0.153.4,
-    # 0.156.1, 0.160.0, 0.162.1, 0.163.0 and the pinned 0.166.0 — its four new fields all
+    # 0.156.1, 0.160.0, 0.162.1, 0.163.0, 0.166.0, 0.169.0, 0.169.1 and the pinned 0.170.0 — its four new fields all
     # default, and 0.162 dropped the ``instructions_variables`` this entry never
     # wrote): no reasoning levels, the config-following shell type
     # ("default", an alias of unified_exec from 0.153 on), no apply_patch

@@ -3,6 +3,7 @@
 // warm-up that failed and the card it shows, the server's own turn start,
 // and the stop's confirmation.
 import { isArtifactBlock } from '../../lib/kinds/artifact'
+import { isForShownChat } from '../../lib/chat/shownChat'
 import { continuesAbove, nudgeBlock, reviewSpeaker } from '../../lib/messageBlocks'
 import { SERVER_TURN_CAUSE, SYSTEM_SUBTYPE } from '../../api/wireEvents'
 import { BG_COMMAND_BLOCK } from '../../lib/kinds/block'
@@ -227,10 +228,8 @@ export function useTurnEnd(core: StreamCore, deps: {
     },
 
     onWarmupFailed: (data) => {
-      // Stale: warmup_failed for a chat we're no longer on.
-      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
-        return
-      }
+      // Stale: warmup_failed for a chat not on screen.
+      if (!isForShownChat(data.chat_id, chatIdRef.current)) return
       // A refusal before any chat was minted (a send below the editor role
       // on a Shared-only agent) belongs to the new-chat page: once the page
       // is on a chat it is another chat's.
@@ -262,7 +261,7 @@ export function useTurnEnd(core: StreamCore, deps: {
             ? [{
                 id: `warmup-fail-${Date.now()}`,
                 role: 'assistant',
-                blocks: [{ type: 'system', subtype, message: data.error }],
+                blocks: [{ type: 'system', subtype, reason, message: data.error }],
                 createdAt: new Date().toISOString(),
               }]
             : prev
@@ -271,7 +270,7 @@ export function useTurnEnd(core: StreamCore, deps: {
         if (last.role === 'assistant' && last.blocks.length === 0) {
           return [
             ...prev.slice(0, -1),
-            { ...last, blocks: [{ type: 'system', subtype, message: data.error }] },
+            { ...last, blocks: [{ type: 'system', subtype, reason, message: data.error }] },
           ]
         }
         return [
@@ -279,7 +278,7 @@ export function useTurnEnd(core: StreamCore, deps: {
           {
             id: `warmup-fail-${Date.now()}`,
             role: 'assistant',
-            blocks: [{ type: 'system', subtype, message: data.error }],
+            blocks: [{ type: 'system', subtype, reason, message: data.error }],
             createdAt: new Date().toISOString(),
           },
         ]

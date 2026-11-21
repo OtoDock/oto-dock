@@ -12,11 +12,11 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from core.session.session_state import resolve_session_permissions
+from core.session.session_state import has_pending_prompt, resolve_session_permissions
 
 logger = logging.getLogger("remote-layer")
 
-# Soft-interrupt escalation window. Longer than the local layer's 8s: the
+# Soft-interrupt escalation window: the
 # frame rides the satellite WS and the CLI's result event rides back the
 # same way, so budget for two hops plus the CLI's own reaction time.
 # 30s (was 12): a CLI mid-TOOL on a slow machine legitimately needs longer
@@ -28,6 +28,19 @@ logger = logging.getLogger("remote-layer")
 # TTS and Stop already acked — this only delays the wedge repair for
 # genuinely dead/stuck processes.
 _REMOTE_INTERRUPT_WATCHDOG_S = 30.0
+# A compute machine beside the platform reads the platform's own folders and
+# is no network hop away: the bound the platform's own sessions had.
+_BESIDE_INTERRUPT_WATCHDOG_S = 8.0
+# The bound of the interrupt a close sends ahead of itself.
+_CLOSE_INTERRUPT_S = 2.0
+
+
+def _interrupt_watchdog_s(info) -> float:
+    """How long a soft interrupt may take to close a turn before the hard
+    abort, by where the session runs (its record's own facts)."""
+    if info is not None and info.compute and not info.files_synced:
+        return _BESIDE_INTERRUPT_WATCHDOG_S
+    return _REMOTE_INTERRUPT_WATCHDOG_S
 
 # Strong refs — a bare create_task is GC-collectable mid-flight.
 _remote_watchdog_tasks: set[asyncio.Task] = set()
@@ -45,8 +58,8 @@ class RemoteAbortMixin(_Host):
     async def abort(self, session_id: str) -> bool:
         """Abort the in-flight turn — graceful-first for every engine.
 
-        Graceful path (live turn, satellite ≥ 0.5.89): send the engine's
-        soft-interrupt frame (``RemoteEngineAdapter.soft_interrupt_frame`` —
+        Graceful path (live turn): send the engine's soft-interrupt frame
+        (``RemoteEngineAdapter.soft_interrupt_frame`` —
         Claude's ``interrupt_turn`` writes the same ``control_request
         {interrupt}`` the local layer uses into the CLI's stdin and the
         process + MCP sidecars SURVIVE for the next prompt; Codex's is the
@@ -63,19 +76,15 @@ class RemoteAbortMixin(_Host):
         Hard path (no live turn, a turn whose result was read and whose
         stream only waits for background work — the task settle, where the
         soft frame would find nothing to interrupt and only buy the
-        watchdog's detour — an older satellite, a send failure, or the
-        watchdog's escalation): the satellite kills the process (an engine
-        whose hard abort leaves its daemon warm soft-interrupts instead), and
+        watchdog's detour — a send failure, or the watchdog's escalation):
+        the satellite kills the process (an engine whose hard abort leaves
+        its daemon warm soft-interrupts instead), and
         the caller keeps the producer-cancel + cancelled-context injection.
         """
         info = self._sessions.get(session_id)
         if not info:
             return False
-        if (
-            info.turn_active
-            and not self._adapter(info).turn_settled(info)
-            and self._cm.satellite_supports_soft_interrupt(info.machine_id)
-        ):
+        if info.turn_active and not self._adapter(info).turn_settled(info):
             # Same release as the hard path: a pending hook/native permission
             # waiter must not strand the turn we just asked to close.
             resolve_session_permissions(session_id, approved=False)
@@ -135,6 +144,31 @@ class RemoteAbortMixin(_Host):
             info.cli_dead = True
         return False
 
+    async def release_prompt_before_close(self, session_id: str, info) -> None:
+        """A close of a session whose prompt waits on a person (a permission
+        card, a plan review): the request is denied in every case, and a
+        Claude Code turn on a connected machine is interrupted, both before
+        the close frame, so the engine winds down at once instead of after the
+        satellite's wait for its input to close. The interrupt goes ahead of
+        the deny, as the platform's own sessions sent them, so the turn the
+        deny releases is already stopping. Never while the platform is
+        stopping: a restart takes the card back up. ``info`` is the record the
+        close already took out of the registry."""
+        from core import drain
+        if drain.stopping() or not has_pending_prompt(session_id):
+            return
+        from core.session.session_manager import capabilities_for_path
+        if (capabilities_for_path(info.execution_path).behaviour.supports_interrupt_for_queued
+                and self._cm.is_connected(info.machine_id)):
+            try:
+                await asyncio.wait_for(self._cm.send_fire_and_forget(info.machine_id, {
+                    "type": self._adapter(info).soft_interrupt_frame(),
+                    "session_id": session_id,
+                }), _CLOSE_INTERRUPT_S)
+            except Exception as e:  # noqa: BLE001  # the close and the deny go on without it
+                logger.warning("Remote session %s: interrupt before close failed: %s", session_id[:8], e)
+        resolve_session_permissions(session_id, approved=False)
+
     async def interrupt_for_queued(self, session_id: str) -> bool:
         """Stop-and-send for a REMOTE session of an engine that supports it
         (``behaviour.supports_interrupt_for_queued`` — Claude) — the graceful
@@ -154,7 +188,6 @@ class RemoteAbortMixin(_Host):
             or not info.turn_active
             or not self.capabilities_for(session_id).behaviour.supports_interrupt_for_queued
             or not self._cm.is_connected(info.machine_id)
-            or not self._cm.satellite_supports_soft_interrupt(info.machine_id)
         ):
             return False
         try:
@@ -182,10 +215,10 @@ class RemoteAbortMixin(_Host):
         watchdog can never kill a successor turn. On escalation the CLI
         history may have lost the partial turn — flip the chat's graceful
         flag back so the next turn re-injects the cancelled context (the ws
-        abort site stamped graceful=True optimistically). Mirrors the local
-        layer's ``_interrupt_watchdog``.
+        abort site stamped graceful=True optimistically).
         """
-        deadline = time.monotonic() + _REMOTE_INTERRUPT_WATCHDOG_S
+        bound = _interrupt_watchdog_s(self._sessions.get(session_id))
+        deadline = time.monotonic() + bound
         while time.monotonic() < deadline:
             info = self._sessions.get(session_id)
             if info is None or not info.alive:
@@ -200,8 +233,7 @@ class RemoteAbortMixin(_Host):
             return
         logger.warning(
             "Remote session %s: soft interrupt did not close the turn within "
-            "%.0fs — falling back to hard abort", session_id[:8],
-            _REMOTE_INTERRUPT_WATCHDOG_S,
+            "%.0fs — falling back to hard abort", session_id[:8], bound,
         )
         await self._hard_abort(session_id)
         try:

@@ -23,12 +23,10 @@ included).
 import asyncio
 import functools
 import logging
-from pathlib import Path
 
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 
-import config
 from api.agents._router import router
 from auth.providers import (
     UserContext,
@@ -37,11 +35,12 @@ from auth.providers import (
     require_creator_interactive,
     session_bound_to,
 )
-from core import layout
+from core import agent_folder, layout
 from core.background import spawn
+from services.infra import safe_fs
 from services.infra.path_confinement import (
     PathOutsideRoot,
-    resolve_under,
+    normalize_rel_path,
 )
 from services.knowledge import library_rules
 from storage.agents import agent_store
@@ -74,22 +73,22 @@ _validate_subdir_on_disk = library_rules.validate_subdir_on_disk
 _validate_disjoint = library_rules.validate_disjoint
 
 
-def _bulletin_file(agent: str, subdir: str, name: str) -> Path | None:
-    """Host path of a library's source-resident bulletin, or None for an
-    unnamed library (or one whose name would leave ``knowledge/``)."""
+def _bulletin_rel(subdir: str, name: str) -> str:
+    """A library's source-resident bulletin as a rel beneath the agent's
+    real folder (``knowledge/<bulletin>``), "" for an unnamed library or a
+    name that is no plain path."""
     rel = db_knowledge_libraries.bulletin_rel(subdir, name)
     if not rel:
-        return None
-    knowledge = config.get_agent_dir(agent) / layout.KNOWLEDGE
+        return ""
     try:
-        return resolve_under(knowledge / rel, knowledge)
+        return f"{layout.KNOWLEDGE}/{normalize_rel_path(rel)}"
     except PathOutsideRoot:
-        return None
+        return ""
 
 
 def _has_bulletin(agent: str, subdir: str, name: str) -> bool:
-    p = _bulletin_file(agent, subdir, name)
-    return bool(p and p.is_file())
+    rel = _bulletin_rel(subdir, name)
+    return bool(rel) and safe_fs.kind_beneath(agent_folder.agent_root(agent), rel).is_file
 
 
 def _wopi_locked(agent: str, knowledge_rel: str) -> bool:
@@ -105,31 +104,37 @@ def _rename_bulletin_for(agent: str, subdir: str, old_name: str,
     with it. Refused (409) — and the label change with it — when the
     target filename already exists as real content, or an active Collabora
     lock holds either file: the operator resolves and retries. Mirrors
-    catch up via projection (they briefly show the old copy).
+    catch up via projection (they briefly show the old copy). The file is
+    looked at and moved beneath the agent's real folder with no link
+    followed: a bulletin reached through a link is not carried.
 
     Synchronous (runs in a worker thread); returns ``(old_rel, new_rel)``
     when a file was moved so the ASYNC caller schedules the tombstone +
     projection bookkeeping, or None when there was nothing to carry."""
-    old_file = _bulletin_file(agent, subdir, old_name)
-    if old_file is None or not old_file.is_file():
+    root = agent_folder.agent_root(agent)
+    old, new = _bulletin_rel(subdir, old_name), _bulletin_rel(subdir, new_name)
+    if not old or not new or not safe_fs.kind_beneath(root, old).is_file:
         return None  # nothing to carry over
-    new_file = _bulletin_file(agent, subdir, new_name)
-    if new_file is None:
-        return None
     old_rel = db_knowledge_libraries.bulletin_rel(subdir, old_name)
     new_rel = db_knowledge_libraries.bulletin_rel(subdir, new_name)
-    if new_file.exists():
-        raise HTTPException(
-            status_code=409,
-            detail=f"Renaming would move the bulletin to '{new_rel}', which "
-                   "already exists — move or delete that file first, then "
-                   "rename again.")
+    taken = HTTPException(
+        status_code=409,
+        detail=f"Renaming would move the bulletin to '{new_rel}', which "
+               "already exists — move or delete that file first, then "
+               "rename again.")
+    if safe_fs.kind_beneath(root, new).kind != "missing":
+        raise taken
     if _wopi_locked(agent, old_rel) or _wopi_locked(agent, new_rel):
         raise HTTPException(
             status_code=409,
             detail="The library's bulletin is open in the document editor — "
                    "close it and rename again.")
-    old_file.rename(new_file)
+    try:
+        safe_fs.rename_beneath(root, old, new)
+    except FileExistsError:
+        raise taken from None
+    except OSError:
+        return None
     return old_rel, new_rel
 
 

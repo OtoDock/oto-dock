@@ -61,9 +61,11 @@ from configuration.models import (
     successor_model as successor_model,
 )
 from configuration.prompts import (
+    StartArgs as StartArgs,
     build_agent_prompt as build_agent_prompt,
     fold_unavailable_mcps as fold_unavailable_mcps,
     persona_is_unconfigured as persona_is_unconfigured,
+    start_sections as start_sections,
 )
 from configuration.readers import (
     DEFAULT_NO_PROXY as DEFAULT_NO_PROXY,
@@ -426,6 +428,17 @@ HOST = _cfg("PROXY_HOST", "0.0.0.0")
 # at import. Sandboxes and the satellite tunnel reach the proxy there, where
 # forwarding headers are never read (auth/lan_check.py).
 INTERNAL_LISTENER_PORT = 0
+# How long a drain waits for open work before a stop or an update, in
+# seconds. 0: no wait, new work is held and the stop cuts what is open.
+DRAIN_BOUND_S = _cfg_int("OTODOCK_DRAIN_BOUND_S", 600, minimum=0)
+# A bearer that reads /metrics (a scraper's), beside an admin signed in and
+# the master key from this machine. Empty: off. Shorter than 32 characters it
+# is ignored, so a guessable value never opens the counters.
+METRICS_TOKEN_MIN = 32
+METRICS_TOKEN = _cfg("OTODOCK_METRICS_TOKEN")
+if METRICS_TOKEN and len(METRICS_TOKEN) < METRICS_TOKEN_MIN:
+    _boot_note(f"OTODOCK_METRICS_TOKEN is shorter than {METRICS_TOKEN_MIN} characters: ignored")
+    METRICS_TOKEN = ""
 
 # Authentication
 API_KEY = _cfg("PROXY_API_KEY")
@@ -477,28 +490,27 @@ LOOP_WATCHDOG_REPORT_S = _cfg_float("LOOP_WATCHDOG_REPORT_S", 0.25)
 # runtime root; every local sandbox has its own, so an uncapped fleet can
 # commit N × RAM/2. Bounded by half the host's RAM at use (never looser than
 # the kernel default); 0 disables; ignored where bubblewrap lacks ``--size``
-# (0.6.1). See core/sandbox/sandbox.py::tmpfs_cap_mb.
+# (0.6.1). See core/sandbox/sandbox_render.py::effective_tmp_cap_mb.
 SANDBOX_TMP_SIZE_MB = _cfg_int("SANDBOX_TMP_SIZE_MB", 4096)
 
 # Universal per-file size cap: ONE knob for the satellite sync engine (manifest
 # + push/pull legs) AND every dashboard/chat upload (both hit POST /v1/upload).
-# Satellites learn the sync cap via the auth_result policy handshake — the proxy
-# config is the single source of truth; pre-0.5.103 satellites are pinned to the
-# legacy 100MB by the per-machine gate in satellite_connection.effective_sync_cap.
+# Satellites learn the sync cap via the auth_result policy handshake: the proxy
+# config is the single source of truth.
 MAX_FILE_MB = _cfg_int("OTODOCK_MAX_FILE_MB", 1024)
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 SYNC_MAX_FILE_BYTES = MAX_FILE_BYTES  # alias read by core/remote/file_sync.py
 MAX_UPLOAD_SIZE_BYTES = MAX_FILE_BYTES  # alias read live by api/media/uploads.py
 
 # Sync-ignore rule table: marker-confirmed generated/build-dir exclusion for
-# satellite workspace sync (1.5). Shipped to 0.5.110+ satellites in the
+# satellite workspace sync (1.5). Shipped to every satellite in the
 # auth_result policy handshake and applied to the proxy's own per-machine
-# manifest walk for those machines (core/remote/file_sync.py holds the engine
+# manifest walk (core/remote/file_sync.py holds the engine
 # + full semantics; from the 1.5 sync-ignore design round).
 #
 # EVOLUTION CONTRACT — read before editing:
 #   * ADDITIVE data edits (new named rule, new marker, new veto entry) are
-#     safe proxy-only changes: 0.5.110+ satellites apply whatever v1 table
+#     safe proxy-only changes: every satellite applies whatever v1 table
 #     the handshake carries, no satellite release needed.
 #   * Any FORMAT/semantic change requires version=2 + a NEW satellite
 #     capability gate (satellites reject unknown versions → legacy walk, so
@@ -725,6 +737,11 @@ RATE_LIMIT_RULES = {
     "app_inbound_fail": _rate_limit_rule("APP_INBOUND_FAIL", 20, 300, 300, 3600),
     # Webhook-fire key failures per key prefix, checked before bcrypt runs.
     "webhook_prefix": _rate_limit_rule("WEBHOOK_PREFIX", 10, 300, 300, 3600),
+    # A person's API key on the public routes: calls per verified key, and
+    # unknown keys per client address (met only by a token with no cached
+    # verdict, counted only for a token that matches no key).
+    "api_key_call": _rate_limit_rule("API_KEY_CALL", 600, 60, 60, 600),
+    "api_key_fail": _rate_limit_rule("API_KEY_FAIL", 20, 300, 300, 3600),
     # Vendor and relay webhook receivers, per client IP (unauthenticated).
     "webhook_receive_ip": _rate_limit_rule("WEBHOOK_RECEIVE_IP", 120, 60, 60, 600),
     # Chunked uploads started per user.
@@ -762,17 +779,6 @@ CODEX_BIN = _cfg(
     "CODEX_BIN",
     shutil.which("codex")
     or str(Path.home() / ".npm-global" / "bin" / "codex")
-)
-# Bun runs app servers (apps with a server/ folder) inside their own
-# sandbox; the binary is bind-mounted in from this path. Same ladder:
-# explicit override → PATH → the official user install (a dev box without
-# sudo for /usr/local/bin). Empty when none exists: app servers then refuse
-# to start with a log line, everything else runs.
-BUN_BIN = _cfg(
-    "BUN_BIN",
-    shutil.which("bun")
-    or (str(Path.home() / ".bun" / "bin" / "bun")
-        if (Path.home() / ".bun" / "bin" / "bun").is_file() else "")
 )
 CLAUDE_TIMEOUT = _cfg_int("CLAUDE_TIMEOUT", 7200)  # 2 hours — headroom for long tasks; per-deployment override via CLAUDE_TIMEOUT, per-install override via the session_timeout platform setting
 # A chat turn with no stream line and nothing keeping it alive (no open tool,
@@ -835,6 +841,10 @@ def get_agent_dir(agent_name: str) -> Path:
 
 # Persistent sessions: idle timeout before reaping (seconds)
 PERSISTENT_SESSION_TIMEOUT = _cfg_int("PERSISTENT_SESSION_TIMEOUT", 900)
+# A Docker tool's container stops after this many minutes without use and
+# starts again at its next call (services/containers/idle.py); 0 keeps every
+# tool running.
+OTODOCK_TOOLS_IDLE_MINUTES = _cfg_int("OTODOCK_TOOLS_IDLE_MINUTES", 15, minimum=0)
 
 # A session with tracked background work (a Bash command left running, a
 # background subagent) is not idle: the reapers and the evictor spare it up
@@ -913,11 +923,10 @@ if DIRECT_LLM_TOOL_SEARCH not in ("auto", "on", "off"):
     DIRECT_LLM_TOOL_SEARCH = "auto"
 DIRECT_LLM_TOOL_SEARCH_THRESHOLD_TOKENS = _cfg_int("DIRECT_LLM_TOOL_SEARCH_THRESHOLD_TOKENS", 6000)
 
-# When true, the shared MCP installer will attempt to install missing system
-# packages (libmagic, libreoffice, etc.) via the local package manager using
-# sudo. Default: false — the installer only warns and produces a clear error
-# message so the admin can install manually. Applies both on the proxy host
-# and on every satellite that runs `mcp_installer.install_system_requirements`.
+# Read and acted on nowhere: no caller runs the installer's system-package
+# step (`mcp_system_deps.install_system_requirements`), so a missing system
+# package (libmagic, libreoffice, etc.) is reported for the admin to install
+# by hand, never installed. A released install's config.env may still set it.
 MCP_AUTO_INSTALL_SYSTEM_DEPS = _cfg_bool("MCP_AUTO_INSTALL_SYSTEM_DEPS", False)
 
 
@@ -1000,6 +1009,13 @@ WS_WRITE_STALL_S = _cfg_float("WS_WRITE_STALL_S", 60, minimum=1.0)
 BULK_CREDIT_BYTES = _cfg_int("BULK_CREDIT_BYTES", 1024 * 1024, minimum=64 * 1024)
 PUSH_STALL_S = _cfg_float("PUSH_STALL_S", 90, minimum=10.0)
 PULL_STALL_S = _cfg_float("PULL_STALL_S", 90, minimum=10.0)
+# What the platform holds for one machine (core/remote/satellite_connection.py,
+# core/remote/machine_push_lane.py): the bytes of the frames queued for its
+# socket, past which for ten seconds a machine that reads too slowly is
+# disconnected (it reconnects and catches up), and the file names one agent
+# may be owed there before the pair is settled by one merge instead.
+SAT_SEND_QUEUE_MAX_BYTES = _cfg_int("SAT_SEND_QUEUE_MAX_BYTES", 64 * 1024 * 1024, minimum=1024 * 1024)
+SAT_PUSH_LANE_MAX_NAMES = _cfg_int("SAT_PUSH_LANE_MAX_NAMES", 100_000, minimum=100)
 
 # ---------------------------------------------------------------------------
 # Concurrency admission (core/concurrency.py + core/sandbox/host_resources.py)
@@ -1027,17 +1043,24 @@ SESSION_EST_LIGHT_MB = _cfg_int("SESSION_EST_LIGHT_MB", 250)    # floor of the D
 # Gate-1 budget = total RAM × this. Generous on purpose — Gate 1 is a coarse cap +
 # burst bound, Gate 2 is the real safety, so this never needs precise tuning.
 BUDGET_FRACTION = _cfg_float("BUDGET_FRACTION", 0.90)
-# Gate-2 headroom kept free for the OS/kernel/page-cache. Effective floor is
-# max(this, total_mb × 0.03) so large hosts keep proportional headroom.
-SESSION_RESERVE_FLOOR_MB = _cfg_int("SESSION_RESERVE_FLOOR_MB", 256)
+# Gate-2 reserve kept free for the OS, the programs' code and the satellite. The
+# reserve is max(this, total_mb × 0.05) on the platform's host and every compute
+# machine (host_resources.reserve_mb); a machine's memory guard keeps the same.
+SESSION_RESERVE_FLOOR_MB = _cfg_int("SESSION_RESERVE_FLOOR_MB", 512)
 # Gate-2 SWAP CREDIT: MemAvailable counts zero swap, so a small box with swap
 # configured denies sessions it could comfortably run by paging out cold heap
 # (idle CLI sessions spend most of their life blocked on the API — their
 # coldest pages swap gracefully). The live reading gains min(SwapFree / 2,
 # this cap): half of free swap so the credit shrinks as swap fills, capped so
-# admission never leans DEEP into swap. 0 disables. Boxes without swap are
+# admission never leans DEEP into swap. 0 (the default) disables: a machine's
+# memory guard reads the same credit, and with one it would let free memory fall
+# that far under the reserve before it stops a runaway. Boxes without swap are
 # unaffected (SwapFree = 0).
-SESSION_SWAP_CREDIT_MB = _cfg_int("SESSION_SWAP_CREDIT_MB", 512)
+SESSION_SWAP_CREDIT_MB = _cfg_int("SESSION_SWAP_CREDIT_MB", 0)
+# A ceiling per session (MB) on compute machines and admin-paired computers, sent
+# to each machine's memory guard; never under host_resources.WORK_FLOOR_MB there.
+# 0 = none: a session may use everything above its machine's reserve.
+OTODOCK_SESSION_MEMORY_MAX_MB = _cfg_int("OTODOCK_SESSION_MEMORY_MAX_MB", 0)
 # Under Gate-1 pressure, an idle LOCAL session this old (seconds) may be gracefully
 # evicted to admit an active one (clamped below the idle-reap timeout). Streaming
 # sessions have ~0 idle age and are never eligible.
@@ -1046,11 +1069,12 @@ SESSION_EVICT_FLOOR_S = _cfg_int("SESSION_EVICT_FLOOR_S", 300)
 # UI). 0 = no cap (pure budget, the default). For operators on noisy shared boxes who
 # want a deterministic ceiling regardless of the live-RAM reading.
 OTODOCK_MAX_LOCAL_SESSIONS = _cfg_int("OTODOCK_MAX_LOCAL_SESSIONS", 0)
-# Sessions one person may hold at once (0 = no cap), and the session spawns
-# allowed at once (0 = half the CPUs this process may use, at least 2).
+# Sessions one person may hold at once (0 = no cap).
 MAX_SESSIONS_PER_USER = _cfg_int("OTODOCK_MAX_SESSIONS_PER_USER", 8)
-SESSION_SPAWN_CONCURRENCY = _cfg_int("SESSION_SPAWN_CONCURRENCY", 0) or max(
-    2, len(os.sched_getaffinity(0)) // 2 if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4) // 2)
+# Session processes a compute machine starts at once, sent to it at its
+# sign-in (0 = the machine's own: half its CPUs, at least 2). A personal or
+# admin-paired computer always keeps its own.
+SESSION_SPAWN_CONCURRENCY = max(0, _cfg_int("SESSION_SPAWN_CONCURRENCY", 0))
 # Admission: how long a session start waits in the queue for a slot, and how
 # long a parked delegate result or continuation wake waits for one before it
 # is stored for the chat's next turn.
@@ -1069,6 +1093,12 @@ SCHEDULER_SYNC_INTERVAL = _cfg_int("SCHEDULER_SYNC_INTERVAL", 30)
 # hosts. The fire times themselves stay exact; only the session starts are
 # spaced. 0 disables. Manual Run-Now and event triggers are never spaced.
 TASK_SPAWN_SPACING_SECONDS = _cfg_int("TASK_SPAWN_SPACING_SECONDS", 10)
+# How long a delegated follow-up waits at its lane's gate for a cut turn
+# nobody has taken up again (services/scheduler/lanes.py). Past it the
+# follow-up ends as not started, never behind a turn that runs. The floor
+# keeps it above what a lane needs to come back: the continue pass starts
+# records a few seconds apart, and a session's start can take minutes.
+LANE_GATE_CEILING_S = _cfg_int("LANE_GATE_CEILING_S", 1800, minimum=300)
 # Active clocked tasks (recurring, and one-time not yet fired) one person may
 # create and one agent may hold (429 past them; admins are exempt), and the
 # pending self-continuations per chat and per agent. 0 = no cap.
@@ -1229,14 +1259,44 @@ COOKIE_SECURE = _default_cookie_secure() if _cookie_secure_env is None else _coo
 # enforcement model and hosted-OAuth security.
 OTODOCK_CLOUD = _cfg_bool("OTODOCK_CLOUD", False)
 
+# Keys an internal build of 2.0 read and no release ever did, still set in
+# this install's config: each does nothing now, and the boot says so once
+# (``startup.UNREAD_KEY_SENTENCES``). ``OTODOCK_COMPUTE_SESSIONS`` chose
+# between a compute machine and the platform's own sandbox, which runs no
+# session any more; ``OTODOCK_CREDENTIAL_EXIT`` could turn the credential
+# exit off, and the exit always runs.
+UNREAD_KEYS_SET = tuple(key for key, word in (
+    ("OTODOCK_COMPUTE_SESSIONS", _cfg("OTODOCK_COMPUTE_SESSIONS", "")),
+    ("OTODOCK_CREDENTIAL_EXIT", _cfg("OTODOCK_CREDENTIAL_EXIT", "")),
+) if word.strip())
+# The address the install's own compute service links from on a compose
+# install (its pinned address on the compute network, set by the compose
+# file); empty on bare metal, where the unit links over loopback.
+OTODOCK_COMPUTE_LINK_FROM = _cfg("OTODOCK_COMPUTE_LINK_FROM", "").strip()
+# The folder the proxy writes its own compute machine's credential into (set
+# by the compose file and by the bare-metal setup that installs the unit):
+# empty, the install runs no compute service of its own.
+OTODOCK_COMPUTE_LINK_DIR = _cfg("OTODOCK_COMPUTE_LINK_DIR", "").strip()
+# The image a compute machine on another server runs (``repository:tag``):
+# empty, the image this proxy runs (OTODOCK_PROXY_IMAGE, which the compose
+# file sets and its build overlay leaves empty). An install built from source
+# names the image it loads on those servers, with a new tag for each build:
+# the machines follow its tag.
+OTODOCK_REMOTE_COMPUTE_IMAGE = _cfg("OTODOCK_REMOTE_COMPUTE_IMAGE", "").strip()
+OTODOCK_PROXY_IMAGE = _cfg("OTODOCK_PROXY_IMAGE", "").strip()
+
+
 # Local-PBX (Asterisk / FreePBX) telephony adapters are AudioSocket-based — they
 # only work where the PBX can reach the phone daemon on the LAN. Enabled by default
 # on self-host (the 99% case); OFF on OtoDock cloud (a tenant's LAN PBX can't reach
-# a multi-tenant pool — cloud telephony goes through Twilio/3CX instead). An explicit
-# OTODOCK_LOCAL_PBX_ENABLED wins either way (a Twilio-only self-host sets it false;
-# an advanced cloud op sets it true).
+# a hosted install — cloud telephony goes through Twilio instead). On a self-host an
+# explicit OTODOCK_LOCAL_PBX_ENABLED wins (a Twilio-only self-host sets it false); on
+# a hosted install the flag wins: a PBX there would be dialled on a private address.
 _local_pbx_raw = _cfg_bool("OTODOCK_LOCAL_PBX_ENABLED", None)
 LOCAL_PBX_ENABLED = (not OTODOCK_CLOUD) if _local_pbx_raw is None else _local_pbx_raw
+if OTODOCK_CLOUD and LOCAL_PBX_ENABLED:
+    _boot_note("OTODOCK_LOCAL_PBX_ENABLED is ignored on a hosted install: Twilio only")
+    LOCAL_PBX_ENABLED = False
 
 def untrusted_edge(in_docker: bool, public_url: str, trusted: list[str]) -> bool:
     """In a container the edge never connects from 127.0.0.1, so an https
@@ -1314,15 +1374,19 @@ OTODOCK_MCP_DEFAULT_MEM_LIMIT = _cfg("OTODOCK_MCP_DEFAULT_MEM_LIMIT", "2g")
 
 # --- Operator-forced platform settings (managed / OtoDock-cloud installs) ---
 # A JSON object in config.env that pins selected ``platform_settings`` keys the
-# customer-admin must NOT change (e.g. {"session_retention_enabled":"1",
+# customer-admin must NOT change (e.g. {"session_retention_enabled":true,
 # "session_retention_days":"180","smtp_host":"...","password_min_score":"3"}).
 # Read ONCE at startup and overlaid on every platform-setting read in
 # ``storage.database`` (so EVERY consumer honors it uniformly), surfaced as
 # ``forced_keys`` in the admin settings API (UI locks/hides them), and ignored
 # on write. Fail-safe: unset / blank / invalid JSON / non-object → {} (no-op).
+# A JSON true or false on a switch is stored in that switch's own words
+# (configuration/setting_switches.py); on any other key it stays "1" or "", so
+# a number or text setting forced with false keeps its default.
 # NOTE: never put ``license_key`` here — that would freeze the relay re-issue
 # adoption; use OTODOCK_LICENSE_KEY (a one-time seed) instead.
 def _parse_forced_settings(raw: str) -> dict[str, str]:
+    from configuration.setting_switches import stored_word
     if not raw.strip():
         return {}
     try:
@@ -1333,8 +1397,16 @@ def _parse_forced_settings(raw: str) -> dict[str, str]:
         return {}
     out: dict[str, str] = {}
     for k, v in data.items():
-        # platform_settings values are TEXT; mirror the bool-as-"1"/"" convention.
-        out[str(k)] = ("1" if v else "") if isinstance(v, bool) else str(v)
+        key = str(k)
+        if not isinstance(v, bool):
+            out[key] = str(v)
+            continue
+        word = stored_word(key, v)
+        if word is None:
+            _boot_note(f"OTODOCK_FORCED_SETTINGS: {key} is not an on/off setting, so its true is "
+                       "stored as \"1\" and its false as \"\". Write its value in quotes.")
+            word = "1" if v else ""
+        out[key] = word
     return out
 
 
@@ -1401,11 +1473,11 @@ ALLOW_NEWER_DATABASE = _cfg_bool("OTODOCK_ALLOW_NEWER_DATABASE", False)
 # blackholed, with egress carved ONLY to the proxy hook port + the session's
 # configured MCP / docker-MCP / local-LLM targets (registry-derived at spawn;
 # see services/mcp/mcp_registry.resolve_sandbox_egress). There is no un-isolated
-# mode — genuinely un-isolated execution is a remote machine. Requires `pasta`
-# (passt) + `ip` (iproute2) + unprivileged user namespaces on the host —
-# enforced by a hard-fail startup preflight (core/sandbox/sandbox.py::netns_preflight).
-# Satellites are unaffected (no bwrap there — remote execution trusts the
-# paired machine's own boundary).
+# mode — genuinely un-isolated execution is a paired computer. Requires `pasta`
+# (passt) + `ip` (iproute2) + unprivileged user namespaces on the machine that
+# runs the sessions: a compute machine checks them at its start and refuses
+# to serve sessions without them (core/sandbox/sandbox_render.py::preflight).
+# A paired computer is unaffected (no bwrap there: its own boundary is trusted).
 
 # --- Storage quotas ---
 # Per-agent disk limits over the LOCAL agent tree (AGENTS_DIR). Two buckets per
@@ -1545,7 +1617,7 @@ WOPI_SECRET = _cfg("WOPI_SECRET", JWT_SECRET)
 # for an older Collabora, or an operator's own one, that has no proof key yet. It
 # takes effect only while Collabora advertises no key; off unless set.
 WOPI_ACCEPT_UNSIGNED = _cfg_bool("WOPI_ACCEPT_UNSIGNED", False)
-# COLLABORA_URL auto-derives to sub-path mode (OSS default): the platform proxy
+# COLLABORA_URL auto-derives to sub-path mode (the default): the platform proxy
 # reverse-proxies /collabora/* internally, so users get a working preview just
 # by setting DASHBOARD_PUBLIC_URL. Override explicitly for:
 #   - subdomain mode: COLLABORA_URL=https://collabora.example.com

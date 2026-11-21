@@ -22,6 +22,9 @@ export interface ChatDocument {
   download_url: string
   generation: number
   versions: DocumentVersion[]
+  /** The conversions the pane's menu offers ("pdf", "csv"); absent from an
+   * older server. */
+  downloads?: string[]
 }
 
 export const chatDocumentsKey = (chatId: string) => ['chat-documents', chatId] as const

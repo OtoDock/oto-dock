@@ -40,7 +40,7 @@ async def test_client_credentials_success_returns_token_set():
         "token_type": "Bearer",
         "scope": "meeting:read",
     }
-    with patch("auth.oauth_providers.generic.httpx.AsyncClient",
+    with patch("auth.oauth_providers.generic._client",
                return_value=_mock_post_response(200, payload)):
         ts = await _provider().exchange_client_credentials(
             client_id="zoom-cid",
@@ -71,7 +71,7 @@ async def test_client_credentials_extra_params_forwarded():
             resp.json.return_value = {"access_token": "x", "expires_in": 3600}
             return resp
 
-    with patch("auth.oauth_providers.generic.httpx.AsyncClient",
+    with patch("auth.oauth_providers.generic._client",
                return_value=_CapturePost()):
         await _provider().exchange_client_credentials(
             client_id="cid",
@@ -89,7 +89,7 @@ async def test_client_credentials_extra_params_forwarded():
 async def test_client_credentials_vendor_error_raises():
     """4xx with error payload → RuntimeError."""
     payload = {"error": "invalid_client", "error_description": "Bad creds"}
-    with patch("auth.oauth_providers.generic.httpx.AsyncClient",
+    with patch("auth.oauth_providers.generic._client",
                return_value=_mock_post_response(401, payload)):
         with pytest.raises(RuntimeError, match="Bad creds|invalid_client"):
             await _provider().exchange_client_credentials(

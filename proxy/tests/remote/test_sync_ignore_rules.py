@@ -1,6 +1,5 @@
 """Proxy-side sync-ignore rules (1.5): marker-confirmed generated-dir
-exclusion in ``compute_manifest``, the per-machine version gate, and the
-config table's own validity. Mirrors satellite/tests/test_sync_ignore_rules.py
+exclusion in ``compute_manifest`` and the config table's own validity. Mirrors satellite/tests/test_sync_ignore_rules.py
 — the fixture trees are the shared symmetry contract between the two walks.
 """
 
@@ -130,26 +129,3 @@ def test_validation_rejects_bad_tables():
     big = {"version": 1, "named": [
         {"dir": f"d{i}", "siblings": ["x"]} for i in range(200)]}
     assert validate_ignore_rules(big) is None
-
-
-def test_version_gate_selects_rules_per_machine():
-    from core.remote.satellite_connection import get_connection_manager
-
-    cm = get_connection_manager()
-
-    class _Conn:
-        def __init__(self, v):
-            self.satellite_version = v
-
-    mid_old, mid_new = "gate-old-mid", "gate-new-mid"
-    cm._connections[mid_old] = _Conn("0.5.109")
-    cm._connections[mid_new] = _Conn("0.5.110")
-    try:
-        assert cm.satellite_supports_sync_ignore_rules(mid_new)
-        assert not cm.satellite_supports_sync_ignore_rules(mid_old)
-        assert cm.effective_ignore_rules(mid_old) is None
-        rules = cm.effective_ignore_rules(mid_new)
-        assert rules is not None and rules["version"] == 1
-    finally:
-        cm._connections.pop(mid_old, None)
-        cm._connections.pop(mid_new, None)

@@ -29,7 +29,7 @@ import psycopg
 #     supported on Opus 4.7+ (Anthropic, incl. 4.8) and the OpenAI gpt-5 family.
 #     Models without support silently fall back to "max" at wire time via the
 #     failsafe in each execution layer — see get_model_supports_xhigh().
-#   - "ultra" (Codex: GPT-6.1 Sol/Terra and GPT-6 Astra) is max reasoning PLUS Codex-native
+#   - "ultra" (Codex: GPT-6.2 Sol, GPT-6.1 Terra and GPT-6.2 Astra) is max reasoning PLUS Codex-native
 #     proactive multi-agent orchestration (parallel sub-agent workstreams inside
 #     one turn). Offered per-model via supports_ultra / get_model_supports_ultra()
 #     and mapped in core/layers/codex/helpers.map_effort_to_codex; every other
@@ -51,19 +51,21 @@ DEFAULT_EFFORT_LEVEL = "high"
 # Update this when Anthropic changes pricing or adds new models.
 # ---------------------------------------------------------------------------
 MODEL_REGISTRY: dict[str, dict] = {
-    # Fable 5.1 (2026-09-01) replaces the Fable 5 builtin at the SAME base
-    # price ($10/$50) with cheaper cache reads (2.5% of input vs 10% —
-    # platform.claude.com models overview), so the swap is lossless: a
-    # one-time boot remap moves fable-5-pinned agents/tasks/chats to
-    # claude-fable-5-1 (MODEL_SUCCESSORS, walked at startup); sync_builtin_models
-    # retires the builtin row so pickers stop offering Fable 5 (still served
-    # by Anthropic as a legacy model — admins can re-add claude-fable-5 as a
-    # custom model).
-    "claude-fable-5-1": {
-        "label": "Fable 5.1",
+    # Fable 5.2 (2026-11-09) replaces the Fable 5.1 builtin a fifth cheaper
+    # on every element of the tuple ($8/$40, 5-minute cache write $10, cache
+    # read $0.20; Fable 5.1 was $10/$50/$12.50/$0.25 — platform.claude.com
+    # models overview) with the same 1M window, adaptive thinking and
+    # effort levels, so the swap is lossless: a one-time boot remap moves
+    # 5.1-pinned agents/tasks/chats (and Fable 5 pins, through the chain) to
+    # claude-fable-5-2 (MODEL_SUCCESSORS, walked at startup); sync_builtin_models
+    # retires the builtin row so pickers stop offering Fable 5.1 (still served
+    # by Anthropic as a legacy model — admins can re-add claude-fable-5-1 as a
+    # custom model). Needs Claude Code >= 2.1.321 (VERSIONS.md).
+    "claude-fable-5-2": {
+        "label": "Fable 5.2",
         "provider": "anthropic",
-        "context_window": 1_000_000,   # 1M native window (as Fable 5)
-        "pricing": (10.0, 50.0, 12.50, 0.25),  # cache write 1.25x input; reads 2.5% of input (5.1 cut)
+        "context_window": 1_000_000,   # 1M native window (as Fable 5.1)
+        "pricing": (8.0, 40.0, 10.0, 0.20),  # cache write 1.25x input; reads 2.5% of input
         # CLI-only: Fable's pricing is above Opus-tier, so keeping it off
         # direct-llm bounds accidental spend on the hosted (credit-metered) path.
         # Fable's safety classifiers can refuse a request mid-run; Claude Code
@@ -88,7 +90,7 @@ MODEL_REGISTRY: dict[str, dict] = {
     # walk then leaves pins on it alone. Prices per 1M from the
     # platform.claude.com models overview at the swap: $4 in, $20 out, $5 cache write
     # (1.25x input), $0.20 cache read (5% of input). Needs Claude Code
-    # >= 2.1.280 (VERSIONS.md). Fable 5.1 stays the tier-1 offer above it.
+    # >= 2.1.280 (VERSIONS.md). Fable 5.2 stays the tier-1 offer above it.
     "claude-opus-5-5": {
         "label": "Opus 5.5",
         "provider": "anthropic",
@@ -152,19 +154,20 @@ MODEL_REGISTRY: dict[str, dict] = {
     # orchestration on top of max reasoning (Astra delegates at xhigh) — see
     # core/layers/codex/helpers.map_effort_to_codex.
     #
-    # GPT-6.1 Sol (API id gpt-6.1-sol) replaces GPT-6 Sol, which
-    # had replaced GPT-5.6 Sol on 2026-09-24, and GPT-6 Luna replaces GPT-5.6
-    # Luna (2026-09-24): each at a LOWER or equal price on every element of
-    # the tuple with the same effort ceilings (Sol: max + ultra; Luna: max,
-    # no ultra), so the swaps are lossless MODEL_SUCCESSORS entries and the
-    # chain gpt-5.6-sol → gpt-6-sol → gpt-6.1-sol ends on 6.1. Prices per
-    # 1M from developers.openai.com/api/docs/pricing at each swap, permanent.
-    # Cache WRITES cost 1.25x the uncached input rate, cache reads 95% off on
-    # 6.1 Sol (90% before) — reflected in the tuples. Codex 0.160.0 bundles
-    # all three (VERSIONS.md); gpt-6.1-sol is its own default (priority 1,
-    # default effort low, ultra delegating at xhigh) and is ABSENT from the
-    # 0.156.1 catalog, so a Codex still on that pin refuses the id.
-    # Context: the GPT-6 and 6.1 models are 1.05M (922k input + 128k output);
+    # GPT-6.2 Sol (2026-11-17; API id gpt-6.2-sol) replaces GPT-6.1 Sol on both
+    # engines, which had replaced GPT-6 Sol (2026-10-04), itself GPT-5.6 Sol's
+    # successor; GPT-6 Luna replaced GPT-5.6 Luna (2026-09-24). Each swap is at a LOWER
+    # or equal price on every element of the tuple with the same effort ceilings
+    # (Sol: max + ultra; Luna: max, no ultra), so the swaps are lossless
+    # MODEL_SUCCESSORS entries and the chain gpt-5.6-sol → gpt-6-sol →
+    # gpt-6.1-sol → gpt-6.2-sol ends on 6.2. Prices per 1M from
+    # developers.openai.com/api/docs/models/gpt-6.2-sol at the swap: $2 in, $10
+    # out, $2.50 cache write (1.25x the uncached input rate), $0.10 cached read,
+    # 6.1 Sol's tuple exactly. Codex 0.169.1 is the first Codex whose catalog
+    # lists the id (its own default, priority 1, default effort low, ultra
+    # delegating at xhigh); an older Codex runs it on fallback metadata
+    # without the model's tools.
+    # Context: the GPT-6 and 6.x models are 1.05M (922k input + 128k output);
     # input beyond 272k bills the WHOLE request at the long-context tier
     # (2x input / 1.5x output), the ``long_context`` tuple on every row:
     # price_usage multiplies once a request's prompt passes the line. The
@@ -172,14 +175,15 @@ MODEL_REGISTRY: dict[str, dict] = {
     # the capability display (until 2026-10-13 it sat at the 272k line so a
     # Direct LLM chat never crossed into the tier). codex-cli ignores it: the
     # daemon reports the LIVE modelContextWindow per turn, OpenAI's catalog
-    # per Codex version (258k on 0.160.0, 500k for Sol on 0.162.1), so the
+    # per Codex version (500k for both Sols on 0.169.1, 95% of it usable,
+    # the bundled catalog an API-key session reads; 258k on 0.160.0), so the
     # headless gauge shows the account's real window.
     # Agents still PINNED to a retired id with no successor (gpt-5.5) keep
     # running (the CLI supports it; pricing falls back to the provider
     # default) — sync_builtin_models retires the builtin row so pickers
     # stop offering it.
-    "gpt-6.1-sol": {
-        "label": "GPT-6.1 Sol",
+    "gpt-6.2-sol": {
+        "label": "GPT-6.2 Sol",
         "provider": "openai",
         "context_window": 1_050_000,
         "long_context": (272_000, 2.0, 1.5),   # (prompt tokens over, input x, output x)
@@ -193,27 +197,28 @@ MODEL_REGISTRY: dict[str, dict] = {
         "tier": 2,
         "good_at": "substantial, well-scoped coding and analysis; complex or open-ended work belongs on the frontier",
     },
-    # GPT-6 Astra (2026-09-03; API id gpt-6-astra, no alias, no snapshots): a
-    # NEW model, not a rename of any row — no MODEL_SUCCESSORS entry points
-    # at it. OpenAI's flagship and Codex's own bundled default since 0.153.4.
-    # The platform's codex-cli default is DECLARED (core/layers/codex
-    # ModelPolicy.default_model = GPT-6.1 Sol, tier 2): Astra costs 5× the
+    # GPT-6.2 Astra (2026-11-17; API id gpt-6.2-astra, no alias, no snapshots)
+    # replaces GPT-6 Astra (2026-09-03), OpenAI's flagship: lower on every
+    # element of the tuple (6 Astra: $10 / $50 / $12.50 / $1), the same 1.05M
+    # window and 272k tier, the same effort ceilings in Codex's catalog (low
+    # to max and ultra, delegation at xhigh), the same engine and tier, so the
+    # swap is a lossless MODEL_SUCCESSORS entry. Codex 0.169.1 is its first
+    # catalog. The platform's codex-cli default is DECLARED (core/layers/codex
+    # ModelPolicy.default_model = GPT-6.2 Sol, tier 2): Astra costs 4x the
     # Sol tier on an API key, so a frontier model stays a deliberate choice —
     # registry order no longer decides the "Auto" default.
-    # Context: the same 1.05M window and 272k tier as the 5.6 family ($20 /
-    # $75 past the line). Prices per 1M verified
-    # 2026-09-08 (developers.openai.com/api/docs/models/gpt-6-astra):
-    # $10 in, $50 out, $12.50 cache write, $1 cached read. codex-cli only for
-    # now: the hosted relay prices per model and has no Astra row yet, so a
-    # direct-llm listing would fail hosted installs — add the layer with the
-    # relay row. Reasoning: low/medium/high/xhigh/max on the API; Codex adds
-    # "ultra" (delegation at xhigh — multi_agent_reasoning_effort — not max).
-    "gpt-6-astra": {
-        "label": "GPT-6 Astra",
+    # Prices per 1M from developers.openai.com/api/docs/models/gpt-6.2-astra:
+    # $8 in, $40 out, $10 cache write, $0.40 cached read. codex-cli only: the
+    # hosted relay prices per model and has no Astra row, so a direct-llm
+    # listing would fail hosted installs — add the layer with the relay row.
+    # Reasoning: Codex adds "ultra" (delegation at xhigh —
+    # multi_agent_reasoning_effort — not max).
+    "gpt-6.2-astra": {
+        "label": "GPT-6.2 Astra",
         "provider": "openai",
         "context_window": 1_050_000,
         "long_context": (272_000, 2.0, 1.5),
-        "pricing": (10.0, 50.0, 12.50, 1.00),  # per 1M: (input, output, cache_write, cache_read)
+        "pricing": (8.0, 40.0, 10.0, 0.40),  # per 1M: (input, output, cache_write, cache_read)
         "layers": ["codex-cli"],
         "supports_reasoning": True,
         "supports_xhigh": True,
@@ -244,7 +249,7 @@ MODEL_REGISTRY: dict[str, dict] = {
         "tier": 3,
         "good_at": "drafting, summaries and bounded analysis",
     },
-    # Every direct-llm builtin (GPT-6.1 Sol and Terra, GPT-6 Luna here) needs
+    # Every direct-llm builtin (GPT-6.2 Sol, GPT-6.1 Terra and GPT-6 Luna here) needs
     # its hosted-relay row first: the relay prices per model and rejects
     # unknown ids, so its row (otodock-commercial relay_vendors.py) must be
     # served BEFORE an OSS release lists a new direct-llm builtin; a
@@ -267,7 +272,8 @@ MODEL_REGISTRY: dict[str, dict] = {
     },
     # (Older GPT-5.x builtins — gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex
     # — were retired with the 5.6 family, 5.6 Sol / 5.6 Luna with the GPT-6
-    # pair, GPT-6 Sol with 6.1 Sol, 5.6 Terra with 6.1 Terra. Pins with a
+    # pair, GPT-6 Sol with 6.1 Sol, 5.6 Terra with 6.1 Terra, 6.1 Sol with
+    # 6.2 Sol, GPT-6 Astra with 6.2 Astra. Pins with a
     # successor move at boot; the others keep running; admins can re-add any
     # as a custom model.)
 
@@ -369,7 +375,7 @@ def get_model_supports_xhigh(model: str) -> bool:
     xhigh as the top of its reasoning-effort scale for a while. Pre-4.7
     Anthropic models reject xhigh at the API, so each execution layer's
     startup path consults this helper and silently falls back to "max" on
-    models that don't support it — see the failsafe in core/layers/cli/session.py,
+    models that don't support it — see the failsafe in core/layers/cli/spawn.py,
     core/layers/providers/anthropic_adapter.py, etc.
 
     Resolution order: MODEL_REGISTRY (builtins) → DB execution_layer_models
@@ -390,10 +396,10 @@ def get_model_supports_xhigh(model: str) -> bool:
 def get_model_supports_ultra(model: str) -> bool:
     """Return True if the model accepts the platform's "ultra" effort level.
 
-    Ultra is Codex-only (GPT-6.1 Sol, GPT-6.1 Terra, GPT-6 Astra): max reasoning plus
+    Ultra is Codex-only (GPT-6.2 Sol, GPT-6.1 Terra, GPT-6.2 Astra): max reasoning plus
     Codex-native proactive multi-agent orchestration. Registry-only on purpose — custom
     admin-added models have no supports_ultra column (the wire clamp in
-    map_effort_to_codex is prefix-based, so a custom "gpt-6.1-sol-*" id still
+    map_effort_to_codex is prefix-based, so a custom "gpt-6.2-sol-*" id still
     maps correctly; the dashboard just won't offer the option). Unknown
     models → False: a stored "ultra" then clamps to the model's ceiling in
     every execution layer rather than risking an API rejection.
@@ -437,7 +443,7 @@ def get_model_layers(model: str) -> list[str]:
     Resolution: MODEL_REGISTRY (builtins) → DB execution_layer_models (custom).
     Empty list = unknown model. Used to keep an agent's PRIMARY execution layer
     consistent with its default model — a model only runs on its own layer
-    (e.g. ``gpt-6-astra`` is ``codex-cli`` only), so the no-picker default (primary
+    (e.g. ``gpt-6.2-astra`` is ``codex-cli`` only), so the no-picker default (primary
     layer + default model) must agree or tasks hard-reject the model.
     """
     if not model:
@@ -498,6 +504,9 @@ MODEL_SUCCESSORS: dict[str, str] = {
     # and output. Kept because Groq no longer serves Qwen 3.6 to free and
     # developer keys, so a pin left on it fails.
     "qwen/qwen3.6-27b": "qwen/qwen3.8-27b",   # 2026-10-31 — the same window, flags, tier and engine
+    "claude-fable-5-1": "claude-fable-5-2",   # 2026-11-10 — cheaper on every element, the same window, flags, tier and engine
+    "gpt-6.1-sol": "gpt-6.2-sol",             # 2026-11-18 — the same tuple, line, window, ceilings, tier and engines
+    "gpt-6-astra": "gpt-6.2-astra",           # 2026-11-18 — cheaper on every element, the same line, window, ceilings, tier and engine
 }
 
 
@@ -533,10 +542,24 @@ def live_model_id(model: str) -> str:
     return successor_model(model)
 
 
+def _priced_entry(model: str) -> dict | None:
+    """The registry entry a model id is priced and sized by: its own, else
+    the chain end's of a retired builtin (``MODEL_SUCCESSORS``; a swap is
+    at an equal or lower price). A retired id still runs where the walk
+    cannot reach it: a terminal whose own model menu lists it, a session
+    adopted before its chat moved. A custom row an admin re-added is read
+    before this by every caller that reads the store."""
+    entry = MODEL_REGISTRY.get(model)
+    if entry is None and model in MODEL_SUCCESSORS:
+        entry = MODEL_REGISTRY.get(successor_model(model))
+    return entry
+
+
 def get_model_pricing(model: str, provider: str = "") -> tuple[float, float, float, float]:
     """Get (input, output, cache_write, cache_read) pricing per 1M tokens.
 
-    Resolution order: DB (custom pricing) → MODEL_REGISTRY → provider default.
+    Resolution order: DB (custom pricing) → MODEL_REGISTRY (a retired builtin
+    by its successor's row, :func:`_priced_entry`) → provider default.
     If provider is given, use it directly for fallback instead of heuristic.
     """
     # 1. Check DB for custom pricing (dynamically added models).
@@ -553,8 +576,8 @@ def get_model_pricing(model: str, provider: str = "") -> tuple[float, float, flo
                     m["pricing_input"], m["pricing_output"],
                     m.get("pricing_cache_write", 0), m.get("pricing_cache_read", 0),
                 )
-    # 2. Check in-memory registry (Anthropic builtins)
-    entry = MODEL_REGISTRY.get(model)
+    # 2. The registry (a retired builtin by its successor's row)
+    entry = _priced_entry(model)
     if entry:
         return entry["pricing"]
     # 3. Fall back to provider-level default
@@ -568,7 +591,7 @@ def get_model_long_context(model: str) -> tuple[int, float, float]:
     registry entry, Haiku 5.5's 100K line): a request whose prompt — input
     plus cache reads and writes — passes the line pays the multiplied rates
     on ALL of its tokens. ``(0, 1.0, 1.0)`` for every other model."""
-    lc = (MODEL_REGISTRY.get(model) or {}).get("long_context")
+    lc = (_priced_entry(model) or {}).get("long_context")
     if not lc:
         return 0, 1.0, 1.0
     over, in_m, out_m = lc
@@ -577,15 +600,21 @@ def get_model_long_context(model: str) -> tuple[int, float, float]:
 
 def price_usage(model: str, provider: str = "", *, input_tokens: int = 0,
                 output_tokens: int = 0, cache_write_tokens: int = 0,
-                cache_read_tokens: int = 0) -> float:
+                cache_read_tokens: int = 0,
+                rates: tuple[float, float, float, float] | None = None,
+                line_tokens: int | None = None) -> float:
     """The USD cost of one request's tokens at the model's rates
     (:func:`get_model_pricing`), the long-context multipliers applied when
     the prompt passes the model's line. The one formula for the token-priced
     paths (the Direct LLM adapters, the interactive transcript rows); a
-    provider's per-call fees are the caller's."""
-    p_in, p_out, p_cw, p_cr = get_model_pricing(model, provider)
+    provider's per-call fees are the caller's. ``rates`` is that function's
+    answer read earlier: given, this reads no store, so the event loop may
+    call it. ``line_tokens``: what the line is judged on when these tokens are
+    only part of what it is judged on (one model's share of a Direct turn)."""
+    p_in, p_out, p_cw, p_cr = get_model_pricing(model, provider) if rates is None else rates
     over, in_m, out_m = get_model_long_context(model)
-    if over and input_tokens + cache_write_tokens + cache_read_tokens > over:
+    judged = input_tokens + cache_write_tokens + cache_read_tokens if line_tokens is None else line_tokens
+    if over and judged > over:
         p_in, p_cw, p_cr, p_out = p_in * in_m, p_cw * in_m, p_cr * in_m, p_out * out_m
     return (input_tokens * p_in + output_tokens * p_out
             + cache_write_tokens * p_cw + cache_read_tokens * p_cr) / 1_000_000
@@ -594,7 +623,8 @@ def price_usage(model: str, provider: str = "", *, input_tokens: int = 0,
 def get_model_context_window(model: str) -> int:
     """Get the context window size for a model.
 
-    Resolution order: DB → MODEL_REGISTRY → default.
+    Resolution order: DB → MODEL_REGISTRY (a retired builtin by its
+    successor's row) → default.
     """
     # Check DB for a custom context window — every layer's rows, for the same
     # reason as get_model_pricing above (an admin's window set on the Codex or
@@ -605,7 +635,7 @@ def get_model_context_window(model: str) -> int:
         for m in subscription_store.list_models():
             if m.get("model_id") == model and m.get("context_window", 0) > 0:
                 return m["context_window"]
-    entry = MODEL_REGISTRY.get(model)
+    entry = _priced_entry(model)
     return entry["context_window"] if entry else MODEL_DEFAULT_CONTEXT_WINDOW
 
 
@@ -662,7 +692,7 @@ def get_layer_models(layer: str, *, offers_ultra: bool = False) -> list[dict]:
 
 # Precomputed once at module load: model_id → index in MODEL_REGISTRY order.
 # Used to sort the DB fallback so builtins surface in the order they appear
-# in MODEL_REGISTRY.keys() (Fable 5.1 before Opus 5.5 before Sonnet 5.5). Python
+# in MODEL_REGISTRY.keys() (Fable 5.2 before Opus 5.5 before Sonnet 5.5). Python
 # 3.7+ guarantees dict insertion order, so this is stable.
 _MODEL_REGISTRY_ORDER: dict[str, int] = {
     model_id: i for i, model_id in enumerate(MODEL_REGISTRY.keys())
@@ -690,7 +720,7 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
     new middle term; the operator's rule is "the tier is the rule": each
     engine DECLARES its default as the best tier it serves with tier 1
     offered but never defaulted; Direct LLM keeps the operator's Sonnet 5.5
-    (tier 3) though it serves GPT-6.1 Sol at tier 2):
+    (tier 3) though it serves GPT-6.2 Sol at tier 2):
       1. agents.default_model (the per-agent PIN), read through
          :func:`live_model_id` (a retired builtin as its successor). Two-mode:
          with ``layer=None`` it is returned with no check at all; with

@@ -1,16 +1,15 @@
-"""Tests for the interactive spawn-command factor in PersistentSession.
-
-Verifies that `build_spawn_command()` produces the headless `-p` argv unchanged
-and the interactive TUI argv with the headless flags dropped + TERM set, sharing
+"""The argv and the environment a Claude Code session starts with
+(``ClaudeSpawn.build_spawn_command``): the headless ``-p`` argv, and the
+terminal's TUI argv with the headless flags dropped and TERM set, sharing
 every other flag. DB-free.
 """
 import pytest
 
-from core.layers.cli.session import PersistentSession
+from core.layers.cli.spawn import ClaudeSpawn
 
 
-def _mk(interactive: bool) -> PersistentSession:
-    return PersistentSession(
+def _mk(interactive: bool) -> ClaudeSpawn:
+    return ClaudeSpawn(
         session_id="sess-abcdef123456",
         agent_prompt=None,
         mcp_config_path=None,
@@ -21,9 +20,9 @@ def _mk(interactive: bool) -> PersistentSession:
     )
 
 
-def _mk_task(permission_mode: str = "auto") -> PersistentSession:
+def _mk_task(permission_mode: str = "auto") -> ClaudeSpawn:
     """An autonomous interactive TASK session (client_type='task')."""
-    return PersistentSession(
+    return ClaudeSpawn(
         session_id="sess-task00112233",
         agent_prompt=None,
         mcp_config_path=None,
@@ -183,57 +182,6 @@ def test_interactive_task_plan_mode_still_passes_through():
     assert "--dangerously-skip-permissions" not in cmd
 
 
-@pytest.mark.asyncio
-async def test_start_session_interactive_routes_to_register(monkeypatch, tmp_path):
-    """config.interactive=True → CLIExecutionLayer.start_session spawns the TUI
-    via interactive_session.register (not the headless -p pool), with the right
-    argv/env. Proves the full config → build_spawn_command → register wiring."""
-    from auth.path_policy import SecurityContext
-    from core.execution_layer import AgentConfig
-    from core.layers.cli.layer import CLIExecutionLayer
-    from core.session import interactive_session
-
-    captured: dict = {}
-
-    async def _fake_register(**kwargs):
-        captured.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(interactive_session, "register", _fake_register)
-
-    # Local sessions are always sandboxed + network-isolated — provide the
-    # persistent config dir the real config builders set (without it the layer
-    # fails closed). The egress resolver derives the netns forward set.
-    claude_dir = tmp_path / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-
-    cfg = AgentConfig(
-        agent_name="agent",
-        user_sub="u1",
-        model="claude-opus-5",
-        effort="high",
-        chat_id="chat-xyz",
-        client_type="interactive_cli",
-        permission_mode="default",
-        interactive=True,
-        sandbox_host_claude_dir=str(claude_dir),
-        # Every builder sets one; a session with none is refused (it would
-        # run as nobody from the agent's own CLI state).
-        security_context=SecurityContext(role="manager", username="", agent="agent",
-                                         is_admin_agent=False, session_scope="agent"),
-    )
-    await CLIExecutionLayer().start_session("sess-interactive-1", cfg)
-
-    assert captured.get("session_id") == "sess-interactive-1"
-    assert captured.get("chat_id") == "chat-xyz"
-    assert captured.get("agent_name") == "agent"
-    argv = captured["argv"]
-    assert "-p" not in argv and "stream-json" not in argv
-    assert "--model" in argv and "claude-opus-5" in argv
-    assert "--session-id" in argv
-    assert captured["env"].get("TERM") == "xterm-256color"
-
-
 @pytest.mark.parametrize("interactive", [False, True])
 def test_the_shell_gets_a_command_line_token_mirroring_its_session_token(interactive):
     """Headless and the TUI alike: ``OTO_CLI_TOKEN`` names the same session,
@@ -245,3 +193,30 @@ def test_the_shell_gets_a_command_line_token_mirroring_its_session_token(interac
     cli = validate_cli_token(env["OTO_CLI_TOKEN"])
     assert cli["sid"] == s.session_id and cli["user_sub"] == "user-x"
     assert env["OTO_CLI_TOKEN"] != env["PROXY_API_KEY"]
+
+
+def test_a_terminal_on_an_api_key_signs_in_through_the_key_helper():
+    """The TUI reads a key in its environment as one a person must approve
+    on screen ("Not logged in" until then): a terminal's key moves to the
+    helper's variable and the helper on its command line prints it. A
+    headless session keeps the key where the CLI reads it."""
+    import json
+    import subprocess
+
+    from core.layers.cli.spawn import KEY_HELPER_ENV
+    term = _mk(True)
+    term.extra_env = {"ANTHROPIC_API_KEY": "sk-ant-x"}
+    cmd, env, _cwd = term.build_spawn_command()
+    assert "ANTHROPIC_API_KEY" not in env and env[KEY_HELPER_ENV] == "sk-ant-x"
+    helper = json.loads(cmd[cmd.index("--settings") + 1])["apiKeyHelper"]
+    assert "sk-ant-x" not in " ".join(cmd)
+    printed = subprocess.run(["sh", "-c", helper], capture_output=True, text=True, timeout=20,
+                             env={KEY_HELPER_ENV: "sk-ant-x"}, check=True).stdout
+    assert printed == "sk-ant-x"
+    headless = _mk(False)
+    headless.extra_env = {"ANTHROPIC_API_KEY": "sk-ant-x"}
+    cmd, env, _cwd = headless.build_spawn_command()
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-x" and "--settings" not in cmd
+    # A terminal signed in by file carries no helper.
+    cmd, _env, _cwd = _mk(True).build_spawn_command()
+    assert "--settings" not in cmd

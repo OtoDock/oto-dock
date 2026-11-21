@@ -14,7 +14,7 @@ vi.mock('@/contexts/AuthContext', () => ({
 import * as authApi from '@/api/auth'
 import { SubscribeToEventsModal } from '@/components/accounts/SubscribeToEventsModal'
 import { SubscriptionsPanel } from '@/components/accounts/SubscriptionsPanel'
-import { ServiceAccountBindingDropdown } from '@/components/ServiceAccountBindingDropdown'
+import { AgentAccounts } from '@/components/accounts/AgentAccounts'
 import { CreateTriggerModal, EditTriggerModal } from '@/pages/agent/AgentTriggers.modals'
 import DialogsHost from '@/components/ui/DialogsHost'
 import { answerDialog, findAlertDialog } from './dialogsHarness'
@@ -171,7 +171,7 @@ describe('SubscribeToEventsModal — subscribe as', () => {
     wrap(<SubscribeToEventsModal {...modalProps} scope="service" agent="dev" serviceOptions={BINDINGS} />)
     expect(screen.queryByLabelText('Subscribe as')).toBeNull()
     expect(screen.getByText('dev')).toBeInTheDocument()
-    expect(screen.getByText(/with the account set as its service account\. The agent's shared triggers and apps fire on these events\./))
+    expect(screen.getByText(/with this account\. The agent's shared triggers and apps fire on these events\./))
       .toBeInTheDocument()
   })
 
@@ -259,14 +259,15 @@ describe('SubscriptionsPanel — both scopes with a pill', () => {
   })
 })
 
-describe('Agent MCPs tab — subscribe for this agent', () => {
+describe('Agent MCPs tab — subscribe for this agent, under its account', () => {
   beforeEach(() => { fetchSpy.mockReset() })
 
-  const routes = (binding: unknown) => async (path: string) => {
+  const routes = (accounts: unknown[]) => async (path: string) => {
     if (path.includes('/service-account-options')) {
-      return ok({ my_accounts: [{ label: 'acct', display_email: 'me@x', is_default: true }], current_binding: binding })
+      return ok({ my_accounts: [{ label: 'acct', display_email: 'me@x', is_default: true }], accounts })
     }
     if (path.includes('/webhook-event-catalog')) {
+      expect(path).toContain('account_label=acct')
       expect(path).toContain('scope=service')
       expect(path).toContain('agent=dev')
       return ok(CATALOG)
@@ -277,28 +278,30 @@ describe('Agent MCPs tab — subscribe for this agent', () => {
     }
     return ok({})
   }
-  const bound = { label: 'acct', owner_sub: 'me', owner_name: 'Me', owner_email: '', set_by: '', set_at: '' }
+  const held = {
+    label: 'acct', display_email: 'me@x', owner_sub: 'me', owner_name: 'Me',
+    is_default: true, stands: true, mine: true, installation_id: '',
+  }
 
-  it('renders the button and the agent rows when a binding exists', async () => {
-    fetchSpy.mockImplementation(routes(bound))
-    wrap(<ServiceAccountBindingDropdown agentName="dev" mcpName="github-mcp" callerSub="me" agentScopeAvailable />)
-    expect(await screen.findByRole('button', { name: '+ Subscribe to events for this agent' })).toBeInTheDocument()
-    expect(await screen.findByText('dev/repo')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: '+ Subscribe to events for this agent' }))
+  it("renders the button and the agent rows under the account they are on", async () => {
+    fetchSpy.mockImplementation(routes([held]))
+    wrap(<AgentAccounts agentName="dev" mcpName="github-mcp" chatsUseThem={false} />)
+    const account = await screen.findByTestId('service-account-row')
+    expect(await within(account).findByRole('button', { name: 'Subscribe to events' })).toBeInTheDocument()
+    expect(within(account).getByText('dev/repo')).toBeInTheDocument()
+    fireEvent.click(within(account).getByRole('button', { name: 'Subscribe to events' }))
     expect(await screen.findByText('Subscribe to github events')).toBeInTheDocument()
     expect(screen.queryByLabelText('Subscribe as')).toBeNull()
   })
 
-  it('shows nothing without a binding or without agent scope', async () => {
-    fetchSpy.mockImplementation(routes(null))
-    wrap(<ServiceAccountBindingDropdown agentName="dev" mcpName="github-mcp" callerSub="me" agentScopeAvailable />)
-    await screen.findByText('No service account')
+  it('shows no account subscriptions without an account, and none at all without agent scope', async () => {
+    // With no account the agent's rows still show, apart, so they can go.
+    fetchSpy.mockImplementation(routes([]))
+    const first = wrap(<AgentAccounts agentName="dev" mcpName="github-mcp" chatsUseThem={false} />)
+    const leftover = await screen.findByTestId('agent-leftover-subscriptions')
+    expect(within(leftover).getByText('dev/repo')).toBeInTheDocument()
     expect(screen.queryByTestId('agent-service-subscriptions')).toBeNull()
-
-    fetchSpy.mockImplementation(routes(bound))
-    wrap(<ServiceAccountBindingDropdown agentName="dev" mcpName="github-mcp" callerSub="me" agentScopeAvailable={false} />)
-    await waitFor(() => expect(screen.getAllByText('No service account').length).toBe(2))
-    expect(screen.queryByTestId('agent-service-subscriptions')).toBeNull()
+    first.unmount()
   })
 })
 

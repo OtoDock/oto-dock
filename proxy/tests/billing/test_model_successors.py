@@ -20,13 +20,18 @@ def test_successor_model_follows_the_chain_to_its_end():
     # Opus 4.8 → Opus 5 → Opus 5.5: the intermediate id is retired too.
     assert app_config.successor_model("claude-opus-4-8[1m]") == "claude-opus-5-5"
     assert app_config.successor_model("claude-opus-5") == "claude-opus-5-5"
-    # 5.6 Sol → GPT-6 Sol → GPT-6.1 Sol; Sonnet 5 → Sonnet 5.5.
-    assert app_config.successor_model("gpt-5.6-sol") == "gpt-6.1-sol"
-    assert app_config.successor_model("gpt-6-sol") == "gpt-6.1-sol"
+    # 5.6 Sol → GPT-6 Sol → GPT-6.1 Sol → GPT-6.2 Sol; Sonnet 5 → Sonnet 5.5.
+    assert app_config.successor_model("gpt-5.6-sol") == "gpt-6.2-sol"
+    assert app_config.successor_model("gpt-6-sol") == "gpt-6.2-sol"
+    assert app_config.successor_model("gpt-6.1-sol") == "gpt-6.2-sol"
+    assert app_config.successor_model("gpt-6-astra") == "gpt-6.2-astra"
     assert app_config.successor_model("gpt-5.6-luna") == "gpt-6-luna"
     assert app_config.successor_model("claude-sonnet-5") == "claude-sonnet-5-5"
     assert app_config.successor_model("claude-haiku-4-5") == "claude-haiku-5-5"
     # 5.6 Terra → 6.1 Terra on both engines; Qwen 3.6 → Qwen 3.8 on Groq.
+    # Fable 5 → Fable 5.1 → Fable 5.2.
+    assert app_config.successor_model("claude-fable-5") == "claude-fable-5-2"
+    assert app_config.successor_model("claude-fable-5-1") == "claude-fable-5-2"
     assert app_config.successor_model("gpt-5.6-terra") == "gpt-6.1-terra"
     assert app_config.successor_model("qwen/qwen3.6-27b") == "qwen/qwen3.8-27b"
     # A current id, a custom id and nothing pass through unchanged.
@@ -56,6 +61,23 @@ _GPT_5_6_TERRA = {"pricing": (2.0, 12.0, 2.50, 0.20), "layers": {"codex-cli", "d
 _QWEN_3_6 = {"pricing": (0.60, 3.00, 0.0, 0.30), "layers": {"direct-llm"},
              "context_window": 131_072, "tier": 4,
              "good_at": "general-purpose answers served on Groq"}
+_FABLE_5_1 = {"pricing": (10.0, 50.0, 12.50, 0.25), "layers": {"claude-code-cli"},
+              "context_window": 1_000_000, "tier": 1,
+              "good_at": "complex coding, architecture, subtle bugs, judgement calls and long autonomous work"}
+
+
+def test_fable_5_2_succeeds_fable_5_1_losslessly():
+    # A fifth cheaper on every element, on Claude Code alone as before (kept
+    # off Direct LLM), the same window, tier, flags and good-at line.
+    e = app_config.MODEL_REGISTRY["claude-fable-5-2"]
+    assert e["provider"] == "anthropic" and set(e["layers"]) == _FABLE_5_1["layers"]
+    assert e["tier"] == _FABLE_5_1["tier"] and e["good_at"] == _FABLE_5_1["good_at"]
+    assert e["context_window"] == _FABLE_5_1["context_window"]
+    assert e["pricing"] == (8.0, 40.0, 10.0, 0.20)
+    assert all(new < old for new, old in zip(e["pricing"], _FABLE_5_1["pricing"], strict=True))
+    assert e["supports_reasoning"] and e["supports_xhigh"] and e["server_tools"]
+    assert not e.get("supports_ultra") and not e.get("long_context")
+    assert app_config.get_model_tier("claude-fable-5-2")[0] == 1
 
 
 def test_gpt_6_1_terra_succeeds_gpt_5_6_terra_losslessly():
@@ -126,7 +148,7 @@ def test_the_gpt_rows_carry_their_window_and_the_272k_tier():
     # OpenAI bills the WHOLE request at 2x input / 1.5x output once its input
     # passes 272K; the rows carried that line as their window until the tier
     # could be priced, now they carry the vendor's 1.05M window and the tier.
-    for model in ("gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-luna"):
+    for model in ("gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6-luna"):
         assert app_config.MODEL_REGISTRY[model]["context_window"] == 1_050_000, model
         assert app_config.get_model_long_context(model) == (272_000, 2.0, 1.5), model
     cost = app_config.price_usage
@@ -205,7 +227,7 @@ class TestBootWalk:
         assert first == {"gpt-5.6-luna": 1} and second == {"gpt-5.6-luna": 0}
         assert _pin("walk-d") == "gpt-6-luna"
 
-    def test_the_walk_moves_terra_and_qwen_pins_in_every_column(self):
+    def test_the_walk_moves_terra_qwen_and_fable_pins_in_every_column(self):
         # The registry's own table, on a DB whose builtin rows are synced the
         # way boot syncs them: an agent's default, a chat's model and a
         # task's model, each on a retired id, land on the successor.
@@ -214,8 +236,13 @@ class TestBootWalk:
         for path, caps in get_all_capabilities().items():
             subscription_store.sync_builtin_models(path, caps.get("models", []))
         offered = {m["model_id"] for m in subscription_store.list_models("direct-llm")}
-        assert {"gpt-6.1-terra", "gpt-6.1-sol", "qwen/qwen3.8-27b"} <= offered
-        assert not offered & {"gpt-5.6-terra", "qwen/qwen3.6-27b"}
+        assert {"gpt-6.1-terra", "gpt-6.2-sol", "qwen/qwen3.8-27b"} <= offered
+        assert not offered & {"gpt-5.6-terra", "qwen/qwen3.6-27b", "gpt-6.1-sol"}
+        codex = {m["model_id"] for m in subscription_store.list_models("codex-cli")}
+        assert {"gpt-6.2-sol", "gpt-6.2-astra"} <= codex
+        assert not codex & {"gpt-6.1-sol", "gpt-6-astra"}
+        claude = {m["model_id"] for m in subscription_store.list_models("claude-code-cli")}
+        assert "claude-fable-5-2" in claude and "claude-fable-5-1" not in claude
         agent_store.create_agent("walk-t", "Walk T", execution_path="codex-cli",
                                  default_model="gpt-5.6-terra")
         db.create_chat("walk-t-chat", "u-walk", "walk-t", model="gpt-5.6-terra",
@@ -233,6 +260,85 @@ class TestBootWalk:
             row = conn.execute("SELECT override_model FROM dynamic_tasks WHERE id = %s",
                                ("walk-t-task",)).fetchone()
         assert row["override_model"] == "qwen/qwen3.8-27b"
+
+        agent_store.create_agent("walk-f", "Walk F", execution_path="claude-code-cli",
+                                 default_model="claude-fable-5-1")
+        db.create_chat("walk-f-chat", "u-walk", "walk-f", model="claude-fable-5-1",
+                       execution_path="claude-code-cli")
+        db.create_dynamic_task("walk-f-task", "walk-f", "t", "go", "default", "one-time",
+                               None, None, None, 600, "u-walk",
+                               override_model="claude-fable-5",
+                               override_execution_path="claude-code-cli")
+        remapped = subscription_store.remap_retired_models(app_config.MODEL_SUCCESSORS)
+        assert remapped["claude-fable-5-1"] == 2 and remapped["claude-fable-5"] == 1
+        assert _pin("walk-f") == "claude-fable-5-2"
+        assert (db.get_chat("walk-f-chat") or {}).get("model") == "claude-fable-5-2"
+        with get_conn() as conn:
+            row = conn.execute("SELECT override_model FROM dynamic_tasks WHERE id = %s",
+                               ("walk-f-task",)).fetchone()
+        assert row["override_model"] == "claude-fable-5-2"
+
+        # GPT-6.2 Sol and Astra: every column, the wrap-up's pin included.
+        from storage.agents import outside_store
+        agent_store.create_agent("walk-s", "Walk S", execution_path="codex-cli",
+                                 default_model="gpt-6.1-sol")
+        db.create_chat("walk-s-chat", "u-walk", "walk-s", model="gpt-6.1-sol",
+                       execution_path="direct-llm")
+        db.create_dynamic_task("walk-s-task", "walk-s", "t", "go", "default", "one-time",
+                               None, None, None, 600, "u-walk",
+                               override_model="gpt-6-astra",
+                               override_execution_path="codex-cli")
+        outside_store.update("walk-s", wrapup_model="gpt-6.1-sol")
+        remapped = subscription_store.remap_retired_models(app_config.MODEL_SUCCESSORS)
+        assert remapped["gpt-6.1-sol"] == 3 and remapped["gpt-6-astra"] == 1
+        assert _pin("walk-s") == "gpt-6.2-sol"
+        assert (db.get_chat("walk-s-chat") or {}).get("model") == "gpt-6.2-sol"
+        assert outside_store.get_wrapup("walk-s")["wrapup_model"] == "gpt-6.2-sol"
+        with get_conn() as conn:
+            row = conn.execute("SELECT override_model FROM dynamic_tasks WHERE id = %s",
+                               ("walk-s-task",)).fetchone()
+        assert row["override_model"] == "gpt-6.2-astra"
+
+
+def test_the_two_gpt_6_2_swaps_are_lossless_by_the_registrys_rule():
+    """The rule of MODEL_SUCCESSORS for 6.1 Sol and 6 Astra: every price the
+    same or lower, the same long-context line, window, flags, engines and
+    tier. The retired rows' values as they were on 2026-11-17 (OpenAI's own
+    pages): an edit of a new row that breaks the rule fails here."""
+    retired = {
+        "gpt-6.1-sol": {"pricing": (2.0, 10.0, 2.50, 0.10), "layers": ["codex-cli", "direct-llm"],
+                        "server_tools": True, "tier": 2},
+        "gpt-6-astra": {"pricing": (10.0, 50.0, 12.50, 1.00), "layers": ["codex-cli"],
+                        "server_tools": False, "tier": 1},
+    }
+    for old_id, old in retired.items():
+        new_id = app_config.MODEL_SUCCESSORS[old_id]
+        new = app_config.MODEL_REGISTRY[new_id]
+        assert old_id not in app_config.MODEL_REGISTRY
+        assert all(n <= o for n, o in zip(new["pricing"], old["pricing"], strict=True)), new_id
+        assert new["long_context"] == (272_000, 2.0, 1.5) and new["context_window"] == 1_050_000
+        assert new["layers"] == old["layers"] and new["tier"] == old["tier"], new_id
+        assert new.get("server_tools", False) == old["server_tools"], new_id
+        assert new["supports_reasoning"] and new["supports_xhigh"] and new["supports_ultra"], new_id
+
+
+def test_a_retired_id_is_priced_and_sized_by_its_successor(monkeypatch):
+    """A terminal can still run a retired id (Codex's own model menu lists
+    it): its usage is priced by its successor's row, never the provider
+    default, and an admin's custom row for it still wins."""
+    monkeypatch.setattr(subscription_store, "list_models", lambda layer=None: [])
+    assert app_config.get_model_pricing("gpt-6.1-sol") == app_config.MODEL_REGISTRY["gpt-6.2-sol"]["pricing"]
+    assert app_config.get_model_pricing("gpt-6-astra") == app_config.MODEL_REGISTRY["gpt-6.2-astra"]["pricing"]
+    assert app_config.get_model_long_context("gpt-6.1-sol") == (272_000, 2.0, 1.5)
+    assert app_config.get_model_context_window("gpt-6.1-sol") == 1_050_000
+    assert app_config.price_usage("gpt-6.1-sol", input_tokens=300_000) == pytest.approx(300_000 * 4.0 / 1_000_000)
+    # An id that is neither a row nor retired keeps the provider default.
+    assert app_config.get_model_pricing("gpt-5.5", "openai") == app_config.PROVIDER_DEFAULT_PRICING["openai"]
+    monkeypatch.setattr(subscription_store, "list_models", lambda layer=None: [
+        {"model_id": "gpt-6.1-sol", "pricing_input": 3.0, "pricing_output": 12.0,
+         "pricing_cache_write": 0.0, "pricing_cache_read": 0.3, "context_window": 400_000}])
+    assert app_config.get_model_pricing("gpt-6.1-sol") == (3.0, 12.0, 0.0, 0.3)
+    assert app_config.get_model_context_window("gpt-6.1-sol") == 400_000
 
 
 def _raw_pin(slug: str, model: str) -> None:
@@ -257,9 +363,14 @@ class TestLiveModelId:
     def test_a_retired_id_is_its_successor_unless_an_admin_kept_it(self, monkeypatch):
         monkeypatch.setattr(subscription_store, "custom_model_exists", lambda m: False)
         assert app_config.live_model_id("claude-opus-4-8[1m]") == "claude-opus-5-5"
-        assert app_config.live_model_id("gpt-6-sol") == "gpt-6.1-sol"
+        assert app_config.live_model_id("gpt-6-sol") == "gpt-6.2-sol"
+        assert app_config.live_model_id("gpt-6.1-sol") == "gpt-6.2-sol"
+        assert app_config.live_model_id("gpt-6-astra") == "gpt-6.2-astra"
+        assert app_config.live_model_id("claude-fable-5-1") == "claude-fable-5-2"
         monkeypatch.setattr(subscription_store, "custom_model_exists", lambda m: m == "claude-opus-5")
         assert app_config.live_model_id("claude-opus-5") == "claude-opus-5"
+        monkeypatch.setattr(subscription_store, "custom_model_exists", lambda m: m == "claude-fable-5-1")
+        assert app_config.live_model_id("claude-fable-5-1") == "claude-fable-5-1"
 
     def test_a_lookup_error_answers_the_successor(self, monkeypatch):
         def _boom(model_id):
@@ -291,17 +402,17 @@ class TestReadTimeSuccession:
         assert app_config.resolve_run_model("late-q", "qwen/qwen3.6-27b") == "qwen/qwen3.8-27b"
 
     def test_a_sol_pin_without_its_engine_runs_on_the_runs_first_engine(self):
-        # GPT-6.1 Sol is on Codex and Direct LLM: a model-only pin takes the
+        # GPT-6.2 Sol is on Codex and Direct LLM: a model-only pin takes the
         # run's first engine when it offers the id, else the allowlist's
         # order (engine_for_model), the rule of every two-engine id.
         from services.engines import engine_resolution
         agent_store.create_agent("sol-a", "Sol A", execution_path="claude-code-cli",
                                  execution_paths=["codex-cli", "direct-llm"])
         agent = agent_store.get_agent("sol-a") or {}
-        assert engine_resolution.engine_for_model(agent, "gpt-6.1-sol", first="direct-llm") == "direct-llm"
-        assert engine_resolution.engine_for_model(agent, "gpt-6.1-sol", first="codex-cli") == "codex-cli"
-        assert engine_resolution.engine_for_model(agent, "gpt-6.1-sol", first="claude-code-cli") == "codex-cli"
-        assert engine_resolution.engine_for_model(agent, "gpt-6-astra", first="direct-llm") == "codex-cli"
+        assert engine_resolution.engine_for_model(agent, "gpt-6.2-sol", first="direct-llm") == "direct-llm"
+        assert engine_resolution.engine_for_model(agent, "gpt-6.2-sol", first="codex-cli") == "codex-cli"
+        assert engine_resolution.engine_for_model(agent, "gpt-6.2-sol", first="claude-code-cli") == "codex-cli"
+        assert engine_resolution.engine_for_model(agent, "gpt-6.2-astra", first="direct-llm") == "codex-cli"
 
     def test_a_run_and_its_chat_row_name_the_same_model(self):
         # The runner stamps the chat row (billing reads it) and the config
@@ -311,4 +422,5 @@ class TestReadTimeSuccession:
         assert app_config.resolve_run_model("late-b", "gpt-5.6-luna") == "gpt-6-luna"
         assert app_config.resolve_run_model("late-b", None) == app_config.resolve_run_model(
             "late-b", None, layer="codex-cli")
-        assert app_config.resolve_run_model("late-b", "") == "gpt-6.1-sol"
+        # The agent pinned to the retired 6.1 Sol runs on 6.2 Sol.
+        assert app_config.resolve_run_model("late-b", "") == "gpt-6.2-sol"

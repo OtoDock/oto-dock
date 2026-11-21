@@ -11,6 +11,7 @@ Covers the pure / unit-testable pieces without real npm/PyPI/GitHub:
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -343,6 +344,76 @@ class TestDetectionScopedToCommunity:
         assert updates["camoufox"]["latest"] == "0.0.72"
         # Only the community npm candidate was even probed.
         assert out["checked"] == 2  # notion (npm) + camoufox (docker)
+
+
+class TestOneBrokenVenvStopsNothing:
+    """A build can write anything into its venv's ``pyvenv.cfg``: a NUL in
+    the ``home`` it names once raised out of the check of every tool."""
+
+    def _manifests(self, tmp_path):
+        from types import SimpleNamespace as NS
+        out = {}
+        for name in ("good-mcp", "nul-mcp"):
+            venv = tmp_path / name / "venv"
+            venv.mkdir(parents=True)
+            home = "/usr/bin" if name == "good-mcp" else "/usr/\x00bin"
+            (venv / "pyvenv.cfg").write_text(f"home = {home}\nversion = 3.13.1\n")
+            out[name] = NS(category="community", version="1.0.0", mcp_dir=str(tmp_path / name),
+                           server=NS(runtime="python", source=f"pypi:{name}", image="", url_template="",
+                                     version_constraint=""))
+        return out
+
+    def _patch(self, tmp_path, monkeypatch):
+        manifests = self._manifests(tmp_path)
+        monkeypatch.setattr(mcp_updater.mcp_registry, "get_all_manifests", lambda: manifests)
+
+        async def _fake_registry():
+            return {"mcps": [{"name": n, "version": "", "version_constraint": ""} for n in manifests]}
+        monkeypatch.setattr(community_catalog, "fetch_registry", _fake_registry)
+
+        async def _fake_latest(registry, package, constraint):
+            return "2.0.0"
+        monkeypatch.setattr(mcp_updater, "resolve_latest_in_bound", _fake_latest)
+
+        async def _no_doc(registry, package):
+            return None
+        monkeypatch.setattr(mcp_updater, "_registry_doc", _no_doc)
+        return manifests
+
+    def test_the_reader_answers_without_raising(self, tmp_path):
+        from services.mcp import mcp_installer
+        venv = self._manifests(tmp_path)["nul-mcp"].mcp_dir + "/venv"
+        assert mcp_installer.venv_interpreter_paths(venv) == []
+        assert mcp_installer.venv_outside(venv, [tmp_path]) is False
+
+    @pytest.mark.asyncio
+    async def test_the_update_check_goes_on_past_it(self, tmp_path, monkeypatch):
+        self._patch(tmp_path, monkeypatch)
+        updates = (await mcp_updater.detect_available_updates())["updates"]
+        assert updates["good-mcp"]["latest"] == "2.0.0" and updates["nul-mcp"]["latest"] == "2.0.0"
+
+    @pytest.mark.asyncio
+    async def test_the_weekly_job_goes_on_past_it(self, tmp_path, monkeypatch):
+        from services.mcp import mcp_autoupdate
+        manifests = self._patch(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_updater, "community_targets",
+                            lambda: [SimpleNamespace(name=n, category=m.category, server=m.server)
+                                     for n, m in manifests.items()])
+        updated: list[str] = []
+
+        async def _update_one(name, **kw):
+            updated.append(name)
+            return {"status": "updated", "old_version": "1.0.0", "version": "2.0.0"}
+        monkeypatch.setattr(mcp_updater, "update_one", _update_one)
+        monkeypatch.setattr(mcp_autoupdate.log_store, "record_result", lambda *a, **kw: None)
+        monkeypatch.setattr(mcp_autoupdate, "_waits", lambda info: False)  # no release times here
+
+        async def _quiet(**kw):
+            return []
+        import services.notifications.notification_manager as nm
+        monkeypatch.setattr(nm, "fire_notification", _quiet)
+        await mcp_autoupdate.run_auto_update(trigger="auto")
+        assert sorted(updated) == ["good-mcp", "nul-mcp"]
 
 
 class TestAheadOfCatalog:

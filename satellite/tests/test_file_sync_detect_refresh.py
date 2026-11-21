@@ -21,6 +21,8 @@ baseline and only emits genuinely new changes.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 
 import pytest
@@ -32,7 +34,7 @@ from satellite.transport.file_sync import (
     snapshot_agent_dir,
 )
 
-_REAL_HASH_FILE = _file_sync._hash_file
+_REAL_OPEN_LISTED = _file_sync._open_listed
 
 
 def test_repeat_call_with_no_writes_returns_no_changes(tmp_path):
@@ -303,7 +305,11 @@ def _windows_os(monkeypatch):
     """The Windows shape of ``os`` on this host: no ``O_NONBLOCK``, and an
     ``os.set_blocking`` that takes only a pipe (Python 3.12+ raises
     "Incorrect function" for a regular file)."""
+    import dataclasses
     import stat
+
+    from satellite import config as sat_config
+    monkeypatch.setattr(sat_config, "HOST", dataclasses.replace(sat_config.HOST, posix=False))
     monkeypatch.delattr(os, "O_NONBLOCK", raising=False)
 
     def set_blocking(fd, blocking):
@@ -340,19 +346,19 @@ def test_windows_hashes_every_file(tmp_path, monkeypatch):
 
 
 def _lock(monkeypatch, *names, vanished=()):
-    """``_hash_file`` refusing the named files as a Windows lock does, and
-    raising FileNotFoundError for the vanished ones."""
+    """The open of a listed file refusing the named files as a Windows lock
+    does, and raising FileNotFoundError for the vanished ones."""
     from satellite.transport import file_sync
-    real = _REAL_HASH_FILE
+    real = _REAL_OPEN_LISTED
 
-    def hash_file(path):
+    def open_listed(root, rel, path, cap):
         if path.name in names:
             raise PermissionError(13, "The process cannot access the file")
         if path.name in vanished:
             raise FileNotFoundError(2, "No such file")
-        return real(path)
+        return real(root, rel, path, cap)
 
-    monkeypatch.setattr(file_sync, "_hash_file", hash_file)
+    monkeypatch.setattr(file_sync, "_open_listed", open_listed)
 
 
 def test_an_unreadable_file_is_summed_up_once_per_change(tmp_path, monkeypatch, caplog):
@@ -468,7 +474,7 @@ def test_a_file_hashed_but_not_read_is_reported_next_turn(tmp_path, monkeypatch)
     """A write the scan hashed but could not read (locked in between) keeps
     the baseline the platform knows, so the next turn reports it instead of
     losing it until a merge."""
-    from pathlib import Path
+    from satellite.transport import file_sync
     agent = tmp_path
     ws = agent / "workspace"
     ws.mkdir()
@@ -476,16 +482,16 @@ def test_a_file_hashed_but_not_read_is_reported_next_turn(tmp_path, monkeypatch)
     snap = snapshot_agent_dir(agent)
     (ws / "doc.txt").write_text("v2")
     (ws / "new.txt").write_text("n")
-    real = Path.read_bytes
+    real = file_sync._read_inline
 
-    def read_bytes(self):
-        if self.name in ("doc.txt", "new.txt"):
+    def read_inline(root, rel, path):
+        if path.name in ("doc.txt", "new.txt"):
             raise PermissionError(13, "locked")
-        return real(self)
+        return real(root, rel, path)
 
-    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(file_sync, "_read_inline", read_inline)
     assert detect_changes(agent, snap) == []
-    monkeypatch.setattr(Path, "read_bytes", real)
+    monkeypatch.setattr(file_sync, "_read_inline", real)
     assert sorted(c["path"] for c in detect_changes(agent, snap)) == [
         "workspace/doc.txt", "workspace/new.txt"]
 
@@ -571,6 +577,24 @@ def test_only_the_persons_folders_sync_under_an_engine_home(tmp_path):
         assert not _file_sync.is_unsynced_engine_home_path(rel), rel
 
 
+@pytest.mark.skipif(os.name == "nt", reason="links stand in for junctions on POSIX")
+def test_a_sessions_home_never_syncs_nor_what_its_links_reach(tmp_path):
+    """A session's home (``sessions/session_homes.py``) holds its sign-in:
+    never listed, and the walk never enters ``own``, so a link in a home
+    (a junction is walked as a folder on Windows) never syncs a file twice."""
+    sid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    from satellite.sessions import session_homes
+    store = tmp_path / "users" / "alice" / ".claude"
+    (store / "skills" / "x").mkdir(parents=True)
+    (store / "skills" / "x" / "SKILL.md").write_text("x")
+    home = session_homes.open_home(store, sid, {"links": ["skills"], "seed": {}})
+    (home / ".credentials.json").write_text("{}")
+    assert set(snapshot_agent_dir(tmp_path)) == {"users/alice/.claude/skills/x/SKILL.md"}
+    for rel in (f"users/alice/.claude/own/{sid}/.credentials.json",
+                f"users/alice/.claude/own/{sid}/skills/x/SKILL.md", "workspace/.claude/own"):
+        assert _file_sync.is_unsynced_engine_home_path(rel), rel
+
+
 def test_the_per_session_mcp_config_copies_never_sync(tmp_path):
     """The session MCP config copies carry that session's own tokens and are
     rewritten at every start: this satellite's ``mcp-config-<sid12>.json``,
@@ -634,13 +658,13 @@ def test_snapshot_hash_cache_skips_rehash(tmp_path, monkeypatch):
         _os.utime(f, (old, old))
 
     calls = {"n": 0}
-    real = fs._hash_file
+    real = fs._hash_fd
 
-    def _counting(path):
+    def _counting(fd):
         calls["n"] += 1
-        return real(path)
+        return real(fd)
 
-    monkeypatch.setattr(fs, "_hash_file", _counting)
+    monkeypatch.setattr(fs, "_hash_fd", _counting)
     fs._HASH_CACHE.clear()
 
     snapshot_agent_dir(agent)
@@ -660,17 +684,17 @@ def test_hash_cache_keeps_the_raw_digest_and_primes_tolerantly(tmp_path):
     fs._HASH_CACHE.clear()
     fs.prime_hash_cache(f, "sha256:" + "ab" * 32)
     entry = fs._HASH_CACHE[str(f)]
-    assert isinstance(entry[2], bytes) and len(entry[2]) == 32
+    assert isinstance(entry[3], bytes) and len(entry[3]) == 32
     fs.prime_hash_cache(f, "not-a-hash")  # never raises, never poisons
-    assert fs._HASH_CACHE[str(f)][2] == bytes.fromhex("ab" * 32)
+    assert fs._HASH_CACHE[str(f)][3] == bytes.fromhex("ab" * 32)
     fs._HASH_CACHE.clear()
     import os as _os
     import time as _time
     old = _time.time() - 60
     _os.utime(f, (old, old))
-    st = _os.stat(f)
-    assert fs._hash_file_cached(f, st) == fs._hash_file(f)
-    assert fs._hash_file_cached(f, st) == fs._hash_file(f)  # the hit answers the text form
+    st = _os.lstat(f)
+    assert fs._hash_listed(str(tmp_path), f.name, f, st, 100) == fs._hash_file(f)
+    assert fs._hash_listed(str(tmp_path), f.name, f, st, 100) == fs._hash_file(f)  # the hit answers the text form
     assert fs._HASH_CACHE_MAX >= 200_000
 
 
@@ -718,3 +742,671 @@ def test_a_junction_is_a_name_surrogate_and_a_placeholder_is_not():
     assert _is_surrogate(SimpleNamespace(st_mode=regular_dir, st_reparse_tag=0xA000000C))
     assert not _is_surrogate(SimpleNamespace(st_mode=regular_dir, st_reparse_tag=0x9000001A))
     assert not _is_surrogate(SimpleNamespace(st_mode=regular_dir, st_reparse_tag=0))
+
+
+def test_a_folder_that_became_a_link_after_its_listing_sends_nothing_from_it(tmp_path, monkeypatch):
+    """The scan lists by name; a folder swapped for a link since its listing
+    is refused where it stands: no change and no hash carries what lies
+    behind the link, and the manifest names the folder as a link."""
+    from satellite.transport import file_sync
+    agent = tmp_path / "agent"
+    (agent / "workspace").mkdir(parents=True)
+    (agent / "workspace" / "ok.txt").write_text("ok")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("stand-in")
+    (agent / "workspace" / "sub").symlink_to(outside)
+    real_walk = os.walk
+
+    def _listed_before_the_swap(top, *a, **kw):
+        yield from real_walk(top, *a, **kw)
+        yield str(agent / "workspace" / "sub"), [], ["secret.txt"]
+    monkeypatch.setattr(file_sync.os, "walk", _listed_before_the_swap)
+    changes = detect_changes(agent, {})
+    assert [c["path"] for c in changes] == ["workspace/ok.txt"]
+    assert not any(base64.b64decode(c.get("content_b64", "")) == b"stand-in" for c in changes)
+    entries = compute_manifest(agent, report_skipped=True)
+    assert {"path": "workspace/sub", "skipped": "link", "dir": True} in entries
+    assert [e["path"] for e in entries if "hash" in e] == ["workspace/ok.txt"]
+
+
+def test_an_inline_write_carries_the_hash_of_the_bytes_it_sends(tmp_path, monkeypatch):
+    """A file rewritten between its hash and its read is sent with the hash
+    of what was read, never the hash of the bytes before."""
+    import hashlib
+
+    from satellite.transport import file_sync
+    agent = tmp_path / "agent"
+    (agent / "workspace").mkdir(parents=True)
+    (agent / "workspace" / "doc.txt").write_text("read")
+    monkeypatch.setattr(file_sync, "snapshot_agent_dir",
+                        lambda d: {"workspace/doc.txt": "sha256:" + "0" * 64})
+    snap: dict = {}
+    [change] = detect_changes(agent, snap)
+    assert base64.b64decode(change["content_b64"]) == b"read"
+    assert change["hash"] == "sha256:" + hashlib.sha256(b"read").hexdigest()
+    assert snap == {"workspace/doc.txt": change["hash"]}
+
+
+def test_an_agent_folder_moved_behind_a_link_keeps_its_turn_end_scan(tmp_path):
+    """A person's agent folder moved to another disk behind a link keeps
+    reporting its changes; a link below it is still never followed."""
+    real = tmp_path / "disk2" / "agent"
+    (real / "workspace").mkdir(parents=True)
+    (tmp_path / "secret.txt").write_text("stand-in")
+    (real / "workspace" / "linked.txt").symlink_to(tmp_path / "secret.txt")
+    (tmp_path / "agents").mkdir()
+    agent = tmp_path / "agents" / "agent"
+    agent.symlink_to(real)
+    snap = snapshot_agent_dir(agent)
+    (real / "workspace" / "new.txt").write_text("new")
+    assert [(c["path"], base64.b64decode(c["content_b64"])) for c in detect_changes(agent, snap)] == [
+        ("workspace/new.txt", b"new")]
+
+
+def test_a_listed_file_is_opened_with_no_link_on_its_way_whatever_its_folder_check(tmp_path, monkeypatch):
+    """A folder checked before it was swapped for a link: the open of each
+    file below it refuses the link on the way, in the snapshot and in the
+    turn-end read alike."""
+    from satellite.transport import file_sync
+    agent = tmp_path / "agent"
+    (agent / "workspace").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("stand-in")
+    (agent / "workspace" / "sub").symlink_to(outside)
+    real_walk = os.walk
+
+    def _listed_before_the_swap(top, *a, **kw):
+        yield from real_walk(top, *a, **kw)
+        yield str(agent / "workspace" / "sub"), [], ["secret.txt"]
+    monkeypatch.setattr(file_sync.os, "walk", _listed_before_the_swap)
+    monkeypatch.setattr(file_sync, "_folder_refused", lambda root, rel: None)
+    assert snapshot_agent_dir(agent) == {}
+    monkeypatch.setattr(file_sync, "snapshot_agent_dir",
+                        lambda d: {"workspace/sub/secret.txt": "sha256:" + "0" * 64})
+    assert detect_changes(agent, {}) == []
+
+
+def _backdated(path, data: bytes):
+    """``data`` at ``path``, its times a minute back (past the racy window)."""
+    import time as _time
+    path.write_bytes(data)
+    old = _time.time() - 60
+    os.utime(path, (old, old))
+    return os.lstat(path)
+
+
+def test_a_file_swapped_at_its_name_with_its_size_and_time_kept_is_hashed_again(tmp_path, monkeypatch):
+    """Another file renamed onto the name with the same size and the first
+    one's time is a different file: the snapshot reads it again."""
+    import hashlib
+    from collections import OrderedDict
+
+    from satellite.transport import file_sync
+    monkeypatch.setattr(file_sync, "_HASH_CACHE", OrderedDict())
+    agent = tmp_path / "agent"
+    (agent / "workspace").mkdir(parents=True)
+    st = _backdated(agent / "workspace" / "doc.txt", b"aaaa")
+    assert snapshot_agent_dir(agent) == {"workspace/doc.txt": "sha256:" + hashlib.sha256(b"aaaa").hexdigest()}
+    other = tmp_path / "other.txt"
+    other.write_bytes(b"bbbb")
+    os.utime(other, ns=(st.st_atime_ns, st.st_mtime_ns))
+    os.replace(other, agent / "workspace" / "doc.txt")
+    assert snapshot_agent_dir(agent) == {"workspace/doc.txt": "sha256:" + hashlib.sha256(b"bbbb").hexdigest()}
+
+
+def test_a_hash_read_while_the_file_changed_is_never_remembered(tmp_path, monkeypatch):
+    """A file that changes while it is hashed leaves nothing in the cache,
+    so the next snapshot reads it again."""
+    from collections import OrderedDict
+
+    from satellite.transport import file_sync
+    monkeypatch.setattr(file_sync, "_HASH_CACHE", OrderedDict())
+    agent = tmp_path / "agent"
+    (agent / "workspace").mkdir(parents=True)
+    doc = agent / "workspace" / "doc.txt"
+    _backdated(doc, b"aaaa")
+    real = file_sync._hash_fd
+    hashed: list = []
+
+    def _grows_while_hashed(fd):
+        hashed.append(fd)
+        digest = real(fd)
+        if len(hashed) == 1:
+            with open(doc, "ab") as fh:
+                fh.write(b"b")
+        return digest
+    monkeypatch.setattr(file_sync, "_hash_fd", _grows_while_hashed)
+    snapshot_agent_dir(agent)
+    assert str(doc) not in file_sync._HASH_CACHE
+    snapshot_agent_dir(agent)
+    assert len(hashed) == 2
+
+
+def test_a_link_above_the_visited_folder_is_a_skipped_link_folder_never_a_gap(tmp_path, monkeypatch):
+    """A folder above the one the walk visits, swapped for a link after its
+    own check: the visited folder is a skipped ``link`` folder, so the merge
+    reads its files as unknown, never as gone."""
+    from satellite.transport import file_sync
+    agent = tmp_path / "agent"
+    (agent / "workspace").mkdir(parents=True)
+    (agent / "workspace" / "ok.txt").write_text("ok")
+    outside = tmp_path / "outside"
+    (outside / "deeper").mkdir(parents=True)
+    (outside / "deeper" / "x.txt").write_text("stand-in")
+    (agent / "workspace" / "sub").symlink_to(outside)
+    real_walk = os.walk
+
+    def _listed_before_the_swap(top, *a, **kw):
+        yield from real_walk(top, *a, **kw)
+        yield str(agent / "workspace" / "sub" / "deeper"), [], ["x.txt"]
+    monkeypatch.setattr(file_sync.os, "walk", _listed_before_the_swap)
+    entries = compute_manifest(agent, report_skipped=True)
+    assert {"path": "workspace/sub/deeper", "skipped": "link", "dir": True} in entries
+    assert [e["path"] for e in entries if "hash" in e] == ["workspace/ok.txt"]
+
+
+def _fstat_with_another_inode(monkeypatch):
+    """``os.fstat`` answering an inode that is not ``os.lstat``'s for the same
+    file, as a Windows filesystem and Python may (the file index and the file
+    id come from two calls there)."""
+    real = os.fstat
+
+    def fstat(fd):
+        st = real(fd)
+        return os.stat_result(
+            (st.st_mode, st.st_ino + 1_000_003, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+             st.st_size, int(st.st_atime), int(st.st_mtime), int(st.st_ctime)),
+            {"st_atime": st.st_atime, "st_mtime": st.st_mtime, "st_ctime": st.st_ctime,
+             "st_atime_ns": st.st_atime_ns, "st_mtime_ns": st.st_mtime_ns, "st_ctime_ns": st.st_ctime_ns})
+    monkeypatch.setattr(os, "fstat", fstat)
+
+
+def test_an_unchanged_tree_opens_no_file_where_the_two_inodes_differ(tmp_path, monkeypatch):
+    """The cache compares the listing's status with a listing's status, never
+    with the open file's: on a Windows-shaped host whose open file reports
+    another inode, a second scan of an unchanged tree still opens nothing."""
+    from collections import OrderedDict
+
+    from satellite.transport import file_sync
+    _windows_os(monkeypatch)
+    _fstat_with_another_inode(monkeypatch)
+    monkeypatch.setattr(file_sync, "_HASH_CACHE", OrderedDict())
+    agent = tmp_path / "agent"
+    (agent / "workspace").mkdir(parents=True)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        _backdated(agent / "workspace" / name, name.encode())
+    first = snapshot_agent_dir(agent)
+    opened: list = []
+    real = file_sync._open_listed
+
+    def _counted(root, rel, path, cap):
+        opened.append(rel)
+        return real(root, rel, path, cap)
+    monkeypatch.setattr(file_sync, "_open_listed", _counted)
+    assert snapshot_agent_dir(agent) == first and len(first) == 3
+    assert opened == []
+
+
+def test_a_file_changed_between_its_listing_and_its_read_is_never_remembered(tmp_path, monkeypatch):
+    from collections import OrderedDict
+
+    from satellite.transport import file_sync
+    monkeypatch.setattr(file_sync, "_HASH_CACHE", OrderedDict())
+    agent = tmp_path / "agent"
+    (agent / "workspace").mkdir(parents=True)
+    doc = agent / "workspace" / "doc.txt"
+    _backdated(doc, b"aaaa")
+    real = file_sync._open_listed
+
+    def _grows_before_the_read(root, rel, path, cap):
+        with open(doc, "ab") as fh:
+            fh.write(b"b")
+        return real(root, rel, path, cap)
+    monkeypatch.setattr(file_sync, "_open_listed", _grows_before_the_read)
+    snapshot_agent_dir(agent)
+    assert str(doc) not in file_sync._HASH_CACHE
+
+
+def test_a_push_refreshed_during_the_scan_keeps_its_hash(tmp_path, monkeypatch):
+    """The scan runs in a thread while a push applied on the loop refreshes
+    the same snapshot: the push's hash is kept, so the pushed file never
+    echoes back to the platform as a change of this machine."""
+    from satellite.transport import file_sync
+    agent = tmp_path / "agent"
+    (agent / "workspace").mkdir(parents=True)
+    (agent / "workspace" / "a.txt").write_text("a")
+    snap = snapshot_agent_dir(agent)
+    real = file_sync.snapshot_agent_dir
+
+    pushed = "sha256:" + hashlib.sha256(b"from the platform").hexdigest()
+
+    def _push_lands_meanwhile(d):
+        current = real(d)
+        (agent / "workspace" / "pushed.txt").write_text("from the platform")
+        snap["workspace/pushed.txt"] = pushed
+        return current
+    monkeypatch.setattr(file_sync, "snapshot_agent_dir", _push_lands_meanwhile)
+    assert detect_changes(agent, snap) == []
+    assert snap["workspace/pushed.txt"] == pushed
+    monkeypatch.setattr(file_sync, "snapshot_agent_dir", real)
+    assert detect_changes(agent, snap) == []
+
+
+def _write_msg(rel: str, data: bytes) -> dict:
+    return {"path": rel, "action": "write", "content_b64": base64.b64encode(data).decode(),
+            "hash": "sha256:" + hashlib.sha256(data).hexdigest()}
+
+
+def _agent_with_two_files(tmp_path):
+    agent = tmp_path / "agents" / "a"
+    (agent / "workspace").mkdir(parents=True)
+    (agent / "workspace" / "kept.txt").write_text("kept")
+    (agent / "workspace" / "doc.txt").write_text("first")
+    return agent
+
+
+def _push_lands(monkeypatch, agent, snap, msg, *, before_walk: bool):
+    """The satellite's own ``apply_file_push`` with the session's snapshot,
+    run whole between two steps of the scan, as the event loop runs it
+    beside the scan's thread."""
+    real = _file_sync.snapshot_agent_dir
+
+    def _walk(d):
+        if before_walk:
+            _file_sync.apply_file_push(agent, msg, snapshots=[snap])
+            return real(d)
+        current = real(d)
+        _file_sync.apply_file_push(agent, msg, snapshots=[snap])
+        return current
+    monkeypatch.setattr(_file_sync, "snapshot_agent_dir", _walk)
+    return real
+
+
+@pytest.mark.parametrize("rel", ["workspace/doc.txt", "workspace/new.txt"])
+def test_a_write_pushed_before_the_scan_reads_the_file_is_never_reported_back(tmp_path, monkeypatch, rel):
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    real = _push_lands(monkeypatch, agent, snap, _write_msg(rel, b"from the platform"), before_walk=True)
+    assert detect_changes(agent, snap) == []
+    monkeypatch.setattr(_file_sync, "snapshot_agent_dir", real)
+    assert detect_changes(agent, snap) == []
+
+
+@pytest.mark.parametrize("before_walk", [True, False], ids=["before-the-walk", "after-the-walk"])
+def test_a_delete_pushed_during_the_scan_is_never_reported_back(tmp_path, monkeypatch, before_walk):
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    real = _push_lands(monkeypatch, agent, snap, {"path": "workspace/doc.txt", "action": "delete"},
+                       before_walk=before_walk)
+    assert detect_changes(agent, snap) == []
+    assert "workspace/doc.txt" not in snap
+    monkeypatch.setattr(_file_sync, "snapshot_agent_dir", real)
+    assert detect_changes(agent, snap) == []
+
+
+def test_a_machine_change_beside_a_push_is_still_reported(tmp_path, monkeypatch):
+    """The other half: what the session itself changed is reported, whatever
+    a push did to another path meanwhile."""
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    (agent / "workspace" / "kept.txt").write_text("changed on the machine")
+    _push_lands(monkeypatch, agent, snap, _write_msg("workspace/doc.txt", b"from the platform"),
+                before_walk=True)
+    assert [(c["path"], c["action"]) for c in detect_changes(agent, snap)] == [("workspace/kept.txt", "write")]
+
+
+def test_a_large_file_pushed_after_the_walk_is_never_reported_back(tmp_path, monkeypatch):
+    """A file too large to send inline is reported by its hash alone: the
+    walk's hash of the bytes the push replaced is never sent back."""
+    monkeypatch.setattr(_file_sync, "CHUNK_THRESHOLD", 8)
+    agent = _agent_with_two_files(tmp_path)
+    (agent / "workspace" / "doc.txt").write_bytes(b"a" * 20)
+    snap = snapshot_agent_dir(agent)
+    real = _push_lands(monkeypatch, agent, snap, _write_msg("workspace/doc.txt", b"b" * 30),
+                       before_walk=False)
+    assert detect_changes(agent, snap) == []
+    monkeypatch.setattr(_file_sync, "snapshot_agent_dir", real)
+    assert detect_changes(agent, snap) == []
+
+
+def _scan_inside(monkeypatch, name, agent, snap, *, after: bool) -> list:
+    """Runs a whole scan inside the push's one disk step, before or after
+    it, as the scan's thread runs while the loop applies the push."""
+    from satellite.host import safe_fs
+    real = getattr(safe_fs, name)
+    reports: list = []
+
+    def _step(*a, **kw):
+        if not after:
+            reports.append(detect_changes(agent, snap))
+        out = real(*a, **kw)
+        if after:
+            reports.append(detect_changes(agent, snap))
+        return out
+    monkeypatch.setattr(safe_fs, name, _step)
+    return reports
+
+
+@pytest.mark.parametrize("after", [True, False], ids=["after-the-disk-step", "before-the-disk-step"])
+@pytest.mark.parametrize("msg, step", [
+    (_write_msg("workspace/doc.txt", b"from the platform"), "atomic_write_beneath"),
+    (_write_msg("workspace/new.txt", b"new from the platform"), "atomic_write_beneath"),
+    ({"path": "workspace/doc.txt", "action": "delete"}, "unlink_beneath"),
+], ids=["write", "new-file", "delete"])
+def test_a_scan_inside_a_push_never_reports_the_push(tmp_path, monkeypatch, msg, step, after):
+    """The push's disk step and its baseline entry are never seen apart: a
+    scan that runs between them leaves the path to the push."""
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    reports = _scan_inside(monkeypatch, step, agent, snap, after=after)
+    _file_sync.apply_file_push(agent, msg, snapshots=[snap])
+    monkeypatch.undo()
+    assert reports == [[]]
+    assert detect_changes(agent, snap) == []
+    assert (snap.get(msg["path"]) is None) == (msg["action"] == "delete")
+
+
+@pytest.mark.parametrize("step, msg", [
+    ("atomic_write_beneath", _write_msg("workspace/doc.txt", b"from the platform")),
+    ("unlink_beneath", {"path": "workspace/doc.txt", "action": "delete"}),
+], ids=["write", "delete"])
+def test_a_push_that_fails_leaves_the_baseline_as_it_was(tmp_path, monkeypatch, step, msg):
+    from satellite.host import safe_fs
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    before = dict(snap)
+
+    def _fails(*a, **kw):
+        raise PermissionError(13, "refused")
+    monkeypatch.setattr(safe_fs, step, _fails)
+    with pytest.raises(PermissionError):
+        _file_sync.apply_file_push(agent, msg, snapshots=[snap])
+    monkeypatch.undo()
+    assert snap == before
+    (agent / "workspace" / "doc.txt").write_text("changed on the machine")
+    assert [(c["path"], c["action"]) for c in detect_changes(agent, snap)] == [("workspace/doc.txt", "write")]
+
+
+@pytest.mark.parametrize("hook", ["stat", "read"])
+def test_two_scans_of_one_session_report_a_change_once(tmp_path, monkeypatch, hook):
+    """A second scan of the session that runs inside the first (a turn's
+    end beside a terminal's quiet moment) never reports the same change
+    again: each move of the session's entry is one scan's."""
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    if hook == "stat":
+        (agent / "workspace" / "doc.txt").unlink()
+        expected = ("workspace/doc.txt", "delete")
+        target, name = _file_sync.os, "stat"
+    else:
+        (agent / "workspace" / "doc.txt").write_text("changed on the machine")
+        expected = ("workspace/doc.txt", "write")
+        target, name = _file_sync, "_read_inline"
+    real = getattr(target, name)
+    inner: list = []
+
+    def _second_scan_meanwhile(*a, **kw):
+        try:
+            return real(*a, **kw)
+        finally:
+            if not inner and any(str(x).endswith("doc.txt") for x in a):
+                inner.append(None)
+                inner.extend(detect_changes(agent, snap))
+    monkeypatch.setattr(target, name, _second_scan_meanwhile)
+    outer = detect_changes(agent, snap)
+    monkeypatch.undo()
+    reported = [(c["path"], c["action"]) for c in outer + inner[1:]]
+    assert reported == [expected]
+    assert detect_changes(agent, snap) == []
+
+
+def test_a_start_frame_rewrites_no_file_that_holds_its_bytes(tmp_path):
+    """A rename over a file a running sandbox binds by name detaches the bind
+    there: a file the frame carries unchanged is left as it is (and still
+    counted the session's for its close)."""
+    import base64
+
+    from satellite.sessions import session_files
+    agent = tmp_path / "agents" / "a"
+    payload = {"host_files": {"users/alice/cfg/hooks.json": {
+        "content_b64": base64.b64encode(b"{}").decode(), "mode": 0o600}}}
+    session_files.materialize_agent_files(payload, "s-1", agent)
+    path = agent / "users" / "alice" / "cfg" / "hooks.json"
+    first = path.stat().st_ino
+    session_files.materialize_agent_files(payload, "s-2", agent)
+    assert path.stat().st_ino == first
+    session_files.wipe_agent_files("s-1")
+    assert path.exists()
+    session_files.wipe_agent_files("s-2")
+    assert not path.exists()
+    changed = {"host_files": {"users/alice/cfg/hooks.json": {
+        "content_b64": base64.b64encode(b"{\"a\": 1}").decode(), "mode": 0o600}}}
+    session_files.materialize_agent_files(payload, "s-3", agent)
+    session_files.materialize_agent_files(changed, "s-4", agent)
+    assert path.read_bytes() == b'{"a": 1}'
+    session_files.wipe_agent_files("s-3")
+    session_files.wipe_agent_files("s-4")
+
+
+def test_a_start_and_a_close_on_two_threads_never_leave_a_written_file_unregistered(tmp_path, monkeypatch):
+    """A prepared file's write and its registration are one step for the
+    close's removal: a close that runs while another session's start writes
+    the same file never removes it under that start."""
+    import base64
+    import threading
+
+    from satellite.host import safe_fs
+    from satellite.sessions import session_files
+    agent = tmp_path / "agents" / "a"
+    payload = {"host_files": {"users/alice/cfg/settings.json": {
+        "content_b64": base64.b64encode(b"{}").decode(), "mode": 0o600}}}
+    session_files.materialize_agent_files(payload, "s-1", agent)
+    written = threading.Event()
+    removing = threading.Event()
+    real_write = safe_fs.atomic_write_beneath
+
+    def _slow_write(*a, **kw):
+        real_write(*a, **kw)
+        written.set()
+        removing.wait(1.0)
+    monkeypatch.setattr(safe_fs, "atomic_write_beneath", _slow_write)
+    start = threading.Thread(target=session_files.materialize_agent_files, args=(payload, "s-2", agent))
+    start.start()
+    written.wait(5)
+    close = threading.Thread(target=session_files.wipe_agent_files, args=("s-1",))
+    close.start()
+    removing.set()
+    start.join(5)
+    close.join(5)
+    assert (agent / "users" / "alice" / "cfg" / "settings.json").exists()
+    session_files.wipe_agent_files("s-2")
+    assert not (agent / "users" / "alice" / "cfg" / "settings.json").exists()
+
+
+@pytest.mark.parametrize("after", [True, False], ids=["after-the-disk-step", "before-the-disk-step"])
+def test_a_scan_inside_a_chunked_pushs_commit_never_reports_the_push(tmp_path, monkeypatch, after):
+    """A file sent in pieces changes on disk at its commit alone, and that
+    step is marked as a whole write's is."""
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    rel, data = "workspace/doc.txt", b"from the platform, in pieces"
+    full = "sha256:" + hashlib.sha256(data).hexdigest()
+    _file_sync.apply_file_push(agent, {"path": rel, "action": "write_chunk", "chunk_index": 0,
+                                       "content_b64": base64.b64encode(data[:10]).decode()}, snapshots=[snap])
+    reports = _scan_inside(monkeypatch, "commit_partial", agent, snap, after=after)
+    _file_sync.apply_file_push(agent, {"path": rel, "action": "write_chunk", "chunk_index": 1,
+                                       "content_b64": base64.b64encode(data[10:]).decode(), "hash": full},
+                               snapshots=[snap])
+    monkeypatch.undo()
+    assert reports == [[]]
+    assert snap[rel] == full
+    assert detect_changes(agent, snap) == []
+
+
+@pytest.mark.parametrize("msg, step", [
+    (_write_msg("workspace/doc.txt", b"from the platform"), "atomic_write_beneath"),
+    ({"path": "workspace/doc.txt", "action": "delete"}, "unlink_beneath"),
+], ids=["write", "delete"])
+def test_a_push_marks_and_settles_every_session_of_the_agent(tmp_path, monkeypatch, msg, step):
+    """Two sessions of one agent on this machine: the push marks both
+    baselines and settles both, so neither session's scan reports it and
+    neither keeps the mark."""
+    agent = _agent_with_two_files(tmp_path)
+    one, two = snapshot_agent_dir(agent), snapshot_agent_dir(agent)
+    reports = _scan_inside(monkeypatch, step, agent, two, after=True)
+    _file_sync.apply_file_push(agent, msg, snapshots=[one, two])
+    monkeypatch.undo()
+    assert reports == [[]]
+    assert one == two and _file_sync._PUSHING not in two.values()
+    assert detect_changes(agent, two) == [] and detect_changes(agent, one) == []
+
+
+def test_a_scans_claim_waits_for_the_baselines_lock(tmp_path):
+    """The check and the move of an entry are one step under the lock: a
+    scan's claim does not run while another holder is inside it."""
+    import threading
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    (agent / "workspace" / "doc.txt").write_text("changed on the machine")
+    before = dict(snap)
+    out: list = []
+    with _file_sync._baseline_lock:
+        scan = threading.Thread(target=lambda: out.extend(detect_changes(agent, snap)))
+        scan.start()
+        scan.join(0.5)
+        assert scan.is_alive() and snap == before
+    scan.join(5)
+    assert [(c["path"], c["action"]) for c in out] == [("workspace/doc.txt", "write")]
+
+
+def test_a_pushs_mark_waits_for_the_baselines_lock(tmp_path):
+    """A push takes the lock before it marks: while another holder is inside
+    it, the push has changed neither the baseline nor the disk."""
+    import threading
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    before = dict(snap)
+    msg = _write_msg("workspace/doc.txt", b"from the platform")
+    with _file_sync._baseline_lock:
+        push = threading.Thread(target=_file_sync.apply_file_push, args=(agent, msg),
+                                kwargs={"snapshots": [snap]})
+        push.start()
+        push.join(0.5)
+        assert push.is_alive() and snap == before
+        assert (agent / "workspace" / "doc.txt").read_text() == "first"
+    push.join(5)
+    assert snap["workspace/doc.txt"] == msg["hash"]
+
+def test_an_agent_folder_that_is_gone_is_never_read_as_its_files_deleted(tmp_path):
+    """The agent's folder itself out of reach at a turn's end (a disk not
+    mounted, a folder moved away) is no delete of its files: nothing goes
+    out, and the baseline stands for the turn end after it is back."""
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    before = dict(snap)
+    away = tmp_path / "agents" / "a-not-mounted"
+    agent.rename(away)
+    assert detect_changes(agent, snap) == []
+    assert snap == before
+    away.rename(agent)
+    assert detect_changes(agent, snap) == []
+    (agent / "workspace" / "doc.txt").unlink()
+    assert [(c["path"], c["action"]) for c in detect_changes(agent, snap)] == [("workspace/doc.txt", "delete")]
+
+def test_a_file_changed_back_before_its_read_is_not_reported(tmp_path, monkeypatch):
+    """The walk saw new bytes, and the file holds the baseline's bytes again
+    when the scan reads it: no change goes out."""
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    doc = agent / "workspace" / "doc.txt"
+    doc.write_text("for a moment")
+    real = _file_sync._read_inline
+
+    def _back_before_the_read(root, rel, path):
+        if rel == "workspace/doc.txt":
+            doc.write_text("first")
+        return real(root, rel, path)
+    monkeypatch.setattr(_file_sync, "_read_inline", _back_before_the_read)
+    assert detect_changes(agent, snap) == []
+    monkeypatch.undo()
+    assert detect_changes(agent, snap) == []
+
+
+def test_a_delete_pushed_after_the_scan_read_a_change_of_that_file_is_never_sent_back(tmp_path, monkeypatch):
+    """This machine changed a file and the platform deleted it while the
+    scan read it: the person's delete stands, and no scan sends it back."""
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    (agent / "workspace" / "doc.txt").write_text("changed on the machine")
+    real = _file_sync._read_inline
+
+    def _delete_lands_after_the_read(root, rel, path):
+        out = real(root, rel, path)
+        if rel == "workspace/doc.txt":
+            _file_sync.apply_file_push(agent, {"path": rel, "action": "delete"}, snapshots=[snap])
+        return out
+    monkeypatch.setattr(_file_sync, "_read_inline", _delete_lands_after_the_read)
+    first = detect_changes(agent, snap)
+    monkeypatch.undo()
+    assert ("workspace/doc.txt", "delete") not in [(c["path"], c["action"]) for c in first]
+    assert not (agent / "workspace" / "doc.txt").exists()
+    assert "workspace/doc.txt" not in snap
+    assert detect_changes(agent, snap) == []
+
+def test_a_push_that_lands_while_the_scan_looks_for_deletes_never_breaks_it(tmp_path, monkeypatch):
+    """The scan iterates its own copy of the snapshot: an entry a push adds
+    on the loop meanwhile never ends the scan with an error."""
+    agent = _agent_with_two_files(tmp_path)
+    snap = snapshot_agent_dir(agent)
+    (agent / "workspace" / "doc.txt").unlink()
+    (agent / "workspace" / "kept.txt").unlink()
+    real_stat = _file_sync.os.stat
+    landed: list = []
+
+    def _stat(path, *a, **kw):
+        landed.append(path)
+        snap[f"workspace/pushed-{len(landed)}.txt"] = "sha256:the-push"
+        return real_stat(path, *a, **kw)
+    monkeypatch.setattr(_file_sync.os, "stat", _stat)
+    changes = detect_changes(agent, snap)
+    monkeypatch.undo()
+    assert sorted(c["path"] for c in changes if c["action"] == "delete") == [
+        "workspace/doc.txt", "workspace/kept.txt"]
+
+
+def test_a_close_that_is_removing_holds_back_a_start_of_the_same_file(tmp_path, monkeypatch):
+    """The close's choice and its removal are one step: a start of another
+    session of the scope waits for the removal, then writes, so the file it
+    wrote is never the one the close removes."""
+    import threading
+
+    from satellite.host import safe_fs
+    from satellite.sessions import session_files
+    monkeypatch.setattr(session_files, "_agent_files", {})
+    agent = tmp_path / "agents" / "a"
+    payload = {"host_files": {"users/alice/cfg/settings.json": {
+        "content_b64": base64.b64encode(b"{}").decode(), "mode": 0o600}}}
+    session_files.materialize_agent_files(payload, "s-1", agent)
+    removing, go = threading.Event(), threading.Event()
+    real_unlink = safe_fs.unlink_beneath
+
+    def _slow_unlink(*a, **kw):
+        removing.set()
+        go.wait(5)
+        return real_unlink(*a, **kw)
+    monkeypatch.setattr(safe_fs, "unlink_beneath", _slow_unlink)
+    close = threading.Thread(target=session_files.wipe_agent_files, args=("s-1",))
+    close.start()
+    assert removing.wait(5)
+    start = threading.Thread(target=session_files.materialize_agent_files, args=(payload, "s-2", agent))
+    start.start()
+    start.join(0.5)
+    go.set()
+    close.join(5)
+    start.join(5)
+    monkeypatch.setattr(safe_fs, "unlink_beneath", real_unlink)
+    assert (agent / "users" / "alice" / "cfg" / "settings.json").exists()
+    session_files.wipe_agent_files("s-2")
+    assert not (agent / "users" / "alice" / "cfg" / "settings.json").exists()

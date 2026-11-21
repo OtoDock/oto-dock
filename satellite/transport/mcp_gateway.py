@@ -323,6 +323,11 @@ class LocalMcpGateway:
         body = await self._read_body(request)
         if body is None:
             return web.json_response({"error": "request-body-too-large"}, status=413)
+        if mcp.startswith("oto-exit-"):
+            # The credential exit's values share this table under their
+            # placeholder: only the exit, which admits a session by its own
+            # secret and judges each request, adds them.
+            return self._refuse(method, body, _REFUSAL_NO_TOKEN)
         bearer_hash = token_hash_of(bearer)
         token = self.table.get(bearer_hash, mcp)
         if token is None:

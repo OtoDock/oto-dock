@@ -2,6 +2,7 @@
 pictures.
 """
 
+import os
 from typing import Any
 
 import units
@@ -436,16 +437,22 @@ def _crop(picture: Any, crop: Any) -> None:
 def _op_add_image(job: PptxJob, ctx: OpCtx, op: dict) -> None:
     from pptx.enum.shapes import MSO_SHAPE
 
+    import shared
+
     slide, _ = slide_of(job, op)
     width = emu(op, "width", 0) if op.get("width") else None
     height = emu(op, "height", 0) if op.get("height") else None
-    picture = slide.shapes.add_picture(op["image_path"], emu(op, "left", 1), emu(op, "top", 1), width=width,
-                                       height=height)
+    with shared.safe_open_read(op["image_path"]) as image:
+        picture = slide.shapes.add_picture(image, emu(op, "left", 1), emu(op, "top", 1), width=width,
+                                           height=height)
     if op.get("crop") is not None:
         _crop(picture, op["crop"])
     if op.get("shape_type") is not None:
         picture.auto_shape_type = getattr(MSO_SHAPE, preset_word(op["shape_type"]))
-    _alt_text(picture, op.get("alt_text"), op.get("decorative"))
+    # From a file object python-pptx describes the picture as image.<ext>:
+    # it keeps its own file name, as it did when read by name.
+    alt_text = op.get("alt_text")
+    _alt_text(picture, os.path.basename(op["image_path"]) if alt_text is None else alt_text, op.get("decorative"))
 
 
 DECORATIVE_NS = "http://schemas.microsoft.com/office/drawing/2017/decorative"

@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 
 import pytest
 
+from services.mcp import mcp_manifest_store
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -54,10 +56,9 @@ def _make_manifest(name, assignment_mode="auto", category="custom", has_instance
 
 
 def _patch_manifests(monkeypatch, manifests: dict):
-    """Replace mcp_registry._manifests + enable each in mcp_state."""
-    from services.mcp import mcp_registry
+    """Replace mcp_manifest_store._manifests + enable each in mcp_state."""
     from storage.mcp import mcp_store
-    monkeypatch.setattr(mcp_registry, "_manifests", manifests)
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", manifests)
     for name in manifests:
         mcp_store.set_mcp_enabled(name, True)
 
@@ -543,6 +544,19 @@ class TestApiEndpoint:
         assert skill["enabled"] is False
         assert skill["exclude_from"] == ["phone"]
 
+    def test_put_tells_the_agents_machines_on_an_enable_and_a_disable(self, client, monkeypatch):
+        """An enable installs ahead; a disable drops the tool's failure from
+        a machine's card. A save that changes nothing tells no machine."""
+        from services.remote import tools_ahead
+        _seed_agent("alice-agent")
+        _patch_manifests(monkeypatch, {"schedules-mcp": _make_manifest("schedules-mcp", assignment_mode="auto")})
+        told: list[str] = []
+        monkeypatch.setattr(tools_ahead, "after_enable", told.append)
+        client.put("/v1/agents/alice-agent/mcps", json={"mcps": ["schedules-mcp"]})
+        client.put("/v1/agents/alice-agent/mcps", json={"mcps": ["schedules-mcp"]})
+        client.put("/v1/agents/alice-agent/mcps", json={"mcps": []})
+        assert told == ["alice-agent", "alice-agent"]
+
 
 # ---------------------------------------------------------------------------
 # Integration test — the original bug
@@ -671,7 +685,7 @@ class TestMigration:
 _ORDER_PROBE = '''
 import json, sys
 from pathlib import Path
-from services.mcp import mcp_registry
+from services.mcp import mcp_manifest_store, mcp_registry
 from services.mcp.mcp_registry import CredentialConfig, McpManifest, ServerConfig, SkillDef
 from storage.mcp import mcp_store
 
@@ -689,7 +703,7 @@ for name in names:
         exclude_from=[], mcp_dir=folder,
         skills=[SkillDef(id=name + "-usage", file="skills/card.md", loading="always")],
     )
-mcp_registry._manifests = manifests
+mcp_manifest_store._manifests = manifests
 mcp_store.get_manager_enabled_mcps = lambda agent: list(reversed(names))
 mcp_store.get_all_mcp_states = lambda: {n: True for n in names}
 mcp_store.get_visible_explicit_mcps = lambda agent: set()

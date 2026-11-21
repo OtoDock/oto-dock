@@ -1,0 +1,6 @@
+{
+ "": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call  again this turn.",
+ "AskUserQuestion": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call AskUserQuestion again this turn.",
+ "request_user_input": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input again this turn.",
+ "request_user_input_async": "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input_async again this turn."
+}

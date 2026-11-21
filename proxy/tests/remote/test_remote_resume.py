@@ -78,6 +78,9 @@ class _FakeCM:
     def is_connected(self, machine_id: str) -> bool:
         return self.connected
 
+    def owns_copy(self, machine_id: str) -> bool:
+        return False
+
     def get_connection(self, machine_id: str):
         return self.conn if self.connected else None
 
@@ -172,18 +175,179 @@ async def test_can_resume_session_falls_back_to_target_resolution():
 
 
 @pytest.mark.asyncio
-async def test_can_resume_session_is_fresh_when_target_is_local():
-    """If target resolves to 'local', we're not on a satellite: nothing of
-    the session is on a machine."""
+async def test_a_local_target_is_answered_by_the_engines_own_layer():
+    """If the target resolves to 'local', the session's files are the
+    platform's own, whichever host ran it: the engine's local layer reads
+    them, and no machine is asked."""
     layer = _make_layer()
+    asked: list[tuple] = []
+
+    class _Local:
+        async def can_resume_session(self, sid, *, agent_name="", username="", external_home=""):
+            asked.append((sid, agent_name, username))
+            return ResumeVerdict.RESUMABLE
     with patch("storage.database.get_user_sub_by_username", return_value=None), \
          patch("services.remote.remote_status.resolve_execution_target",
-               return_value=("local", None)):
+               return_value=("local", None)), \
+         patch("core.session.session_manager.get_layer_by_path", return_value=_Local()):
         result = await layer.can_resume_session(
             "sess-x", agent_name="agent-1", username="",
         )
-    assert result is ResumeVerdict.FRESH
+    assert result is ResumeVerdict.RESUMABLE
+    assert asked == [("sess-x", "agent-1", "")]
     assert layer._cm.sent == []
+    # Its machine reads as the platform's, and no probe is kept for it.
+    assert layer.resume_machine_reach("sess-x", agent_name="agent-1") is MachineReach.LOCAL
+    assert layer.resume_probe_future("sess-x", agent_name="agent-1") is None
+
+
+@pytest.mark.asyncio
+async def test_a_local_pin_is_never_resolved_again_through_the_agents_target(tmp_path, monkeypatch):
+    """A chat pinned ``local`` whose closed session left no record: its files
+    are the platform's and the builder resumes it there (a pin is never
+    re-resolved), so the engine's own local check answers even when the
+    agent's current target is a machine, and no machine is asked."""
+    import config as app_config
+    from core.session import session_state
+    agents = tmp_path / "agents"
+    projects = agents / "agent-1" / "users" / "alice" / ".claude" / "projects" / "-users-alice"
+    projects.mkdir(parents=True)
+    (projects / "sess-c.jsonl").write_text('{"type":"user","message":{"role":"user","content":"hello"}}\n')
+    monkeypatch.setattr(app_config, "AGENTS_DIR", agents)
+    monkeypatch.setattr(session_state, "placed_on", lambda sid, chat_id="": None)
+    cm = _FakeCM(answer={"resumable": False})
+    cm.is_compute = lambda mid: False
+    layer = _make_layer(cm)
+    chat = {"id": "chat-c", "agent": "agent-1", "execution_path": "claude-code-cli",
+            "execution_target": "local", "codex_thread_id": ""}
+    with patch("storage.database.get_chat_by_session", return_value=chat), \
+         patch("storage.database.get_user_sub_by_username", return_value="sub-a"), \
+         patch("services.remote.remote_status.resolve_execution_target",
+               return_value=("m-1", None)):
+        verdict = await layer.can_resume_session("sess-c", agent_name="agent-1", username="alice")
+    assert cm.sent == [], [m["machine"] for m in cm.sent]
+    assert verdict is ResumeVerdict.RESUMABLE
+    assert layer.resume_machine_reach("sess-c", agent_name="agent-1") is MachineReach.LOCAL
+
+
+@pytest.mark.asyncio
+async def test_a_compute_chat_resumes_after_its_session_was_closed(tmp_path, monkeypatch):
+    """A compute session's close pops its record and its security index
+    entry; the chat's pin is ``local`` and its transcript sits in the shared
+    folder. The next turn's resume check must find that transcript through
+    the engine's own local check, not answer FRESH from the resolver."""
+    import config as app_config
+    from core.remote import remote_resume
+    from core.session import session_state
+    agents = tmp_path / "agents"
+    projects = agents / "agent-1" / "users" / "alice" / ".claude" / "projects" / "-users-alice"
+    projects.mkdir(parents=True)
+    (projects / "sess-compute.jsonl").write_text(
+        '{"type":"user","message":{"role":"user","content":"hello"}}\n')
+    monkeypatch.setattr(app_config, "AGENTS_DIR", agents)
+    monkeypatch.setattr(session_state, "placed_on", lambda sid, chat_id="": None)
+    layer = _make_layer()  # no record: the close popped it
+    layer._cm.is_compute = lambda mid: False
+    chat = {"id": "chat-c", "agent": "agent-1", "execution_path": "claude-code-cli",
+            "execution_target": "local", "codex_thread_id": ""}
+    with patch("storage.database.get_chat_by_session", return_value=chat), \
+         patch("storage.database.get_user_sub_by_username", return_value="sub-a"), \
+         patch("services.remote.remote_status.resolve_execution_target",
+               return_value=("local", None)):
+        result = await layer.can_resume_session("sess-compute", agent_name="agent-1", username="alice")
+    assert result is ResumeVerdict.RESUMABLE
+    assert layer._cm.sent == []
+    # With no transcript the same path answers FRESH, from the same reader.
+    (projects / "sess-compute.jsonl").unlink()
+    remote_resume._resume_targets.clear()
+    with patch("storage.database.get_chat_by_session", return_value=chat), \
+         patch("storage.database.get_user_sub_by_username", return_value="sub-a"), \
+         patch("services.remote.remote_status.resolve_execution_target",
+               return_value=("local", None)):
+        assert await layer.can_resume_session(
+            "sess-compute", agent_name="agent-1", username="alice") is ResumeVerdict.FRESH
+
+
+@pytest.mark.asyncio
+async def test_a_sessions_own_record_outranks_its_local_pin_only_for_a_connected_compute_machine(monkeypatch):
+    """The session's place is read before the chat's pin, but it moves the
+    question only to a connected compute machine (its files are the
+    platform's own, which it reads); a record naming a paired machine
+    leaves the pin to decide, as before."""
+    from core.session import session_state
+    chat = {"id": "chat-c", "agent": "agent-1", "execution_path": "claude-code-cli",
+            "execution_target": "local", "codex_thread_id": ""}
+    for on, compute, expected in (("c-1", True, "c-1"), ("m-9", False, "")):
+        layer = _make_layer()
+        layer._cm.is_compute = lambda mid, _c=compute: _c
+        monkeypatch.setattr(session_state, "placed_on", lambda sid, chat_id="", _on=on: _on)
+        with patch("storage.database.get_chat_by_session", return_value=chat), \
+             patch("storage.database.get_user_sub_by_username", return_value=None), \
+             patch("services.remote.remote_status.resolve_execution_target",
+                   return_value=("local", None)):
+            target = await asyncio.to_thread(layer._resume_target, "sess-r", "agent-1", "alice")
+        assert target[0] == expected, (on, compute)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row, beside, expected", [
+    ({}, True, "fresh"),                                   # a person's chat follows the rule
+    ({}, False, "c-2"),                                    # no tool of a local address: asked there
+    ({"parent_chat_id": "chat-0"}, True, "c-2"),           # a lane resumes by id: asked there
+    ({"id": "task-r1", "source_type": "task"}, True, "c-2"),  # a run's chat too
+])
+async def test_a_chat_on_another_host_starts_fresh_beside_the_platform_under_the_rule(
+        monkeypatch, row, beside, expected):
+    """A chat whose record lives on a compute machine on another host is
+    asked there while it is connected, unless a tool of its agent reaches a
+    local address: its next session is built beside the platform, where the
+    record is not, so the answer is FRESH (the history carries the chat
+    on). Delegated or task work stays there and is asked there."""
+    from core.session import session_state
+    from services.remote import remote_status
+    monkeypatch.setattr(session_state, "placed_on", lambda sid, chat_id="": None)
+    asked: list = []
+
+    def _beside(agent, machines=None):
+        asked.append((agent, tuple(machines or ())))
+        return beside
+    monkeypatch.setattr(remote_status, "keeps_beside", _beside)
+    chat = {"id": "chat-c", "agent": "agent-1", "execution_path": "claude-code-cli",
+            "execution_target": "local", "codex_thread_id": "", "session_id": "sess-o",
+            "compute_machine": "c-2", **row}
+    layer = _make_layer()
+    layer._cm.is_compute = lambda mid: mid == "c-2"
+    layer._cm.owns_copy = lambda mid: mid == "c-2"
+    with patch("storage.database.get_chat_by_session", return_value=chat):
+        target = await asyncio.to_thread(layer._resume_target, "sess-o", "agent-1", "alice")
+    if expected == "fresh":
+        assert target is ResumeVerdict.FRESH
+    else:
+        assert target[0] == expected
+    assert asked == [("agent-1", ("c-2",))]
+
+
+@pytest.mark.asyncio
+async def test_a_live_record_on_another_host_follows_the_rule_and_a_store_error_decides_nothing(monkeypatch):
+    import psycopg
+
+    from services.remote import remote_status
+    layer = _make_layer()
+    layer._cm.owns_copy = lambda mid: mid == "c-2"
+    info = _make_info(session_id="sess-l", machine_id="c-2")
+    layer._sessions[info.session_id] = info
+    chat = {"id": "chat-l", "agent": "agent-1", "session_id": "sess-l", "compute_machine": "c-2"}
+    monkeypatch.setattr(remote_status, "keeps_beside", lambda agent, machines=None: True)
+    with patch("storage.database.get_chat_by_session", return_value=chat):
+        assert await asyncio.to_thread(layer._resume_target, "sess-l", "", "") is ResumeVerdict.FRESH
+
+    def _down(agent, machines=None):
+        raise psycopg.OperationalError("down")
+    monkeypatch.setattr(remote_status, "keeps_beside", _down)
+    assert await asyncio.to_thread(layer._resume_target, "sess-l", "", "") is ResumeVerdict.UNKNOWN
+    # A machine that works on the platform's folder is not asked about the rule.
+    layer._cm.owns_copy = lambda mid: False
+    assert (await asyncio.to_thread(layer._resume_target, "sess-l", "", ""))[0] == "c-2"
 
 
 @pytest.mark.asyncio
@@ -482,8 +646,14 @@ def test_resume_username_task_chat_user_scope(monkeypatch):
 
 
 def test_get_execution_layer_pinned_local_wins_over_remote_agent_default(monkeypatch):
-    """Pin 'local' → CLI layer even when the agent's default target is remote."""
+    """Pin 'local' is answered for the platform's place even when the agent's
+    default target is remote, and never re-resolved: the layer of the compute
+    machine the chat's session was built on, and with no compute placement
+    the refusal (the platform runs no session itself), never the agent's
+    default machine."""
+    from core import placement
     from core.session import session_manager as sm
+    from tests._compute import placed
     monkeypatch.setattr(
         sm.agent_store, "get_agent",
         lambda name: {"execution_path": "claude-code-cli"},
@@ -492,10 +662,17 @@ def test_get_execution_layer_pinned_local_wins_over_remote_agent_default(monkeyp
     def _boom(*a, **k):
         raise AssertionError("pinned call must not re-resolve the target")
     monkeypatch.setattr(remote_status, "resolve_execution_target", _boom)
+    sentinel = MagicMock()
+    monkeypatch.setattr(sm, "_get_remote_layer", lambda: sentinel)
     layer = sm.get_execution_layer(
-        "agent-1", user_sub="sub-1", execution_target="local",
+        "agent-1", user_sub="sub-1", execution_target="local", placement_built=placed(),
     )
-    assert layer is sm._cli_layer
+    assert layer is sentinel
+    with pytest.raises(placement.NoComputeMachine) as refused:
+        sm.get_execution_layer(
+            "agent-1", user_sub="sub-1", execution_target="local",
+        )
+    assert str(refused.value) == placement.NO_COMPUTE_SENTENCE
 
 
 def test_get_execution_layer_pinned_remote_wins_over_local_agent_default(monkeypatch):
@@ -578,3 +755,157 @@ async def test_can_resume_claude_after_restart_rpcs_the_pinned_machine():
         )
     assert result is ResumeVerdict.RESUMABLE
     assert layer._cm.sent[0]["machine"] == "m-pinned"
+
+
+class _AdoptCM(_FakeCM):
+    """The surface ``adopt_session`` reads: a queue per session, a port and
+    a fire-and-forget send."""
+
+    def __init__(self):
+        super().__init__()
+        self.queues: dict[str, asyncio.Queue] = {}
+        self.fired: list[dict] = []
+
+    def create_session_queue(self, machine_id, session_id, execution_path, maxsize=0):
+        q = self.queues[session_id] = asyncio.Queue(maxsize=maxsize)
+        return q
+
+    def is_compute(self, machine_id):
+        return False
+
+    def shares_folders(self, machine_id):
+        return False
+
+    def tunnel_port(self, machine_id):
+        return 18000
+
+    async def send_fire_and_forget(self, machine_id, msg):
+        self.fired.append(msg)
+
+
+@pytest.mark.asyncio
+async def test_the_engines_state_is_built_after_the_replays_begin_marker(monkeypatch):
+    """The Codex router is the queue's sole consumer: built before the
+    marker it would take the marker itself. The adoption reads the marker
+    from the raw queue, then builds the engine's state with the turn
+    marked active, then streams."""
+    from core.events.common_events import DONE, CommonEvent
+    from core.remote import remote_resume
+    cm = _AdoptCM()
+    layer = _make_layer(cm)
+    order: list[str] = []
+    seen = {}
+
+    class _Adapter:
+        def adopt_state(self, info, cm_):
+            order.append("adopt_state")
+            seen["turn_active"] = info.turn_active
+            seen["queue_size"] = info.event_queue.qsize()
+
+        async def stream_turn(self, info, cm_):
+            order.append("stream")
+            # Its binding is restored by now: no longer on its way to it.
+            seen["on_its_way"] = bool(satellite_link._adopting.get("m-1"))
+            yield CommonEvent(type=DONE)
+
+    from core.remote import satellite_link
+    monkeypatch.setattr(satellite_link, "_adopting", {})
+    satellite_link.adoption_begins("m-1", "s-codex")
+    monkeypatch.setattr(layer, "_adapter", lambda info: _Adapter())
+    monkeypatch.setattr(layer, "_adoptable", lambda sid, path, idle=False: True)
+    monkeypatch.setattr(remote_resume, "_record_session_use", lambda *a, **k: None)
+    monkeypatch.setattr(layer, "_restore_adopted_credentials", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(layer, "_reprovision_gateway", staticmethod(_noop))
+
+    async def feed():
+        q = cm.queues["s-codex"]
+        await q.put({"type": "_resume_replay_begin", "truncated": False})
+        await q.put({"method": "item/started", "params": {}})
+    events = []
+    task = asyncio.ensure_future(feed())
+    async for ev in layer.adopt_session(
+            machine_id="m-1", session_id="s-codex", agent_name="pa", execution_path="codex-cli",
+            command_id="cmd-1", resume_handle="thread-3", model="gpt-6.1-sol",
+            used_mcps=("memory",), client_type="dashboard"):
+        events.append(ev.type)
+    await task
+    assert order == ["adopt_state", "stream"]
+    # The marker was taken, the event waits.
+    assert seen == {"turn_active": True, "queue_size": 1, "on_its_way": False}
+    info = layer._sessions["s-codex"]
+    assert (info.resume_handle, info.model, info.used_mcps) == ("thread-3", "gpt-6.1-sol", {"memory"})
+    assert cm.fired == [{"type": "resume_session_stream", "session_id": "s-codex"}]
+    assert events[0] == remote_resume.REPLAY_BEGIN and events[-1] == DONE
+
+
+async def _noop(*a, **k):
+    return None
+
+
+def test_the_codex_adapter_registers_a_main_consumer_for_a_replayed_turn_only():
+    from core.layers.codex.remote import CodexRemoteAdapter, CodexRemoteState
+
+    async def run():
+        adapter = CodexRemoteAdapter(SimpleNamespace())
+        cm = SimpleNamespace()
+        def _drop(coro, **k):
+            coro.close()
+        with patch("core.layers.codex.remote.spawn", _drop), \
+                patch("core.layers.codex.remote._server_to_manifest_name", lambda: {}):
+            live = _make_info("s-live", execution_path="codex-cli")
+            live.turn_active = True
+            adapter.adopt_state(live, cm)
+            idle = _make_info("s-idle", execution_path="codex-cli")
+            adapter.adopt_state(idle, cm)
+        try:
+            assert isinstance(live.engine_state, CodexRemoteState)
+            assert live.engine_state.default_consumer is not None
+            assert idle.engine_state.default_consumer is None
+        finally:
+            for info in (live, idle):
+                info.engine_state.router_task.cancel()
+    asyncio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_codex_turn_streams_through_the_real_router_to_its_end(monkeypatch):
+    """A Codex turn the machine kept across a restart: the real adapter
+    builds its state after the replay's begin marker, its router feeds the
+    main thread's replayed notifications to the turn, and the turn ends on
+    the replayed ``turn/completed`` with the text it carried."""
+    from core.events.common_events import DONE, TEXT
+    from core.remote import remote_resume
+    cm = _AdoptCM()
+    layer = _make_layer(cm)
+    monkeypatch.setattr(layer, "_adoptable", lambda sid, path, idle=False: True)
+    monkeypatch.setattr(remote_resume, "_record_session_use", lambda *a, **k: None)
+    monkeypatch.setattr(layer, "_restore_adopted_credentials", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(layer, "_reprovision_gateway", staticmethod(_noop))
+    monkeypatch.setattr("core.layers.codex.remote._server_to_manifest_name", lambda: {})
+
+    async def feed():
+        q = cm.queues["s-replay"]
+        await q.put({"type": "_resume_replay_begin", "truncated": False})
+        await q.put({"method": "turn/started", "params": {"threadId": "thread-7", "turn": {"id": "t1"}}})
+        await q.put({"method": "item/agentMessage/delta",
+                     "params": {"threadId": "thread-7", "itemId": "m1", "delta": "Kept across the restart."}})
+        await q.put({"method": "turn/completed",
+                     "params": {"threadId": "thread-7", "turn": {"id": "t1", "status": "completed"}}})
+    task = asyncio.ensure_future(feed())
+    events = []
+    try:
+        async for ev in layer.adopt_session(
+                machine_id="m-1", session_id="s-replay", agent_name="pa", execution_path="codex-cli",
+                command_id="cmd-1", resume_handle="thread-7", model="gpt-6.1-sol", client_type="dashboard"):
+            events.append(ev)
+            if len(events) > 50:
+                break
+    finally:
+        await task
+        info = layer._sessions.get("s-replay")
+        if info is not None and info.engine_state is not None and info.engine_state.router_task:
+            info.engine_state.router_task.cancel()
+    types = [ev.type for ev in events]
+    assert types[0] == remote_resume.REPLAY_BEGIN and types[-1] == DONE
+    text = "".join(ev.data.get("content", "") for ev in events if ev.type == TEXT)
+    assert text == "Kept across the restart."

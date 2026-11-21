@@ -13,9 +13,7 @@ when the CLI withdraws it, shown again to a viewer who opens the chat later,
 and bounded by the surface it runs on: a person's chat waits like a hook
 card, a session nobody drives waits ``UNATTENDED_WAIT_S`` and is refused (the
 CLI refuses that one call and the turn goes on), a phone call's is refused at
-once. A remote session's answer is written by its satellite, so it waits only
-on a satellite that writes the CLI's shape (``ANSWER_SATELLITE_VERSION``);
-on an older one the request is refused at once.
+once. A remote session's answer is written by its satellite.
 
 A request reaches here from the pump (the turn's own stream, ``watch``) or
 from a between-turns reader (``note_frame``: the idle drains, the stale
@@ -46,6 +44,14 @@ answers the CLI's ask for that same call at once. Two kinds:
   answered from the record (``_PLAN_FLOOR_REASONS``, and ExitPlanMode's own
   question after the person's approval, whose answer also moves the CLI to
   the mode the person chose: ``setMode``).
+* ``PLAN_FILE_RECORD``: a plan file the Plan stage allowed. A session that
+  runs from a home of its own writes its plan through the home's ``plans``
+  link, and Claude Code (2.1.322) reads the link's target, the store's
+  ``plans`` folder, as a sensitive file outside its own folder: it asks
+  (``safetyCheck``, ``blocked_path`` the target). That ask, and no other,
+  is answered when the target is the store's plan that this session's home
+  links to (``_same_plan_file``), for the input the hook judged; a link that
+  points anywhere else stays a card.
 * ``HOOK_RECORD``: under bypass (Ask, Don't Ask, the unattended word) the CLI
   still asks for an ``rm`` its safety check cannot clear
   (``_HOOK_CHECK_REASONS``). Under Don't Ask and the unattended word the hook
@@ -81,9 +87,6 @@ logger = logging.getLogger("otodock")
 #: How long a session nobody drives (a task run, a delegated worker, a meeting
 #: participant) waits for an answer before the request is refused.
 UNATTENDED_WAIT_S = 600.0
-#: The first satellite version that writes an answer in the CLI's shape; an
-#: older one's remote request is refused at once.
-ANSWER_SATELLITE_VERSION = "0.5.140"
 
 #: The ``decision_reason_type`` of a request Claude Code raises after its
 #: reviewer's decline limit.
@@ -100,7 +103,6 @@ _deny_messages: dict[str, str] = {}
 # Why a request was refused without a person's answer (the chat line).
 _NOBODY = "nobody answered in time"
 _PHONE = "a phone call cannot answer it"
-_SATELLITE = "this machine's satellite cannot pass an answer back yet"
 
 
 @dataclass
@@ -134,9 +136,11 @@ _EARLY_WITHDRAWAL_S = 60.0
 #: How long the gate's record of a call it allowed waits for the CLI's ask
 #: (which follows the hook's answer at once).
 GATE_ALLOW_S = 120.0
-#: The record's kinds: a call the Plan stages allowed, and a call the hook
-#: alone decided (Don't Ask, the unattended word, a person's Allow in Ask).
+#: The record's kinds: a call the Plan stages allowed, a plan file they
+#: allowed, and a call the hook alone decided (Don't Ask, the unattended
+#: word, a person's Allow in Ask).
 PLAN_RECORD = "plan"
+PLAN_FILE_RECORD = "plan_file"
 HOOK_RECORD = "hook"
 # session id -> {tool_use_id: (tool name, input digest, expiry, kind)}
 _gate_allowed: dict[str, dict[str, tuple[str, str, float, str]]] = {}
@@ -202,7 +206,15 @@ def _take_gate_allow(session_id: str, request: dict) -> bool:
     if request.get("decision_reason_code"):
         return False
     reason = request.get("decision_reason_type")
-    if kind == HOOK_RECORD:
+    if kind == PLAN_FILE_RECORD:
+        # Only the sensitive-file question it was made for, as the engine
+        # marks it for its reviewer: the plan mode's own question about a plan
+        # file, and one the engine marks for a person alone, stay the card.
+        if (reason != "safetyCheck" or request.get("classifier_approvable") is not True
+                or input_digest(request.get("input")) != digest
+                or not _same_plan_file(session_id, request)):
+            return False
+    elif kind == HOOK_RECORD:
         # Never an ask the CLI's reviewer could take (Auto keeps its cards).
         if (request.get("classifier_approvable") is not False
                 or reason not in _HOOK_CHECK_REASONS
@@ -223,6 +235,28 @@ def _take_gate_allow(session_id: str, request: dict) -> bool:
     if not calls:
         _gate_allowed.pop(session_id, None)
     return True
+
+
+def _same_plan_file(session_id: str, request: dict) -> bool:
+    """Whether the path Claude Code's safety check names (``blocked_path``,
+    the write's target past the home's ``plans`` link) is the store's plan
+    that this session's home links to: the written path with the home's part
+    taken out. The written path itself is not it (the engine names a blocked
+    path only when the write lands elsewhere), nor is a plan of the same name
+    in any other plans folder."""
+    import posixpath
+
+    from core.sandbox import session_home
+    from core.sandbox.session_config_dir import plan_file_name
+
+    def _norm(path) -> str:
+        return posixpath.normpath(str(path or "").replace("\\", "/"))
+    written = _norm((request.get("input") or {}).get("file_path"))
+    target = _norm(request.get("blocked_path"))
+    if not plan_file_name(written, session_id) or not plan_file_name(target, session_id):
+        return False
+    own = f"/{session_home.relative(session_id)}/plans/"
+    return own in written and target == written.replace(own, "/plans/", 1)
 
 
 def withdrawn_before_registered(request_id: str) -> bool:
@@ -276,28 +310,6 @@ def card_frame(p: EnginePrompt) -> dict:
     return {"type": p.frame_type or wire.PERMISSION_PROMPT, "chat_id": p.chat_id, **p.frame}
 
 
-def _version_tuple(v: str) -> tuple[int, ...]:
-    out = []
-    for part in (v or "").split("."):
-        digits = "".join(ch for ch in part if ch.isdigit())
-        out.append(int(digits) if digits else 0)
-    return tuple(out)
-
-
-def _satellite_answers(session_id: str) -> bool:
-    """A local session always; a remote one only on a satellite that writes
-    the CLI's shape."""
-    from core.remote import remote_file_flow
-    machine = remote_file_flow.remote_machine_id(session_id)
-    if not machine:
-        return True
-    if not ANSWER_SATELLITE_VERSION:
-        return False
-    from core.remote.satellite_connection import get_connection_manager
-    have = get_connection_manager().satellite_version(machine)
-    return _version_tuple(have) >= _version_tuple(ANSWER_SATELLITE_VERSION)
-
-
 def _bound(session_id: str) -> tuple[float, str]:
     """How long the request may wait for a person, and why it is refused
     when the wait is nil."""
@@ -306,8 +318,6 @@ def _bound(session_id: str) -> tuple[float, str]:
     client_type = get_session_client_type(session_id)
     if session_kind.of(client_type) is session_kind.PHONE:
         return 0.0, _PHONE
-    if not _satellite_answers(session_id):
-        return 0.0, _SATELLITE
     if session_kind.attended(client_type):
         return float(PROMPT_WAIT_S), _NOBODY
     return UNATTENDED_WAIT_S, _NOBODY
@@ -386,13 +396,10 @@ def _refuse_review_fallback(session_id: str, rid: str, tool_input: dict) -> None
 def _answer_gate_allow(session_id: str, rid: str, request: dict) -> bool:
     """The CLI's ask for a call the gate allowed: allowed at once with the
     request's own input, never shown (the pump's card for it is skipped:
-    ``withdrawn_before_registered``). A remote session's answer waits on a
-    satellite that writes the CLI's shape."""
+    ``withdrawn_before_registered``)."""
     if not rid or not session_id or rid in _pending:
         return False
     if not _take_gate_allow(session_id, request):
-        return False
-    if not _satellite_answers(session_id):
         return False
     _mark_withdrawn_early(rid)
     _note_implement_mode(session_id, rid, str(request.get("tool_name") or ""))
@@ -407,7 +414,8 @@ def _note_implement_mode(session_id: str, rid: str, tool_name: str) -> None:
     or in Ask: the answer moves the CLI to that mode (Claude Code otherwise
     goes back to the mode it entered Plan from, ``default`` for a chat that
     started in Plan, so its own reviewer would not run in Auto). A
-    satellite drops the field (it passes the decision's own keys only)."""
+    satellite passes the field on with the allow (``updatedPermissions``,
+    ``CLISession.send_permission_response``)."""
     from core.events import tool_roles
     if tool_roles.role_of(tool_name) != tool_roles.PLAN_EXIT:
         return
@@ -456,8 +464,8 @@ async def _refuse_and_reenter(session_id: str, rid: str, tool_input: dict) -> No
             logger.info("engine review paused on session %s after %d re-entries",
                         session_id[:8], done)
             return
-        # The engine re-enters its own review (a local session after the
-        # turn's end); a mode the person changed meanwhile stands.
+        # The engine re-enters its own review; a mode the person changed
+        # meanwhile stands.
         await layer.reenter_review(session_id)
     except Exception:
         logger.exception("engine prompt %s on session %s: the decline-limit answer failed",

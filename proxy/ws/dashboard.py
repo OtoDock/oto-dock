@@ -37,7 +37,7 @@ from auth.providers import (
 from core import placement
 from core.background import spawn
 from core.events import tool_roles
-from core.events.input_queue import _connections_by_user
+from core.events.input_queue import _connections_by_user, arm_for_author
 from services.notifications import notification_manager
 from storage import database as task_store
 from storage.automation import notification_store, run_status
@@ -71,7 +71,7 @@ def register_offboarding() -> None:
     """Subscribe the sockets to the offboarding event (called by the lifespan)."""
     from services.agents import offboarding
     offboarding.subscribe("dashboard-sockets", _on_offboard, priority=15)
-from core import execution_mode
+from core import drain, execution_mode
 from core.config.task_config_builder import (
     resolve_task_identity,
     run_allows_knowledge_rw,
@@ -84,7 +84,7 @@ from core.events.stream_pump import (
 from core.execution_layer import ExecutionLayer
 from core.remote import install_registry
 from core.session import session_kind, visibility as _vis, warmup_registry
-from core.session.session_manager import get_execution_layer
+from core.session.session_manager import layer_for_chat
 from core.session.session_state import (
     _dashboard_notify_queues,
 )
@@ -105,11 +105,34 @@ STALE_TURN_SECS = 90.0
 _CHAT_PAGE = 50
 
 
-def _build_chat_restore(chat_id: str) -> dict:
+def _chat_cost(chat_ids: list[str]) -> dict:
+    """The cost gauge's word over the view's FULL history: a page of a long
+    turn's own steps holds no cost row, and the gauge must still hide a
+    subscription's estimate. ``billed`` is the account of a turn in flight
+    (``session_cost_billed``), else the newest turn's stamped flag, shown when
+    neither says; ``fees`` sums every tool fee row (money on any account)."""
+    from services.engines import subscription_pool
+    turn, fee_rows = task_store.get_cost_rows(chat_ids, wire.METADATA, wire.MCP_COST)
+    live = next((p for c in chat_ids if (p := _active_pumps.get(c)) is not None and not p.is_done), None)
+    if live is not None:
+        billed = subscription_pool.session_cost_billed(live.session_id)
+    else:
+        billed = (turn or {}).get("cost_billed") is not False
+    fees = 0.0
+    for row in fee_rows:
+        try:
+            fees += max(0.0, float(row.get("cost_usd") or 0))
+        except (TypeError, ValueError):
+            continue
+    return {"billed": billed, "fees": round(fees, 6)}
+
+
+def _build_chat_restore(chat_id: str, related: list[str] | tuple[str, ...] = ()) -> dict:
     """Panel-restore state computed from FULL history (window-independent), so the
     TODO panel + meeting state survive the lazy-load message window on an idle
     reload — the frontend no longer scans the loaded messages for them. For an
-    ACTIVE session the pump's live_state overrides this (sent after chat_history)."""
+    ACTIVE session the pump's live_state overrides this (sent after chat_history).
+    ``cost`` covers the sibling runs a task chat's view carries (``related``)."""
     meeting = None
     m = task_store.get_active_meeting_for_chat(chat_id)
     # The row turns ``concluded`` only after the meeting's pump and its
@@ -159,7 +182,7 @@ def _build_chat_restore(chat_id: str) -> dict:
         except (ValueError, TypeError):
             pass
     return {"todos": task_store.get_last_todo_snapshot(chat_id, tool_roles.TODO_SNAPSHOT), "meeting": meeting,
-            "goal": goal}
+            "goal": goal, "cost": _chat_cost([chat_id, *related])}
 
 
 class _SpawnResult(NamedTuple):
@@ -192,12 +215,7 @@ def _role_and_layer(
     The role is ``acting_role_of`` (the live row, or the connect-time dict a
     socket kept): a session's target must match the role it was built with."""
     role = acting_role_of(user_sub, agent, fallback_user=fallback_user)
-    row = chat or {}
-    layer = get_execution_layer(
-        agent, execution_path=row.get("execution_path", ""),
-        user_sub=user_sub, role=role,
-        execution_target=row.get("execution_target") or "",
-    )
+    layer = layer_for_chat(agent, chat, user_sub=user_sub, role=role)
     return role, layer
 
 
@@ -206,12 +224,52 @@ def _role_and_layer(
 # reduced scale through draft()) is refused.
 _MAX_IMAGE_DIM = 1568
 _MAX_FULL_DECODE_PIXELS = 50_000_000
+# The picture formats a chat keeps: what a browser hands the chat as a
+# picture, less SVG (JPEG's opener also reads a multi-picture JPEG, which
+# reports MPO). Each decodes inside the process: Pillow is never asked to
+# open another, since one of its decoders starts a program of the host. A
+# picture in another format is left out, and the chat says so.
+_CHAT_IMAGE_FORMATS = ("JPEG", "PNG", "GIF", "WEBP", "BMP", "TIFF", "AVIF", "ICO")
 # Modes a JPEG can hold once converted to RGB; anything deeper (16-bit,
 # float) is kept as PNG.
 _JPEG_SAFE_MODES = {"RGB", "RGBA", "L", "LA", "1", "CMYK", "YCbCr", "P", "PA"}
 
 
-def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
+def _land_photo(save_dir: Path, scope_dir: Path, ext: str, data: bytes) -> Path:
+    """Write ``data`` under a fresh name in ``save_dir`` and answer its path.
+    The folder is judged where it resolves: inside the person's own scope
+    folder (``scope_dir``, as written) and outside the engines' state and the
+    credentials. The bytes go through ``safe_fs`` beneath the agent's real
+    folder (``core.agent_folder``: an agent folder that is the operator's
+    link is followed there, once), so a link put on the way after the
+    judgement refuses the write instead of carrying it elsewhere. Raises
+    ``OSError`` when refused. Blocking."""
+    import config
+    from core import agent_folder
+    from services import path_roles
+    from services.infra import safe_fs
+    agent = agent_folder.agent_holding(scope_dir)
+    if not agent:
+        raise PermissionError(f"no scope folder for the photo folder {save_dir}")
+    root, asked = agent_folder.beneath_agent(save_dir, agent)
+    in_agent = safe_fs.canonical_rel(root, asked)
+    scope = agent_folder.beneath_agent(scope_dir, agent)[1]
+    inside = not scope or in_agent == scope or in_agent.startswith(scope + "/")
+    if (not inside or path_roles.in_session_state_dir(in_agent)
+            or path_roles.is_protected_credentials_path(in_agent)):
+        raise PermissionError(f"the photo folder {save_dir} is not the person's to write")
+    for _ in range(3):
+        name = f"img_{uuid.uuid4().hex[:8]}.{ext}"
+        try:
+            safe_fs.atomic_write_beneath(root, f"{in_agent}/{name}" if in_agent else name,
+                                         data, mkdirs=True, exclusive=True, fsync=False)
+        except FileExistsError:
+            continue
+        return config.get_agent_dir(agent) / in_agent / name
+    raise FileExistsError(f"no free photo name in {save_dir}")
+
+
+def _save_base64_image(data_url: str, save_dir: Path, *, scope_dir: Path) -> dict | None:
     """Decode a base64 data URL, resize if needed, and save to disk.
 
     The saved format follows the input: a JPEG stays a JPEG (q85); an image
@@ -225,6 +283,8 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
         data_url: Base64 data URL (data:image/...;base64,...)
         save_dir: Directory to save to. Required — caller picks the
             scope-correct location (user-scoped vs agent-scoped workspace).
+        scope_dir: The person's scope folder ``save_dir`` must resolve
+            inside (``_land_photo``).
 
     Returns:
         ``None`` on failure, otherwise a dict::
@@ -252,11 +312,11 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
         # Parse: data:image/png;base64,iVBOR...
         header, b64data = data_url.split(",", 1)
         raw_bytes = base64.b64decode(b64data)
-        img: Image.Image = Image.open(io.BytesIO(raw_bytes))  # reads the header only
+        img: Image.Image = Image.open(io.BytesIO(raw_bytes), formats=_CHAT_IMAGE_FORMATS)  # reads the header only
         w, h = img.size
         source_format = img.format
     except Exception as e:  # noqa: BLE001  # Pillow on a user's upload raises anything from a decoder
-        logger.error("Failed to save image: %s", e)
+        logger.warning("Image left out, it could not be read: %s", e)
         return None
     if source_format not in ("JPEG", "MPO") and w * h > _MAX_FULL_DECODE_PIXELS:
         from ws.dashboard_chat_support import AttachmentsRefused
@@ -300,24 +360,24 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
             img.save(buf, format="JPEG", quality=85, optimize=True,
                      **({"icc_profile": icc} if icc else {}))
         out_bytes = buf.getvalue()
-
-        save_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"img_{uuid.uuid4().hex[:8]}.{ext}"
-        filepath = save_dir / filename
-        filepath.write_bytes(out_bytes)
-        logger.info(
-            "Saved image: %s (%sx%s -> %sx%s, "
-            "%s -> %s bytes)",
-            filepath, w, h, img.size[0], img.size[1], original_size, len(out_bytes)
-        )
-        return {
-            "path": str(filepath),
-            "base64": base64.b64encode(out_bytes).decode("ascii"),
-            "media_type": media_type,
-        }
     except Exception as e:  # noqa: BLE001  # Pillow on a user's upload raises anything from a decoder
+        logger.warning("Image left out, it could not be read: %s", e)
+        return None
+    try:
+        filepath = _land_photo(save_dir, scope_dir, ext, out_bytes)
+    except Exception as e:  # noqa: BLE001  # the platform's own write: a refused folder or a disk error
         logger.error("Failed to save image: %s", e)
         return None
+    logger.info(
+        "Saved image: %s (%sx%s -> %sx%s, "
+        "%s -> %s bytes)",
+        filepath, w, h, img.size[0], img.size[1], original_size, len(out_bytes)
+    )
+    return {
+        "path": str(filepath),
+        "base64": base64.b64encode(out_bytes).decode("ascii"),
+        "media_type": media_type,
+    }
 
 
 def _park_delegate_result(item: dict, person: str = "") -> bool:
@@ -474,16 +534,13 @@ async def chat_process_alive(chat: dict) -> bool:
     if not sid:
         return False
     try:
-        from core.session.session_manager import (
-            _remote_layer,
-            find_layer_for_session,
-            resolve_execution_path,
-        )
-        holder = find_layer_for_session(sid)
-        if holder is _remote_layer and holder is not None:
-            if await holder.is_session_alive(sid):
+        from core.session.session_manager import live_session, resolve_execution_path
+        live = live_session(sid)
+        holder = live.layer if live is not None else None
+        if live is not None and live.machine_id:
+            if await live.layer.is_session_alive(sid):
                 return True
-            return holder.is_session_grace_held(sid)
+            return live.grace
         # An engine with no OS process is excluded: its in-memory session
         # object reads "alive" with nothing behind it, and abandoning one
         # loses nothing (it rebuilds full history from the DB).
@@ -500,10 +557,9 @@ async def chat_process_alive(chat: dict) -> bool:
         from core.session.session_manager import get_layer_capabilities
         path_caps = get_layer_capabilities(path)
         if holder is None and path_caps is not None and path_caps.runtime.has_os_process:
-            layer = get_execution_layer(
-                agent, execution_path=path,
-                execution_target=chat.get("execution_target") or "",
-            )
+            from core.session.session_manager import layer_for_chat
+            layer = layer_for_chat(agent, {**chat, "execution_path": path},
+                                   user_sub=None, role="manager")
             return bool(await layer.is_session_alive(sid))
     except Exception:  # noqa: BLE001  # a liveness probe across engines and machines: a failure reads as dead
         logger.debug("chat_process_alive: liveness probe failed for %s",
@@ -747,6 +803,20 @@ class DashboardConnection(
     # resume and warmup): no notify-queue registration, no session zone.
     _view_only = False
 
+    @property
+    def session_id(self) -> str | None:
+        """The session this socket drives: the one it adopted on the chat it
+        is on, else none. Every frame that acts on a session reads it here
+        (a send, a mode or model pick, a card's answer, Stop, compaction,
+        Implement, a terminal's keys), so none reaches the session of a chat
+        the socket left, whatever put the socket on another chat."""
+        held = self.__dict__.get("_session")
+        return held[1] if held and held[0] == self.__dict__.get("chat_id") else None
+
+    @session_id.setter
+    def session_id(self, session_id: str | None) -> None:
+        self._session = (self.__dict__.get("chat_id"), session_id) if session_id else None
+
     def __init__(self, websocket: WebSocket, *, user_sub: str, user: dict):
         self.websocket = websocket
         self.user_sub = user_sub
@@ -779,8 +849,8 @@ class DashboardConnection(
             return
         logger.info("WebSocket dashboard connection accepted for user=%s", self.user_sub)
 
-        self.session_id: str | None = None
         self.chat_id: str | None = None
+        self.session_id = None
         self.agent_name: str = ""
         # The plan's implement message a closed pump queue or a dead session
         # left for this connection's next turn on its chat (a typed message
@@ -859,7 +929,7 @@ class DashboardConnection(
 
         # --- Interactive (PTY) viewer attach -------------------------------------
         # A connection views at most ONE interactive session at a time; attaching a
-        # new one (or a chat-switch) detaches the prior. The PtyProcess OUTLIVES the
+        # new one (or a chat-switch) detaches the prior. The terminal OUTLIVES the
         # WS — detach removes this socket's output listener, it does NOT kill the
         # session (reconnect replays the scrollback ring).
         self._pty_viewer_sid: str | None = None
@@ -905,6 +975,7 @@ class DashboardConnection(
             # phase that raises above leaves neither behind (the send below
             # cannot raise).
             _connections_by_user.setdefault(self.user_sub, set()).add(self)
+            arm_for_author(self.user_sub)
             self._ticker = asyncio.create_task(self._revalidation_ticker())
             try:
                 await self.websocket.send_json(self._server_info_frame())
@@ -1019,7 +1090,7 @@ class DashboardConnection(
                 await warmup_registry.detach_listener(_wcid, self._send)
             self._attached_warmups.clear()
             # Detach any interactive PTY viewer: removes this socket's output
-            # listener only — the PtyProcess keeps running (reconnect replays the
+            # listener only — the terminal keeps running (reconnect replays the
             # scrollback ring; the idle reaper reclaims it if never re-viewed).
             self._detach_pty_viewer()
             # Install events need no per-connection detach: they are delivered via
@@ -1148,8 +1219,17 @@ class DashboardConnection(
             # before admin configures a model). Surface as a WS
             # error so the user sees the actionable message instead
             # of a silent WS close.
-            logger.warning("WS dashboard model resolution failed: %s", e)
-            await self._send_error(str(e))
+            said = str(e)
+            if isinstance(e, placement.PlacementRefused):
+                logger.info("WS dashboard: a start was refused: %s", e)
+                if isinstance(e, placement.NoComputeMachine) and drain.holding():
+                    # A new chat's start under a hold (the start still waits
+                    # for the compute machine, an update or a backup stopped
+                    # it): the hold's own line, as every other door says it.
+                    said = drain.refusal(wire.PLATFORM_UPDATING)
+            else:
+                logger.warning("WS dashboard model resolution failed: %s", e)
+            await self._send_error(said)
             result = None
         if result == "close" or self._closed_by_revalidation:
             return "close"
@@ -1174,10 +1254,15 @@ class DashboardConnection(
             from core.session import prewarm_session_registry as _prewarm
             if await _prewarm.claim(orphan_sid):
                 try:
-                    from core.session.session_manager import layer_for_prewarm
+                    from core.session.session_manager import (
+                        layer_for_prewarm,
+                        release_unheld,
+                    )
                     orphan_layer = layer_for_prewarm(orphan_sid, orphan_exec_path)
                     if orphan_layer:
                         await orphan_layer.close_session(orphan_sid)
+                    else:
+                        release_unheld(orphan_sid)
                     logger.info("WS dashboard: closed orphaned pre-warmed session %s", orphan_sid[:8])
                 except Exception:  # noqa: BLE001  # closing an orphaned pre-warmed session nobody will use
                     pass
@@ -1321,6 +1406,9 @@ class DashboardConnection(
             "type": wire.SERVER_INFO,
             "build_id": dashboard_build_id(),
             "version": config.PINNED_OTODOCK_VERSION or "",
+            # New work is held for an update (``core.drain``): the page says
+            # so. The key is there only while it holds.
+            **({"updating": True} if drain.holding() else {}),
         }
 
     async def _pong(self) -> None:
@@ -1477,13 +1565,7 @@ class DashboardConnection(
         ag = rec.get("agent") or ""
         role = acting_role_of(self.user_sub, ag, fallback_user=self.user)
         try:
-            return get_execution_layer(
-                ag,
-                execution_path=rec.get("execution_path") or "",
-                user_sub=self.user_sub,
-                role=role,
-                execution_target=rec.get("execution_target") or placement.LOCAL,
-            )
+            return layer_for_chat(ag, rec, user_sub=self.user_sub, role=role)
         except Exception as e:  # noqa: BLE001  # a chat whose layer cannot be built is skipped, the socket serves on
             logger.warning("WS dashboard: cannot resolve layer for chat %s: %s", cid, e)
             return None
@@ -1501,12 +1583,10 @@ class DashboardConnection(
         turns and interactive turns) this viewer may see, their rows read in
         ONE batched job (a connect storm of N sockets at M streaming chats
         must cost N reads, not N x M)."""
-        from core.session import interactive_session as _isess
-        from core.session.session_state import streaming_chat_ids as _pump_streaming
         from core.session.visibility import is_shared_chat_owner as _is_shared_owner
+        from services.delegation import lane_status
         from storage.pg import run_db
-        cids = list(dict.fromkeys(
-            c for c in [*_pump_streaming(), *_isess.streaming_chat_ids()] if c))
+        cids = lane_status.working_chat_ids()
 
         def _rows_and_modes() -> tuple[dict, set[str]]:
             found = task_store.get_chats_by_ids(cids)

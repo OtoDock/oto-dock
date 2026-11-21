@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import { useAuth } from '../contexts/AuthContext'
 import { isAdmin } from '../lib/permissions'
@@ -6,6 +6,42 @@ import { isLocalTarget, PAIRING_SCOPE, type PairingScope } from '../lib/placemen
 import { isReachableMachine, type MachineState } from '../lib/status/machine'
 import type { BootstrapOs, DisplayServer } from '../lib/hostOs/os'
 import { apiJson, apiOk, withMessage } from '../lib/http/apiJson'
+
+export interface ComputeBox {
+  own: boolean
+  sessions: number
+  memory: { total_mb: number; available_mb: number; reserved_mb: number; capped: boolean } | null
+  holding: boolean
+  /** A machine on another server holds a sign-in (it ran its command). */
+  paired?: boolean
+  /** A pairing command waits for it. */
+  waiting?: boolean
+  /** The last address its address lock refused, "" for none. */
+  refused_from?: string
+  /** Its address is one other clients share: a lock cannot hold on it. */
+  shared?: boolean
+  /** Its server's setup predates this platform's: "Pair again" updates it. */
+  host_behind?: boolean
+}
+
+/** A machine's update state, as the proxy reads it for the card and for a
+ *  press (`remote_machines.machine_update_state`). */
+export const MACHINE_UPDATE_STATE = {
+  /** It runs the version the platform sends, or a newer one. */
+  CURRENT: 'current',
+  /** An update sent to it has not ended. */
+  RUNNING: 'running',
+  /** Its link is plaintext: only the installer updates it. */
+  MANUAL: 'manual',
+  /** Away: its version is below the platform's minimum, so no session runs there until it updates. */
+  REFUSED: 'refused',
+  /** Away, with an update waiting for its next connect. */
+  QUEUED: 'queued',
+  /** The update waits until nothing runs on it. */
+  WAITING: 'waiting',
+  AVAILABLE: 'available',
+} as const
+export type MachineUpdateState = (typeof MACHINE_UPDATE_STATE)[keyof typeof MACHINE_UPDATE_STATE]
 
 export interface RemoteMachine {
   id: string
@@ -23,7 +59,18 @@ export interface RemoteMachine {
   link_ok?: boolean
   link_down_s?: number | null
   link_error?: string
-  registered_by: string  // user_sub of who paired it
+  // What install ahead is doing for this machine (null: nothing to say).
+  tools_ahead?: { installing: string[]; failed: Record<string, string> } | null
+  registered_by: string  // user_sub of who paired it; "" for a compute machine, which nobody owns
+  // A compute machine's row: whether the install runs it itself, the sessions
+  // it holds a slot for, its memory as admission reads it (null before its
+  // first report) and whether the platform holds new work for an update.
+  compute?: ComputeBox
+  // A compute machine on another server: the address it last signed in from
+  // ("" for one beside the platform, and before its pairing), and whether its
+  // admin locked it to that address.
+  compute_address?: string
+  compute_address_locked?: boolean
   // 'admin' = paired via the admin Remote Machines page (platform
   // infrastructure, can be agent-scope default). 'user' = paired via
   // UserSettings (personal scope, only the owner's user-scope chats run there).
@@ -69,6 +116,9 @@ export interface RemoteMachine {
   last_update_at?: string | null
   last_update_error?: string | null
   pending_update?: boolean
+  // Where the machine stands on the version the platform sends (the proxy's
+  // `machine_update_state`); absent or '' when no update is offered.
+  update_state?: MachineUpdateState | ''
   // Rollback budget for the target named in update_rollback_target: at 2
   // consecutive rollbacks the proxy stops auto-pushing that target until
   // "Update now" (see MachineUpdateControls' paused notice).
@@ -94,8 +144,8 @@ export interface RemoteMachine {
   // never returned). Without one every session asks for a click in the
   // browser and unattended sessions cannot use it.
   browser_extension_token_set?: boolean
-  // Whether unattended sessions (scheduled tasks, triggers, calls, meetings)
-  // may use the saved token; off, only a session a person drives does.
+  // Whether unattended sessions (scheduled tasks, triggers, calls, meetings,
+  // API keys) may use the saved token; off, only a session a person drives does.
   browser_unattended?: boolean
   // "Browser profile": the profile that has the Playwright Extension, as the
   // browser names it ('' = the one profile that has it).
@@ -138,9 +188,15 @@ export const useRemoteMachines = () => {
       const data = await res.json()
       return data.machines ?? []
     },
-    refetchInterval: 15000,
+    refetchInterval: query => toolsAheadRefetch(query.state.data),
     enabled: isAdmin(user),
   })
+}
+
+/** How often a machine list is read: every 5 s while a machine installs
+ * tools ahead (its card says so), else every 15 s. */
+export function toolsAheadRefetch(machines: RemoteMachine[] | undefined): number {
+  return machines?.some(m => (m.tools_ahead?.installing.length ?? 0) > 0) ? 5000 : 15000
 }
 
 export const usePairMachine = () => {
@@ -154,6 +210,79 @@ export const usePairMachine = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       }, 'Failed to pair machine')
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['remote-machines'] }),
+  })
+}
+
+/** What this install says about compute machines on other servers. */
+export interface ComputeSettings {
+  /** The image such a machine runs, and whether a server can download it. */
+  image: string
+  image_public: boolean
+  /** The install is served over plain HTTP on a local network. */
+  plain: boolean
+  /** Why this install cannot add one (it runs outside Docker), "" when it can. */
+  add_refusal: string
+  /** The install runs a compute machine of its own, and where its log is read. */
+  own: boolean
+  docker: boolean
+}
+
+/** The one command that pairs a compute machine on another server. */
+export interface ComputeCommand extends ComputeSettings {
+  id: string
+  name: string
+  install_command: string
+  expires_in_hours: number
+}
+
+export const useComputeSettings = () => {
+  const { user } = useAuth()
+  return useQuery({
+    queryKey: ['compute-settings'],
+    queryFn: (): Promise<ComputeSettings> => apiJson<ComputeSettings>('/v1/admin/remote-machines/compute'),
+    staleTime: 60_000,
+    enabled: isAdmin(user),
+  })
+}
+
+/** Add a compute machine on another server: its command comes back. */
+export const useAddComputeMachine = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: { name: string }): Promise<ComputeCommand> =>
+      apiJson<ComputeCommand>('/v1/admin/remote-machines/compute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }, 'The machine was not added'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['remote-machines'] }),
+  })
+}
+
+/** A new command for a compute machine that lost its sign-in. */
+export const usePairComputeAgain = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (machineId: string): Promise<ComputeCommand> =>
+      apiJson<ComputeCommand>(`/v1/admin/remote-machines/compute/${machineId}/pair`, {
+        method: 'POST',
+      }, 'No new command was made'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['remote-machines'] }),
+  })
+}
+
+/** "Lock to this address": on, it pins the address the machine is shown with. */
+export const useSetComputeAddressLock = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ machineId, locked, address }: { machineId: string; locked: boolean; address: string }) => {
+      await apiOk(`/v1/admin/remote-machines/compute/${machineId}/address-lock`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ locked, address }),
+      }, 'The lock was not changed')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['remote-machines'] }),
   })
@@ -415,7 +544,7 @@ export const useMyRemoteMachines = () =>
       const res = await apiFetch('/v1/users/me/remote-machines')
       return res.json()
     },
-    refetchInterval: 15000,
+    refetchInterval: query => toolsAheadRefetch(query.state.data?.machines),
   })
 
 export const usePairMyMachine = () => {
@@ -539,7 +668,8 @@ export const useTriggerUpdateNow = (mine: boolean = false) => {
         method: 'POST',
       }, 'Failed to trigger update')
     },
-    onSuccess: () => {
+    // A refusal (already updating, already current) refreshes the card too.
+    onSettled: () => {
       qc.invalidateQueries({ queryKey: ['remote-machines'] })
       qc.invalidateQueries({ queryKey: ['my-remote-machines'] })
     },
@@ -637,6 +767,17 @@ export interface MoveChatResult {
 export interface AgentRunTargets {
   default_target: string
   targets: RunTarget[]
+}
+
+/** Every query that shows where something runs or whether a machine is
+ *  there: the chat's place, a new chat's and a task's places, the agent's
+ *  connection dot, both machines pages. A machine that came or went
+ *  (`machine_link`) and a socket that came back read them all again. */
+export function refreshMachinePlaces(qc: QueryClient): void {
+  for (const key of [['chat-targets'], ['agent-run-targets'], ['agent-target-status'],
+    ['remote-machines'], ['my-remote-machines']]) {
+    void qc.invalidateQueries({ queryKey: key })
+  }
 }
 
 /** The targets query of one chat: the chip, the banner, the row menu and the

@@ -1,10 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react'
 import { safeHref } from '../../../lib/safeUrl'
 
 import { ensureMediaDownloadName } from '../../../lib/fileTypes'
 import { useCoarsePointer } from '../../../hooks/useCoarsePointer'
-import { callNative } from '../../../lib/nativeBridge'
+import { callNative, hasNativeBridge, inAndroidApp } from '../../../lib/nativeBridge'
+import { emitAppToast } from '../../../lib/appToasts'
+import { NOTIFICATION_SEVERITY } from '../../../lib/status/notificationSeverity'
+import { pushEscHandler } from '../../../lib/escStack'
+import { canPresent, popoverOpen } from '../../../lib/ui/topLayer'
 import { isRecord } from '../../../lib/json/guards'
+import { logError } from '../../../lib/debug/log'
 import { OVER_MEDIA, STAGE_FRAME, STAGE_TEXT, VIDEO_BAR, VIDEO_BUFFERED, VIDEO_SPINNER, VIDEO_THUMB, VIDEO_TRACK, VIDEO_VOLUME } from './stage'
 
 interface Props {
@@ -95,6 +100,36 @@ function toEmbedUrl(src: string): string | null {
 const PIP_SUPPORTED =
   typeof document !== 'undefined' && !!document.pictureInPictureEnabled
 
+// Safari's own full screen for a video; an iPhone has no other. It can be
+// entered once the clip's shape is known (webkitSupportsFullscreen).
+type OwnFullscreenVideo = HTMLVideoElement & {
+  webkitEnterFullscreen?: () => void
+  webkitSupportsFullscreen?: boolean
+}
+
+// The frame while it fills the page from the top layer (the page-level full
+// screen): the view's whole box, over the browser's own style for a popover
+// and the frame's in-flow classes.
+const PAGE_FS: CSSProperties = {
+  position: 'fixed', inset: 0, width: '100%', height: '100%', maxWidth: 'none', maxHeight: 'none',
+  margin: 0, padding: 0, border: 0, borderRadius: 0, overflow: 'hidden', color: 'inherit',
+}
+
+// A full screen that ends this soon after it began was ended by the app
+// around the page, not by the person.
+const ENDED_AT_ONCE_MS = 600
+
+/** The one sentence when a video cannot go full screen. Its second line
+ *  only where an update of the app is what fixes it: the Android app whose
+ *  view has no full screen to give, or ends one at once. */
+function sayNoFullscreen(updateFixesIt: boolean) {
+  emitAppToast({
+    title: 'This video could not go full screen.',
+    body: updateFixesIt ? 'Update the OtoDock app.' : '',
+    severity: NOTIFICATION_SEVERITY.WARNING,
+  })
+}
+
 // `screen.orientation` and its `lock` are missing from some engines (an
 // older Safari, a desktop browser): every call below is optional.
 function screenOrientation(): ScreenOrientation | undefined {
@@ -153,6 +188,16 @@ export default function VideoPlayer({
   const [volume, setVolume] = useState(() => loadVolume().volume)
   const [muted, setMuted] = useState(() => loadVolume().muted)
   const [fs, setFs] = useState(false)
+  // The page-level full screen: this player's frame fills the page from the
+  // top layer, where the view around the page has no full screen to give.
+  const [pageFs, setPageFs] = useState(false)
+  const active = fs || pageFs
+  // This player's own request, the moment its frame went full screen, and
+  // whether the player itself is leaving: what tells a full screen that was
+  // ended at once from one the person left.
+  const asking = useRef(false)
+  const enteredAt = useRef(0)
+  const leaving = useRef(false)
   const [ratio, setRatio] = useState('16 / 9')
   const [error, setError] = useState(false)
   const [offline, setOffline] = useState(false)
@@ -226,11 +271,41 @@ export default function VideoPlayer({
     wake()
   }
 
+  // The frame goes full screen with the player's own controls. Where the
+  // view cannot (an Android app whose build lost what its web view looks for
+  // answers document.fullscreenEnabled false, an iPhone has no full screen
+  // for an element) or refuses: the video's own full screen where it has
+  // one, else the frame fills the page inside an app whose view said no,
+  // else one sentence says so.
+  const fallBack = () => {
+    const v: OwnFullscreenVideo | null = videoRef.current
+    if (v?.webkitSupportsFullscreen && typeof v.webkitEnterFullscreen === 'function') {
+      try { v.webkitEnterFullscreen(); return } catch (err: unknown) {
+        logError('The video could not go full screen:', err)
+      }
+    }
+    // Strictly false: WebKit leaves the property out where it has no full
+    // screen for an element, and the page must not stand in for it there.
+    const viewCannot = document.fullscreenEnabled === false
+    if (hasNativeBridge() && viewCannot && canPresent()) { setPageFs(true); return }
+    sayNoFullscreen(inAndroidApp() && viewCannot)
+  }
   const toggleFs = () => {
     const el = wrapRef.current
     if (!el) return
-    if (document.fullscreenElement) document.exitFullscreen().catch(() => {})
-    else el.requestFullscreen?.().catch(() => {})
+    if (pageFs) { setPageFs(false); return }
+    if (document.fullscreenElement) {
+      leaving.current = true
+      document.exitFullscreen().catch(() => {})
+      return
+    }
+    if (typeof el.requestFullscreen !== 'function' || document.fullscreenEnabled === false) { fallBack(); return }
+    asking.current = true
+    el.requestFullscreen().catch((err: unknown) => {
+      asking.current = false
+      logError('The video could not go full screen:', err)
+      fallBack()
+    })
   }
 
   const togglePip = async () => {
@@ -245,10 +320,40 @@ export default function VideoPlayer({
   }
 
   useEffect(() => {
-    const onFsChange = () => setFs(!!document.fullscreenElement)
+    const onFsChange = () => {
+      const el = document.fullscreenElement
+      setFs(!!el)
+      if (el) {
+        if (asking.current && el === wrapRef.current) enteredAt.current = Date.now()
+        asking.current = false
+        return
+      }
+      // Never silent: this player's own full screen that the app around the
+      // page ended at once (the Android app's view can, a browser never does).
+      const endedAtOnce = enteredAt.current > 0 && Date.now() - enteredAt.current < ENDED_AT_ONCE_MS
+      if (endedAtOnce && !leaving.current && inAndroidApp()) sayNoFullscreen(true)
+      enteredAt.current = 0
+      leaving.current = false
+    }
     document.addEventListener('fullscreenchange', onFsChange)
     return () => document.removeEventListener('fullscreenchange', onFsChange)
   }, [])
+
+  // The page-level full screen shows the frame in the top layer, in place.
+  // React owns the popover attribute (set only while open: a closed popover
+  // is not displayed), and taking it away closes the popover.
+  useLayoutEffect(() => {
+    const el = wrapRef.current
+    if (!el || !pageFs || typeof el.showPopover !== 'function' || popoverOpen(el)) return
+    try { el.showPopover() } catch { /* not in the document: nothing to show */ }
+  }, [pageFs])
+
+  // Escape, and Back in an app that asks an open dialog first, leave it
+  // before whatever holds it (a file preview inside a dialog).
+  useEffect(() => {
+    if (!pageFs) return
+    return pushEscHandler(() => setPageFs(false), () => wrapRef.current)
+  }, [pageFs])
 
   // Fullscreen side-effects: native edge-to-edge + immersive in the apps (the
   // screen turns with the phone there), Android/web Back closes fullscreen
@@ -256,13 +361,17 @@ export default function VideoPlayer({
   // videos, a CUE, not a pin: startOrientationFollow follows the physical
   // orientation afterwards.
   useEffect(() => {
-    if (!fs) return
+    if (!active) return
     const w: Window & { __otodockVideoFullscreenActive?: boolean; __otodockVideoFullscreenClose?: () => void } = window
     const v = videoRef.current
     // videoWidth is 0 until metadata loads — never treat that as "wide" (it
     // used to rotate PORTRAIT videos to landscape when fullscreen came fast).
     const landscape = coarse && !!v && v.videoWidth > 0 && v.videoWidth >= v.videoHeight
-    const close = () => { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}) }
+    const close = () => {
+      leaving.current = true
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {})
+      setPageFs(false)
+    }
     const native = callNative('enterVideoFullscreen', landscape)
     w.__otodockVideoFullscreenActive = true       // MainActivity.handleBackAction checks this
     w.__otodockVideoFullscreenClose = close
@@ -289,7 +398,7 @@ export default function VideoPlayer({
       const state: unknown = history.state
       if (pushed && isRecord(state) && state.otoVideoFs) { try { history.back() } catch { /* ignore */ } }
     }
-  }, [fs, coarse])
+  }, [active, coarse])
 
   // Re-arm auto-hide whenever play-state or fullscreen changes — fixes the
   // control bar staying visible after exiting fullscreen (it only re-hid on the
@@ -303,7 +412,7 @@ export default function VideoPlayer({
   useEffect(() => {
     if (!playing) { clearHide(); return }
     scheduleHide()
-  }, [playing, fs, clearHide, scheduleHide])
+  }, [playing, active, clearHide, scheduleHide])
 
   const onTime = () => {
     const v = videoRef.current
@@ -311,14 +420,23 @@ export default function VideoPlayer({
     setCur(v.currentTime)
     if (v.buffered.length) setBuffered(v.buffered.end(v.buffered.length - 1))
   }
-  const onLoaded = () => {
-    const v = videoRef.current
-    if (!v) return
+  const readMeta = useCallback((v: HTMLVideoElement) => {
     setDur(v.duration || 0)
     if (v.videoWidth && v.videoHeight) setRatio(`${v.videoWidth} / ${v.videoHeight}`)
+  }, [])
+  const onLoaded = (e: React.SyntheticEvent<HTMLVideoElement>) => {
+    const v = e.currentTarget
+    readMeta(v)
     v.volume = volume
     v.muted = muted
   }
+  // A clip can load before its element is on the page (a cached clip while
+  // the page renders): its loadedmetadata then had no element to read, the
+  // frame kept 16:9 and the bar 0:00. Read what loaded once it is here.
+  useEffect(() => {
+    const v = videoRef.current
+    if (v && v.readyState >= HTMLMediaElement.HAVE_METADATA) readMeta(v)
+  }, [readMeta])
 
   const onVideoError = () => {
     setError(true)
@@ -430,18 +548,23 @@ export default function VideoPlayer({
   // paused/ended, pause while playing. Hidden while buffering.
   const showCenter = controlsVisible && !loading
 
+  // A column the frame shrinks in to fit, the video letterboxing, so a tall
+  // clip keeps its controls in view: bounded by its host (a pop-up window)
+  // and, with the pop-up's numbers, by the screen in every other host (the
+  // message list, the file preview). Full screen is the top layer: no bound.
   return (
-    <div className="my-2 max-w-2xl">
+    <div className="my-2 flex min-h-0 max-h-[min(70dvh,40rem)] max-w-2xl flex-col">
       {title && <div className="mb-1 text-sm font-medium text-primary">{title}</div>}
       <div
         ref={wrapRef}
         tabIndex={0}
         onKeyDown={onKeyDown}
         onMouseMove={() => { if (!coarse) wake() }}
-        className={`relative overflow-hidden rounded-card ${STAGE_FRAME} outline-hidden ${
-          fs && !controlsVisible ? 'cursor-none' : ''
+        popover={pageFs ? 'manual' : undefined}
+        className={`relative min-h-0 overflow-hidden rounded-card ${STAGE_FRAME} outline-hidden ${
+          active && !controlsVisible ? 'cursor-none' : ''
         }`}
-        style={{ aspectRatio: fs ? undefined : ratio }}
+        style={pageFs ? PAGE_FS : { aspectRatio: fs ? undefined : ratio }}
       >
         <video
           ref={videoRef}
@@ -450,7 +573,7 @@ export default function VideoPlayer({
           playsInline
           preload="metadata"
           className={`h-full w-full ${STAGE_FRAME}`}
-          style={fs ? { objectFit: 'contain', height: '100%', width: '100%' } : undefined}
+          style={active ? { objectFit: 'contain', height: '100%', width: '100%' } : undefined}
           onClick={onSurfaceClick}
           onPlay={() => { setPlaying(true); setEnded(false); wake() }}
           onPause={() => { setPlaying(false); setShowControls(true); clearHide() }}
@@ -564,7 +687,7 @@ export default function VideoPlayer({
                 </a>
               )}
               <button onClick={toggleFs} aria-label="Fullscreen" className="shrink-0">
-                {fs
+                {active
                   ? <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" /></svg>
                   : <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" /></svg>}
               </button>

@@ -190,16 +190,21 @@ class ProviderAdapter(ABC):
     # Shared cost calculation (uses centralized config.MODEL_REGISTRY)
     # ---------------------------------------------------------------------------
 
-    def calculate_cost(self, model: str, usage: ProviderUsage) -> float:
+    def calculate_cost(self, model: str, usage: ProviderUsage, *,
+                       rates: tuple[float, float, float, float] | None = None,
+                       line_tokens: int | None = None) -> float:
         """Calculate USD cost from usage using centralized model pricing (the
         tokens at the model's rates, ``config.price_usage``, which applies a
         model's long-context tier, plus the per-call fee of every provider-run
-        web search, ``config.WEB_SEARCH_USD_PER_REQUEST``)."""
+        web search, ``config.WEB_SEARCH_USD_PER_REQUEST``). ``rates`` read
+        earlier spare the store read, for a caller on the event loop.
+        ``line_tokens``: what the long-context line is judged on, when ``usage``
+        is only a part of it."""
         return (
             app_config.price_usage(
                 model, self.provider_name,
                 input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
                 cache_write_tokens=usage.cache_write_tokens,
-                cache_read_tokens=usage.cache_read_tokens)
+                cache_read_tokens=usage.cache_read_tokens, rates=rates, line_tokens=line_tokens)
             + usage.web_search_requests * app_config.WEB_SEARCH_USD_PER_REQUEST
         )

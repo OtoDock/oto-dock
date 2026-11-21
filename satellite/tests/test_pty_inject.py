@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -48,7 +47,8 @@ def _make_session(tmp_path, ws, *, attached=True) -> BasePtySession:
     sess.pty = _FakePty()
     # Injectable baseline: transcript located, no burst, local line clean +
     # last keystroke long ago, local relay attached.
-    sess._transcript_path = Path(tmp_path / "transcript.jsonl")
+    (agent_dir / "transcript.jsonl").touch()
+    sess._transcript_rel = "transcript.jsonl"
     sess._files_dirty = False
     sess._local_line_dirty = False
     sess._last_local_input = time.monotonic() - 60
@@ -315,3 +315,5 @@ async def test_the_claude_terminal_turns_the_advisor_tool_off(tmp_path, monkeypa
     monkeypatch.setattr(sess, "_wire_and_spawn", _spawn)
     await sess.start()
     assert seen["env"]["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+    # Tools that really start connect together (mirrors the proxy env builder).
+    assert 3 <= int(seen["env"]["MCP_SERVER_CONNECTION_BATCH_SIZE"]) <= 16

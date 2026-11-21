@@ -21,13 +21,16 @@ that this module's ``router`` includes (``proxy/app.py`` mounts only this one):
 
 * ``paths.py``      — resolve-path, resolve-tool-arg-paths, the path helpers
 * ``routing.py``    — which chat a hook belongs to, the meeting turn-end backstop
-* ``permission.py`` — permission, codex-question, mcp-credentials, session-files;
-                      ``decide_tool_permission`` is the single authority
+* ``permission.py`` — permission, codex-question; ``decide_tool_permission`` is the
+                      single authority (its question path in ``questions.py``)
+* ``credentials.py`` — mcp-credentials, cli-credential, ssh-agent
+* ``tool_start.py`` — tool-listing, tool-start (a tool's stand-in)
 * ``artifacts.py``  — images, image-generating, image-gen-failed, url, file, media, ui
 * ``pins.py``       — apps/pin, apps/unpin, apps/list, files/pin, files/unpin
 * ``preview.py``    — document-preview
 * ``lifecycle.py``  — tool-result, stop, subagent, file-written,
-                      sessions/{id}/permission-response, location/request
+                      location/request
+* ``usage.py``      — usage-report (a terminal's report of its account's windows)
 
 A test that patches a name a route reads patches the module that holds the
 route (``api.hooks.artifacts.verify_session_match_async``), never this facade.
@@ -35,10 +38,22 @@ route (``api.hooks.artifacts.verify_session_match_async``), never this facade.
 
 from fastapi import APIRouter
 
-from api.hooks import app_deploy, artifacts, lifecycle, paths, permission, pins, preview
+from api.hooks import (
+    app_deploy,
+    artifacts,
+    credentials,
+    lifecycle,
+    paths,
+    permission,
+    pins,
+    preview,
+    tool_start,
+    usage,
+)
 from api.hooks.permission import ask_user_question, decide_tool_permission  # noqa: F401
 from api.hooks.routing import resolve_hook_chat_id, resolve_hook_route  # noqa: F401
 
 router = APIRouter()
-for _piece in (paths, permission, artifacts, pins, app_deploy, preview, lifecycle):
+for _piece in (paths, permission, credentials, tool_start, artifacts, pins, app_deploy, preview, lifecycle,
+               usage):
     router.include_router(_piece.router)

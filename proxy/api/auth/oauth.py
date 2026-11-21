@@ -32,7 +32,6 @@ This module owns no business logic — it's a thin wrapper around
 from __future__ import annotations
 
 import asyncio
-import functools
 import hashlib
 import hmac
 import html
@@ -873,32 +872,21 @@ async def _disconnect_locked(
             scope="user", owner=user.sub,
             mcp_name=body.mcp_name, account_label=body.account_label,
         )
-        # (b) agent-scope cascade: any agent whose service binding points at
-        # THIS (owner, account) loses its service subscriptions, and the now-
-        # dangling binding is removed.
+        # (b) agent-scope cascade: every agent whose own set holds THIS
+        # (owner, account) loses it through the one remover, which takes its
+        # service subscriptions and, once no row names it, its installation's
+        # token file with it.
         bindings = await asyncio.to_thread(
             credential_store.list_service_agent_bindings, body.mcp_name,
         )
-        installations: set[str] = set()
+        from services.remote import chat_reload
         for b in bindings:
             if (b.get("account_owner_sub") == user.sub
                     and b.get("account_label") == body.account_label):
-                await subscription_manager.cleanup_account_subscriptions(
-                    scope="service", owner=user.sub,
-                    mcp_name=body.mcp_name, account_label=body.account_label,
-                    agent=b.get("agent_name"),
-                )
-                await asyncio.to_thread(functools.partial(
-                    credential_store.remove_service_agent_binding,
+                await chat_reload.remove_service_account(
                     body.mcp_name, cast("str", b.get("agent_name")),
                     owner_sub=user.sub, account_label=body.account_label,
-                ))
-                if b.get("installation_id"):
-                    installations.add(str(b["installation_id"]))
-        # An installation's token file stays while another person's binding
-        # still names it.
-        for installation_id in installations:
-            await asyncio.to_thread(github_apps.reap_if_orphan, provider_id, installation_id)
+                )
     except Exception:
         logger.exception(
             "Subscription cleanup raised for %s/%s (continuing with disconnect)",

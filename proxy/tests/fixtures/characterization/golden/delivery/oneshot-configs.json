@@ -1,0 +1,1493 @@
+{
+ "a chat on the other engine, its thread kept": {
+  "admission": [
+   {
+    "path": "codex-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": "",
+  "asked": [
+   {
+    "args": [
+     "char-agent",
+     "user-viewer"
+    ],
+    "call": "build_session_mcp_config",
+    "kwargs": {
+     "chat_id": "c-codex",
+     "delegation_targets": [
+      "char-agent"
+     ],
+     "mcp_config_format": "toml",
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "session_id": "<sid>",
+     "shared_chat": true,
+     "target_browser": {},
+     "task_mode": true,
+     "task_scope": "user",
+     "user_role": "editor",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "char-agent",
+     [
+      "char-files",
+      "phone-mcp"
+     ]
+    ],
+    "call": "get_dynamic_contexts",
+    "kwargs": {
+     "delegation_roster": [
+      "char-agent"
+     ],
+     "delegation_targets": [
+      "char-agent"
+     ],
+     "meetings_access": [
+      "char-agent",
+      "char-shared"
+     ],
+     "nouser_reads": false,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "trigger_payload": null,
+     "user_role": "editor",
+     "user_sub": "user-viewer"
+    }
+   },
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "build_agent_prompt",
+    "kwargs": {
+     "client_type": "task",
+     "dynamic_contexts": null,
+     "excluded_mcps": null,
+     "execution_path": "codex-cli",
+     "mount_shared": true,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "session_id": "<sid>",
+     "shared_chat": true,
+     "tool_limits": null,
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     {
+      "agent": "char-agent",
+      "config_visible": false,
+      "is_admin_agent": false,
+      "placement": {
+       "kind": "compute",
+       "label": "Compute",
+       "machine_id": "compute-0123456789ab"
+      },
+      "role": "editor",
+      "tool_limits": [
+       [
+        "agent-config-mcp",
+        [
+         "reload_session",
+         "switch_account"
+        ]
+       ]
+      ],
+      "username": "vic"
+     }
+    ],
+    "call": "build_permission_context",
+    "kwargs": {
+     "assigned_mcp_names": [
+      "char-files",
+      "phone-mcp"
+     ],
+     "execution_path": "codex-cli"
+    }
+   },
+   {
+    "args": [],
+    "call": "build_oto_env",
+    "kwargs": {
+     "agent_name": "char-agent",
+     "available_scopes": [
+      "user",
+      "agent"
+     ],
+     "default_scope": "user",
+     "force_config": false,
+     "memory_agent_enabled": true,
+     "memory_user_enabled": true,
+     "platform_role": "member",
+     "session_id": "<sid>",
+     "task_type": "task",
+     "user_role": "editor",
+     "user_sub": "user-viewer",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "ensure_persistent_agent_dir",
+    "kwargs": {
+     "execution_path": "codex-cli",
+     "scope": "user",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "codex-cli",
+     "user-viewer"
+    ],
+    "call": "resolve_subscription_env",
+    "kwargs": {
+     "agent_info": "char-agent",
+     "model": "",
+     "sticky_scope": "local:/char/.claude"
+    }
+   }
+  ],
+  "config": [
+   {
+    "agent_name": "char-agent",
+    "credential_env": {
+     "CHAR_FILES_DIR": "/users/vic/workspace/files",
+     "MCP_CRED": "1",
+     "OTO_STUB": "1",
+     "PROXY_API_KEY": "<session-token>"
+    },
+    "execution_path": "codex-cli",
+    "extra_env": {
+     "SUB_ENV": "1"
+    },
+    "multi_value_envs": {
+     "OTO_STUB_ROOTS": ":"
+    },
+    "permission_mode": "auto",
+    "resume": true,
+    "resume_handle": "thread-9",
+    "sandbox_host_claude_dir": "/char/.claude",
+    "security_context": {
+     "agent": "char-agent",
+     "config_visible": false,
+     "is_admin_agent": false,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "tool_limits": [
+      [
+       "agent-config-mcp",
+       [
+        "reload_session",
+        "switch_account"
+       ]
+      ]
+     ],
+     "username": "vic"
+    },
+    "subscription_id": "sub-char",
+    "subscription_user_sub": "user-viewer",
+    "system_prompt": "PROMPT\n\nPERMISSIONS",
+    "token_minted_at": "<now>",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ],
+   [
+    "send_message",
+    "<sid>",
+    "WAKE"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "codex-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "a shared-only chat as the person": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": "",
+  "asked": [
+   {
+    "args": [
+     "char-shared",
+     "user-manager"
+    ],
+    "call": "build_session_mcp_config",
+    "kwargs": {
+     "chat_id": "c-so",
+     "delegation_targets": [
+      "char-shared"
+     ],
+     "mcp_config_format": "json",
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "session_id": "<sid>",
+     "shared_chat": true,
+     "target_browser": {},
+     "task_mode": true,
+     "task_scope": "agent",
+     "user_role": "editor",
+     "username": "max"
+    }
+   },
+   {
+    "args": [
+     "char-shared",
+     [
+      "char-files",
+      "phone-mcp"
+     ]
+    ],
+    "call": "get_dynamic_contexts",
+    "kwargs": {
+     "delegation_roster": [
+      "char-shared"
+     ],
+     "delegation_targets": [
+      "char-shared"
+     ],
+     "meetings_access": [
+      "char-agent",
+      "char-shared"
+     ],
+     "nouser_reads": false,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "trigger_payload": null,
+     "user_role": "editor",
+     "user_sub": "user-manager"
+    }
+   },
+   {
+    "args": [
+     "char-shared"
+    ],
+    "call": "build_agent_prompt",
+    "kwargs": {
+     "client_type": "task",
+     "dynamic_contexts": null,
+     "excluded_mcps": null,
+     "execution_path": "claude-code-cli",
+     "mount_shared": true,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "session_id": "<sid>",
+     "shared_chat": true,
+     "tool_limits": null,
+     "username": ""
+    }
+   },
+   {
+    "args": [
+     {
+      "agent": "char-shared",
+      "available_scopes": [
+       "agent"
+      ],
+      "config_visible": false,
+      "is_admin_agent": false,
+      "placement": {
+       "kind": "compute",
+       "label": "Compute",
+       "machine_id": "compute-0123456789ab"
+      },
+      "role": "editor",
+      "session_scope": "agent",
+      "tool_limits": [
+       [
+        "agent-config-mcp",
+        [
+         "reload_session",
+         "switch_account"
+        ]
+       ]
+      ],
+      "username": "max"
+     }
+    ],
+    "call": "build_permission_context",
+    "kwargs": {
+     "assigned_mcp_names": [
+      "char-files",
+      "phone-mcp"
+     ],
+     "execution_path": "claude-code-cli"
+    }
+   },
+   {
+    "args": [],
+    "call": "build_oto_env",
+    "kwargs": {
+     "agent_name": "char-shared",
+     "available_scopes": [
+      "agent"
+     ],
+     "default_scope": "agent",
+     "force_config": false,
+     "memory_agent_enabled": true,
+     "memory_user_enabled": false,
+     "platform_role": "creator",
+     "session_id": "<sid>",
+     "task_type": "task",
+     "user_role": "editor",
+     "user_sub": "user-manager",
+     "username": ""
+    }
+   },
+   {
+    "args": [
+     "char-shared"
+    ],
+    "call": "ensure_persistent_agent_dir",
+    "kwargs": {
+     "execution_path": "claude-code-cli",
+     "scope": "agent",
+     "username": ""
+    }
+   },
+   {
+    "args": [
+     "claude-code-cli",
+     "user-manager"
+    ],
+    "call": "resolve_subscription_env",
+    "kwargs": {
+     "agent_info": "char-shared",
+     "model": "",
+     "sticky_scope": "local:/char/.claude"
+    }
+   }
+  ],
+  "config": [
+   {
+    "agent_name": "char-shared",
+    "credential_env": {
+     "CHAR_FILES_DIR": "/workspace/files",
+     "MCP_CRED": "1",
+     "OTO_STUB": "1",
+     "PROXY_API_KEY": "<session-token>"
+    },
+    "execution_path": "claude-code-cli",
+    "extra_env": {
+     "SUB_ENV": "1"
+    },
+    "multi_value_envs": {
+     "OTO_STUB_ROOTS": ":"
+    },
+    "permission_mode": "auto",
+    "resume": true,
+    "sandbox_host_claude_dir": "/char/.claude",
+    "security_context": {
+     "agent": "char-shared",
+     "available_scopes": [
+      "agent"
+     ],
+     "config_visible": false,
+     "is_admin_agent": false,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "session_scope": "agent",
+     "tool_limits": [
+      [
+       "agent-config-mcp",
+       [
+        "reload_session",
+        "switch_account"
+       ]
+      ]
+     ],
+     "username": "max"
+    },
+    "subscription_id": "sub-char",
+    "subscription_user_sub": "user-manager",
+    "system_prompt": "PROMPT\n\nPERMISSIONS",
+    "token_minted_at": "<now>",
+    "user_sub": "user-manager"
+   }
+  ],
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-shared",
+    ""
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ],
+   [
+    "send_message",
+    "<sid>",
+    "WAKE"
+   ],
+   [
+    "close_session",
+    "<sid>"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-shared",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-manager"
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "a task run's chat as nobody": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": "",
+  "asked": [
+   {
+    "args": [
+     "char-agent",
+     null
+    ],
+    "call": "build_session_mcp_config",
+    "kwargs": {
+     "chat_id": "task-run-char",
+     "delegation_targets": [
+      "char-agent",
+      "char-peer"
+     ],
+     "mcp_config_format": "json",
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "session_id": "<sid>",
+     "shared_chat": true,
+     "target_browser": {},
+     "task_mode": true,
+     "task_scope": "agent",
+     "user_role": "manager",
+     "username": ""
+    }
+   },
+   {
+    "args": [
+     "char-agent",
+     [
+      "char-files",
+      "phone-mcp"
+     ]
+    ],
+    "call": "get_dynamic_contexts",
+    "kwargs": {
+     "delegation_roster": [
+      "char-agent",
+      "char-peer"
+     ],
+     "delegation_targets": [
+      "char-agent",
+      "char-peer"
+     ],
+     "meetings_access": [],
+     "nouser_reads": true,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "trigger_payload": null,
+     "user_role": "manager",
+     "user_sub": ""
+    }
+   },
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "build_agent_prompt",
+    "kwargs": {
+     "client_type": "task",
+     "dynamic_contexts": null,
+     "excluded_mcps": null,
+     "execution_path": "claude-code-cli",
+     "mount_shared": true,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "manager",
+     "session_id": "<sid>",
+     "shared_chat": true,
+     "tool_limits": null,
+     "username": ""
+    }
+   },
+   {
+    "args": [
+     {
+      "agent": "char-agent",
+      "config_visible": false,
+      "is_admin_agent": false,
+      "placement": {
+       "kind": "compute",
+       "label": "Compute",
+       "machine_id": "compute-0123456789ab"
+      },
+      "role": "manager",
+      "session_scope": "agent",
+      "tool_limits": [
+       [
+        "agent-config-mcp",
+        [
+         "reload_session",
+         "switch_account"
+        ]
+       ]
+      ],
+      "username": ""
+     }
+    ],
+    "call": "build_permission_context",
+    "kwargs": {
+     "assigned_mcp_names": [
+      "char-files",
+      "phone-mcp"
+     ],
+     "execution_path": "claude-code-cli"
+    }
+   },
+   {
+    "args": [],
+    "call": "build_oto_env",
+    "kwargs": {
+     "agent_name": "char-agent",
+     "available_scopes": [
+      "user",
+      "agent"
+     ],
+     "default_scope": "agent",
+     "force_config": false,
+     "memory_agent_enabled": true,
+     "memory_user_enabled": true,
+     "platform_role": "",
+     "session_id": "<sid>",
+     "task_type": "task",
+     "user_role": "manager",
+     "user_sub": "",
+     "username": ""
+    }
+   },
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "ensure_persistent_agent_dir",
+    "kwargs": {
+     "execution_path": "claude-code-cli",
+     "scope": "agent",
+     "username": ""
+    }
+   },
+   {
+    "args": [
+     "claude-code-cli",
+     null
+    ],
+    "call": "resolve_subscription_env",
+    "kwargs": {
+     "agent_info": "char-agent",
+     "model": "",
+     "sticky_scope": "local:/char/.claude"
+    }
+   }
+  ],
+  "config": [
+   {
+    "agent_name": "char-agent",
+    "credential_env": {
+     "CHAR_FILES_DIR": "/workspace/files",
+     "MCP_CRED": "1",
+     "OTO_STUB": "1",
+     "PROXY_API_KEY": "<session-token>"
+    },
+    "execution_path": "claude-code-cli",
+    "extra_env": {
+     "SUB_ENV": "1"
+    },
+    "multi_value_envs": {
+     "OTO_STUB_ROOTS": ":"
+    },
+    "permission_mode": "auto",
+    "resume": true,
+    "sandbox_host_claude_dir": "/char/.claude",
+    "security_context": {
+     "agent": "char-agent",
+     "config_visible": false,
+     "is_admin_agent": false,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "manager",
+     "session_scope": "agent",
+     "tool_limits": [
+      [
+       "agent-config-mcp",
+       [
+        "reload_session",
+        "switch_account"
+       ]
+      ]
+     ],
+     "username": ""
+    },
+    "subscription_id": "sub-char",
+    "subscription_user_sub": "",
+    "system_prompt": "PROMPT\n\nPERMISSIONS",
+    "token_minted_at": "<now>"
+   }
+  ],
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    ""
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ],
+   [
+    "send_message",
+    "<sid>",
+    "WAKE"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "manager",
+    "user_sub": null
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "an admin-paired machine": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "m-admin"
+   }
+  ],
+  "answer": "",
+  "asked": [
+   {
+    "args": [
+     "char-agent",
+     "user-viewer"
+    ],
+    "call": "build_session_mcp_config",
+    "kwargs": {
+     "chat_id": "c-admin",
+     "delegation_targets": [
+      "char-agent"
+     ],
+     "mcp_config_format": "json",
+     "placement": {
+      "kind": "admin_remote",
+      "label": "M-ADMIN",
+      "machine_id": "m-admin"
+     },
+     "session_id": "<sid>",
+     "shared_chat": true,
+     "target_browser": {
+      "owner_sub": "user-admin"
+     },
+     "task_mode": true,
+     "task_scope": "user",
+     "user_role": "editor",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "char-agent",
+     [
+      "char-files",
+      "phone-mcp"
+     ]
+    ],
+    "call": "get_dynamic_contexts",
+    "kwargs": {
+     "delegation_roster": [
+      "char-agent"
+     ],
+     "delegation_targets": [
+      "char-agent"
+     ],
+     "meetings_access": [
+      "char-agent",
+      "char-shared"
+     ],
+     "nouser_reads": false,
+     "placement": {
+      "kind": "admin_remote",
+      "label": "M-ADMIN",
+      "machine_id": "m-admin"
+     },
+     "trigger_payload": null,
+     "user_role": "editor",
+     "user_sub": "user-viewer"
+    }
+   },
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "build_agent_prompt",
+    "kwargs": {
+     "client_type": "task",
+     "dynamic_contexts": null,
+     "excluded_mcps": null,
+     "execution_path": "claude-code-cli",
+     "mount_shared": true,
+     "placement": {
+      "kind": "admin_remote",
+      "label": "M-ADMIN",
+      "machine_id": "m-admin"
+     },
+     "role": "editor",
+     "session_id": "<sid>",
+     "shared_chat": true,
+     "tool_limits": null,
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     {
+      "agent": "char-agent",
+      "config_visible": false,
+      "is_admin_agent": false,
+      "placement": {
+       "kind": "admin_remote",
+       "label": "M-ADMIN",
+       "machine_id": "m-admin"
+      },
+      "role": "editor",
+      "tool_limits": [
+       [
+        "agent-config-mcp",
+        [
+         "reload_session",
+         "switch_account"
+        ]
+       ]
+      ],
+      "username": "vic"
+     }
+    ],
+    "call": "build_permission_context",
+    "kwargs": {
+     "assigned_mcp_names": [
+      "char-files",
+      "phone-mcp"
+     ],
+     "execution_path": "claude-code-cli"
+    }
+   },
+   {
+    "args": [],
+    "call": "build_oto_env",
+    "kwargs": {
+     "agent_name": "char-agent",
+     "available_scopes": [
+      "user",
+      "agent"
+     ],
+     "default_scope": "user",
+     "force_config": false,
+     "memory_agent_enabled": true,
+     "memory_user_enabled": true,
+     "platform_role": "member",
+     "session_id": "<sid>",
+     "task_type": "task",
+     "user_role": "editor",
+     "user_sub": "user-viewer",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "ensure_persistent_agent_dir",
+    "kwargs": {
+     "execution_path": "claude-code-cli",
+     "scope": "user",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "claude-code-cli",
+     "user-viewer"
+    ],
+    "call": "resolve_subscription_env",
+    "kwargs": {
+     "agent_info": "char-agent",
+     "model": "",
+     "sticky_scope": "m-admin:/char/.claude"
+    }
+   }
+  ],
+  "config": [
+   {
+    "agent_name": "char-agent",
+    "credential_env": {
+     "CHAR_FILES_DIR": "/users/vic/workspace/files",
+     "MCP_CRED": "1",
+     "OTO_STUB": "1",
+     "PROXY_API_KEY": "<session-token>"
+    },
+    "execution_path": "claude-code-cli",
+    "execution_target": "m-admin",
+    "extra_env": {
+     "SUB_ENV": "1"
+    },
+    "multi_value_envs": {
+     "OTO_STUB_ROOTS": ":"
+    },
+    "permission_mode": "auto",
+    "resume": true,
+    "sandbox_host_claude_dir": "/char/.claude",
+    "security_context": {
+     "agent": "char-agent",
+     "config_visible": false,
+     "is_admin_agent": false,
+     "placement": {
+      "kind": "admin_remote",
+      "label": "M-ADMIN",
+      "machine_id": "m-admin"
+     },
+     "role": "editor",
+     "tool_limits": [
+      [
+       "agent-config-mcp",
+       [
+        "reload_session",
+        "switch_account"
+       ]
+      ]
+     ],
+     "username": "vic"
+    },
+    "subscription_id": "sub-char",
+    "subscription_user_sub": "user-viewer",
+    "system_prompt": "PROMPT\n\nPERMISSIONS",
+    "token_minted_at": "<now>",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ],
+   [
+    "send_message",
+    "<sid>",
+    "WAKE"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "m-admin",
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "the person's own machine": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<sid>",
+    "superseded": false,
+    "target": "m-vic"
+   }
+  ],
+  "answer": "",
+  "asked": [
+   {
+    "args": [
+     "char-agent",
+     "user-viewer"
+    ],
+    "call": "build_session_mcp_config",
+    "kwargs": {
+     "chat_id": "c-vic",
+     "delegation_targets": [
+      "char-agent"
+     ],
+     "mcp_config_format": "json",
+     "placement": {
+      "kind": "user_remote",
+      "label": "M-VIC",
+      "machine_id": "m-vic"
+     },
+     "session_id": "<sid>",
+     "shared_chat": true,
+     "target_browser": {
+      "owner_sub": "user-viewer"
+     },
+     "task_mode": true,
+     "task_scope": "user",
+     "user_role": "editor",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "char-agent",
+     [
+      "char-files",
+      "phone-mcp"
+     ]
+    ],
+    "call": "get_dynamic_contexts",
+    "kwargs": {
+     "delegation_roster": [
+      "char-agent"
+     ],
+     "delegation_targets": [
+      "char-agent"
+     ],
+     "meetings_access": [
+      "char-agent",
+      "char-shared"
+     ],
+     "nouser_reads": false,
+     "placement": {
+      "kind": "user_remote",
+      "label": "M-VIC",
+      "machine_id": "m-vic"
+     },
+     "trigger_payload": null,
+     "user_role": "editor",
+     "user_sub": "user-viewer"
+    }
+   },
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "build_agent_prompt",
+    "kwargs": {
+     "client_type": "task",
+     "dynamic_contexts": null,
+     "excluded_mcps": null,
+     "execution_path": "claude-code-cli",
+     "mount_shared": true,
+     "placement": {
+      "kind": "user_remote",
+      "label": "M-VIC",
+      "machine_id": "m-vic"
+     },
+     "role": "editor",
+     "session_id": "<sid>",
+     "shared_chat": true,
+     "tool_limits": null,
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     {
+      "agent": "char-agent",
+      "config_visible": false,
+      "is_admin_agent": false,
+      "placement": {
+       "kind": "user_remote",
+       "label": "M-VIC",
+       "machine_id": "m-vic"
+      },
+      "role": "editor",
+      "tool_limits": [
+       [
+        "agent-config-mcp",
+        [
+         "reload_session",
+         "switch_account"
+        ]
+       ]
+      ],
+      "username": "vic"
+     }
+    ],
+    "call": "build_permission_context",
+    "kwargs": {
+     "assigned_mcp_names": [
+      "char-files",
+      "phone-mcp"
+     ],
+     "execution_path": "claude-code-cli"
+    }
+   },
+   {
+    "args": [],
+    "call": "build_oto_env",
+    "kwargs": {
+     "agent_name": "char-agent",
+     "available_scopes": [
+      "user",
+      "agent"
+     ],
+     "default_scope": "user",
+     "force_config": false,
+     "memory_agent_enabled": true,
+     "memory_user_enabled": true,
+     "platform_role": "member",
+     "session_id": "<sid>",
+     "task_type": "task",
+     "user_role": "editor",
+     "user_sub": "user-viewer",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "ensure_persistent_agent_dir",
+    "kwargs": {
+     "execution_path": "claude-code-cli",
+     "scope": "user",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "claude-code-cli",
+     "user-viewer"
+    ],
+    "call": "resolve_subscription_env",
+    "kwargs": {
+     "agent_info": "char-agent",
+     "model": "",
+     "sticky_scope": "m-vic:/char/.claude"
+    }
+   }
+  ],
+  "config": [
+   {
+    "agent_name": "char-agent",
+    "credential_env": {
+     "CHAR_FILES_DIR": "/users/vic/workspace/files",
+     "MCP_CRED": "1",
+     "OTO_STUB": "1",
+     "PROXY_API_KEY": "<session-token>"
+    },
+    "execution_path": "claude-code-cli",
+    "execution_target": "m-vic",
+    "extra_env": {
+     "SUB_ENV": "1"
+    },
+    "multi_value_envs": {
+     "OTO_STUB_ROOTS": ":"
+    },
+    "permission_mode": "auto",
+    "resume": true,
+    "sandbox_host_claude_dir": "/char/.claude",
+    "security_context": {
+     "agent": "char-agent",
+     "config_visible": false,
+     "is_admin_agent": false,
+     "placement": {
+      "kind": "user_remote",
+      "label": "M-VIC",
+      "machine_id": "m-vic"
+     },
+     "role": "editor",
+     "tool_limits": [
+      [
+       "agent-config-mcp",
+       [
+        "reload_session",
+        "switch_account"
+       ]
+      ]
+     ],
+     "username": "vic"
+    },
+    "subscription_id": "sub-char",
+    "subscription_user_sub": "user-viewer",
+    "system_prompt": "PROMPT\n\nPERMISSIONS",
+    "token_minted_at": "<now>",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "frames": [],
+  "layer": [
+   [
+    "can_resume_session",
+    "<sid>",
+    "char-agent",
+    "vic"
+   ],
+   [
+    "start_session",
+    "<sid>"
+   ],
+   [
+    "send_message",
+    "<sid>",
+    "WAKE"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "m-vic",
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ },
+ "the resume after the agent's own move": {
+  "admission": [
+   {
+    "path": "claude-code-cli",
+    "session": "<uuid>",
+    "superseded": false,
+    "target": "compute-0123456789ab"
+   }
+  ],
+  "answer": "",
+  "asked": [
+   {
+    "args": [
+     "char-agent",
+     "user-viewer"
+    ],
+    "call": "build_session_mcp_config",
+    "kwargs": {
+     "chat_id": "c-moved",
+     "delegation_targets": [
+      "char-agent"
+     ],
+     "mcp_config_format": "json",
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "session_id": "<uuid>",
+     "shared_chat": true,
+     "target_browser": {},
+     "task_mode": false,
+     "task_scope": "user",
+     "user_role": "editor",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "char-agent",
+     [
+      "char-files",
+      "phone-mcp"
+     ]
+    ],
+    "call": "get_dynamic_contexts",
+    "kwargs": {
+     "delegation_roster": [
+      "char-agent"
+     ],
+     "delegation_targets": [
+      "char-agent"
+     ],
+     "meetings_access": [
+      "char-agent",
+      "char-shared"
+     ],
+     "nouser_reads": false,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "trigger_payload": null,
+     "user_role": "editor",
+     "user_sub": "user-viewer"
+    }
+   },
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "build_agent_prompt",
+    "kwargs": {
+     "client_type": "dashboard",
+     "dynamic_contexts": null,
+     "excluded_mcps": null,
+     "execution_path": "claude-code-cli",
+     "mount_shared": true,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "session_id": "<uuid>",
+     "shared_chat": true,
+     "tool_limits": null,
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     {
+      "agent": "char-agent",
+      "config_visible": false,
+      "is_admin_agent": false,
+      "placement": {
+       "kind": "compute",
+       "label": "Compute",
+       "machine_id": "compute-0123456789ab"
+      },
+      "role": "editor",
+      "username": "vic"
+     }
+    ],
+    "call": "build_permission_context",
+    "kwargs": {
+     "assigned_mcp_names": [
+      "char-files",
+      "phone-mcp"
+     ],
+     "execution_path": "claude-code-cli"
+    }
+   },
+   {
+    "args": [],
+    "call": "build_oto_env",
+    "kwargs": {
+     "agent_name": "char-agent",
+     "available_scopes": [
+      "user",
+      "agent"
+     ],
+     "default_scope": "user",
+     "force_config": false,
+     "memory_agent_enabled": true,
+     "memory_user_enabled": true,
+     "platform_role": "member",
+     "session_id": "<uuid>",
+     "task_type": "",
+     "user_role": "editor",
+     "user_sub": "user-viewer",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "char-agent"
+    ],
+    "call": "ensure_persistent_agent_dir",
+    "kwargs": {
+     "execution_path": "claude-code-cli",
+     "scope": "user",
+     "username": "vic"
+    }
+   },
+   {
+    "args": [
+     "claude-code-cli",
+     "user-viewer"
+    ],
+    "call": "resolve_subscription_env",
+    "kwargs": {
+     "agent_info": "char-agent",
+     "model": "",
+     "sticky_scope": "local:/char/.claude"
+    }
+   }
+  ],
+  "config": [
+   {
+    "agent_name": "char-agent",
+    "client_type": "dashboard",
+    "credential_env": {
+     "CHAR_FILES_DIR": "/users/vic/workspace/files",
+     "MCP_CRED": "1",
+     "OTO_STUB": "1",
+     "PROXY_API_KEY": "<session-token>"
+    },
+    "execution_path": "claude-code-cli",
+    "extra_env": {
+     "SUB_ENV": "1"
+    },
+    "multi_value_envs": {
+     "OTO_STUB_ROOTS": ":"
+    },
+    "permission_mode": "default",
+    "sandbox_host_claude_dir": "/char/.claude",
+    "security_context": {
+     "agent": "char-agent",
+     "config_visible": false,
+     "is_admin_agent": false,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
+     "role": "editor",
+     "username": "vic"
+    },
+    "subscription_id": "sub-char",
+    "subscription_user_sub": "user-viewer",
+    "system_prompt": "PROMPT\n\nPERMISSIONS",
+    "token_minted_at": "<now>",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "frames": [],
+  "layer": [
+   [
+    "start_session",
+    "<uuid>"
+   ],
+   [
+    "send_message",
+    "<uuid>",
+    "WAKE"
+   ]
+  ],
+  "layers_asked": [
+   {
+    "agent": "char-agent",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "placement_built": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "editor",
+    "user_sub": "user-viewer"
+   }
+  ],
+  "released": [],
+  "seats": []
+ }
+}

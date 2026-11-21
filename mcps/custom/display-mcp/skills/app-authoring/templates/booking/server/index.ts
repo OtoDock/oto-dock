@@ -1,5 +1,6 @@
 // A booking page with its own customers: Bun + bun:sqlite, the reference
-// server for an app that faces the public through a link. Visitors register
+// server for an app that faces the public through a link and, through the
+// agent, a caller on its phone line (the methods in app.json's exports). Visitors register
 // and log in (the host keeps the login: the session token rides INSIDE the
 // verified claim, never in a header the page sets), pick a slot, and pay
 // through a Stripe Checkout Session the platform signs on the way out, so the
@@ -44,6 +45,12 @@ db.exec(`CREATE TABLE IF NOT EXISTS bookings (
   created_at TEXT NOT NULL,
   paid_at TEXT NOT NULL DEFAULT ''
 )`);
+// A booking a caller made by phone: no account, the caller named by the
+// platform's opaque person id (never a number). Added to a file an older
+// release made, so the column is checked first.
+if (!(db.query("PRAGMA table_info(bookings)").all() as { name: string }[]).some((c) => c.name === "caller")) {
+  db.exec(`ALTER TABLE bookings ADD COLUMN caller TEXT NOT NULL DEFAULT ''`);
+}
 // A handler fire is retried with the SAME delivery id, so remember the ones
 // already done (the app-authoring skill, "Handlers").
 db.exec(`CREATE TABLE IF NOT EXISTS handled (id TEXT PRIMARY KEY, at TEXT NOT NULL)`);
@@ -168,13 +175,17 @@ function taken(): Set<string> {
   return new Set(rows.map((r) => r.starts_at));
 }
 function bookingRow(id: number) {
-  return db.query(`SELECT b.id, b.account_id, b.starts_at, b.status, b.checkout_id, b.created_at, b.paid_at, a.name, a.email
-                   FROM bookings b JOIN accounts a ON a.id = b.account_id WHERE b.id = ?`).get(id) as any;
+  return db.query(`SELECT b.id, b.account_id, b.caller, b.starts_at, b.status, b.checkout_id, b.created_at, b.paid_at, a.name, a.email
+                   FROM bookings b LEFT JOIN accounts a ON a.id = b.account_id WHERE b.id = ?`).get(id) as any;
 }
 function shapeBooking(b: any, owner: boolean) {
   const tz = setting("timezone");
   const out: any = { id: b.id, starts_at: b.starts_at, label: label(b.starts_at, tz), status: b.status, paid_at: b.paid_at, created_at: b.created_at };
-  if (owner) { out.name = b.name; out.email = b.email; }
+  if (owner) {
+    out.name = b.caller ? "A caller" : b.name;
+    out.email = b.caller ? "" : b.email;
+    out.source = b.caller ? "call" : "link";
+  }
   return out;
 }
 
@@ -186,6 +197,7 @@ function shapeBooking(b: any, owner: boolean) {
 type Claim = {
   principal?: string; role?: string; external?: boolean; session?: string; username?: string;
   handler?: string; delivery?: string; purpose?: string; aud?: string; exp?: number;
+  grant?: string; channel?: string; person?: string; ephemeral?: boolean; verified?: boolean;
 };
 const b64url = (s: string) => Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 let appKey: Promise<CryptoKey | null> | null = null;
@@ -202,7 +214,7 @@ function publicKey(): Promise<CryptoKey | null> {
   return appKey;
 }
 // A viewer and a link visitor carry purpose app_viewer. The agent's own
-// sessions and handler wakes carry app_caller. No claim, or one that fails,
+// sessions, a caller's session and handler wakes carry app_caller. No claim, or one that fails,
 // is an empty object: it is no customer and no owner.
 async function claimOf(req: Request): Promise<Claim> {
   const [head, body, sig] = (req.headers.get("x-otodock-viewer") || "").split(".");
@@ -237,12 +249,25 @@ function customerOf(claim: Claim) {
                         WHERE s.token = ? AND s.expires_at > ?`).get(claim.session, new Date().toISOString()) as any;
   return row || null;
 }
-// The owner's view: a person on the dashboard with an editor's role or
-// above (the owner of a personal app is its manager). A link visitor never.
+// A caller on the agent's phone line, whose session the agent's manager let
+// use this app: the methods in app.json's exports reach the server at
+// /api/<method>, with the person an opaque id the platform keeps (never a
+// body field). A link visitor carries a grant and is never a caller.
+function callerOf(claim: Claim, basis: string) {
+  if (basis !== "external" || claim.principal !== "external" || !claim.channel || claim.grant) return null;
+  const person = claim.ephemeral ? "" : String(claim.person || "");
+  return { who: person ? `${claim.channel}:${person}` : "", verified: !!claim.verified };
+}
+// The owner's view: one of the agent's own people on the dashboard with an
+// editor's role or above (the owner of a personal app is its manager). A
+// link visitor never, nor a person the app was only shared with (a grant).
 function isOwner(claim: Claim, basis: string): boolean {
-  if (claim.external || !(basis === "viewer" || basis === "agent")) return false;
+  if (claim.external || claim.grant || !(basis === "viewer" || basis === "agent")) return false;
   return rankOf(claim.role) >= rankOf("editor");
 }
+// A caller holds at most this many bookings still ahead, so a borrowed
+// number cannot fill the week.
+const CALLER_OPEN_MAX = 2;
 
 const SESSION_DAYS = 30;   // keep level with external.session_days in app.json
 function newSession(accountId: number): string {
@@ -381,6 +406,46 @@ Bun.serve({
     const s = settings();
     const service = { service_name: s.service_name, price_cents: Number(s.price_cents), currency: s.currency, slot_minutes: Number(s.slot_minutes), timezone: s.timezone, hold_minutes: Number(s.hold_minutes) };
 
+    // A caller's session, through the agent: the free times, a booking, and
+    // their own bookings. A free service only: a paid one is booked on the
+    // page, where the payment happens.
+    const caller = callerOf(claim, basis);
+    if (url.pathname.startsWith("/api/")) {
+      if (!caller) return json({ error: "These are for a caller the agent is talking to." }, 403);
+      if (url.pathname === "/api/slots") {
+        const busy = taken();
+        const free = schedule().filter((x) => !busy.has(x.starts_at)).slice(0, 20);
+        return json({ service: service.service_name, slots: free.map((x) => ({ starts_at: x.starts_at, day: x.day, time: x.time })) });
+      }
+      if (url.pathname === "/api/book") {
+        if (!caller.who) return json({ error: "This line cannot tell who is calling, so a booking cannot be made by phone." }, 400);
+        if (service.price_cents > 0) return json({ error: "This booking needs a payment, so it is made on the booking page." }, 400);
+        const body = await readBody(req);
+        const at = String(body.starts_at || "");
+        if (!schedule().some((x) => x.starts_at === at)) return json({ error: "That time is not open. Pick another one." }, 400);
+        if (taken().has(at)) return json({ error: "Someone just took that time. Pick another one." }, 409);
+        const open = (db.query("SELECT COUNT(*) AS n FROM bookings WHERE caller = ? AND status IN ('held', 'confirmed') AND starts_at > ?").get(caller.who, new Date().toISOString()) as any).n;
+        if (open >= CALLER_OPEN_MAX) return json({ error: "You already have two bookings ahead, so another one cannot be made by phone." }, 409);
+        const now = new Date().toISOString();
+        const r = db.run("INSERT INTO bookings (account_id, caller, starts_at, status, created_at, paid_at) VALUES (0, ?, ?, 'confirmed', ?, ?)",
+          [caller.who, at, now, now]);
+        const b = bookingRow(Number(r.lastInsertRowid));
+        changed();
+        await notifyOwner("New booking by phone", `A caller booked ${label(b.starts_at, s.timezone)}`);
+        return json({ booked: { starts_at: b.starts_at, label: label(b.starts_at, s.timezone), service: service.service_name } });
+      }
+      if (url.pathname === "/api/mine") {
+        if (!caller.who) return json({ bookings: [], note: "This line cannot tell who is calling, so your bookings cannot be found." });
+        expireHolds();
+        const rows = db.query("SELECT * FROM bookings WHERE caller = ? AND status <> 'cancelled' ORDER BY starts_at").all(caller.who) as any[];
+        // Who is calling rests on the number the line shows: without a PIN,
+        // the count alone.
+        if (!caller.verified) return json({ count: rows.length, note: "The caller was not verified, so only the count is given." });
+        return json({ bookings: rows.map((b) => ({ label: label(b.starts_at, s.timezone), status: b.status, service: service.service_name })) });
+      }
+      return json({ error: "not found" }, 404);
+    }
+
     if (req.method === "GET" && url.pathname === "/me") {
       return json({ me: me ? { name: me.name, email: me.email } : null, owner, link: !!claim.external, service });
     }
@@ -473,7 +538,7 @@ Bun.serve({
       }
       if (req.method === "GET" && url.pathname === "/owner/bookings") {
         expireHolds();
-        const rows = db.query(`SELECT b.*, a.name, a.email FROM bookings b JOIN accounts a ON a.id = b.account_id
+        const rows = db.query(`SELECT b.*, a.name, a.email FROM bookings b LEFT JOIN accounts a ON a.id = b.account_id
                                WHERE b.status <> 'cancelled' OR b.paid_at <> '' ORDER BY b.starts_at`).all() as any[];
         return json({ bookings: rows.map((b) => shapeBooking(b, true)), customers: (db.query("SELECT COUNT(*) AS n FROM accounts").get() as any).n });
       }

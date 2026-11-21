@@ -1,0 +1,134 @@
+{
+ "('custom', 'high')": {
+  "": "",
+  "LOW": "LOW",
+  "high": "high",
+  "low": "high",
+  "max": "high",
+  "medium": "high",
+  "turbo": "turbo",
+  "ultra": "high",
+  "xhigh": "high"
+ },
+ "('custom',)": {
+  "": "",
+  "LOW": "LOW",
+  "high": "custom",
+  "low": "custom",
+  "max": "custom",
+  "medium": "custom",
+  "turbo": "turbo",
+  "ultra": "custom",
+  "xhigh": "custom"
+ },
+ "('high', 'max')": {
+  "": "",
+  "LOW": "LOW",
+  "high": "high",
+  "low": "high",
+  "max": "max",
+  "medium": "high",
+  "turbo": "turbo",
+  "ultra": "max",
+  "xhigh": "high"
+ },
+ "('high',)": {
+  "": "",
+  "LOW": "LOW",
+  "high": "high",
+  "low": "high",
+  "max": "high",
+  "medium": "high",
+  "turbo": "turbo",
+  "ultra": "high",
+  "xhigh": "high"
+ },
+ "('low', 'medium', 'high')": {
+  "": "",
+  "LOW": "LOW",
+  "high": "high",
+  "low": "low",
+  "max": "high",
+  "medium": "medium",
+  "turbo": "turbo",
+  "ultra": "high",
+  "xhigh": "high"
+ },
+ "('low', 'medium', 'high', 'xhigh')": {
+  "": "",
+  "LOW": "LOW",
+  "high": "high",
+  "low": "low",
+  "max": "xhigh",
+  "medium": "medium",
+  "turbo": "turbo",
+  "ultra": "xhigh",
+  "xhigh": "xhigh"
+ },
+ "('low',)": {
+  "": "",
+  "LOW": "LOW",
+  "high": "low",
+  "low": "low",
+  "max": "low",
+  "medium": "low",
+  "turbo": "turbo",
+  "ultra": "low",
+  "xhigh": "low"
+ },
+ "('max', 'ultra')": {
+  "": "",
+  "LOW": "LOW",
+  "high": "max",
+  "low": "max",
+  "max": "max",
+  "medium": "max",
+  "turbo": "turbo",
+  "ultra": "ultra",
+  "xhigh": "max"
+ },
+ "('medium', 'high')": {
+  "": "",
+  "LOW": "LOW",
+  "high": "high",
+  "low": "medium",
+  "max": "high",
+  "medium": "medium",
+  "turbo": "turbo",
+  "ultra": "high",
+  "xhigh": "high"
+ },
+ "('ultra',)": {
+  "": "",
+  "LOW": "LOW",
+  "high": "ultra",
+  "low": "ultra",
+  "max": "ultra",
+  "medium": "ultra",
+  "turbo": "turbo",
+  "ultra": "ultra",
+  "xhigh": "ultra"
+ },
+ "()": {
+  "": "",
+  "LOW": "LOW",
+  "high": "high",
+  "low": "low",
+  "max": "max",
+  "medium": "medium",
+  "turbo": "turbo",
+  "ultra": "ultra",
+  "xhigh": "xhigh"
+ },
+ "['low', 'high']": {
+  "": "",
+  "LOW": "LOW",
+  "high": "high",
+  "low": "low",
+  "max": "high",
+  "medium": "low",
+  "turbo": "turbo",
+  "ultra": "high",
+  "xhigh": "high"
+ }
+}

@@ -17,7 +17,7 @@ if str(PROXY_DIR) not in sys.path:
 import config
 from auth.session_token import SESSION_JWT_SENTINEL_BEARER
 from core.credentials.mcp_gateway import GatewayCredential, TokenRef
-from services.mcp import mcp_registry
+from services.mcp import mcp_registry, mcp_server_resolve
 from services.mcp.mcp_manifest_types import (
     CredentialConfig,
     McpManifest,
@@ -66,7 +66,7 @@ def test_a_bearer_entry_becomes_the_gateway_route_with_the_token_sentinel(monkey
     bearer_allowlist.add_allowed(key, "mcp.example.com", "test")
     m = _manifest("vendor", oauth={"provider_id": key, "bearer_required": True,
                                    "proposed_hosts": ["mcp.example.com"]})
-    monkeypatch.setattr(mcp_registry, "_gateway_bearer_source",
+    monkeypatch.setattr(mcp_server_resolve, "_gateway_bearer_source",
                         lambda *a, **k: (TokenRef(str(tmp_path), "acct", ""), None))
     entry = {"type": "http", "url": "https://mcp.example.com/mcp"}
     cred, reason = _call(entry, m)
@@ -115,7 +115,7 @@ def test_an_unapproved_host_leaves_the_mcp_out_naming_the_security_tab(monkeypat
     m = _manifest("vendor", url_template="https://attacker.example.com/mcp",
                   oauth={"provider_id": key, "bearer_required": True,
                          "proposed_hosts": ["attacker.example.com"]})
-    monkeypatch.setattr(mcp_registry, "_gateway_bearer_source",
+    monkeypatch.setattr(mcp_server_resolve, "_gateway_bearer_source",
                         lambda *a, **k: (TokenRef(str(tmp_path), "acct", ""), None))
     entry = {"type": "http", "url": "https://attacker.example.com/mcp"}
     with caplog.at_level("WARNING"):
@@ -129,7 +129,7 @@ def test_a_dead_account_leaves_the_mcp_out_with_the_reconnect_wording(monkeypatc
     bearer_allowlist.add_allowed(key, "mcp.example.com", "test")
     m = _manifest("vendor", oauth={"provider_id": key, "bearer_required": True,
                                    "proposed_hosts": ["mcp.example.com"]})
-    monkeypatch.setattr(mcp_registry, "_gateway_bearer_source",
+    monkeypatch.setattr(mcp_server_resolve, "_gateway_bearer_source",
                         lambda *a, **k: (None, "Vendor: the vendor ended the account's grant; reconnect it"))
     entry = {"type": "http", "url": "https://mcp.example.com/mcp"}
     cred, reason = _call(entry, m)
@@ -141,7 +141,7 @@ def test_a_sidecar_is_judged_under_localhost_and_marked_proxy_local(monkeypatch,
     bearer_allowlist.add_allowed(key, "localhost", "test")
     m = _manifest("github-mcp", runtime="docker", url_template="http://localhost:8935/mcp",
                   oauth={"provider_id": key, "bearer_required": True, "proposed_hosts": ["localhost"]})
-    monkeypatch.setattr(mcp_registry, "_gateway_bearer_source",
+    monkeypatch.setattr(mcp_server_resolve, "_gateway_bearer_source",
                         lambda *a, **k: (TokenRef(str(tmp_path), "acct", ""), None))
     entry = {"type": "http", "url": "http://localhost:8935/mcp"}
     cred, reason = _call(entry, m)
@@ -155,7 +155,7 @@ def test_a_hosted_mcp_naming_a_loopback_host_is_refused(monkeypatch, tmp_path):
     bearer_allowlist.add_allowed(key, "localhost", "test")
     m = _manifest("sneaky", url_template="http://localhost:5432/mcp",
                   oauth={"provider_id": key, "bearer_required": True, "proposed_hosts": ["localhost"]})
-    monkeypatch.setattr(mcp_registry, "_gateway_bearer_source",
+    monkeypatch.setattr(mcp_server_resolve, "_gateway_bearer_source",
                         lambda *a, **k: (TokenRef(str(tmp_path), "acct", ""), None))
     entry = {"type": "http", "url": "http://localhost:5432/mcp"}
     cred, reason = _call(entry, m)
@@ -181,17 +181,17 @@ def test_the_bearer_source_resolves_user_and_service_scope(monkeypatch, tmp_path
                         lambda username, *, provider_id: tmp_path)
     (tmp_path / "acct.json").write_text(json.dumps({"access_token": "at", "expires_at": "",
                                                     "extra": {"preferred_bearer": "bot"}}))
-    ref, reason = mcp_registry._gateway_bearer_source(m, "u-1", "agent", "user")
+    ref, reason = mcp_server_resolve._gateway_bearer_source(m, "u-1", "agent", "user")
     assert reason is None and ref == TokenRef(str(tmp_path), "acct", "bot")
     assert picks["user_sub"] == "u-1"
-    ref, reason = mcp_registry._gateway_bearer_source(m, "u-1", "agent", "agent")
+    ref, reason = mcp_server_resolve._gateway_bearer_source(m, "u-1", "agent", "agent")
     assert reason is None and picks["user_sub"] == ""
     (tmp_path / "acct.json").write_text(json.dumps({"access_token": "at", "expires_at": "",
                                                     "extra": {"refresh_failed": "invalid_grant"}}))
-    ref, reason = mcp_registry._gateway_bearer_source(m, "u-1", "agent", "user")
+    ref, reason = mcp_server_resolve._gateway_bearer_source(m, "u-1", "agent", "user")
     assert ref is None and "reconnect" in reason
     monkeypatch.setattr(credential_resolver, "pick_account", lambda *a, **k: None)
-    ref, reason = mcp_registry._gateway_bearer_source(m, "u-1", "agent", "user")
+    ref, reason = mcp_server_resolve._gateway_bearer_source(m, "u-1", "agent", "user")
     assert ref is None and "no account" in reason
 
 
@@ -200,7 +200,7 @@ def test_the_bearer_source_resolves_user_and_service_scope(monkeypatch, tmp_path
 # ---------------------------------------------------------------------------
 
 
-def test_the_claude_sandbox_copy_is_per_session_and_keeps_the_sentinel(tmp_path):
+def test_the_claude_sandbox_copy_is_per_session_and_keeps_the_sentinel(tmp_path, monkeypatch):
     from core.credentials import mcp_broker
     from core.sandbox.session_config_dir import prepare_mcp_config_for_sandbox
     cfg = {"mcpServers": {
@@ -210,8 +210,9 @@ def test_the_claude_sandbox_copy_is_per_session_and_keeps_the_sentinel(tmp_path)
     }}
     src = tmp_path / "agent-abc123.json"
     src.write_text(json.dumps(cfg))
-    host_dir = tmp_path / ".claude"
-    host_dir.mkdir()
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+    host_dir = tmp_path / "agents" / "agent-x" / "users" / "alice" / ".claude"
+    host_dir.mkdir(parents=True)
     # a copy an earlier release left under the shared name, with a secret inline
     (host_dir / "agent-abc123.json").write_text('{"mcpServers": {"v": {"headers": {"Authorization": "Bearer xoxb-old"}}}}')
     bundles = {
@@ -221,7 +222,7 @@ def test_the_claude_sandbox_copy_is_per_session_and_keeps_the_sentinel(tmp_path)
     }
     out = prepare_mcp_config_for_sandbox(
         src, host_dir, sandbox_config_dir="/users/alice/.claude",
-        session_id="sess-1234567890ab", secret_bundles=bundles,
+        session_id="sess-1234567890ab", secret_bundles=bundles, agent_name="agent-x",
     )
     assert out == "/users/alice/.claude/agent-abc123-sess-1234567.json"
     assert not (host_dir / "agent-abc123.json").exists()
@@ -236,14 +237,17 @@ def test_the_claude_sandbox_copy_is_per_session_and_keeps_the_sentinel(tmp_path)
     assert mcp_broker.verify_token(tool["env"]["OTO_MCP_FETCH_TOKEN"]) == ("sess-1234567890ab", "tool")
 
 
-def test_two_sessions_of_one_person_get_two_copies(tmp_path):
+def test_two_sessions_of_one_person_get_two_copies(tmp_path, monkeypatch):
     from core.sandbox.session_config_dir import prepare_mcp_config_for_sandbox
     src = tmp_path / "agent-abc123.json"
     src.write_text(json.dumps({"mcpServers": {}}))
-    host_dir = tmp_path / ".claude"
-    host_dir.mkdir()
-    a = prepare_mcp_config_for_sandbox(src, host_dir, sandbox_config_dir="/u/.claude", session_id="aaaa")
-    b = prepare_mcp_config_for_sandbox(src, host_dir, sandbox_config_dir="/u/.claude", session_id="bbbb")
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+    host_dir = tmp_path / "agents" / "agent-x" / "users" / "alice" / ".claude"
+    host_dir.mkdir(parents=True)
+    a = prepare_mcp_config_for_sandbox(src, host_dir, sandbox_config_dir="/u/.claude", session_id="aaaa",
+                                       agent_name="agent-x")
+    b = prepare_mcp_config_for_sandbox(src, host_dir, sandbox_config_dir="/u/.claude", session_id="bbbb",
+                                       agent_name="agent-x")
     assert a != b and (host_dir / "agent-abc123-aaaa.json").exists() and (host_dir / "agent-abc123-bbbb.json").exists()
 
 
@@ -301,5 +305,61 @@ def test_the_direct_layer_forwards_the_swapped_session_token(monkeypatch):
     monkeypatch.setattr("core.layers.direct.mcp.ClientSession", lambda *a, **k: _Sess())
     asyncio.run(conn._start_remote())
     auth = captured["headers"]["Authorization"]
-    assert auth.startswith("Bearer eyJ") and SESSION_JWT_SENTINEL_BEARER not in auth
+    assert auth.startswith("Bearer ") and SESSION_JWT_SENTINEL_BEARER not in auth
+    # The session's own kind, which the gateway route takes; never the callbacks'.
+    from auth.session_token import validate_callback_token, validate_session_token
+    token = auth.removeprefix("Bearer ")
+    assert validate_session_token(token)["sid"] == "dir-s1" and validate_callback_token(token) is None
     assert "/v1/mcp-gateway/vendor/mcp" in captured["url"]
+
+
+def test_a_docker_tool_with_no_credential_becomes_the_gateway_route_of_its_door(monkeypatch):
+    from auth.session_token import CALLBACK_JWT_SENTINEL_BEARER
+    from core.config import deployment
+    from core.credentials.mcp_gateway import CONTAINER
+    monkeypatch.setattr(deployment, "is_proxy_local_mcp_host", lambda host, manifest: host == "localhost")
+    m = _manifest("video-tools", transport="http", url_template="http://localhost:8933", runtime="docker",
+                  cred_type="none")
+    m.server.proxy_callbacks = True
+    entry = {"type": "http", "url": "http://localhost:8933/mcp/",
+             "headers": {"Authorization": CALLBACK_JWT_SENTINEL_BEARER}}
+    cred, reason = _call(entry, m)
+    assert reason is None
+    assert entry["url"] == f"http://127.0.0.1:{config.PORT}/v1/mcp-gateway/video-tools/mcp/"
+    # The callback token is the door's to add per request, never the config's.
+    assert entry["headers"]["Authorization"] == SESSION_JWT_SENTINEL_BEARER
+    assert cred.kind == CONTAINER and cred.callbacks is True and cred.proxy_local is True
+    assert cred.upstream == "http://localhost:8933" and cred.path == "/mcp/" and cred.value == ""
+    again = GatewayCredential.from_descriptor(cred.descriptor())
+    assert (again.kind, again.callbacks) == (CONTAINER, True)
+
+
+def test_a_vendor_http_tool_with_no_credential_is_still_untouched(monkeypatch):
+    from core.config import deployment
+    monkeypatch.setattr(deployment, "is_proxy_local_mcp_host", lambda host, manifest: False)
+    m = _manifest("vendor-open", transport="http", url_template="https://mcp.example.com", cred_type="none")
+    entry = {"type": "http", "url": "https://mcp.example.com/mcp/"}
+    assert _call(entry, m) == (None, None)
+    assert entry["url"] == "https://mcp.example.com/mcp/"
+
+
+def test_codex_gives_a_docker_tools_entry_the_doors_two_budgets(monkeypatch):
+    from services.mcp import mcp_session_config
+    m = _manifest("video-tools", transport="http", url_template="http://localhost:8933", runtime="docker",
+                  cred_type="none")
+    from services.mcp import mcp_manifest_store
+    monkeypatch.setattr(mcp_manifest_store, "get_manifest_by_config_key",
+                        lambda key: m if key == "video-tools" else None)
+    gateway_url = f"http://127.0.0.1:{config.PORT}/v1/mcp-gateway/video-tools/mcp/"
+    toml = mcp_session_config._servers_to_toml({
+        "video-tools": {"type": "streamable-http", "url": gateway_url},
+        "vendor": {"type": "streamable-http", "url": "https://mcp.example.com/mcp/"},
+    })
+    door_part, vendor_part = toml.split("[mcp_servers.vendor]")
+    assert "startup_timeout_sec = 30" in door_part and "tool_timeout_sec = 120" in door_part
+    assert "startup_timeout_sec = 10" in vendor_part and "tool_timeout_sec" not in vendor_part
+    # The wake's budget is the door's own, read where it is set.
+    from services.containers import door
+    monkeypatch.setattr(door, "WAKE_BUDGET_S", 45.0)
+    toml = mcp_session_config._servers_to_toml({"video-tools": {"type": "streamable-http", "url": gateway_url}})
+    assert "tool_timeout_sec = 105" in toml

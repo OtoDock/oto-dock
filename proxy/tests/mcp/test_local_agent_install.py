@@ -280,6 +280,30 @@ class TestSnapshotGuards:
             import shutil
             shutil.rmtree(dest, ignore_errors=True)
 
+    def test_a_folder_above_the_template_swapped_after_its_check_is_refused(self, tmp_path, monkeypatch):
+        """The walk's top is the folder that was authorized, reached beneath
+        the agent's real folder with no link followed: a folder above it
+        replaced by a link after the check is refused, never walked."""
+        import os
+
+        import pytest
+        from fastapi import HTTPException
+
+        import config as app_config
+        from api.mcp import local_templates as lt
+        agents = tmp_path / "agents"
+        src = agents / "pa" / "workspace" / "tpl"
+        (src / "context").mkdir(parents=True)
+        (src / "context" / "notes.md").write_text("ok")
+        monkeypatch.setattr(app_config, "AGENTS_DIR", agents)
+        elsewhere = tmp_path / "elsewhere"
+        (elsewhere / "tpl" / "context").mkdir(parents=True)
+        (elsewhere / "tpl" / "context" / "notes.md").write_text("SECRET")
+        os.rename(agents / "pa" / "workspace", tmp_path / "aside")
+        os.symlink(elsewhere, agents / "pa" / "workspace")
+        with pytest.raises(HTTPException):
+            lt._snapshot_template_dir(src, agent="pa")
+
     def test_oversized_file_is_rejected(self, tmp_path, monkeypatch, temp_db):
         app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
         d = _write_template(_agent_root(agents_dir))
@@ -417,6 +441,83 @@ class TestValidate:
         assert any(e.startswith("apps/issues: client/index.html:") and "nope" in e for e in body["errors"]), body
         assert not any("not available to this agent" in e for e in body["errors"]), body
 
+    def _validate_board(self, tmp_path, monkeypatch, actions, blueprint):
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        board = {"title": "Board", "actions": actions}
+        if blueprint is not None:
+            board["_files"] = {"blueprint.json": json.dumps(blueprint)}
+        _write_template(_agent_root(agents_dir), apps={"board": board})
+        return TestClient(app).post(
+            "/v1/agents/local-template/validate",
+            json={"path": "/users/alice/workspace/demo-template"},
+        ).json()
+
+    def test_a_blueprint_button_passes(self, tmp_path, monkeypatch, temp_db):
+        body = self._validate_board(
+            tmp_path, monkeypatch,
+            [{"id": "check-now", "label": "Check now", "type": "fire_task", "task": "check-now"}],
+            {"tasks": [{"slug": "check-now", "prompt": "Check it."}]},
+        )
+        assert body["ok"] is True, body
+
+    def test_a_slug_the_blueprint_lacks_is_refused(self, tmp_path, monkeypatch, temp_db):
+        body = self._validate_board(
+            tmp_path, monkeypatch,
+            [{"id": "go", "label": "Go", "type": "fire_task", "task": "nope"}],
+            {"tasks": [{"slug": "check-now", "prompt": "Check it."}]},
+        )
+        assert body["ok"] is False
+        assert any("action 'go' names a task its blueprint.json does not have" in e
+                   for e in body["errors"]), body
+
+    def test_a_button_with_no_blueprint_at_all_is_refused(self, tmp_path, monkeypatch, temp_db):
+        body = self._validate_board(
+            tmp_path, monkeypatch,
+            [{"id": "go", "label": "Go", "type": "fire_task", "task": "brief"}], None,
+        )
+        assert body["ok"] is False
+        assert any("names a task its blueprint.json does not have" in e for e in body["errors"]), body
+
+    def test_a_real_error_after_the_button_is_still_reported(self, tmp_path, monkeypatch, temp_db):
+        body = self._validate_board(
+            tmp_path, monkeypatch,
+            [{"id": "go", "label": "Go", "type": "fire_task", "task": "check-now"},
+             {"id": "bad action", "label": "Oops", "type": "fire_task", "task": "check-now"}],
+            {"tasks": [{"slug": "check-now", "prompt": "Check it."}]},
+        )
+        assert body["ok"] is False
+        assert any("invalid action id" in e for e in body["errors"]), body
+
+    def test_a_blueprint_button_is_still_held_to_the_other_rules(self, tmp_path, monkeypatch, temp_db):
+        body = self._validate_board(
+            tmp_path, monkeypatch,
+            [{"id": "go", "label": "Go", "type": "fire_task", "task": "check-now", "min_role": "admin"}],
+            {"tasks": [{"slug": "check-now", "prompt": "Check it."}]},
+        )
+        assert body["ok"] is False
+        assert any("min_role" in e for e in body["errors"]), body
+
+    def test_a_task_id_in_a_template_is_refused(self, tmp_path, monkeypatch, temp_db):
+        body = self._validate_board(
+            tmp_path, monkeypatch,
+            [{"id": "go", "label": "Go", "type": "fire_task", "task_id": "task-1"}],
+            {"tasks": [{"slug": "check-now", "prompt": "Check it."}]},
+        )
+        assert body["ok"] is False
+        assert any("never task_id" in e for e in body["errors"]), body
+
+    def test_the_prep_templates_with_apps_validate_clean(self, temp_db):
+        from api.mcp.local_templates import _validate_apps
+        from services.community.community_agent_template_store import (
+            load_template_from_dir,
+        )
+        prep = Path.home() / "otodock" / "otodock-community-agents-prep"
+        folders = sorted(p.parent for p in prep.glob("*/apps")) if prep.is_dir() else []
+        if not folders:
+            pytest.skip("the prep catalog is not checked out beside this repo")
+        for folder in folders:
+            assert _validate_apps(load_template_from_dir(folder)) == [], folder.name
+
     def test_checks_and_apps_are_reported_as_seeds(self, tmp_path, monkeypatch, temp_db):
         app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
         _write_template(
@@ -533,7 +634,7 @@ class TestInstall:
         no boot backfill — so it must happen here."""
         from types import SimpleNamespace
 
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_store
 
         def _stub(category, assignment_mode, skills=()):
             return SimpleNamespace(
@@ -541,7 +642,7 @@ class TestInstall:
                 skills=list(skills), path_env={},
             )
 
-        monkeypatch.setattr(mcp_registry, "_manifests", {
+        monkeypatch.setattr(mcp_manifest_store, "_manifests", {
             "core-thing": _stub(
                 "core", "auto",
                 [SimpleNamespace(id="core-skill", default_exclude_from=[])],
@@ -570,9 +671,9 @@ class TestInstall:
         opt-out sticks across restarts, which is the whole point."""
         from types import SimpleNamespace
 
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_store
 
-        monkeypatch.setattr(mcp_registry, "_manifests", {
+        monkeypatch.setattr(mcp_manifest_store, "_manifests", {
             "core-thing": SimpleNamespace(
                 category="core", assignment_mode="auto", skills=[], path_env={},
             ),

@@ -1,4 +1,4 @@
-"""One file push in flight (``satellite_file_transfer.push_file``): the run
+"""One file push in flight (``satellite_file_verbs.push_file``): the run
 that holds what the loop's locals held, the frame builder and the ack
 callback as its methods, and the loop's three stages, each answering the
 verdict the loop acts on. ``push_file`` keeps the entry checks, the chunk
@@ -179,9 +179,20 @@ async def _push_reap_answers(run: _PushRun) -> str:
         if ack.get("status") != "ok":
             run.failure = f"the satellite refused it ({ack.get('error') or 'error'})"
             return FAILED
+        last = end >= run.size
+        if (last and run.ref.kind == "agent_tree" and run.frame_fields is None
+                and ("size" not in ack or "mtime_ns" not in ack)):
+            # Every satellite that may connect puts the committed file's stat
+            # on the ok of an agent file it wrote (the keys, an empty file's
+            # size is 0). An ok without them wrote nothing there: a Windows
+            # machine skips a name its filesystem cannot hold. Taken as an ok,
+            # it would make a merge base of a file the machine lacks, and the
+            # next merge would delete the platform's copy as deleted there.
+            run.failure = "the machine answered ok but reported no file it wrote"
+            return FAILED
         run.last_progress = time.monotonic()
         run.acked_end = end
-        if end >= run.size and run.ref.kind == "agent_tree":
+        if last and run.ref.kind == "agent_tree":
             record_committed_stat(run.machine_id, run.agent_slug, run.ref.value, ack)
         if end < run.size:
             await run.notify(end, run.size)

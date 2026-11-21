@@ -260,8 +260,8 @@ class TestSecretsStayOutOfTheLog:
 
     def test_http_client_loggers_sit_at_warning(self, tmp_path, private_logger):
         _configure(tmp_path, private_logger, queue_size=8)
-        assert logging.getLogger("httpx").level == logging.WARNING
-        assert logging.getLogger("httpcore").level == logging.WARNING
+        for name in ("httpx", "httpcore", "httpx2", "httpcore2"):
+            assert logging.getLogger(name).level == logging.WARNING, name
 
     def test_the_log_file_is_private(self, tmp_path, private_logger):
         import os

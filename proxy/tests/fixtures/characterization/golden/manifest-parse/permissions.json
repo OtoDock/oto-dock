@@ -1,0 +1,49 @@
+{
+ "absent": {
+  "parsed": null
+ },
+ "bad default tier": {
+  "refused": "char-mcp: invalid permissions block — permissions.default_tier must be one of ['open', 'standard', 'sensitive', 'critical'], got 'loud'"
+ },
+ "bad tier": {
+  "refused": "char-mcp: invalid permissions block — permissions.rules[0].tier must be one of ['open', 'standard', 'sensitive', 'critical'], got 'loud'"
+ },
+ "default only": {
+  "parsed": {}
+ },
+ "duplicate exact": {
+  "refused": "char-mcp: invalid permissions block — permissions.rules[1]: duplicate rule for tool 'a'"
+ },
+ "empty tool": {
+  "refused": "char-mcp: invalid permissions block — permissions.rules[0].tool must be a non-empty string"
+ },
+ "not an object": {
+  "refused": "char-mcp: invalid permissions block — permissions must be an object, got list"
+ },
+ "prefixed tool": {
+  "refused": "char-mcp: invalid permissions block — permissions.rules[0].tool must be the bare tool name (no 'mcp__' prefix), got 'mcp__x__y'"
+ },
+ "repeated glob": {
+  "parsed": {
+   "rules": [
+    {
+     "tier": "open",
+     "tool": "a*"
+    },
+    {
+     "tier": "standard",
+     "tool": "a*"
+    }
+   ]
+  }
+ },
+ "rule not an object": {
+  "refused": "char-mcp: invalid permissions block — permissions.rules[0] must be an object, got str"
+ },
+ "rules not a list": {
+  "refused": "char-mcp: invalid permissions block — permissions.rules must be a list, got dict"
+ },
+ "unknown key": {
+  "refused": "char-mcp: invalid permissions block — permissions.rules[0] has unknown keys: ['note']"
+ }
+}

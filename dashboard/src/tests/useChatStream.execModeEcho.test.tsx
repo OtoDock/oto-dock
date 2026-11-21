@@ -46,3 +46,23 @@ describe('execution_mode_changed in useChatStream', () => {
     expect(onExecutionModeChanged).toHaveBeenCalledWith('interactive')
   })
 })
+
+describe('mode_changed in useChatStream', () => {
+  it('sets the mode and hands the page the answer, with a refusal\'s sentence', () => {
+    const onModeAnswered = vi.fn()
+    const { result } = renderHook(() =>
+      useChatStream({
+        agents: [],
+        initialChatId: 'chat-1',
+        queue: { addQueued: vi.fn(), clearQueued: vi.fn() },
+        onModeAnswered,
+      } as any),
+    )
+    act(() => captured.cb.onModeChanged('ask', 'The agent is working.'))
+    expect(result.current.mode).toBe('ask')
+    expect(onModeAnswered).toHaveBeenLastCalledWith('The agent is working.')
+    act(() => captured.cb.onModeChanged('dontAsk'))
+    expect(result.current.mode).toBe('dontAsk')
+    expect(onModeAnswered).toHaveBeenLastCalledWith(undefined)
+  })
+})

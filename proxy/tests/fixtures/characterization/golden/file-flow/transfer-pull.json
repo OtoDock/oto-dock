@@ -1,0 +1,211 @@
+{
+ "outside": [
+  "x.bin"
+ ],
+ "steps": [
+  {
+   "answer": true,
+   "bytes": "012345678901234567890123456789",
+   "partials_left": [],
+   "pending": 0,
+   "progress": [
+    [
+     8,
+     0
+    ],
+    [
+     16,
+     0
+    ],
+    [
+     24,
+     0
+    ],
+    [
+     30,
+     0
+    ]
+   ],
+   "step": "three chunks into the agents tree",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "path": "workspace/x.bin",
+     "path_kind": "agent_tree",
+     "request_id": "<id>",
+     "type": "file_pull"
+    }
+   ]
+  },
+  {
+   "answer": true,
+   "bytes": "",
+   "partials_left": [],
+   "pending": 0,
+   "progress": [
+    [
+     0,
+     0
+    ]
+   ],
+   "step": "an empty file",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "path": "workspace/empty.txt",
+     "path_kind": "agent_tree",
+     "request_id": "<id>",
+     "type": "file_pull"
+    }
+   ]
+  },
+  {
+   "answer": true,
+   "bytes": "012345678901234567890123456789",
+   "partials_left": [],
+   "pending": 0,
+   "progress": [
+    [
+     8,
+     0
+    ],
+    [
+     16,
+     0
+    ],
+    [
+     24,
+     0
+    ],
+    [
+     30,
+     0
+    ]
+   ],
+   "step": "outside the tree, its parent made",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "path": "workspace/x.bin",
+     "path_kind": "agent_tree",
+     "request_id": "<id>",
+     "type": "file_pull"
+    }
+   ]
+  },
+  {
+   "answer": false,
+   "bytes": null,
+   "partials_left": [],
+   "pending": 0,
+   "progress": [],
+   "step": "the machine's refusal",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "path": "workspace/none.bin",
+     "path_kind": "agent_tree",
+     "request_id": "<id>",
+     "type": "file_pull"
+    }
+   ]
+  },
+  {
+   "answer": false,
+   "bytes": null,
+   "partials_left": [],
+   "pending": 0,
+   "progress": [
+    [
+     3,
+     0
+    ]
+   ],
+   "step": "a hash that does not match",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "path": "workspace/tampered.bin",
+     "path_kind": "agent_tree",
+     "request_id": "<id>",
+     "type": "file_pull"
+    }
+   ]
+  },
+  {
+   "answer": false,
+   "bytes": null,
+   "partials_left": [],
+   "pending": 0,
+   "progress": [],
+   "step": "past the caller's cap",
+   "wire": [
+    {
+     "agent_slug": "flow-agent",
+     "path": "workspace/x.bin",
+     "path_kind": "agent_tree",
+     "request_id": "<id>",
+     "type": "file_pull"
+    },
+    {
+     "request_id": "<id>",
+     "type": "file_pull_cancel"
+    }
+   ]
+  },
+  {
+   "answer": "ValueError: pull_file_to_path(agent_tree) requires agent_slug",
+   "bytes": null,
+   "partials_left": [],
+   "pending": 0,
+   "progress": [],
+   "step": "no slug for the agent tree",
+   "wire": []
+  },
+  {
+   "answer": false,
+   "bytes": null,
+   "partials_left": [],
+   "pending": 0,
+   "progress": [],
+   "step": "a link on the way refuses",
+   "wire": []
+  },
+  {
+   "answer": true,
+   "bytes": "012345678901234567890123456789",
+   "partials_left": [],
+   "pending": 0,
+   "progress": [
+    [
+     8,
+     0
+    ],
+    [
+     16,
+     0
+    ],
+    [
+     24,
+     0
+    ],
+    [
+     30,
+     0
+    ]
+   ],
+   "step": "request fields replace the path",
+   "wire": [
+    {
+     "path": "workspace/x.bin",
+     "request_id": "<id>",
+     "scope": "move",
+     "type": "file_pull"
+    }
+   ]
+  },
+  {
+   "absent_machine": false
+  }
+ ]
+}

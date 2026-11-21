@@ -1,0 +1,157 @@
+{
+ "<unrecorded>": {
+  "answers": {
+   "7": {
+    "answers": [
+     "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input again this turn."
+    ]
+   },
+   "colour": {
+    "answers": [
+     "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input again this turn."
+    ]
+   }
+  },
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "header": "Colour",
+       "id": "colour",
+       "options": [
+        {
+         "description": "calm",
+         "label": "Green"
+        }
+       ],
+       "question": "Which colour?"
+      },
+      {
+       "id": 7,
+       "question": "A numeric id"
+      },
+      {
+       "question": "No id at all"
+      },
+      "not a mapping"
+     ]
+    },
+    "tool_name": "request_user_input"
+   }
+  ]
+ },
+ "app": {
+  "answers": {},
+  "queued": []
+ },
+ "dashboard": {
+  "answers": {
+   "7": {
+    "answers": [
+     "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input again this turn."
+    ]
+   },
+   "colour": {
+    "answers": [
+     "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input again this turn."
+    ]
+   }
+  },
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "header": "Colour",
+       "id": "colour",
+       "options": [
+        {
+         "description": "calm",
+         "label": "Green"
+        }
+       ],
+       "question": "Which colour?"
+      },
+      {
+       "id": 7,
+       "question": "A numeric id"
+      },
+      {
+       "question": "No id at all"
+      },
+      "not a mapping"
+     ]
+    },
+    "tool_name": "request_user_input"
+   }
+  ]
+ },
+ "internal": {
+  "answers": {},
+  "queued": []
+ },
+ "meeting": {
+  "answers": {},
+  "queued": []
+ },
+ "phone": {
+  "answers": {},
+  "queued": []
+ },
+ "pings": [],
+ "task": {
+  "answers": {},
+  "queued": []
+ },
+ "trigger": {
+  "answers": {},
+  "queued": []
+ },
+ "unnamed-kind": {
+  "answers": {
+   "7": {
+    "answers": [
+     "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input again this turn."
+    ]
+   },
+   "colour": {
+    "answers": [
+     "Questions have been displayed to the user in the chat interface. The user will reply in their next message. Do NOT re-ask these questions or call request_user_input again this turn."
+    ]
+   }
+  },
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "header": "Colour",
+       "id": "colour",
+       "options": [
+        {
+         "description": "calm",
+         "label": "Green"
+        }
+       ],
+       "question": "Which colour?"
+      },
+      {
+       "id": 7,
+       "question": "A numeric id"
+      },
+      {
+       "question": "No id at all"
+      },
+      "not a mapping"
+     ]
+    },
+    "tool_name": "request_user_input"
+   }
+  ]
+ },
+ "viewer_frames": []
+}

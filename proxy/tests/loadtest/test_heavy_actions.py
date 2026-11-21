@@ -174,9 +174,10 @@ def _photo(target_bytes: int) -> bytes:
     return best
 
 
-def test_a_12_mp_pasted_photo_holds_the_loop(tmp_path):
+def test_a_12_mp_pasted_photo_holds_the_loop(tmp_path, monkeypatch):
     from PIL import Image
 
+    import config
     import ws.dashboard  # noqa: F401  (assembles the support mixin first)
     from tests.loadtest import _harness as h
     from ws import dashboard as dash, dashboard_chat_support as support
@@ -194,6 +195,8 @@ def test_a_12_mp_pasted_photo_holds_the_loop(tmp_path):
         sizes[label] = len(jpeg)
         frame_files.append(str(path))
     order = ["dashboard"] * RUNS + ["raw_client"]
+    # A photo is written beneath the agents root (_land_photo): the test's own.
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     save_dir = tmp_path / "photos"
     save_dir.mkdir()
 
@@ -201,7 +204,7 @@ def test_a_12_mp_pasted_photo_holds_the_loop(tmp_path):
         await websocket.accept()
         msg = json.loads(await websocket.receive_text())
         saved = await support._save_photo_off_loop(dash._save_base64_image, msg["images"][0],
-                                                   save_dir=save_dir)
+                                                   save_dir=save_dir, scope_dir=save_dir)
         await websocket.send_json({"path": (saved or {}).get("path", "")})
         await websocket.close()
 

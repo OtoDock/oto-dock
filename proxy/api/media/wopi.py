@@ -197,23 +197,70 @@ def request_wopi_token(request: Request, access_token: str = "") -> str:
     return access_token
 
 
+class _Kept:
+    """Store answers read on the fast lane, kept ``_HOLDER_TTL_S`` and shared
+    by the requests that ask meanwhile (a cold editor load sends dozens). A
+    store failure answers None and is not kept. A read in flight when any
+    ``forget`` lands keeps nothing (it may predate the change). Loop-only."""
+
+    def __init__(self, what: str) -> None:
+        self.what = what
+        self.answers: OrderedDict[tuple, tuple[object, float]] = OrderedDict()
+        self.reads: dict[tuple, asyncio.Task] = {}
+        self.generation = 0
+        self.failure_logged = 0.0
+
+    async def ask(self, key: tuple, read: Callable[..., object], *args: object) -> object | None:
+        hit = self.answers.get(key)
+        if hit is not None and hit[1] >= time.monotonic():
+            return hit[0]
+        task = self.reads.get(key)
+        if task is None:
+            task = asyncio.get_running_loop().create_task(self._read(key, read, args))
+            self.reads[key] = task
+        return await asyncio.shield(task)
+
+    async def _read(self, key: tuple, read: Callable[..., object], args: tuple) -> object | None:
+        from storage.pg import run_db_fast
+        generation = self.generation
+        try:
+            answer = await run_db_fast(read, *args)
+        except psycopg.Error as exc:
+            now = time.monotonic()
+            if now - self.failure_logged >= 60.0:
+                self.failure_logged = now
+                logger.warning("WOPI: %s could not be read (%s)", self.what, type(exc).__name__)
+            return None
+        finally:
+            if self.reads.get(key) is asyncio.current_task():  # else a fresh read after a forget
+                self.reads.pop(key, None)
+        if self.generation == generation:
+            self.answers[key] = (answer, time.monotonic() + _HOLDER_TTL_S)
+            self.answers.move_to_end(key)
+            while len(self.answers) > _HOLDERS_MAX:
+                self.answers.popitem(last=False)
+        return answer
+
+    def forget(self, match: Callable[[tuple], bool]) -> None:
+        self.generation += 1
+        for key in [k for k in self.answers if match(k)]:
+            self.answers.pop(key, None)
+        for key in [k for k in self.reads if match(k)]:
+            self.reads.pop(key, None)
+
+
 # The person a WOPI token or the editor relay's cookie names, judged on the
 # HTTP routes' own rules (``auth.providers``): the users row, the credential
 # timeline (a password set, a sign out everywhere, the row re-created) on
 # the token's issue time, and the forced password change and 2FA
 # enrolment. One store read per (person, issue time) per ``_HOLDER_TTL_S``
-# at most, shared by the requests that ask meanwhile (a cold editor load
-# sends dozens at once); every answer expires (the forced change can clear
-# with the same cookie), and a store failure refuses the request it serves
-# and is not kept.
+# at most. Every answer expires: the forced change can clear with the same
+# cookie.
 _HOLDER_TTL_S = 10.0
 _HOLDERS_MAX = 4096
-_holder_answers: OrderedDict[tuple[str, int], tuple[bool, float]] = OrderedDict()
-_holder_reads: dict[tuple[str, int], asyncio.Task] = {}
-# Bumped by ``forget_person``: a store read that began before it may predate
-# the change that caused the forget, so it keeps nothing (token_holder's rule).
-_holder_generation: dict[str, int] = {}
-_holder_failure_logged = 0.0
+_holders = _Kept("the person behind a token")
+# ``document_standing``'s answers, per (person, agent claim, path, chat claim).
+_documents = _Kept("a person's access to a document")
 # The subs of the principals that are no person: the agent's own token
 # (minted before 1.9.0 for a push of a turn with no person; nothing mints
 # it now) and the master key's, a no-user session's, a render principal's. Judged as no person only when no users row bears
@@ -237,47 +284,37 @@ def _person_holds_now(sub: str, iat: int) -> bool:
     return session_cookie_current(user, {"iat": iat}) and not auth_gate(user)
 
 
-async def _read_holder(key: tuple[str, int]) -> bool | None:
-    global _holder_failure_logged
-    from storage.pg import run_db_fast
-    generation = _holder_generation.get(key[0], 0)
-    try:
-        ok = bool(await run_db_fast(_person_holds_now, *key))
-    except psycopg.Error as exc:
-        now = time.monotonic()
-        if now - _holder_failure_logged >= 60.0:
-            _holder_failure_logged = now
-            logger.warning("WOPI: the person behind a token could not be read (%s)",
-                           type(exc).__name__)
-        return None
-    finally:
-        # A forget meanwhile registered a fresh read under this key: that one
-        # stays.
-        if _holder_reads.get(key) is asyncio.current_task():
-            _holder_reads.pop(key, None)
-    if _holder_generation.get(key[0], 0) != generation:
-        return ok
-    _holder_answers[key] = (ok, time.monotonic() + _HOLDER_TTL_S)
-    _holder_answers.move_to_end(key)
-    while len(_holder_answers) > _HOLDERS_MAX:
-        _holder_answers.popitem(last=False)
-    return ok
-
-
 def forget_person(sub: str) -> None:
-    """Drop the kept answers of ``sub``: their next WOPI call or editor
-    request reads the store (their token epoch moved), a read in flight
-    keeps nothing, and a request arriving now starts its own read instead of
-    sharing the old one. Called through ``token_holder.forget`` by every
-    site that bumps an epoch."""
-    _holder_generation[sub] = _holder_generation.get(sub, 0) + 1
-    for key in [k for k in _holder_answers if k[0] == sub]:
-        _holder_answers.pop(key, None)
-    for key in [k for k in _holder_reads if k[0] == sub]:
-        _holder_reads.pop(key, None)
+    """Drop ``sub``'s kept answers (standing and documents) and wake their
+    open editor sockets. Called by ``token_holder.forget`` at every epoch
+    move and by the offboarding event (``register_offboarding``). Loop-only."""
+    _holders.forget(lambda key: key[0] == sub)
+    _documents.forget(lambda key: key[0] == sub)
+    _wake_editors(sub)
+
+
+def forget_agent(agent: str) -> None:
+    """Drop a deleted agent's document answers, wake every editor socket."""
+    _documents.forget(lambda key: key[1] == agent or key[2].startswith(agent + "/"))
+    _wake_editors(None)
+
+
+def _wake_editors(sub: str | None) -> None:
+    from api.media import collabora_proxy
+    collabora_proxy.wake_sockets(sub)
 
 
 token_holder.on_forget(forget_person)
+
+
+async def _on_offboard(event) -> None:
+    forget_person(event.sub)
+
+
+def register_offboarding() -> None:
+    """Subscribe to the offboarding event, first in the chain (lifespan)."""
+    from services.agents import offboarding
+    offboarding.subscribe("documents", _on_offboard, priority=1)
 
 
 async def person_standing(sub: str, iat) -> bool | None:
@@ -287,15 +324,8 @@ async def person_standing(sub: str, iat) -> bool | None:
     principal that is no person (``_no_person``)."""
     if not sub or not isinstance(iat, int):
         return False
-    key = (sub, iat)
-    hit = _holder_answers.get(key)
-    if hit is not None and hit[1] >= time.monotonic():
-        return hit[0]
-    read = _holder_reads.get(key)
-    if read is None:
-        read = asyncio.get_running_loop().create_task(_read_holder(key))
-        _holder_reads[key] = read
-    return await asyncio.shield(read)
+    answer = await _holders.ask((sub, iat), _person_holds_now, sub, iat)
+    return None if answer is None else bool(answer)
 
 
 async def person_holds(sub: str, iat) -> bool:
@@ -303,16 +333,63 @@ async def person_holds(sub: str, iat) -> bool:
     return await person_standing(sub, iat) is True
 
 
-async def _wopi_claims(request: Request, access_token: str) -> dict:
+_FILE_RULE, _CHAT_RULE, _SNAPSHOT_RULE = "file", "chat", "snapshot"
+
+
+def _rule_of(claims: dict) -> str:
+    """The mint that made a token: a version's path is in the snapshot
+    namespace, a chat's document (pane, push) names its chat, a workspace
+    file neither. 1.9.1 mints alike, so its tokens are judged as new ones."""
+    if str(claims.get("file_path") or "").startswith(_SNAPSHOT_NS + "/"):
+        return _SNAPSHOT_RULE
+    return _CHAT_RULE if claims.get("chat_id") else _FILE_RULE
+
+
+def _standing_now(sub: str, agent: str, file_path: str, chat_id: str) -> str:
+    """``document_standing``'s store reads: the person now, judged through
+    the function the token's mint calls. DB executor."""
+    from auth.providers import user_context_for_sub
+    u = user_context_for_sub(sub)
+    if u is None:
+        return "edit" if _no_person(sub) else ""
+    rule = _rule_of({"file_path": file_path, "chat_id": chat_id})
+    try:
+        if rule == _SNAPSHOT_RULE:
+            _chat_for_mint(u, file_path.split("/")[1])
+            return "view"
+        if rule == _CHAT_RULE:
+            return chat_document_permissions(u, _chat_for_mint(u, chat_id), agent, file_path)
+        first, _, agent_rel = file_path.partition("/")
+        if first != agent or not agent_rel:
+            return ""
+        return file_permissions(u, agent, agent_rel)
+    except HTTPException:
+        return ""
+
+
+async def document_standing(claims: dict) -> str | None:
+    """What the person a WOPI token names may do with its document now, by
+    the rule that made the token at their role now: "edit", "view", "" for
+    nothing, None when the store could not be read. A principal that is no
+    person (``_no_person``) keeps its token's word."""
+    sub = claims.get("user_sub") or ""
+    if not sub:
+        return ""
+    key = (sub, str(claims.get("agent") or ""), str(claims.get("file_path") or ""),
+           str(claims.get("chat_id") or ""))
+    answer = await _documents.ask(key, _standing_now, *key)
+    return answer if isinstance(answer, str) else None
+
+
+async def _wopi_claims(request: Request, access_token: str, *, releasing: bool = False) -> dict:
     """The claims of the request's WOPI token: signed by the platform's
     Collabora (``wopi_proof``: a token copied from its log opens nothing),
-    valid, and its person still holding (``person_holds``: a sign out
-    everywhere ends the token too, whatever reaches the WOPI host,
-    Collabora's own exit save included). 401 otherwise, 503 while
-    Collabora's key cannot be read. The order keeps the costly steps for a
-    holder of a valid token: the proof headers parsed, the token checked,
-    the signature verified (which may read Collabora's discovery again),
-    then the person read."""
+    valid, its person holding (``person_holds``, Collabora's exit save too)
+    and allowed the document now (``document_standing``: a person who may
+    only read gets ``permissions`` "view", the routes' read-only answers).
+    401 otherwise, 503 while Collabora's key cannot be read. ``releasing``
+    (an unlock) skips the last step: giving a lock back takes nothing. The
+    costly steps come last (the signature may read Collabora's discovery)."""
     proof = wopi_proof.read_headers(request)
     token = request_wopi_token(request, access_token)
     claims = validate_wopi_token(token)
@@ -321,6 +398,13 @@ async def _wopi_claims(request: Request, access_token: str) -> dict:
     await wopi_proof.check(request, token, proof)
     if not await person_holds(claims.get("user_sub") or "", claims.get("iat")):
         raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
+    if releasing:
+        return claims
+    may = await document_standing(claims)
+    if not may:
+        raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
+    if may == "view" and claims.get("permissions") == "edit":
+        return {**claims, "permissions": "view"}
     return claims
 
 
@@ -334,23 +418,13 @@ def _open_wopi_regular(file_id: str, claims: dict, *,
     routes. The signed ``file_path`` is the binding: it is the path the mint
     resolved and authorized, and it is opened beneath its root through
     ``safe_fs`` with no symlink followed, so a file swapped for a link after
-    the mint is "not found" whatever it points at (no role is re-checked:
-    the three mint rules differ and the path is already theirs). Blocking:
+    the mint is "not found" whatever it points at (the person's standing on
+    it now is ``_wopi_claims``'s, by the mint's own rule). Blocking:
     run it in a thread. The caller closes the descriptor. ``unreadable``,
     when given, is raised instead of the 404 for a file that is there but
     could not be opened (the save check fails open on it)."""
     rel_path = _wopi_path_of(file_id, claims)
-    if rel_path.startswith(_SNAPSHOT_NS + "/"):
-        from services.media import preview_snapshots
-        parts = rel_path.split("/")
-        if len(parts) != 3 or not all(preview_snapshots._valid_id(x) for x in parts[1:]):
-            raise HTTPException(status_code=404, detail="Snapshot not found")
-        root, rel = config.PREVIEW_SNAPSHOT_DIR, f"{parts[1]}/{parts[2]}"
-    else:
-        first, _, rest = rel_path.partition("/")
-        if not rest or (first != HOST_CACHE_SEGMENT and not config.is_safe_agent_name(first)):
-            raise HTTPException(status_code=404, detail="File not found")
-        root, rel = config.AGENTS_DIR, rel_path
+    root, rel = read_root(rel_path)
     try:
         fd, st = safe_fs.open_regular_for_read(root, rel)
     except FileNotFoundError as err:
@@ -361,6 +435,24 @@ def _open_wopi_regular(file_id: str, claims: dict, *,
             raise unreadable(type(exc).__name__) from exc
         raise HTTPException(status_code=404, detail="File not found") from exc
     return fd, st, rel.rsplit("/", 1)[-1]
+
+
+def read_root(rel_path: str) -> tuple[Path, str]:
+    """``(root, rel)`` a pane file's path is opened beneath: the snapshot
+    namespace under ``PREVIEW_SNAPSHOT_DIR`` (strict ids), anything else
+    under ``AGENTS_DIR`` when its first segment is an agent's name or the
+    host-cache segment. 404 otherwise. Shared by the WOPI reads and the
+    pane's downloads (``document_downloads``)."""
+    if rel_path.startswith(_SNAPSHOT_NS + "/"):
+        from services.media import preview_snapshots
+        parts = rel_path.split("/")
+        if len(parts) != 3 or not all(preview_snapshots._valid_id(x) for x in parts[1:]):
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        return config.PREVIEW_SNAPSHOT_DIR, f"{parts[1]}/{parts[2]}"
+    first, _, rest = rel_path.partition("/")
+    if not rest or (first != HOST_CACHE_SEGMENT and not config.is_safe_agent_name(first)):
+        raise HTTPException(status_code=404, detail="File not found")
+    return config.AGENTS_DIR, rel_path
 
 
 # ---------------------------------------------------------------------------
@@ -801,7 +893,7 @@ async def wopi_put_file(
         # Host-cache doc: the platform copy is a MIRROR of a file on the
         # session's own machine (Desktop/Downloads pulled through the lazy
         # cache). Persist the cache copy atomically, then push the bytes back
-        # to the REAL file via the sidecar's (machine, abs_path) — the
+        # to the REAL file via the pull's record of (machine, abs_path) — the
         # satellite's host write policy is the authoritative gate there. If
         # the machine refuses or is offline, FAIL the save (Collabora shows
         # a save error) instead of letting cache and reality silently
@@ -922,15 +1014,17 @@ async def wopi_lock_operations(
     of a file, like Collabora's documents) and no file is opened: the check
     is the token and the path the id names (an id that does not decode, or
     that names another path, is 403 as on the read routes)."""
-    claims = await _wopi_claims(request, access_token)
+    override = request.headers.get("X-WOPI-Override", "").upper()
+    claims = await _wopi_claims(request, access_token, releasing=override == "UNLOCK")
     _wopi_path_of(file_id, claims)
 
-    override = request.headers.get("X-WOPI-Override", "").upper()
     lock_id = request.headers.get("X-WOPI-Lock", "")
     old_lock = request.headers.get("X-WOPI-OldLock", "")
 
     # Mutating lock ops require edit capability — a view-only session must
     # not be able to place/steal a lock and 409 the real editor's saves.
+    # An unlock reads the token's own word (``releasing`` above): the person
+    # who may no longer write still gives back the lock their editor took.
     # GET_LOCK stays readable with any valid token.
     if override in ("LOCK", "UNLOCK", "REFRESH_LOCK") and claims.get("permissions") != "edit":
         raise HTTPException(status_code=403, detail="Write permission required")
@@ -1067,45 +1161,42 @@ def _workspace_mint(req: WopiUrlRequest, user: UserContext) -> tuple[str, str]:
     if not full_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
-    # Read-scope gate: minting ANY token must be authorized like READING the
-    # file — without this a user could mint a (view) token for another user's
-    # document. Checked on the RESOLVED agent-relative path. A trusted no-user /
-    # service caller (acting_sub None) gets full access, like the file API.
-    if user.acting_sub is not None:
-        from api.agents.agents import _check_file_role
-        from storage import database as _db
-        _check_file_role(
-            agent_rel, user.acting_role(req.agent), writing=False,
-            username=_db.get_username_by_sub(user.sub) or "",
-        )
+    # Authorized like READING the file, on the RESOLVED path. ``req.edit``
+    # is a request, not authority.
+    permissions = file_permissions(user, req.agent, agent_rel)
 
-    # Relative path from AGENTS_DIR (for file_id)
-    rel_path = str(full_path.relative_to(config.AGENTS_DIR.resolve()))
+    # Relative path from AGENTS_DIR (for file_id): the agent's own name
+    # first, never where its folder resolves.
+    try:
+        rel_path = safe_fs.rel_under(full_path, config.AGENTS_DIR)
+    except OSError:
+        rel_path = ""
+    if rel_path.split("/", 1)[0] != req.agent:
+        raise HTTPException(status_code=403, detail="This agent's folder was moved, so its documents cannot open here.")
+    return rel_path, "edit" if req.edit and permissions == "edit" else "view"
 
-    # Role-gate the edit decision SERVER-SIDE. The client `req.edit`
-    # bool is a request, not authority — without this a viewer could mint an
-    # edit token via the API. ``can_write_back`` is the same write matrix the
-    # satellite write-back guard + simple file editor enforce; req.file_path is
-    # already agent-tree-relative ("workspace/..." or "users/{u}/..."). API-key
-    # callers (trusted master key) bypass, mirroring the file API's role check.
-    if user.acting_sub is None:
-        can_edit = req.edit
-    else:
-        from core.remote.file_sync import can_write_back, library_mirror_source
-        from storage import database as _db
-        _uname = _db.get_username_by_sub(user.sub) or ""
-        # Authorize the RESOLVED agent-relative path (== req.file_path for a
-        # well-formed request) so a '..'-laundered body can't flip the verdict.
-        _rel = full_path.relative_to(agent_root).as_posix()
-        _wl = None
-        if library_mirror_source(_rel) is not None:
-            from storage.knowledge import db_knowledge_libraries
-            _wl = db_knowledge_libraries.writable_pairs_for(req.agent)
-        can_edit = req.edit and can_write_back(
-            _rel, user.acting_role(req.agent), _uname,
-            writable_libraries=_wl,
-        )
-    return rel_path, "edit" if can_edit else "view"
+
+def file_permissions(u: UserContext, agent: str, agent_rel: str) -> str:
+    """What ``u`` may do with ``agent_rel`` (canonical, in ``agent``'s
+    folder), the workspace mint's rule: "edit" or "view", 403 when they may
+    not read it. Read as the file API reads (``_check_file_role``), written
+    as the write-back guard writes (``can_write_back``). A caller acting as
+    no person (master key, no-user session) may do both. DB executor."""
+    if not u.can_access_agent(agent):
+        raise HTTPException(status_code=403, detail="No access to agent")
+    if u.acting_sub is None:
+        return "edit"
+    from api.agents.agents import _check_file_role
+    from core.remote.file_sync import can_write_back, library_mirror_source
+    from storage import database as _db
+    role = u.acting_role(agent)
+    username = _db.get_username_by_sub(u.sub) or ""
+    _check_file_role(agent_rel, role, writing=False, username=username)
+    writable = None
+    if library_mirror_source(agent_rel) is not None:
+        from storage.knowledge import db_knowledge_libraries
+        writable = db_knowledge_libraries.writable_pairs_for(agent)
+    return "edit" if can_write_back(agent_rel, role, username, writable_libraries=writable) else "view"
 
 
 @router.get("/v1/documents/snapshot-wopi-url")
@@ -1130,7 +1221,7 @@ async def generate_snapshot_wopi_url(
             detail="Document preview is unavailable: COLLABORA_URL is not configured.",
         )
 
-    chat, event, owner = await run_db(_snapshot_mint, u, chat_id, snapshot_id)
+    chat, event, owner = await run_db(snapshot_document, u, chat_id, snapshot_id)
     rel_path = snapshot_rel_path(owner, snapshot_id)
     token, token_ttl = create_wopi_token(
         rel_path, u.sub, u.name, "view", chat.get("agent") or "",
@@ -1179,7 +1270,7 @@ def _page_chat_ids(chat_id: str) -> list[str]:
     return out
 
 
-def _snapshot_mint(u: UserContext, chat_id: str, snapshot_id: str) -> tuple[dict, dict, str]:
+def snapshot_document(u: UserContext, chat_id: str, snapshot_id: str) -> tuple[dict, dict, str]:
     """``(chat, preview event, the event's chat id)`` of a snapshot mint: the
     chat gate, the live event that references the snapshot in any chat the
     page shows and the snapshot file's presence under that chat. Store reads
@@ -1248,6 +1339,52 @@ def _preview_mint(u: UserContext, chat_id: str, file_id: str) -> tuple[str, str,
     one the hook noted (``preview.mint_generation``, on the loop). Store
     reads and path probes: run it through ``run_db``; its ``HTTPException``
     reaches the client unchanged."""
+    chat, owner, event, rel_path, _full_path = live_document(u, chat_id, file_id)
+    generation = _row_document_generation(event)
+
+    agent = chat.get("agent") or ""
+    # A meeting participant's preview sits in the participant's tree: the
+    # claim names the tree the path is in (the role is still the requester's
+    # on that agent), so the token says what it covers.
+    _first = rel_path.partition("/")[0]
+    if _first != agent and _first != HOST_CACHE_SEGMENT and config.is_safe_agent_name(_first):
+        agent = _first
+    return rel_path, chat_document_permissions(u, chat, agent, rel_path), agent, owner, generation
+
+
+def chat_document_permissions(u: UserContext, chat: dict, agent: str, rel_path: str) -> str:
+    """What ``u`` may do with ``rel_path`` (beneath ``AGENTS_DIR``) in
+    ``chat``'s pane, ``agent`` the tree it is in: ``live_permissions`` at
+    their role there, after the chat's own rule (``_chat_for_mint``). The
+    chat session's own host cache is named as the hooks' gate names it (by
+    the folder's name, never its realpath). DB executor."""
+    from storage import database as _db
+    session_id = chat.get("session_id") or ""
+    host_cache = False
+    if session_id:
+        from api.hooks import paths
+        with contextlib.suppress(OSError):
+            host_cache = paths.in_own_host_cache(
+                session_id, safe_fs.rel_under((config.AGENTS_DIR / rel_path).resolve(), config.AGENTS_DIR))
+    person = ""
+    if host_cache:
+        from core.session.session_state import get_session_security
+        sec = get_session_security(session_id)
+        person = (getattr(sec, "username", "") or "") if sec is not None else ""
+    return live_permissions(
+        rel_path.partition("/")[2], u.acting_role(agent), _db.get_username_by_sub(u.sub) or "",
+        agent, host_cache=host_cache, session_person=person,
+    )
+
+
+def live_document(u: UserContext, chat_id: str, file_id: str) -> tuple[dict, str, dict, str, Path]:
+    """``(chat, the event's chat id, the live preview event, rel beneath
+    AGENTS_DIR, its resolved path)`` of a file the chat's pane holds: the
+    chat gate, the newest live event of ``file_id`` in a chat the page
+    shows, the path confined beneath ``AGENTS_DIR`` and a regular file.
+    The live mint and the pane's downloads ask the same proof. Store reads
+    and path probes: run it through ``run_db``; its ``HTTPException``
+    reaches the client unchanged."""
     chat = _chat_for_mint(u, chat_id)
     from storage import database as task_store
     owner, event = None, None
@@ -1258,8 +1395,6 @@ def _preview_mint(u: UserContext, chat_id: str, file_id: str) -> tuple[str, str,
             break
     if owner is None or event is None:
         raise HTTPException(status_code=404, detail="Preview not found")
-    generation = _row_document_generation(event)
-
     try:
         rel_path = decode_file_id(file_id)
     except (ValueError, UnicodeDecodeError) as exc:
@@ -1273,33 +1408,7 @@ def _preview_mint(u: UserContext, chat_id: str, file_id: str) -> tuple[str, str,
         raise HTTPException(status_code=403, detail="Path traversal blocked")
     if not full_path.is_file():
         raise HTTPException(status_code=404, detail="Preview not found")
-
-    agent = chat.get("agent") or ""
-    # A meeting participant's preview sits in the participant's tree: the
-    # claim names the tree the path is in (the role is still the requester's
-    # on that agent), so the token says what it covers.
-    _first = rel_path.partition("/")[0]
-    if _first != agent and _first != HOST_CACHE_SEGMENT and config.is_safe_agent_name(_first):
-        agent = _first
-    from storage import database as _db
-    _session_id = chat.get("session_id") or ""
-    _is_host_cache = False
-    if _session_id:
-        from core.remote import remote_file_flow
-        with contextlib.suppress(OSError):
-            _is_host_cache = full_path.is_relative_to(
-                remote_file_flow.host_cache_session_root(_session_id).resolve()
-            )
-    _person = ""
-    if _is_host_cache:
-        from core.session.session_state import get_session_security
-        _sec = get_session_security(_session_id)
-        _person = (getattr(_sec, "username", "") or "") if _sec is not None else ""
-    permissions = live_permissions(
-        rel_path.partition("/")[2], u.acting_role(agent), _db.get_username_by_sub(u.sub) or "",
-        agent, host_cache=_is_host_cache, session_person=_person,
-    )
-    return rel_path, permissions, agent, owner, generation
+    return chat, owner, event, rel_path, full_path
 
 
 def _row_document_generation(event: dict) -> int:
@@ -1344,8 +1453,9 @@ async def list_chat_documents(
     with its newest push's name and download link, and its versions newest
     first (``version`` = the push's 1-based position among the file's
     pushes, ``turn`` = the person's messages up to it, ``generation`` = the
-    push time in ms, ``available`` = the version's copy still exists).
-    Gated like the mints: the requester's chat access. No WOPI URL and no
+    push time in ms, ``available`` = the version's copy still exists), and
+    ``downloads``, the conversions the pane's menu offers for it
+    (``document_downloads.targets_for``). Gated like the mints: the requester's chat access. No WOPI URL and no
     token: the pane mints those per file and per version."""
     u = require_auth(user)
     return {"documents": await run_db(_chat_documents, u, chat_id)}
@@ -1356,6 +1466,7 @@ def _chat_documents(u: UserContext, chat_id: str) -> list[dict]:
     stats: run it through ``run_db``; its ``HTTPException`` reaches the
     client unchanged."""
     _chat_for_mint(u, chat_id)
+    from api.media.document_downloads import targets_for
     from services.media import preview_snapshots
     from storage import database as task_store
     by_file: dict[str, dict] = {}
@@ -1367,6 +1478,7 @@ def _chat_documents(u: UserContext, chat_id: str) -> list[dict]:
         doc = by_file.setdefault(file_id, {"file_id": file_id, "versions": []})
         doc["filename"] = data.get("filename") or ""
         doc["download_url"] = data.get("download_url") or ""
+        doc["downloads"] = list(targets_for(doc["filename"]))
         doc["generation"] = row["generation"]
         snapshot_id = data.get("snapshot_id") or ""
         doc["versions"].append({

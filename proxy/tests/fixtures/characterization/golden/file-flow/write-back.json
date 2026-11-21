@@ -1,0 +1,113 @@
+{
+ "held_reason": "knowledge/n.md is not on the platform, and this session may not copy files from its machine into that folder (its role cannot write there)",
+ "verdicts": {
+  "another-agent": {
+   "C:/Users/x": false,
+   "config/agent.md": false,
+   "knowledge/n.md": false,
+   "knowledge/shared/src-agent/g.md": false,
+   "knowledge/shared/src-ro/g.md": false,
+   "users/alice/.codex/config.toml": false,
+   "users/alice/workspace/a.txt": false,
+   "users/bob/workspace/a.txt": false,
+   "workspace/../config/x": false,
+   "workspace/a.txt": false
+  },
+  "no-context": {
+   "C:/Users/x": false,
+   "config/agent.md": false,
+   "knowledge/n.md": false,
+   "knowledge/shared/src-agent/g.md": false,
+   "knowledge/shared/src-ro/g.md": false,
+   "users/alice/.codex/config.toml": false,
+   "users/alice/workspace/a.txt": false,
+   "users/bob/workspace/a.txt": false,
+   "workspace/../config/x": false,
+   "workspace/a.txt": false
+  },
+  "role-admin": {
+   "C:/Users/x": false,
+   "config/agent.md": true,
+   "knowledge/n.md": true,
+   "knowledge/shared/src-agent/g.md": true,
+   "knowledge/shared/src-ro/g.md": false,
+   "users/alice/.codex/config.toml": false,
+   "users/alice/workspace/a.txt": true,
+   "users/bob/workspace/a.txt": false,
+   "workspace/../config/x": false,
+   "workspace/a.txt": true
+  },
+  "role-contributor": {
+   "C:/Users/x": false,
+   "config/agent.md": false,
+   "knowledge/n.md": false,
+   "knowledge/shared/src-agent/g.md": false,
+   "knowledge/shared/src-ro/g.md": false,
+   "users/alice/.codex/config.toml": false,
+   "users/alice/workspace/a.txt": true,
+   "users/bob/workspace/a.txt": false,
+   "workspace/../config/x": false,
+   "workspace/a.txt": true
+  },
+  "role-editor": {
+   "C:/Users/x": false,
+   "config/agent.md": false,
+   "knowledge/n.md": false,
+   "knowledge/shared/src-agent/g.md": false,
+   "knowledge/shared/src-ro/g.md": false,
+   "users/alice/.codex/config.toml": false,
+   "users/alice/workspace/a.txt": true,
+   "users/bob/workspace/a.txt": false,
+   "workspace/../config/x": false,
+   "workspace/a.txt": true
+  },
+  "role-manager": {
+   "C:/Users/x": false,
+   "config/agent.md": true,
+   "knowledge/n.md": true,
+   "knowledge/shared/src-agent/g.md": true,
+   "knowledge/shared/src-ro/g.md": false,
+   "users/alice/.codex/config.toml": false,
+   "users/alice/workspace/a.txt": true,
+   "users/bob/workspace/a.txt": false,
+   "workspace/../config/x": false,
+   "workspace/a.txt": true
+  },
+  "role-viewer": {
+   "C:/Users/x": false,
+   "config/agent.md": false,
+   "knowledge/n.md": false,
+   "knowledge/shared/src-agent/g.md": false,
+   "knowledge/shared/src-ro/g.md": false,
+   "users/alice/.codex/config.toml": false,
+   "users/alice/workspace/a.txt": true,
+   "users/bob/workspace/a.txt": false,
+   "workspace/../config/x": false,
+   "workspace/a.txt": false
+  },
+  "service": {
+   "C:/Users/x": false,
+   "config/agent.md": false,
+   "knowledge/n.md": false,
+   "knowledge/shared/src-agent/g.md": false,
+   "knowledge/shared/src-ro/g.md": false,
+   "users/alice/.codex/config.toml": false,
+   "users/alice/workspace/a.txt": false,
+   "users/bob/workspace/a.txt": false,
+   "workspace/../config/x": false,
+   "workspace/a.txt": true
+  },
+  "service-knowledge": {
+   "C:/Users/x": false,
+   "config/agent.md": false,
+   "knowledge/n.md": true,
+   "knowledge/shared/src-agent/g.md": true,
+   "knowledge/shared/src-ro/g.md": false,
+   "users/alice/.codex/config.toml": false,
+   "users/alice/workspace/a.txt": false,
+   "users/bob/workspace/a.txt": false,
+   "workspace/../config/x": false,
+   "workspace/a.txt": true
+  }
+ }
+}

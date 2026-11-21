@@ -10,15 +10,23 @@ prompt renders the same entries live for the topics it does not inline
 no LLM is involved anywhere.
 
 The scanning primitives live here (``iter_topic_files``, the index names and
-caps) and ``memory_file`` imports them, never the reverse.
+caps) and ``memory_file`` imports them, never the reverse. A person's own
+sessions write their ``context/`` and an owner's write ``knowledge/``, so
+every read here opens the path as joined beneath the agents root with no
+link followed (``safe_fs``): a link at a memory folder or inside one is
+never read through.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+from core import agent_folder
+from services.infra import safe_fs
 
 INDEX_FILENAME = "MEMORY.md"
 ALLOWED_EXTENSIONS = {".md", ".txt"}
@@ -59,28 +67,41 @@ def today_utc() -> date:
 # Scanning
 # ---------------------------------------------------------------------------
 
-def iter_topic_files(root: Path) -> list[Path]:
-    """All topic files in a scope (recursive), excluding the index, hidden
-    files/dirs, and non-text extensions. Sorted by relpath for stability."""
-    if not root.is_dir():
+def topic_stats(root: Path) -> list[tuple[Path, os.stat_result]]:
+    """Every topic file in a scope (recursive) with its status, excluding
+    the index, hidden files and folders, and non-text extensions; sorted by
+    relpath. Walked beneath the agent's folder (``core/agent_folder.py``)
+    with no link listed or entered: a scope root that is a link, or sits
+    under one below the agent's folder, lists nothing. A folder inside that
+    cannot be entered is left out, never the whole scope."""
+    out: list[tuple[str, os.stat_result]] = []
+    try:
+        base, top = agent_folder.beneath_agent(root)
+        for step in safe_fs.walk_beneath(base, top, onerror=lambda _exc: None):
+            step.dirs[:] = [d for d in step.dirs if not d.startswith(".")]
+            rel_dir = step.rel[len(top):].lstrip("/")
+            for name in step.files:
+                rel = f"{rel_dir}/{name}" if rel_dir else name
+                if name.startswith(".") or (name == INDEX_FILENAME and not rel_dir):
+                    continue
+                if Path(name).suffix.lower() not in ALLOWED_EXTENSIONS:
+                    continue
+                try:
+                    out.append((rel, os.stat(name, dir_fd=step.dirfd, follow_symlinks=False)))
+                except OSError:
+                    continue
+    except OSError:
         return []
-    out: list[Path] = []
-    for p in sorted(root.rglob("*")):
-        if not p.is_file() or p.is_symlink():
-            continue
-        rel = p.relative_to(root)
-        if any(seg.startswith(".") for seg in rel.parts):
-            continue
-        if p.name == INDEX_FILENAME and len(rel.parts) == 1:
-            continue
-        if p.suffix.lower() not in ALLOWED_EXTENSIONS:
-            continue
-        out.append(p)
-    return out
+    return [(root / rel, st) for rel, st in sorted(out, key=lambda item: Path(item[0]).parts)]
+
+
+def iter_topic_files(root: Path) -> list[Path]:
+    """All topic files in a scope (``topic_stats`` without the status)."""
+    return [p for p, _st in topic_stats(root)]
 
 
 def scope_total_bytes(root: Path) -> int:
-    return sum(p.stat().st_size for p in iter_topic_files(root))
+    return sum(st.st_size for _p, st in topic_stats(root))
 
 
 @dataclass(frozen=True)
@@ -134,8 +155,8 @@ def topic_facts(path: Path, root: Path, *, today: date) -> TopicFacts:
     them (``str.splitlines``), so a section's ``L12`` is a ``view_range``
     start."""
     try:
-        size = path.stat().st_size
-        with open(path, "rb") as f:
+        with safe_fs.open_file_for_read(*agent_folder.beneath_agent(path)) as f:
+            size = os.fstat(f.fileno()).st_size
             raw = f.read(TOPIC_READ_CAP_BYTES)
     except OSError:
         raw, size = b"", 0

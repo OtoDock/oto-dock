@@ -313,13 +313,34 @@ def attach_env(phone_ws_env, monkeypatch):  # noqa: F811
         ws.closed.append(code)
         ws.disconnect()
     ws.close = _close_ws
-    monkeypatch.setattr(phone_attach.task_store, "get_chat", lambda cid: {
-        "id": cid, "session_id": SID, "execution_path": "direct-llm",
-        "agent": "unified", "user_sub": "u1"})
+    layer.chat = {"id": CHAT, "session_id": SID, "execution_path": "direct-llm",
+                  "agent": "unified", "user_sub": "u1"}
+    monkeypatch.setattr(phone_attach.task_store, "get_chat", lambda cid: dict(layer.chat, id=cid))
     import auth.providers as providers
     monkeypatch.setattr(providers, "acting_role_of", lambda sub, agent: "editor")
+    # The chat's layer is read as every chat door reads it (the role and
+    # ``layer_for_chat``, never a patched resolver): the stand-in holds the
+    # chat's session on the platform's own place unless a test moves it
+    # (``layer.place``), and a reconnect it waits for comes back only when
+    # a test says so (``layer.reconnects``).
+    import ws.dashboard as ws_dashboard
     from core.session import session_manager, visibility
-    monkeypatch.setattr(session_manager, "get_execution_layer", lambda *a, **kw: layer)
+    from services.remote import remote_status
+    from storage.agents import agent_store
+    monkeypatch.setattr(ws_dashboard, "acting_role_of", lambda sub, agent, fallback_user=None: "editor")
+    monkeypatch.setattr(agent_store, "get_agent", lambda name: {"name": name, "execution_path": "claude-code-cli"})
+    monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **kw: ("local", None))
+    monkeypatch.setattr(remote_status, "serving_compute_machine", lambda *a, **kw: None)
+    layer.place = ""
+    monkeypatch.setattr(session_manager, "live_session", lambda sid: session_manager.LiveSession(
+        layer, layer.place) if sid == SID else None)
+    layer.reconnects = False
+
+    async def _wait_reconnect(sid, **kw):
+        if layer.reconnects:
+            layer.alive = True
+        return layer.reconnects
+    layer.wait_session_reconnect = _wait_reconnect
     monkeypatch.setattr(visibility, "is_shared_only", lambda agent: False)
     monkeypatch.setattr(phone_attach, "_context_text", lambda rid, can_transfer=True: "CTX")
     grant = in_session_calls.mint(session_id=SID, chat_id=CHAT, agent="unified",
@@ -423,6 +444,156 @@ def test_a_chat_whose_session_is_not_running_refuses_the_attach(attach_env):
     asyncio.run(run())
     assert in_session_calls.live_for_chat(CHAT) is None
     assert call_control.binding_for(SID) is None
+
+
+def _on_compute(monkeypatch, layer, *, linked=True):
+    """The chat runs on compute machine c-1: the stand-in holds its session
+    there, the engine's own layer in the proxy holds nothing. Returns the
+    machine's link, which a test may drop and bring back."""
+    from types import SimpleNamespace
+
+    from core.remote import satellite_connection
+    link = {"up": linked}
+    cm = SimpleNamespace(is_compute=lambda mid: link["up"] and mid == "c-1",
+                         is_connected=lambda mid: link["up"] and mid == "c-1",
+                         exit_state=lambda mid: (0, False))
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", lambda: cm)
+    from core.session import session_manager
+    monkeypatch.setattr(session_manager, "live_session", lambda sid: session_manager.LiveSession(
+        layer, "c-1", linked=link["up"], grace=not link["up"]) if sid == SID else None)
+    # The session's own record names the compute machine it was placed on:
+    # what tells a reconnecting compute machine from a paired computer.
+    from core import placement
+    from core.session import session_state
+    placed = placement.from_machine(placement.KIND_COMPUTE, {"id": "c-1", "pairing_scope": "compute"})
+    monkeypatch.setattr(session_state, "get_session_security",
+                        lambda sid: SimpleNamespace(placement=placed) if sid == SID else None)
+    layer.place = "c-1"
+    layer.chat.update(execution_path="claude-code-cli", execution_target="local")
+    return link
+
+
+def _on_machine(monkeypatch, layer, mid, *, scope="admin", owner=""):
+    """The chat is pinned to a paired machine that holds its session; the
+    agent itself targets the platform."""
+    from core.session import session_manager
+    from storage import remote_store
+    monkeypatch.setattr(remote_store, "get_remote_machine", lambda m: {
+        "id": m, "pairing_scope": scope, "registered_by": owner} if m == mid else None)
+    monkeypatch.setattr(session_manager, "_get_remote_layer", lambda: layer)
+    layer.place = mid
+    layer.chat.update(execution_path="claude-code-cli", execution_target=mid)
+
+
+def _a_call_runs(ws, grant):
+    async def run():
+        handler = await _run_handler(ws)
+        ws.push(_attach_warmup(grant))
+        ready = await ws.wait_for_frame(lambda f: f["type"] in ("warmup_ready", "error"))
+        assert ready["type"] == "warmup_ready", ready
+        ws.push({"type": "chat", "prompt": "hello there", "turn": 1})
+        await ws.wait_for_frame(lambda f: f["type"] == "done" and f.get("turn") == 1)
+        texts = [f for f in ws.sent if f["type"] == "text" and f["turn"] == 1]
+        assert texts and "Phone (+30210): hello there" in texts[0]["data"]["content"]
+        ws.push({"type": "chat", "prompt": "bye", "turn": 2, "system": True, "resume": True})
+        ws.push({"type": "close"})
+        await handler
+        await _pump_finished()
+    asyncio.run(run())
+
+
+def _the_attach_is_refused(ws, grant) -> str:
+    async def run():
+        handler = await _run_handler(ws)
+        ws.push(_attach_warmup(grant))
+        frame = await ws.wait_for_frame(lambda f: f["type"] in ("warmup_ready", "error"))
+        ws.disconnect()
+        await handler
+        return frame
+    frame = asyncio.run(run())
+    assert frame["type"] == "error"
+    assert in_session_calls.live_for_chat(CHAT) is None
+    return frame["data"]["message"]
+
+
+def test_a_chat_that_moved_to_another_session_refuses_the_attach(attach_env):
+    """The grant names the session it was minted for: a chat whose row now
+    names another one is never attached, whatever holds either session."""
+    ws, layer, grant = attach_env
+    layer.chat["session_id"] = "another-session"
+    assert "moved to another session" in _the_attach_is_refused(ws, grant)
+    assert layer.prompts == []
+
+
+def test_a_call_runs_in_a_chat_the_compute_machine_runs(attach_env, monkeypatch):
+    """The session the compute machine holds is the call's: the engine's own
+    layer in the proxy holds nothing and is never asked to run the turn."""
+    ws, layer, grant = attach_env
+    _on_compute(monkeypatch, layer)
+    _a_call_runs(ws, grant)
+    assert layer.prompts[0].endswith("Phone (+30210): hello there")
+    assert layer.closed == []
+
+
+def test_a_call_runs_in_a_chat_pinned_to_a_paired_computer(attach_env, monkeypatch):
+    """The chat's pin decides, not the agent's target (the platform here)."""
+    ws, layer, grant = attach_env
+    _on_machine(monkeypatch, layer, "m-1")
+    _a_call_runs(ws, grant)
+
+
+def test_a_call_waits_for_the_compute_machine_to_reconnect(attach_env, monkeypatch):
+    """A reading taken while the machine is away is the platform's own: the
+    holder is waited for, and once the machine is back the chat's layer is
+    read again and the call runs on it."""
+    ws, layer, grant = attach_env
+    link = _on_compute(monkeypatch, layer, linked=False)
+    layer.alive, layer.reconnects = False, True
+    orig = layer.wait_session_reconnect
+
+    async def _back(sid, **kw):
+        link["up"] = True
+        return await orig(sid, **kw)
+    layer.wait_session_reconnect = _back
+    _a_call_runs(ws, grant)
+
+
+def test_a_machine_that_stays_away_answers_the_dead_line(attach_env, monkeypatch):
+    ws, layer, grant = attach_env
+    _on_compute(monkeypatch, layer, linked=False)
+    layer.alive = False
+    assert "not running" in _the_attach_is_refused(ws, grant)
+
+
+def test_a_call_into_a_chat_on_another_persons_computer_is_refused(attach_env, monkeypatch):
+    """The placement lock, as for typing and voice: the grant's checks
+    passed, the chat's session runs on another person's own computer."""
+    ws, layer, grant = attach_env
+    _on_machine(monkeypatch, layer, "m-2", scope="user", owner="u2")
+    assert "computer" in _the_attach_is_refused(ws, grant)
+    assert layer.prompts == []
+
+
+def test_a_user_paired_machine_the_admin_switched_off_answers_the_dead_line(attach_env, monkeypatch):
+    """The resolver's guard runs on the chat's pin: the caller's own machine,
+    with user-paired machines turned off by the admin."""
+    ws, layer, grant = attach_env
+    _on_machine(monkeypatch, layer, "m-3", scope="user", owner="u1")
+    monkeypatch.setattr(phone_attach.task_store, "get_platform_setting",
+                        lambda key, *a, **kw: "0" if key == "allow_user_paired_machines" else None)
+    assert "not running" in _the_attach_is_refused(ws, grant)
+
+
+def test_a_chat_with_no_live_session_and_no_compute_machine_answers_the_dead_line(attach_env, monkeypatch):
+    """The platform runs no session itself: a chat of the platform's place
+    whose session nothing holds, with no compute machine connected, has no
+    layer to read. The call is refused with the dead line and starts nothing."""
+    from core.session import session_manager
+    ws, layer, grant = attach_env
+    monkeypatch.setattr(session_manager, "live_session", lambda sid: None)
+    layer.chat.update(execution_path="claude-code-cli", execution_target="local")
+    assert "not running" in _the_attach_is_refused(ws, grant)
+    assert layer.prompts == [] and layer.started == []
 
 
 def test_an_unknown_grant_refuses_the_attach(attach_env):
@@ -565,6 +736,31 @@ def test_a_session_that_dies_under_the_call_ends_it_and_tells_the_chat(attach_en
     assert call_control.binding_for(SID) is None
 
 
+def test_an_engine_error_while_the_machine_reconnects_keeps_the_call(attach_env, monkeypatch):
+    """The turn that failed is told; the session's machine comes back within
+    the wait and the next utterance reaches it."""
+    ws, layer, grant = attach_env
+    _on_compute(monkeypatch, layer)
+    _erroring_layer(layer, dead_after=True)
+    layer.reconnects = True
+
+    async def run():
+        handler = await _run_handler(ws)
+        ws.push(_attach_warmup(grant))
+        await ws.wait_for_frame(lambda f: f["type"] == "warmup_ready")
+        ws.push({"type": "chat", "prompt": "boom", "turn": 1})
+        await ws.wait_for_frame(lambda f: f["type"] == "error" and f.get("turn") == 1)
+        ws.push({"type": "chat", "prompt": "still there?", "turn": 2})
+        await ws.wait_for_frame(lambda f: f["type"] == "done" and f.get("turn") == 2)
+        assert ws.closed == [] and layer.notes == []
+        ws.push({"type": "chat", "prompt": "bye", "turn": 3, "system": True, "resume": True})
+        ws.push({"type": "close"})
+        await handler
+        await _pump_finished()
+    asyncio.run(run())
+    assert layer.prompts[-2] == "Phone (+30210): still there?"
+
+
 def test_a_stop_in_the_chat_ends_the_call_and_tells_the_chat(attach_env):
     ws, layer, grant = attach_env
 
@@ -695,3 +891,29 @@ def test_a_daemon_body_that_is_no_object_releases_the_grant(monkeypatch, body):
     monkeypatch.setattr(in_session_calls, "remember_call", lambda cid, grant: remembered.append(cid))
     phone_relay._remember_in_session(Response(content=body), "grant-1")
     assert released == ["grant-1"] and remembered == []
+
+
+@pytest.mark.parametrize("a_call_of_its_own_first", [False, True])
+def test_the_sockets_end_never_closes_the_chats_session_or_frees_its_slot(
+        attach_env, monkeypatch, a_call_of_its_own_first):
+    """The attach borrows the chat's session: at the socket's end nothing of
+    the chat's is closed or released, also on a socket that warmed a call of
+    its own before the grant came."""
+    import core.concurrency as concurrency
+    ws, layer, grant = attach_env
+    freed: list[str] = []
+    monkeypatch.setattr(concurrency, "release_chat_slot", freed.append)
+
+    async def run():
+        handler = await _run_handler(ws)
+        if a_call_of_its_own_first:
+            ws.push({"type": "warmup", "model": "unified", "llm_mode": "direct", "phone_mode": True})
+            own = await ws.wait_for_frame(lambda f: f["type"] in ("warmup_ready", "error"))
+            assert own["type"] == "warmup_ready" and own["data"]["session_id"] != SID
+            assert len(layer.started) == 1
+        ws.push(_attach_warmup(grant))
+        await ws.wait_for_frame(lambda f: f["type"] == "warmup_ready" and f["data"]["session_id"] == SID)
+        ws.push({"type": "close"})
+        await handler
+    asyncio.run(run())
+    assert SID not in layer.closed and SID not in freed

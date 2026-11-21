@@ -6,19 +6,24 @@ push/pull operations over WebSocket.
 
 import base64
 import contextlib
+import errno
 import fnmatch
+import functools
 import hashlib
 import logging
 import os
 import re
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+from stat import S_ISDIR, S_ISREG
 
 import config
 from auth import roles
 from core import layout
+from core.layers.codex import session_text
 from services.infra import safe_fs
 from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
 
@@ -32,12 +37,7 @@ _EMPTY_CONTENT_HASH = f"sha256:{hashlib.sha256(b'').hexdigest()}"
 MAX_CHUNK_SIZE = 512 * 1024  # 512KB per chunk
 # Cap on individual files entering sync (manifest + push/pull legs). Config-
 # driven (OTODOCK_MAX_FILE_MB); satellites receive the same value in the
-# auth_result policy handshake. Pre-0.5.103 satellites are hard-capped at
-# LEGACY_SYNC_MAX_FILE_BYTES — the per-machine gate lives in
-# satellite_connection.effective_sync_cap, and compute_manifest takes a
-# max_file_size override so old machines' merge plans never contain files
-# they would reject.
-LEGACY_SYNC_MAX_FILE_BYTES = 100 * 1024 * 1024
+# auth_result policy handshake.
 MAX_FILE_SIZE = config.SYNC_MAX_FILE_BYTES
 
 # Dotted directories that ARE included in the manifest despite starting
@@ -45,13 +45,9 @@ MAX_FILE_SIZE = config.SYNC_MAX_FILE_BYTES
 # every hidden dir; this whitelist is the carve-out for dirs the platform
 # legitimately needs to keep in sync with the satellite.
 #
-# ``.credentials`` (OAuth token files) is deliberately NOT here: token
-# files are delivered per-session over the session-file broker channel
-# (``remote_session_start._collect_session_files`` → satellite
-# ``sessions/session_files.py``) and wiped at session close, so a satellite
-# disk never holds long-lived refresh tokens between sessions. The platform
-# is refresh-authoritative (proxy-side background refresher); the transient
-# satellite copies are disposable.
+# ``.credentials`` is deliberately NOT here: an earlier release may have
+# left OAuth token files under it on a satellite's disk, and they must
+# never sync up.
 #
 # - ``.claude`` — Claude Code CLI per-user dir. Mixed authority:
 #   ``settings.json`` + the hook scripts are HOST-LOCAL (regenerated at every
@@ -131,15 +127,15 @@ _CLI_RUNTIME_CHILD_DIRS = frozenset({
     # are per-machine. Pushing the tree flooded a satellite off the socket
     # mid-sync (2026-08-06 incident).
     "plugins",
-    # Per-session ssh keys ($OTO_SSH_KEY_DIR) — materialized locally by
-    # session_config_dir.materialize_ssh_keys_for_sandbox, delivered to
-    # satellites only via the session-file broker (purged at close). Syncing
-    # them would persist private keys on every satellite of the agent.
+    # Per-session ssh key dirs ($OTO_SSH_KEY_DIR): the public halves each
+    # start writes (session_config_dir.materialize_ssh_public_keys), and an
+    # earlier release's private files until the boot's sweep removes them.
+    # Syncing them would carry those files to every satellite of the agent.
     "ssh",
 })
 
 
-def _is_cli_runtime_child(parent_name: str, child_name: str) -> bool:
+def is_runtime_child(parent_name: str, child_name: str) -> bool:
     """True for a runtime-cruft dir that is an immediate child of an engine
     config dir (``INCLUDE_DOTTED_DIRS``)."""
     return parent_name in INCLUDE_DOTTED_DIRS and child_name in _CLI_RUNTIME_CHILD_DIRS
@@ -213,17 +209,13 @@ def _is_cli_runtime_cruft_file(parent_name: str, file_name: str) -> bool:
 # Codex app-server keeps per-machine SQLite *runtime state* directly in
 # CODEX_HOME — versioned DB families (``state_N``, ``logs_N``, ``goals_N``,
 # ``memories_N``, …) plus their ``-wal``/``-shm`` sidecars. Each host — the
-# platform AND every satellite — owns its own copies; a foreign one aborts
-# daemon init with "migration N … has been modified"
-# (``CodexAppServerSession._reset_codex_state`` self-heals it, but only if its
-# globs cover the poisoned file). New DB families appear with codex releases,
-# so match EVERY SQLite file directly under ``.codex/`` — nothing legitimate to
-# sync is ever SQLite there. These NEVER sync, in EITHER direction — excluded
-# from every manifest/snapshot below. This is stronger than
+# platform AND every satellite — owns its own copies, which every session of
+# that host's store shares (``CODEX_SQLITE_HOME``). New DB families appear with
+# codex releases, so match EVERY SQLite file directly under ``.codex/`` —
+# nothing legitimate to sync is ever SQLite there. These NEVER sync, in EITHER
+# direction — excluded from every manifest/snapshot below. This is stronger than
 # ``SATELLITE_OWNED_SUBPATHS`` (which only blocks satellite→platform *deletes*):
-# the SQLite must also never be pushed platform→satellite. The glob matches
-# ``_reset_codex_state``'s own glob so what we exclude is exactly what codex
-# resets.
+# the SQLite must also never be pushed platform→satellite.
 _CODEX_RUNTIME_GLOBS = ("*.sqlite*",)
 
 # Per-session REGENERATED Codex config — each host writes its own at session
@@ -255,7 +247,10 @@ def _is_codex_runtime_state(rel_path: str) -> bool:
     parts = rel_path.replace("\\", "/").split("/")
     if len(parts) < 2 or parts[-2] != ".codex":
         return False
-    if parts[-1] in _CODEX_HOST_LOCAL_FILES:
+    # A session's own Codex files and a thread's record
+    # (``session_text.is_session_file``): host-local like the set above, for
+    # the same reason (a session's tokens and text).
+    if parts[-1] in _CODEX_HOST_LOCAL_FILES or session_text.is_session_file(parts[-1]):
         return True
     return any(fnmatch.fnmatch(parts[-1], g) for g in _CODEX_RUNTIME_GLOBS)
 
@@ -273,7 +268,7 @@ def _is_codex_runtime_state(rel_path: str) -> bool:
 _CLAUDE_HOST_LOCAL_FILES = frozenset({
     "settings.json", "permission_gate.py", "tool_result_forwarder.py",
     "subagent_tracker.py", "stop_tracker.py", "stdio_path_interceptor.py",
-    "mcp-config.json", "system-prompt.md",
+    "usage_report.py", "mcp-config.json", "system-prompt.md",
     # Claude CLI OAuth credential file. Each host's copy is written by the
     # platform itself — at session start (local: the CLI layer; remote: the
     # satellite from the ``credentials_json`` start payload) and on every
@@ -298,6 +293,19 @@ _CLAUDE_HOST_LOCAL_FILES = frozenset({
 _CLAUDE_HOST_LOCAL_RE = re.compile(
     r"^(?:mcp-config(?:-[^/]{1,12})?|[A-Za-z0-9._-]+-[0-9a-f]{12}(?:-[^/]{1,12})?)\.json$"
 )
+
+
+def is_host_local_config_name(name: str) -> bool:
+    """A file name in an engine home that each host writes its own of at
+    session start (``_CLAUDE_HOST_LOCAL_FILES``, ``_CODEX_HOST_LOCAL_FILES``)."""
+    return name in _CLAUDE_HOST_LOCAL_FILES or name in _CODEX_HOST_LOCAL_FILES
+
+
+def is_session_copy_name(name: str) -> bool:
+    """A file name of a tool config copy in an engine home
+    (``_CLAUDE_HOST_LOCAL_RE``): a session's own, named with the session's
+    first twelve characters, or an earlier release's shared one."""
+    return bool(_CLAUDE_HOST_LOCAL_RE.match(name))
 
 
 def _is_claude_runtime_state(rel_path: str) -> bool:
@@ -326,10 +334,8 @@ def _is_venv_dir(path: Path) -> bool:
 # Sync-ignore rules: marker-confirmed generated-dir exclusion (1.5).
 #
 # The proxy is the table's SOURCE (``config.SYNC_IGNORE_RULES``, shipped to
-# 0.5.110+ satellites in the auth_result policy handshake) and applies the
-# SAME table to its own per-machine manifest walk — but ONLY for machines
-# whose satellite ACKed support (``satellite_supports_sync_ignore_rules``),
-# else both sides must walk legacy-style or the diff churns. Semantics are
+# satellites in the auth_result policy handshake) and applies the SAME table
+# to its own per-machine manifest walk, or the diff churns. Semantics are
 # documented in satellite/transport/file_sync.py — engine code MUST stay
 # semantically identical here (evidence from walk LISTINGS by exact string
 # compare / fnmatchcase, never filesystem probes: the satellite may sit on
@@ -456,18 +462,15 @@ class _IgnoreMatcher:
                     return True
         return False
 
-    def has_in_dir_marker(self, dir_path: Path, files: list[str],
-                          dirs: list[str]) -> bool:
+    def has_in_dir_marker(self, files: list[str], dirs: list[str],
+                          read_tag: Callable[[str], bytes]) -> bool:
+        """``read_tag(name)`` gives the first bytes of a signed marker in this
+        folder, ``b""`` when it cannot be read (fail toward syncing)."""
         for f in files:
             if f in self.file_markers:
                 return True
-            if f in self.signed_markers:
-                try:
-                    with open(dir_path / f, "rb") as fh:
-                        if fh.read(len(_CACHEDIR_SIG)) == _CACHEDIR_SIG:
-                            return True
-                except OSError:
-                    pass  # unreadable tag → not a marker (fail toward syncing)
+            if f in self.signed_markers and read_tag(f) == _CACHEDIR_SIG:
+                return True
         return any(d in self.dir_markers for d in dirs)
 
     def is_vetoed(self, files: list[str]) -> bool:
@@ -564,6 +567,10 @@ class MergePlan:
     on the satellite, never captured, never pulled)."""
     actions: list[FileAction]
     to_scrub: list[str]
+    # Platform copies that differ from the base at paths the machine could not
+    # read: no side may act on them this time, and no read may take the
+    # machine's copy over them (``remote_file_cache.note_merge_left``).
+    left_unread: list[str] = field(default_factory=list)
 
 
 def _adjusted_satellite_mtime(satellite_mtime: float, clock_offset: float | None) -> float | None:
@@ -591,6 +598,23 @@ def _platform_wins_divergence(
     return True       # platform newer, or within margin → platform-wins
 
 
+def _tag_head(rootfd: int, rel_dir: str, name: str) -> bytes:
+    """The first bytes of the marker file ``name`` in the walked folder
+    ``rel_dir`` beneath ``rootfd``: a regular file reached with no link,
+    never waited on; ``b""`` otherwise."""
+    rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+    try:
+        fd, _st = safe_fs.open_regular_for_read(rootfd, rel)
+    except OSError:
+        return b""
+    try:
+        return os.pread(fd, len(_CACHEDIR_SIG), 0)
+    except OSError:
+        return b""
+    finally:
+        os.close(fd)
+
+
 def compute_manifest(
     agent_dir: Path,
     *,
@@ -598,7 +622,6 @@ def compute_manifest(
     target_username: str | None = None,
     target_role: str = "",
     exclude_user_dirs: bool = False,
-    max_file_size: int | None = None,
     ignore_rules: dict | None = None,
 ) -> list[FileEntry]:
     """Compute file manifest for an agent directory.
@@ -621,26 +644,54 @@ def compute_manifest(
             (``roles.can_manage``), ``config/`` paths are excluded so the
             satellite never receives the agent's prompt / context files —
             ``""`` and any word the table does not know are non-owners.
-        max_file_size: Per-file byte cap override. Pass the target machine's
-            ``effective_sync_cap`` so a pre-0.5.103 satellite's merge plan
-            never contains a file it would reject at 100MB. None = the
-            config-driven ``MAX_FILE_SIZE``.
         ignore_rules: VALIDATED sync-ignore rule table to apply to this
-            walk, or None for the legacy walk. Pass the table ONLY for
-            machines whose satellite ACKed support (0.5.110+ — see
-            ``satellite_supports_sync_ignore_rules``); the two walks must
-            apply the SAME rules or the diff misattributes deletes.
+            walk, or None for a walk with no rules. The machine's walk
+            applies the same table: the two walks must apply the SAME rules
+            or the diff misattributes deletes.
+
+    The walk lists by name, and what it lists is read beneath the agent's
+    folder with no link followed (``safe_fs``): every folder it visits is
+    checked where it stands, a file is hashed from its own descriptor, a
+    pipe is never waited on. The agent's folder itself is held by its
+    realpath, as the sandbox render takes it: an operator who moved it to
+    another disk behind a link keeps syncing.
     """
-    entries: list[FileEntry] = []
     if not agent_dir.exists():
-        return entries
-    size_cap = max_file_size or MAX_FILE_SIZE
+        return []
+    with contextlib.ExitStack() as stack:
+        try:
+            rootfd = stack.enter_context(safe_fs.open_root(agent_dir))
+        except OSError:
+            return []
+        return _manifest_beneath(
+            agent_dir, rootfd, scope=scope, target_username=target_username,
+            target_role=target_role, exclude_user_dirs=exclude_user_dirs,
+            ignore_rules=ignore_rules)
+
+
+def _manifest_beneath(
+    agent_dir: Path, rootfd: int, *, scope: str, target_username: str | None,
+    target_role: str, exclude_user_dirs: bool, ignore_rules: dict | None,
+) -> list[FileEntry]:
+    """``compute_manifest``'s walk, ``rootfd`` held on the agent's folder."""
+    entries: list[FileEntry] = []
+    size_cap = MAX_FILE_SIZE
     matcher = compiled_ignore_matcher(ignore_rules)
     rule_candidates: set[str] = set()
 
     for root, dirs, files in os.walk(agent_dir):
         root_path = Path(root)
         rel_root = root_path.relative_to(agent_dir)
+        rel_dir = rel_root.as_posix()
+        if rel_dir != ".":
+            # Listed by name: a folder swapped for a link since is refused
+            # where it stands, and nothing below it is listed or read.
+            try:
+                if not S_ISDIR(safe_fs.lstat_beneath(rootfd, rel_dir).st_mode):
+                    raise NotADirectoryError(rel_dir)
+            except OSError:
+                dirs[:] = []
+                continue
         # Sync-ignore rules: at-visit decision — mirror of the satellite's
         # ``_walk_sync_tree`` (same candidate mechanics, same evidence-from-
         # listings rule; see the engine block above).
@@ -651,7 +702,8 @@ def compute_manifest(
             if (len(rel_root.parts) >= 2
                     and root_path.name not in _RULE_PROTECTED_DIR_NAMES
                     and (_was_candidate
-                         or matcher.has_in_dir_marker(root_path, files, dirs))
+                         or matcher.has_in_dir_marker(
+                             files, dirs, functools.partial(_tag_head, rootfd, rel_dir)))
                     and not matcher.is_vetoed(files)):
                 dirs[:] = []
                 continue
@@ -666,7 +718,7 @@ def compute_manifest(
             if d not in SKIP_DIRS
             and not _is_venv_dir(Path(root) / d)
             and (not d.startswith(".") or d in INCLUDE_DOTTED_DIRS)
-            and not _is_cli_runtime_child(_root_name, d)
+            and not is_runtime_child(_root_name, d)
         ]
         synced_children = _engine_home_children(rel_root.as_posix())
         if synced_children is not None:
@@ -728,25 +780,26 @@ def compute_manifest(
             try:
                 # Skip symlinks entirely — they can't be transferred meaningfully
                 # via base64 file content and would silently become regular files
-                # on the other side.
-                if file_path.is_symlink():
+                # on the other side — and anything else that is not a regular
+                # file (a pipe, a socket, a device).
+                st = os.lstat(file_path)
+                if not S_ISREG(st.st_mode):
                     continue
-                stat = file_path.stat()
                 # Skip very large files (> the effective per-file cap).
-                if stat.st_size > size_cap:
+                if st.st_size > size_cap:
                     logger.warning(
                         "Skipping %s in manifest: %.1f MB exceeds %d MB limit",
-                        rel_path, stat.st_size / 1024 / 1024, size_cap // 1024 // 1024,
+                        rel_path, st.st_size / 1024 / 1024, size_cap // 1024 // 1024,
                     )
                     continue
-                file_hash = _hash_file_cached(file_path, stat)
+                file_hash, st = _hash_listed(rootfd, rel_path, file_path, st, max_size=size_cap)
                 entries.append(FileEntry(
                     path=rel_path,
                     hash=file_hash,
-                    size=stat.st_size,
-                    mtime=stat.st_mtime,
+                    size=st.st_size,
+                    mtime=st.st_mtime,
                 ))
-            except (OSError, PermissionError):
+            except OSError:
                 continue
 
     return entries
@@ -1044,6 +1097,22 @@ def should_sync_to_target(rel_path: str, username: str | None, role: str) -> boo
     return True
 
 
+def replaced_notice(names: list[str]) -> tuple[str, str]:
+    """The title and the words a person reads when a conflict replaced their
+    version of ``names``: the Recover bin's own words, whoever the other
+    writer was (another person, or the person's own second place)."""
+    count = len(names)
+    if count == 1:
+        return ("Recover your file",
+                f"Your version of “{names[0]}” was replaced by a newer version. "
+                "It is in the Recover bin.")
+    preview = ", ".join(names[:3])
+    more = f" +{count - 3} more" if count > 3 else ""
+    return ("Recover your files",
+            f"{count} of your files were replaced by newer versions. "
+            f"They are in the Recover bin: {preview}{more}.")
+
+
 def _divergence_capture(
     path: str, author_of, satellite_user: str, platform_wins: bool,
 ) -> tuple[str | None, str | None, str | None]:
@@ -1077,7 +1146,6 @@ def _resolve_merge(
     satellite_tree_present: bool = True,
     writable_libraries: frozenset[tuple[str, str]] | None = None,
     knowledge_rw: bool = False,
-    absence_unknown: bool = False,
     held: bool = False,
     restore_holds: bool = False,
 ) -> FileAction | None:
@@ -1089,12 +1157,10 @@ def _resolve_merge(
     ``can_write_back`` — an unauthorized satellite→platform write becomes a
     no-op (leave the satellite's copy), never a clobber.
 
-    ``absence_unknown``: the satellite's manifest may leave out a file it
-    has (a Windows satellite 0.5.130–0.5.143 hashed nothing it had not
-    been sent), so a platform-only path is left alone. ``held``: the path's
-    platform copy went with the Windows hash bug (``windows-hash-hold``); it
-    is never deleted on a machine, and only a ``restore_holds`` merge (a
-    fixed Windows satellite) brings the machine's copy back.
+    ``held``: the path's platform copy went with the Windows hash bug
+    (``windows-hash-hold``); it is never deleted on a machine, and only a
+    ``restore_holds`` merge (a Windows satellite) brings the machine's copy
+    back.
     """
     def cwb() -> bool:
         return can_write_back(path, target_role, target_username,
@@ -1136,9 +1202,6 @@ def _resolve_merge(
         return None
 
     # --- platform only ---
-    if P is not None and S is None and absence_unknown:
-        # A base proves nothing here: the bug's own deletes cleared it.
-        return None
     if P is not None and S is None:
         # The satellite lacks a platform file. If it CONVERGED on this exact version
         # (B == P), its tree is still ALIVE (non-empty manifest — not a wipe), AND the
@@ -1174,7 +1237,7 @@ def _resolve_merge(
 
     # --- satellite only ---
     if S is not None and P is None and held:
-        # Only a fixed Windows machine restores: its copy may hold edits the
+        # Only a Windows machine restores: its copy may hold edits the
         # platform never received, which an idle machine's older bytes must
         # not beat. The restored copy keeps that machine's mtime, so a newer
         # copy elsewhere (another Windows machine, an edit made meanwhile)
@@ -1228,9 +1291,9 @@ def diff_manifests(
     writable_libraries: frozenset[tuple[str, str]] | None = None,
     scrub_dirs: set[str] | None = None,
     knowledge_rw: bool = False,
-    absence_unknown: bool = False,
     holds: dict[str, float] | None = None,
     restore_holds: bool = False,
+    shared_by_many: bool = False,
 ) -> MergePlan:
     """Resolve a 3-way merge (platform vs satellite vs last-converged base) into a
     per-file action plan — **newest-version-wins**, not proxy-always-wins.
@@ -1238,7 +1301,7 @@ def diff_manifests(
     Args:
         local: Platform manifest (``FileEntry`` with hash + mtime).
         remote: Satellite manifest (dicts with ``path``/``hash``/``mtime``).
-            An entry with ``skipped`` (0.5.145+, asked with ``report_skipped``)
+            An entry with ``skipped`` (asked with ``report_skipped``)
             is there but could not be read: a file, or with ``dir`` every path
             at or under a folder (``""`` = the whole tree). Nothing is done to
             an unknown path, and it does not make the tree count as alive.
@@ -1276,14 +1339,18 @@ def diff_manifests(
             per-turn ``file_changed`` applier agree on knowledge/ writes
             from agent-scope task fires. Machine-pairing merges (reconnect,
             idle sweep, presync) carry no session and pass False.
-        absence_unknown: the satellite may leave out files it has (an old
-            Windows satellite): no platform-only path gets an action, but for
-            the platform-authoritative push-only paths, which are pushed.
         holds: ``{rel_path: deleted_at_mtime}`` of the ``windows-hash-hold``
             tombstones (left out of ``tombstones``): never a delete on a
-            machine; ``restore_holds`` (a fixed Windows satellite) pulls a
+            machine; ``restore_holds`` (a Windows satellite) pulls a
             held file the machine has, and a held path the platform has
             again merges as usual and drops the hold.
+        shared_by_many: the machine is a compute machine with its own copy,
+            which many people's sessions share. ``target_username`` is then
+            the session's person (``""`` for the agent's own run), and the
+            other people's folders there are theirs: left out of every input,
+            they are neither scrubbed, pulled nor read as deleted, and a
+            ``config/`` extra stays for a manager's merge. What never leaves
+            the platform is still scrubbed.
 
     Returns a ``MergePlan`` (per-file ``FileAction`` list + the ``to_scrub``
     isolation deletes). Pure / side-effect-free — the caller executes it.
@@ -1316,6 +1383,18 @@ def diff_manifests(
         tombstones = {k: v for k, v in tombstones.items()
                       if not layout.is_personal(k)}
         holds = {k: v for k, v in holds.items() if not layout.is_personal(k)}
+    if shared_by_many and target_username is not None:
+        # Another person's folder on a machine many people share: the
+        # single-owner scrub below would delete it there, and its owner's
+        # next merge would then read it as deleted and delete it on the
+        # platform. Only that person's own sessions merge it.
+        def _theirs(p: str) -> bool:
+            return layout.is_personal(p) and layout.user_of(p) != target_username
+        local = [e for e in local if not _theirs(e.path)]
+        remote = [r for r in remote if not _theirs(str(r.get("path", "")))]
+        base = {k: v for k, v in base.items() if not _theirs(k)}
+        tombstones = {k: v for k, v in tombstones.items() if not _theirs(k)}
+        holds = {k: v for k, v in holds.items() if not _theirs(k)}
     # The engine-home paths the allowlist leaves to each host are nobody's
     # to sync: a satellite below 0.5.150 still lists them, and read as
     # satellite-only extras under a push-only segment they would be scrubbed
@@ -1342,6 +1421,7 @@ def diff_manifests(
 
     actions: list[FileAction] = []
     to_scrub: list[str] = []
+    left_unread: list[str] = []
 
     # Iterate the union of all known keys so a both-absent file with only a stale
     # base/tombstone row still gets cleaned up.
@@ -1350,6 +1430,9 @@ def diff_manifests(
         # There on the machine but unread (locked, denied, past the cap, in
         # a folder it could not list): no side may act on it this time.
         if path in unknown_files or (unknown_dirs and path.startswith(unknown_dirs)):
+            unread = local_map.get(path)
+            if unread is not None and (path not in base or base[path][0] != unread.hash):
+                left_unread.append(path)
             continue
         lentry = local_map.get(path)
         rentry = remote_map.get(path)
@@ -1377,13 +1460,17 @@ def diff_manifests(
         if _is_push_only(path, push_only_p, push_only_s):
             if P is not None:
                 if S is None or P != S:
-                    # A divergent satellite copy of a READ-ONLY library
-                    # mirror is someone's local edit about to be reverted —
-                    # honor revert-to-trash: capture the satellite bytes
-                    # before the platform push clobbers them. Other
-                    # push-only divergences (config/, machinery) keep the
-                    # historical silent-overwrite behavior.
-                    capture = (S is not None
+                    # A satellite copy of a READ-ONLY library mirror that
+                    # differs from its base is someone's local edit about to
+                    # be reverted: honor revert-to-trash, capture the
+                    # satellite bytes before the platform push clobbers them.
+                    # A copy equal to its base is the copy the platform last
+                    # gave this machine: the library moved on while it was
+                    # away, nobody changed it there, and it is pushed with no
+                    # capture. No base row: kept, as nothing proves it old.
+                    # Other push-only divergences (config/, machinery) keep
+                    # the historical silent-overwrite behavior.
+                    capture = (S is not None and S != B
                                and library_mirror_source(path) is not None)
                     actions.append(FileAction(
                         path, "push", base_hash=P,
@@ -1407,7 +1494,7 @@ def diff_manifests(
                 # regenerated segments: read-only library-mirror extras are
                 # an anomaly on ANY pairing (the projector owns mirror
                 # content), unlike config/ pending-curation extras.
-                if (target_username is not None
+                if ((target_username is not None and not shared_by_many)
                         or _is_push_only(path, scrub_p, push_only_s)):
                     to_scrub.append(path)
             continue
@@ -1436,14 +1523,13 @@ def diff_manifests(
             satellite_tree_present=sat_tree_present,
             writable_libraries=writable_libraries,
             knowledge_rw=knowledge_rw,
-            absence_unknown=absence_unknown,
             held=held,
             restore_holds=restore_holds,
         )
         if action is not None:
             actions.append(action)
 
-    return MergePlan(actions=actions, to_scrub=to_scrub)
+    return MergePlan(actions=actions, to_scrub=to_scrub, left_unread=left_unread)
 
 
 def prepare_outgoing_files(
@@ -1637,23 +1723,36 @@ def apply_incoming_file(
                 raise
 
 
-def _hash_file(path: Path) -> str:
-    """Compute sha256 hash of a file (streamed — memory-bounded at any size)."""
+def _hash_fd(fd: int) -> str:
+    """sha256 of what ``fd`` holds, streamed with ``pread`` (no offset moved,
+    memory-bounded at any size). The caller owns ``fd``."""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while chunk := f.read(1024 * 1024):
-            h.update(chunk)
+    for chunk in safe_fs.iter_fd(fd, chunk_size=1024 * 1024):
+        h.update(chunk)
     return f"sha256:{h.hexdigest()}"
 
 
-# (path → (size, mtime_ns, digest)) LRU so repeated manifest passes never re-hash
+def _hash_file(path: Path) -> str:
+    """sha256 of a regular file at ``path``: a descriptor's path
+    (``safe_fs.fd_path``) or a file the caller made. The open never waits,
+    and anything but a regular file is refused (``NotRegularFile``)."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY)
+    try:
+        if not S_ISREG(os.fstat(fd).st_mode):
+            raise safe_fs.NotRegularFile(errno.EINVAL, "not a regular file", str(path))
+        return _hash_fd(fd)
+    finally:
+        os.close(fd)
+
+
+# (path → (size, mtime_ns, inode, digest)) LRU so repeated manifest passes never re-hash
 # unchanged files — at the 1GB cap a single re-hash is seconds of CPU+IO, and
 # manifests run every sync cycle. Thread-safe: compute_manifest runs inside
 # asyncio.to_thread, potentially concurrently for several machines. The
 # digest is the raw 32 bytes (a third of the ``sha256:<hex>`` text), and the
 # ceiling covers a fleet's synced trees: a cache that thrashes turns every
 # cyclic walk cold, which one INFO line per process reports the first time.
-_HASH_CACHE: OrderedDict[str, tuple[int, int, bytes]] = OrderedDict()
+_HASH_CACHE: OrderedDict[str, tuple[int, int, int, bytes]] = OrderedDict()
 _HASH_CACHE_MAX = 200_000
 _hash_cache_lock = threading.Lock()
 _hash_cache_evicted_logged = False
@@ -1670,10 +1769,10 @@ def _digest_of(file_hash: str) -> bytes | None:
     return digest if len(digest) == 32 else None
 
 
-def _hash_cache_put(key: str, size: int, mtime_ns: int, digest: bytes) -> None:
+def _hash_cache_put(key: str, st: os.stat_result, digest: bytes) -> None:
     """Under the lock: store one entry, keep the LRU under its ceiling."""
     global _hash_cache_evicted_logged
-    _HASH_CACHE[key] = (size, mtime_ns, digest)
+    _HASH_CACHE[key] = (st.st_size, st.st_mtime_ns, st.st_ino, digest)
     _HASH_CACHE.move_to_end(key)
     evicted = 0
     while len(_HASH_CACHE) > _HASH_CACHE_MAX:
@@ -1693,32 +1792,50 @@ def _hash_cache_put(key: str, size: int, mtime_ns: int, digest: bytes) -> None:
 _HASH_CACHE_RACY_WINDOW_S = 2.0
 
 
-def _hash_file_cached(path: Path, st: os.stat_result) -> str:
-    """``_hash_file`` with a (size, mtime_ns) validity check against the LRU."""
+def _same_state(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_size, a.st_mtime_ns, a.st_ino) == (b.st_size, b.st_mtime_ns, b.st_ino)
+
+
+def _same_bytes(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_size, a.st_mtime_ns) == (b.st_size, b.st_mtime_ns)
+
+
+def _hash_listed(root, rel: str, key: Path, st: os.stat_result, *,
+                 max_size: int | None) -> tuple[str, os.stat_result]:
+    """The hash of the regular file a walk listed at ``rel`` beneath ``root``,
+    with the status it was read at. ``st`` is the listing's own ``lstat``: a
+    hit on its (size, mtime_ns, inode) outside the racy window reads
+    nothing. A miss opens ``rel`` with no link followed and never waiting
+    (``safe_fs``: an ``OSError`` for a link, a pipe, a vanished file, over
+    ``max_size``) and hashes that descriptor. The cache is keyed by the
+    path text ``key``, the one ``prime_hash_cache`` and ``forget_hash`` use,
+    and holds the listing's status, so a hit compares an ``lstat`` with an
+    ``lstat`` (the satellite's rule: Windows may give the open file another
+    inode)."""
     import time as _time
-    key = str(path)
-    racy = (_time.time() - st.st_mtime) < _HASH_CACHE_RACY_WINDOW_S
-    if not racy:
+    cache_key = str(key)
+    if (_time.time() - st.st_mtime) >= _HASH_CACHE_RACY_WINDOW_S:
         with _hash_cache_lock:
-            hit = _HASH_CACHE.get(key)
-            if hit is not None and hit[0] == st.st_size and hit[1] == st.st_mtime_ns:
-                _HASH_CACHE.move_to_end(key)
-                return "sha256:" + hit[2].hex()
-    file_hash = _hash_file(path)
+            hit = _HASH_CACHE.get(cache_key)
+            if hit is not None and hit[:3] == (st.st_size, st.st_mtime_ns, st.st_ino):
+                _HASH_CACHE.move_to_end(cache_key)
+                return "sha256:" + hit[3].hex(), st
+    fd, before = safe_fs.open_regular_for_read(root, rel, max_size=max_size)
     try:
-        st2 = os.stat(path)
-    except OSError:
-        return file_hash
-    # TOCTOU guard: only cache when the file provably didn't change under the
-    # streaming read — otherwise the hash may be of a torn intermediate state.
-    # (Caching a racy-fresh entry is fine — reads inside the racy window
-    # bypass the cache anyway.)
-    if st2.st_size == st.st_size and st2.st_mtime_ns == st.st_mtime_ns:
+        file_hash = _hash_fd(fd)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    # Cached only when the file provably didn't change under the streaming
+    # read, nor since its listing (else the hash may be of a torn state or of
+    # another file). Caching a racy-fresh entry is fine: reads inside the
+    # racy window bypass it.
+    if _same_state(before, after) and _same_bytes(before, st):
         digest = _digest_of(file_hash)
         if digest is not None:
             with _hash_cache_lock:
-                _hash_cache_put(key, st.st_size, st.st_mtime_ns, digest)
-    return file_hash
+                _hash_cache_put(cache_key, st, digest)
+    return file_hash, before
 
 
 def prime_hash_cache(path: Path, file_hash: str) -> None:
@@ -1730,11 +1847,11 @@ def prime_hash_cache(path: Path, file_hash: str) -> None:
     if digest is None:
         return
     try:
-        st = os.stat(path)
+        st = os.lstat(path)
     except OSError:
         return
     with _hash_cache_lock:
-        _hash_cache_put(str(path), st.st_size, st.st_mtime_ns, digest)
+        _hash_cache_put(str(path), st, digest)
 
 
 def forget_hash(path: Path) -> None:

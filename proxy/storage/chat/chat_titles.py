@@ -112,6 +112,27 @@ def remove_tag_blocks(text: str, tags: tuple[str, ...]) -> str:
     return "".join(out)
 
 
+#: The start's riding part (``core/session/start_context.py``): a block the
+#: platform puts ahead of a headless session's first turn, never a person's
+#: words. Its bodies are fenced, so the first close after the open is its own.
+START_CONTEXT_TAG = "start-context"
+_START_OPEN = f"<{START_CONTEXT_TAG}>"
+_START_CLOSE = f"</{START_CONTEXT_TAG}>"
+
+
+def without_start_context(text: str) -> str:
+    """``text`` without the riding-part blocks that lead it."""
+    out = text
+    while True:
+        lead = out.lstrip()
+        if not lead.startswith(_START_OPEN):
+            return out
+        end = lead.find(_START_CLOSE, len(_START_OPEN))
+        if end < 0:
+            return out
+        out = lead[end + len(_START_CLOSE):].lstrip()
+
+
 def _strip_preludes(text: str) -> str:
     pos = 0
     while True:  # stacked preludes (the time stamp plus the focus line)

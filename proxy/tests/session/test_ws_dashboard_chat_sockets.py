@@ -153,6 +153,25 @@ def test_a_notification_reaches_the_socket_during_its_turn(temp_db, monkeypatch)
     run_ws_scenario(scenario)
 
 
+def test_a_machine_that_came_or_went_reaches_the_socket_during_its_turn(temp_db, monkeypatch):
+    """A machine's connect reaches a streaming socket before ``done``, and
+    the page's ``target_check`` after it is answered inside the turn too:
+    the banner does not wait for the turn's end."""
+    layer, gate, slug = _setup(monkeypatch)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, _sid = await _start(ws, layer, slug)
+            _conn().notify_queue.put_nowait({"type": wire.MACHINE_LINK, "machine_id": "m-1"})
+            await ws.expect({"type": wire.MACHINE_LINK, "machine_id": "m-1"})
+            ws.client_send({"type": wire.IN_TARGET_CHECK})
+            await ws.expect({"type": wire.TARGET_MISMATCH, "chat_id": chat_id})
+            gate.set()
+            await _until(ws, "done")
+    run_ws_scenario(scenario)
+
+
 def test_a_server_turn_queued_mid_turn_waits_for_the_turn(temp_db, monkeypatch):
     """A nudge queued during the turn is not run inside it, and a
     notification queued BEHIND it still goes out at once; the nudge runs
@@ -1399,3 +1418,360 @@ def test_a_store_error_in_the_unread_count_runs_the_cleanup(temp_db, monkeypatch
         assert not _connections_by_user.get("user-admin")
         assert len(unregistered) == 1
     run_ws_scenario(scenario)
+
+
+# -- a send runs on the session of the chat its gates judged -------------------
+#
+# A socket that holds one chat's session and is then put on another chat holds
+# no session of the second: its send starts or finds that chat's own session
+# and never rides, or recycles, the first chat's, which the person may only be
+# allowed to watch.
+
+_VIEWER = {"sub": "user-viewer", "email": "viewer@test.com", "name": "Viewer User",
+           "role": "member"}
+
+
+def _watched_and_own(layer) -> tuple[str, str]:
+    """A Shared-only agent's chat a contributor may watch, live, and that
+    contributor's own chat on another agent."""
+    import uuid
+
+    from core.session.visibility import shared_chat_owner
+    from tests.fixtures.ws_dashboard_harness import TEST_MODEL
+    pool_agent = make_test_agent(collaborative=False, default_scope="agent")
+    own_agent = make_test_agent()
+    task_store.add_user_agent("user-viewer", pool_agent, "contributor", "test")
+    task_store.add_user_agent("user-viewer", own_agent, "viewer", "test")
+    set_username("user-viewer", "viewer")
+    layer.alive.add("sid-watched")
+    layer.turn_events = [CommonEvent(type=TEXT, data={"content": "ok"}),
+                         CommonEvent(type=DONE, data={})]
+    chats = []
+    for agent, owner in ((pool_agent, shared_chat_owner(pool_agent)), (own_agent, "user-viewer")):
+        cid = str(uuid.uuid4())
+        task_store.create_chat(cid, owner, agent, "default", model=TEST_MODEL,
+                               execution_path="claude-code-cli", source_type="chat")
+        chats.append(cid)
+    task_store.update_chat(chats[0], session_id="sid-watched")
+    return chats[0], chats[1]
+
+
+async def _watch(ws, watched: str) -> None:
+    await drain_startup(ws)
+    ws.client_send({"type": "resume_chat", "chat_id": watched})
+    ready = await _until(ws, "warmup_ready")
+    assert ready["session_id"] == "sid-watched"
+    await _until(ws, "queue_snapshot")
+
+
+async def _done_of(ws, chat_id: str) -> None:
+    while (await _until(ws, "done")).get("chat_id") != chat_id:
+        pass
+
+
+def _never_the_watched_session(layer, watched: str, own: str) -> None:
+    took = [sid for sid, _, _ in layer.messages]
+    assert took and "sid-watched" not in took, took
+    assert took == [task_store.get_chat(own)["session_id"]]
+    # The watched chat's session is neither sent to nor closed.
+    assert layer.closed_sessions == [] and "sid-watched" in layer.alive
+    assert task_store.get_chat_messages(watched) == []
+
+
+def test_a_send_after_joining_another_chats_warmup_runs_on_that_chat(temp_db, monkeypatch):
+    from core.session import warmup_registry
+    layer = FakeExecutionLayer()
+    stub_dashboard_seams(monkeypatch, layer)
+    watched, own = _watched_and_own(layer)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie(**_VIEWER)) as ws:
+            await _watch(ws, watched)
+            # Another tab of the person warms their own chat.
+            await warmup_registry.register(own, "user-viewer", "x")
+            ws.client_send({"type": "resume_chat", "chat_id": own})
+            while (await _until(ws, "chat_history")).get("chat_id") != own:
+                pass
+            # While it gets ready a message waits in the chat's queue.
+            ws.client_send({"type": "chat", "chat_id": own, "text": "first"})
+            await _done_of(ws, own)
+            assert layer.messages == []
+            # That warmup ends, and this socket adopted nothing of it.
+            await warmup_registry.unregister(own)
+            ws.client_send({"type": "chat", "chat_id": own, "text": "second"})
+            await _done_of(ws, own)
+    run_ws_scenario(scenario)
+    _never_the_watched_session(layer, watched, own)
+
+
+def test_a_send_after_a_first_message_to_a_moving_chat_runs_on_that_chat(temp_db, monkeypatch):
+    from services.remote import chat_move
+    layer = FakeExecutionLayer()
+    stub_dashboard_seams(monkeypatch, layer)
+    watched, own = _watched_and_own(layer)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie(**_VIEWER)) as ws:
+            await _watch(ws, watched)
+            # A move of the person's own chat runs: it holds the chat.
+            q = await input_queue.loaded(own)
+            claim = q.try_claim()
+            monkeypatch.setitem(chat_move._running, own, object())
+            ws.client_send({"type": "warmup", "chat_id": own,
+                            "agent": task_store.get_chat(own)["agent"], "text": "first"})
+            # The first message waits in the chat's queue behind the move.
+            await _wait_for(lambda: bool(q.of("user-viewer")))
+            assert layer.messages == []
+            monkeypatch.delitem(chat_move._running, own)
+            q.release(claim, rearm=False)
+            await _done_of(ws, own)
+            ws.client_send({"type": "chat", "chat_id": own, "text": "second"})
+            await _done_of(ws, own)
+    run_ws_scenario(scenario)
+    _never_the_watched_session(layer, watched, own)
+
+
+def test_a_warmup_naming_another_chat_holds_no_session_until_its_own_is_ready(
+        temp_db, monkeypatch):
+    """A socket that watches a live chat and then warms the person's own chat
+    by its id holds no session while that chat's own starts: a mode picked
+    for the person's chat meanwhile never reaches the watched session."""
+    from core.session.session_state import get_session_mode, set_session_mode
+    layer = FakeExecutionLayer()
+    stub_dashboard_seams(monkeypatch, layer)
+    watched, own = _watched_and_own(layer)
+    set_session_mode("sid-watched", "ask")
+    seen: dict = {}
+
+    async def scenario():
+        async with dashboard_connection(session_cookie(**_VIEWER)) as ws:
+            await _watch(ws, watched)
+            layer.start_gate = asyncio.Event()
+            ws.client_send({"type": "warmup", "chat_id": own,
+                            "agent": task_store.get_chat(own)["agent"]})
+            await _until(ws, "warmup_started")
+            conn = _conn("user-viewer")
+            seen["during"] = (conn.chat_id, conn.session_id)
+            ws.client_send({"type": "mode_change", "chat_id": own, "mode": "autoReview"})
+            await _until(ws, "mode_changed")
+            seen["watched_mode"] = get_session_mode("sid-watched")
+            layer.start_gate.set()
+            await _until(ws, "warmup_ready")
+    run_ws_scenario(scenario)
+    assert seen["during"] == (own, None)
+    assert seen["watched_mode"] == "ask"
+    assert "sid-watched" not in [sid for sid, _ in layer.mode_changes]
+
+
+def test_a_send_after_a_failed_warmup_runs_on_the_chats_own_session(temp_db, monkeypatch):
+    """The same warmup, and the start of the person's own chat fails: the
+    socket holds no session, and the next message starts that chat's own."""
+    layer = FakeExecutionLayer()
+    stub_dashboard_seams(monkeypatch, layer)
+    watched, own = _watched_and_own(layer)
+    real_start, failed = layer.start_session, []
+
+    async def fail_once(sid, agent_cfg):
+        if not failed:
+            failed.append(sid)
+            raise RuntimeError("the start failed")
+        await real_start(sid, agent_cfg)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie(**_VIEWER)) as ws:
+            await _watch(ws, watched)
+            monkeypatch.setattr(layer, "start_session", fail_once)
+            ws.client_send({"type": "warmup", "chat_id": own,
+                            "agent": task_store.get_chat(own)["agent"]})
+            await _until(ws, "warmup_failed")
+            conn = _conn("user-viewer")
+            await _wait_for(lambda: conn._warmup_task is None or conn._warmup_task.done())
+            assert (conn.chat_id, conn.session_id) == (own, None)
+            ws.client_send({"type": "chat", "chat_id": own, "text": "second"})
+            await _done_of(ws, own)
+    run_ws_scenario(scenario)
+    took = [sid for sid, _, _ in layer.messages]
+    assert took == [task_store.get_chat(own)["session_id"]] and "sid-watched" not in took
+    assert "sid-watched" not in layer.closed_sessions and "sid-watched" in layer.alive
+    assert task_store.get_chat_messages(watched) == []
+
+
+def test_a_resume_that_ends_early_holds_no_session_of_the_chat_it_left(temp_db, monkeypatch):
+    """A resume binds the chat and may end before it reaches that chat's
+    session: its layer cannot be resolved (the agent's machine is away), or
+    the chat is a call's, read and never bound. The socket then holds no
+    session."""
+    import uuid
+
+    import ws.dashboard as wsd
+    from core.session import session_kind
+    from core.session.visibility import PHONE_CHAT_OWNER
+    from tests.fixtures.ws_dashboard_harness import TEST_MODEL
+    layer = FakeExecutionLayer()
+    stub_dashboard_seams(monkeypatch, layer)
+    watched, own = _watched_and_own(layer)
+    call_agent, call = make_test_agent(), str(uuid.uuid4())
+    task_store.add_user_agent("user-viewer", call_agent, "manager", "test")
+    task_store.create_chat(call, PHONE_CHAT_OWNER, call_agent, "default", model=TEST_MODEL,
+                           execution_path="claude-code-cli",
+                           source_type=session_kind.PHONE.source_type)
+    real = wsd._role_and_layer
+
+    def _machine_away(user_sub, agent, chat, **kw):
+        if (chat or {}).get("id") == own:
+            raise RuntimeError("the machine is offline")
+        return real(user_sub, agent, chat, **kw)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie(**_VIEWER)) as ws:
+            await _watch(ws, watched)
+            conn = _conn("user-viewer")
+            monkeypatch.setattr(wsd, "_role_and_layer", _machine_away)
+            ws.client_send({"type": "resume_chat", "chat_id": own})
+            await _until(ws, "error")
+            assert (conn.chat_id, conn.session_id) == (own, None)
+            # Back on the watched chat, then a call's conversation.
+            ws.client_send({"type": "resume_chat", "chat_id": watched})
+            assert (await _until(ws, "warmup_ready"))["session_id"] == "sid-watched"
+            ws.client_send({"type": "resume_chat", "chat_id": call})
+            await _until(ws, "chat_view_only")
+            await _until(ws, "chat_history")
+            assert (conn.chat_id, conn.session_id) == (call, None)
+    run_ws_scenario(scenario)
+    assert layer.messages == [] and "sid-watched" in layer.alive
+
+
+def test_a_socket_put_on_a_chat_lets_go_of_the_terminal_it_viewed(temp_db, monkeypatch):
+    """``_onto_chat`` leaves the chat the socket was on whole: its terminal
+    viewer is detached with its session."""
+    from ws.dashboard import DashboardConnection
+    layer = FakeExecutionLayer()
+    stub_dashboard_seams(monkeypatch, layer)
+    _watched, own = _watched_and_own(layer)
+    conn = DashboardConnection.__new__(DashboardConnection)
+    conn.user_sub, conn.user = "user-viewer", {"sub": "user-viewer", "role": "member"}
+    conn.chat_id, conn.agent_name, conn.layer = "chat-term", "agent-x", layer
+    conn.session_id = "sid-term"
+    conn._pty_viewer_sid, conn._pty_listener, conn._pty_outbox = "sid-term", None, None
+    asyncio.run(conn._onto_chat(task_store.get_chat(own)))
+    assert conn._pty_viewer_sid is None
+    assert (conn.chat_id, conn.session_id) == (own, None)
+
+
+def test_a_session_reads_as_none_once_the_socket_is_on_another_chat():
+    """The second layer, at the point of use: a session is the socket's only
+    while it is on the chat it adopted that session on, whatever bound the
+    socket to another chat."""
+    from ws.dashboard import DashboardConnection
+    conn = DashboardConnection.__new__(DashboardConnection)
+    conn.chat_id = "chat-a"
+    conn.session_id = "sid-a"
+    assert conn.session_id == "sid-a"
+    conn.chat_id = "chat-b"   # a binding with no reset beside it
+    assert conn.session_id is None
+    conn.session_id = "sid-b"
+    assert conn.session_id == "sid-b"
+    conn.session_id = None
+    conn.chat_id = "chat-a"
+    assert conn.session_id is None
+
+
+def _session_reset(stmt) -> bool:
+    """Whether a statement, or an ``if`` it is, sets ``self.session_id`` to None."""
+    import ast
+    for node in ast.walk(stmt):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            pairs = (zip(target.elts, node.value.elts, strict=True)
+                     if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple)
+                     else [(target, node.value)])
+            for left, right in pairs:
+                if (ast.unparse(left) == "self.session_id"
+                        and isinstance(right, ast.Constant) and right.value is None):
+                    return True
+    return False
+
+
+def _chat_bindings() -> list[tuple[str, int, bool]]:
+    """Every assignment to ``self.chat_id`` in the socket's modules: the
+    file, the line, and whether a session reset sits beside it (the
+    statement itself, the one before or the one after)."""
+    import ast
+    from pathlib import Path
+    found = []
+    for path in sorted((Path(__file__).resolve().parents[2] / "ws").glob("dashboard*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            for field in ("body", "orelse", "finalbody"):
+                block = getattr(node, field, None)
+                if not isinstance(block, list):
+                    continue
+                for i, stmt in enumerate(block):
+                    if not isinstance(stmt, ast.Assign):
+                        continue
+                    names = [ast.unparse(e) for t in stmt.targets
+                             for e in (t.elts if isinstance(t, ast.Tuple) else [t])]
+                    if "self.chat_id" in names:
+                        beside = block[max(0, i - 1):i + 2]
+                        found.append((path.name, stmt.lineno, any(map(_session_reset, beside))))
+    return found
+
+
+def test_every_chat_binding_of_the_socket_sits_beside_a_session_reset():
+    """A socket put on a chat holds no session of the chat it was on: every
+    place that binds ``self.chat_id`` resets ``self.session_id`` beside it,
+    so a next place fails here."""
+    bindings = _chat_bindings()
+    assert {name for name, _, _ in bindings} == {
+        "dashboard_chat_resume.py", "dashboard_chat_send.py", "dashboard_chat_stream.py",
+        "dashboard_chat_support.py", "dashboard_warmup.py"}
+    assert len(bindings) >= 7
+    assert [(name, line) for name, line, beside in bindings if not beside] == []
+
+
+def test_an_editor_never_drives_a_managers_chat_worker_that_writes_knowledge(temp_db, monkeypatch):
+    """A chat-surface worker a manager delegated runs as the agent, in a
+    chat of the agent's own with a run row. While its run holds the write on
+    the agent's knowledge, an editor who opens that chat in the dashboard is
+    refused at every frame that drives it, as the delegation's own door
+    refuses them. A manager drives it, and a pool chat with no run row keeps
+    the editor tier alone."""
+    import uuid
+
+    from core.session.visibility import KNOWLEDGE_RUN_REFUSED, shared_chat_owner
+    from tests.fixtures.ws_dashboard_harness import TEST_MODEL
+    from tests.session.test_ws_dashboard_resume_controls import _bare_connection
+    layer = FakeExecutionLayer()
+    layer.turn_events = [CommonEvent(type=TEXT, data={"content": "ok"}),
+                         CommonEvent(type=DONE, data={})]
+    stub_dashboard_seams(monkeypatch, layer)
+    slug = make_test_agent()
+    task_store.add_user_agent("user-viewer", slug, "editor", "test")
+    task_store.add_user_agent("user-manager", slug, "manager", "test")
+    worker, pool = str(uuid.uuid4()), str(uuid.uuid4())
+    for cid in (worker, pool):
+        task_store.create_chat(cid, shared_chat_owner(slug), slug, "auto", model=TEST_MODEL,
+                               execution_path="claude-code-cli", source_type="chat")
+    run_id = f"run-{uuid.uuid4().hex[:12]}"
+    task_store.create_run(run_id, "dyn-x", slug, "delegate", None, "go", "delegate", "agent",
+                          "user-admin")
+    task_store.update_run(run_id, status="completed", chat_id=worker, session_id="sid-worker")
+    task_store.update_chat(worker, session_id="sid-worker")
+    layer.alive.add("sid-worker")
+
+    async def frames(sub: str, cid: str) -> list[dict]:
+        conn = _bare_connection(cid, "sid-worker" if cid == worker else None,
+                                user_sub=sub, agent=slug, layer=layer)
+        conn.deferred_for, conn.deferred_model, conn._warmup_in_flight = "", "", False
+        await conn._handle_mode_change({"mode": "dontAsk", "chat_id": cid})
+        await conn._on_compact_context({})
+        refusal = await conn._deny_task_continue(cid, quiet=True)
+        return [*conn.sent, {"refusal": refusal}]
+
+    sent = asyncio.run(frames("user-viewer", worker))
+    assert sent[-1] == {"refusal": KNOWLEDGE_RUN_REFUSED}
+    assert {"type": "error", "message": KNOWLEDGE_RUN_REFUSED} in sent
+    assert task_store.get_chat(worker)["permission_mode"] == "auto"
+    assert layer.mode_changes == []
+    assert asyncio.run(frames("user-manager", worker))[-1] == {"refusal": ""}
+    assert asyncio.run(frames("user-viewer", pool))[-1] == {"refusal": ""}

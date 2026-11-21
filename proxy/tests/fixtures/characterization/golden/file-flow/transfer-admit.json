@@ -1,0 +1,92 @@
+{
+ "a_delete": {
+  "admitted": {
+   "action": "delete",
+   "agent": "flow-agent",
+   "msg": true,
+   "path": "workspace/a.txt",
+   "role": "manager",
+   "session": "flow-session"
+  },
+  "log": []
+ },
+ "admitted": {
+  "admitted": {
+   "action": "write",
+   "agent": "flow-agent",
+   "msg": true,
+   "path": "workspace/a.txt",
+   "role": "manager",
+   "session": "flow-session"
+  },
+  "log": []
+ },
+ "another_agent": {
+  "admitted": null,
+  "log": [
+   "WARNING write-back agent mismatch: session=flow-ses sec_agent=flow-agent payload=other-agent path=workspace/a.txt"
+  ]
+ },
+ "bound_elsewhere": {
+  "admitted": null,
+  "log": [
+   "WARNING file_changed: session s-elsewh is bound to machine sat-two- but the frame came from sat-one-; dropping the claimed role",
+   "WARNING write-back denied: session=s-elsewh role=no-ctx path=workspace/a.txt action=write"
+  ]
+ },
+ "engine_machinery": {
+  "admitted": null,
+  "log": [
+   "INFO write-back skipped (engine machinery, no session context): session=s-none path=workspace/.claude/.last-cleanup action=write"
+  ]
+ },
+ "no_action": {
+  "admitted": null,
+  "log": []
+ },
+ "no_agent": {
+  "admitted": null,
+  "log": []
+ },
+ "no_context": {
+  "admitted": null,
+  "log": [
+   "WARNING write-back denied: session=s-none role=no-ctx path=workspace/a.txt action=write"
+  ]
+ },
+ "no_machine_and_not_held": {
+  "admitted": null,
+  "log": [
+   "WARNING file_changed: session s-unheld is bound to machine none but the frame came from sat-one-; dropping the claimed role",
+   "WARNING write-back denied: session=s-unheld role=no-ctx path=workspace/a.txt action=write"
+  ]
+ },
+ "no_path": {
+  "admitted": null,
+  "log": []
+ },
+ "no_session": {
+  "admitted": null,
+  "log": [
+   "WARNING write-back denied: session=? role=no-ctx path=workspace/a.txt action=write"
+  ]
+ },
+ "the_layer_holds_it_elsewhere": {
+  "admitted": null,
+  "log": [
+   "WARNING file_changed: session s-moved is bound to machine sat-two- but the frame came from sat-one-; dropping the claimed role",
+   "WARNING write-back denied: session=s-moved role=no-ctx path=workspace/a.txt action=write"
+  ]
+ },
+ "the_layer_holds_it_here": {
+  "admitted": {
+   "action": "write",
+   "agent": "flow-agent",
+   "msg": true,
+   "path": "workspace/a.txt",
+   "role": "editor",
+   "session": "s-task"
+  },
+  "log": []
+ }
+}

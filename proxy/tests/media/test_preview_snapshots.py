@@ -21,14 +21,17 @@ from tests.media.wopi_signing import signed_client, signing
 @pytest.fixture(autouse=True)
 def _wopi_persons_hold(monkeypatch):
     """The WOPI routes judge the person a token names (the users row, the
-    credential timeline, the forced change): these tests mint tokens for
-    subs with no row, so the person holds unless a test asks otherwise
-    (``_REAL_PERSON_HOLDS``)."""
+    credential timeline, the forced change) and what that person may do
+    with its document now: these tests mint tokens for subs with no row, so
+    the person holds and the token's own word stands."""
     from api.media import wopi
     monkeypatch.setattr(wopi, "_person_holds_now", lambda sub, iat: True)
-    wopi._holder_answers.clear()
+    monkeypatch.setattr(wopi, "_standing_now", lambda sub, agent, path, chat: "edit")
+    wopi._holders.answers.clear()
+    wopi._documents.answers.clear()
     yield
-    wopi._holder_answers.clear()
+    wopi._holders.answers.clear()
+    wopi._documents.answers.clear()
 
 @pytest.fixture
 def snap_root(tmp_path, monkeypatch):
@@ -625,3 +628,29 @@ def test_preview_remint_host_cache_is_session_scoped(temp_db, tmp_path, monkeypa
     _add_preview_row("chat-1", other_fid, "")
     body = _remint(client, "chat-1", other_fid).json()
     assert body["permissions"] == "view"
+
+
+def test_preview_remint_judges_the_session_cache_where_it_lands(temp_db, tmp_path, monkeypatch):
+    """The chat's own session cache is its own by its name: a cache folder
+    that leads into another person's folder mints view only, never the
+    session person's edit."""
+    from types import SimpleNamespace
+
+    import config
+    from api.media.wopi import encode_file_id
+    task_store.create_chat("chat-1", "user-a", "test-agent")
+    task_store.update_chat("chat-1", session_id="sess-1")
+    monkeypatch.setattr("storage.database.get_username_by_sub",
+                        lambda sub: {"user-a": "alice"}.get(sub, ""))
+    monkeypatch.setattr("core.session.session_state.get_session_security",
+                        lambda sid: SimpleNamespace(username="alice") if sid == "sess-1" else None)
+    client = _mint_app(monkeypatch, tmp_path)  # manager role
+    bob = config.AGENTS_DIR / "test-agent" / "users" / "bob" / "workspace" / "d1"
+    bob.mkdir(parents=True)
+    (bob / "notes.docx").write_bytes(b"bob's")
+    cache = config.AGENTS_DIR / ".remote-host-cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "sess-1").symlink_to(bob.parent)
+    fid = encode_file_id(".remote-host-cache/sess-1/d1/notes.docx")
+    _add_preview_row("chat-1", fid, "")
+    assert _remint(client, "chat-1", fid).json()["permissions"] == "view"

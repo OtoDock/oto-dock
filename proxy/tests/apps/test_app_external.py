@@ -151,6 +151,8 @@ def test_the_link_serves_the_folder_document_assets_and_api_behind_its_own_claim
     vt = client.post(f"/s/{token}/viewer-token").json()
     claims = app_tokens.verify(vt["token"], row["id"], app_tokens.PURPOSE_VIEWER)
     assert claims["external"] is True and claims["grant"] == share_id and claims["sub"] == ""
+    # Every visitor of a link is an outside person (2.0).
+    assert claims["role"] == "external" and claims["principal"] == "external"
     # From here the frame sends no cookie: the assets ride the hash, the API
     # the claim.
     client.cookies.clear()
@@ -273,3 +275,39 @@ def test_the_link_socket_takes_the_external_claim_only(ws_upstream):
         with pytest.raises(WebSocketDisconnect) as e:
             ws.receive_text()
     assert e.value.code == 4401
+
+
+def test_a_link_never_serves_an_app_reading_a_folder_its_visitors_may_not_see(upstream):
+    """The folder rule (2.0): a link's visitors are outside people, so an app
+    with a server that names a workspace folder, or a knowledge folder the
+    External identities card has not added, makes no link and an existing
+    link stops serving, page, claim and API alike, with the link's one 404;
+    once the folder is added on the card it serves again."""
+    import json
+
+    from services.mcp import outside_picks
+    from storage.agents import outside_store
+    from storage.pg import get_conn
+    row, _sha = _folder_app()
+    _install(row, upstream.server_port)
+    out, token = _link(row["id"])
+    # The app now reads a workspace folder: its link stops.
+    with get_conn() as conn:
+        conn.execute("UPDATE pinned_apps SET files = %s WHERE id = %s",
+                     (json.dumps({"read": ["users/{owner}/workspace/notes"]}), row["id"]))
+        conn.commit()
+    outside_picks._knowledge_cache.clear()
+    assert client.get(f"/s/{token}").status_code == 404
+    assert client.post(f"/s/{token}/viewer-token").status_code in (401, 404)
+    _as(_user())
+    r = client.post("/v1/shares", json={"target_kind": "app", "target_id": row["id"], "scope": "external",
+                                        "password": ACCOUNT_PW})
+    assert r.status_code == 400 and "Visitors of a link are external identities" in r.json()["detail"]
+    # A shared app reading a knowledge folder serves once the card adds it.
+    shared = task_store.upsert_app(AGENT, "", None, "faq-board", title="Faq", rel_path="workspace/apps/faq-board",
+                                   kind="folder", blocks={"files": json.dumps({"read": ["knowledge/faq"]})})
+    assert outside_picks.link_refusal(shared) == "knowledge/faq"
+    outside_store.update(AGENT, add_knowledge=["faq"])
+    outside_picks._knowledge_cache.clear()
+    (config.AGENTS_DIR / AGENT / "knowledge" / "faq").mkdir(parents=True, exist_ok=True)
+    assert outside_picks.link_refusal(shared) == ""

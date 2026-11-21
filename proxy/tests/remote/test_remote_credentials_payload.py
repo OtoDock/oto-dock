@@ -156,3 +156,102 @@ class TestBindSubscription:
             "sess-4", config, "claude-code-cli", True,
         )
         assert pool.get_session_subscription("sess-4") is None
+
+
+class TestSessionHome:
+    """A session the builder gave a home of its own (a satellite that reports
+    ``session_homes``): the start payload asks the satellite for it, the
+    binding is keyed by it, and the rotation reaches the home's sign-in."""
+
+    SID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from services.engines import subscription_pool as pool, token_fanout
+        yield
+        for sid in (self.SID, "sess-1"):
+            pool._session_subscriptions.pop(sid, None)
+            pool._session_scope_keys.pop(sid, None)
+            token_fanout._targets.pop(sid, None)
+
+    @pytest.mark.asyncio
+    async def test_the_payload_asks_for_the_home_by_the_engines_word(self, layer):
+        home = f"/agents/test-agent/users/alice/.claude/own/{self.SID}"
+        with_home = await _payload(layer, _config(session_home=home), "claude-code-cli")
+        assert with_home["session_home"]["links"][0] == "projects"
+        assert with_home["session_home"]["seed"] == {".claude.json": ["oauthAccount"]}
+        without = await _payload(layer, _config(), "claude-code-cli")
+        assert "session_home" not in without
+
+    def test_the_binding_and_the_rotation_target_are_the_homes(self):
+        from types import SimpleNamespace
+
+        from services.engines import subscription_pool as pool, token_fanout
+        store = "/agents/test-agent/users/alice/.claude"
+        config = _config(subscription_id="sub-1", sandbox_host_claude_dir=store,
+                         session_home=f"{store}/own/{self.SID}",
+                         security_context=SimpleNamespace(mount_username="alice"))
+        RemoteExecutionLayer._bind_subscription(self.SID, config, "claude-code-cli", True)
+        assert pool._session_scope_keys[self.SID] == f"machine-1:{store}/own/{self.SID}"
+        assert pool.bound_folder(self.SID) == f"{store}/own/{self.SID}"
+        target = token_fanout.session_target(self.SID)
+        assert target.dir_relative == f"users/alice/.claude/own/{self.SID}"
+
+    def test_a_compute_sessions_rotation_writes_the_homes_file(self):
+        from services.engines import token_fanout
+        store = "/agents/test-agent/workspace/.claude"
+        config = _config(subscription_id="sub-1", sandbox_host_claude_dir=store,
+                         session_home=f"{store}/own/{self.SID}")
+        RemoteExecutionLayer._bind_subscription(self.SID, config, "claude-code-cli", True,
+                                                local_file=True)
+        assert token_fanout.session_target(self.SID).host_dir == f"{store}/own/{self.SID}"
+
+    def test_without_a_home_the_scope_folder_keys_and_receives_as_before(self):
+        from types import SimpleNamespace
+
+        from services.engines import subscription_pool as pool, token_fanout
+        store = "/agents/test-agent/users/alice/.claude"
+        config = _config(subscription_id="sub-1", sandbox_host_claude_dir=store,
+                         security_context=SimpleNamespace(mount_username="alice"))
+        RemoteExecutionLayer._bind_subscription("sess-1", config, "claude-code-cli", True)
+        assert pool._session_scope_keys["sess-1"] == f"machine-1:{store}"
+        assert token_fanout.session_target("sess-1").dir_relative == "users/alice/.claude"
+
+
+class TestExitBlock:
+    @pytest.mark.asyncio
+    async def test_a_paired_computers_payload_carries_the_sessions_door(self, layer, monkeypatch):
+        """A paired computer whose exit the rule admits: the payload's ``exit``
+        block with the session's secret, the hash of the payload's own token
+        and the entries, no value; a machine with no exit gets no block."""
+        from core import placement
+        from core.credentials import credential_exit, mcp_broker, mcp_gateway
+        from core.credentials.mcp_gateway import ExitCredential
+        from core.remote.mcp_gateway_push import token_hash_of
+        monkeypatch.setattr(mcp_gateway, "_host_allowed", lambda key, host: True)
+        for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+        where = placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="machine-1", label="Laptop",
+                                                satellite_version="0.5.175", exit_port=41111, exit_ok=True, os="linux",
+                                                reported_otodock_dir="/home/u/.oto-dock")
+        cred = ExitCredential(placeholder=credential_exit.new_placeholder(), header="xi-api-key",
+                              hosts=("api.elevenlabs.io",), allowlist_key="music-gen-mcp", manifest="music-gen-mcp",
+                              env_name="ELEVENLABS_API_KEY", value="xk-9f3a")
+        bundles = {"music-gen-mcp": mcp_broker.SecretBundle(env={"ELEVENLABS_API_KEY": cred.placeholder}, exit=(cred,))}
+        try:
+            env = credential_exit.machine_env("sess-1", where)
+            assert env["HTTPS_PROXY"].endswith("@127.0.0.1:41111")
+            payload = await _payload(layer, _config(mcp_secret_bundles=bundles), "claude-code-cli")
+            block = payload["exit"]
+            assert block["secret"] == credential_exit.machine_secret("sess-1")
+            assert block["token_hash"] == token_hash_of(payload["env"]["PROXY_API_KEY"])
+            assert block["entries"] == [{"placeholder": cred.placeholder, "header": "xi-api-key", "prefix": "",
+                                         "key": "ELEVENLABS_API_KEY", "hosts": ["api.elevenlabs.io"]}]
+            assert block["carves"] == [] and "xk-9f3a" not in str(block)
+            # The session's own environment carries no proxy variable: the
+            # bundle's processes and git alone route through the exit.
+            assert "HTTPS_PROXY" not in payload["env"]
+        finally:
+            credential_exit.forget("sess-1")
+        payload = await _payload(layer, _config(mcp_secret_bundles=bundles), "claude-code-cli")
+        assert "exit" not in payload

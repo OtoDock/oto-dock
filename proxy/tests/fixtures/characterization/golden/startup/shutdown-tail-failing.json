@@ -1,0 +1,71 @@
+{
+ "bg_tasks_left": 0,
+ "logged": [
+  [
+   "error",
+   "Shutdown DB cleanup failed: failed"
+  ],
+  [
+   "error",
+   "Ending the Docker compose runs failed: failed"
+  ],
+  [
+   "error",
+   "Shutdown: background task cancel failed (continuing): RuntimeError('failed')"
+  ],
+  [
+   "exception",
+   "Shutdown: persist drain failed (continuing)"
+  ],
+  [
+   "exception",
+   "Shutdown: chat writer drain failed (continuing)"
+  ],
+  [
+   "exception",
+   "Shutdown: session index flush failed (continuing)"
+  ],
+  [
+   "exception",
+   "Shutdown: the clean stop was not recorded (continuing)"
+  ],
+  [
+   "exception",
+   "Shutdown: binding writer close failed (continuing)"
+  ]
+ ],
+ "order": [
+  "abort s-open",
+  "list_orphaned_runs",
+  "end_running_compose",
+  "a background loop was cancelled",
+  {
+   "call": "cancel_all",
+   "kwargs": {
+    "grace": 2.0,
+    "timeout": 1.0
+   }
+  },
+  "scheduler.stop",
+  {
+   "call": "drain_persists",
+   "timeout": 2.0
+  },
+  {
+   "call": "drain_all",
+   "kwargs": {
+    "timeout": 3.0
+   }
+  },
+  "flush_session_index",
+  "note_clean_stop",
+  "loop_watchdog.stop",
+  "close_binding_writes",
+  "shutdown_db_executor",
+  "close_pool",
+  "stop_mcp_thread"
+ ],
+ "wait_for_timeouts": [
+  35.0
+ ]
+}

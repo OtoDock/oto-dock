@@ -235,7 +235,6 @@ def test_the_deny_names_the_failure_its_address_and_the_hold(gate, monkeypatch, 
     for name, value in (("PROXY_URL", "http://127.0.0.1:57353"), ("PROXY_API_KEY", "k"),
                         ("OTO_SESSION_ID", "s")):
         monkeypatch.setenv(name, value)
-    monkeypatch.delenv("OTO_HOOK_BRIDGED", raising=False)
     monkeypatch.delenv("OTO_HOOK_DENY_ONLY", raising=False)
     monkeypatch.setattr(gate.sys, "stdin", io.StringIO('{"tool_name": "Bash", "tool_input": {}}'))
     gate.main()
@@ -244,3 +243,24 @@ def test_the_deny_names_the_failure_its_address_and_the_hold(gate, monkeypatch, 
     assert out["permissionDecisionReason"] == (
         "OtoDock platform unreachable (no answer at 127.0.0.1:57353: connection refused "
         f"for {sum(gate._slept):.0f} s). Tool call denied (fail closed).")
+
+
+def test_a_machine_told_of_an_update_holds_the_call_for_as_long_as_it_names(gate, monkeypatch):
+    """The platform said it is away for an update: the machine's tunnel names
+    how long it still expects that (``hold_s``), and the call is held for it
+    where it would be denied after two minutes."""
+    away = [_http_body(503, b'{"error": "tunnel-not-connected", "hold_s": 600}')] * 30
+    _answers(gate, monkeypatch, [*away, b'{"decision": "allow"}'])
+    assert gate._request_decision(object()) == {"decision": "allow"}
+    assert sum(gate._slept) > gate._HOLD_S
+
+
+def test_a_named_hold_ends_with_none_and_never_passes_its_cap(gate, monkeypatch):
+    _answers(gate, monkeypatch, [
+        _http_body(503, b'{"error": "tunnel-not-connected", "hold_s": 300}'),
+        *[_http(503)] * 100])
+    assert gate._request_decision(object()) is None
+    assert 280 <= gate._held_s <= 300 and gate._held_s == sum(gate._slept)
+    for body, least in ((b'{"hold_s": 999999}', gate._HOLD_MAX_S), (b'{"hold_s": true}', 0.0),
+                        (b'{"hold_s": "600"}', 0.0), (b'{"hold_s": -5}', 0.0), (b'[600]', 0.0)):
+        assert gate._hold_named(gate._body_of(_http_body(503, body))) == least

@@ -288,6 +288,119 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
+    "get_outside_people": {
+        "description": (
+            "Show what external identities (a caller on this agent's phone line, "
+            "another person who is not a member) get on this agent, as the "
+            "External identities card shows it: each tool with its choice, the "
+            "person's own files, web search, whether the agent remembers each "
+            "conversation, the knowledge folders, the apps, and what is on offer. Read-only."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
+    "set_outside_people": {
+        "description": (
+            "Change what external identities get on this agent. Only what you pass "
+            "changes; everything else stays as it is. tools: each named tool's "
+            "choice, read_only (the parts its maker labels as only reading), "
+            "read_write, or custom with the function names to give; remove_tools: "
+            "tools to take away. files: read_only or read_write for the person's "
+            "own folder. web: web search, the engine's own search and page reading. "
+            "add_folders / remove_folders: knowledge folders they may read, any "
+            "folder inside the ones on offer. wrapup: whether the agent writes "
+            "down what it learned after each conversation; notes_for_team: whether "
+            "that leaves a note for the team; wrapup_model: its model, '' for the "
+            "conversation's own. add_apps / remove_apps: this agent's apps by their "
+            "short name, opened to them or taken away; a caller uses only the "
+            "methods an app opens with min_role external. Run get_outside_people first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tools": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "mcp": {"type": "string"},
+                            "access": {"type": "string", "enum": ["read_only", "read_write", "custom"]},
+                            "functions": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["mcp", "access"],
+                        "additionalProperties": False,
+                    },
+                },
+                "remove_tools": {"type": "array", "items": {"type": "string"}},
+                "files": {"type": "string", "enum": ["read_only", "read_write"]},
+                "web": {"type": "boolean"},
+                "add_folders": {"type": "array", "items": {"type": "string"}},
+                "remove_folders": {"type": "array", "items": {"type": "string"}},
+                "wrapup": {"type": "boolean"},
+                "notes_for_team": {"type": "boolean"},
+                "wrapup_model": {"type": "string"},
+                "add_apps": {"type": "array", "items": {"type": "string"}},
+                "remove_apps": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+    },
+    "get_tool_limits": {
+        "description": (
+            "Show what this agent may use of each enabled MCP, as the What the agent "
+            "may use card shows it: per tool its listed functions and, for external "
+            "identities, the agent's own runs and people's chats, all tools or the "
+            "limit set. Read-only."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
+    "set_tool_limits": {
+        "description": (
+            "Limit what this agent may use of an enabled MCP, for its own runs and "
+            "for people's chats. Only what you pass changes. tools: each named tool "
+            "with runs and/or chats, each read_only (the functions its maker labels as "
+            "only reading) or a list of function names to allow; remove: columns to "
+            "set back to all tools. From a session you may only tighten a limit: add "
+            "one, or shrink a list. Widening or removing one takes a manager at Agent "
+            "Settings, and the platform says so. Run get_tool_limits first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tools": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "mcp": {"type": "string"},
+                            "runs": {"anyOf": [{"type": "string", "enum": ["read_only"]},
+                                               {"type": "array", "items": {"type": "string"}}]},
+                            "chats": {"anyOf": [{"type": "string", "enum": ["read_only"]},
+                                                {"type": "array", "items": {"type": "string"}}]},
+                        },
+                        "required": ["mcp"],
+                        "additionalProperties": False,
+                    },
+                },
+                "remove": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "mcp": {"type": "string"},
+                            "column": {"type": "string", "enum": ["runs", "chats"]},
+                        },
+                        "required": ["mcp", "column"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+    },
     "update_agent_memory_enabled": {
         "description": (
             "Enable or disable the shared agent memory for this agent "
@@ -330,6 +443,72 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+    },
+    "reload_session": {
+        "description": (
+            "Rebuild this chat's session, so it starts again with the tools and accounts "
+            "this agent has now. Call it after a tool was enabled for this agent or an "
+            "account was connected and you need it in this chat. Tell the person first. "
+            "Never call it on a guess, and never to retry something that failed. The "
+            "session reloads when your turn ends, so end your turn right after the call: "
+            "the chat then continues by itself where it was, with a note that says why. "
+            "Background commands of this session end with it, and a question you ask in "
+            "the same turn may be answered only after the reload, so ask none. A reload "
+            "grants nothing: your tools, your role and your mode are read again as they "
+            "are stored."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Why, in a few plain words the person reads in the chat, for "
+                        "example 'the Notion tool was enabled'."
+                    ),
+                },
+            },
+            "required": ["reason"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    },
+    "switch_account": {
+        "description": (
+            "Switch this chat to another account of one tool, for this chat only: one of "
+            "the person's own accounts, or in a chat that runs as the agent one of the "
+            "agent's own, for everyone in that chat. A Personal only agent has no accounts of "
+            "its own. The accounts you may use are named in your "
+            "prompt under 'Accounts you may switch to'. Ask the person before you switch. "
+            "The session reloads "
+            "when your turn ends, so end your turn right after the call: the chat then "
+            "continues by itself on the chosen account. The choice stays with this chat "
+            "until you switch again. Other chats keep their own accounts."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "description": "The tool's (MCP's) name, as your prompt's account lines give it.",
+                },
+                "account": {
+                    "type": "string",
+                    "description": (
+                        "The account's label, one of those your prompt names for the tool. "
+                        "The word 'default' goes back to the default account, "
+                        "unless one of the accounts carries that label."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why, in a few plain words the person reads in the chat.",
+                },
+            },
+            "required": ["tool", "account", "reason"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     "list_knowledge_libraries": {
         "description": (
@@ -449,7 +628,8 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "Assign THIS agent to a department + level on the company map "
             "(names resolved case-insensitively), or clear the assignment "
             "by passing an empty department. Wires delegation edges per "
-            "the department's structure. Platform admins/creators only."
+            "the department's structure. Platform admins and creators, into a "
+            "department they made or whose agents they all manage."
         ),
         "inputSchema": {
             "type": "object",

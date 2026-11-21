@@ -1,7 +1,10 @@
-"""Bubblewrap (bwrap) sandbox engine for agent session isolation.
+"""What a session's sandbox is: its mounts, its masks and its network routes.
 
-Pure, testable module. SandboxBuilder constructs bwrap command prefixes
-based on a SandboxConfig. No side effects — only produces command lists.
+``SandboxBuilder`` resolves a ``SandboxConfig`` into the description of a
+session's sandbox (``describe``), which names nothing of this host. The
+machine that runs the session renders the description into the launcher
+and bubblewrap command (``core/sandbox/sandbox_render.py``). The platform
+itself starts no sandbox.
 
 The engines' config-dir builders (core/layers/<x>/config_dir.py) create and populate the persistent
 .claude/ directory for a session (hooks, settings.json).
@@ -13,10 +16,7 @@ import contextlib
 import logging
 import os
 import re
-import shutil
-import signal
 import stat
-import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +27,7 @@ import psycopg
 import config as app_config
 from auth import roles
 from core import layout
+from core.sandbox import sandbox_render as _render
 
 if TYPE_CHECKING:
     from services.mcp.mcp_manifest_types import McpManifest
@@ -86,672 +87,19 @@ def _mkdirs_held(root_real: Path, *parts: str) -> Path:
         ) from exc
     return root_real.joinpath(*parts)
 
-# System paths to mount read-only into every sandbox
-_SYSTEM_RO_BINDS = [
-    "/usr",
-    "/bin",
-    "/lib",
-    "/sbin",
-]
-
-# Optional system paths (mount only if they exist on the host)
-_SYSTEM_RO_OPTIONAL = [
-    "/lib64",
-    "/lib32",
-    # Snap-installed binaries land at /snap/bin/{tool}. Mount when the
-    # host has it so sandboxed agents can invoke gh / kubectl / etc. that
-    # came from snap. No-op on non-snap hosts (Docker, most servers).
-    "/snap/bin",
-]
-
-# Individual files to mount read-only
-_SYSTEM_RO_FILES = [
-    "/etc/resolv.conf",
-    "/etc/ssl",
-    "/etc/hosts",
-    "/etc/passwd",
-    "/etc/group",
-    "/etc/nsswitch.conf",
-    # System git config — `scripts/install-baseline-tools.sh` wires the
-    # host's `oto-git-credential-helper` there; a platform session's own git
-    # configuration resets it and names the session's credential helper, so
-    # it is mounted for the rest of what the host's config says. Mounted only
-    # when the host has it (existing existence check below).
-    "/etc/gitconfig",
-]
-
-# Ubuntu 24.04+ AppArmor gate on unprivileged user namespaces: when this
-# sysctl reads "1", only processes confined by a profile granting `userns`
-# (or holding CAP_SYS_ADMIN) may create them — the exact capability the agent
-# sandbox is built on. Module-level so tests can point it at a fixture.
-_APPARMOR_USERNS_SYSCTL = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
-
-
-def _apparmor_userns_restricted() -> bool:
-    """True when the host kernel restricts unprivileged userns via AppArmor."""
-    try:
-        return _APPARMOR_USERNS_SYSCTL.read_text().strip() == "1"
-    except OSError:
-        return False  # sysctl absent → not an Ubuntu-restricted kernel
-
-
-# Debian's older gate on the same capability (predates the AppArmor sysctl,
-# also present on Ubuntu kernels): 0 disables unprivileged userns creation
-# kernel-wide. Module-level so tests can point it at a fixture.
-_DEBIAN_USERNS_SYSCTL = Path("/proc/sys/kernel/unprivileged_userns_clone")
-
-
-def _debian_userns_disabled() -> bool:
-    """True when the Debian sysctl disables unprivileged user namespaces."""
-    try:
-        return _DEBIAN_USERNS_SYSCTL.read_text().strip() == "0"
-    except OSError:
-        return False  # sysctl absent → not a Debian-gated kernel
-
 
 # ---------------------------------------------------------------------------
 # Network namespace isolation (always on)
 # ---------------------------------------------------------------------------
 #
-# Every LOCAL sandboxed session runs inside a pasta-managed network namespace
+# Every sandboxed session runs inside a pasta-managed network namespace
 # (RFC1918 + the host's own subnet + cloud-metadata blackholed), with egress
 # carved ONLY to the session's legitimate destinations (proxy hook port +
 # configured MCP / docker-MCP / local-LLM targets — see resolve_sandbox_egress).
 # There is no un-isolated sandbox mode: genuinely un-isolated execution is a
-# remote machine. Un-resolvable egress fails CLOSED (refuses to spawn) — never
-# a silent fall-back to host networking.
-
-# The launcher that owns pasta orchestration (pasta is the OUTER process: it
-# creates the netns, then spawns bwrap inside it).
-# Lives in proxy/scripts/ and runs in the HOST mount namespace, before bwrap —
-# referenced by absolute path so no PATH setup is needed on installs.
-_NETNS_LAUNCHER = app_config.BASE_DIR / "scripts" / "oto-sandbox-net"
-
-# In-netns DNS forwarder address used on hosts whose /etc/resolv.conf points
-# at a loopback stub resolver (systemd-resolved's 127.0.0.53, Docker's embedded
-# 127.0.0.11) — loopback addresses can't exist inside the netns, so pasta
-# intercepts port 53 to this address and relays to the host's real resolver
-# (same address rootless podman uses). The launcher carves a /32 route for it
-# out of the 169.254.0.0/16 metadata blackhole; 169.254.169.254 stays
-# unreachable via its more-specific /32 block.
-_NETNS_DNS_FORWARD_ADDR = "169.254.1.1"
-
-
-def netns_resolv_path() -> Path:
-    """Generated resolv.conf bind-mounted over /etc/resolv.conf in netns mode.
-
-    Written by netns_preflight() when the host resolver is a loopback stub;
-    deleted when it isn't. Its existence is the single signal the builder
-    uses to emit the bind swap + --dns-forward (no second decision point).
-    """
-    return app_config.SESSIONS_DIR / "netns-resolv.conf"
-
-
-def _host_resolv_has_loopback_ns(resolv_path: str = "/etc/resolv.conf") -> bool:
-    """True if any nameserver in the host resolv.conf is a loopback address.
-
-    One loopback entry is enough to need the swap: glibc tries nameservers in
-    order, so a dead stub first in line means 5s timeouts per lookup even if
-    a reachable server follows.
-    """
-    import ipaddress
-    try:
-        text = Path(resolv_path).read_text()
-    except OSError:
-        return False
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0] == "nameserver":
-            try:
-                if ipaddress.ip_address(parts[1]).is_loopback:
-                    return True
-            except ValueError:
-                continue
-    return False
-
-
-# Result of the boot-time nested-namespace probe: None = not probed (yet),
-# True/False afterwards. Read by the codex layer to warn per local session on
-# hosts where the engine-owned inner sandbox cannot start.
-_nested_sandbox_ok: bool | None = None
-
-
-def nested_sandbox_ok() -> bool | None:
-    """Boot probe result: can a bwrap nest inside the sandbox stack?"""
-    return _nested_sandbox_ok
-
-
-def claude_runtime_root() -> str:
-    """The Claude Code CLI's per-user runtime root INSIDE a local sandbox.
-
-    The CLI derives it as ``os.tmpdir()/claude-<uid>`` and keeps its
-    scratchpad + background-task outputs under ``<root>/<cwd-slug>/<session
-    id>/``. In our sandbox that is a proxy-host constant: ``HOME`` is
-    ``/tmp`` on the per-sandbox ``--tmpfs /tmp`` (``get_env_overrides`` /
-    ``_system_mounts``), no ``TMPDIR`` reaches the agent env (env_builder's
-    allowlist), and the in-sandbox uid is the proxy uid on every topology
-    (plain bwrap keeps it; the netns launcher maps it back). The path policy
-    admits the session's own subtree with this root — keep the three facts
-    above in step with it.
-    """
-    return f"/tmp/claude-{os.getuid()}"
-
-
-# Boot probe: does this bubblewrap accept ``--size`` (tmpfs size cap)? None =
-# not probed (yet); the mount builder probes lazily if the preflight never ran.
-_bwrap_has_size: bool | None = None
-
-
-def _probe_bwrap_size() -> bool:
-    bwrap = shutil.which("bwrap")
-    if not bwrap:
-        return False
-    try:
-        out = subprocess.run(
-            [bwrap, "--help"], capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return "--size" in (out.stdout or "") + (out.stderr or "")
-
-
-def _mem_total_mb() -> int:
-    """Host RAM in MB from /proc/meminfo (0 when unreadable). In a container
-    this is the HOST's figure, not the cgroup limit — the cap is a bound."""
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) // 1024
-    except (OSError, ValueError, IndexError):
-        pass
-    return 0
-
-
-def tmpfs_cap_mb() -> int:
-    """Effective per-sandbox ``/tmp`` cap in MB, or 0 for "no --size".
-
-    ``SANDBOX_TMP_SIZE_MB`` (default 4096; 0 disables) bounded by half the
-    host's RAM — the kernel's own tmpfs default — so the cap can never
-    LOOSEN what an uncapped mount would get on a small box. Every local
-    sandbox has its own RAM-backed ``/tmp`` (``HOME``: uv/pip/npm caches,
-    model downloads, any runaway write), so without a cap N sandboxes can
-    commit N × RAM/2; with it a runaway becomes ENOSPC inside one sandbox
-    instead of host memory pressure. Requires a bubblewrap with ``--size``
-    (0.8 in the proxy image has it; 0.6.1 on Ubuntu 22.04 does not).
-    """
-    global _bwrap_has_size
-    mb = int(app_config.SANDBOX_TMP_SIZE_MB or 0)
-    if mb <= 0:
-        return 0
-    if _bwrap_has_size is None:
-        _bwrap_has_size = _probe_bwrap_size()
-    if not _bwrap_has_size:
-        return 0
-    half_ram = _mem_total_mb() // 2
-    return min(mb, half_ram) if half_ram > 0 else mb
-
-
-def tmpfs_cap_preflight() -> None:
-    """Boot: probe ``bwrap --size`` support once and log the effective cap,
-    so an operator can see from the log whether sandboxes' /tmp is bounded."""
-    global _bwrap_has_size
-    _bwrap_has_size = _probe_bwrap_size()
-    configured = int(app_config.SANDBOX_TMP_SIZE_MB or 0)
-    if configured <= 0:
-        logger.info("sandbox /tmp cap disabled (SANDBOX_TMP_SIZE_MB=0)")
-        return
-    if not _bwrap_has_size:
-        logger.info(
-            "sandbox /tmp uncapped: this bubblewrap has no --size "
-            "(SANDBOX_TMP_SIZE_MB=%d ignored; the proxy image's bwrap has it)",
-            configured,
-        )
-        return
-    logger.info(
-        "sandbox /tmp cap: %d MB per sandbox (SANDBOX_TMP_SIZE_MB=%d, "
-        "host RAM/2=%d MB)", tmpfs_cap_mb(), configured, _mem_total_mb() // 2,
-    )
-
-
-# How long a killed probe child gets to be reaped before the boot goes on
-# without it (a child uninterruptible inside the kernel never is).
-_PROBE_REAP_S = 5
-# The bound on each probe of the sandbox shape (one level, nested).
-_SHAPE_PROBE_S = 20
-
-
-def _run_probe(argv: list[str], timeout: float) -> subprocess.CompletedProcess[bytes]:
-    """Run a boot probe within a wall-clock bound the boot can rely on.
-
-    ``subprocess.run(timeout=...)`` kills the child when the time is up and
-    then waits for it with no bound, so a child the kernel will not let die
-    (uninterruptible inside a namespace or mount call) hangs the boot for
-    good, with nothing in the log. Here the child owns a process group that
-    the timeout kills whole (pasta and bwrap included), the wait after the
-    kill is bounded, and a child still alive after it is left behind: the
-    caller sees ``TimeoutExpired`` either way.
-    """
-    proc = subprocess.Popen(
-        argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
-    )
-    try:
-        _, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=_PROBE_REAP_S)
-        if proc.stderr is not None:
-            proc.stderr.close()
-        raise
-    return subprocess.CompletedProcess(argv, proc.returncode, stderr=err or b"")
-
-
-def _nested_sandbox_probe() -> str | None:
-    """Probe that a SECOND bwrap can start inside the full sandbox stack.
-
-    Mirrors the real runtime shape — the pasta netns launcher wrapping bwrap
-    with our exact namespace flags — and runs a minimal inner bwrap where the
-    engine's helper would sit. System bwrap stands in for Codex's npm-vendored
-    copy (whose install path isn't knowable at proxy boot);
-    scripts/sandbox-doctor.sh probes the vendored binary itself.
-
-    Returns None when the nested level works, else a short failure detail.
-    Diagnostic only: callers must treat a failure as a warning, never fatal.
-    """
-    bwrap = shutil.which("bwrap")
-    if not bwrap:  # unreachable after the missing-tools gate; belt-and-braces
-        return "bwrap not on PATH"
-    try:
-        probe = _run_probe(_sandbox_shape(bwrap, [bwrap, "--ro-bind", "/", "/", "--", "/bin/true"]),
-                           timeout=_SHAPE_PROBE_S)
-    except subprocess.TimeoutExpired:
-        return f"nested probe timed out after {_SHAPE_PROBE_S}s"
-    except Exception as e:  # noqa: BLE001  # diagnostic-only path
-        return f"nested probe failed to run: {e}"
-    return _probe_detail(probe)
-
-
-def _sandbox_shape(bwrap: str, inner: list[str]) -> list[str]:
-    """The shape every local session runs: the network launcher wrapping one
-    bwrap level with our namespace flags and a fresh /proc, running ``inner``."""
-    argv = [str(_NETNS_LAUNCHER), "--block-private", "--",
-            bwrap, "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent", "--share-net"]
-    if os.getuid() != 0:
-        argv += ["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid())]
-    return argv + ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", *inner]
-
-
-def _probe_detail(probe: subprocess.CompletedProcess[bytes]) -> str | None:
-    """None for a probe that exited 0, else the tail of what it printed."""
-    detail = (probe.stderr or b"").decode(errors="replace").strip()
-    return None if probe.returncode == 0 else (detail[-400:] or f"exit {probe.returncode}")
-
-
-def pasta_build_date(version_line: str) -> str:
-    """`YYYY_MM_DD` of a passt version line: an upstream tag
-    (`2026_10_02.cba3570`), a git build (`2026_06_11.a9c61ff-31-g…`) or a
-    Debian version (`0.0~git20230309.7c7625d-1`); "" when it names none."""
-    m = (re.search(r"(\d{4})_(\d{2})_(\d{2})", version_line)
-         or re.search(r"git(\d{4})(\d{2})(\d{2})", version_line))
-    return "_".join(m.groups()) if m else ""
-
-
-def _first_line(argv: list[str]) -> str:
-    """The first line a quick command prints, "" when it cannot run."""
-    try:
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    lines = (out or "").strip().splitlines()
-    return lines[0] if lines else ""
-
-
-def _pasta_version() -> tuple[str, str]:
-    """(the version to name, its build date) of the pasta on PATH.
-
-    Debian's package prints no date (built outside git: bookworm's says
-    "pasta unknown version", trixie's prints nothing), so a binary under
-    /usr/bin with no date in its line falls back to the package's own
-    version."""
-    exe = shutil.which("pasta")
-    if not exe:
-        return "", ""
-    line = _first_line([exe, "--version"])
-    date = pasta_build_date(line)
-    if not date and os.path.realpath(exe).startswith("/usr/bin/"):
-        package = _first_line(["dpkg-query", "-W", "-f=${Version}", "passt"])
-        if pasta_build_date(package):
-            return f"pasta (package passt {package})", pasta_build_date(package)
-    return line, date
-
-
-def _warn_pasta_below_floor() -> None:
-    """Warn, never refuse, when pasta is older than PASST_MIN_VERSION.
-
-    The floor names the build the launcher's options are written against, but
-    an older pasta still runs it (every 1.8.x image shipped bookworm's
-    2023_03_09), so refusing would stop hosts that work today. The warning
-    names the gap and the fix for this kind of install.
-    """
-    floor = app_config._read_pinned_version("PASST_MIN_VERSION")
-    line, have = _pasta_version()
-    if not floor or not have:
-        logger.info("netns preflight: pasta %r not compared with the floor %r", line, floor)
-        return
-    if have >= floor:
-        return
-    fix = ("take this release's proxy image, which carries the pinned build"
-           if app_config.RUNNING_IN_DOCKER else
-           "re-run scripts/install-baseline-tools.sh, which builds the pinned release")
-    logger.warning(
-        "netns preflight: %s is older than PASST_MIN_VERSION %s (the pasta the sandbox's "
-        "launcher options are written against); agents still run, but %s.",
-        line, floor, fix,
-    )
-
-
-# pasta opens the sandbox's tap through this device; a container has it only
-# when the compose file maps it in (``devices: /dev/net/tun``).
-_TUN_DEVICE = "/dev/net/tun"
-_TUN_WORDS = re.compile(r"\btun\b|\btap\b", re.IGNORECASE)
-
-
-def _tun_device_problem() -> str | None:
-    """Why this host has no ``/dev/net/tun`` character device, or None."""
-    try:
-        if not stat.S_ISCHR(os.stat(_TUN_DEVICE).st_mode):
-            return f"{_TUN_DEVICE} is not a character device"
-    except OSError:
-        return f"{_TUN_DEVICE} is missing"
-    return None
-
-
-def _tun_unavailable(detail: str) -> str | None:
-    """Why the network launcher cannot open its tap, or None: no tun device,
-    or a probe's error (a probe runs the launcher) names the tun or tap."""
-    return _tun_device_problem() or (detail if _TUN_WORDS.search(detail) else None)
-
-
-def _tun_sentence(why: str) -> str:
-    """What the boot refusal and the nested probe's error both say."""
-    return (f"Sandbox network launcher cannot open its tap device ({why}): no session can start in "
-            "this server's sandbox (sessions on paired machines do not use it). Map the device into the "
-            "proxy container (docker-compose.yml: devices: /dev/net/tun) or, on a host, load the tun "
-            "module (sudo modprobe tun), then restart.")
-
-
-def _sandbox_shape_gate() -> None:
-    """The hard gate's last step, the shape every local session runs: any
-    failure of it refuses the boot (every local session would fail at spawn), the
-    tun device's with the tun sentence; a probe that does not answer only
-    logs an error (a loaded host at boot is no reason to refuse)."""
-    problem = _tun_device_problem()
-    if problem is not None:
-        raise RuntimeError(_tun_sentence(problem))
-    try:
-        detail = _probe_detail(_run_probe(_sandbox_shape("bwrap", ["true"]), timeout=_SHAPE_PROBE_S))
-    except OSError as e:
-        detail = f"failed to run: {e}"
-    except subprocess.TimeoutExpired:
-        logger.error("netns preflight: the sandbox shape (the network launcher wrapping "
-                     "bwrap) did not answer within %ss; agent sessions may fail to start. "
-                     "Run scripts/sandbox-doctor.sh on this host.", _SHAPE_PROBE_S)
-        return
-    if detail is None:
-        return
-    if _TUN_WORDS.search(detail):
-        raise RuntimeError(_tun_sentence(detail))
-    raise RuntimeError(
-        f"Sandbox network isolation is mandatory but the sandbox does not start on this host (the network "
-        f"launcher wrapping bwrap failed: {detail}). Run scripts/sandbox-doctor.sh to pinpoint the denial. "
-        "Refusing to start: every session in this server's sandbox would fail the same way.")
-
-
-def _warn_nested_probe(nested_detail: str) -> None:
-    """The nested probe failed: when the launcher itself could not open its
-    tap no session in this server's sandbox can start, so that is an error naming
-    the device; otherwise the outer sandbox works and only the engine's
-    inner sandbox is lost. Never fatal: a boot refusal would stop hosts the
-    probe misjudges."""
-    tun = _tun_unavailable(nested_detail)
-    if tun is not None:
-        logger.error("%s", _tun_sentence(tun))
-        return
-    logger.warning(
-        "Sandbox nested-namespace probe FAILED — the agent sandbox itself "
-        "works, but a bwrap nested inside it cannot start (%s). Local "
-        "Codex sessions lose their engine-side inner sandbox: shell "
-        "commands degrade to unsandboxed retries behind permission "
-        "prompts (Claude sessions are unaffected). Run "
-        "scripts/sandbox-doctor.sh on this host to pinpoint the denial.",
-        nested_detail,
-    )
-
-
-def netns_preflight() -> None:
-    """Startup gate for the always-on sandbox network isolation — called at boot.
-
-    Hard-fails when the host can't enforce the isolation, so the misconfig is
-    caught at deploy rather than silently running agents unisolated (there is no
-    un-isolated mode). Verifies the tools exist AND that an unprivileged
-    user+net namespace can actually be created (a binary may be present yet
-    namespace creation blocked by the container's seccomp/userns profile — that
-    would otherwise pass and fail every session at spawn), then runs the
-    sandbox shape itself (`_sandbox_shape_gate`, the tun device included). A
-    pasta older than PASST_MIN_VERSION only warns (`_warn_pasta_below_floor`). Also materializes the
-    stub-resolver resolv.conf swap file so every later build_command_prefix()
-    call is a pure argv transform.
-    """
-    missing = [tool for tool in ("pasta", "ip", "bwrap")
-               if shutil.which(tool) is None]
-    if not os.access(_NETNS_LAUNCHER, os.X_OK):
-        missing.append(str(_NETNS_LAUNCHER))
-    if missing:
-        raise RuntimeError(
-            "Sandbox network isolation is mandatory but the host is missing: "
-            f"{', '.join(missing)}. Run scripts/install-baseline-tools.sh "
-            "(it installs passt, which provides pasta, and `iproute2`; see "
-            "VERSIONS.md for the pin). Refusing to start: agents would "
-            "otherwise run without network isolation."
-        )
-    _warn_pasta_below_floor()
-
-    # Capability probe: can we actually create an unprivileged user+net
-    # namespace? `unshare -Urn true` exercises exactly the namespaces the
-    # sandbox needs; a present-but-blocked kernel/profile fails here at boot
-    # instead of at every session spawn.
-    try:
-        probe = _run_probe(["unshare", "-Urn", "true"], timeout=10)
-    except FileNotFoundError:
-        # `unshare` (util-linux) absent. This used to skip the probe entirely —
-        # letting a namespace-denying host boot and then fail every session
-        # spawn — so probe with bwrap itself instead (bwrap presence is already
-        # gated above; --unshare-all exercises user+net+mount creation).
-        logger.warning(
-            "netns preflight: `unshare` (util-linux) is missing — probing "
-            "namespace support with bwrap directly. Install util-linux for "
-            "the canonical probe."
-        )
-        try:
-            probe = _run_probe(
-                ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--", "/bin/true"],
-                timeout=10,
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"Sandbox netns capability probe failed to run: {e}. The host "
-                "must allow unprivileged user+network namespaces."
-            ) from e
-    except Exception as e:
-        raise RuntimeError(
-            f"Sandbox netns capability probe failed to run: {e}. The host must "
-            "allow unprivileged user+network namespaces."
-        ) from e
-    if probe is not None and probe.returncode != 0:
-        detail = (probe.stderr or b"").decode(errors="replace").strip()
-        if _apparmor_userns_restricted():
-            # The Ubuntu 24.04+ default. Name the exact cause and the scoped
-            # remedy — the generic advice people find is "set the sysctl to
-            # 0", which disables the hardening for the whole host.
-            raise RuntimeError(
-                "Sandbox network isolation is mandatory but this host denies "
-                "unprivileged user namespaces via AppArmor "
-                "(kernel.apparmor_restrict_unprivileged_userns=1 — the "
-                f"Ubuntu 24.04+ default; `unshare -Urn` failed: {detail}). "
-                "Fix, containerised install: run "
-                "`sudo scripts/setup-apparmor-userns.sh` on the Docker HOST "
-                "(installs the scoped `otodock_userns` AppArmor profile), then "
-                "restart via scripts/compose.sh — it selects the profile "
-                "automatically (standalone `docker compose`: set "
-                "OTODOCK_APPARMOR_PROFILE=otodock_userns in .env). Bare-metal "
-                "install: the distro AppArmor profiles for bwrap/unshare/passt "
-                "must be present (Ubuntu's `apparmor` package ships them). Do "
-                "NOT set the sysctl to 0 — that disables the protection for "
-                "the entire host."
-            )
-        if _debian_userns_disabled():
-            raise RuntimeError(
-                "Sandbox network isolation is mandatory but unprivileged user "
-                "namespaces are disabled on this host "
-                "(kernel.unprivileged_userns_clone=0 — the Debian hardening "
-                f"knob; probe failed: {detail}). Re-enable it "
-                "(`sysctl kernel.unprivileged_userns_clone=1` + a "
-                "/etc/sysctl.d drop-in) — the sandbox is built on unprivileged "
-                "user namespaces."
-            )
-        raise RuntimeError(
-            "Sandbox network isolation is mandatory but this host cannot create "
-            f"an unprivileged user+network namespace (`unshare -Urn` failed: {detail}). "
-            "Enable unprivileged user namespaces (and, in a container, relax the "
-            "seccomp/userns profile)."
-        )
-
-    _sandbox_shape_gate()
-
-    # Nested-level probe (diagnostic, never boot-fatal): the Codex engine ships
-    # its own bubblewrap and nests it INSIDE our sandbox for every shell
-    # command (its "fs sandbox helper"). A host can pass the one-level gate
-    # above yet deny the second level — e.g. Ubuntu 24.04's AppArmor userns
-    # restriction covers /usr/bin/bwrap via distro profiles but not what runs
-    # a level deeper — and the only runtime symptom is every Codex command
-    # degrading to unsandboxed retries + permission prompts, paraphrased by
-    # the model as "the local sandbox could not start" (2026-08-12 incident).
-    global _nested_sandbox_ok
-    nested_detail = _nested_sandbox_probe()
-    _nested_sandbox_ok = nested_detail is None
-    if nested_detail is None:
-        logger.info("netns: nested-namespace probe OK (engine inner sandboxes can start)")
-    else:
-        _warn_nested_probe(nested_detail)
-
-    resolv = netns_resolv_path()
-    if _host_resolv_has_loopback_ns():
-        resolv.parent.mkdir(parents=True, exist_ok=True)
-        resolv.write_text(
-            "# Generated by otodock (sandbox network isolation): the host's\n"
-            "# resolver is a loopback stub that cannot exist inside the\n"
-            "# agent netns — pasta forwards this address to the real one.\n"
-            f"nameserver {_NETNS_DNS_FORWARD_ADDR}\n"
-        )
-        logger.info(
-            "netns: host uses a loopback stub resolver — sessions get a "
-            "generated resolv.conf via pasta --dns-forward %s",
-            _NETNS_DNS_FORWARD_ADDR
-        )
-    elif resolv.exists():
-        resolv.unlink()
-
-
-def cli_version_preflight() -> None:
-    """Warn (don't fail) if the proxy host's claude/codex drift from the pins.
-
-    The installer (`scripts/install-baseline-tools.sh`) pins + upgrades these and
-    satellites reconcile on auth, but a manual `npm i -g …@latest` (or a CLI's
-    own updater) can still drift the PROXY host — exactly the dev-box drift that
-    motivated the pin-and-freeze. Catch it at boot. Warn-only: a drifted CLI
-    usually still runs, and we never want to block startup on it.
-    """
-    import re
-    import subprocess
-
-    from core.session.session_manager import get_all_layers
-
-    # Every registered engine with a CLI: its display name, the binary this
-    # host is configured to run and the pin VERSIONS.md carries — read from
-    # the layer, so a fourth engine is checked the day it registers.
-    checks = (
-        (layer.capabilities.display_name, layer.cli_binary_path(), layer.pinned_cli_version())
-        for layer in get_all_layers().values()
-        if layer.capabilities.runtime.binary
-    )
-    for label, bin_name, want in checks:
-        if not want or not bin_name:
-            continue
-        exe = shutil.which(bin_name)
-        if not exe:
-            logger.warning("CLI pin: %s (%s) not found on PATH", label, bin_name)
-            continue
-        try:
-            out = subprocess.run(
-                [exe, "--version"], capture_output=True, text=True, timeout=15,
-            ).stdout
-        except (OSError, subprocess.SubprocessError):
-            continue
-        m = re.search(r"(\d+\.\d+\.\d+)", out or "")
-        have = m.group(1) if m else ""
-        pkg = _npm_package_of(exe) or "<package>"
-        hint = (f"run scripts/install-baseline-tools.sh (or `npm i -g "
-                f"--allow-scripts={pkg} {pkg}@{want}`) to reconcile the proxy host")
-        if not have:
-            # npm 12 installs a CLI whose own install step it skipped as a stub
-            # that prints no version.
-            logger.warning(
-                "CLI pin: %s (%s) printed no version — its install step may not "
-                "have run (npm 12 skips install scripts by default); %s.",
-                label, exe, hint,
-            )
-        elif have != want:
-            logger.warning(
-                "CLI pin DRIFT: %s is %s but VERSIONS.md pins %s — %s.",
-                label, have, want, hint,
-            )
-
-
-def _npm_package_of(exe: str) -> str:
-    """The npm package a globally installed CLI comes from, read from where
-    its binary resolves (``…/node_modules/<pkg>/…`` or
-    ``…/node_modules/@scope/<pkg>/…``); "" for a binary npm did not install."""
-    parts = Path(os.path.realpath(exe)).parts
-    if "node_modules" not in parts:
-        return ""
-    i = len(parts) - 1 - parts[::-1].index("node_modules")
-    rest = parts[i + 1:]
-    if not rest:
-        return ""
-    if rest[0].startswith("@") and len(rest) > 1:
-        return f"{rest[0]}/{rest[1]}"
-    return rest[0]
-
-
-def cli_install_ro_binds(bin_path: str) -> list[str]:
-    """RO bind dirs that make a CLI installed OUTSIDE the system mounts
-    (e.g. a user-prefix npm install under ``~/.npm-global``) runnable inside
-    the sandbox: the binary's directory (shim/symlink location) plus the
-    resolved package root for npm JS shims. Paths already under the system
-    binds (/usr, …) just re-bind harmlessly. Shared by the CLI and Codex
-    layers so both binaries get identical treatment.
-    """
-    if not bin_path or "/" not in bin_path:
-        return []  # bare name → PATH-resolved inside the sandbox (system dirs)
-    dirs = [os.path.dirname(bin_path)]
-    real = os.path.realpath(bin_path)
-    if real != os.path.abspath(bin_path):
-        # npm shim: bin/<cli> symlinks into lib/node_modules/<pkg>/… — mount
-        # the package root too. A direct native binary needs only its bin dir.
-        dirs.append(os.path.dirname(os.path.dirname(real)))  # bin/x.js → pkg root
-    return [d for d in dict.fromkeys(dirs) if d and os.path.isdir(d)]
+# paired computer whose owner chose it. Un-resolvable egress fails CLOSED
+# (the render refuses a description with no route) — never a silent
+# fall-back to host networking.
 
 
 # ---------------------------------------------------------------------------
@@ -784,14 +132,18 @@ class Mount:
     appears at ``sandbox`` inside the session, read-write when ``rw``.
 
     ``SandboxBuilder.workspace_mount_table`` is the single source of truth for
-    what a session can read and write: ``_workspace_mounts`` renders the list
-    as bwrap ``--bind`` / ``--ro-bind`` args for CLI + MCP processes, and the
-    Direct-LLM file tools (core/layers/direct/files.py — in-proxy, no bwrap
-    underneath) resolve their paths against the SAME list. Order matters:
-    bwrap gives a later bind precedence at the same or a deeper destination
-    (the RO root + RW subdir stacking below relies on it), so a resolver must
-    pick the longest matching ``sandbox`` prefix and, on a tie, the later
-    entry.
+    what a session can read and write: the render turns the list into
+    bwrap ``--bind`` / ``--ro-bind`` args for CLI + MCP processes and for the
+    Direct-LLM file tools' program, which runs inside that sandbox. The
+    platform's half of those tools (core/layers/direct/files.py) opens
+    nothing and reads the SAME list as text for three things: to word an
+    early refusal, to judge the place where a link lands (``files.landing``),
+    and to name the file that the bookkeeping records and the delete owner
+    removes (``files.record_place``). Order
+    matters: bwrap gives a later bind precedence at the same or a deeper
+    destination (the RO root + RW subdir stacking below relies on it), so a
+    reader of the list must pick the longest matching ``sandbox`` prefix and,
+    on a tie, the later entry.
     """
     host: str       # real directory on the proxy host
     sandbox: str    # mount point inside the session
@@ -842,6 +194,27 @@ class SandboxConfig:
     # Both ride the agent-scope branch (``username == ""``).
     external: bool = False
     external_home: str = ""
+    # An outside session's picks (services/mcp/outside_picks.py): whether the
+    # person's own files are read-write, and the knowledge folders bound
+    # read-only (a folder name, or ``shared/<source>[/<subdir>]`` for an
+    # attached library). No shared workspace and no knowledge root ever.
+    outside_files_write: bool = False
+    outside_knowledge: tuple[str, ...] = ()
+    # The wrap-up after a conversation (services/phone/wrapup.py): ``None``
+    # for every other session. The shared workspace and the knowledge read
+    # only, the person's tree (``wrapup_home``, "" for none) at /caller with
+    # workspace/ and context/ writable and its memory read only. Agent scope.
+    wrapup_home: str | None = None
+    # A session that runs from its own scratch engine home instead of its
+    # scope's (the wrap-up, the agent's own phone line; ``own_engine_home``):
+    # that home's .claude and .codex at /caller/.claude and /caller/.codex, its
+    # config dir there, and the agent scope's own engine state masked. The
+    # line also has the agent's shared memory masked.
+    engine_home: str = ""
+    # The session's own home (``core/sandbox/session_home``), its host path,
+    # bound back in writable over the masked ``own`` folder (``describe``);
+    # "" for every sandbox that is not a session running from one.
+    session_home: str = ""
     # Attached knowledge libraries: ``(source_slug, subdir, writable)`` per
     # row of knowledge_library_attachments (``subdir == ''`` = whole-folder
     # share). Mirrors are real dirs inside THIS agent's knowledge tree
@@ -876,12 +249,15 @@ class SandboxConfig:
     # / False for every agent session.
     app_mounts: list[Mount] | None = None
     app_cwd: str = ""
+    # An app button's tools (services/apps/headless_exec.py): every engine
+    # state the table would bind is masked, at the app's own role too.
+    app_press: bool = False
     net_inbound: str = ""
     net_egress_deny: bool = False
 
 
 # Sandbox-internal destinations an MCP manifest mount must NEVER target.
-# Conditional manifest mounts run LAST in build_command_prefix, so a later
+# Conditional manifest mounts run LAST in the render, so a later
 # ``--ro-bind`` would shadow whatever already sits at the destination. Without
 # this guard a malicious community manifest could overlay its own file onto the
 # permission-gate hook (under ``.claude``) to disable tool gating, or shadow
@@ -922,14 +298,21 @@ def _is_safe_mcp_mount_dest(dest: str) -> bool:
 # ---------------------------------------------------------------------------
 
 class SandboxBuilder:
-    """Constructs bwrap command prefix from a SandboxConfig.
-
-    Pure function: SandboxConfig -> list[str]. Does not spawn processes.
+    """Resolves a SandboxConfig into the description of a session's sandbox
+    (``describe``), which the machine that runs the session renders. Starts
+    no process.
     """
 
     def __init__(self, cfg: SandboxConfig):
         self.cfg = cfg
         self._agent_dir = cfg.host_agents_dir / cfg.agent_name
+        # The credential exit's port inside the sandbox (0 for none) and the
+        # session's SSH agent socket by its name under the host's socket dir
+        # ("" for none): set by the starting layer once the resolve is done
+        # (``credential_exit.attach_sandbox``, ``ssh_signer.attach_sandbox``),
+        # read by ``describe``.
+        self.exit_port = 0
+        self.ssh_agent = ""
 
     def _agent_root_real(self) -> Path:
         """The agent's folder resolved: the one spelling every bind source
@@ -938,79 +321,145 @@ class SandboxBuilder:
         moved to another disk) is the operator's and is followed once here."""
         return Path(os.path.realpath(self._agent_dir))
 
-    def build_command_prefix(self, inner_cmd: list[str]) -> list[str]:
-        """Wrap inner_cmd with bwrap (+ the netns launcher when enabled)."""
-        args = ["bwrap"]
-        args.extend(self._namespace_flags())
-        args.extend(self._cap_flags())
-        args.extend(self._system_mounts())
-        args.extend(self._claude_config_mount())
-        args.extend(self._workspace_mounts())
-        args.extend(self._mcp_mounts())
-        args.extend(self._conditional_mcp_mounts())
-        args.extend(["--chdir", self.get_cwd()])
-        args.append("--")
-        args.extend(inner_cmd)
-        # Isolation is ALWAYS on. An empty forward set means the egress resolver
-        # was never consulted (a build error — every session must come through
-        # resolve_sandbox_config) — fail CLOSED rather than launch the agent
-        # un-isolated OR netns-wrapped without the permission-hook port.
-        if not self.cfg.net_forwards:
-            raise RuntimeError(
-                "sandbox network egress was not resolved (empty net_forwards) — "
-                "refusing to launch a local agent. Sessions must be built via "
-                "resolve_sandbox_config(); see core/sandbox/sandbox.py."
-            )
-        return self._netns_launcher_prefix() + args
 
-    def _netns_active(self) -> bool:
-        """Always true for a resolved session (isolation is mandatory).
-
-        Kept as a single predicate for the uid-map-back + resolv-swap decisions;
-        false only for a malformed config with no egress set, which
-        build_command_prefix rejects outright.
-        """
-        return bool(self.cfg.net_forwards)
-
-    def _netns_launcher_prefix(self) -> list[str]:
-        """The oto-sandbox-net argv prepended to bwrap (pasta outside, bwrap inside).
-
-        bwrap keeps `--share-net`: under the launcher it shares pasta's
-        isolated netns, not the host's. Loopback forwards are spliced by pasta
-        (`-T`); routable allow-hosts are carved /32·/128 routes; outbound rides
-        NAT. The generated-resolv.conf check mirrors `_system_mounts` (same
-        single signal — file existence).
-        """
-        prefix = [str(_NETNS_LAUNCHER)]
-        if self.cfg.app_mounts is None:
-            # The role table's sources all sit in the agent's resolved
-            # folder: the shim hands each to bwrap as a descriptor it opened
-            # with no link followed below it (an app's table is its own).
-            prefix.extend(["--beneath", str(self._agent_root_real())])
-        prefix.append("--block-private")
-        # The proxy-port forward lands on the internal listener when the app
-        # bound one (``config.INTERNAL_LISTENER_PORT``, 0 when it did not):
-        # pasta's ``-T <namespace port>:<host port>`` splices the sandbox's
-        # ``127.0.0.1:PORT`` onto that listener, whose requests carry no
-        # forwarded-client headers, so nothing inside the sandbox changes
-        # and nothing inside it can speak for another client address.
-        internal = int(getattr(app_config, "INTERNAL_LISTENER_PORT", 0) or 0)
+    def describe(self) -> _render.SandboxDescription:
+        """What this session's sandbox is, with nothing of this host in it:
+        the role table and the hook binds as roots and relative paths (an
+        app server's table keeps its absolute sources, which only the proxy
+        renders), the session's tool folders, the manifest mounts the
+        builder checked, the working directory and the network routes with
+        the proxy port spelled as its marker."""
+        root = str(self._agent_root_real())
+        table = self.workspace_mount_table()
+        binds = tuple(self._bind_of(m, root) for m in table)
+        masks, home = self._home_parts(table, root)
+        mcps_root = str(self.cfg.host_mcps_dir)
         proxy_port = str(app_config.PORT)
-        for port in self.cfg.net_forwards:
-            spec = str(port)
-            if internal and spec == proxy_port:
-                spec = f"{proxy_port}:{internal}"
-            prefix.extend(["--forward", spec])
-        for host in self.cfg.net_allow_hosts:
-            prefix.extend(["--allow-host", str(host)])
-        if self.cfg.net_inbound:
-            prefix.extend(["--inbound", self.cfg.net_inbound])
-        if self.cfg.net_egress_deny:
-            prefix.append("--egress-deny")
-        if netns_resolv_path().exists():
-            prefix.extend(["--dns-forward", _NETNS_DNS_FORWARD_ADDR])
-        prefix.append("--")
-        return prefix
+        return _render.SandboxDescription(
+            agent=self.cfg.agent_name,
+            binds=binds,
+            mcp_binds=tuple(self._mcp_rels(mcps_root)),
+            mcps_root=mcps_root,
+            extra_binds=tuple(self._extra_binds(root)),
+            cwd=self.get_cwd(),
+            proxy_port=int(app_config.PORT),
+            forwards=tuple(_render.PROXY_FORWARD if str(p) == proxy_port else str(p)
+                           for p in self.cfg.net_forwards),
+            allow_hosts=tuple(str(h) for h in self.cfg.net_allow_hosts),
+            hosted=bool(app_config.OTODOCK_CLOUD),
+            inbound=self.cfg.net_inbound or "",
+            egress_deny=bool(self.cfg.net_egress_deny),
+            # The role table's sources all sit in the agent's resolved
+            # folder, which the shim holds; an app's table is its own.
+            beneath=self.cfg.app_mounts is None,
+            tmp_size_mb=int(app_config.SANDBOX_TMP_SIZE_MB or 0),
+            exit_port=int(self.exit_port or 0),
+            ssh_agent=self.ssh_agent or "",
+            home_masks=masks,
+            home=home,
+        )
+
+    def _home_parts(self, table: list[Mount], root: str
+                    ) -> tuple[tuple[_render.Bind, ...], _render.Bind | None]:
+        """The sessions' homes the render masks (``sandbox_render.home_args``):
+        the ``own`` folder of each engine folder of this agent the table
+        shows, wherever it shows it (the session's own scope, the agent
+        scope's through a person's ``/workspace``, every person's under an
+        admin's ``/users``), and this session's own home. Every sandbox over
+        a store masks them (a session, a script, an app button's tools): a
+        home holds its session's sign-in, so only the session that runs from
+        it names it (``SandboxConfig.session_home``)."""
+        from core.sandbox import session_home
+        base = Path(root)
+        stores = [base / layout.WORKSPACE / n for n in _STATE_DIR_NAMES]
+        users = base / layout.USERS
+        if users.is_dir() and not users.is_symlink():
+            stores += [u / n for u in sorted(users.iterdir())
+                       if u.is_dir() and not u.is_symlink() for n in _STATE_DIR_NAMES]
+        masks: list[_render.Bind] = []
+        for store in stores:
+            seen = _seen_at(table, str(store))
+            if seen is None or store.is_symlink() or not store.is_dir():
+                continue
+            masks.append(_render.Bind(_render.ROOT_AGENT, f"{store.relative_to(base)}/{session_home.OWN}",
+                                      f"{seen}/{session_home.OWN}", False))
+        home = None
+        if self.cfg.session_home and session_home.is_home(self.cfg.session_home):
+            store = session_home.store_of(self.cfg.session_home)
+            seen = _seen_at(table, str(store))
+            if seen is not None and Path(self.cfg.session_home).is_relative_to(base):
+                home = _render.Bind(_render.ROOT_AGENT, str(Path(self.cfg.session_home).relative_to(base)),
+                                    f"{seen}/{session_home.relative(Path(self.cfg.session_home).name)}", True)
+        return tuple(masks), home
+
+    @staticmethod
+    def _bind_of(m: Mount, root: str) -> _render.Bind:
+        """A row of the table as the description spells it: below the
+        agent's resolved folder, the empty mask folder, or (an app server's
+        table) an absolute source of this host."""
+        if m.host == str(empty_mount_dir()):
+            return _render.Bind(_render.ROOT_EMPTY, "", m.sandbox, m.rw)
+        if m.host == os.devnull:
+            return _render.Bind(_render.ROOT_NULL, "", m.sandbox, m.rw)
+        if m.host == root:
+            return _render.Bind(_render.ROOT_AGENT, "", m.sandbox, m.rw)
+        if m.host.startswith(root + "/"):
+            return _render.Bind(_render.ROOT_AGENT, m.host[len(root) + 1:], m.sandbox, m.rw)
+        return _render.Bind(_render.ROOT_ABS, m.host, m.sandbox, m.rw)
+
+    def _mcp_rels(self, mcps_root: str) -> list[str]:
+        """This session's tool folders relative to the tools root: identity
+        binds, read-only, at the same path inside (the MCP config names
+        them). Only the folders of ``cfg.mcp_dir_binds`` (the assigned stdio
+        MCPs and ``mcps/.uv-python``), never the whole tree: an agent must
+        not read the code, config or data of a tool it is not assigned. The
+        render skips a folder the host lacks. A folder named through a link
+        is taken by its place under the tools root, and one outside the root
+        is left out: the render refuses a name that climbs out of it."""
+        rels: list[str] = []
+        for d in self.cfg.mcp_dir_binds:
+            real = d if d.startswith(mcps_root + "/") else os.path.realpath(d)
+            if real.startswith(mcps_root + "/"):
+                rels.append(real[len(mcps_root) + 1:])
+            else:
+                logger.warning("tool folder %s is outside the tools folder: not bound", d)
+        return rels
+
+    def _extra_binds(self, root: str) -> list[_render.Bind]:
+        """The mounts an MCP manifest declares (``sandbox.mounts``), each end
+        checked against a malicious community manifest: the source must
+        resolve inside this agent's own tree or the tools tree (never the
+        platform root with ``config.env`` and ``sessions/``, never another
+        agent's), and the destination must not overlay the hooks, the
+        per-session config, ``/config``, ``/knowledge`` or a system mount
+        (``_is_safe_mcp_mount_dest``), since these binds run last. A source
+        the host lacks is skipped, here and at the render."""
+        mcps_root = Path(self.cfg.host_mcps_dir)
+        with contextlib.suppress(OSError, ValueError):
+            mcps_root = mcps_root.resolve()
+        binds: list[_render.Bind] = []
+        for mount in self.cfg.mcp_sandbox_mounts:
+            if not os.path.exists(mount.host):
+                continue
+            host_resolved = Path(mount.host).resolve()
+            if host_resolved.is_relative_to(root):
+                bind_root, rel = _render.ROOT_AGENT, str(host_resolved.relative_to(root))
+            elif host_resolved.is_relative_to(mcps_root):
+                bind_root, rel = _render.ROOT_MCPS, str(host_resolved.relative_to(mcps_root))
+            else:
+                logger.warning(
+                    "Refusing MCP sandbox mount of %s (mode=%s): host outside "
+                    "the agent / mcps tree", mount.host, mount.mode,
+                )
+                continue
+            if not _is_safe_mcp_mount_dest(mount.sandbox):
+                logger.warning(
+                    "Refusing MCP sandbox mount to %s (mode=%s): destination "
+                    "overlays a protected sandbox path", mount.sandbox, mount.mode,
+                )
+                continue
+            binds.append(_render.Bind(bind_root, rel, mount.sandbox, mount.mode == "rw"))
+        return binds
 
     def get_cwd(self) -> str:
         """Sandbox-internal CWD for this role."""
@@ -1018,8 +467,9 @@ class SandboxBuilder:
 
         if self.cfg.app_cwd:
             return self.cfg.app_cwd
-        if self.cfg.external_home:
-            # External caller with a private tree — their own home.
+        if self.cfg.external_home or self.cfg.wrapup_home is not None:
+            # External caller with a private tree — their own home; the
+            # wrap-up after a conversation, the person's (or its scratch).
             return EXTERNAL_SANDBOX_HOME
         if not username:
             # Agent-scoped task
@@ -1039,8 +489,8 @@ class SandboxBuilder:
             config_env_var: Env var pointing to it ("CLAUDE_CONFIG_DIR" or "CODEX_CONFIG_DIR").
         """
         # Config dir lives inside the caller / user / workspace dir (no
-        # separate mount)
-        if self.cfg.external_home:
+        # separate mount), or a session's own scratch engine home's
+        if self.cfg.external_home or self.cfg.wrapup_home is not None or self.cfg.engine_home:
             scope_root = EXTERNAL_SANDBOX_HOME
         elif self.cfg.username:
             scope_root = layout.virtual_user_root(self.cfg.username)
@@ -1084,132 +534,6 @@ class SandboxBuilder:
     # Internal mount builders
     # -----------------------------------------------------------------------
 
-    def _namespace_flags(self) -> list[str]:
-        flags = [
-            "--unshare-pid",      # new PID namespace (can't see other processes)
-            "--unshare-ipc",      # own SysV/POSIX-mq namespace — all local
-                                  # sandboxes share the proxy uid, so a shared
-                                  # IPC namespace would be a live cross-agent
-                                  # shm/semaphore channel (/dev/shm is per-
-                                  # sandbox tmpfs already; this closes shmget)
-            "--unshare-uts",      # own hostname namespace (completeness)
-            "--die-with-parent",  # kill sandbox if parent dies
-            "--share-net",        # share network (hooks need localhost:8400;
-                                  # under the netns launcher this is pasta's
-                                  # isolated netns, not the host's)
-        ]
-        flags.extend(self._netns_uid_flags())
-        return flags
-
-    def _netns_uid_flags(self) -> list[str]:
-        """Preserve the agent's host-native uid/gid when wrapped in pasta.
-
-        Rootless pasta (proxy uid != 0, the host-native dev install) runs
-        bwrap inside a user namespace that maps the proxy uid -> 0, so a plain
-        bwrap hands the agent **uid 0** instead of today's proxy uid (verified
-        on the 5.15 dev host: files still land host-owned either way, but the
-        in-sandbox uid flips to root — a behavior delta that trips tools'
-        run-as-root guards). Mapping back to the proxy's real uid/gid makes
-        the in-sandbox identity byte-identical to the flag-off path; the only
-        delta becomes the network policy.
-
-        If the proxy runs as root (no default topology does — an operator
-        override only), bwrap nests no user namespace and already hands the agent
-        uid 0, so no map-back is needed and none is emitted. Empty when netns is
-        inactive → legacy argv intact. (T2/cloud run the proxy as uid 1000, so
-        they take the rootless map-back branch, identical to bare-metal.)
-        """
-        if not self._netns_active() or os.getuid() == 0:
-            return []
-        return [
-            "--unshare-user",
-            "--uid", str(os.getuid()),
-            "--gid", str(os.getgid()),
-        ]
-
-    def _cap_flags(self) -> list[str]:
-        """Drop ALL Linux capabilities from the sandboxed agent — unconditionally.
-
-        The agent never needs a Linux capability (it runs the CLI + workspace
-        tooling; nothing requires CAP_*). Dropping them is the single uniform
-        invariant: the agent always holds zero capabilities, regardless of how
-        the proxy was launched.
-
-        It is load-bearing when the proxy runs as root (e.g. an operator who runs
-        the image as root): there bwrap nests no user namespace, so without this
-        the agent would inherit the container's full capability set — empirically
-        CapEff=0xa82425fb (CAP_SYS_ADMIN, CAP_DAC_OVERRIDE, CAP_MKNOD, …), a large
-        kernel attack surface for a sandbox/namespace breakout. `--cap-drop ALL`
-        zeroes the effective + bounding set for the payload AFTER bwrap performs
-        its own (privileged) mount/pivot_root setup, so the sandbox is still built
-        but the agent holds no caps (verified: CapEff=0, workspace still writable
-        via ownership, RO binds still enforced, mount() refused).
-
-        On the non-root paths (bare-metal T1, and the containerised T2/cloud where
-        the proxy runs as uid 1000) bwrap nests a user namespace where caps are
-        already namespaced and powerless on the host — so this is a harmless,
-        free belt-and-braces there (verified: rootless bwrap + --cap-drop ALL →
-        uid unchanged, CapEff=0, python still runs).
-        """
-        return ["--cap-drop", "ALL"]
-
-    def _system_mounts(self) -> list[str]:
-        args: list[str] = []
-
-        # Required RO binds
-        for path in _SYSTEM_RO_BINDS:
-            args.extend(["--ro-bind", path, path])
-
-        # Optional RO binds (some paths don't exist on all systems)
-        for path in _SYSTEM_RO_OPTIONAL:
-            if os.path.exists(path):
-                args.extend(["--ro-bind", path, path])
-
-        # Individual system files
-        netns_resolv = (
-            netns_resolv_path() if self._netns_active() else None
-        )
-        for path in _SYSTEM_RO_FILES:
-            # Stub-resolver netns mode: shadow the host's loopback resolv.conf
-            # (127.0.0.53 — unreachable inside the netns) with the generated
-            # one pointing at pasta's --dns-forward address. Same single signal
-            # as the launcher's --dns-forward (the file's existence).
-            if (path == "/etc/resolv.conf" and netns_resolv is not None
-                    and netns_resolv.exists()):
-                args.extend(["--ro-bind", str(netns_resolv), "/etc/resolv.conf"])
-                continue
-            if os.path.exists(path):
-                args.extend(["--ro-bind", path, path])
-
-        # Extra RO binds from layer config (e.g. Codex npm-global directory)
-        for path in self.cfg.extra_ro_binds:
-            if os.path.exists(path):
-                args.extend(["--ro-bind", path, path])
-
-        # Minimal /dev, /proc, /tmp. The tmpfs is HOME (see get_env_overrides)
-        # and the CLI's runtime root (claude_runtime_root); ``--size`` must
-        # directly precede the ``--tmpfs`` it bounds (see tmpfs_cap_mb).
-        args.extend(["--dev", "/dev"])
-        args.extend(["--proc", "/proc"])
-        cap_mb = tmpfs_cap_mb()
-        if cap_mb > 0:
-            args.extend(["--size", str(cap_mb * 1024 * 1024)])
-        args.extend(["--tmpfs", "/tmp"])
-
-        return args
-
-    def _claude_config_mount(self) -> list[str]:
-        """No-op: .claude/ is inside the user or workspace dir (already mounted)."""
-        return []
-
-    def _workspace_mounts(self) -> list[str]:
-        """bwrap args for the role mount table — rendered from
-        :meth:`workspace_mount_table` so the kernel view and the Direct-LLM
-        file resolver can never disagree."""
-        args: list[str] = []
-        for m in self.workspace_mount_table():
-            args.extend(["--bind" if m.rw else "--ro-bind", m.host, m.sandbox])
-        return args
 
     def workspace_mount_table(self) -> list[Mount]:
         """The role mount table (``_role_mount_table``) with the session's
@@ -1237,8 +561,9 @@ class SandboxBuilder:
         binds. A bind holds only while the host file is not replaced (a
         rename over a mountpoint detaches it in every other namespace), so
         these files' content stays a function of the scope's paths and the
-        build (``session_config_dir.write_if_changed``). Satellites run no
-        bwrap."""
+        build (``session_config_dir.write_if_changed``). A ``.codex`` dir
+        also takes the null device, read-only, over its instruction file
+        names (``_shared_text_masks``)."""
         from core.sandbox.session_config_dir import (
             _INTERCEPTOR_SRC,
             HOOK_FILE_OF_STATE_DIR,
@@ -1283,6 +608,7 @@ class SandboxBuilder:
             if c.sandbox != d:
                 binds.append(Mount(str(host_dir), d, True))
             binds.extend(Mount(str(f), f"{d}/{f.name}", False) for f in files)
+            binds.extend(self._shared_text_masks(self._agent_root_real(), host_dir, d))
             # The command wrappers' directory sits first on the session's
             # PATH: read-only as a whole, so nothing can be added beside
             # them (a planted interpreter there would run in place of the
@@ -1292,6 +618,67 @@ class SandboxBuilder:
                     and os.path.realpath(wrappers) == str(wrappers)):
                 binds.append(Mount(str(wrappers), f"{d}/{WRAPPER_DIR}", False))
         return binds
+
+    @staticmethod
+    def _shared_text_masks(root: Path, host_dir: Path, d: str) -> list[Mount]:
+        """The host's null device, read-only, over each instruction file name
+        of a Codex home (``session_text.SHARED_TEXT_FILES``). Codex reads
+        those files for every session of the home at every turn and skips one
+        that is empty or not a file, so a session cannot leave text there for
+        the others. The mountpoint, an empty file made here, stays in the
+        home, which no start removes (``session_text.remove_shared_text``:
+        removing it would detach the mask in every running sandbox of the
+        home) and which a build without the mask writes into as before.
+        Anything else at the name was planted (a link, a dir, a FIFO, a
+        socket, a device) and is removed: bwrap would follow a link and
+        cannot mount a file over a dir, and a FIFO would block the open.
+        Every name is reached beneath ``root``, the agent's real folder the
+        table's sources come from, with no link followed at any part: a home
+        that is not a plain folder there gets its masks and no file work."""
+        from core.layers.codex import session_text
+        from services.infra import safe_fs
+        # By the state dir's name, as HOOK_FILE_OF_STATE_DIR: the engine that
+        # reads instruction files from its home.
+        names = {".codex": session_text.SHARED_TEXT_FILES}.get(d.rsplit("/", 1)[-1], ())
+        masks: list[Mount] = []
+        try:
+            base = safe_fs.rel_under(host_dir, root)
+        except OSError:
+            base = None
+            if names:
+                logger.warning("sandbox: Codex home %s is outside the agent's folder, masks only", host_dir)
+        for name in names:
+            if base is not None:
+                SandboxBuilder._ready_mask_point(root, f"{base}/{name}" if base else name)
+            masks.append(Mount(os.devnull, f"{d}/{name}", False))
+        return masks
+
+    @staticmethod
+    def _ready_mask_point(root: Path, rel: str) -> None:
+        """The mask's mountpoint at ``rel`` beneath ``root``: anything that is
+        not a regular file is removed first, then an empty owner-writable file
+        is made if none is there (bwrap would make it read-only, 0444, which a
+        build without the mask cannot write). Never blocking, judged on the
+        descriptor; a refusal leaves the name as it is."""
+        from services.infra import safe_fs
+        try:
+            st = safe_fs.lstat_beneath(root, rel)
+        except OSError:
+            st = None
+        if st is not None and not stat.S_ISREG(st.st_mode):
+            with contextlib.suppress(OSError):
+                if stat.S_ISDIR(st.st_mode):
+                    safe_fs.rmtree_beneath(root, rel)
+                else:
+                    safe_fs.unlink_beneath(root, rel)
+                logger.warning("sandbox: removed %s planted in a Codex home", rel)
+        with contextlib.suppress(OSError):
+            fd = safe_fs.open_beneath(root, rel, os.O_RDONLY | os.O_CREAT, 0o600)
+            try:
+                if stat.S_ISREG(os.fstat(fd).st_mode):
+                    os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
 
     def _role_mount_table(self) -> list[Mount]:
         """Role-dependent workspace mounts (3-tier per-agent model), as the
@@ -1313,9 +700,8 @@ class SandboxBuilder:
 
         †RO. No OAuth token file is mounted into any sandbox: a
         ``.credentials`` directory under /knowledge or under /users/{u} is
-        masked with an empty read-only dir (``_credentials_mask``), and a
-        stdio OAuth MCP receives its token file through the credential
-        broker at spawn.
+        masked with an empty read-only dir (``_credentials_mask``), for
+        what earlier releases may have left there.
 
         `/config/` is **owner-only** — editor + viewer don't see it at all.
         Config shapes agent BEHAVIOR (prompt, MCP wiring, auto-loaded
@@ -1324,9 +710,10 @@ class SandboxBuilder:
         Kernel-level enforcement is the single source of truth for file
         access — sidesteps Codex's hook bypass for non-Bash tools. The
         application-level path_policy is defense-in-depth that runs in the
-        Claude Code hook only — and the Direct-LLM file tools, which run
-        inside the proxy with no bwrap underneath, resolve against this very
-        list so they see exactly the kernel's view.
+        Claude Code hook and in the Direct-LLM builtin gate. The Direct-LLM
+        file tools run in a program inside the session's sandbox, under
+        these very mounts, and their platform half reads this list as text
+        for the sentence of an early refusal.
         """
         mounts: list[Mount] = []
         if self.cfg.app_mounts is not None:
@@ -1405,8 +792,26 @@ class SandboxBuilder:
             config_visible = roles.can_manage(role) and bool(username)
         mount_shared = self.cfg.mount_shared
 
+        if not username and self.cfg.wrapup_home is not None:
+            return self._wrapup_mounts(agent_root_real, agent_dir)
+
+        if not username and self.cfg.external:
+            # An outside session (a caller who is not a platform user): its
+            # own home, the knowledge folders a manager picked, no shared
+            # workspace, no knowledge root.
+            return self._apply_read_only(self._outside_mounts(
+                agent_root_real, lib_attachments, _mirror_host, _mirror_dest))
+
+        if not username and not mount_shared:
+            # Agent scope on an agent whose mode has no shared space
+            # (Personal-only): nothing shared to bind; attached libraries
+            # mirror one by one, read-only, as the user branch does.
+            for _src, _subdir, _writable in lib_attachments:
+                mounts.append(Mount(_mirror_host(_src, _subdir), _mirror_dest(_src, _subdir), False))
+            return self._apply_read_only(mounts)
+
         if not username:
-            # Agent-scope MOUNT — a service session (phone / task / trigger /
+            # Agent-scope MOUNT — a service session (task / trigger /
             # meeting) OR a Shared-only HUMAN chat (``mount_username==""`` for
             # both). Role-aware: below the workspace tier (a Shared-only
             # viewer, or a word the table does not know) the workspace is
@@ -1417,33 +822,12 @@ class SandboxBuilder:
                 mounts.append(Mount(f"{agent_dir}/{layout.WORKSPACE}", layout.V_WORKSPACE, True))
             else:
                 mounts.append(Mount(f"{agent_dir}/{layout.WORKSPACE}", layout.V_WORKSPACE, False))
-            if not self.cfg.external and not roles.can_edit(role):
+            if not roles.can_edit(role) or self.cfg.app_press:
                 # A person below the editor tier never runs from the agent's
                 # own CLI state (the engines refuse such a session,
                 # session_config_dir.refuse_session_on_agent_state): a script
-                # or an app button run as them sees it masked.
+                # run as them, and every app button, sees it masked.
                 mounts.extend(self._agent_state_masks(agent_root_real))
-            elif not roles.can_write_workspace(role) and not self.cfg.external_home:
-                # An external caller with no tree of its own runs from the
-                # agent's CLI state (CLAUDE_CONFIG_DIR / CODEX_HOME =
-                # /workspace/.claude or .codex) and writes its session files
-                # there, so the two stack RW on the RO root as the user-scope
-                # branch does for users/<u>/ (the caller has no shell; the
-                # gate refuses a write to the hooks and settings).
-                # Existence-guarded (bwrap cannot create a mountpoint under
-                # an RO parent) and symlink-refusing: the workspace is RW
-                # for the tiers above, so a planted link would bind its
-                # target read-write into this sandbox.
-                for sub in (".claude", ".codex"):
-                    state_dir = _verified_literal_path(agent_root_real, layout.WORKSPACE, sub)
-                    if state_dir is None:
-                        logger.error(
-                            "Refusing workspace/%s bind for agent %s: path contains "
-                            "a symlinked component (possible tampering)",
-                            sub, self.cfg.agent_name,
-                        )
-                    elif state_dir.is_dir():
-                        mounts.append(Mount(str(state_dir), f"{layout.V_WORKSPACE}/{sub}", True))
             if config_visible or self.cfg.knowledge_rw:
                 # Owner-tier human in the agent scope (curates knowledge +
                 # config) — or a manager-provenance task fire (knowledge_rw:
@@ -1464,7 +848,16 @@ class SandboxBuilder:
             mounts.extend(self._credentials_mask(
                 agent_root_real, layout.KNOWLEDGE, layout.CREDENTIALS_DIR,
                 sandbox=f"{layout.V_KNOWLEDGE}/{layout.CREDENTIALS_DIR}"))
-            mounts.extend(self._external_mounts(agent_dir_path, agent_root_real))
+            if self.cfg.engine_home:
+                # The agent's own phone line: its scratch engine home at
+                # /caller, the agent scope's own engine state and its shared
+                # memory masked (anyone who dials acts as the agent).
+                mounts.append(Mount(self.cfg.engine_home, EXTERNAL_SANDBOX_HOME, False))
+                mounts.extend(_engine_state_mounts(agent_root_real, Path(self.cfg.engine_home)))
+                if roles.can_edit(role):
+                    mounts.extend(self._agent_state_masks(agent_root_real))
+                mounts.extend(self._credentials_mask(
+                    agent_root_real, layout.KNOWLEDGE, "memory", sandbox=f"{layout.V_KNOWLEDGE}/memory"))
             return self._apply_read_only(mounts)
 
         # User-scope MOUNT — the session has its own personal dir. The dir
@@ -1492,10 +885,14 @@ class SandboxBuilder:
         for sub in layout.USER_SUBDIRS:
             _mkdirs_held(agent_root_real, layout.USERS, username, sub)
             mounts.append(Mount(str(user_dir / sub), f"{v_user}/{sub}", True))
-        # CLI state dirs (session's own is pre-created by the layer).
-        for sub in (".claude", ".codex"):
-            if (user_dir / sub).is_dir():
-                mounts.append(Mount(str(user_dir / sub), f"{v_user}/{sub}", True))
+        # CLI state dirs (session's own is pre-created by the layer). An app
+        # button runs from none of them: masked over the read-only root.
+        if self.cfg.app_press:
+            mounts.extend(self._state_masks(agent_root_real, (layout.USERS, username), v_user))
+        else:
+            for sub in (".claude", ".codex"):
+                if (user_dir / sub).is_dir():
+                    mounts.append(Mount(str(user_dir / sub), f"{v_user}/{sub}", True))
         mounts.extend(self._credentials_mask(
             agent_root_real, layout.USERS, username, layout.CREDENTIALS_DIR,
             sandbox=f"{v_user}/{layout.CREDENTIALS_DIR}"))
@@ -1549,10 +946,8 @@ class SandboxBuilder:
     ) -> list[Mount]:
         """An empty read-only dir over a ``.credentials`` directory the parent
         bind would otherwise show. No OAuth token file is mounted into a
-        sandbox: a stdio OAuth MCP receives its file through the credential
-        broker at spawn (``core/credentials/credential_files.py``), so any
-        copy in the tree stays
-        out of every session's view. Existence-guarded (bwrap cannot make a
+        sandbox, so a copy an earlier release left in the tree stays out of
+        every session's view. Existence-guarded (bwrap cannot make a
         mountpoint under a read-only parent; no copy, nothing to hide) and
         symlink-refusing: a planted link refuses the build, as the state
         masks do. A link AT the name is never legitimate and, left in
@@ -1564,10 +959,19 @@ class SandboxBuilder:
                 f"Refusing sandbox build: {'/'.join(rel_parts[:-1])} contains a "
                 "symlinked component (possible tampering)"
             )
-        leaf = parent / rel_parts[-1]
-        if leaf.is_symlink():
-            leaf.unlink(missing_ok=True)
-            logger.warning("credentials: removed a symlink planted at %s", leaf)
+        rel = "/".join(rel_parts)
+        from services.infra import safe_fs
+        try:
+            if stat.S_ISLNK(safe_fs.lstat_beneath(agent_root_real, rel).st_mode):
+                safe_fs.unlink_beneath(agent_root_real, rel, missing_ok=True)
+                logger.warning("credentials: removed a symlink planted at %s", parent / rel_parts[-1])
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise RuntimeError(
+                f"Refusing sandbox build: {'/'.join(rel_parts[:-1])} changed underneath the "
+                "build (possible tampering)"
+            ) from exc
         cred_dir = _verified_literal_path(agent_root_real, *rel_parts)
         if cred_dir is None:
             raise RuntimeError(
@@ -1588,15 +992,21 @@ class SandboxBuilder:
         manager's task runs next. The mountpoints are made host-side (bwrap
         cannot make one under a read-only /workspace) and a planted link
         refuses the build."""
+        return self._state_masks(agent_root_real, (layout.WORKSPACE,), layout.V_WORKSPACE)
+
+    @staticmethod
+    def _state_masks(agent_root_real: Path, base: tuple[str, ...], v_root: str) -> list[Mount]:
+        """The empty read-only masks over ``<base>/.claude`` and
+        ``<base>/.codex`` below the agent's folder, seen at ``v_root``."""
         masks: list[Mount] = []
         for sub in (".claude", ".codex"):
-            if _verified_literal_path(agent_root_real, layout.WORKSPACE, sub) is None:
+            if _verified_literal_path(agent_root_real, *base, sub) is None:
                 raise RuntimeError(
-                    f"Refusing sandbox build: workspace/{sub} contains a "
+                    f"Refusing sandbox build: {'/'.join(base)}/{sub} contains a "
                     "symlinked component (possible tampering)"
                 )
-            _mkdirs_held(agent_root_real, layout.WORKSPACE, sub)
-            masks.append(Mount(str(empty_mount_dir()), f"{layout.V_WORKSPACE}/{sub}", False))
+            _mkdirs_held(agent_root_real, *base, sub)
+            masks.append(Mount(str(empty_mount_dir()), f"{v_root}/{sub}", False))
         return masks
 
     # The CLI state dirs a judge still writes (its own session files);
@@ -1612,120 +1022,84 @@ class SandboxBuilder:
         return [m if (not m.rw or m.sandbox.rstrip("/").rsplit("/", 1)[-1] in self._READ_ONLY_KEEP_RW)
                 else Mount(m.host, m.sandbox, False) for m in mounts]
 
-    def _external_mounts(self, agent_dir_path: Path, agent_root_real: Path) -> list[Mount]:
-        """The external-session additions to the agent-scope mount set
-        (``SandboxConfig.external`` — a phone caller who is not a platform
-        user), appended AFTER the shared binds so bwrap's later-bind
-        precedence (and the Direct resolver's longest-prefix rule) applies:
+    def _outside_mounts(self, agent_root_real: Path, lib_attachments, mirror_host, mirror_dest) -> list[Mount]:
+        """The whole mount table of an outside session (``SandboxConfig.
+        external``: a caller who is not a platform user), in bwrap's
+        later-bind order (the Direct file tools' text check agrees: it
+        picks the longest prefix):
 
-        1. the shared agent memory is masked — an empty, platform-owned dir
-           is bound RO over ``/knowledge/memory`` (existence-guarded: bwrap
-           cannot create a mountpoint under the RO parent, and an agent
-           that never saved memory has nothing to hide);
-        2. the caller's own tree (``external_home``) at /caller — RO root
-           with ``workspace/`` + ``context/`` RW and the CLI state dirs RW
-           when present, the ``/users/{u}`` shape. Every bind source is
-           verified symlink-free under the resolved agent root (the tree
-           sits below agent-writable binds — see ``_verified_literal_path``).
+        1. each knowledge folder a manager picked (``outside_knowledge``,
+           ``outside_picks.knowledge_parts``), read-only at its own place: a
+           folder of the agent's own knowledge, or a folder inside it, at
+           ``/knowledge/<path>``; an attached library, or a folder inside it,
+           at its mirror path; no ``/knowledge`` root, so nothing else of it
+           exists; a folder that is gone, linked on its way, outside every
+           attachment or never offered binds nothing, and only a library's
+           own root is made when missing;
+        2. the person's own tree (``external_home``, a scratch one when the
+           identity keeps none) at /caller: a read-only root; ``workspace/``
+           and ``context/`` read-write only with the files pick at Read and
+           write, else read-only; ``context/memory`` read-only always (the
+           memory is read into the prompt and written after the
+           conversation); the CLI state dirs read-write when present. Every
+           bind source is verified symlink-free under the resolved agent root
+           (the tree sits below agent-writable binds, ``_verified_literal_path``);
+        3. the agent scope's CLI state masked, as for every session that does
+           not run from it.
+
+        No shared workspace, whatever the role word says.
         """
+        from services.mcp import outside_picks
         cfg = self.cfg
-        if not cfg.external:
-            return []
         mounts: list[Mount] = []
-        if (agent_dir_path / layout.KNOWLEDGE / "memory").is_dir():
-            mounts.append(Mount(str(empty_mount_dir()), f"{layout.V_KNOWLEDGE}/memory", False))
-        if not cfg.external_home:
-            return mounts
-        home = Path(cfg.external_home)
-        home_real = Path(os.path.realpath(home))
-        if home_real != home or not home_real.is_relative_to(agent_root_real):
-            raise RuntimeError(
-                f"Refusing sandbox build: external home {home} is not a "
-                "plain directory under the agent tree (possible tampering)"
-            )
-        rel_parts = home_real.relative_to(agent_root_real).parts
-        for sub in layout.USER_SUBDIRS:
-            if _verified_literal_path(agent_root_real, *rel_parts, sub) is None:
-                raise RuntimeError(
-                    f"Refusing sandbox build: external home subdir {home / sub} "
-                    "contains a symlinked component (possible tampering)"
-                )
-            _mkdirs_held(agent_root_real, *rel_parts, sub)
-        mounts.append(Mount(str(home), EXTERNAL_SANDBOX_HOME, False))
-        for sub in layout.USER_SUBDIRS:
-            mounts.append(Mount(str(home / sub), f"{EXTERNAL_SANDBOX_HOME}/{sub}", True))
-        for sub in (".claude", ".codex"):
-            p = _verified_literal_path(agent_root_real, *rel_parts, sub)
-            if p is not None and p.is_dir():
-                mounts.append(Mount(str(p), f"{EXTERNAL_SANDBOX_HOME}/{sub}", True))
-        # This caller's CLI state is its own (/caller): the agent scope's is masked.
+        for pick in cfg.outside_knowledge:
+            parts = outside_picks.knowledge_parts(pick)
+            library = outside_picks.library_of(parts, lib_attachments) if parts else None
+            if parts is None or (parts[0] == outside_picks.SHARED_ROOT and library is None):
+                logger.warning("outside people: knowledge pick %r of agent %s is not a folder on offer; not bound",
+                               pick, cfg.agent_name)
+                continue
+            if library is not None and parts[2:] == (tuple(library[1].split("/")) if library[1] else ()):
+                mounts.append(Mount(mirror_host(*library), mirror_dest(*library), False))
+                continue
+            folder = _verified_literal_path(agent_root_real, layout.KNOWLEDGE, *parts)
+            if folder is None or not folder.is_dir():
+                logger.warning("outside people: knowledge folder %r of agent %s is missing or linked; not bound",
+                               pick, cfg.agent_name)
+                continue
+            mounts.append(Mount(str(folder), f"{layout.V_KNOWLEDGE}/{'/'.join(parts)}", False))
+        if cfg.external_home:
+            mounts.extend(_caller_tree_mounts(
+                agent_root_real, Path(cfg.external_home), files_write=cfg.outside_files_write))
+            mounts.extend(_engine_state_mounts(agent_root_real, Path(cfg.external_home)))
         mounts.extend(self._agent_state_masks(agent_root_real))
         return mounts
 
-    def _mcp_mounts(self) -> list[str]:
-        """Mount this session's MCP dirs at the SAME absolute paths (RO).
-
-        Identity binds keep all resolved paths in mcp-config.json valid inside
-        the sandbox without rewriting. Only the dirs in ``cfg.mcp_dir_binds``
-        (the session's assigned stdio MCPs + ``mcps/.uv-python``) are bound —
-        never the whole mcps/ tree, so an agent can't read the code/config/data
-        of MCPs it isn't assigned.
-
-        The per-session MCP config file is NOT mounted from sessions/ —
-        it's copied into the .claude/ dir by prepare_mcp_config_for_sandbox()
-        to avoid exposing the sessions/ directory.
-        """
-        args: list[str] = []
-        for d in self.cfg.mcp_dir_binds:
-            if os.path.isdir(d):
-                args.extend(["--ro-bind", d, d])
-        return args
-
-    def _conditional_mcp_mounts(self) -> list[str]:
-        """Additional mounts declared in an MCP manifest's ``sandbox.mounts``.
-
-        Both ends are constrained against a malicious community manifest:
-          * HOST (source) must resolve inside THIS agent's own tree or the
-            mcps/ install tree — never the platform root (which holds
-            ``config.env`` + ``sessions/`` OAuth material) nor another agent's
-            tree.
-          * DESTINATION must not overlay the permission-gate hook / per-session
-            config (``.claude``/``.codex``), the shared ``/config`` +
-            ``/knowledge`` trees, or any system mount (see
-            ``_is_safe_mcp_mount_dest``) — these mounts run last, so a bind
-            there would shadow the real one.
-        System dirs the sandbox legitimately needs are handled by
-        ``_system_mounts``, not here.
-        """
-        allowed_roots = []
-        for root in (self._agent_dir, self.cfg.host_mcps_dir):
-            try:
-                allowed_roots.append(Path(root).resolve())
-            except (OSError, ValueError):
-                continue
-        args: list[str] = []
-        for mount in self.cfg.mcp_sandbox_mounts:
-            if not os.path.exists(mount.host):
-                continue
-            host_resolved = Path(mount.host).resolve()
-            if not any(host_resolved.is_relative_to(r) for r in allowed_roots):
-                logger.warning(
-                    "Refusing MCP sandbox mount of %s (mode=%s): host outside "
-                    "the agent / mcps tree", mount.host, mount.mode,
-                )
-                continue
-            if not _is_safe_mcp_mount_dest(mount.sandbox):
-                logger.warning(
-                    "Refusing MCP sandbox mount to %s (mode=%s): destination "
-                    "overlays a protected sandbox path", mount.sandbox, mount.mode,
-                )
-                continue
-            target = str(host_resolved)
-            if mount.mode == "rw":
-                args.extend(["--bind", target, mount.sandbox])
-            else:
-                args.extend(["--ro-bind", target, mount.sandbox])
-        return args
+    def _wrapup_mounts(self, agent_root_real: Path, agent_dir: str) -> list[Mount]:
+        """The wrap-up after a conversation (``cfg.wrapup_home`` set), in
+        bwrap's later-wins order: the shared workspace and the knowledge read
+        only (the credential directory masked), the person's tree at /caller
+        with workspace/ and context/ writable and its memory read only, the
+        engine's state from the run's scratch home over /caller/.claude and
+        /caller/.codex, and the agent's own CLI state masked. Never /config,
+        never /users."""
+        cfg = self.cfg
+        mounts: list[Mount] = []
+        if cfg.mount_shared:
+            # A Personal-only agent has no shared space to read.
+            mounts.append(Mount(f"{agent_dir}/{layout.WORKSPACE}", layout.V_WORKSPACE, False))
+            mounts.append(Mount(f"{agent_dir}/{layout.KNOWLEDGE}", layout.V_KNOWLEDGE, False))
+            mounts.extend(self._credentials_mask(
+                agent_root_real, layout.KNOWLEDGE, layout.CREDENTIALS_DIR,
+                sandbox=f"{layout.V_KNOWLEDGE}/{layout.CREDENTIALS_DIR}"))
+        if cfg.wrapup_home:
+            mounts.extend(_caller_tree_mounts(agent_root_real, Path(cfg.wrapup_home), files_write=True))
+        elif cfg.engine_home:
+            mounts.append(Mount(cfg.engine_home, EXTERNAL_SANDBOX_HOME, False))
+        if cfg.engine_home:
+            mounts.extend(_engine_state_mounts(agent_root_real, Path(cfg.engine_home)))
+        mounts.extend(self._agent_state_masks(agent_root_real))
+        return mounts
 
 
 # Per-session config-directory setup lives in session_config_dir.py (the
@@ -1768,15 +1142,101 @@ def mcp_dir_binds_from_config(mcp_config_path: str | Path | None) -> list[str]:
     )
     seen: set[str] = set()
     for m in pattern.finditer(text):
+        # Two plain parts only: a `.` or `..` would name a folder outside
+        # the tools folder (the proxy's own data among them).
+        if {m.group(1), m.group(2)} & {".", ".."}:
+            continue
         d = str(mcps_dir / m.group(1) / m.group(2))
         if d not in seen and os.path.isdir(d):
             seen.add(d)
             binds.append(d)
     if binds:
-        uv_python = mcps_dir / ".uv-python"
-        if uv_python.is_dir():
-            binds.append(str(uv_python))
+        # Every interpreter folder, whatever this host's disk holds: the
+        # session may run on a machine whose folders are its own, and the
+        # render skips a source its host lacks.
+        from services.mcp import mcp_installer
+        binds.extend(str(d) for d in mcp_installer.interpreter_dirs(mcps_dir))
     return binds
+
+
+_STATE_DIR_NAMES = (".claude", ".codex")
+
+
+def _seen_at(table: list[Mount], host_path: str) -> str | None:
+    """Where ``host_path`` shows inside the sandbox, or None when no mount
+    shows it or a mount over that place hides it: a mask, or another folder
+    bound there (the agent scope's engine folders for a session that does
+    not run from them, ``_agent_state_masks``). bwrap mounts in the table's
+    order, so the deepest place wins and a later mount the same place."""
+    def deepest(path: str, key) -> Mount | None:
+        best = None
+        for m in table:
+            at = key(m).rstrip("/")
+            if path == key(m) or path.startswith(at + "/"):
+                if best is None or len(key(m)) >= len(key(best)):
+                    best = m
+        return best
+    source = deepest(host_path, lambda m: m.host)
+    if source is None or source.host in (str(empty_mount_dir()), os.devnull):
+        return None
+    sandbox = source.sandbox.rstrip("/") + host_path[len(source.host.rstrip("/")):]
+    shown = deepest(sandbox, lambda m: m.sandbox)
+    if (shown is None or shown.host in (str(empty_mount_dir()), os.devnull)
+            or shown.host.rstrip("/") + sandbox[len(shown.sandbox.rstrip("/")):] != host_path):
+        return None
+    return sandbox
+
+
+def own_engine_home(ctx, host_config_dir) -> str:
+    """The scratch engine home a session runs from instead of its scope's own
+    (the config dir's parent): the wrap-up's after a conversation and the
+    agent's own phone line's; "" for every other session."""
+    if not (getattr(ctx, "wrapup", "") or getattr(ctx, "open_line", False)) or not host_config_dir:
+        return ""
+    return str(Path(host_config_dir).parent)
+
+
+def _caller_tree_mounts(agent_root_real: Path, home: Path, *, files_write: bool) -> list[Mount]:
+    """A person's tree at /caller: a read-only root, with ``workspace/`` and
+    ``context/`` writable when ``files_write`` and ``context/memory/`` read
+    only always. Refuses a tree that is not a plain directory under the
+    agent's, or whose subdirs hold a symlinked component."""
+    home_real = Path(os.path.realpath(home))
+    if home_real != home or not home_real.is_relative_to(agent_root_real):
+        raise RuntimeError(
+            f"Refusing sandbox build: external home {home} is not a "
+            "plain directory under the agent tree (possible tampering)"
+        )
+    rel_parts = home_real.relative_to(agent_root_real).parts
+    for sub in (*layout.USER_SUBDIRS, f"{layout.CONTEXT}/memory"):
+        if _verified_literal_path(agent_root_real, *rel_parts, *sub.split("/")) is None:
+            raise RuntimeError(
+                f"Refusing sandbox build: external home subdir {home / sub} "
+                "contains a symlinked component (possible tampering)"
+            )
+        _mkdirs_held(agent_root_real, *rel_parts, *sub.split("/"))
+    mounts = [Mount(str(home), EXTERNAL_SANDBOX_HOME, False)]
+    if files_write:
+        for sub in layout.USER_SUBDIRS:
+            mounts.append(Mount(str(home / sub), f"{EXTERNAL_SANDBOX_HOME}/{sub}", True))
+        mounts.append(Mount(str(home / layout.CONTEXT / "memory"),
+                            f"{EXTERNAL_SANDBOX_HOME}/{layout.CONTEXT}/memory", False))
+    return mounts
+
+
+def _engine_state_mounts(agent_root_real: Path, home: Path) -> list[Mount]:
+    """The engine's own state dirs of ``home`` (``.claude``, ``.codex``) at
+    /caller, writable: the engine writes its session there."""
+    home_real = Path(os.path.realpath(home))
+    if not home_real.is_relative_to(agent_root_real):
+        return []
+    rel_parts = home_real.relative_to(agent_root_real).parts
+    mounts = []
+    for sub in (".claude", ".codex"):
+        p = _verified_literal_path(agent_root_real, *rel_parts, sub)
+        if p is not None and p.is_dir():
+            mounts.append(Mount(str(p), f"{EXTERNAL_SANDBOX_HOME}/{sub}", True))
+    return mounts
 
 
 def resolve_sandbox_config(
@@ -1800,8 +1260,30 @@ def resolve_sandbox_config(
     external: bool = False,
     external_home: str = "",
     read_only: bool = False,
+    account_choices: dict[str, str] | None = None,
+    attached_mcps: Iterable[str] | None = None,
+    outside_files_write: bool = False,
+    outside_knowledge: Iterable[str] = (),
+    wrapup_home: str | None = None,
+    engine_home: str = "",
+    session_home: str = "",
+    app_press: bool = False,
+    own_copy: bool = False,
 ) -> SandboxConfig:
     """Build a SandboxConfig from session context.
+
+    ``attached_mcps`` names the MCPs the session's build attached (the
+    assigned set minus ``AgentConfig.excluded_mcps``): the egress carves
+    routes for those alone, so a tool a session was refused (a kind's
+    ``exclude_from``, the audience, the credentials, an outside pick) has no
+    route either. None carves for every assigned MCP, as a unit test asks.
+    ``outside_files_write`` and ``outside_knowledge`` are an outside
+    session's picks (``SandboxConfig``); ``wrapup_home`` the wrap-up after a
+    conversation's (``None``: not one); ``engine_home`` the scratch engine
+    home of a session that does not run from its scope's (``own_engine_home``);
+    ``session_home`` the home a session runs from (``SandboxConfig``);
+    ``own_copy`` a session placed on a compute machine on another server,
+    whose sandbox opens no tool address (``resolve_sandbox_egress``).
 
     ``external`` / ``external_home`` describe an EXTERNAL session (a phone
     caller who is not a platform user — see ``SandboxConfig``): the shared
@@ -1836,8 +1318,13 @@ def resolve_sandbox_config(
     if net_forwards is None:
         try:
             from services.mcp import mcp_registry
+            # The chat's choice of account decides whose own endpoint a
+            # per-person tool may reach (given only when the chat has one).
             net_forwards, _allow = mcp_registry.resolve_sandbox_egress(
                 agent_name, user_sub=user_sub, extra_targets=extra_egress_targets,
+                attached=attached_mcps,
+                own_copy=own_copy,
+                **({"account_choices": account_choices} if account_choices else {}),
             )
             if net_allow_hosts is None:
                 net_allow_hosts = _allow
@@ -1893,4 +1380,10 @@ def resolve_sandbox_config(
         external=external,
         external_home=external_home or "",
         read_only=read_only,
+        outside_files_write=bool(outside_files_write),
+        outside_knowledge=tuple(outside_knowledge or ()),
+        wrapup_home=wrapup_home,
+        engine_home=engine_home or "",
+        session_home=session_home or "",
+        app_press=app_press,
     )

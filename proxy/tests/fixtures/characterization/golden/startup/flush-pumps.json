@@ -1,0 +1,40 @@
+{
+ "logged": [
+  [
+   "warning",
+   "Shutdown: pump flush chat-rai error: the abort failed"
+  ],
+  [
+   "info",
+   "Shutdown: flushed 1 open pump(s)"
+  ]
+ ],
+ "nothing_open": {
+  "logged": [],
+  "order": []
+ },
+ "order": [
+  {
+   "args": [
+    "chat-replayed"
+   ],
+   "call": "suppress_recovery_flush"
+  },
+  {
+   "args": [
+    "s-replayed"
+   ],
+   "call": "mark_recover_pending"
+  },
+  {
+   "args": [
+    "chat-run"
+   ],
+   "call": "suppress_recovery_flush"
+  },
+  "abort s-open",
+  "abort s-plain",
+  "abort s-raises",
+  "the pump's tail ran"
+ ]
+}

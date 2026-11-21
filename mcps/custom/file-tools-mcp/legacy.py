@@ -68,18 +68,31 @@ class Copy:
                 f"to that temporary copy, and layout details may differ from the original.]")
 
 
-def _copy_in(path: str, target: str) -> bytes:
-    from checks import open_beneath_root
+def _too_large(size: int | None) -> LegacyError:
+    what = f"{size // (1024 * 1024)} MB, past" if size is not None else "past"
+    return LegacyError(f"the file is {what} the {LEGACY_MAX_BYTES // (1024 * 1024)} MB an old-format file is "
+                       "converted at. Save it in the current format from its application and use that.")
 
-    with open_beneath_root(path) as src, open(target, "wb") as dst:
+
+def _copy_in(path: str, target: str) -> bytes:
+    """The file at ``path`` (read beneath the mount) copied to ``target``,
+    capped at LEGACY_MAX_BYTES at the open and while copying; its first
+    bytes."""
+    import safe_fs
+    import shared
+
+    with shared.safe_open_read(path) as src, open(target, "wb") as dst:
         size = os.fstat(src.fileno()).st_size
         if size > LEGACY_MAX_BYTES:
-            raise LegacyError(f"the file is {size // (1024 * 1024)} MB, past the "
-                              f"{LEGACY_MAX_BYTES // (1024 * 1024)} MB an old-format file is converted at. Save it "
-                              "in the current format from its application and use that.")
+            raise _too_large(size)
         head = src.read(_CHUNK)
+        if len(head) > LEGACY_MAX_BYTES:
+            raise _too_large(None)
         dst.write(head)
-        shutil.copyfileobj(src, dst, _CHUNK)
+        try:
+            safe_fs.copy_fd(src, dst, max_size=LEGACY_MAX_BYTES - len(head))
+        except safe_fs.FileTooLarge:
+            raise _too_large(None) from None
     return head
 
 

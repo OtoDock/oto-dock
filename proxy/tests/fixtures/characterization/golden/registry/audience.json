@@ -1,0 +1,99 @@
+{
+ "admits": {
+  "<none>": {
+   "": true,
+   "None": true,
+   "admin": true,
+   "contributor": true,
+   "editor": true,
+   "manager": true,
+   "viewer": true
+  },
+  "bogus": {
+   "": false,
+   "None": true,
+   "admin": false,
+   "contributor": false,
+   "editor": false,
+   "manager": false,
+   "viewer": false
+  },
+  "editor": {
+   "": false,
+   "None": true,
+   "admin": true,
+   "contributor": false,
+   "editor": true,
+   "manager": true,
+   "viewer": false
+  },
+  "owner": {
+   "": false,
+   "None": true,
+   "admin": true,
+   "contributor": false,
+   "editor": false,
+   "manager": true,
+   "viewer": false
+  },
+  "workspace": {
+   "": false,
+   "None": true,
+   "admin": true,
+   "contributor": true,
+   "editor": true,
+   "manager": true,
+   "viewer": false
+  }
+ },
+ "refusal": {
+  "agent": {
+   "": null,
+   "None": null,
+   "admin": null,
+   "contributor": null,
+   "editor": null,
+   "manager": null,
+   "viewer": null
+  },
+  "user": {
+   "": null,
+   "None": null,
+   "admin": null,
+   "contributor": "Char Editors is for the editor tier of this agent and above",
+   "editor": null,
+   "manager": null,
+   "viewer": "Char Editors is for the editor tier of this agent and above"
+  }
+ },
+ "refusal_of_no_audience": null,
+ "skill_admits": {
+  "char-editor": {
+   "": false,
+   "None": true,
+   "admin": true,
+   "contributor": false,
+   "editor": true,
+   "manager": true,
+   "viewer": false
+  },
+  "char-guide": {
+   "": true,
+   "None": true,
+   "admin": true,
+   "contributor": true,
+   "editor": true,
+   "manager": true,
+   "viewer": true
+  },
+  "char-owner": {
+   "": false,
+   "None": true,
+   "admin": true,
+   "contributor": false,
+   "editor": false,
+   "manager": true,
+   "viewer": false
+  }
+ }
+}

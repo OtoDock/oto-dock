@@ -89,6 +89,15 @@ describe('TaskModelChip', () => {
     expect(screen.getByTitle(/on direct-llm/).textContent).toContain('direct-llm')
   })
 
+  it("names the chat's own model for a continuation, never a pin", () => {
+    render(<TaskModelChip task={task({
+      effective_model: 'claude-opus-5-5', override_model: 'claude-sonnet-5-5',
+      effective_model_source: "the chat's", effective_model_tier: 2, tier_label: 'strong',
+    })} />)
+    expect(screen.getByTitle(/^The chat's own model: claude-opus-5-5,/)).toBeTruthy()
+    expect(screen.queryByTitle(/^Pinned/)).toBeNull()
+  })
+
   it('renders nothing when the install could not resolve a model', () => {
     const { container } = render(<TaskModelChip task={task({ effective_model: '' })} />)
     expect(container.firstChild).toBeNull()

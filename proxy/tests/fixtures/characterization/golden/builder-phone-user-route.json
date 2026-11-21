@@ -7,15 +7,23 @@
    ],
    "call": "build_session_mcp_config",
    "kwargs": {
+    "call": true,
     "call_ask_back": false,
+    "chat_id": "",
     "delegation_targets": [
      "char-agent"
     ],
     "extra_mcps": null,
     "interactive_local": false,
+    "kind_rule": null,
+    "limits": null,
     "mcp_config_format": "json",
     "phone_mode": true,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "session_id": "s-phone-user",
     "target_browser": null,
     "task_scope": "user",
@@ -100,7 +108,11 @@
      }
     ],
     "nouser_reads": false,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "trigger_payload": null,
     "user_role": "editor",
     "user_sub": "user-viewer"
@@ -116,11 +128,17 @@
     "dynamic_contexts": null,
     "excluded_mcps": null,
     "execution_path": "claude-code-cli",
+    "kind_rule": null,
     "mount_shared": true,
-    "placement": {},
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
     "role": "editor",
     "sandboxed": true,
-    "skip_http_mcps": false,
+    "session_id": "s-phone-user",
+    "tool_limits": null,
     "user_role": "editor",
     "username": "vic"
    }
@@ -133,6 +151,11 @@
      "email": "viewer@test.com",
      "external_claim": "phone:char",
      "is_admin_agent": false,
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
      "role": "editor",
      "username": "vic"
     }
@@ -185,9 +208,12 @@
      "execution_path": "claude-code-cli",
      "execution_paths": "",
      "execution_target": "local",
+     "history_retention_days": 0,
      "local_only_engines": "",
      "setup_completed_at": null,
      "slug": "char-agent",
+     "team_account": false,
+     "team_account_floor": "editor",
      "updated_at": "<stamp>"
     },
     "model": "claude-char-1",
@@ -221,6 +247,11 @@
    "email": "viewer@test.com",
    "external_claim": "phone:char",
    "is_admin_agent": false,
+   "placement": {
+    "kind": "compute",
+    "label": "Compute",
+    "machine_id": "compute-0123456789ab"
+   },
    "role": "editor",
    "username": "vic"
   },

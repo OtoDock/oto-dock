@@ -9,8 +9,7 @@ the session registry and lifecycle.
 import asyncio
 import base64
 import contextlib
-import errno
-import json
+import functools
 import logging
 import os
 import platform
@@ -27,7 +26,7 @@ from .. import config
 from .._vendored import layout
 from ..background import spawn
 from ..config import atomic_replace, force_rmtree, kill_process_tree
-from ..engines import BY_CREDENTIAL_KIND, ENGINES, engine_for
+from ..engines import BY_CREDENTIAL_KIND, DEFAULT_REPLAYS, ENGINES, engine_for
 from ..host.host_probe import (
     _detect_display,
     _detect_os_user_and_home,
@@ -37,10 +36,13 @@ from ..host.host_probe import (
     _recommended_max_sessions,
 )
 from ..transport import file_sync
-from . import alive_report
-from .cli_session import CLISession, _write_cli_hooks
-from .codex_session import CodexSession, _write_codex_hooks
+from . import alive_report, close_hold, session_homes
+from .app_server import AppServers
+from .cli_session import CLISession, rewrite_cli_hooks
+from .codex_session import CodexSession, rewrite_codex_hooks
 from .mcp_install_support import (
+    COMMUNITY_ALONE,
+    PRESERVED_SUBDIRS,
     InstallFailed,
     _fix_shebangs_after_swap,
     _fix_windows_exe_paths_after_swap,
@@ -50,9 +52,18 @@ from .mcp_install_support import (
     _uv_bin_if_present,
     _warm_one_mcp,
     _write_runtime_marker,
+    begin_sync,
+    end_sync,
+    install,
     install_failure_cause,
+    kept_categories,
     mcp_python_spec,
+    rescue_preserved,
+    settle_pin,
+    sweep_staged,
+    verify_installed,
 )
+from .resume_probe import _probe_session_file
 
 if TYPE_CHECKING:
     from ..config import SatelliteConfig
@@ -69,59 +80,9 @@ logger = logging.getLogger("satellite")
 MCP_CATEGORIES = frozenset({"core", "custom", "community"})
 
 
-# The read errors a resume probe answers as a definite "not resumable": a
-# name nobody can load as a transcript (a planted directory, a dropped
-# permission). The chat takes a fresh session instead of waiting on a file
-# that will never open. Anything else (memory, I/O, a full disk) is the
-# machine's moment and is answered as an error the platform asks again.
-_PROBE_UNREADABLE_ERRNOS = frozenset({
-    errno.EISDIR, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM,
-})
-# The two spellings claude-code has used for a user turn's line.
-_PROBE_USER_MARKS = ('"type":"user"', '"type": "user"')
-_PROBE_READ_BUFFER = 1024 * 1024
 # The engine-home pushes refused so far (``<slug>/<rel>``): each is said
 # once; a platform before 1.9.0 sends them at every merge.
 _engine_home_refusals: set[str] = set()
-
-
-def _probe_session_file(claude_dir: Path, session_id: str) -> tuple[bool, str, int]:
-    """Whether the session JSONL under ``claude_dir`` holds a user message:
-    ``(resumable, reason, lines_read)``. The file is read line by line (one
-    message a line) and the read stops at the first user line, so a
-    transcript of any size costs one line of memory. A missing file is
-    ``(False, "missing", 0)``, one with no user line ``(False, "empty", n)``,
-    one that cannot be loaded for good ``(False, "unreadable", n)``
-    (``_PROBE_UNREADABLE_ERRNOS``); any other ``OSError`` is raised. Runs in
-    a worker thread."""
-    projects_dir = claude_dir / "projects"
-    candidate: Path | None = None
-    try:
-        if projects_dir.is_dir():
-            # The project-hash dir name varies by CWD; search all.
-            for project_dir in projects_dir.iterdir():
-                if project_dir.is_dir() and (project_dir / f"{session_id}.jsonl").exists():
-                    candidate = project_dir / f"{session_id}.jsonl"
-                    break
-    except OSError as e:
-        if e.errno in _PROBE_UNREADABLE_ERRNOS:
-            return False, "unreadable", 0
-        raise
-    if candidate is None:
-        return False, "missing", 0
-    lines = 0
-    try:
-        with open(candidate, encoding="utf-8", errors="replace",
-                  buffering=_PROBE_READ_BUFFER) as fh:
-            for line in fh:
-                lines += 1
-                if any(mark in line for mark in _PROBE_USER_MARKS):
-                    return True, "", lines
-    except OSError as e:
-        if e.errno in _PROBE_UNREADABLE_ERRNOS:
-            return False, "unreadable", lines
-        raise
-    return False, "empty", lines
 
 
 def _under_engine_home(path: str, path_kind: str, agents_dir: Path) -> bool:
@@ -485,11 +446,43 @@ def _close_opened(fut: "asyncio.Future") -> None:
         os.close(fut.result()[0])
 
 
+def _credential_exit_state() -> dict:
+    from . import credential_exit
+    return credential_exit.state()
+
+
+def _ends_sync(handler):
+    """A ``sync_mcps`` handler, one frame at a time on this machine, that
+    forgets what its frame said of its builds' egress when it ends, however
+    it ends (``end_sync``). The egress is one value for the machine, so the
+    lock is its owner's rule: the platform lets go of a machine while it
+    still builds (its own restart, a build past its budget, a request that
+    ended early), and a second frame then waits for the first instead of
+    clearing the value under its build or building the same tool beside it."""
+    @functools.wraps(handler)
+    async def run(self, msg: dict, ws: "SatelliteWSClient") -> None:
+        async with self._sync_frames:
+            try:
+                await handler(self, msg, ws)
+            finally:
+                await asyncio.to_thread(end_sync, self.config)
+    return run
+
+
 class SessionManager:
     """Routes commands to CLI or Codex sessions."""
 
     def __init__(self, config: "SatelliteConfig"):
         self.config = config
+        # Compute mode (``SatelliteConfig.compute``): beside the platform the
+        # folders are the platform's own, read through shared mounts and
+        # never made or swept (``shares_folders``); on another host
+        # (``own_copy``) they are this machine's copy, made and swept as a
+        # paired machine's.
+        self.compute = bool(getattr(config, "compute", False))
+        self.shares_folders = self.compute and not bool(getattr(config, "own_copy", False))
+        # One ``sync_mcps`` frame at a time (``_ends_sync``).
+        self._sync_frames = asyncio.Lock()
         self.sessions: dict[str, CLISession | CodexSession] = {}
         # Interactive PTY sessions — a separate lifecycle
         # from the -p `sessions` above (no send_message/stop_turn; driven by
@@ -508,6 +501,7 @@ class SessionManager:
         # right now, by delivery id — killed when the link drops. The
         # private scratch tree is wiped at start.
         self._steps: dict[str, asyncio.subprocess.Process] = {}
+        self.app_servers = AppServers(self.config)
         from .step_runner import wipe_steps_root
         wipe_steps_root()
         # The file pulls producing right now, by request id (0.5.137): the
@@ -515,6 +509,12 @@ class SessionManager:
         # (the proxy failed them, and their chunks must not reach the next
         # connection).
         self._pulls: dict[str, asyncio.Task] = {}
+        # Direct LLM's tool processes on a compute machine: the three frames
+        # the platform sends for them, taken by the relay.
+        from .tool_relay import ToolRelay
+        self.tool_relay = ToolRelay(config)
+        self.tool_open, self.tool_in, self.tool_close = (
+            self.tool_relay.open, self.tool_relay.take_in, self.tool_relay.close)
         # Proxy-restart re-attach (Mode C): per-CLI-session retention of the
         # CURRENT turn's forwarded events, replayable to a restarted proxy.
         # turn_state carries {command_id, active, seq, start_seq}; the buffer
@@ -526,6 +526,11 @@ class SessionManager:
         self.turn_buffers: dict[str, deque] = {}
         self.turn_state: dict[str, dict] = {}
         self.forward_paused: dict[str, asyncio.Event] = {}
+        # The engines whose live sessions the connect report lists in
+        # ``sessions`` (the platform replays their turns): what the platform
+        # named at the sign-in (``auth_result.replays_turns_of``), the table's
+        # default under a platform that named none.
+        self.replays_turns_of: frozenset[str] = DEFAULT_REPLAYS
 
     def _live_session_count(self, exclude: str = "") -> int:
         """Live agent sessions on this satellite: headless (-p/codex) + interactive
@@ -538,12 +543,47 @@ class SessionManager:
         return n
 
     def _check_capacity(self, session_id: str = "") -> None:
-        """Raise if this satellite is at its session ceiling — the physical-safety
-        hard cap, enforced for BOTH proxy-commanded and satellite-initiated spawns."""
+        """The last check of a start the platform already admitted, for BOTH
+        proxy-commanded and satellite-initiated spawns. An id this machine
+        already holds always passes (a replacing start after a platform
+        restart). A machine whose memory guard runs refuses while its own
+        reading is under its reserve (the platform shows the sentence);
+        elsewhere the count caps it, and a compute machine has none."""
+        if session_id and (session_id in self.sessions or session_id in self.pty_sessions):
+            return
+        from . import memory_guard
+        if memory_guard.running():
+            refusal = memory_guard.start_refusal()
+            if refusal:
+                raise memory_guard.MachineMemoryRefused(refusal)
+            return
+        if self.compute:
+            return
         cap = _recommended_max_sessions()
         live = self._live_session_count(exclude=session_id)
         if live >= cap:
             raise RuntimeError(f"machine at capacity ({live}/{cap} active sessions)")
+
+    def memory_units(self) -> list:
+        """The process trees this satellite runs for the platform, for its
+        memory guard: copies of the tables, taken in one call from the guard's
+        thread (a table that changes meanwhile raises, and the guard reads it at
+        its next pass)."""
+        from .memory_guard import Unit
+        units = [Unit(s.pid, sid, "session", engine_for(s.execution_path).binary)
+                 for sid, s in list(self.sessions.items()) if getattr(s, "pid", None)]
+        units += [Unit(s.pid, sid, "terminal", engine_for(s.execution_path).binary)
+                  for sid, s in list(self.pty_sessions.items()) if getattr(s, "pid", None)]
+        units += [Unit(srv.proc.pid, "", "app") for srv in list(self.app_servers.servers.values()) if srv.proc]
+        units += [Unit(pid, sid, "tool") for pid, sid in self.tool_relay.pids()]
+        units += [Unit(proc.pid, "", "step") for proc in list(self._steps.values())]
+        return units
+
+    def mark_ended_for_memory(self, session_id: str) -> None:
+        """The memory guard ends this session: its turn's end says so."""
+        held = self.sessions.get(session_id) or self.pty_sessions.get(session_id)
+        if held is not None:
+            held.ended_for_memory = True
 
     def detect_capabilities(self) -> dict:
         """Detect installed CLIs, MCPs, and system info."""
@@ -572,6 +612,10 @@ class SessionManager:
             # subprocesses on this machine. 0 = tunnel not started (e.g.
             # tests).
             "local_tunnel_port": self.local_tunnel_port,
+            # The credential exit on this machine (``exit_port``, ``exit_ok``;
+            # none when it runs no exit): the platform gives a session on
+            # this machine placeholders only while the exit answers.
+            **_credential_exit_state(),
             # OS user identity + home dir + well-known folders.
             # Drives the path-policy framework's home-directory admission
             # rules and populates the agent prompt's # Execution
@@ -607,8 +651,7 @@ class SessionManager:
         caps["installed_clis"] = installed_clis
         # The engines this build's CODE can dispatch (the table's wire ids) —
         # the proxy sends a start for an engine only to a satellite that has
-        # said it runs it; a satellite that reports no ``engines`` is read as
-        # the two every earlier build ran. Binary presence is a separate fact
+        # said it runs it. Binary presence is a separate fact
         # (``installed_clis`` above): the pin reconcile may install a pinned
         # binary after this probe, so a spawn is never gated on it.
         caps["engines"] = sorted(ENGINES)
@@ -620,24 +663,41 @@ class SessionManager:
         # actually importable so a Windows box that missed the dep falls back to
         # headless -p instead of opening a PTY that can't spawn.
         caps["interactive_pty"] = _interactive_pty_supported()
+        # Its stand-ins say when the engine has a tool's list (the
+        # interceptor's ``listed`` report): the platform may hold a
+        # terminal's first message for them.
+        caps["tools_listed"] = True
+        # A terminal's start hook asks for the start's riding part
+        # (``start_context_parts`` in the start payload): the platform
+        # sends it to the terminal of a satellite that says so, and puts it in
+        # the text of one that does not.
+        caps["start_context_hook"] = True
+        # The platform may ask a Claude session's output between turns for
+        # the life of the process (``stream_between_turns`` on ``stop_turn``),
+        # and steer into a turn the engine started by itself while it runs.
+        caps["between_turns_stream"] = True
+        # A session gets a home of its own in its scope's engine folder when
+        # the start asks (``sessions/session_homes.py``): the platform then
+        # picks its account alone. The folders named (a platform reads Claude
+        # Code's alone from ``session_homes`` without them).
+        caps["session_homes"], caps["session_home_dirs"] = True, list(session_homes.ENGINE_DIRS)
+        # The four flags below name what this satellite runs. A platform
+        # before 2.0 read each flag, with the version, before it used the
+        # feature. A later one reads none of them: no satellite below its
+        # floor (0.5.171) connects.
         # App steps (proxy APPS.md "Steps"): this satellite handles
-        # ``step_run`` and streams ``step_output``; the proxy gates on the
-        # flag AND the version, and never sends the frame to a satellite
-        # without it (the router would drop it silently).
+        # ``step_run`` and streams ``step_output``.
         caps["steps"] = True
         # The credential gateway (0.5.132): this satellite holds a session's
-        # vendor MCP tokens in memory and adds them on the way out; the proxy
-        # gates on the flag AND the version, and below it keeps a vendor
-        # entry's inline shape.
+        # vendor MCP tokens in memory and adds them on the way out.
         caps["mcp_gateway"] = True
         # Paced transfers (0.5.137): file pulls ride a bounded bulk lane
         # after control and PTY, are purged on a drop, and stop on
-        # ``file_pull_cancel``. The proxy gates the cancel on the flag AND
-        # the version.
+        # ``file_pull_cancel``.
         caps["paced_transfers"] = True
         # The session move (0.5.156): a chat's engine session files go on and
         # off this machine through ``session_move``, the one door into an
-        # engine home. The proxy gates on the flag AND the version.
+        # engine home.
         caps["session_move"] = True
         # Per-satellite budget: raw resources + this host's own
         # physical-safety session ceiling. The proxy displays these and may apply
@@ -646,8 +706,37 @@ class SessionManager:
         caps["cpu_count"] = cpus
         caps["mem_total_bytes"] = mem_bytes
         caps["recommended_max_sessions"] = _recommended_max_sessions()
+        # The sessions held at the sign-in (0.5.171): the platform pushes an
+        # update to a machine with none, and waits for one with some.
+        caps["active_sessions"] = self._live_session_count()
 
         return caps
+
+    def _agent_dir_for(self, agent_slug: str) -> Path:
+        """The agent's folder for a start: made under this machine's agents
+        folder, or, in compute mode, the platform's own, which must already
+        be there (a compute machine creates nothing in the platform's
+        folder: an unknown slug is refused)."""
+        agent_dir = self.config.agents_dir / agent_slug
+        if self.shares_folders:
+            if not agent_dir.is_dir():
+                raise ValueError(f"no agent folder for {agent_slug!r} on the platform")
+            return agent_dir
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        return agent_dir
+
+    def _refuse_other_kind(self, payload: dict) -> None:
+        """A start whose payload is not this machine's kind: a compute
+        machine takes a compute payload (the description it renders) and a
+        paired machine a paired one. The other way round would write a
+        session's files into the platform's folder and spawn its engine
+        with no sandbox, or render nothing on a machine that has no
+        sandbox: refused before anything is made."""
+        from . import sandbox_host
+        if self.compute != sandbox_host.is_compute(payload):
+            raise ValueError("this machine is a compute machine and takes compute sessions alone"
+                             if self.compute else
+                             "this machine is a paired computer and takes no compute session")
 
     def cleanup_orphans(self) -> None:
         """Kill orphan process trees + GC stale install scratch dirs from a
@@ -656,8 +745,12 @@ class SessionManager:
         Scans for PID files and tree-kills any still-running processes.
         Tree-kill covers ``cmd.exe`` → ``node.exe`` on Windows and
         MCP/child forks on Unix. Then sweeps leftover MCP install scratch
-        directories so they don't accumulate.
+        directories so they don't accumulate. A compute machine's folders
+        beside the platform are the platform's: nothing of this is its own
+        to sweep.
         """
+        if self.shares_folders:
+            return
         pid_dir = self.config.agents_dir / ".satellite-pids"
         if pid_dir.is_dir():
             for pid_file in pid_dir.glob("*.pid"):
@@ -670,27 +763,14 @@ class SessionManager:
                 finally:
                     pid_file.unlink(missing_ok=True)
 
-        # GC stale MCP-install scratch dirs left by a Windows quarantine-on-lock
-        # swap (``.quarantine-<mcp>-<uuid>``) or an interrupted install
-        # (``<mcp>.new``). The handles that blocked deletion mid-install are
-        # released after this restart, so force_rmtree succeeds now. Fulfils the
-        # "GC'd by the startup sweep" contract that _force_remove_or_quarantine
-        # and the sync_mcps swap rely on. Best-effort — a still-held dir is
-        # retried on the next restart.
+        # The scratch a stopped install left in each category folder
+        # (``sweep_staged``): what ``_force_remove_or_quarantine`` and the
+        # ``sync_mcps`` swap leave for the start to clear.
         mcps_dir = self.config.mcps_dir
         if mcps_dir.is_dir():
             for category_dir in mcps_dir.iterdir():
-                if not category_dir.is_dir():
-                    continue
-                stale = list(category_dir.glob(".quarantine-*")) + list(
-                    category_dir.glob("*.new")
-                )
-                for d in stale:
-                    try:
-                        force_rmtree(d)
-                        logger.info("Swept stale MCP install scratch dir: %s", d.name)
-                    except OSError:
-                        pass  # still held — retry next restart
+                if category_dir.is_dir():
+                    sweep_staged(category_dir)
 
     # -----------------------------------------------------------------
     # Command handlers
@@ -711,9 +791,10 @@ class SessionManager:
             from ..host import auth_paths
             if not auth_paths.is_safe_slug(agent_slug):
                 raise ValueError(f"unsafe agent_slug: {agent_slug!r}")
-            agent_dir = self.config.agents_dir / agent_slug
-            agent_dir.mkdir(parents=True, exist_ok=True)
+            agent_dir = self._agent_dir_for(agent_slug)
+            self._refuse_other_kind(config_payload)
             self._check_capacity(session_id)  # physical-safety cap → ack error below
+            await close_hold.settled(session_id)
 
             # A start for a session id we still track live means the platform
             # lost its handle (e.g. proxy restart mid-turn) and is replacing
@@ -736,11 +817,18 @@ class SessionManager:
 
             session = engine.headless_cls()(session_id, agent_dir, config_payload, self.config)
             session.incarnation = alive_report.next_incarnation()
-            await session.start()
+            # A session that watches its process (Claude Code's, whose engine
+            # does not come back by itself) says when it is gone.
+            session.on_exit = functools.partial(self._engine_gone, session, ws)
+            try:
+                await session.start()
+            except Exception:
+                await close_hold.close_now(session_id, session, "its start raised")
+                raise
 
             self.sessions[session_id] = session
 
-            ack = {"type": "ack", "command_id": command_id, "status": "ok"}
+            ack = {"type": "ack", "command_id": command_id, "status": "ok", "incarnation": session.incarnation}
             if getattr(session, "resume_refused", False) is True:
                 # The engine refused the session the platform asked to
                 # resume (a Codex thread): the platform reseeds the chat
@@ -776,6 +864,7 @@ class SessionManager:
                 "command_id": command_id,
                 "status": "error",
                 "error": str(e),
+                **({"reason": e.reason} if getattr(e, "reason", "") else {}),
             })
 
     async def send_message(self, msg: dict, ws: "SatelliteWSClient") -> None:
@@ -811,6 +900,9 @@ class SessionManager:
             return
 
         await ws.enqueue_send({"type": "ack", "command_id": command_id, "status": "ok"})
+        # An end the guard made between turns is not this turn's: a Codex
+        # session re-warms its engine in place and this turn may well answer.
+        session.ended_for_memory = False
 
         # Mode C retention (engines whose in-flight turn a restarted proxy can
         # re-adopt): a fresh per-turn buffer, and every event tagged with the
@@ -830,7 +922,10 @@ class SessionManager:
             self.turn_buffers[session_id] = buffer
 
         async def _forward(event: dict) -> None:
-            if engine.turn_replay:
+            # Only the turn's own events are kept: an engine whose forwarder
+            # outlives the turn (Codex, a background sub-agent's events)
+            # forwards the rest plain, with no wait on a replay's pause.
+            if engine.turn_replay and state is not None and state.get("active"):
                 event["_command_id"] = command_id
                 state["seq"] += 1
                 event["_seq"] = state["seq"]
@@ -853,6 +948,10 @@ class SessionManager:
                 msg["message"],
                 inject_time=msg.get("inject_time", False),
                 forward=_forward,
+                # The start's data as Claude Code's own message (a satellite
+                # that reports start_context_hook; the proxy sends it to no
+                # other engine).
+                **({"start_context": msg["start_context"]} if msg.get("start_context") else {}),
             )
 
         except Exception as e:
@@ -889,10 +988,18 @@ class SessionManager:
         # one turn behind: every response persists one prompt late and the
         # final turn's response is lost (live repro 2026-07-21, delegated
         # worker chat). The proxy's RemoteExecutionLayer filters on this id.
+        # The memory guard ended the engine in this turn: the platform says so,
+        # once. Else what the session says of an end it made itself
+        # (``take_turn_end``: a daemon dropped for an interrupt it did not take).
+        ended_for_memory = getattr(session, "ended_for_memory", False)
+        session.ended_for_memory = False
+        take = getattr(session, "take_turn_end", None)
+        own_end = take() if take is not None else {}
         await ws.enqueue_send({
             "type": "turn_ended",
             "session_id": session_id,
             "command_id": command_id,
+            **({"reason": "memory"} if ended_for_memory else own_end),
         })
 
         # Scan for file changes after the marker: file_changed frames are
@@ -902,7 +1009,7 @@ class SessionManager:
         # sync by the scan duration — exactly what already happened whenever
         # the scan overran the old drain window.
         try:
-            changes = session.detect_file_changes()
+            changes = await asyncio.to_thread(session.detect_file_changes)
             for change in changes:
                 await ws.enqueue_send({
                     "type": "file_changed",
@@ -938,12 +1045,16 @@ class SessionManager:
         """Proxy is asking the current send_message loop to exit (turn over).
         ``drain_bg`` (set when background work is still pending) arms the
         session's post-turn stdout drainer once this turn's loop exits, for
-        ``drain_bg_s`` seconds (the proxy's background-work ceiling)."""
+        ``drain_bg_s`` seconds (the proxy's background-work ceiling).
+        ``stream_between_turns`` (a platform that reads every line between
+        turns, ``between_turns_stream`` in the capabilities) keeps it running
+        with no time bound."""
         session_id = msg.get("session_id", "")
         session = self.sessions.get(session_id)
         if isinstance(session, CLISession):
             session.request_stop_turn(drain_bg=msg.get("drain_bg", False),
-                                      drain_bg_s=msg.get("drain_bg_s"))
+                                      drain_bg_s=msg.get("drain_bg_s"),
+                                      stream=bool(msg.get("stream_between_turns", False)))
         elif session and hasattr(session, "request_stop_turn"):
             session.request_stop_turn(drain_bg=msg.get("drain_bg", False))
 
@@ -1010,6 +1121,20 @@ class SessionManager:
         if ws is not None:
             await ws.enqueue_send({"type": "session_aborted", "session_id": session_id})
 
+    async def _engine_gone(self, session, ws: "SatelliteWSClient", code: int | None) -> None:
+        """A session's engine ended with no turn reading it: the platform is
+        told (``session_ended`` with the reason), so it sends that session no
+        message and frees its place. The session stays held here until the
+        platform's close, which cleans up after it. A session closed or
+        replaced meanwhile tells nothing: that end was the platform's."""
+        if self.sessions.get(session.session_id) is not session:
+            return
+        await ws.enqueue_send({
+            "type": "session_ended", "session_id": session.session_id, "incarnation": session.incarnation,
+            "reason": "memory" if getattr(session, "ended_for_memory", False) is True else "exited",
+            **({"exit_code": code} if isinstance(code, int) else {}),
+        })
+
     async def close_session(self, msg: dict, ws: "SatelliteWSClient") -> None:
         """Clean shutdown of a session."""
         session_id = msg.get("session_id", "")
@@ -1028,7 +1153,8 @@ class SessionManager:
         self._release_forward(session_id)
 
         if session:
-            await session.close()
+            async with close_hold.closing(session_id):
+                await session.close()
             await ws.enqueue_send({
                 "type": "ack",
                 "command_id": command_id,
@@ -1072,7 +1198,7 @@ class SessionManager:
         dir_relative = str(msg.get("dir_relative", ""))
         kind = msg.get("kind", "")
         content = msg.get("content")
-        error_msg = ""
+        error_msg = note = ""
         try:
             # The target is constrained to exactly what the platform writes at
             # session start: an engine's scope config dir inside the agent
@@ -1093,26 +1219,40 @@ class SessionManager:
                 or Path(dir_relative).is_absolute()
                 or parts[0] == "" or ":" in parts[0]
                 or not auth_paths.is_authorized_relative_path("/".join(parts))
-                or parts[-1] != engine.config_dir
+                or not session_homes.sign_in_dir(parts, engine.config_dir)
             ):
                 raise ValueError(f"invalid credentials_update target: "
                                  f"{agent_slug!r}/{dir_relative!r} kind={kind!r}")
             filename = engine.credential_filename
-            target_dir = self.config.agents_dir / agent_slug / dir_relative
-            target_dir.mkdir(parents=True, exist_ok=True)
-            path = target_dir / filename
-            path.write_text(json.dumps(content))
-            path.chmod(0o600)
-            logger.info("credentials_update: rewrote %s/%s/%s",
+            # A home takes a sign-in only while its session runs here, not closing.
+            target_dir = (session_homes.write_sign_in_beneath(
+                self.config.agents_dir, agent_slug, "/".join(parts), filename, content, engine.config_dir)
+                if not session_homes.is_home_dir(parts, engine.config_dir)
+                or close_hold.runs_unclosed(parts[-1], self.sessions, self.pty_sessions) else None)
+            if target_dir is None:
+                note = "session gone, not written"
+            # A session that re-warms its own dead process (Codex) writes the
+            # file again from its start config: that copy follows the
+            # rotation too, or a revive would put the spawn's token back.
+            for session in self.sessions.values():
+                home = (getattr(session, "_engine_dir", None)
+                        or getattr(session, f"_{engine.config_dir.lstrip('.')}_dir", None))
+                session_config = getattr(session, "config", None)
+                if (target_dir is not None and home is not None and isinstance(session_config, dict)
+                        and Path(home) == target_dir):
+                    session_config[engine.credential_payload_key] = dict(content)
+            logger.info("credentials_update: %s %s/%s/%s", note or "rewrote",
                         agent_slug, dir_relative, filename)
-        except Exception as e:
-            logger.exception("credentials_update failed")
+        except Exception as e:  # noqa: BLE001  # the ack carries any failure back to the platform
+            log = logger.warning if isinstance(e, session_homes.FolderAtSignIn) else logger.exception
+            log("credentials_update failed: %s", e)
             error_msg = str(e)
         await ws.enqueue_send({
             "type": "ack",
             "command_id": command_id,
             "status": "error" if error_msg else "ok",
             **({"error": error_msg} if error_msg else {}),
+            **({"note": note} if note and not error_msg else {}),
         })
 
     # -----------------------------------------------------------------
@@ -1133,6 +1273,10 @@ class SessionManager:
         execution_path = msg.get("execution_path", "")
         rows = int(msg.get("rows", 24))
         cols = int(msg.get("cols", 80))
+        # The platform's token for this open (0.5.171): the ack and the
+        # exit name it, so a late exit of an earlier PTY under this id
+        # never reaches the platform's handle of this one.
+        open_token = str(msg.get("open_token") or "")
 
         try:
             engine = engine_for(execution_path)   # fail-closed, like start_session
@@ -1140,9 +1284,23 @@ class SessionManager:
             from ..host import auth_paths
             if not auth_paths.is_safe_slug(agent_slug):
                 raise ValueError(f"unsafe agent_slug: {agent_slug!r}")
-            agent_dir = self.config.agents_dir / agent_slug
-            agent_dir.mkdir(parents=True, exist_ok=True)
+            agent_dir = self._agent_dir_for(agent_slug)
+            self._refuse_other_kind(config_payload)
             self._check_capacity(session_id)  # physical-safety cap → ack error below
+            await close_hold.settled(session_id)
+            # A PTY still held under the id (the platform's close of it was
+            # lost, or raced this open): ended first, as start_session ends a
+            # stale headless process, and marked replaced so its own close
+            # leaves the files this open lands.
+            stale = self.pty_sessions.pop(session_id, None)
+            if stale is not None:
+                logger.warning("pty_open: session %s already live (pid=%s); closing it first",
+                               session_id, getattr(stale, "pid", None))
+                stale.superseded = True
+                try:
+                    await stale.close()
+                except Exception:
+                    logger.exception("Failed to close the replaced PTY %s", session_id)
             # The engine's TUI session (Codex: the Ratatui TUI + its rollout
             # JSONL; Claude: the Ink TUI + <id>.jsonl). Both share
             # BasePtySession (spawn + transcript forwarding); only the config
@@ -1151,10 +1309,15 @@ class SessionManager:
                 session_id, agent_dir, config_payload, self.config, ws,
                 rows=rows, cols=cols,
             )
+            session.open_token = open_token
             # When the child exits on its own, drop it from pty_sessions
             # so a later pty_alive reconcile is accurate (no dead-session re-adopt).
-            session._on_dead = lambda sid=session_id: self._on_pty_dead(sid)
-            await session.start()
+            session._on_dead = lambda sid=session_id, tok=open_token, s=session: self._on_pty_dead(sid, tok, s)
+            try:
+                await session.start()
+            except Exception:
+                await close_hold.close_now(session_id, session, "its start raised")
+                raise
             self.pty_sessions[session_id] = session
             # otodock-CLI: if a local terminal is already waiting for this
             # session (the common ordering — start_session awaits the pty_open ack
@@ -1163,12 +1326,10 @@ class SessionManager:
             conn = self._otodock_conns.get(session_id)
             if conn is not None:
                 self._wire_local_conn(session, conn)
-            await ws.enqueue_send({
-                "type": "ack",
-                "command_id": command_id,
-                "status": "ok",
-                "pid": session.pid,
-            })
+            ack = {"type": "ack", "command_id": command_id, "status": "ok", "pid": session.pid}
+            if open_token:
+                ack["open_token"] = open_token
+            await ws.enqueue_send(ack)
         except Exception as e:
             logger.exception("Failed to open PTY session %s", session_id)
             await ws.enqueue_send({
@@ -1176,6 +1337,7 @@ class SessionManager:
                 "command_id": command_id,
                 "status": "error",
                 "error": str(e),
+                **({"reason": e.reason} if getattr(e, "reason", "") else {}),
             })
 
     async def pty_input(self, msg: dict) -> None:
@@ -1211,12 +1373,29 @@ class SessionManager:
             str(msg.get("text", "")), inject_id, str(msg.get("source", "")),
         )
 
+    async def transcript_ack(self, msg: dict) -> None:
+        """The platform took a terminal's transcript lines up to ``offset``."""
+        session = self.pty_sessions.get(msg.get("session_id", ""))
+        offset = msg.get("offset")
+        token = str(msg.get("open_token") or "")
+        if (session is None or isinstance(offset, bool) or not isinstance(offset, int)
+                or (token and getattr(session, "open_token", "") != token)):
+            return
+        session.note_transcript_ack(offset)
+
     async def pty_close(self, msg: dict) -> None:
         sid = msg.get("session_id", "")
+        token = str(msg.get("open_token") or "")
+        held = self.pty_sessions.get(sid)
+        if held is not None and token and getattr(held, "open_token", "") != token:
+            # A close aimed at an earlier PTY under this id: the live one stays.
+            logger.info("pty_close: %s names another open of this id; the live PTY stays", sid)
+            return
         session = self.pty_sessions.pop(sid, None)
         conn = self._otodock_conns.pop(sid, None)
         if session is not None:
-            await session.close()
+            async with close_hold.closing(sid):
+                await session.close()
             logger.info("PTY session closed: %s", sid)
         if conn is not None:
             # Proxy-driven close (e.g. take-over) → tell the local terminal
@@ -1224,12 +1403,21 @@ class SessionManager:
             conn.feed_exit(None)
 
     # --- otodock-CLI local control-socket relay ------------------------------
-    def _on_pty_dead(self, session_id: str) -> None:
+    def _on_pty_dead(self, session_id: str, open_token: str = "", dead=None) -> None:
         """Child PTY exited on its own — drop bookkeeping. The local terminal was
         already notified via the PTY's `_on_exit` → `conn.feed_exit` tee (which
-        fires before this), so we just clear the maps."""
+        fires before this), so we just clear the maps. Only the entry of that
+        open: a PTY started again under the id since keeps its place. The
+        platform sends no close for an exited terminal, so the one that was
+        held here runs its own (another close that took it first owns it)."""
+        held = self.pty_sessions.get(session_id)
+        if held is not None and open_token and getattr(held, "open_token", "") != open_token:
+            return
         self.pty_sessions.pop(session_id, None)
         self._otodock_conns.pop(session_id, None)
+        if held is not None and held is dead:
+            spawn(close_hold.close_now(session_id, held, "its engine ended"), name="pty_dead_close",
+                  owner="session_manager")
 
     def _wire_local_conn(self, session, conn, force_repaint: bool = False) -> None:
         """Cross-wire a local `otodock` terminal to a live PTY session: the conn's
@@ -1383,12 +1571,10 @@ class SessionManager:
             # Mirror the proxy-side path derivation: per-user agent dirs
             # win over the shared workspace .claude/ for sessions that ran
             # under a logged-in user.
-            claude_dir = layout.state_dir(
-                self.config.agents_dir / agent_slug, username, ".claude",
-            )
             try:
                 resumable, reason, lines = await asyncio.to_thread(
-                    _probe_session_file, claude_dir, session_id,
+                    _probe_session_file, self.config.agents_dir / agent_slug,
+                    f"{layout.scope_root(username)}/.claude", session_id,
                 )
             except OSError as e:
                 logger.warning(
@@ -1528,13 +1714,14 @@ class SessionManager:
         its resume handle already covers next-turn continuity."""
         out = []
         for sid, session in self.sessions.items():
-            engine = ENGINES.get(session.execution_path)
-            if engine is None or not engine.turn_replay:
+            if not self.replays_turns(session.execution_path):
                 continue
             if not session.is_alive:
                 continue
             state = self.turn_state.get(sid) or {}
             buffer = self.turn_buffers.get(sid)
+            config = getattr(session, "config", None)
+            config = config if isinstance(config, dict) else {}
             out.append({
                 "session_id": sid,
                 "execution_path": session.execution_path,
@@ -1543,12 +1730,22 @@ class SessionManager:
                 "incarnation": getattr(session, "incarnation", "") or "",
                 "command_id": state.get("command_id", ""),
                 "buffered_events": len(buffer) if buffer is not None else 0,
-                "use_native_permissions": bool(
-                    getattr(session, "config", {}).get(
-                        "use_native_permissions", False)
-                ),
+                "use_native_permissions": bool(config.get("use_native_permissions", False)),
+                # What an adoption needs beside the turn (0.5.171): the
+                # thread to resume, the model and the tools the session runs.
+                "resume_handle": getattr(session, "resume_handle", "") or "",
+                "model": config.get("model", "") or "",
+                "mcp_servers": list(getattr(session, "mcp_server_names", None) or []),
             })
         return out
+
+    def replays_turns(self, execution_path: str) -> bool:
+        """Whether a live session of this engine is listed in ``sessions``:
+        its turn is kept here and the platform signed in says it replays
+        it. Everything else is in ``other_sessions``."""
+        engine = ENGINES.get(execution_path)
+        return bool(engine is not None and engine.turn_replay
+                    and execution_path in self.replays_turns_of)
 
     async def resume_session_stream(
         self, msg: dict, ws: "SatelliteWSClient",
@@ -1890,10 +2087,7 @@ class SessionManager:
             try:
                 if base == "settings.json" and claude_dir is not None \
                         and (claude_dir / "settings.json").resolve() == pushed:
-                    _write_cli_hooks(
-                        claude_dir,
-                        getattr(session, "config", {}).get("disallowed_tools"),
-                    )
+                    rewrite_cli_hooks(session)
                     self._refresh_push_snapshot(session, claude_dir / "settings.json", agent_dir)
                     logger.info(
                         "re-applied real-path Claude hooks after settings push (slug=%s)",
@@ -1901,7 +2095,7 @@ class SessionManager:
                     )
                 elif base == "hooks.json" and codex_dir is not None \
                         and (codex_dir / "hooks.json").resolve() == pushed:
-                    _write_codex_hooks(codex_dir)
+                    rewrite_codex_hooks(session)
                     self._refresh_push_snapshot(session, codex_dir / "hooks.json", agent_dir)
                     logger.info(
                         "re-applied real-path Codex hooks after hooks push (slug=%s)",
@@ -2383,6 +2577,7 @@ class SessionManager:
     # MCP lifecycle (install / update / remove)
     # ------------------------------------------------------------------
 
+    @_ends_sync
     async def sync_mcps(self, msg: dict, ws: "SatelliteWSClient") -> None:
         """Install / update / remove MCPs per a batched platform directive.
 
@@ -2408,6 +2603,14 @@ class SessionManager:
         Failure: drop `.new`, emit `phase=failed`, keep old version.
 
         Removes: delete `{mcps_dir}/{category}/{name}/`.
+
+        A spec with ``pin`` (the platform's own install) has its staged
+        folder settled to the version the build read back before step 4
+        (``settle_pin``), and every result names that version
+        (``resolved_version``). The install's own compute machine
+        (``own_tools``) installs and removes in ``community`` alone and holds
+        the frame's ``egress`` for its builds (``begin_sync``) until the
+        frame ends (``_ends_sync``).
         """
         import base64 as _b64
         import io
@@ -2418,6 +2621,9 @@ class SessionManager:
         command_id = msg.get("command_id", "")
         to_install = msg.get("mcps_to_install", []) or []
         to_remove = msg.get("mcps_to_remove", []) or []
+        # The install's own compute machine keeps the community tools alone,
+        # and its builds go where the platform's frame says.
+        kept = await asyncio.to_thread(begin_sync, self.config, msg)
 
         results: dict[str, dict] = {}
 
@@ -2435,7 +2641,7 @@ class SessionManager:
                 return f"unsafe mcp name: {name!r}"
             if category not in MCP_CATEGORIES:
                 return f"unsafe mcp category: {category!r}"
-            return None
+            return None if kept is None or category in kept else COMMUNITY_ALONE
 
         async def _progress(ev: dict) -> None:
             # Forward progress events upstream so the pump can surface them
@@ -2449,7 +2655,7 @@ class SessionManager:
             except Exception:
                 logger.exception("progress forward failed")
 
-        preserve_subdirs = {"keys", "config", "screenshots"}
+        preserve_subdirs = PRESERVED_SUBDIRS
 
         # Pre-warm freshly-installed MCPs (cold-start mitigation). Kicked as
         # background tasks right after each successful install so an MCP warms
@@ -2493,6 +2699,8 @@ class SessionManager:
                 # blocked — then proceed with a fresh ``.new/``. The
                 # quarantine dir is GC'd by the satellite startup sweep
                 # (next reboot releases the handles).
+                if new_root.is_dir():
+                    rescue_preserved(new_root)  # a swap that stopped: its keys and data
                 _force_remove_or_quarantine(
                     new_root,
                     self.config.mcps_dir / category /
@@ -2504,18 +2712,8 @@ class SessionManager:
                 # Extract the tarball into .new/
                 tarbytes = _b64.b64decode(tarball_b64)
                 with tarfile.open(fileobj=io.BytesIO(tarbytes), mode="r:gz") as tar:
-                    # Safe extract: reject absolute paths + path traversal
-                    # (the satellite's containment, symlinks followed).
                     from ..host import auth_paths
-                    for member in tar.getmembers():
-                        if not auth_paths.is_path_under_root(new_root / member.name, new_root):
-                            raise ValueError(f"tarball escaped: {member.name}")
-                    # filter="data" additionally blocks what the pre-check
-                    # can't see: symlink members that retarget later writes
-                    # outside new_root, device/fifo members, and setuid
-                    # bits. Same pattern as the auto-update extract
-                    # (transport/lifecycle_update.py).
-                    tar.extractall(new_root, filter="data")
+                    auth_paths.unpack_tarball(tar, new_root)
 
                 # Sanity-check the extract — manifest.json is required for
                 # every MCP, so missing it after extract means the tarball
@@ -2544,13 +2742,27 @@ class SessionManager:
                 # A fresh venv runs on this satellite's own Python, never on
                 # whatever python3 comes first on the service's PATH.
                 python_spec = mcp_python_spec()
-                r = await mcp_installer.install_mcp(
-                    new_root, spec.get("runtime", ""), source,
+                # On a compute machine the tool runs in the platform's
+                # sandbox: its Python must be one the sandbox binds (a
+                # community tool's a uv-managed one in its own folder, pinned
+                # by version: a path pin would keep the image's), and every
+                # step of its build runs in that sandbox too.
+                roots = None
+                compute = self.config if self.compute else None
+                if compute is not None:
+                    from . import sandbox_host
+                    sandbox_host.note_hosted(bool(msg.get("hosted")))
+                    roots = sandbox_host.interpreter_roots(compute, new_root)
+                    if mcp_installer.is_community(new_root):
+                        python_spec = f"{sys.version_info[0]}.{sys.version_info[1]}"
+                r = await install(
+                    new_root, spec.get("runtime", ""), source, compute=compute,
                     progress_cb=_progress,
                     uv_bin=_uv_bin_if_present(),
                     python_bin=sys.executable,
                     source_build=source_build,
                     python_spec=python_spec,
+                    sandbox_roots=roots,
                 )
                 # Retry past a TRANSIENT Windows file lock: a real-time AV
                 # scanner holding a freshly-written file open blocks uv/pip's
@@ -2559,9 +2771,12 @@ class SessionManager:
                 # the partial venv and retry past the scan window. Mirrors
                 # force_rmtree / atomic_replace, which already retry the delete
                 # and swap for the same reason. Heavy MCPs (many native .pyd
-                # files = lots of scanning) are the ones that hit it.
+                # files = lots of scanning) are the ones that hit it. Never on
+                # a compute machine (the platform's Linux image, no scanner):
+                # the retry is decided by the build's own output.
                 _lock_retry = 0
-                while not r.ok and _lock_retry < 3 and _is_transient_lock(r.log or ""):
+                while (compute is None and not r.ok and _lock_retry < 3
+                       and _is_transient_lock(r.log or "")):
                     _lock_retry += 1
                     logger.warning(
                         "sync_mcps install %s: transient file lock (likely AV) "
@@ -2577,16 +2792,20 @@ class SessionManager:
                     with contextlib.suppress(OSError):
                         force_rmtree(new_root / "venv")
                     await asyncio.sleep(2.0 * _lock_retry)
-                    r = await mcp_installer.install_mcp(
-                        new_root, spec.get("runtime", ""), source,
+                    r = await install(
+                        new_root, spec.get("runtime", ""), source, compute=compute,
                         progress_cb=_progress,
                         uv_bin=_uv_bin_if_present(),
                         python_bin=sys.executable,
                         source_build=source_build,
                         python_spec=python_spec,
+                        sandbox_roots=roots,
                     )
                 if not r.ok:
                     raise InstallFailed(install_failure_cause(r.log or ""))
+                # The version the build read back, pinned into the staged
+                # folder first when the platform's own install asked (``pin``).
+                resolved = await asyncio.to_thread(settle_pin, spec, new_root, source, r)
 
                 # Verify hash. Soft-warn on mismatch; satellite still keeps
                 # the install (it works — the hash only keys the sync diff).
@@ -2697,11 +2916,16 @@ class SessionManager:
                 if spec.get("runtime") == "python" and getattr(r, "venv_python", ""):
                     _write_runtime_marker(target_root, python=f"{sys.version_info[0]}.{sys.version_info[1]}")
                 await _progress({"mcp": name, "phase": "done", "pct": 100, "message": "installed"})
-                results[name] = {"status": "ok", "version_hash": r.version_hash}
+                results[name] = {"status": "ok", "version_hash": r.version_hash,
+                                 **({"resolved_version": resolved} if resolved else {})}
                 # Pre-warm in the background so it overlaps the next install.
-                warm_tasks.append(
-                    asyncio.create_task(_warm_one_mcp(target_root, name, warm_sem))
-                )
+                # Never on a compute machine: the warm-up starts the tool's own
+                # command with no sandbox, and a session's start of it, in the
+                # session's sandbox, is the check there.
+                if not self.compute:
+                    warm_tasks.append(
+                        asyncio.create_task(_warm_one_mcp(target_root, name, warm_sem))
+                    )
             except Exception as e:
                 logger.exception("sync_mcps install %s failed", name)
                 # Clean up .new and marker; leave any old version intact.
@@ -2727,10 +2951,10 @@ class SessionManager:
         # so with ``remove_any_category``: those go from any category. An
         # older platform also names MCPs a session merely left out, so
         # without the flag ``core`` stays untouched as before.
-        categories = (("core", "custom", "community") if msg.get("remove_any_category")
-                      else ("custom", "community"))
+        categories = kept or (("core", "custom", "community") if msg.get("remove_any_category")
+                              else ("custom", "community"))
         for name in to_remove:
-            if err := _bad_mcp_ref(name):
+            if err := _bad_mcp_ref(name, categories[0]):
                 logger.warning("sync_mcps: rejected removal — %s", err)
                 results[name or "?"] = {"status": "error", "error": err}
                 continue
@@ -2773,6 +2997,15 @@ class SessionManager:
             "installed_mcps": installed,
         })
 
+    async def app_server_start(self, msg: dict, ws: "SatelliteWSClient") -> None:
+        await self.app_servers.start(msg, ws)
+
+    async def app_server_stop(self, msg: dict, ws: "SatelliteWSClient") -> None:
+        await self.app_servers.stop(msg, ws)
+
+    async def app_server_sweep(self, msg: dict, ws: "SatelliteWSClient") -> None:
+        await self.app_servers.sweep(msg, ws)
+
     async def step_run(self, msg: dict, ws: "SatelliteWSClient") -> None:
         """An app step (proxy APPS.md "Steps", 0.5.122): the script and the
         payload land in the private steps directory, the hash is checked,
@@ -2780,6 +3013,9 @@ class SessionManager:
         proxy chose, the output streams as ``step_output`` frames and the
         ack carries the verdict. ``step_runner`` does the work."""
         from . import step_runner
+        if self.config.compute:
+            await step_runner.run_compute_step(msg, ws, self.config, self.local_tunnel_port, self._steps)
+            return
         await step_runner.run_step(msg, ws, self.config.agents_dir, self.local_tunnel_port,
                                    self._steps)
 
@@ -2796,30 +3032,13 @@ class SessionManager:
         Called by the platform on reconnect to detect MCPs left in
         half-installed state (marker present) or that have drifted from the
         last-known version_hash. The platform queues re-install for any
-        mismatches on the next session warmup.
+        mismatches on the next session warmup. The walk hashes every tool's
+        source, so it runs off the loop (``verify_installed``).
         """
-        from .._vendored import mcp_installer
-
-        command_id = msg.get("command_id", "")
-        out: dict[str, dict] = {}
-        for cat_dir in self.config.mcps_dir.iterdir():
-            if not cat_dir.is_dir():
-                continue
-            for mcp_dir in cat_dir.iterdir():
-                if not mcp_dir.is_dir() or not (mcp_dir / "manifest.json").is_file():
-                    continue
-                name = mcp_dir.name
-                marker = cat_dir / f".install-in-progress-{name}"
-                healthy = not marker.exists()
-                try:
-                    vh = mcp_installer.compute_version_hash(mcp_dir)
-                except OSError:
-                    vh = ""
-                    healthy = False
-                out[name] = {"version_hash": vh, "healthy": healthy, "category": cat_dir.name}
+        out = await asyncio.to_thread(verify_installed, self.config.mcps_dir, kept_categories(self.config))
         await ws.enqueue_send({
             "type": "ack",
-            "command_id": command_id,
+            "command_id": msg.get("command_id", ""),
             "status": "ok",
             "mcps": out,
         })

@@ -108,20 +108,21 @@ async def reap_stale(ttl: float = PREWARM_TTL_S) -> int:
     reaped = 0
     for sid, e in stale:  # close OUTSIDE the lock (async, and these are ours alone)
         try:
-            from core.session.session_manager import layer_for_prewarm
+            from core.session.session_manager import (
+                layer_for_prewarm,
+                release_unheld,
+            )
             # The entry is already popped under the lock above, so the only
-            # thing left is the close, on the layer holding the session or
-            # the pre-warm's own engine. No agent row, no machine row, no
-            # platform settings: resolving those would strand the slot and
-            # the subscription seat whenever it failed (a deleted agent).
+            # thing left is the close, on the layer holding the session. No
+            # agent row, no machine row, no platform settings: resolving
+            # those would strand the slot and the subscription seat whenever
+            # it failed (a deleted agent). One nobody holds any more gives
+            # the slot and the seat back here.
             layer = layer_for_prewarm(sid, e.exec_path)
             if layer is None:
-                logger.info(
-                    "prewarm: %s (agent=%s) has no layer to close on",
-                    sid[:8], e.agent,
-                )
-                continue
-            await layer.close_session(sid)
+                release_unheld(sid)
+            else:
+                await layer.close_session(sid)
             reaped += 1
             logger.info("prewarm: reaped unused pre-warm %s (agent=%s, idle>%.0fs)",
                         sid[:8], e.agent, ttl)

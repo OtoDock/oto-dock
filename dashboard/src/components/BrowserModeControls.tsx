@@ -22,7 +22,8 @@ const EXTENSION_URL =
 // consent register as the grant: switching to own mode asks for
 // confirmation. The extension token (what lets sessions connect without a
 // click) is entered here and never shown again; a separate box lets
-// unattended sessions (scheduled tasks, calls, meetings) use it too.
+// unattended sessions (scheduled tasks, triggers, calls, meetings, API keys)
+// use it too.
 export function BrowserModeSelect({
   machine, scope,
 }: { machine: RemoteMachine; scope: MachineScope }) {
@@ -39,8 +40,7 @@ export function BrowserModeSelect({
       'Agents on this machine will work inside the browser you are signed into. ' +
       'They get their own tab group, and can reach your logins, cookies and open tabs. ' +
       'You can also let unattended runs use the saved token. ' +
-      'Then scheduled tasks, triggers, calls and meetings use this browser with nobody watching. ' +
-      'Those runs ask no one before a browser action.\n\n' +
+      'Then scheduled tasks, triggers, calls, meetings and API keys use this browser.\n\n' +
       'Install the Playwright Extension in that browser first. Sessions already running ' +
       'switch when they next start.',
       confirmLabel: 'Use my browser',
@@ -144,8 +144,8 @@ export function BrowserTokenField({
               const enabled = e.target.checked
               if (enabled && !(await dialogs.confirm({
                 title: `Let unattended runs use your browser on ${machine.name}?`,
-                body: 'Scheduled tasks, triggers, calls and meetings will drive the browser you are ' +
-                  'signed into. Nobody watches, and no one is asked before a browser action.',
+                body: 'Scheduled tasks, triggers, calls, meetings and API keys will drive the browser you are ' +
+                  'signed into.',
                 confirmLabel: 'Let them use it',
               }))) return
               void run('unattended', () => setUnattended.mutateAsync({ machineId: machine.id, enabled }),
@@ -154,8 +154,8 @@ export function BrowserTokenField({
             className="mt-0.5 accent-action"
           />
           <span>
-            Also let unattended runs like scheduled tasks, triggers, calls and meetings use
-            this browser. Off, they cannot use it at all.
+            Also let unattended runs like scheduled tasks, triggers, calls, meetings and API keys
+            use this browser. Off, they cannot use it at all.
           </span>
         </label>
         <SaveState state={stateOf('unattended')} />

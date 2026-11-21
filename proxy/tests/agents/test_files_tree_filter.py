@@ -262,3 +262,39 @@ def test_files_endpoint_returns_json_bytes_off_the_loop(tmp_path, monkeypatch):
     tree = resp.json()["tree"]
     assert _names(tree) == ["knowledge", "users", "workspace"]
     assert _users_children(tree) == ["jim"]
+
+
+def test_a_folder_swapped_for_a_link_after_its_listing_shows_nothing_of_the_target(tmp_path, monkeypatch):
+    """Each level of the tree is listed from a handle opened beneath the
+    root with no link followed: a folder replaced by a link after its
+    parent's listing lists nothing of where the link points."""
+    from api.agents import files
+    base = tmp_path / "agent"
+    (base / "workspace" / "sub").mkdir(parents=True)
+    (base / "workspace" / "sub" / "mine.txt").write_text("mine")
+    stand_in = tmp_path / "stand-in"
+    stand_in.mkdir()
+    (stand_in / "theirs.txt").write_text("theirs")
+    from services.mcp import mcp_registry
+    real_protected = mcp_registry.get_protected_credentials_subpaths
+    levels = []
+
+    def protected_then_swap():
+        # Called once a level, after its listing: the second level is the
+        # workspace, whose "sub" is then replaced before it is entered.
+        levels.append(1)
+        if len(levels) == 2:
+            sub = base / "workspace" / "sub"
+            sub.rename(tmp_path / "aside")
+            sub.symlink_to(stand_in)
+        return real_protected()
+    monkeypatch.setattr(mcp_registry, "get_protected_credentials_subpaths", protected_then_swap)
+    tree = files._build_tree(base, base, depth=1, max_depth=5)
+    names = []
+
+    def walk(nodes):
+        for n in nodes:
+            names.append(n["name"])
+            walk(n.get("children") or [])
+    walk(tree)
+    assert "theirs.txt" not in names

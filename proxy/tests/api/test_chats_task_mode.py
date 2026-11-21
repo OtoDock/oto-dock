@@ -117,23 +117,6 @@ def test_the_mint_writes_the_kind_and_both_lists_agree(temp_db, _as, monkeypatch
     assert "worker-uuid" not in task_ids
 
 
-def test_the_conversations_tab_lists_the_external_kinds_only(temp_db):
-    """The agent Conversations tab takes the resolved list of the externally
-    driven kinds (phone today): a task row — minted before or after the
-    column was written — never lists there, nor does a dashboard chat."""
-    from core.session import session_kind
-    task_store.create_chat("phone-1", "phone", AGENT, "auto", source_type="phone")
-    task_store.create_chat(str(uuid.uuid4()), "user-alice", AGENT)
-    _mk_task_chat()
-    task_store.create_chat("task-run-new", f"task::{AGENT}", AGENT, "auto", source_type="task")
-    kinds = session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES
-    assert [r["id"] for r in task_store.get_agent_conversations(AGENT, source_types=kinds)] == ["phone-1"]
-    assert task_store.count_agent_conversations(AGENT, source_types=kinds) == 1
-    assert [r["id"] for r in task_store.get_agent_conversations(
-        AGENT, source_type="phone", source_types=kinds)] == ["phone-1"]
-    assert task_store.get_agent_conversations(AGENT, source_type="task", source_types=kinds) == []
-
-
 def test_unread_finished_backfill_excludes_delegated_task_chats(temp_db):
     task_store.create_chat("task-run-d9", "user-alice", AGENT, origin="delegated")
     task_store.update_chat("task-run-d9",

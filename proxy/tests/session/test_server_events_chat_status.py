@@ -304,3 +304,70 @@ async def test_a_continuations_wake_sends_its_card_to_the_viewer_before_the_turn
     await other._handle_server_notification(dict(notification))
     assert [f["type"] for f in other.sent] == []
     assert broadcast[-1] == ("sc-wake", frame, other.notify_queue)
+
+
+def _result_item(**over) -> dict:
+    from ws import wire_events as wire
+    return {"type": wire.NOTIFY_TASK_RESULT_PROMPT, "task_id": "t-r", "task_name": "lane",
+            "result_prompt": "the worker reported", "delegate_agent": "worker",
+            "output_text": "the worker's report", "status": "completed", **over}
+
+
+class _ResultViewer(_Conn):
+    """A socket on a chat: the server turn is recorded, not run."""
+    session_id = "sess-shown"
+    user_sub = "user-admin"
+    layer = object()
+
+    def __init__(self, chat_id):
+        super().__init__()
+        self.chat_id = chat_id
+        self.turns: list[dict] = []
+
+    async def _run_server_turn(self, prompt, **target):
+        self.turns.append(target)
+        return object()
+
+    async def _resolve_layer_for_chat_async(self, cid):
+        return object()
+
+
+@pytest.mark.asyncio
+async def test_a_result_frame_names_the_delegating_chat(temp_db):
+    """The socket that shows the delegating chat gets the result naming that
+    chat, so the page can tell it from every other chat's."""
+    from ws import wire_events as wire
+    temp_db.create_chat("sc-res", "user-admin", "a1")
+    conn = _ResultViewer("sc-res")
+    await conn._handle_server_notification(_result_item(chat_id="sc-res", session_id="sess-res"))
+    frames = [f for f in conn.sent if f["type"] == wire.DELEGATE_RESULT]
+    assert len(frames) == 1 and frames[0]["chat_id"] == "sc-res"
+    assert conn.turns and conn.turns[0]["target_chat_id"] == "sc-res"
+
+
+@pytest.mark.asyncio
+async def test_a_result_that_names_no_chat_never_lands_on_the_chat_on_screen(temp_db):
+    """A result item with no chat, whose session has none either, belongs to
+    no chat: the chat the socket shows gets no row, no frame and no turn."""
+    temp_db.create_chat("sc-shown", "user-admin", "a1")
+    conn = _ResultViewer("sc-shown")
+    await conn._handle_server_notification(_result_item(session_id="sess-no-chat"))
+    assert conn.sent == []
+    assert conn.turns == []
+    assert [m for m in temp_db.get_chat_messages("sc-shown")
+            if m.get("event_type") == "delegate_result"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_result_for_the_chat_left_runs_headless_and_sends_nothing(temp_db):
+    """The page left the delegating chat (another chat, or its new-chat view):
+    the result is written on the delegating chat and its turn runs there,
+    and this socket sends no frame of it."""
+    temp_db.create_chat("sc-left", "user-admin", "a1")
+    for shown in ("sc-other", None):
+        conn = _ResultViewer(shown)
+        await conn._handle_server_notification(_result_item(chat_id="sc-left", session_id="sess-left"))
+        assert conn.sent == [], shown
+        assert [t["target_chat_id"] for t in conn.turns] == ["sc-left"]
+    rows = [m for m in temp_db.get_chat_messages("sc-left") if m.get("event_type") == "delegate_result"]
+    assert len(rows) == 2

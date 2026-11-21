@@ -77,7 +77,7 @@ export default function ArtifactView({ block, agent, embedded, onArtifactInterac
           </div>
           <div className="px-3 py-2">
             <p className="text-xs text-tertiary truncate">
-              {block.model === 'gpt-image' ? 'GPT Image 1.5' : 'Nano Banana Pro'}
+              {block.model === 'gpt-image' ? 'GPT Image 2.6' : 'Nano Banana Pro'}
               {block.promptPreview && ` — ${block.promptPreview}`}
             </p>
           </div>

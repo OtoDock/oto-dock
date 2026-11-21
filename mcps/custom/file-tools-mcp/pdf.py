@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import tempfile
+import unicodedata
 from pathlib import Path
 
 import render_engine
@@ -38,8 +39,11 @@ from shared import (
     _to_agents_relative,
     cleanup_partials,
     logger,
+    safe_kind,
     safe_mkdirs,
     safe_open_write,
+    safe_read_fd,
+    sibling_path,
     worker_temp_path,
 )
 
@@ -63,15 +67,26 @@ class PasswordNeeded(ValueError):
 
 def open_pdf(path: str, password: str | None = None):
     """The PDF at ``path``, opened with ``password`` when it needs one."""
+    return _opened(path, password)[0]
+
+
+def _opened(path: str, password: str | None = None):
+    """``open_pdf`` and the status of the file it opened: read through
+    ``safe_read_fd`` (beneath the mount, no link followed); MuPDF opens its
+    own descriptor of that very file, so ours is closed at once."""
     import fitz
 
-    doc = fitz.open(path)
+    fd, st = safe_read_fd(path)
+    try:
+        doc = fitz.open(safe_fs.fd_path(fd), filetype="pdf")
+    finally:
+        os.close(fd)
     if doc.needs_pass and not (password not in (None, "") and doc.authenticate(str(password))):
         doc.close()
         if password in (None, ""):
             raise PasswordNeeded(f"{Path(path).name} is password-protected: give its password (password).")
         raise PasswordNeeded(f"The password given is not the one that opens {Path(path).name}.")
-    return doc
+    return doc, st
 
 
 def _read_range(pages, total: int) -> tuple[list[int], str]:
@@ -89,11 +104,11 @@ def _read_range(pages, total: int) -> tuple[list[int], str]:
 
 
 def read_pdf(path: str, pages: str | None, *, mode: str = "text", password: str | None = None) -> str:
-    doc = open_pdf(path, password)
+    doc, st = _opened(path, password)
     try:
         if mode == "form_fields":
             return _read_form(doc, path, pages)
-        return _read_text(doc, path, pages)
+        return _read_text(doc, path, pages, st.st_size)
     finally:
         doc.close()
 
@@ -117,7 +132,7 @@ def _read_form(doc, path: str, pages) -> str:
     return "\n".join(result)
 
 
-def _read_text(doc, path: str, pages) -> str:
+def _read_text(doc, path: str, pages, file_size: int) -> str:
     from formats.pdf.edit import protection_of
 
     meta = doc.metadata or {}
@@ -147,8 +162,7 @@ def _read_text(doc, path: str, pages) -> str:
         orient = "landscape" if w_in > h_in else "portrait"
         result.append(f"**Pages**: {total} pages, {w_in}x{h_in}in ({orient})")
 
-    # File size
-    file_size = os.path.getsize(path)
+    # File size (of the file opened)
     if file_size > 1_000_000:
         result.append(f"**Size**: {file_size / 1_000_000:.1f} MB")
     else:
@@ -705,12 +719,12 @@ def _land_files(src_dir: str, out_dir: str, names: list[str]) -> None:
 
 async def handle_pdf_to_images(args: dict) -> str:
     path = await _resolve_path(args["path"])
-    if not await asyncio.to_thread(os.path.exists, path):
+    if (await asyncio.to_thread(safe_kind, path)).kind == "missing":
         return f"Error: File not found: {args['path']}"
 
     output_dir = args.get("output_dir")
     if not output_dir:
-        output_dir = _write_form(str(Path(path).parent / (Path(path).stem + "_pages")))
+        output_dir = await _beside_input(args["path"], path, "_pages")
     out_dir = await _resolve_path(output_dir, writing=True)
 
     page_spec = args.get("pages", "all")
@@ -873,7 +887,7 @@ async def handle_screenshot_document(args: dict) -> list:
     from formats.pdf import screenshot as shot
 
     path = await _resolve_path(args.get("path", ""))
-    if not await asyncio.to_thread(os.path.isfile, path):
+    if (await asyncio.to_thread(safe_kind, path)).kind in ("missing", "dir"):
         return [TextContent(type="text", text=f"Error: file not found: {_to_agents_relative(path)}")]
 
     ext = Path(path).suffix.lower()
@@ -1021,41 +1035,14 @@ def _images_to_pdf_core(image_paths: list, out: str, page_size: str,
     doc = fitz.open()
 
     for img_path in image_paths:
-        # Get image dimensions
-        img_doc = fitz.open(img_path)
-        if img_doc.page_count == 0:
-            img_doc.close()
-            continue
-        img_rect = img_doc[0].rect
-        img_w, img_h = img_rect.width, img_rect.height
-        img_doc.close()
-
-        if page_size == "original":
-            pw, ph = img_w, img_h
-        else:
-            pw, ph = sizes.get(page_size, (595, 842))
-            # Auto-rotate page to match image orientation
-            if (img_w > img_h and pw < ph) or (img_h > img_w and ph < pw):
-                pw, ph = ph, pw
-
-        page = doc.new_page(width=pw, height=ph)
-
-        if fit == "stretch":
-            img_rect = fitz.Rect(0, 0, pw, ph)
-        elif fit == "cover":
-            scale = max(pw / img_w, ph / img_h)
-            new_w, new_h = img_w * scale, img_h * scale
-            x = (pw - new_w) / 2
-            y = (ph - new_h) / 2
-            img_rect = fitz.Rect(x, y, x + new_w, y + new_h)
-        else:  # contain
-            scale = min(pw / img_w, ph / img_h)
-            new_w, new_h = img_w * scale, img_h * scale
-            x = (pw - new_w) / 2
-            y = (ph - new_h) / 2
-            img_rect = fitz.Rect(x, y, x + new_w, y + new_h)
-
-        page.insert_image(img_rect, filename=img_path)
+        # One descriptor per picture (beneath the mount, no link followed):
+        # its size and its bytes come from the same file.
+        fd, _ = safe_read_fd(img_path)
+        try:
+            _place_image(doc, safe_fs.fd_path(fd), Path(img_path).suffix.lstrip(".").lower() or None,
+                         sizes, page_size, fit)
+        finally:
+            os.close(fd)
 
     inserted = doc.page_count
     try:
@@ -1063,6 +1050,47 @@ def _images_to_pdf_core(image_paths: list, out: str, page_size: str,
     finally:
         doc.close()
     return inserted
+
+
+def _place_image(doc, source: str, filetype: str | None, sizes: dict, page_size: str, fit: str) -> None:
+    """The picture at ``source`` (a descriptor's path) on a page of its own."""
+    import fitz
+
+    # Get image dimensions
+    img_doc = fitz.open(source, filetype=filetype)
+    if img_doc.page_count == 0:
+        img_doc.close()
+        return
+    img_rect = img_doc[0].rect
+    img_w, img_h = img_rect.width, img_rect.height
+    img_doc.close()
+
+    if page_size == "original":
+        pw, ph = img_w, img_h
+    else:
+        pw, ph = sizes.get(page_size, (595, 842))
+        # Auto-rotate page to match image orientation
+        if (img_w > img_h and pw < ph) or (img_h > img_w and ph < pw):
+            pw, ph = ph, pw
+
+    page = doc.new_page(width=pw, height=ph)
+
+    if fit == "stretch":
+        img_rect = fitz.Rect(0, 0, pw, ph)
+    elif fit == "cover":
+        scale = max(pw / img_w, ph / img_h)
+        new_w, new_h = img_w * scale, img_h * scale
+        x = (pw - new_w) / 2
+        y = (ph - new_h) / 2
+        img_rect = fitz.Rect(x, y, x + new_w, y + new_h)
+    else:  # contain
+        scale = min(pw / img_w, ph / img_h)
+        new_w, new_h = img_w * scale, img_h * scale
+        x = (pw - new_w) / 2
+        y = (ph - new_h) / 2
+        img_rect = fitz.Rect(x, y, x + new_w, y + new_h)
+
+    page.insert_image(img_rect, filename=source)
 
 
 async def handle_images_to_pdf(args: dict) -> str:
@@ -1089,7 +1117,7 @@ async def handle_images_to_pdf(args: dict) -> str:
             logger.warning(f"images_to_pdf: skipping {img_input} ({exc})")
             skipped.append(f"{img_input} (refused: {exc})")
             continue
-        if not await asyncio.to_thread(os.path.exists, img_path):
+        if (await asyncio.to_thread(safe_kind, img_path)).kind == "missing":
             logger.warning(f"images_to_pdf: skipping {img_input} (not found)")
             skipped.append(f"{img_input} (not found)")
             continue
@@ -1129,17 +1157,37 @@ _MARKDOWN_EXTS = (".md", ".markdown")
 _HTML_EXTS = (".html", ".htm")
 
 
-def _write_form(container_path: str) -> str:
-    """A resolved path in the session's agent tree as the sandbox path the
-    proxy resolves as a write (``/agents/<slug>/users/u/x`` becomes
-    ``/users/u/x``). ``_resolve_path`` hands the proxy a container path in
-    its agents-relative form, which the proxy resolves for reads only. A
-    path outside the mount or in the host cache (no sandbox form) is
-    returned unchanged."""
-    if not container_path.startswith(MOUNT_AGENTS_DIR + "/"):
-        return container_path
-    slug, _, rest = container_path[len(MOUNT_AGENTS_DIR) + 1:].partition("/")
-    return container_path if slug == HOST_CACHE_SEGMENT else "/" + rest
+async def _beside_input(caller: str, resolved: str, suffix: str) -> str:
+    """A default output beside an input, as a path the proxy resolves as a
+    write: the caller's own path with the suffix of its last part changed
+    (``sibling_path``), so a paired computer's file gets one beside it. An
+    input named by its place in the agent's tree (``/agents/<slug>/…``, or
+    ``<slug>/…`` as the tools print it, which the server takes as that place
+    when something sits there), which the proxy resolves for reads only, is
+    answered in its sandbox form (``/users/u/x``) from the caller's own text,
+    so a person's own folder link on the way is kept."""
+    def tree_form(path: str) -> str:
+        if path.startswith(MOUNT_AGENTS_DIR + "/"):
+            path = path[len(MOUNT_AGENTS_DIR) + 1:]
+        return unicodedata.normalize("NFC", path)
+
+    slug, _, rest = tree_form(resolved).partition("/")
+    if slug == HOST_CACHE_SEGMENT or not resolved.startswith(MOUNT_AGENTS_DIR + "/"):
+        return sibling_path(caller, suffix)
+    if tree_form(caller) == tree_form(resolved):
+        return sibling_path("/" + rest, suffix)
+    raw = caller[len(MOUNT_AGENTS_DIR) + 1:] if caller.startswith(MOUNT_AGENTS_DIR + "/") else caller
+    c_slug, _, c_rest = raw.partition("/")
+    if c_slug == slug and c_rest:
+        # The container form and the bare form are one text to the server:
+        # both are the tree place only where something sits there.
+        try:
+            there = (await asyncio.to_thread(safe_kind, f"{MOUNT_AGENTS_DIR}/{raw}")).kind != "missing"
+        except OSError:
+            there = False
+        if there:
+            return sibling_path("/" + c_rest, suffix)
+    return sibling_path(caller, suffix)
 
 
 # A converted or screenshotted Markdown or HTML file is read whole in the
@@ -1193,7 +1241,7 @@ def _read_source(container_path: str, *, html: bool) -> str:
 
 async def handle_convert_document(args: dict) -> str:
     input_path = await _resolve_path(args["input_path"])
-    if not await asyncio.to_thread(os.path.exists, input_path):
+    if (await asyncio.to_thread(safe_kind, input_path)).kind == "missing":
         return f"Error: File not found: {args['input_path']}"
 
     output_format = args.get("output_format", "pdf")
@@ -1210,7 +1258,7 @@ async def handle_convert_document(args: dict) -> str:
         is_html = ext in _HTML_EXTS
         content = await asyncio.to_thread(_read_source, input_path, html=is_html)
         out = await _resolve_path(
-            output_path or _write_form(str(Path(input_path).with_suffix(".pdf"))),
+            output_path or await _beside_input(args["input_path"], input_path, ".pdf"),
             writing=True,
         )
         tail = await _write_pdf(
@@ -1221,19 +1269,20 @@ async def handle_convert_document(args: dict) -> str:
         return f"Converted: {_to_agents_relative(out)}" + tail
 
     # Every other output is likewise output_path itself, else derived from
-    # the input's own path in sandbox form, resolved once as a write.
-    beside = str(Path(input_path).with_suffix(""))
+    # the caller's own input path, resolved once as a write.
 
     # Image → PDF via pymupdf
     if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif", ".webp") and output_format == "pdf":
-        out = await _resolve_path(output_path or _write_form(beside + ".pdf"), writing=True)
+        out = await _resolve_path(output_path or await _beside_input(args["input_path"], input_path, ".pdf"),
+                                  writing=True)
         await _images_to_pdf([input_path], out, "original", "contain")
         return f"Converted: {_to_agents_relative(out)}"
 
     # PDF → PNG via pymupdf, into a folder: output_path, else one named
     # after the input beside it
     if ext == ".pdf" and output_format in ("png", "jpg", "jpeg"):
-        out_dir = await _resolve_path(output_path or _write_form(beside), writing=True)
+        out_dir = await _resolve_path(output_path or await _beside_input(args["input_path"], input_path, ""),
+                                      writing=True)
         await _pdf_to_images(input_path, out_dir, "all", 150, output_format)
         return f"Converted: {_to_agents_relative(out_dir)}/"
 
@@ -1253,7 +1302,7 @@ async def handle_convert_document(args: dict) -> str:
             return f"Conversion error: {exc}"
         if out is None:
             out = await _resolve_path(
-                _write_form(str(Path(input_path).parent / Path(produced).name)), writing=True,
+                await _beside_input(args["input_path"], input_path, Path(produced).suffix), writing=True,
             )
         await asyncio.to_thread(_copy_beneath, produced, out)
     finally:

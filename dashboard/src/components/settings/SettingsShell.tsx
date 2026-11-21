@@ -31,8 +31,8 @@ export interface SettingsShellProps {
 
 type ViewProps = SettingsShellProps & { nav: SettingsAreaNav }
 
-/** A touch starting this close to the screen's edge is Android's own back
- *  gesture, never the section's swipe. */
+/** A touch starting this close to the screen's edge is the system's back
+ *  gesture (Android's, the iOS app's edge swipe), never the shell's swipe. */
 const EDGE_DEAD_ZONE_PX = 20
 
 /** The phone list's scroll offset per area, kept while the page lives. */
@@ -168,6 +168,12 @@ function SectionFrame({ base, title, subtitle, wordmark, sections, banners, read
 
 function ListView({ base, title, subtitle, sections, banners, nav }: ViewProps) {
   const mainRef = useRef<HTMLElement>(null)
+  // The list's back is Back to Chat, as a section's is its arrow.
+  useSwipeGesture(mainRef, {
+    onSwipeRight: nav.backToChat,
+    edgeDeadZone: EDGE_DEAD_ZONE_PX,
+    ignoreIframeSwipes: true,
+  })
   // A return from a section lands where the row was.
   useLayoutEffect(() => {
     const el = mainRef.current

@@ -113,6 +113,21 @@ describe('a notification tap in the app', () => {
     expect(noteStoreReviewMoment).not.toHaveBeenCalled()
   })
 
+  it("a recover push opens over the chat of that agent on screen, as the bell's button does", async () => {
+    installFakeNativeChannel({ switchToInstall: false })
+    const navigate = vi.fn()
+    const tap = await mountAndTap(navigate)
+    window.history.pushState({}, '', '/chat/pa/c9?ws=1')
+    try {
+      await act(async () => { await tap({ notification: { data: { click_url: '/chat/pa?recover=1' } } }) })
+      expect(navigate).toHaveBeenCalledWith('/chat/pa/c9?ws=1&recover=1')
+      await act(async () => { await tap({ notification: { data: { click_url: '/chat/other?recover=1' } } }) })
+      expect(navigate).toHaveBeenLastCalledWith('/chat/other?recover=1')
+    } finally {
+      window.history.pushState({}, '', '/')
+    }
+  })
+
   it('opens the path in place when the app does not answer', async () => {
     installFakeNativeChannel()
     const navigate = vi.fn()

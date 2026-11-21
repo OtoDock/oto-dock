@@ -2,8 +2,8 @@
   "name": "computer-control",
   "server_name": "computer",
   "label": "Computer Control",
-  "description": "Control this machine's screen, mouse, and keyboard (Anthropic computer-use action set). Each action returns a fresh screenshot so the agent can see the result.",
-  "version": "1.0.1",
+  "description": "Control this machine's screen, mouse, and keyboard. Each call runs a short list of steps and returns one screenshot, and it stops before a step when the screen or the mouse changed.",
+  "version": "1.1.0",
   "category": "custom",
 
   "server": {
@@ -30,7 +30,7 @@
   "system_requirements": {
     "debian": ["scrot", "xclip"],
     "ubuntu": ["scrot", "xclip"],
-    "notes": "Linux: X11 sessions only. Wayland blocks synthetic mouse/keyboard input — the tool returns an actionable error there rather than silently doing nothing. `scrot` backstops screen capture; `xclip` enables the clipboard-paste fallback the `type` action uses for non-ASCII text. macOS: grant the satellite's host process BOTH Accessibility (synthetic input) and Screen Recording (capture) under System Settings -> Privacy & Security; while macOS Secure Input is active (some password fields) synthetic keystrokes are silently dropped. Windows: no extra packages needed, but a non-elevated satellite cannot interact with UAC prompts or windows of elevated processes."
+    "notes": "Linux: X11 sessions only. Wayland blocks synthetic mouse/keyboard input. The tool returns an actionable error there rather than silently doing nothing. `scrot` backstops screen capture. `xclip` enables the clipboard-paste fallback the `type` action uses for non-ASCII text. macOS: grant the satellite's host process BOTH Accessibility (synthetic input) and Screen Recording (capture) under Privacy & Security in System Settings. While macOS Secure Input is active (some password fields), synthetic keystrokes are silently dropped. Windows: no extra packages needed, but a non-elevated satellite cannot interact with UAC prompts or windows of elevated processes."
   },
 
   "skills": [
@@ -38,7 +38,7 @@
       "id": "computer-control-usage",
       "loading": "always",
       "file": "skills/computer-control.md",
-      "description": "How to drive the screen/mouse/keyboard with the computer tool: the screenshot-first loop, the coordinate space, every action's parameters, and the platform edge cases.",
+      "description": "How to drive the screen, mouse and keyboard with the computer tool: a list of steps per call, when to batch and when to look first, why a list stops, the coordinate space, every action, the zoom, and the platform edge cases.",
       "default_exclude_from": []
     }
   ],

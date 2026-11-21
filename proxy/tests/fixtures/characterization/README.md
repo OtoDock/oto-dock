@@ -8,8 +8,11 @@ to `tests/core/test_builder_characterization.py`: the session builders' configs 
 collaborator calls, built by `tests/fixtures/loop_builder_rig.py` from rows the test
 writes (no recording), before their store reads left the event loop. A golden is never rewritten by a
 refactor: a drift is a behaviour change to explain. `CHARACTERIZATION_WRITE=1` writes
-them (used once, from a tree whose behaviour is the one to keep) and fails each test it
-rewrote: run again without it.
+them (from a tree whose behaviour is the one to keep, with the reason in the commit) and fails each test it
+rewrote: run again without it. A suite with several goldens keeps them in a folder of its own under `golden/`.
+
+The folders under `golden/` belong to the suites that recorded the modules split in 2.0, and
+`route-table.json` to the app's route table.
 
 Every file is scrubbed: the agent tree's paths read `/users/dev-admin/...`, the OS
 user is `person`, the person's address is `person@example.com`, the organization

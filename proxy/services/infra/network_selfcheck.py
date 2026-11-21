@@ -43,6 +43,9 @@ _TIMEOUT_S = 3.0
 _PLANE_MEMBERS = {
     "socketproxy": frozenset({"docker-socket-proxy", "otodock-proxy"}),
     "otodock-data": frozenset({"otodock-postgres", "otodock-db-init", "otodock-proxy"}),
+    # The compute link, and the way in to an app server on the compute machine
+    # (its relay on that address admits this plane's other member alone).
+    "otodock-compute": frozenset({"otodock-proxy", "otodock-compute"}),
 }
 _PLATFORM_PROJECT = "otodock"
 _PLATFORM_SERVICE_LABELS = _CONTROL_SERVICES | {"otodock-proxy"}

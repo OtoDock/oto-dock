@@ -154,6 +154,10 @@ def _cached_key_row(kind: str, owner: str, key_id: str, key_hash: str) -> dict |
     if (not owner_ok or cast("dict", row).get("revoked_at") or cast("dict", row).get("key_hash") != key_hash
             or not api_key_store.has_permission(cast("dict", row), "triggers")):
         return None
+    user = None if kind == _vis.SCOPE_AGENT else task_store.get_user(cast("dict", row)["user_sub"])
+    key_kind = api_key_manager.KEY_KIND_AGENT if kind == _vis.SCOPE_AGENT else api_key_manager.KEY_KIND_USER
+    if api_key_manager.key_row_refusal(cast("dict", row), key_kind, user):
+        return None
     if kind == _vis.SCOPE_AGENT:
         api_key_store.update_agent_key_last_used(key_id)
     else:
@@ -337,9 +341,8 @@ def _check_trigger_mutation_authority(trigger: dict, user: UserContext) -> None:
                 403, "Cannot manage another user's trigger",
             )
     elif scope == _vis.SCOPE_AGENT:
-        acting_user = task_store.get_user(acting) or {}
-        role = roles.effective_role(
-            acting_user.get("role"), task_store.get_user_agent_roles(acting), trigger["agent"])
+        # The principal's role: a session's cap included.
+        role = user.effective_role(trigger["agent"])
         if roles.is_admin(role):
             return  # platform admin: any
         if roles.may_mutate_shared(role, own=trigger.get("created_by") == acting):

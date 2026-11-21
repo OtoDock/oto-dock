@@ -530,7 +530,7 @@ def test_a_model_server_name_that_turns_to_the_metadata_address_reaches_nothing(
         mp.setattr(pinned_http, "checked_client", recording)
         models = asyncio.run(OllamaAdapter().list_available_models(
             "", f"http://{NAME}:{target.port}/v1"))
-    assert models == [] and seen == [pinned_http.model_server]
+    assert models == [] and seen == [pinned_http.admin_host]
     assert target.connections == 0
     target.close()
 
@@ -733,3 +733,250 @@ def test_the_media_socket_resolve_is_bounded_by_its_timeout(resolver, monkeypatc
     # The call gives up at its timeout (the stalled resolve finishes on its
     # own thread, which asyncio.run then waits for).
     assert asyncio.run(call()) < 1.0
+
+
+# --- a hosted install: no setting reaches a private address --------------
+
+@pytest.fixture
+def hosted(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
+    return config
+
+
+def test_the_control_plane_policy_is_public_only_on_a_hosted_install(hosted, monkeypatch):
+    """The credential gateway's vendors, the MCP sign-in client and the
+    relay dial on ``control_plane``: a LAN host an admin allowed is refused."""
+    for addr in ("10.0.0.5", "192.168.1.20", "172.16.0.9", "fd00::1", "100.64.0.1",
+                 "127.0.0.1", "169.254.169.254"):
+        assert pinned_http.control_plane(addr), addr
+    assert not pinned_http.control_plane("8.8.8.8")
+    monkeypatch.setattr(hosted, "OTODOCK_CLOUD", False)
+    assert not pinned_http.control_plane("192.168.1.20"), "the broken form: the LAN passes"
+
+
+def test_the_admin_host_policy(hosted, monkeypatch):
+    for addr in ("127.0.0.1", "10.0.0.5", "192.168.1.20", "fd00::1", "169.254.169.254"):
+        assert pinned_http.admin_host(addr), addr
+    assert not pinned_http.admin_host("8.8.8.8")
+    monkeypatch.setattr(hosted, "OTODOCK_CLOUD", False)
+    for addr in ("127.0.0.1", "192.168.1.20", "8.8.8.8"):
+        assert not pinned_http.admin_host(addr), addr
+    for addr in ("169.254.169.254", "fe80::1", "224.0.0.1"):
+        assert pinned_http.admin_host(addr), addr
+
+
+def test_admin_host_refuses_the_whole_answer_on_a_hosted_install(resolver, hosted, monkeypatch):
+    resolver(_answers("192.168.1.20", "8.8.8.8"))
+    with pytest.raises(pinned_http.Refused):
+        pinned_http.checked_addresses("mixed.example", 443, pinned_http.admin_host)
+    monkeypatch.setattr(hosted, "OTODOCK_CLOUD", False)
+    assert pinned_http.checked_addresses("mixed.example", 443, pinned_http.admin_host) == [
+        "192.168.1.20", "8.8.8.8"]
+
+
+def test_a_gateway_vendor_on_the_lan_is_refused_on_a_hosted_install(resolver, hosted, monkeypatch):
+    from core.credentials import mcp_gateway
+    lan = _answers("192.168.1.20")
+    resolver(lan)
+    monkeypatch.setattr(socket, "getaddrinfo", lan)
+    monkeypatch.setattr(mcp_gateway, "_proxied_memo", {})
+    monkeypatch.setattr(mcp_gateway, "_egress_memo", {})
+    assert "a hosted install never reaches" in (mcp_gateway._egress_refusal("https://crm.lan/mcp") or "")
+    monkeypatch.setattr(mcp_gateway, "_egress_memo", {})
+    monkeypatch.setattr(hosted, "OTODOCK_CLOUD", False)
+    assert not mcp_gateway._egress_refusal("https://crm.lan/mcp"), "the broken form"
+
+
+def test_the_mcp_sign_in_client_refuses_a_private_token_url_on_a_hosted_install(resolver, hosted):
+    from services.oauth import mcp_authorization
+    resolver(_answers("10.0.0.7"))
+    client = mcp_authorization._client("https://idp.lan/token")
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(client.post("https://idp.lan/token", data={"a": "b"}))
+    asyncio.run(client.aclose())
+
+
+def test_the_environments_proxy_is_ignored_on_a_hosted_install(hosted, monkeypatch):
+    """Behind a proxy the guard's own lookup is only best effort: on a hosted
+    install every checked transport pins its dial itself."""
+    from services.webhooks import vendor_http
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    for var in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    assert pinned_http.proxied(f"https://{NAME}/") is False
+    client = vendor_http.client(f"https://{NAME}/", timeout=5)
+    assert isinstance(client._transport, pinned_http.CheckedTransport)
+    pool = pinned_http.checked_pool()
+    assert not pool._mounts or all(t is None for t in pool._mounts.values())
+    asyncio.run(client.aclose())
+    asyncio.run(pool.aclose())
+    monkeypatch.setattr(hosted, "OTODOCK_CLOUD", False)
+    assert pinned_http.proxied(f"https://{NAME}/") is True, "the broken form"
+
+
+def test_the_relay_refuses_a_private_base_on_a_hosted_install(resolver, hosted, monkeypatch):
+    from services.billing import relay_client
+    resolver(_answers("10.1.2.3"))
+    monkeypatch.setattr(hosted, "OTODOCK_RELAY_BASE", "https://relay.lan")
+    with pytest.raises(httpx.ConnectError, match="may not reach"):
+        relay_client._relay_post_sync("/v1/x", {})
+
+
+def test_a_manifests_sign_in_urls_and_the_sign_in_provider_are_checked(resolver, hosted):
+    """A manifest's token, userinfo, revoke and device URLs and the sign-in
+    provider's calls dial at a checked address: none private when hosted."""
+    from auth.oauth_providers import generic
+    from auth.providers import oidc_provider
+    resolver(_answers("10.0.0.9"))
+    for client in (generic._client(5), oidc_provider._client(5)):
+        assert isinstance(client._transport, pinned_http.CheckedTransport)
+        assert client._transport.policy is pinned_http.admin_host
+        with pytest.raises(httpx.ConnectError, match="may not reach"):
+            asyncio.run(client.post("https://idp.lan/token", data={"a": "b"}))
+        asyncio.run(client.aclose())
+
+
+def test_a_remote_mcp_direct_llm_dials_is_checked_and_the_platforms_own_hops_are_not(
+        resolver, hosted, monkeypatch):
+    from core.config import deployment
+    from core.layers.direct.mcp import MCPServerConnection
+    from services.mcp import mcp_registry
+    monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: None)
+    monkeypatch.setattr(deployment, "in_docker_compose", lambda: False)
+    conn = MCPServerConnection.__new__(MCPServerConnection)
+    conn.name = "crm"
+    import config
+    assert conn._client_factory(f"http://127.0.0.1:{config.PORT}/v1/mcp-gateway/x") == {}
+    factory = conn._client_factory("https://crm.lan/mcp")["httpx_client_factory"]
+    resolver(_answers("192.168.1.40"))
+    client = factory(headers={"Authorization": "Bearer t"})
+    assert client._transport.policy is pinned_http.admin_host
+    with pytest.raises(httpx.ConnectError, match="may not reach"):
+        asyncio.run(client.get("https://crm.lan/mcp"))
+    asyncio.run(client.aclose())
+
+
+# --- A Docker tool's own container (``docker_tool``) -------------------------
+
+_METADATA_AS_A_NAME = "2852039166"   # glibc reads it as 169.254.169.254, no DNS asked
+
+
+def test_a_docker_tool_is_dialled_only_on_the_installs_tool_networks(monkeypatch):
+    """Nothing refused self-hosted; on a hosted install every address outside
+    the tools' network and the document plane, an IPv4-mapped form as its IPv4."""
+    import config
+    outside = ("169.254.169.254", "127.0.0.1", "192.168.1.5", "8.8.8.8",
+               "::ffff:169.254.169.254", "10.201.0.2", "fd00::1")
+    inside = ("10.200.0.7", "10.204.0.3", "::ffff:10.200.0.7")
+    for addr in outside + inside:
+        assert pinned_http.docker_tool(addr) is False, addr
+    assert pinned_http.tool_policy() is None
+    assert "transport" not in pinned_http.tool_transport(timeout=None)
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
+    for addr in outside:
+        assert pinned_http.docker_tool(addr) is True, addr
+    for addr in inside:
+        assert pinned_http.docker_tool(addr) is False, addr
+    assert pinned_http.tool_policy() is pinned_http.docker_tool
+
+
+def _refused_dial(client, url):
+    with pytest.raises(httpx.ConnectError, match="may not reach"):
+        asyncio.run(client.get(url))
+
+
+def test_the_tunnels_tool_dial_is_checked_on_a_hosted_install(hosted):
+    """The satellite tunnel dials ``http://{docker_mcp_host}:{port}``: a tool
+    named as a number reaches no metadata address."""
+    from core.remote import satellite_http_tunnel as tunnel
+    client = tunnel._new_client(True)
+    assert client._transport.policy is pinned_http.docker_tool
+    _refused_dial(client, f"http://{_METADATA_AS_A_NAME}:3000/mcp")
+    asyncio.run(client.aclose())
+    hook = tunnel._new_client(False)
+    assert not isinstance(hook._transport, pinned_http.CheckedTransport)
+    asyncio.run(hook.aclose())
+    hosted.OTODOCK_CLOUD = False
+    plain = tunnel._new_client(True)
+    assert not isinstance(plain._transport, pinned_http.CheckedTransport), "the broken form"
+    asyncio.run(plain.aclose())
+
+
+def test_the_gateways_sidecar_pool_is_checked_on_a_hosted_install(hosted, monkeypatch):
+    from core.credentials import mcp_gateway
+    monkeypatch.setattr(mcp_gateway, "_clients", {})
+
+    async def go():
+        sidecar = mcp_gateway.client(True)
+        assert sidecar._transport.policy is pinned_http.docker_tool
+        with pytest.raises(httpx.ConnectError, match="may not reach"):
+            await sidecar.get(f"http://{_METADATA_AS_A_NAME}:3000/mcp")
+        await sidecar.aclose()
+    asyncio.run(go())
+    monkeypatch.setattr(mcp_gateway, "_clients", {})
+    hosted.OTODOCK_CLOUD = False
+
+    async def self_hosted():
+        plain = mcp_gateway.client(True)
+        assert not isinstance(plain._transport, pinned_http.CheckedTransport)
+        await plain.aclose()
+    asyncio.run(self_hosted())
+
+
+def test_direct_llm_dials_a_tool_only_on_its_networks_on_a_hosted_install(hosted, monkeypatch):
+    """A sidecar named as a number and a loopback URL a manifest names are
+    refused; the gateway's own entry keeps the SDK's client."""
+    import config
+    from core.config import deployment
+    from core.layers.direct.mcp import MCPServerConnection
+    from services.mcp import mcp_registry
+    tool = SimpleNamespace(name=_METADATA_AS_A_NAME, server=SimpleNamespace(
+        runtime="docker", service_name="", port=3000))
+    monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: tool)
+    monkeypatch.setattr(deployment, "in_docker_compose", lambda: True)
+    conn = MCPServerConnection.__new__(MCPServerConnection)
+    conn.name = _METADATA_AS_A_NAME
+    assert conn._client_factory(f"http://127.0.0.1:{config.PORT}/v1/mcp-gateway/x") == {}
+    # Direct LLM re-addresses a gateway URL to the internal listener first
+    # (``internal_entry_url``): that form is the platform's own hop too.
+    monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", 8401)
+    assert conn._client_factory("http://127.0.0.1:8401/v1/mcp-gateway/x") == {}
+    for url in (f"http://{_METADATA_AS_A_NAME}:3000/mcp", "http://127.0.0.1:9000/mcp",
+                "http://127.0.0.1:5432/v1/mcp-gateway/x"):
+        client = conn._client_factory(url)["httpx_client_factory"]()
+        assert client._transport.policy is pinned_http.docker_tool
+        _refused_dial(client, url)
+        asyncio.run(client.aclose())
+    hosted.OTODOCK_CLOUD = False
+    assert conn._client_factory(f"http://{_METADATA_AS_A_NAME}:3000/mcp") == {}
+
+
+def test_the_renderers_dials_are_checked_on_a_hosted_install(hosted, monkeypatch):
+    """file-tools' render probe and render dial a Docker tool by its name: on a
+    hosted install only inside the install's tool networks, plain on a
+    self-hosted one."""
+    from services.apps import app_render
+    base = f"http://{_METADATA_AS_A_NAME}:8931"
+    clients: list = []
+    real = httpx.AsyncClient
+
+    def spy(*a, **kw):
+        client = real(*a, **kw)
+        clients.append(client)
+        return client
+    monkeypatch.setattr(httpx, "AsyncClient", spy)
+    monkeypatch.setattr(app_render, "_renderer_tool", lambda: None)
+    with pytest.raises(httpx.ConnectError, match="may not reach"):
+        asyncio.run(app_render._call_renderer(base, "t", "/", timeout_s=5))
+    monkeypatch.setattr(app_render, "renderer_base_url", lambda: base)
+    app_render._probe.update({"at": 0.0, "ok": False, "reason": "", "base": ""})
+    ok, reason = asyncio.run(app_render.renderer_available())
+    assert (ok, reason) == (False, "file-tools did not answer")
+    assert len(clients) == 2
+    assert all(c._transport.policy is pinned_http.docker_tool for c in clients)
+    hosted.OTODOCK_CLOUD = False
+    clients.clear()
+    with pytest.raises(httpx.HTTPError):
+        asyncio.run(app_render._call_renderer("http://127.0.0.1:9", "t", "/", timeout_s=5))
+    assert clients and not isinstance(clients[0]._transport, pinned_http.CheckedTransport)

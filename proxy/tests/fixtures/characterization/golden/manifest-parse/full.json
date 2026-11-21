@@ -1,0 +1,398 @@
+{
+ "full": {
+  "parsed": {
+   "agent_context": [
+    {
+     "builder": {
+      "account_label": "main",
+      "args": {
+       "a": 1
+      },
+      "timeout_seconds": 3,
+      "tool": "mcp__char-key__peek"
+     },
+     "requires": [
+      "a"
+     ],
+     "scope": [
+      "user"
+     ],
+     "template": "Hello ${agent_name}"
+    }
+   ],
+   "agent_env": {
+    "CHAR_AGENT": "${agent_name}"
+   },
+   "always_load": true,
+   "assignment_mode": "explicit",
+   "audience": "editor",
+   "author": "OtoDock",
+   "author_url": "https://example.test",
+   "category": "community",
+   "companion_app": {
+    "auth": "none",
+    "connect": {
+     "host": "127.0.0.2",
+     "port": 9
+    },
+    "plugin": {
+     "asset": "a.zip",
+     "supported_host_versions": [
+      "1"
+     ]
+    },
+    "program": "Char",
+    "status_tool": "status"
+   },
+   "config": [
+    {
+     "default": "fast",
+     "input_type": "select",
+     "key": "CHAR_MODE",
+     "label": "Mode",
+     "required": true,
+     "user_overridable": true
+    },
+    {
+     "key": "CHAR_RAW",
+     "label": "CHAR_RAW"
+    }
+   ],
+   "costs": {
+    "currency": "USD",
+    "provider": "vendor",
+    "rules": [
+     {
+      "amount": 2.0,
+      "match": {
+       "hd": true,
+       "size": [
+        "a",
+        "b"
+       ]
+      },
+      "multiply_by": "count",
+      "tool": "fetch"
+     }
+    ]
+   },
+   "credentials": {
+    "api_key_header": {
+     "name": "X-Char-Key",
+     "proposed_hosts": [
+      "api.example.test"
+     ],
+     "value_from": "CHAR_KEY"
+    },
+    "app_credential_fields": [
+     {
+      "key": "CLIENT_ID",
+      "label": "Client"
+     }
+    ],
+    "description": "An account.",
+    "fields": [
+     {
+      "input_type": "password",
+      "key": "CHAR_KEY",
+      "label": "Key"
+     }
+    ],
+    "has_service_account": true,
+    "label": "Char Account",
+    "oauth": {
+     "app_credential_fields": [
+      {
+       "key": "CLIENT_ID",
+       "label": "Client"
+      }
+     ],
+     "authorization_url": "https://auth.example.test/authorize",
+     "base_scopes": [
+      "base"
+     ],
+     "flows": [
+      "authorization_code"
+     ],
+     "provider_id": "char-oauth",
+     "services": [
+      {
+       "description": "d",
+       "key": "mail",
+       "label": "Mail",
+       "scopes": [
+        "mail.read"
+       ]
+      }
+     ],
+     "token_url": "https://auth.example.test/token"
+    },
+    "server_config_fields": [
+     {
+      "key": "CHAR_SMTP",
+      "label": "SMTP"
+     }
+    ],
+    "service_account": true,
+    "type": "per_user",
+    "ui_type": "custom",
+    "webhooks": {
+     "available": true,
+     "event_catalog": [
+      {
+       "key": "push",
+       "label": "Pushed",
+       "required_scopes": [
+        "mail.read"
+       ]
+      }
+     ],
+     "payload_normalization": {
+      "event_type_path": "headers.X-Event"
+     },
+     "provider_id": "char-oauth",
+     "registration": {
+      "create": {
+       "expected_status": [
+        201
+       ],
+       "method": "POST",
+       "url_template": "https://api.example.test/hooks"
+      },
+      "mode": "auto"
+     },
+     "signature": {
+      "algorithm": "hmac-sha256",
+      "header": "X-Sig",
+      "per_subscription_secret": true
+     },
+     "url_verification": {
+      "kind": "none"
+     },
+     "vendor_target_spec": {
+      "kind": "free_text",
+      "label": "Target"
+     }
+    }
+   },
+   "data_dirs": {
+    "cache": "cache"
+   },
+   "description": "Char tools.",
+   "device_capability": "browser",
+   "env": {
+    "CHAR_STATIC": "1"
+   },
+   "exclude_from": [
+    "phone",
+    "external"
+   ],
+   "hosted": {
+    "oauth_app": {
+     "available": true,
+     "default_mode": "self_managed"
+    }
+   },
+   "instances": {
+    "config_file_arg": "--c",
+    "config_file_name": "c.json",
+    "delivery": "env",
+    "fields": [
+     {
+      "default": "x",
+      "input_type": "url",
+      "key": "INST_HOST",
+      "label": "Host",
+      "required": true,
+      "secret": true
+     },
+     {
+      "key": "INST_RAW",
+      "label": "INST_RAW"
+     }
+    ],
+    "max_instances": 2,
+    "transform": "ssh_hosts"
+   },
+   "label": "Char",
+   "manifest_path": "<tmp>/cases/full/manifest.json",
+   "mcp_dir": "<tmp>/cases/full",
+   "name": "char-mcp",
+   "network_access_default": false,
+   "network_targets": [
+    {
+     "host_key": "INST_HOST",
+     "port_default": 22,
+     "port_key": "INST_PORT",
+     "source": "instance"
+    }
+   ],
+   "outputs": [
+    {
+     "after_tools": [
+      "render"
+     ],
+     "destination_template": "${workspace_dir}/out",
+     "gc_after": 86400,
+     "keep_recent": 5,
+     "source": "${mcp_dir}/out"
+    }
+   ],
+   "patch_note": "note",
+   "patched": true,
+   "path_env": {
+    "CHAR_FILES": {
+     "role": "workspace",
+     "subpath": "files"
+    },
+    "CHAR_ROOTS": {
+     "join": "|",
+     "values": [
+      {
+       "role": "user_root"
+      },
+      {
+       "role": "config"
+      }
+     ]
+    }
+   },
+   "permissions": {
+    "default_tier": "open",
+    "rules": [
+     {
+      "tier": "sensitive",
+      "tool": "fetch*"
+     }
+    ]
+   },
+   "placement": "satellite_only",
+   "remote_policy": "admin_paired_only",
+   "replaces": [
+    {
+     "credentials": {
+      "OLD_KEY": "NEW_KEY"
+     },
+     "source": "npm:old"
+    }
+   ],
+   "requires_capability": "audio_tts",
+   "requires_display": true,
+   "result_files": {
+    "subdir": "maps",
+    "tools": [
+     "fetch_map"
+    ]
+   },
+   "sandbox_mounts": [
+    {
+     "host": "/mounted/x",
+     "mode": "rw",
+     "sandbox": "/x"
+    },
+    {
+     "host": "/y",
+     "sandbox": ""
+    }
+   ],
+   "server": {
+    "args": [
+     "a",
+     "b"
+    ],
+    "command": "python3",
+    "docker_compose": "deploy/compose.yml",
+    "health_endpoint": "/health",
+    "image": "char:1",
+    "port": 8932,
+    "proxy_callbacks": true,
+    "runtime": "docker",
+    "service_name": "char-svc",
+    "source": "remote:api.example.test",
+    "source_build": [
+     "psutil"
+    ],
+    "tool_timeout_sec": 120,
+    "transport": "streamable_http",
+    "url_template": "https://api.example.test/mcp",
+    "version_constraint": ">=2,<3"
+   },
+   "server_name": "char-key",
+   "skills": [
+    {
+     "audience": "owner",
+     "default_exclude_from": [
+      "phone"
+     ],
+     "description": "A guide.",
+     "file": "skills/guide.md",
+     "id": "char-guide",
+     "loading": "always"
+    }
+   ],
+   "system_requirements": {
+    "arch": [
+     "ffmpeg"
+    ],
+    "debian": [
+     "ffmpeg"
+    ],
+    "macos_brew": [
+     "ffmpeg"
+    ],
+    "node_min": "18",
+    "notes": "n",
+    "rhel": [
+     "ffmpeg-free"
+    ],
+    "ubuntu": [
+     "ffmpeg"
+    ]
+   },
+   "tool_arg_paths": [
+    {
+     "json_path": "path",
+     "mode": "write",
+     "optional": true,
+     "relative_anchor": "/workspace",
+     "tool": "fetch"
+    }
+   ],
+   "tool_filter": {
+    "arg_name": "--enabled-tools",
+    "env_var_name": "CHAR_F",
+    "regex_env_var_name": "CHAR_R"
+   },
+   "version": "1.0.0"
+  },
+  "warnings": [
+   "char-mcp: server.source_build entry 'bad name' is not a package name; dropped"
+  ]
+ },
+ "minimal": {
+  "parsed": {
+   "agent_env": {},
+   "category": "community",
+   "config": [],
+   "credentials": {},
+   "description": "",
+   "env": {},
+   "exclude_from": [],
+   "label": "bare",
+   "manifest_path": "<tmp>/cases/minimal/manifest.json",
+   "mcp_dir": "<tmp>/cases/minimal",
+   "name": "bare",
+   "server": {
+    "runtime": "python",
+    "transport": "stdio"
+   },
+   "server_name": "bare",
+   "skills": [],
+   "version": "0.0.0"
+  }
+ },
+ "nameless": {
+  "raised": "KeyError",
+  "text": "'name'"
+ }
+}

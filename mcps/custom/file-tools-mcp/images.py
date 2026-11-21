@@ -34,7 +34,10 @@ from shared import (
     _push_image_preview,
     _resolve_path,
     _to_agents_relative,
+    safe_kind,
+    safe_open_read,
     safe_open_write,
+    sibling_path,
 )
 
 _EXAMPLE_PNG = "logo.png"
@@ -373,10 +376,14 @@ def _op_paste_image(job: _ImageEdit, ctx: OpCtx, op: dict) -> None:
     from PIL import Image
 
     overlay_path = op["image_path"]
-    if not os.path.isfile(overlay_path):
+    try:
+        fh = safe_open_read(overlay_path)
+    except (FileNotFoundError, IsADirectoryError):
         raise OpError(Code.NOT_FOUND, f"the image {Path(overlay_path).name} does not exist", location="image_path",
-                      hint="Check the path.")
-    overlay = Image.open(overlay_path)
+                      hint="Check the path.") from None
+    with fh:
+        overlay = Image.open(fh)
+        overlay.load()
     x = int(op.get("x", 0))
     y = int(op.get("y", 0))
     if op.get("width"):
@@ -562,7 +569,9 @@ CATALOG = Catalog("edit_image", [
            examples=({"op": "highlights", "amount": -30},)),
     OpSpec("shadows", image_tone.op_shadows, (_k("amount", ("float",), 0, "-100 to 100"),), "TONE",
            examples=({"op": "shadows", "amount": 30},)),
-    OpSpec("whites", image_tone.op_whites, (_k("level", ("float",), 0, "relative"),), "TONE",
+    OpSpec("whites", image_tone.op_whites,
+           (_k("level", ("float",), 0, "-100 to 100: >0 lifts the bright tones to white, <0 brings them down"),),
+           "TONE",
            examples=({"op": "whites", "level": 10},)),
     OpSpec("blacks", image_tone.op_blacks, (_k("level", ("float",), 0, "relative: >0 lifts, <0 deepens"),),
            "TONE", examples=({"op": "blacks", "level": -10},)),
@@ -646,9 +655,13 @@ class _EditedImage:
 
 
 def _open_image(path: str) -> Any:
+    """The picture at ``path`` (``safe_open_read``: beneath the mount, no
+    link followed), decoded before the file is closed."""
     from PIL import Image, ImageOps
 
-    img = Image.open(path)
+    with safe_open_read(path) as fh:
+        img = Image.open(fh)
+        img.load()
     # EXIF orientation applied, so the pixels match what a viewer shows and
     # a manual rotation does not fight the tag.
     img = ImageOps.exif_transpose(img) or img
@@ -700,7 +713,7 @@ def _edit_image_core(path: str, out: str, ops: list, *, best_effort: bool, new_f
     job = _ImageEdit(img, out, targets=targets)
     outcome = run_batch(ops, CATALOG, job, best_effort=best_effort, create_new=new_file, rejected=rejected,
                         pre_notes=pre_notes, total=total)
-    existed = os.path.exists(out)
+    existed = safe_kind(out).kind != "missing"
     if not outcome.should_commit:
         return _EditedImage(render_outcome(outcome, kind="Image", path=out, saved=False, existed=existed), False)
     img, out = job.img, job.out
@@ -730,15 +743,18 @@ def _edit_image_core(path: str, out: str, ops: list, *, best_effort: bool, new_f
 
 
 async def _targets(ops: list, base: str) -> dict[str, str]:
-    """Each convert_format's output, resolved as a write: the extension it
-    gives the output is a path the proxy judges, like any other."""
+    """Each convert_format's output, resolved once as a write: the caller's
+    own path (``base``: output_path, else path) with the format's suffix on
+    its last part (``sibling_path``), a path the proxy judges like any
+    other. The resolved form is never sent back: the proxy reads it for
+    reads only."""
     found: dict[str, str] = {}
     for _, op in ops:
         if op.get("op") != "convert_format" or not op.get("format"):
             continue
         name = _FORMATS.get(str(op["format"]).strip().lstrip(".").casefold())
         if name and name not in found:
-            found[name] = await _resolve_path(str(Path(base).with_suffix(_SUFFIX[name])), writing=True)
+            found[name] = await _resolve_path(sibling_path(base, _SUFFIX[name]), writing=True)
     return found
 
 
@@ -759,15 +775,16 @@ async def handle_edit_image(args: dict) -> str:
     # No output_path: an in-place edit, so the input resolves as a write for
     # the proxy's write rules to apply; with one the input stays a read.
     path = await _resolve_path(args["path"], writing=not output_path)
-    if not await asyncio.to_thread(os.path.exists, path):
+    if (await asyncio.to_thread(safe_kind, path)).kind == "missing":
         return f"Error: File not found: {args['path']}"
     out = await _resolve_path(output_path, writing=True) if output_path else path
     ops, path_problems = await CATALOG.preresolve(ops, main_path=out)
     if path_problems and not best_effort:
         return _joined(render_rejected([*problems, *path_problems], kind="Image", path=out, total=prepared.total,
-                                       existed=await asyncio.to_thread(os.path.exists, out)), answer)
+                                       existed=(await asyncio.to_thread(safe_kind, out)).kind != "missing"),
+                     answer)
     try:
-        targets = await _targets(ops, out)
+        targets = await _targets(ops, output_path or args["path"])
     except Exception as exc:  # noqa: BLE001  # the proxy's refusal, whatever its type, answers the call
         return f"Nothing saved: {_to_agents_relative(out)} was not written. The converted file's path was refused: {exc}"
     rejected = [OpResult.from_error(p) for p in [*problems, *path_problems]]
@@ -810,7 +827,7 @@ def _joined(*parts: str) -> str:
 async def handle_analyze_image(args: dict) -> str:
     """Analyze an image — file info, EXIF, histogram, exposure, suggestions."""
     path = await _resolve_path(args["path"])
-    if not await asyncio.to_thread(os.path.exists, path):
+    if (await asyncio.to_thread(safe_kind, path)).kind == "missing":
         return f"Error: File not found: {args['path']}"
     return await _image_job(_analyze_image_core, path)
 
@@ -821,13 +838,15 @@ def _analyze_image_core(path: str) -> str:
     from PIL import Image, ImageStat
     from PIL.ExifTags import TAGS
 
-    raw_img = Image.open(path)
+    with safe_open_read(path) as fh:
+        raw_img = Image.open(fh)
+        raw_img.load()
+        file_size = os.fstat(fh.fileno()).st_size
     img = raw_img.convert("RGB")
     arr = np.array(img, dtype=np.float32)
     stat = ImageStat.Stat(img)
 
     # --- File info ---
-    file_size = os.path.getsize(path)
     if file_size > 1_000_000:
         size_str = f"{file_size / 1_000_000:.1f} MB"
     else:

@@ -5,10 +5,18 @@ Called by ``storage.schema.init_schema`` after the pinned apps (an app share
 references its row) and the chats; every statement is idempotent. See
 ``docs/architecture/DATABASE-SCHEMA.md``. The table shipped in 1.7.0 with
 one grantee kind: the columns, CHECKs and indexes of the three-kind model
-reach an existing install through ``storage.schema.run_migrations``, which
-is also where every index on a migrated column is created (the CREATE below
-no-ops on an existing table, so an index here would name a missing column).
+reach an existing install through ``migrate_sharing``, which is also where every
+index on a migrated column is created (the CREATE below no-ops on an existing
+table, so an index here would name a missing column).
 """
+
+import logging
+import re
+
+from auth import roles
+from storage.schema_base import _check_constraint_words, _index_exists
+
+logger = logging.getLogger(__name__)
 
 # The named CHECKs ``run_migrations`` keeps current on an existing install
 # (the 1.7.0 scope CHECK was auto-named; these are spelled here and found by
@@ -116,3 +124,131 @@ def init_shares(conn) -> None:
             PRIMARY KEY (app_id, agent, user_sub)
         )
     """)
+
+# The named CHECKs of ``shares`` (SHARING.md) ``run_migrations`` keeps current
+# the same way: (name, definition, the quoted words the catalog renders). The
+# 1.7.0 table carried an auto-named scope CHECK over ``grantee_sub`` alone;
+# the grantee rewrite drops it, found by its definition.
+_SHARE_CHECKS: tuple[tuple[str, str, frozenset[str]], ...] = tuple(
+    (name, definition, frozenset(re.findall(r"'([^']*)'", definition)))
+    for name, definition in (
+        ("shares_grantee_check", GRANTEE_CHECK),
+        ("shares_grantee_kind_check", GRANTEE_KIND_CHECK),
+        ("shares_decision_check", DECISION_CHECK),
+    )
+)
+
+
+def _rewrite_share_checks(conn) -> None:
+    """Keep the named ``shares`` CHECKs at the code's words on an existing
+    install: a constraint that is absent or lacks a word is dropped and added
+    again inside a SAVEPOINT (a no-op once the words are in, logged and
+    retried next boot on a failure). The grantee rewrite also drops the 1.7.0
+    scope CHECK, auto-named by Postgres, found by its definition: it reads
+    ``grantee_sub`` and not ``grantee_kind``."""
+    for name, definition, words in _SHARE_CHECKS:
+        present = _check_constraint_words(conn, "shares", name)
+        if present is not None and present >= words:
+            continue
+        conn.execute(f"SAVEPOINT {name}")
+        try:
+            if name == "shares_grantee_check":
+                old = conn.execute(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                    "WHERE t.relname = 'shares' AND n.nspname = current_schema() "
+                    "AND c.contype = 'c' "
+                    "AND pg_get_constraintdef(c.oid) LIKE '%%grantee_sub%%' "
+                    "AND pg_get_constraintdef(c.oid) NOT LIKE '%%grantee_kind%%'"
+                ).fetchall()
+                for row in old:
+                    quoted = '"' + row["conname"].replace('"', '""') + '"'
+                    conn.execute(f"ALTER TABLE shares DROP CONSTRAINT IF EXISTS {quoted}")
+            conn.execute(f"ALTER TABLE shares DROP CONSTRAINT IF EXISTS {name}")
+            conn.execute(f"ALTER TABLE shares ADD CONSTRAINT {name} CHECK ({definition})")
+            conn.execute(f"RELEASE SAVEPOINT {name}")
+            logger.info("shares CHECK %s rewritten", name)
+        except Exception:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            logger.exception("shares CHECK %s could not be rewritten; the next boot retries", name)
+
+
+def migrate_sharing(conn) -> None:
+    """The sharing domain's forward migrations on an existing install: the
+    three-kind columns of ``shares``, their backfill, the named CHECKs, and the
+    indexes on the migrated columns. ``run_migrations`` calls it after the role
+    CHECK loop."""
+
+    # 1.7.1: shares to an agent or a department, a role cap, a decision and a
+    # placement (SHARING.md). The 1.7.0 table knew one grantee kind, so the
+    # columns reach an existing install here; their defaults are what a
+    # 1.7.0 INSERT leaves after a downgrade (``person``, ``pending``,
+    # ``viewer``), which every CHECK below accepts. The role-cap CHECK rides
+    # the column add, so the role loop above finds it from the next boot.
+    conn.execute(
+        "ALTER TABLE shares ADD COLUMN IF NOT EXISTS grantee_kind TEXT NOT NULL DEFAULT 'person'"
+    )
+    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS grantee_agent TEXT")
+    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS grantee_department TEXT")
+    conn.execute(
+        "ALTER TABLE shares ADD COLUMN IF NOT EXISTS role_cap TEXT NOT NULL DEFAULT 'viewer' "
+        "CONSTRAINT shares_role_cap_check CHECK (role_cap IN ("
+        + ", ".join(f"'{w}'" for w in roles.AGENT_ROLES) + "))"
+    )
+    conn.execute(
+        "ALTER TABLE shares ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'pending'"
+    )
+    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS decided_by TEXT")
+    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS decided_at TEXT")
+    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS placed_agent TEXT")
+    # The backfill runs at every boot and never writes ``pending``, so a
+    # decision is never flipped back and a row 1.7.0 wrote with the defaults
+    # after a downgrade is repaired: a link has no kind and no decision; a
+    # chat share needs no decision.
+    conn.execute(
+        "UPDATE shares SET grantee_kind = '', decision = '' "
+        "WHERE scope = 'external' AND (grantee_kind <> '' OR decision <> '')"
+    )
+    conn.execute(
+        "UPDATE shares SET decision = 'accepted' "
+        "WHERE scope = 'internal' AND target_kind = 'chat' AND decision = 'pending'"
+    )
+    _rewrite_share_checks(conn)
+    # The 1.7.0 unique index keyed every unrevoked internal row and would
+    # refuse a re-share after a decline; the three per-kind indexes replace
+    # it. Here, never in init_shares: the CREATE no-ops on an existing table
+    # and an index on a column this block adds would fail the boot.
+    if _index_exists(conn, "idx_shares_internal_grant"):
+        conn.execute("SAVEPOINT drop_idx_shares_internal_grant")
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_shares_internal_grant")
+            conn.execute("RELEASE SAVEPOINT drop_idx_shares_internal_grant")
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT drop_idx_shares_internal_grant")
+            logger.exception("dropping idx_shares_internal_grant failed; the next boot retries")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_person_grant "
+        "ON shares (target_kind, COALESCE(app_id, chat_id), grantee_sub) "
+        "WHERE scope = 'internal' AND grantee_kind = 'person' AND revoked_at IS NULL "
+        "AND decision <> 'declined'"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_agent_grant "
+        "ON shares (app_id, grantee_agent) "
+        "WHERE grantee_kind = 'agent' AND revoked_at IS NULL AND decision <> 'declined'"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_department_grant "
+        "ON shares (app_id, grantee_department) "
+        "WHERE grantee_kind = 'department' AND revoked_at IS NULL AND decision <> 'declined'"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shares_grantee_agent ON shares (grantee_agent)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shares_grantee_department ON shares (grantee_department)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shares_placed_agent ON shares (placed_agent)"
+    )

@@ -5,6 +5,7 @@ for syncing agent directories between the platform and satellite.
 """
 
 import base64
+import contextlib
 import errno
 import fnmatch
 import functools
@@ -15,11 +16,12 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
-from stat import S_ISREG
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 
 from .. import config
-from .._vendored import layout
+from .._vendored import layout, session_text
 
 logger = logging.getLogger("satellite")
 
@@ -63,14 +65,12 @@ CHUNK_SIZE = 524_288  # 512KB
 
 # Codex app-server keeps per-machine SQLite *runtime state* directly in
 # CODEX_HOME — versioned DB families (``state_N``, ``logs_N``, ``goals_N``,
-# ``memories_N``, …) plus ``-wal``/``-shm`` sidecars. Each host owns its own; a
-# foreign one aborts daemon init with "migration N … has been modified"
-# (``_reset_codex_state`` self-heals it, but only if its globs cover the
-# poisoned file). New DB families appear with codex releases, so match EVERY
-# SQLite file directly under ``.codex/`` — nothing legitimate to sync is ever
-# SQLite there. These NEVER sync, in either direction — excluded from both the
-# per-turn snapshot AND the request-manifest. Glob matches
-# ``_reset_codex_state``'s own glob. Mirrors proxy/core/remote/file_sync.py.
+# ``memories_N``, …) plus ``-wal``/``-shm`` sidecars. Each host owns its own,
+# which every session of the host's store shares (``CODEX_SQLITE_HOME``). New DB
+# families appear with codex releases, so match EVERY SQLite file directly
+# under ``.codex/`` — nothing legitimate to sync is ever SQLite there. These
+# NEVER sync, in either direction — excluded from both the per-turn snapshot
+# AND the request-manifest. Mirrors proxy/core/remote/file_sync.py.
 _CODEX_RUNTIME_GLOBS = ("*.sqlite*",)
 
 # Per-session REGENERATED Codex config — this satellite writes its own copies
@@ -93,7 +93,9 @@ def _is_codex_runtime_state(rel_path: str) -> bool:
     parts = rel_path.replace("\\", "/").split("/")
     if len(parts) < 2 or parts[-2] != ".codex":
         return False
-    if parts[-1] in _CODEX_HOST_LOCAL_FILES:
+    # A session's own Codex files and a thread's record: host-local like
+    # the set above (the vendored names, as the platform's twin reads them).
+    if parts[-1] in _CODEX_HOST_LOCAL_FILES or session_text.is_session_file(parts[-1]):
         return True
     return any(fnmatch.fnmatch(parts[-1], g) for g in _CODEX_RUNTIME_GLOBS)
 
@@ -108,7 +110,7 @@ def _is_codex_runtime_state(rel_path: str) -> bool:
 _CLAUDE_HOST_LOCAL_FILES = frozenset({
     "settings.json", "permission_gate.py", "tool_result_forwarder.py",
     "subagent_tracker.py", "stop_tracker.py", "stdio_path_interceptor.py",
-    "mcp-config.json", "system-prompt.md",
+    "usage_report.py", "mcp-config.json", "system-prompt.md",
     # Claude CLI OAuth credential file — written here from the start_session
     # ``credentials_json`` payload and rewritten by ``credentials_update``
     # pushes on rotation; never synced (would race the dedicated push).
@@ -304,21 +306,17 @@ class _IgnoreMatcher:
                     return True
         return False
 
-    def has_in_dir_marker(self, dir_path: Path, files: list[str],
-                          dirs: list[str]) -> bool:
+    def has_in_dir_marker(self, files: list[str], dirs: list[str],
+                          read_tag: Callable[[str], bytes]) -> bool:
         """True if the dir's own listing carries an in-dir marker. Signed
-        markers (CACHEDIR.TAG) additionally require the spec signature —
-        read errors fail toward syncing."""
+        markers (CACHEDIR.TAG) additionally require the spec signature:
+        ``read_tag(name)`` gives a marker's first bytes, ``b""`` when it
+        cannot be read (fail toward syncing)."""
         for f in files:
             if f in self.file_markers:
                 return True
-            if f in self.signed_markers:
-                try:
-                    with open(dir_path / f, "rb") as fh:
-                        if fh.read(len(_CACHEDIR_SIG)) == _CACHEDIR_SIG:
-                            return True
-                except OSError:
-                    pass
+            if f in self.signed_markers and read_tag(f) == _CACHEDIR_SIG:
+                return True
         return any(d in self.dir_markers for d in dirs)
 
     def is_vetoed(self, files: list[str]) -> bool:
@@ -370,7 +368,7 @@ def _effective_ignore_matcher() -> "_IgnoreMatcher | None":
     return matcher
 
 
-def _walk_sync_tree(agent_dir: Path, skipped_dirs: list[tuple[str, str]] | None = None):
+def _walk_sync_tree(agent_dir: Path, root, skipped_dirs: list[tuple[str, str]] | None = None):
     """The ONE dir-walk for every sync surface (snapshot / fingerprint /
     request-manifest): yields ``(root_path, files)`` for each INCLUDED dir
     after all dir-level exclusions — SKIP_DIRS, real venvs, hidden dirs,
@@ -389,7 +387,12 @@ def _walk_sync_tree(agent_dir: Path, skipped_dirs: list[tuple[str, str]] | None 
     A folder the walk cannot list, and on Windows a junction (``os.walk``
     follows one: ``islink`` is False for it), hold files whose state is
     unknown, not absent: ``skipped_dirs`` collects them as ``(rel,
-    "unreadable_dir" | "link")``, ``""`` for the agent folder itself."""
+    "unreadable_dir" | "link")``, ``""`` for the agent folder itself.
+
+    ``root`` is the walk's hold on the agent folder (``host/safe_fs``). The
+    walk lists by name, so on POSIX every folder it visits is checked where
+    it stands beneath that hold: one swapped for a link since its listing is
+    a skipped ``link`` folder and nothing below it is listed or read."""
     matcher = _effective_ignore_matcher()
     candidates: set[str] = set()
     link_like = None
@@ -410,17 +413,26 @@ def _walk_sync_tree(agent_dir: Path, skipped_dirs: list[tuple[str, str]] | None 
             return
         skipped_dirs.append(("" if rel_dir == "." else rel_dir, "unreadable_dir"))
 
-    for root, dirs, files in os.walk(agent_dir, onerror=_unlistable):
-        root_path = Path(root)
+    for walked, dirs, files in os.walk(agent_dir, onerror=_unlistable):
+        root_path = Path(walked)
         rel = root_path.relative_to(agent_dir)
         rel_posix = rel.as_posix()
+        if config.HOST.posix and rel_posix != ".":
+            why = _folder_refused(root, rel_posix)
+            if why is not None:
+                dirs[:] = []
+                if why and skipped_dirs is not None:
+                    skipped_dirs.append((rel_posix, why))
+                continue
         if matcher is not None:
             was_candidate = rel_posix in candidates
             candidates.discard(rel_posix)
             if (len(rel.parts) >= 2
                     and root_path.name not in _RULE_PROTECTED_DIR_NAMES
                     and (was_candidate
-                         or matcher.has_in_dir_marker(root_path, files, dirs))
+                         or matcher.has_in_dir_marker(
+                             files, dirs,
+                             lambda name, _d=root_path, _r=rel_posix: _tag_head(root, f"{_r}/{name}", _d / name)))
                     and not matcher.is_vetoed(files)):
                 if (rel_posix not in _logged_rule_skips
                         and len(_logged_rule_skips) < _LOGGED_RULE_SKIPS_MAX):
@@ -460,6 +472,34 @@ def _walk_sync_tree(agent_dir: Path, skipped_dirs: list[tuple[str, str]] | None 
                 if matcher.named_match(d, files):
                     candidates.add((rel / d).as_posix())
         yield root_path, files
+
+
+def _folder_refused(root, rel: str) -> str | None:
+    """None when the folder the walk visits at ``rel`` is a folder reached
+    beneath ``root`` with no link; ``"link"`` when a link stands on its way
+    or at it (its files are unknown, not gone); ``""`` when it vanished."""
+    from ..host import safe_fs
+    try:
+        return None if S_ISDIR(safe_fs.lstat_beneath(root, rel).st_mode) else "link"
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return "link"
+
+
+def _tag_head(root, rel: str, path: Path) -> bytes:
+    """A marker file's first bytes, read as a listed file is (``_open_listed``),
+    ``b""`` when it cannot be read."""
+    try:
+        fd, _st = _open_listed(root, rel, path, max_file_size())
+    except OSError:
+        return b""
+    try:
+        return os.read(fd, len(_CACHEDIR_SIG))
+    except OSError:
+        return b""
+    finally:
+        os.close(fd)
 
 
 # Hidden dirs that ARE included despite starting with ``.`` — mirror of
@@ -561,6 +601,39 @@ class NotARegularFile(OSError):
     socket, a device): never hashed, never synced."""
 
 
+def _open_listed(root, rel: str, path: Path, cap: int) -> tuple[int, os.stat_result]:
+    """A file the walk listed, opened for reading: a regular file no larger
+    than ``cap``, never waited on. On POSIX beneath the walk's hold on the
+    agent folder with no link followed on the way (``host/safe_fs``), so a
+    sandboxed session that swaps a part after the listing gains nothing.
+    On Windows by its name, as ``_hash_file`` opens one: the twin's checked
+    chain there narrows nothing a process of the same account cannot do,
+    and would cost a stat per part. ``OSError`` otherwise; the caller owns
+    the descriptor."""
+    from ..host import safe_fs
+    if config.HOST.posix:
+        return safe_fs.open_regular_for_read(root, rel, max_size=cap)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        st = os.fstat(fd)
+        if not S_ISREG(st.st_mode):
+            raise NotARegularFile(errno.EINVAL, "not a regular file", str(path))
+        if st.st_size > cap:
+            raise safe_fs.FileTooLarge(errno.EFBIG, "file is over the size cap", str(path))
+        return fd, st
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _hash_fd(fd: int) -> str:
+    h = hashlib.sha256()
+    with os.fdopen(fd, "rb", closefd=False) as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return "sha256:" + h.hexdigest()
+
+
 def _hash_file(path: Path) -> str:
     """Stream-hash a file → ``sha256:<hex>`` without loading it fully in memory.
 
@@ -595,12 +668,12 @@ def _hash_file(path: Path) -> str:
     return "sha256:" + h.hexdigest()
 
 
-# (path → (size, mtime_ns, hash)) LRU so the per-turn snapshot and the
+# (path → (size, mtime_ns, inode, hash)) LRU so the per-turn snapshot and the
 # request-manifest never re-hash unchanged files — at the 1GB cap a single
 # re-hash is seconds of CPU+IO, and snapshots run every turn. Thread-safe
 # (snapshot/manifest calls can run off-thread). Mirrors the proxy-side cache
 # in proxy/core/remote/file_sync.py.
-_HASH_CACHE: OrderedDict[str, tuple[int, int, bytes]] = OrderedDict()
+_HASH_CACHE: OrderedDict[str, tuple[int, int, int, bytes]] = OrderedDict()
 _HASH_CACHE_MAX = 200_000
 _hash_cache_lock = threading.Lock()
 _hash_cache_evicted_logged = False
@@ -617,11 +690,11 @@ def _digest_of(file_hash: str) -> bytes | None:
     return digest if len(digest) == 32 else None
 
 
-def _hash_cache_put(key: str, size: int, mtime_ns: int, digest: bytes) -> None:
+def _hash_cache_put(key: str, st: os.stat_result, digest: bytes) -> None:
     """Under the lock: store one entry (the raw 32-byte digest), keep the LRU
     under its ceiling, and say so once per process when it evicts."""
     global _hash_cache_evicted_logged
-    _HASH_CACHE[key] = (size, mtime_ns, digest)
+    _HASH_CACHE[key] = (st.st_size, st.st_mtime_ns, st.st_ino, digest)
     _HASH_CACHE.move_to_end(key)
     evicted = 0
     while len(_HASH_CACHE) > _HASH_CACHE_MAX:
@@ -641,30 +714,41 @@ def _hash_cache_put(key: str, size: int, mtime_ns: int, digest: bytes) -> None:
 _HASH_CACHE_RACY_WINDOW_S = 2.0
 
 
-def _hash_file_cached(path: Path, st: os.stat_result) -> str:
-    """``_hash_file`` with a (size, mtime_ns) validity check against the LRU."""
-    import time as _time
+def _same_state(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_size, a.st_mtime_ns, a.st_ino) == (b.st_size, b.st_mtime_ns, b.st_ino)
+
+
+def _same_bytes(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_size, a.st_mtime_ns) == (b.st_size, b.st_mtime_ns)
+
+
+def _hash_listed(root, rel: str, path: Path, st: os.stat_result, cap: int) -> str:
+    """The hash of a file the walk listed, ``st`` its listing's ``lstat``: a
+    hit on its (size, mtime_ns, inode) outside the racy window reads
+    nothing (an unchanged file is never opened, the per-turn cost); a miss
+    opens it as ``_open_listed`` does and hashes that descriptor, cached by
+    ``path``'s text only when the file did not change under the read nor
+    since its listing. The cache holds the listing's status, so a hit
+    compares an ``lstat`` with an ``lstat``: on Windows the open file's
+    inode may come from another call and differ."""
     key = str(path)
-    racy = (_time.time() - st.st_mtime) < _HASH_CACHE_RACY_WINDOW_S
-    if not racy:
+    if (time.time() - st.st_mtime) >= _HASH_CACHE_RACY_WINDOW_S:
         with _hash_cache_lock:
             hit = _HASH_CACHE.get(key)
-            if hit is not None and hit[0] == st.st_size and hit[1] == st.st_mtime_ns:
+            if hit is not None and hit[:3] == (st.st_size, st.st_mtime_ns, st.st_ino):
                 _HASH_CACHE.move_to_end(key)
-                return "sha256:" + hit[2].hex()
-    file_hash = _hash_file(path)
+                return "sha256:" + hit[3].hex()
+    fd, before = _open_listed(root, rel, path, cap)
     try:
-        st2 = os.stat(path)
-    except OSError:
-        return file_hash
-    # TOCTOU guard: only cache when the file provably didn't change under the
-    # streaming read. (Caching a racy-fresh entry is fine — reads inside the
-    # racy window bypass the cache anyway.)
-    if st2.st_size == st.st_size and st2.st_mtime_ns == st.st_mtime_ns:
+        file_hash = _hash_fd(fd)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if _same_state(before, after) and _same_bytes(before, st):
         digest = _digest_of(file_hash)
         if digest is not None:
             with _hash_cache_lock:
-                _hash_cache_put(key, st.st_size, st.st_mtime_ns, digest)
+                _hash_cache_put(key, st, digest)
     return file_hash
 
 
@@ -683,7 +767,8 @@ class _SkipTally:
 
     def note(self, path, why) -> bool:
         """Count a skip; False for a skip that is not a read failure."""
-        if isinstance(why, (FileNotFoundError, NotARegularFile)):
+        from ..host.safe_fs import NotRegularFile
+        if isinstance(why, (FileNotFoundError, NotARegularFile, NotRegularFile)):
             return False
         self.skipped += 1
         if self.first is None:
@@ -729,20 +814,38 @@ def prime_hash_cache(path: Path, file_hash: str) -> None:
     if digest is None:
         return
     try:
-        st = os.stat(path)
+        st = os.lstat(path)
     except OSError:
         return
     with _hash_cache_lock:
-        _hash_cache_put(str(path), st.st_size, st.st_mtime_ns, digest)
+        _hash_cache_put(str(path), st, digest)
 
 
-def _listed_files(agent_dir: Path, skipped_dirs: list[tuple[str, str]] | None = None):
-    """``(path, rel)`` of every file the sync surfaces consider, after the
+@contextlib.contextmanager
+def _held(agent_dir: Path):
+    """The walk's hold on the agent folder (``host/safe_fs``), by its
+    realpath: a person's agent folder moved behind a link keeps syncing,
+    and a sandboxed session binds only folders below it. None when the
+    folder cannot be held (gone since the caller looked)."""
+    from ..host import safe_fs
+    with contextlib.ExitStack() as stack:
+        try:
+            root = stack.enter_context(safe_fs.open_root(agent_dir))
+        except OSError:
+            root = None
+        yield root
+
+
+def _listed_files(agent_dir: Path, root, skipped_dirs: list[tuple[str, str]] | None = None):
+    """``(path, rel, st)`` of every file the sync surfaces consider, after the
     shared walk's folder rules and the per-file rules every surface applies
-    alike (snapshot, fingerprint, manifest): the one place they live."""
+    alike (snapshot, fingerprint, manifest): the one place they live. ``st``
+    is the listing's own ``lstat`` (None when it failed: the caller's read
+    fails it as unreadable); anything but a regular file is left to the
+    caller as ``NotARegularFile``, never counted."""
     # Dir-level pruning (skip-dirs, venvs, hidden, CLI runtime, sync-ignore
     # rules) lives in the shared walker — see _walk_sync_tree.
-    for root_path, files in _walk_sync_tree(agent_dir, skipped_dirs):
+    for root_path, files in _walk_sync_tree(agent_dir, root, skipped_dirs):
         for fname in files:
             f = root_path / fname
             # Skip symlinks — they can't round-trip via base64 content and would
@@ -751,12 +854,13 @@ def _listed_files(agent_dir: Path, skipped_dirs: list[tuple[str, str]] | None = 
             # too; otherwise a symlink is satellite-only and the merge materializes
             # its target as a regular file on the platform. A folder that can be
             # listed but not entered fails the check: the file goes on to the
-            # caller, whose stat fails it as unreadable (never a walk abort).
+            # caller, whose read fails it as unreadable (never a walk abort).
             try:
-                if f.is_symlink():
-                    continue
+                st: os.stat_result | None = os.lstat(f)
             except OSError:
-                pass
+                st = None
+            if st is not None and S_ISLNK(st.st_mode):
+                continue
             # Use as_posix() so dict keys are forward-slash on both platforms
             # (proxy-side manifests use forward slashes too). Without this,
             # Windows backslash keys cause every file to look "new" relative
@@ -776,7 +880,17 @@ def _listed_files(agent_dir: Path, skipped_dirs: list[tuple[str, str]] | None = 
             # propagated). Excluded symmetrically in proxy/core/remote/file_sync.py.
             if fname.endswith(".partial"):
                 continue
-            yield f, rel
+            yield f, rel, st
+
+
+def _listed_regular(f: Path, st: os.stat_result | None) -> os.stat_result:
+    """The listing's stat of a regular file, or the ``OSError`` that leaves
+    it out (``NotARegularFile`` for a pipe, a socket, a device)."""
+    if st is None:
+        return os.lstat(f)
+    if not S_ISREG(st.st_mode):
+        raise NotARegularFile(errno.EINVAL, "not a regular file", str(f))
+    return st
 
 
 def _over_cap(cap: int) -> str:
@@ -795,18 +909,21 @@ def snapshot_agent_dir(agent_dir: Path) -> dict[str, str]:
     tally = _SkipTally()
     skipped_dirs: list[tuple[str, str]] = []
     cap = max_file_size()
-    for f, rel in _listed_files(agent_dir, skipped_dirs):
-        try:
-            st = f.stat()
-            if st.st_size > cap:
-                tally.note(f, _over_cap(cap))
-                continue
-            # Streamed + cached — never reads an unchanged file, never
-            # holds a whole file in memory.
-            result[rel] = _hash_file_cached(f, st)
-            tally.hashed += 1
-        except OSError as exc:
-            tally.note(f, exc)
+    with _held(agent_dir) as root:
+        if root is None:
+            return result
+        for f, rel, listed in _listed_files(agent_dir, root, skipped_dirs):
+            try:
+                st = _listed_regular(f, listed)
+                if st.st_size > cap:
+                    tally.note(f, _over_cap(cap))
+                    continue
+                # Streamed + cached — never reads an unchanged file, never
+                # holds a whole file in memory.
+                result[rel] = _hash_listed(root, rel, f, st, cap)
+                tally.hashed += 1
+            except OSError as exc:
+                tally.note(f, exc)
     for rel_dir, why in skipped_dirs:
         if why == "unreadable_dir":
             tally.note(agent_dir / rel_dir, "the folder could not be listed")
@@ -837,20 +954,56 @@ def compute_fingerprint(agent_dir: Path) -> str:
         return ""
     entries: list[tuple[str, int, int]] = []
     cap = max_file_size()
-    for f, rel in _listed_files(agent_dir):
-        try:
-            st = f.stat()
-        except OSError:
-            continue
-        if st.st_size > cap:
-            continue
-        entries.append((rel, st.st_size, st.st_mtime_ns))
+    with _held(agent_dir) as root:
+        if root is None:
+            return ""
+        for f, rel, listed in _listed_files(agent_dir, root):
+            try:
+                st = _listed_regular(f, listed)
+            except OSError:
+                continue
+            if st.st_size > cap:
+                continue
+            entries.append((rel, st.st_size, st.st_mtime_ns))
     if not entries:
         return ""  # missing dir, or no sync-relevant files → nothing to fingerprint
     h = hashlib.sha256()
     for rel, size, mtime_ns in sorted(entries):
         h.update(f"{rel}\0{size}\0{mtime_ns}\n".encode("utf-8", "surrogatepass"))
     return h.hexdigest()
+
+
+# A session's baseline (its ``_file_snapshot``) is read and moved by a scan in
+# a thread and by pushes applied on the event loop. Each check-and-move of an
+# entry holds this lock, and no disk step ever does: the loop never waits on
+# a scan's disk.
+_baseline_lock = threading.Lock()
+# A push's mark on the entry of the path it is changing; never a hash.
+_PUSHING = "pushing"
+
+
+@contextlib.contextmanager
+def _push_step(targets: list[dict[str, str]], rel_path: str, after: str | None):
+    """The one step of a push that changes the path on disk, with each
+    session's entry for it marked meanwhile: a scan leaves the path to the
+    push (``detect_changes``). The entry then holds ``after`` (None: gone),
+    or what it held before when the step failed."""
+    with _baseline_lock:
+        before = [snap.get(rel_path) for snap in targets]
+        for snap in targets:
+            snap[rel_path] = _PUSHING
+    done = False
+    try:
+        yield
+        done = True
+    finally:
+        with _baseline_lock:
+            for snap, old in zip(targets, before, strict=True):
+                value = after if done else old
+                if value is None:
+                    snap.pop(rel_path, None)
+                else:
+                    snap[rel_path] = value
 
 
 def detect_changes(
@@ -878,42 +1031,50 @@ def detect_changes(
     the next ``detect_file_changes()`` call automatically sees the new
     baseline.
     """
+    # The scan runs in a thread beside pushes applied on the event loop, and
+    # beside another scan of the session. It iterates a copy, and moves an
+    # entry of the session's own dict only by a claim: the entry must still be
+    # the one the scan started from, with no push writing the path
+    # (``_push_step``). A path a push or another scan spoke for meanwhile is
+    # left to them, and the next scan judges it again. A change goes out only
+    # with the claim that moved its entry, so it is reported once.
+    seen = dict(snapshot)
     current = snapshot_agent_dir(agent_dir)
     changes: list[dict] = []
 
-    # New or modified files
-    for rel_path, cur_hash in list(current.items()):
-        old_hash = snapshot.get(rel_path)
-        if old_hash == cur_hash:
-            continue
-        full = agent_dir / rel_path
-        try:
-            # Stat first — only files small enough for inline delivery are ever
-            # read into memory. Large files report hash+size and the platform
-            # pulls them separately (streamed on both ends).
-            size = full.stat().st_size
-            if size <= CHUNK_THRESHOLD:
-                content = full.read_bytes()
-                changes.append({
-                    "path": rel_path,
-                    "action": "write",
-                    "content_b64": base64.b64encode(content).decode(),
-                    "hash": cur_hash,
-                })
+    def _claim(rel_path: str, found: str | None) -> bool:
+        old_hash = seen.get(rel_path)
+        with _baseline_lock:
+            if old_hash == _PUSHING or snapshot.get(rel_path) != old_hash:
+                return False
+            if found is None:
+                snapshot.pop(rel_path, None)
             else:
-                changes.append({
-                    "path": rel_path,
-                    "action": "write",
-                    "hash": cur_hash,
-                    "size": size,
-                })
-        except OSError:
-            # Hashed but not read (locked in between): the baseline keeps
-            # what the platform last heard, so the next turn reports it.
-            if old_hash is None:
-                current.pop(rel_path, None)
-            else:
-                current[rel_path] = old_hash
+                snapshot[rel_path] = found
+        return True
+
+    # New or modified files, read as the snapshot reads them (``_open_listed``:
+    # beneath the agent folder with no link on the way, never waiting), and
+    # an inline write carries the hash of exactly the bytes it carries. Only
+    # a file small enough for inline delivery is read into memory: a large
+    # one reports hash+size and the platform pulls it (streamed on both
+    # ends). A file hashed but not read (locked in between) keeps its
+    # baseline entry, so the next turn reports it.
+    with _held(agent_dir) as root:
+        for rel_path, cur_hash in current.items():
+            if seen.get(rel_path) == cur_hash or root is None:
+                continue
+            try:
+                content, size = _read_inline(root, rel_path, agent_dir / rel_path)
+            except OSError:
+                continue
+            change: dict = {"path": rel_path, "action": "write", "hash": cur_hash, "size": size}
+            if content is not None:
+                cur_hash = "sha256:" + hashlib.sha256(content).hexdigest()
+                change = {"path": rel_path, "action": "write",
+                          "content_b64": base64.b64encode(content).decode(), "hash": cur_hash}
+            if cur_hash != seen.get(rel_path) and _claim(rel_path, cur_hash):
+                changes.append(change)
 
     # Deleted files. A path can vanish from ``current`` for THREE reasons:
     # actually deleted; newly EXCLUDED (a sync-ignore rule table arriving
@@ -926,29 +1087,40 @@ def detect_changes(
     # tombstones that could later delete REAL satellite files if the rule is
     # ever retracted (tombstone mtimes would outrank the files'). A path that
     # cannot be stat'ed keeps its baseline entry, emitting nothing. One stat
-    # per candidate delete — rare outside rule-change turns.
-    for rel_path, old_hash in snapshot.items():
+    # per candidate delete — rare outside rule-change turns. The agent folder
+    # itself gone or out of reach (a disk not mounted, a folder moved away) is
+    # no delete of its files: as at a merge, a missing tree is never read so.
+    if not agent_dir.is_dir():
+        return changes
+    for rel_path in seen:
         if rel_path in current:
             continue
         try:
             st = os.stat(agent_dir / rel_path)
         except OSError as exc:
-            if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP) and _claim(rel_path, None):
                 changes.append({"path": rel_path, "action": "delete"})
-            else:
-                current[rel_path] = old_hash
             continue
-        if not S_ISREG(st.st_mode):
+        if _claim(rel_path, None) and not S_ISREG(st.st_mode):
             changes.append({"path": rel_path, "action": "delete"})
 
-    # Refresh the snapshot so the next call's baseline is *this* moment,
-    # not session start. Mutated in place — the session object's
-    # ``_file_snapshot`` attribute is the same dict reference. See the
-    # docstring above for why this is critical.
-    snapshot.clear()
-    snapshot.update(current)
-
     return changes
+
+
+def _read_inline(root, rel: str, path: Path) -> tuple[bytes | None, int]:
+    """A changed file's bytes when it fits an inline write, else ``(None,
+    size)``; opened as ``_open_listed`` opens a listed file."""
+    fd, st = _open_listed(root, rel, path, max_file_size())
+    try:
+        if st.st_size > CHUNK_THRESHOLD:
+            return None, st.st_size
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            content = fh.read(CHUNK_THRESHOLD + 1)
+        if len(content) > CHUNK_THRESHOLD:
+            return None, os.fstat(fd).st_size
+        return content, len(content)
+    finally:
+        os.close(fd)
 
 
 def prune_empty_parents(file_path: Path, root: Path) -> None:
@@ -1080,10 +1252,10 @@ def apply_file_push(
     chunk — matches `prepare_outgoing_files` convention).
 
     If ``snapshot`` is given (the satellite session's ``_file_snapshot`` dict),
-    update it post-write so the next ``detect_changes`` doesn't emit a phantom
-    ``file_changed`` event with the same hash. Without this, every push_back
-    (file-tools edit on platform → push to satellite) round-trips back as a
-    no-op file_changed at end-of-turn.
+    its entry for the path follows the write (``_push_step``) so no
+    ``detect_changes`` emits a phantom ``file_changed`` event with the same
+    hash. Without this, every push_back (file-tools edit on platform → push
+    to satellite) round-trips back as a no-op file_changed at end-of-turn.
     """
     import os
 
@@ -1106,12 +1278,14 @@ def apply_file_push(
         return
     rel = "/".join(parts)
     partial_rel = rel + ".partial"
+    targets = ([snapshot] if snapshot is not None else []) + list(snapshots or [])
     new_hash: str | None = None
     committed: dict[str, int] | None = None
 
     with safe_fs.open_root(Path(agent_dir).parent, Path(agent_dir).name) as root:
         if action == "delete":
-            safe_fs.unlink_beneath(root, rel, missing_ok=True)
+            with _push_step(targets, rel_path, None):
+                safe_fs.unlink_beneath(root, rel, missing_ok=True)
             _prune_empty_parents_beneath(root, rel)
             logger.debug("Deleted: %s", rel_path)
         elif action == "mkdir":
@@ -1141,17 +1315,18 @@ def apply_file_push(
                             f"expected {expected_hash}: {rel_path}"
                         )
                 _refuse_if_stale(root, rel, msg.get("expect"), rel_path)
-                # The temp is created O_EXCL beside the name and renamed onto
-                # it within the parent; the Windows AV retry sits in the commit.
-                safe_fs.atomic_write_beneath(root, rel, data, mkdirs=True)
-                committed = _committed_stat(root, rel)
-                logger.debug("Wrote: %s (%s bytes)", rel_path, len(data))
                 # Snapshot refresh must not depend on the sender attaching a hash:
                 # a stale snapshot echoes the push back as a phantom file_changed
                 # (PTY sessions scan too now). Compute it from the payload if absent.
                 new_hash = expected_hash or (
                     "sha256:" + hashlib.sha256(data).hexdigest()
                 )
+                # The temp is created O_EXCL beside the name and renamed onto
+                # it within the parent; the Windows AV retry sits in the commit.
+                with _push_step(targets, rel_path, new_hash):
+                    safe_fs.atomic_write_beneath(root, rel, data, mkdirs=True)
+                committed = _committed_stat(root, rel)
+                logger.debug("Wrote: %s (%s bytes)", rel_path, len(data))
         elif action == "write_chunk":
             content_b64 = msg.get("content_b64", "")
             chunk_index = int(msg.get("chunk_index", 0) or 0)
@@ -1224,30 +1399,14 @@ def apply_file_push(
                     except StalePush:
                         safe_fs.unlink_beneath(root, partial_rel, missing_ok=True)
                         raise
-                    safe_fs.commit_partial(root, partial_rel, rel)
+                    with _push_step(targets, rel_path, expected_hash):
+                        safe_fs.commit_partial(root, partial_rel, rel)
                     committed = _committed_stat(root, rel)
                     new_hash = expected_hash
-    target = Path(agent_dir) / rel
-
-    # Refresh snapshot(s) so the next detect_changes scan sees this file as
-    # already-known with the same hash (no spurious file_changed event back
-    # to the platform). Only update on completed writes — partial chunks
-    # leave the snapshot as-is.
-    targets: list[dict[str, str]] = []
-    if snapshot is not None:
-        targets.append(snapshot)
-    if snapshots:
-        targets.extend(snapshots)
-
-    if action == "delete":
-        for snap in targets:
-            snap.pop(rel_path, None)
-    elif new_hash:
-        for snap in targets:
-            snap[rel_path] = new_hash
+    if new_hash:
         # The committed bytes' sha256 was just verified — prime the hash cache
         # so the next snapshot pass never re-hashes a big pushed file.
-        prime_hash_cache(target, new_hash)
+        prime_hash_cache(Path(agent_dir) / rel, new_hash)
     return committed
 
 
@@ -1273,30 +1432,33 @@ def compute_manifest(agent_dir: Path, *, report_skipped: bool = False) -> list[d
     # The walk and the file rules are the snapshot's (``_listed_files``): the
     # manifest never reports venv internals, rule-excluded build dirs, or
     # anything else the snapshot/detect path excludes.
-    for f, rel in _listed_files(agent_dir, skipped_dirs):
-        stat = None
-        try:
-            stat = f.stat()
-            if stat.st_size > cap:
-                tally.note(f, _over_cap(cap))
-                if report_skipped:
-                    entries.append({"path": rel, "skipped": "too_large",
-                                    "size": stat.st_size, "mtime": stat.st_mtime})
-                continue
-            # Streamed + cached (see _hash_file_cached) — memory-bounded
-            # and no re-hash of unchanged files.
-            entries.append({
-                "path": rel,
-                "hash": _hash_file_cached(f, stat),
-                "size": stat.st_size,
-                "mtime": stat.st_mtime,
-            })
-            tally.hashed += 1
-        except OSError as exc:
-            if tally.note(f, exc) and report_skipped:
-                entries.append({"path": rel, "skipped": "unreadable",
-                                "size": stat.st_size if stat else 0,
-                                "mtime": stat.st_mtime if stat else 0})
+    with _held(agent_dir) as root:
+        if root is None:
+            return []
+        for f, rel, listed in _listed_files(agent_dir, root, skipped_dirs):
+            stat = None
+            try:
+                stat = _listed_regular(f, listed)
+                if stat.st_size > cap:
+                    tally.note(f, _over_cap(cap))
+                    if report_skipped:
+                        entries.append({"path": rel, "skipped": "too_large",
+                                        "size": stat.st_size, "mtime": stat.st_mtime})
+                    continue
+                # Streamed + cached (see _hash_listed) — memory-bounded
+                # and no re-hash of unchanged files.
+                entries.append({
+                    "path": rel,
+                    "hash": _hash_listed(root, rel, f, stat, cap),
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                })
+                tally.hashed += 1
+            except OSError as exc:
+                if tally.note(f, exc) and report_skipped:
+                    entries.append({"path": rel, "skipped": "unreadable",
+                                    "size": stat.st_size if stat else 0,
+                                    "mtime": stat.st_mtime if stat else 0})
     for rel_dir, why in skipped_dirs:
         if why == "unreadable_dir":
             tally.note(agent_dir / rel_dir, "the folder could not be listed")

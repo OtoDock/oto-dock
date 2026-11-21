@@ -1,0 +1,39 @@
+{
+ "another_machines": null,
+ "expectations": [
+  {
+   "mtime_ns": 9,
+   "size": 3
+  },
+  "live",
+  "live",
+  "live",
+  "live"
+ ],
+ "push_ack_stale": "stale",
+ "stale_stats": [
+  {
+   "exists": true,
+   "mtime_ns": 9,
+   "size": 3
+  },
+  null,
+  null,
+  null
+ ],
+ "taken": [
+  {
+   "exists": true,
+   "mtime_ns": 50,
+   "size": 5
+  },
+  null,
+  {
+   "exists": true,
+   "mtime_ns": 60,
+   "size": 6
+  },
+  null,
+  null
+ ]
+}

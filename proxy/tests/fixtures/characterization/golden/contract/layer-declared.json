@@ -1,0 +1,6 @@
+{
+ "plain_owned": false,
+ "probe_alive": false,
+ "self_wakes_not_owned": false,
+ "self_wakes_owned": true
+}

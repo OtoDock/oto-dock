@@ -5,7 +5,7 @@ one, a community entry's arrives with the folder copy on install and on
 every converge. The dashboard fetches every icon from the proxy
 (``GET /v1/mcps/{name}/icon.png``), never from the catalog host directly.
 
-Resolution order (:func:`installed_icon_path`, then :func:`catalog_icon`):
+Resolution order (:func:`installed_icon`, then :func:`catalog_icon`):
 
 1. the installed MCP's ``<mcp_dir>/icon.png``, any category;
 2. the community catalog: the registry entry's ``icon_url`` (a relative
@@ -29,7 +29,6 @@ import re
 import struct
 import time
 from dataclasses import dataclass
-from pathlib import Path
 
 import httpx
 
@@ -75,24 +74,24 @@ def valid_name(name: str) -> bool:
     return bool(_NAME_RE.match(name or ""))
 
 
-def installed_icon_path(name: str) -> Path | None:
-    """The installed MCP's ``icon.png`` when the MCP is installed and ships one."""
+def installed_icon(name: str) -> bytes | None:
+    """The installed MCP's ``icon.png`` bytes when the MCP is installed and
+    ships a valid one: read once beneath its folder with no link followed,
+    under ``ICON_MAX_BYTES``, and served from these bytes, never opened
+    again by name."""
+    from services.infra import safe_fs
     from services.mcp import mcp_registry
 
     manifest = mcp_registry.get_manifest(name)
     if manifest is None:
         return None
-    path = Path(manifest.mcp_dir) / "icon.png"
     # The same contract the catalog fetch enforces: a community folder's
     # file arrives unvalidated with the tarball, and every row loads it.
     try:
-        if not path.is_file() or path.stat().st_size > ICON_MAX_BYTES:
-            return None
-        with path.open("rb") as f:
-            head = f.read(24)
+        body = safe_fs.read_bytes_beneath(manifest.mcp_dir, "icon.png", max_size=ICON_MAX_BYTES)
     except OSError:
         return None
-    return None if png_problem(head) else path
+    return None if png_problem(body) else body
 
 
 def catalog_folder(icon_url: object) -> str | None:

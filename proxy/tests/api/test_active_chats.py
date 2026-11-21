@@ -67,13 +67,12 @@ def _mk_task_run_chat(owner: str, *, agent: str = AGENT, scope: str = "agent",
 
 @pytest.fixture
 def _as(monkeypatch):
-    """Authenticate as a given user + pin the two streaming registries."""
+    """Authenticate as a given user + pin the chats working now (headless first, then terminals)."""
     def setup(user: UserContext, pump: list[str], interactive: list[str] = ()):
         app.dependency_overrides[get_current_user] = lambda: user
-        import core.session.interactive_session as isess
-        import core.session.session_state as ss
-        monkeypatch.setattr(ss, "streaming_chat_ids", lambda: list(pump))
-        monkeypatch.setattr(isess, "streaming_chat_ids", lambda: list(interactive))
+        from services.delegation import lane_status
+        monkeypatch.setattr(lane_status, "working_chat_ids",
+                            lambda: list(dict.fromkeys([*pump, *interactive])))
     yield setup
     app.dependency_overrides.pop(get_current_user, None)
 

@@ -85,6 +85,11 @@ export function hasNativeBridge(): boolean {
   return channel() !== null
 }
 
+/** True inside the Android app, on the page the app scoped its channel to. */
+export function inAndroidApp(): boolean {
+  return hasNativeBridge() && Capacitor.getPlatform() === 'android'
+}
+
 /** True inside an app shell: the apps' channel, or a Capacitor native
  *  platform without it (an app older than the channel). */
 export function inAppShell(): boolean {

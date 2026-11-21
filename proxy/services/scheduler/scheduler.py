@@ -53,6 +53,7 @@ from services.scheduler.firing import (  # noqa: F401
     _reserve_spawn_slot,
     _spawn_slot_lock,
     _spawn_spacing_gate,
+    wake_skips,
 )
 from services.scheduler.interactive import (  # noqa: F401
     INTERACTIVE_TASK_MAX_S,
@@ -245,7 +246,11 @@ def _register_task(task: shared.TaskDefinition) -> None:
             logger.warning("Invalid run_at for task %s: %s", task.id, e)
             return
     elif task.delay_seconds is not None:
-        run_date = datetime.now(timezone.utc) + timedelta(seconds=task.delay_seconds)
+        run_date = _delay_due(task) or datetime.now(timezone.utc) + timedelta(
+            seconds=task.delay_seconds)
+        if run_date < datetime.now(timezone.utc):
+            logger.debug("Skipping past one-time task: %s", task.id)
+            return
         trigger = DateTrigger(run_date=run_date)
     elif task.interval_seconds is not None:
         # Anchor start_date at `created_at + interval_seconds` so first fire is
@@ -280,6 +285,76 @@ def _register_task(task: shared.TaskDefinition) -> None:
     logger.info("Registered task: %s (agent=%s)", task.id, task.agent)
 
 
+def _delay_due(task: shared.TaskDefinition) -> datetime | None:
+    """When a ``delay_seconds`` task is due: its creation plus the delay, so
+    no boot gives an unfired task a new countdown. None for a task with no
+    creation yet (one being created now), whose delay counts from here."""
+    if task.delay_seconds is None or not task.created_at:
+        return None
+    try:
+        created = datetime.fromisoformat(task.created_at)
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return created + timedelta(seconds=task.delay_seconds)
+
+
+def _one_time_due(task: shared.TaskDefinition) -> datetime | None:
+    """The instant a one-time task is due, None for any other task."""
+    if task.run_at:
+        try:
+            due = datetime.fromisoformat(task.run_at)
+        except (ValueError, TypeError):
+            return None
+        return due if due.tzinfo else due.replace(tzinfo=_resolve_task_tz(task))
+    return _delay_due(task)
+
+
+def due_in_downtime() -> list[shared.TaskDefinition]:
+    """The one-time tasks (a continuation included) that came due while the
+    platform was down, or while a drain held new work, and never fired:
+    enabled, not fired, with no live run, due between the downtime's start
+    and now. None on a database with no known downtime, and none in
+    standalone mode (the external scheduler fires what it missed).
+    Synchronous."""
+    from services.infra import platform_marks
+    since = platform_marks.boot().down_since
+    if since is None or config.SCHEDULER_MODE == "standalone":
+        return []
+    now = datetime.now(timezone.utc)
+    running = {r.get("task_id") for r in task_store.list_orphaned_runs()}
+    due: list[shared.TaskDefinition] = []
+    for row in task_store.list_dynamic_tasks(enabled_only=True):
+        if row.get("fired") or row["id"] in running:
+            continue
+        task = _row_to_task(row)
+        when = _one_time_due(task)
+        if when is not None and since <= when <= now:
+            due.append(task)
+    return due
+
+
+async def fire_downtime() -> int:
+    """Fire what came due in the downtime, once each (boot, after the
+    continue pass). Returns how many fired."""
+    tasks = await asyncio.to_thread(due_in_downtime)
+    for task in tasks:
+        logger.info("Task %s came due while the platform was down: firing it now", task.id)
+        await runner._fire_task(task)
+    return len(tasks)
+
+
+async def fire_held() -> int:
+    """A drain was called off: the continuations it held fire, each once."""
+    held, shared._held_wakes[:] = list(dict.fromkeys(shared._held_wakes)), []
+    for task_id in held:
+        row = await asyncio.to_thread(task_store.get_dynamic_task, task_id)
+        if row and row.get("enabled", True):
+            await runner._fire_task(_row_to_task(row))
+    return len(held)
+
+
 def _row_to_task(row: dict) -> shared.TaskDefinition:
     """Convert a dynamic_tasks DB row to a shared.TaskDefinition."""
     created_at = row.get("created_at")
@@ -298,6 +373,7 @@ def _row_to_task(row: dict) -> shared.TaskDefinition:
         interval_seconds=row.get("interval_seconds"),
         timeout_seconds=_col(row, "timeout_seconds", 600),
         enabled=bool(row.get("enabled", 1)),
+        fired=bool(row.get("fired", False)),
         created_by=row.get("created_by"),
         created_at=created_at,
         on_complete_agent=row.get("on_complete_agent"),
@@ -318,6 +394,7 @@ def _row_to_task(row: dict) -> shared.TaskDefinition:
         override_model=row.get("override_model") or None,
         override_execution_path=row.get("override_execution_path") or None,
         target_machine=row.get("target_machine") or "",
+        spender_sub=row.get("spender_sub"),
         permission_mode=row.get("permission_mode") or "",
         notify_audience=row.get("notify_audience") or roles.VIEWER,
         app_id=row.get("app_id") or None,
@@ -412,6 +489,25 @@ def next_run_time(task_id: str) -> str | None:
     job = _scheduler.get_job(f"task_{task_id}")
     next_run = getattr(job, "next_run_time", None) if job else None
     return next_run.isoformat() if next_run else None
+
+
+def will_not_fire(task: shared.TaskDefinition, has_job: bool) -> bool:
+    """True for a row that can no longer fire by itself, which the listing
+    must not call active: enabled, timed to fire once, due already, never
+    fired, with no job left to fire it (``has_job``: the caller's read of
+    ``next_run_times``) and no fire of it under way or held. Embedded mode
+    only: there the jobs are this process's, while the standalone scheduler
+    fires what it missed. Such a row fires on a Run, or is deleted."""
+    if config.SCHEDULER_MODE == "standalone" or has_job:
+        return False
+    if not getattr(task, "enabled", False) or getattr(task, "fired", False):
+        return False
+    if task.id in shared._fires_under_way or task.id in shared._held_wakes:
+        return False
+    if getattr(task, "run_at", None) is None and getattr(task, "delay_seconds", None) is None:
+        return False
+    due = _one_time_due(task)
+    return due is not None and due <= datetime.now(timezone.utc)
 
 
 def _compute_next_run_times() -> list[dict]:
@@ -528,6 +624,7 @@ async def add_dynamic_task(task: shared.TaskDefinition) -> str:
         override_model=task.override_model,
         override_execution_path=task.override_execution_path,
         target_machine=task.target_machine or "",
+        spender_sub=task.spender_sub,
         permission_mode=task.permission_mode,
         notify_audience=task.notify_audience,
         app_id=task.app_id,
@@ -736,13 +833,20 @@ async def update_dynamic_task(task_id: str, fields: dict) -> tuple[bool, str | N
 async def cancel_run(run_id: str) -> bool:
     """Cancel a running asyncio.Task. Callers of this function are user
     surfaces (run-cancel API / dashboard Stop), so the run is stamped
-    user-cancelled — its delegate callback reports "user_interrupted"."""
+    user-cancelled — its delegate callback reports "user_interrupted". A run
+    no task drives because it waits for its replay or its reopen is stopped
+    by ``stranded_runs.stop``: Stop means stop."""
     t = shared._running_tasks.get(run_id)
     if t and not t.done():
-        shared._user_cancelled_runs.add(run_id)
-        t.cancel()
+        if not _ending_on_a_cancel(run_id):
+            shared._user_cancelled_runs.add(run_id)
+            t.cancel()
         return True
-    return False
+    # No task drives it: a run that waits for its replay or its reopen after
+    # a restart or its machine's restart is stopped at its record, and one
+    # nothing carries on is stopped too.
+    from services.scheduler import stranded_runs
+    return await stranded_runs.stop(run_id)
 
 
 def platform_cancel_run(run_id: str, reason: str) -> bool:
@@ -755,10 +859,19 @@ def platform_cancel_run(run_id: str, reason: str) -> bool:
     turn on a task chat) — the caller stamps the row directly."""
     t = shared._running_tasks.get(run_id)
     if t and not t.done():
-        shared._platform_interrupts[run_id] = reason
-        t.cancel()
+        if not _ending_on_a_cancel(run_id):
+            shared._platform_interrupts[run_id] = reason
+            t.cancel()
         return True
     return False
+
+
+def _ending_on_a_cancel(run_id: str) -> bool:
+    """The run's task was cancelled already and is ending: a second cancel
+    would cut its end (the session's close, the row, the delegator's
+    result) before its delegator's result. Both marks are cleared when the
+    run's frame retires (``runner._retire``)."""
+    return run_id in shared._user_cancelled_runs or run_id in shared._platform_interrupts
 
 
 async def subscribe_run(run_id: str) -> asyncio.Queue:

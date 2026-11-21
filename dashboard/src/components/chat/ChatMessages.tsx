@@ -20,6 +20,7 @@ import { QUEUE_WAITING, WAKE_SOURCE } from '../../api/wireEvents'
 import { CARD_WORDS } from '../../lib/kinds/card'
 import { FILE_ICON_PATH, FOLDER_ICON_PATH } from './attachmentIcons'
 import { useSearch } from '../../contexts/useSearch'
+import { copyOrSay } from '../../lib/copyText'
 
 /** "Working…" under the open turn's newest bubble once it stayed unchanged
  * for the grace with nothing running: every frame replaces the blocks array,
@@ -183,7 +184,8 @@ function CopyMessageButton({ text }: { text: string }) {
 
   const handleCopy = useCallback(() => {
     if (!text.trim()) return
-    navigator.clipboard.writeText(text).then(() => {
+    void copyOrSay(text).then((ok) => {
+      if (!ok) return
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })
@@ -699,8 +701,11 @@ export default function ChatMessages({
           a focus or a find. The side padding lives inside the clip, so what
           overhangs a message (a queued message's cancel button, a focus
           ring) stays in view on every engine, Safari's included (it has no
-          clip margin); the width takes it in, so the column keeps 56rem. */}
-      <div ref={contentRef} className="max-w-[57.5rem] mx-auto w-full px-3 space-y-6 pt-14 pb-4 overflow-x-clip">
+          clip margin); the width takes it in, so the column keeps 56rem.
+          Below md the bottom padding clears one row of the status badges
+          that float over the bottom right corner (ChatBottomPanel), always,
+          so a badge that comes or goes never moves the list. */}
+      <div ref={contentRef} className="max-w-[57.5rem] mx-auto w-full px-3 space-y-6 pt-14 pb-9 md:pb-4 overflow-x-clip">
         {/* Lazy scroll-back trigger (visual top = oldest loaded). The observer
             fires onLoadOlder as it nears the viewport; older rows prepend with no
             jump (column-reverse is bottom-anchored). */}
@@ -729,6 +734,7 @@ export default function ChatMessages({
                 <span className="text-2xs text-tertiary mb-1 mr-1">
                   {formatMessageTime(msg.createdAt)}
                   {msg.fromCard && <span className="ml-2 text-2xs text-tertiary" data-testid="message-from-card">{CARD_WORDS.fromCard}</span>}
+                  {msg.sentWithKey && <span className="ml-2 text-2xs text-tertiary" data-testid="message-from-key">Sent with the key {msg.sentWithKey}</span>}
                 </span>
                 {/* Bubble */}
                 <div
@@ -816,7 +822,11 @@ export default function ChatMessages({
                 </svg>
               </span>
               <span className="text-sm font-semibold text-primary truncate min-w-0" data-testid="wake-card-label">
-                {card.source === WAKE_SOURCE.MOVE ? 'Continued after the move' : 'Scheduled wake'}
+                {card.source === WAKE_SOURCE.MOVE
+                  ? 'Continued after the move'
+                  : card.source === WAKE_SOURCE.RELOAD
+                    ? 'Continued after the reload'
+                    : card.source === WAKE_SOURCE.CONTINUE ? 'Continued after a restart' : 'Scheduled wake'}
               </span>
               <span className="text-2xs text-tertiary whitespace-nowrap shrink-0">
                 {formatMessageTime(msg.createdAt)}
@@ -1061,7 +1071,9 @@ export default function ChatMessages({
                         ? "A teammate's terminal is open on this chat. Your message goes out when it closes."
                         : item.waiting === QUEUE_WAITING.MACHINE
                           ? 'The machine running this chat is not answering. Your message goes out when it does.'
-                          : 'The machine running this chat is reconnecting. Your message goes out when it is back.'}
+                          : item.waiting === QUEUE_WAITING.UPDATING
+                            ? 'OtoDock is updating. Your message goes out when it is back.'
+                            : 'The machine running this chat is reconnecting. Your message goes out when it is back.'}
                     </p>
                   )}
                   {item.card && <span className="ml-2 text-xs text-secondary" data-testid="queued-from-card">{CARD_WORDS.fromCard}</span>}

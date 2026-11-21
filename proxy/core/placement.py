@@ -1,7 +1,7 @@
 """Placement — where a session runs, named once.
 
-A session runs in the platform's bwrap sandbox or on a paired machine (a
-satellite). The tree spells that in three vocabularies, every one of them
+A session runs in the platform's bwrap sandbox on one of its compute
+machines, or on a paired machine (a satellite). The tree spells that in three vocabularies, every one of them
 frozen (stored, on the wire, or in a document a script reads):
 
 - the STORED target value — ``agents.execution_target``,
@@ -13,16 +13,21 @@ frozen (stored, on the wire, or in a document a script reads):
   predicates ``is_local`` / ``machine_of`` / ``is_offline_sentinel`` /
   ``offline_machine_of`` / ``offline_sentinel``;
 - the resolved KIND of a placement — the sandbox, the agent's admin-paired
-  default machine, or the person's own paired machine — ``KIND_*`` (the
-  security index persists it as ``target_kind``), and the scope a machine
-  row was paired under (``remote_machines.pairing_scope``): ``PAIRING_*``;
+  default machine, the person's own paired machine, or a compute machine
+  (the platform's own, sandboxed, on the platform's folder) — ``KIND_*``
+  (the security index persists it as ``target_kind``), and the scope a
+  machine row was registered under (``remote_machines.pairing_scope``):
+  ``PAIRING_*``;
 - the SITE a check input document carries under ``session.placement.kind``
   and an app's ``step_target.kind``: ``"local"`` or ``"machine"`` —
   ``SITE_*``.
 
 ``PlacementCapabilities`` is the resolved placement of ONE session with the
 facts the path policy, the prompt, the MCP gates, the checks and the
-capacity accounting ask. ``storage.remote_store.placement_of`` builds it once
+capacity accounting ask. Each kind's facts are one row of ``_FACTS``: a
+site reads the fact it means (the process's place, the sandbox, the path
+translation, a synced copy, the memory gates, the device tools), never
+``is_remote`` for another of them. ``storage.remote_store.placement_of`` builds it once
 per session build from the machine row; ``SecurityContext.placement``
 carries it (persisted through ``core.session.session_state``'s codec under
 the index's own ``target_*`` keys); ``PathPolicyContext.placement`` copies
@@ -46,6 +51,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -55,6 +61,10 @@ from core import host_os
 
 LOCAL = "local"
 OFFLINE_PREFIX = "__offline__:"
+#: Admission's word for a session of the platform's place that no compute
+#: machine can take (``admission_target``): never a box, never a paired
+#: computer, never stored.
+NO_COMPUTE = "__no_compute__"
 
 
 def is_local(target: str | None) -> bool:
@@ -80,19 +90,45 @@ def offline_machine_of(target: str | None) -> str:
 
 def machine_of(target: str | None) -> str:
     """The machine id a stored value names: the id itself, the id inside a
-    sentinel (it still names the intended machine), ``""`` for the sandbox."""
-    if is_local(target):
+    sentinel (it still names the intended machine), ``""`` for the
+    platform's place (and for admission's word for it with no machine)."""
+    if is_local(target) or target == NO_COMPUTE:
         return ""
     if is_offline_sentinel(target):
         return offline_machine_of(target)
     return target or ""
 
 
-def runs_on(target: str | None, machine_id: str) -> bool:
+def runs_on(target: str | None, machine_id: str, *, platform_machine: bool = False) -> bool:
     """The value names THIS machine and is not a sentinel — what a
     satellite-initiated session asks of a chat row or a resolved target
-    (an offline answer never equals a live machine)."""
-    return bool(machine_id) and not is_offline_sentinel(target) and machine_of(target) == machine_id
+    (an offline answer never equals a live machine), and the rule a chat's
+    pin and its session's own record agree by. ``platform_machine``: the
+    machine is a compute machine, the platform's own, which serves the
+    platform's place, so the pin ``local`` agrees with it."""
+    if not machine_id or is_offline_sentinel(target):
+        return False
+    return machine_of(target) == machine_id or (platform_machine and is_local(target))
+
+
+def compute_of(pl: PlacementCapabilities | None) -> PlacementCapabilities | None:
+    """``pl`` when it is a compute machine's placement (its kind and its
+    machine), else None: what a caller passes on to the layer and to
+    admission, and nothing when the platform's own sandbox serves."""
+    if pl is not None and pl.kind == KIND_COMPUTE and pl.machine_id:
+        return pl
+    return None
+
+
+def admission_target(target: str | None, pl: PlacementCapabilities | None) -> str:
+    """The value admission judges a session by: a compute placement's own
+    machine (its sessions are the machine's to budget), a paired computer's
+    stored target as it is, and ``NO_COMPUTE`` for the platform's place with
+    no compute machine to take it: the platform runs no session itself, so
+    admission refuses that one with the sentence and reserves nothing."""
+    if pl is not None and pl.kind == KIND_COMPUTE and pl.machine_id:
+        return pl.machine_id
+    return NO_COMPUTE if is_local(target) else cast("str", target)
 
 
 # --- the resolved kind and the pairing scope --------------------------------
@@ -100,17 +136,67 @@ def runs_on(target: str | None, machine_id: str) -> bool:
 KIND_LOCAL = "local"
 KIND_ADMIN_REMOTE = "admin_remote"
 KIND_USER_REMOTE = "user_remote"
-KINDS = (KIND_LOCAL, KIND_ADMIN_REMOTE, KIND_USER_REMOTE)
-REMOTE_KINDS = (KIND_ADMIN_REMOTE, KIND_USER_REMOTE)
+KIND_COMPUTE = "compute"
+KINDS = (KIND_LOCAL, KIND_ADMIN_REMOTE, KIND_USER_REMOTE, KIND_COMPUTE)
 
 PAIRING_ADMIN = "admin"
 PAIRING_USER = "user"
+PAIRING_COMPUTE = "compute"
+#: What a pairing mints: an admin's machine or a person's own.
 PAIRING_SCOPES = (PAIRING_ADMIN, PAIRING_USER)
+#: Every scope a machine row may hold: a compute machine is registered,
+#: never paired, and nobody owns it.
+MACHINE_SCOPES = (PAIRING_ADMIN, PAIRING_USER, PAIRING_COMPUTE)
+
+
+def _scope(machine: dict | None) -> str:
+    return (machine.get("pairing_scope") or "") if machine else ""
 
 
 def machine_is_admin_paired(machine: dict | None) -> bool:
     """An admin-paired row (platform infrastructure); a missing row is not."""
-    return bool(machine) and (cast("dict", machine).get("pairing_scope") or "") == PAIRING_ADMIN
+    return _scope(machine) == PAIRING_ADMIN
+
+
+def machine_is_personal(machine: dict | None) -> bool:
+    """A person's own machine (paired from User Settings); a missing row, an
+    admin's machine and a compute machine are not."""
+    return _scope(machine) == PAIRING_USER
+
+
+def machine_is_compute(machine: dict | None) -> bool:
+    """A compute machine: the platform's own, registered with no owner. The
+    sessions of the platform's place run on them."""
+    return _scope(machine) == PAIRING_COMPUTE
+
+
+def compute_own_copy(machine: dict | None) -> bool:
+    """A compute machine on another host: it was paired from an address
+    (recorded at its pairing, then the one it last signed in from) and works
+    on its own copy of the folders, which the platform syncs as it does a
+    paired machine's. One with no address yet, or the install's own, shares
+    the platform's folders. The one reader of the row's mode."""
+    return machine_is_compute(machine) and bool(str((machine or {}).get("compute_address") or ""))
+
+
+# The ids the install makes for its compute machines (its own, an added one).
+_COMPUTE_ID = re.compile(r"compute-(?:[0-9a-f]{12}|[0-9a-f]{16})")
+
+
+def log_id(machine_id: str) -> str:
+    """A machine's id in a log line: a compute id of the install's own shape
+    whole, any other id cut to eight with nothing but letters, digits and
+    dashes (a sign-in sends its id before anything verifies it)."""
+    if _COMPUTE_ID.fullmatch(machine_id):
+        return machine_id
+    return re.sub(r"[^A-Za-z0-9-]", "?", machine_id[:8])
+
+
+def owner_of(machine: dict | None) -> str:
+    """The person who owns a PERSONAL machine; ``""`` for an admin's machine,
+    a compute machine and no row. Compare it only with a non-empty sub: an
+    empty one owns nothing."""
+    return str(machine.get("registered_by") or "") if machine and machine_is_personal(machine) else ""
 
 
 class PlacementRefused(RuntimeError):
@@ -121,6 +207,20 @@ class PlacementRefused(RuntimeError):
 #: The guard's sentence when no caller named the place more precisely.
 REFUSED_SENTENCE = ("This chat is on a machine you can't use. Pick one of your own places "
                     "from the Runs on menu.")
+
+#: What every door says when no compute machine serves the platform's place.
+NO_COMPUTE_SENTENCE = ("OtoDock's compute machine is not connected, so this cannot run now. "
+                       "Try again in a few minutes.")
+
+
+class NoComputeMachine(PlacementRefused):
+    """A session of the platform's place with no compute machine to run it:
+    the platform starts no session itself. Raised by the one reader of where
+    such a session goes (``remote_status.compute_row_for``) and by the layer
+    lookup, and shown by every door as the refusals of this family are."""
+
+    def __init__(self) -> None:
+        super().__init__(NO_COMPUTE_SENTENCE)
 
 
 def admits_every_role(machine: dict | None, agent_default: str | None) -> bool:
@@ -150,14 +250,15 @@ def may_run_on(machine: dict | None, *, run_sub: str | None, run_can_manage: boo
     agent's default (``admits_every_role``; ``agent_default`` is the agent's
     ``execution_target``, empty refuses as before): the machine has no
     sandbox, so a role below the owner tier runs there only by that choice.
+    A compute machine, and a scope no release writes: never.
     Every spawn on a machine passes it
     (``remote_session_start.placement_refuses``), and the config builder
     asks it first (``config_builder._placement_refusal``)."""
-    if not machine:
+    if not machine or machine_is_compute(machine):
         return False
     if machine_is_admin_paired(machine):
         return not run_sub or run_can_manage or admits_every_role(machine, agent_default)
-    return (bool(run_sub) and user_paired_allowed
+    return (machine_is_personal(machine) and bool(run_sub) and user_paired_allowed
             and (machine.get("registered_by") or "") == run_sub)
 
 
@@ -189,6 +290,46 @@ _STATE_DIRNAMES = frozenset(cast("host_os.HostOS", host_os.of(f)).dirname for f 
 
 
 @dataclass(frozen=True)
+class KindFacts:
+    """What one kind of placement is, each fact named once.
+
+    ``on_machine``: the session's process is a machine's, reached over its
+    link. ``files_synced``: the machine works on a synced copy of the
+    folders. ``sandboxed``: the platform's kernel sandbox wraps the session.
+    ``translates_paths``: sandbox paths become the machine's own. ``memory_admitted``:
+    the memory gates count it (a machine of a person or an admin is budgeted
+    by its own session count). ``device_tools``: device tools may be offered,
+    by the machine's grants."""
+
+    on_machine: bool
+    files_synced: bool
+    sandboxed: bool
+    translates_paths: bool
+    memory_admitted: bool
+    device_tools: bool
+
+
+#: A compute machine is a machine the platform owns: its process is on the
+#: machine, as a satellite's, and everything else is the platform sandbox's.
+_FACTS: dict[str, KindFacts] = {
+    KIND_LOCAL: KindFacts(on_machine=False, files_synced=False, sandboxed=True,
+                          translates_paths=False, memory_admitted=True, device_tools=False),
+    KIND_ADMIN_REMOTE: KindFacts(on_machine=True, files_synced=True, sandboxed=False,
+                                 translates_paths=True, memory_admitted=False, device_tools=True),
+    KIND_USER_REMOTE: KindFacts(on_machine=True, files_synced=True, sandboxed=False,
+                                translates_paths=True, memory_admitted=False, device_tools=True),
+    KIND_COMPUTE: KindFacts(on_machine=True, files_synced=False, sandboxed=True,
+                            translates_paths=False, memory_admitted=True, device_tools=False),
+}
+
+
+def facts_of(kind: str) -> KindFacts:
+    """The facts of ``kind``; an unknown word answers as a person's machine,
+    the kind with the most rules on it."""
+    return _FACTS.get(kind) or _FACTS[KIND_USER_REMOTE]
+
+
+@dataclass(frozen=True)
 class PlacementCapabilities:
     """The resolved placement of one session. The defaults are the local
     sandbox; a machine's facts come from its row's last-reported
@@ -200,6 +341,11 @@ class PlacementCapabilities:
     machine_id: str = ""            # for mid-session revocation detection
     label: str = ""                 # the machine's name (the prompt)
     os: str = ""                    # linux | darwin | windows | "" (unreported)
+    satellite_version: str = ""     # the machine's satellite, as its row last recorded it
+    exit_port: int = 0              # the machine's credential exit listener (0: it runs none)
+    exit_ok: bool = False           # whether that listener answers now
+    exit_why: str = ""              # why it does not ("installing", "packages", "bind", "socks")
+    exit_upstream: bool = False     # whether it reaches the world through an outgoing proxy
     home_dir: str = ""              # the OS user's home on the machine
     agents_dir: str = ""            # the machine's agent-tree root
     os_user: str = ""               # the OS account the satellite runs as
@@ -214,15 +360,26 @@ class PlacementCapabilities:
     # names unresolved (the two above are resolved); "" when unreported.
     unresolved_home_dir: str = ""
     unresolved_otodock_dir: str = ""
+    # A compute machine on another host: its own copy of the folders
+    # (``compute_own_copy``), synced as a paired machine's.
+    own_copy: bool = False
+    # The engine folders (``.claude``, ``.codex``) where the machine's
+    # satellite gives each session a home of its own (``home_dirs`` of its
+    # report): the pool picks an account per session there
+    # (``session_config_dir.session_home_for``).
+    session_homes: frozenset[str] = frozenset()
+
+    @property
+    def facts(self) -> KindFacts:
+        return facts_of(self.kind)
 
     @property
     def is_remote(self) -> bool:
-        """A satellite of either kind, as opposed to the local sandbox."""
-        return self.kind in REMOTE_KINDS
-
-    @property
-    def is_local(self) -> bool:
-        return not self.is_remote
+        """The session's process is a machine's, reached over its link (a
+        person's, an admin's or a compute machine), as opposed to the
+        proxy's own. This one fact only: the sandbox, the path translation,
+        a synced copy and the device tools each have their own."""
+        return self.facts.on_machine
 
     @property
     def admin_paired(self) -> bool:
@@ -239,26 +396,43 @@ class PlacementCapabilities:
 
     @property
     def isolates_with_bwrap(self) -> bool:
-        """The kernel sandbox exists only on the platform host."""
-        return self.is_local
+        """The platform's kernel sandbox wraps the session: on the platform
+        host and on a compute machine."""
+        return self.facts.sandboxed
 
     @property
     def needs_path_translation(self) -> bool:
-        """Sandbox-virtual paths translate to the machine's native ones."""
-        return self.is_remote
+        """Sandbox-virtual paths translate to the machine's native ones: a
+        person's or an admin's machine."""
+        return self.facts.translates_paths
+
+    @property
+    def files_synced(self) -> bool:
+        """The session works on a synced copy of the folders on its machine:
+        a person's or an admin's machine, and a compute machine on another
+        host (one beside the platform works on the platform's own folder)."""
+        return self.facts.files_synced or self.own_copy
 
     @property
     def counts_toward_capacity(self) -> bool:
-        """A local session takes a slot of the host's budget; a remote one
-        is budgeted by its satellite."""
-        return self.is_local
+        """The memory gates count the session; a person's or an admin's
+        machine is budgeted by its own session count."""
+        return self.facts.memory_admitted
+
+    @property
+    def offers_device_tools(self) -> bool:
+        """Device tools may be offered, by the machine's own grants: a
+        person's or an admin's machine, never the platform's places."""
+        return self.facts.device_tools
 
     @property
     def site(self) -> str:
         """The two-word answer a check input document and an app's step
-        target carry: a machine only when one is known — a remote kind on
-        a missing row probes locally, as the checks always did."""
-        return SITE_MACHINE if (self.is_remote and self.machine_id) else SITE_LOCAL
+        target carry: where the files a check reads are. A machine only when
+        it holds a synced copy and is known: a remote kind on a missing row
+        probes locally, as the checks always did, and the files of a compute
+        machine beside the platform are the platform's own."""
+        return SITE_MACHINE if (self.files_synced and self.machine_id) else SITE_LOCAL
 
     @property
     def os_family(self) -> str:
@@ -338,15 +512,115 @@ class PlacementCapabilities:
 LOCAL_PLACEMENT = PlacementCapabilities()
 
 
+#: The live connection's report of a machine's credential exit, registered
+#: by the connection manager's module (this leaf imports nothing of it);
+#: None before the remote side is up, when the row's copy answers alone.
+_live_exit_state: Callable[[str], tuple[int, bool]] | None = None
+
+
+def register_live_exit_state(reader: Callable[[str], tuple[int, bool]]) -> None:
+    global _live_exit_state
+    _live_exit_state = reader
+
+
+#: The live connection's report beside the port and the answer (``why``,
+#: ``upstream``), registered the same way.
+_live_exit_report: Callable[[str], dict] | None = None
+
+
+def register_live_exit_report(reader: Callable[[str], dict]) -> None:
+    global _live_exit_report
+    _live_exit_report = reader
+
+
+def _exit_report(machine: dict) -> tuple[str, bool]:
+    """``(why, upstream)`` of the machine's credential exit: the live
+    connection's report first, the row's capabilities as the fallback."""
+    machine_id = str(machine.get("id") or "")
+    live = _live_exit_report(machine_id) if (_live_exit_report is not None and machine_id) else {}
+    if live:
+        return str(live.get("why") or ""), live.get("upstream") is True
+    try:
+        caps_raw = machine.get("capabilities") or "{}"
+        caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
+    except (TypeError, ValueError):
+        return "", False
+    if not isinstance(caps, dict):
+        return "", False
+    why = caps.get("exit_why")
+    return (why if isinstance(why, str) else ""), caps.get("exit_upstream") is True
+
+
+def _exit_state(machine: dict) -> tuple[int, bool]:
+    """The machine's credential exit as it stands now: the live connection's
+    report first (the heartbeat moves it, the row's copy lands off the
+    loop), the row's capabilities as the fallback. ``(0, False)`` for a
+    satellite that reports none (one that runs no exit)."""
+    machine_id = str(machine.get("id") or "")
+    live = _live_exit_state(machine_id) if (_live_exit_state is not None and machine_id) else (0, False)
+    if live[0]:
+        return live
+    try:
+        caps_raw = machine.get("capabilities") or "{}"
+        caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
+    except (TypeError, ValueError):
+        return 0, False
+    if not isinstance(caps, dict):
+        return 0, False
+    port = caps.get("exit_port")
+    port = port if type(port) is int and 0 < port < 65536 else 0
+    return port, bool(port and caps.get("exit_ok") is True)
+
+
+#: The engine folders a satellite that reports ``session_homes`` alone makes
+#: homes in (0.5.191 and older): Claude Code's.
+_HOMES_BEFORE_DIRS = frozenset({".claude"})
+
+
+def home_dirs(caps) -> frozenset[str]:
+    """The engine folders a satellite's report says it makes session homes
+    in: its ``session_home_dirs``, else Claude Code's for a report of
+    ``session_homes`` alone, else none. A live connection's report and a
+    machine row's are read the same way."""
+    if not isinstance(caps, dict):
+        return frozenset()
+    dirs = caps.get("session_home_dirs")
+    if isinstance(dirs, list):
+        return frozenset(d for d in dirs if isinstance(d, str) and d)
+    return _HOMES_BEFORE_DIRS if caps.get("session_homes") is True else frozenset()
+
+
+def _reported_home_dirs(machine: dict) -> frozenset[str]:
+    """``home_dirs`` of the report on a machine's row (a compute machine's row
+    is read for this fact alone)."""
+    raw = machine.get("capabilities") or "{}"
+    try:
+        caps = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return frozenset()
+    return home_dirs(caps)
+
+
 def from_machine(kind: str, machine: dict | None) -> PlacementCapabilities:
     """The placement of ``kind`` on a machine row. A missing row, or one whose
     capabilities cannot be read, answers the kind with every fact empty
     (``label`` survives — it needs no parsing): the path gate fail-closes,
     the revocation check sees no machine id, exactly as the disassembled
-    readers answered."""
+    readers answered. A compute placement carries its id and name only:
+    its sessions see sandbox paths, and no path, OS user, full access or
+    device grant of the row may reach a reader that reads them ungated."""
     if not machine:
         return PlacementCapabilities(kind=kind)
     label = str(machine.get("name") or "")
+    version = str(machine.get("satellite_version") or "")
+    exit_port, exit_ok = _exit_state(machine)
+    exit_why, exit_upstream = _exit_report(machine)
+    if kind == KIND_COMPUTE:
+        return PlacementCapabilities(kind=kind, machine_id=str(machine.get("id") or ""), label=label,
+                                     satellite_version=version, exit_port=exit_port, exit_ok=exit_ok,
+                                     exit_why=exit_why, exit_upstream=exit_upstream,
+                                     own_copy=compute_own_copy(machine),
+                                     session_homes=_reported_home_dirs(machine))
     try:
         caps_raw = machine.get("capabilities") or "{}"
         caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
@@ -360,6 +634,11 @@ def from_machine(kind: str, machine: dict | None) -> PlacementCapabilities:
             kind=kind,
             machine_id=str(machine.get("id") or ""),
             label=label,
+            satellite_version=version,
+            exit_port=exit_port,
+            exit_ok=exit_ok,
+            exit_why=exit_why,
+            exit_upstream=exit_upstream,
             os=str(caps.get("os") or ""),
             home_dir=str(caps.get("home_dir") or ""),
             agents_dir=str(caps.get("agents_dir") or ""),
@@ -373,6 +652,7 @@ def from_machine(kind: str, machine: dict | None) -> PlacementCapabilities:
             mcps_dir=str(caps.get("mcps_dir") or ""),
             unresolved_home_dir=str(caps.get("home_dir_unresolved") or ""),
             unresolved_otodock_dir=str(caps.get("otodock_dir_unresolved") or ""),
+            session_homes=home_dirs(caps),
         )
     except (ValueError, TypeError):
-        return PlacementCapabilities(kind=kind, label=label)
+        return PlacementCapabilities(kind=kind, label=label, satellite_version=version)

@@ -1,0 +1,64 @@
+{
+ "chats": [
+  {
+   "agent": "warm-reuse-denied",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "<id1>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  },
+  {
+   "agent": "warm-reuse-denied",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "<id2>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  {
+   "message": "The server is busy.",
+   "type": "error"
+  },
+  {
+   "message": "The server is busy.",
+   "type": "error"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  }
+ ],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [],
+  "started": []
+ },
+ "slots": {
+  "acquired": [],
+  "released": []
+ }
+}

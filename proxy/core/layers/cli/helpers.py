@@ -1,29 +1,15 @@
-"""CLI command building and shared helpers for Claude Code subprocess management.
-
-Shared utilities used by the PersistentSession machinery (core/layers/cli/session.py):
-  - ClaudeStreamChunk (dataclass)
-  - _build_env, _build_client_context
-  - _extract_tool_summary, _extract_context_window, _extract_turn_context
-  - _kill_process, abort_session
-  - _SKIP_INLINE_TOOLS
-
-One-shot run_claude() and run_claude_stream() have been removed — all
-execution now uses PersistentSession (core/layers/cli/session.py).
+"""Shared helpers of the Claude Code engine: the stream chunk, the session
+environment and client context of a spawn, and what the translator reads
+off a result (tool summaries, the context window, the turn's context).
 """
 
-import asyncio
 import logging
-import os
-import signal
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from core.session.session_state import _aborted_sessions, _active_processes
-
 if TYPE_CHECKING:
     from pathlib import Path
-
-    from core.sandbox.pty_relay import PipedProcess
 
 logger = logging.getLogger("otodock")
 
@@ -154,44 +140,14 @@ def _extract_turn_context(event: dict) -> int:
     )
 
 
-# ---------------------------------------------------------------------------
-# Process lifecycle helpers
-# ---------------------------------------------------------------------------
+# claude-code#63943: a graceful interrupt mid-thinking can persist an unsigned
+# thinking block in the CLI's session history; every later API call then 400s
+# on the block's missing/invalid signature. Matched against the error result
+# of the first turn(s) after an interrupt to trigger the killpg+resume repair.
+_THINKING_SIG_RE = re.compile(
+    r"thinking.{0,120}signature|signature.{0,120}thinking", re.I | re.S,
+)
 
-
-async def _kill_process(proc: "PipedProcess", session_id: str) -> None:
-    """Kill a Claude subprocess and its entire process group (including MCP servers).
-
-    Uses process groups (start_new_session=True) so child processes like MCP
-    servers are also killed, preventing orphaned processes from keeping stdout
-    pipes open and blocking the drain task.
-    """
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-            logger.info("Process group terminated for session %s (exit=%s)", session_id, proc.returncode)
-        except asyncio.TimeoutError:
-            os.killpg(pgid, signal.SIGKILL)
-            await proc.wait()
-            logger.warning("Process group force-killed (SIGKILL) for session %s", session_id)
-    except ProcessLookupError:
-        logger.info("Process already exited for session %s", session_id)
-    except Exception as e:  # noqa: BLE001  # killing a process group that may already be gone
-        logger.error("Error killing process for session %s: %s", session_id, e)
-
-
-async def abort_session(session_id: str) -> bool:
-    """Kill the active Claude process for a session (called from abort endpoint).
-
-    Returns True if a process was found and killed.
-    """
-    proc = _active_processes.get(session_id)
-    if proc and proc.returncode is None:
-        _aborted_sessions.add(session_id)
-        logger.info("Aborting session %s (pid=%s)", session_id, proc.pid)
-        await _kill_process(proc, session_id)
-        return True
-    logger.info("Abort requested for session %s but no active process found", session_id)
-    return False
+# After a steered turn's result: how long to wait for the init of the turn
+# the CLI starts by itself from a frame it did not consume mid-turn.
+_STEER_INIT_GRACE_S = 3.0

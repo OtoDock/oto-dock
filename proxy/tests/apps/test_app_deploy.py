@@ -38,11 +38,6 @@ SID = "sess-deploy-alice"
 SID_SHARED = "sess-deploy-shared"
 SID_VIEWER = "sess-deploy-bob"
 
-_needs_runtime = pytest.mark.skipif(
-    not (shutil.which("pasta") and shutil.which("bwrap") and app_sandbox.bun_binary()),
-    reason="requires pasta + bwrap + Bun on this host",
-)
-
 SERVER_OK = """
 const port = Number(process.env.PORT || 3000);
 Bun.serve({ port, hostname: "0.0.0.0", fetch(req) {
@@ -76,14 +71,6 @@ def _clean():
     apps_api._fire_rate.clear()
     yield
     app.dependency_overrides.pop(get_current_user, None)
-    import contextlib
-    import os
-    import signal
-    for inst in list(app_supervisor._instances.values()):
-        proc = inst.proc
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(Exception):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     app_supervisor._instances.clear()
     app_supervisor._locks.clear()
 
@@ -278,6 +265,12 @@ def test_an_export_floors_at_contributor_and_the_default_floor_is_never_stored(a
     assert v({"methods": {"m": {"description": "x", "min_role": "viewer"}},
               "snapshots": {"s": {"description": "y", "min_role": "manager"}}}) == {
         "methods": {"m": {"description": "x"}}, "snapshots": {"s": {"description": "y", "min_role": "manager"}}}
+    # The outside floor opens a method to outside people and is stored; a
+    # snapshot cannot be one.
+    assert v({"methods": {"book": {"description": "Book", "min_role": "external"}}}) == {
+        "methods": {"book": {"description": "Book", "min_role": "external"}}}
+    with pytest.raises(app_deploy.DeployError, match="only a method can be one"):
+        v({"snapshots": {"s": {"description": "y", "min_role": "external"}}})
 
 
 def test_the_shipped_templates_pass_the_validator_and_serve_what_they_declare():
@@ -322,9 +315,14 @@ def test_the_shipped_templates_pass_the_validator_and_serve_what_they_declare():
     assert booking["external"] == {"links": ["checkout.stripe.com"], "challenge": ["/register"],
                                    "session_days": 30}
     assert [a["method"] for a in booking["actions"]] == ["notifications.create"]
+    # Its caller half (2.0): the methods a caller's session reaches, each open
+    # to external identities, served at /api/<method>.
+    methods = booking["exports"]["methods"]
+    assert set(methods) == {"slots", "book", "mine"}
+    assert all(m["min_role"] == "external" for m in methods.values())
     server = (root / "booking" / "server" / "index.ts").read_text()
     for must in ("/egress/api.stripe.com/", "platform/notifications.create", "claim.session",
-                 "Bun.password.hash", "x-forwarded-host"):
+                 "Bun.password.hash", "x-forwarded-host", '"/api/book"', "claim.grant", "caller.verified"):
         assert must in server, must
     assert "process.env.STRIPE" not in server, "the key is the platform's, never the server's"
     page = (root / "booking" / "client" / "index.html").read_text()
@@ -408,6 +406,20 @@ def test_deploy_cuts_a_release_viewers_are_served_and_files_are_verified(agent_t
     (agent_tree / single["rel_path"]).write_text("<p>s</p>")
     _folder(agent_tree, "single")
     assert "single-file" in _hook("deploy", {"slug": "single"}).json()["detail"]
+
+
+def test_the_row_says_whether_the_release_that_waits_has_a_server(agent_tree):
+    manifest = {"title": "Board", "actions": [
+        {"id": "me", "label": "Who am I", "type": "platform", "method": "viewer.me"}]}
+    _folder(agent_tree, manifest=manifest, server=SERVER_OK)
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert body["status"] == "pending approval", body
+    shaped = client.get(f"/v1/apps/{body['app_id']}").json()
+    assert shaped["pending_release"] == 1 and shaped["has_server"] is False   # nothing is live yet
+    assert shaped["pending_has_server"] is True                               # what the approval card judges
+    _folder(agent_tree, "plain", manifest=manifest)
+    plain = _hook("deploy", {"slug": "plain"}).json()
+    assert client.get(f"/v1/apps/{plain['app_id']}").json()["pending_has_server"] is False
 
 
 def test_a_new_manifest_waits_for_approval_which_also_approves_it(agent_tree):
@@ -705,7 +717,6 @@ def test_pull_folder_brings_the_satellite_tree_within_the_caps(agent_tree, monke
         agent_name = AGENT
 
     monkeypatch.setattr(rff, "list_remote_entries", fake_list)
-    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
     monkeypatch.setattr(rff, "pull_through", fake_pull)
     monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
     monkeypatch.setattr(rff, "write_back_allowed", _may_write_back)
@@ -745,7 +756,6 @@ def test_pull_folder_refuses_a_missing_or_empty_folder_and_keeps_the_copy(
         agent_name = AGENT
 
     monkeypatch.setattr(rff, "list_remote_entries", fake_list)
-    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
     monkeypatch.setattr(rff, "pull_through", fake_pull)
     monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
     root = agent_tree / "users/alice/workspace/apps/board"
@@ -772,7 +782,6 @@ def test_pull_folder_never_drops_data_dotfiles_or_node_modules(agent_tree, monke
         agent_name = AGENT
 
     monkeypatch.setattr(rff, "list_remote_entries", fake_list)
-    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
     monkeypatch.setattr(rff, "pull_through", fake_pull)
     monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
     monkeypatch.setattr(rff, "write_back_allowed", _may_write_back)
@@ -804,7 +813,6 @@ def test_pull_folder_refuses_a_folder_the_session_may_not_write_back(agent_tree,
         agent_name = AGENT
 
     monkeypatch.setattr(rff, "list_remote_entries", fake_list)
-    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
     monkeypatch.setattr(rff, "pull_through", fake_pull)
     monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
     monkeypatch.setattr(rff, "write_back_allowed", held)
@@ -833,7 +841,6 @@ def test_pull_folder_removes_only_what_the_session_may_write_back(agent_tree, mo
         agent_name = AGENT
 
     monkeypatch.setattr(rff, "list_remote_entries", fake_list)
-    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
     monkeypatch.setattr(rff, "pull_through", fake_pull)
     monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
     monkeypatch.setattr(rff, "write_back_allowed", gate)
@@ -867,7 +874,6 @@ def test_pull_folder_keeps_what_the_machine_could_not_read(agent_tree, monkeypat
         agent_name = AGENT
 
     monkeypatch.setattr(rff, "list_remote_entries", fake_list)
-    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
     monkeypatch.setattr(rff, "pull_through", fake_pull)
     monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
     monkeypatch.setattr(rff, "write_back_allowed", _may_write_back)
@@ -884,73 +890,51 @@ def test_pull_folder_keeps_what_the_machine_could_not_read(agent_tree, monkeypat
     assert (root / "app.json").is_file()
 
 
-def test_pull_folder_removes_nothing_when_the_listing_cannot_vouch_for_absence(agent_tree, monkeypatch):
-    """A satellite whose listing may leave out files it has (the Windows
-    hash bug): the pulls land, the platform's other files stay."""
-    from core.remote import remote_file_flow as rff
-    board = "users/alice/workspace/apps/board"
-
-    async def fake_list(sid, prefix, *, report_skipped=False):
-        return [{"path": f"{board}/app.json", "size": 1}]
-
-    async def fake_pull(sid, rel):
-        p = agent_tree / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("{}")
-        return p
-
-    class Info:
-        agent_name = AGENT
-
-    monkeypatch.setattr(rff, "list_remote_entries", fake_list)
-    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: False)
-    monkeypatch.setattr(rff, "pull_through", fake_pull)
-    monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
-    monkeypatch.setattr(rff, "write_back_allowed", _may_write_back)
-    root = agent_tree / board
-    _write(root, {"client/maybe.js": "unlisted"})
-    assert asyncio.run(app_deploy.pull_folder("sid", board)) == 1
-    assert (root / "client" / "maybe.js").read_text() == "unlisted"
-
-
-@_needs_runtime
-def test_a_broken_server_leaves_the_previous_release_running(agent_tree):
-    """The pipeline itself, on one loop (a child process belongs to the loop
-    that spawned it — the proxy's single loop in production; the test
-    client's per-request loops would take it down between calls)."""
-    import httpx
+def test_a_broken_server_leaves_the_previous_release_running(agent_tree, placed, healthy):
+    """The pipeline itself, against the compute machine: a release whose
+    server the machine cannot start is refused and removed while the
+    previous one keeps serving, and a good one switches blue/green."""
     src = _folder(agent_tree, server=SERVER_OK)
     rel_dir = "users/alice/workspace/apps/board"
+    answers = placed.answer
+
+    def release_of(frame: dict) -> str:
+        return next(b["rel"] for b in frame["sandbox"]["binds"] if b["sandbox"] == "/app")
 
     async def run() -> None:
-        body = await app_deploy.deploy_folder(AGENT, "alice", "alice-sub", "board", src, rel_dir)
+        first = await app_deploy.deploy_folder(AGENT, "alice", "alice-sub", "board", src, rel_dir)
+        assert first["status"] == "pending approval" and first["adds_server"] is True, first
+        body = await app_deploy.approve_pending(task_store.get_app(first["app_id"]), "alice-sub")
         assert body["status"] == "ok" and body["release"] == 1, body
         row = task_store.get_app(body["app_id"])
         inst = app_supervisor.get(row["id"])
         assert inst is not None and inst.state == "up"
-        assert (await asyncio.to_thread(httpx.get, f"{inst.base_url}/")).text == "v1"
+        [first] = placed.of("app_server_start")
+        assert first["instance"] == "live" and release_of(first).endswith("/1")
         # A broken server: refused with the reason, release 1 keeps serving
         # on the same instance, the failed copy is gone.
         (src / "server" / "index.ts").write_text(SERVER_BROKEN)
+        placed.answer = lambda msg: (
+            RuntimeError("Satellite command error: The app server exited at once.\nboom")
+            if msg["type"] == "app_server_start" else answers(msg))
         with pytest.raises(app_deploy.DeployError) as e:
             await app_deploy.deploy_folder(AGENT, "alice", "alice-sub", "board", src, rel_dir)
-        assert "previous one keeps serving" in str(e.value)
+        assert "previous one keeps serving" in str(e.value) and "boom" in str(e.value)
         row = task_store.get_app(row["id"])
         assert releases.current_number(row) == 1 and releases.release_numbers(row) == [1]
-        assert app_supervisor.get(row["id"]) is inst and inst.state == "up"
-        assert (await asyncio.to_thread(httpx.get, f"{inst.base_url}/")).text == "v1"
-        # A good server switches blue/green: the new instance answers, the
-        # old one is stopped, the row points at the new release.
+        assert app_supervisor.get(row["id"]) is inst and inst.state == "up" and inst.proc.returncode is None
+        assert release_of(placed.of("app_server_start")[-1]).endswith("/2") and not placed.of("app_server_stop")
+        # A good server switches blue/green: the machine starts the new
+        # release, the old server is stopped, the row points at the new one.
+        placed.answer = answers
         (src / "server" / "index.ts").write_text(SERVER_OK.replace('"1"', '"2"'))
         body = await app_deploy.deploy_folder(AGENT, "alice", "alice-sub", "board", src, rel_dir)
         assert body["status"] == "ok" and body["release"] == 2  # the failed copy left no number behind
         fresh = app_supervisor.get(row["id"])
         assert fresh is not inst and fresh.state == "up" and inst.proc.returncode is not None
-        assert (await asyncio.to_thread(httpx.get, f"{fresh.base_url}/")).text == "v2"
+        assert release_of(placed.of("app_server_start")[-1]).endswith("/2")
+        assert [m["server_id"] for m in placed.of("app_server_stop")] == [first["server_id"]]
         assert app_deploy.status(task_store.get_app(row["id"]))["server"] == "up"
-        # The smoke starts the working tree apart and stops it.
-        report = await app_supervisor.smoke(row, src)
-        assert report["ok"] and app_supervisor.get(row["id"], "check") is None
         await app_supervisor.stop_all()
 
     asyncio.run(run())
@@ -1288,44 +1272,6 @@ def test_the_restore_validates_off_the_loop(agent_tree, monkeypatch):
     assert threads == [False]
 
 
-def test_the_database_snapshot_and_restore_never_follow_a_planted_link(tmp_path, monkeypatch):
-    """The data directory is the app's own to write: a link at the database's
-    name refuses the snapshot, and the restore replaces a link at the name
-    instead of writing through it."""
-    from services.apps import app_deploy
-    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
-    other = tmp_path / "other.db"
-    con = sqlite3.connect(other)
-    con.execute("CREATE TABLE t (x)")
-    con.execute("INSERT INTO t VALUES (1)")
-    con.commit()
-    con.close()
-    data = tmp_path / "a" / "app-data" / "slug"
-    data.mkdir(parents=True)
-    (data / "app.db").symlink_to(other)
-    with pytest.raises(app_deploy.DeployError):
-        app_deploy.snapshot_db(data / "app.db", tmp_path / "a" / "rel" / "db-before.sqlite")
-    (data / "app.db").unlink()
-    con = sqlite3.connect(data / "app.db")
-    con.execute("CREATE TABLE t (x)")
-    con.commit()
-    con.close()
-    (data / "app.db-shm").symlink_to(other)
-    with pytest.raises(app_deploy.DeployError):
-        app_deploy.snapshot_db(data / "app.db", tmp_path / "a" / "rel" / "db-before.sqlite")
-    (data / "app.db-shm").unlink()
-    assert app_deploy.snapshot_db(data / "app.db", tmp_path / "a" / "rel" / "db-before.sqlite")
-
-    victim = tmp_path / "victim.bin"
-    victim.write_bytes(b"keep")
-    (data / "app.db").unlink()
-    (data / "app.db").symlink_to(victim)
-    app_deploy.restore_db(tmp_path / "a" / "rel" / "db-before.sqlite", data / "app.db")
-    assert victim.read_bytes() == b"keep"
-    assert not (data / "app.db").is_symlink()
-    assert (data / "app.db").read_bytes()[:15] == b"SQLite format 3"
-
-
 # ── the folders an app needs made (files.create) ────────────────────────────
 
 FOLDER_APP = {"title": "Timeline", "files": {"read": ["workspace/videos/"],
@@ -1484,3 +1430,489 @@ def test_a_long_description_never_voids_a_release(agent_tree):
     r = client.post(f"/v1/apps/{row['id']}/rollback")
     assert r.status_code == 200 and r.json()["release"] == 1
     assert [a["id"] for a in json.loads(task_store.get_app(row["id"])["actions"])] == ["me"]
+
+
+def test_a_template_consent_approves_like_a_click_for_an_app_open_to_external_identities(agent_tree, monkeypatch):
+    """A seed or a template update approves on the installer's consent
+    (``approve_as``): for an app an agent opened to external identities it
+    never approves a folder they may not read, and a change in the methods
+    it opens to them tells the managers, as a person's approval does."""
+    from storage.agents import agent_store, outside_store
+    agent_store.create_agent(AGENT, "Deploy Agent", created_by="alice-sub")
+    told: list[dict] = []
+    monkeypatch.setattr("services.notifications.notification_manager.fire_from_thread",
+                        lambda **kw: told.append(kw))
+    book = {"book": {"description": "Book", "min_role": "external"}}
+    src = _folder(agent_tree, "booking", username="", manifest={"title": "Booking", "exports": {"methods": book}})
+    first = asyncio.run(app_deploy.deploy_folder(AGENT, "", None, "booking", src, "workspace/apps/booking",
+                                                 cold=True, approve_as="alice-sub"))
+    app_id = first["app_id"]
+    assert task_store.app_actions_approved(task_store.get_app(app_id))
+    outside_store.update(AGENT, add_apps=[{"app_id": app_id, "methods": ["book"]}])
+    # A template update that opens one more method: approved, the managers told.
+    (src / "app.json").write_text(json.dumps({"title": "Booking", "exports": {"methods": {
+        **book, "cancel": {"description": "Cancel", "min_role": "external"}}}}))
+    asyncio.run(app_deploy.deploy_folder(AGENT, "", None, "booking", src, "workspace/apps/booking",
+                                         cold=True, approve_as="alice-sub"))
+    assert task_store.app_actions_approved(task_store.get_app(app_id))
+    assert len(told) == 1 and "can use: cancel" in told[0]["body"]
+    assert outside_store.get_app_picks(AGENT)[app_id]["changed_at"]
+    # One that reads a workspace folder waits, with the folder rule's reason.
+    (src / "app.json").write_text(json.dumps({"title": "Booking", "exports": {"methods": book},
+                                              "files": {"read": ["workspace/reports"]}}))
+    out = asyncio.run(app_deploy.deploy_folder(AGENT, "", None, "booking", src, "workspace/apps/booking",
+                                               cold=True, approve_as="alice-sub"))
+    assert "cannot read workspace/reports" in out["consent_refused"], out
+    assert not task_store.app_actions_approved(task_store.get_app(app_id))
+
+
+def test_a_new_release_of_an_agent_whose_folder_is_a_link_is_refused_with_a_sentence(agent_tree, tmp_path):
+    # The install's operator made the agent's folder a link: the live release
+    # keeps serving with its approved manifest, and a new one is refused.
+    manifest = {"title": "Board", "actions": [
+        {"id": "me", "label": "Who am I", "type": "platform", "method": "viewer.me"}]}
+    _folder(agent_tree, manifest=manifest)
+    body = _hook("deploy", {"slug": "board"}).json()
+    _as(ALICE)
+    assert client.post(f"/v1/apps/{body['app_id']}/deploy/approve").status_code == 200
+    real = tmp_path / "disk2" / AGENT
+    real.parent.mkdir()
+    agent_tree.rename(real)
+    agent_tree.symlink_to(real)
+    try:
+        manifest["actions"].append({"id": "me2", "label": "Me again", "type": "platform", "method": "viewer.me"})
+        _folder(agent_tree, manifest=manifest, html="<p>v2</p>")
+        r = _hook("deploy", {"slug": "board"})
+        assert r.json()["detail"] == app_deploy.LINKED_AGENT_FOLDER, r.text
+        row = task_store.get_app(body["app_id"])
+        assert task_store.app_actions_approved(row) and releases.current_number(row) == 1
+        assert "<p>v1</p>" in _served(row["id"])
+    finally:
+        agent_tree.unlink()
+
+
+# ── a server that arrives (releases.adds_server) ────────────────────────────
+
+MEDIA_APP = {"title": "Board", "files": {"read": ["workspace/media"]},
+             "actions": [{"id": "m", "label": "Show", "type": "platform", "method": "files.media"}]}
+SHARED_REL = "workspace/apps/{slug}"
+
+
+def _shared(agent_tree: Path, manifest: dict | None = None, *, server: str | None = None,
+            slug: str = "board") -> Path:
+    return _folder(agent_tree, slug, username="", manifest=manifest, server=server)
+
+
+def _deploy_shared(slug: str = "board") -> dict:
+    return _hook("deploy", {"slug": slug, "visibility": "agent"}, sid=SID_SHARED).json()
+
+
+async def _deploy_direct(root: Path, slug: str = "board") -> dict:
+    return await app_deploy.deploy_folder(AGENT, "", None, slug, root, SHARED_REL.format(slug=slug))
+
+
+async def _first_with_server(root: Path, slug: str = "board") -> dict:
+    """A new app's first release with a server: it waits for a person, who
+    approves it here."""
+    first = await _deploy_direct(root, slug)
+    assert first["status"] == "pending approval" and first["adds_server"] is True, first
+    return await app_deploy.approve_pending(task_store.get_app(first["app_id"]), "alice-sub")
+
+
+def test_a_release_that_adds_a_server_waits_for_a_person(agent_tree, placed, healthy, monkeypatch, caplog):
+    """A client-only app approved and live; release 2 brings a server with
+    the manifest unchanged and the switch off: it waits on the card and
+    says why, a viewer cannot take it live, the person who may approve does
+    through the one route, and the server's next code change flows."""
+    told: list[str] = []
+
+    async def fire(title, body, **kw):
+        told.append(body)
+    monkeypatch.setattr("services.notifications.notification_manager.fire_notification", fire)
+    root = _shared(agent_tree, MEDIA_APP)
+    first = _deploy_shared()
+    assert first["status"] == "pending approval", first           # a new manifest waits
+    app_id = first["app_id"]
+    assert client.post(f"/v1/apps/{app_id}/deploy/approve").status_code == 200
+    _write(root, {"server/index.ts": SERVER_OK})
+    body = _deploy_shared()
+    assert body["status"] == "pending approval" and body["adds_server"] is True, body
+    assert body["manifest_changed"] is False and body["live_release"] == 1, body
+    assert "runs its own program on your OtoDock" in told[-1], told
+    status = client.get(f"/v1/apps/{app_id}/deploy/status").json()
+    assert status["adds_server"] is True and status["release"] == 1 and status["manifest_approved"]
+    assert client.get(f"/v1/apps/{app_id}").json()["pending_has_server"] is True
+    assert not placed.of("app_server_start")
+    _as(BOB)
+    assert client.post(f"/v1/apps/{app_id}/deploy/approve").status_code == 403
+    _as(ALICE)
+
+    async def run() -> None:
+        with caplog.at_level("INFO", logger="otodock.apps"):
+            out = await app_deploy.approve_pending(task_store.get_app(app_id), "alice-sub")
+        assert out["release"] == body["release"], out
+        assert f"release {body['release']} brings a server, approved by alice-sub" in caplog.text
+        assert app_supervisor.get(app_id).state == "up" and len(placed.of("app_server_start")) == 1
+        # The server is approved now: a change to its code goes live as before.
+        (root / "server" / "index.ts").write_text(SERVER_OK.replace('"1"', '"2"'))
+        again = await _deploy_direct(root)
+        assert again["status"] == "ok" and "adds_server" not in again, again
+        await app_supervisor.stop_all()
+
+    asyncio.run(run())
+
+
+def test_an_app_with_nothing_to_approve_that_gains_a_server_waits_too(agent_tree):
+    """A manifest with nothing in it is approved by definition, so the app
+    never showed a card: the release that brings its server waits all the
+    same, and a reject keeps the live release as it was."""
+    root = _shared(agent_tree)
+    first = _deploy_shared()
+    assert first["status"] == "ok", first
+    _write(root, {"server/index.ts": SERVER_OK})
+    body = _deploy_shared()
+    assert body["status"] == "pending approval" and body["adds_server"] is True, body
+    assert client.post(f"/v1/apps/{first['app_id']}/deploy/reject").status_code == 200
+    row = task_store.get_app(first["app_id"])
+    assert releases.current_number(row) == 1 and row["deploy_state"] == "idle" and not row["pending_release"]
+    assert task_store.app_actions_approved(row) and app_supervisor.get(row["id"]) is None
+
+
+def test_only_a_server_that_arrives_makes_a_release_wait(agent_tree, placed, healthy):
+    """Once a person approved the app's server, a renamed entry, a removed
+    server and a client-only release that replaces a waiting one go live as
+    before; a wait for another reason names no server."""
+    root = _shared(agent_tree, server=SERVER_OK)
+
+    async def run() -> dict:
+        first = await _first_with_server(root)
+        assert first["status"] == "ok" and "adds_server" not in first, first
+        (root / "server" / "index.ts").rename(root / "server" / "index.js")
+        assert (await _deploy_direct(root))["status"] == "ok"
+        shutil.rmtree(root / "server")
+        assert (await _deploy_direct(root))["status"] == "ok"
+        _write(root, {"server/index.ts": SERVER_OK})
+        waiting = await _deploy_direct(root)
+        assert waiting["status"] == "pending approval" and waiting["adds_server"] is True, waiting
+        shutil.rmtree(root / "server")
+        (root / "client" / "index.html").write_text("<p>v9</p>")
+        out = await _deploy_direct(root)
+        assert out["status"] == "ok" and out["superseded"] == waiting["release"], out
+        await app_supervisor.stop_all()
+        return first
+
+    app_id = asyncio.run(run())["app_id"]
+    app_supervisor._instances.clear()
+    app_supervisor._locks.clear()
+    task_store.set_deploy_state(app_id, requires_approval=True)
+    (root / "client" / "index.html").write_text("<p>v10</p>")
+    switch = _deploy_shared()
+    assert switch["status"] == "pending approval" and "adds_server" not in switch, switch
+    assert "adds_server" not in client.get(f"/v1/apps/{app_id}/deploy/status").json()
+    task_store.set_deploy_state(app_id, requires_approval=False)
+    (root / "app.json").write_text(json.dumps({"title": "Board", "egress": ["api.example.com"]}))
+    changed = _deploy_shared()
+    assert changed["status"] == "pending approval" and changed["manifest_changed"], changed
+    assert "adds_server" not in changed
+    assert "adds_server" not in client.get(f"/v1/apps/{app_id}/deploy/status").json()
+
+
+def test_a_live_copy_that_cannot_be_read_counts_as_no_server(agent_tree, placed, healthy):
+    """What cannot be read is judged closed: a live copy that is gone (the
+    next copy is byte for byte the gone one, under its number) or damaged
+    makes a release with a server wait."""
+    gone = _shared(agent_tree, server=SERVER_OK, slug="gone")
+    damaged = _shared(agent_tree, server=SERVER_OK, slug="damaged")
+
+    async def run() -> tuple[dict, dict]:
+        a = await _first_with_server(gone, "gone")
+        b = await _first_with_server(damaged, "damaged")
+        assert a["status"] == b["status"] == "ok", (a, b)
+        await app_supervisor.stop_all()
+        return a, b
+
+    a, b = asyncio.run(run())
+    app_supervisor._instances.clear()
+    app_supervisor._locks.clear()
+    row = task_store.get_app(a["app_id"])
+    shutil.rmtree(releases.app_release_dir(row) / "1")
+    out = _deploy_shared("gone")
+    assert out["status"] == "pending approval" and out["adds_server"] is True, out
+    row = task_store.get_app(b["app_id"])
+    (releases.app_release_dir(row) / "1" / releases.MANIFEST_NAME).write_text("{}")
+    (damaged / "client" / "index.html").write_text("<p>v2</p>")
+    out = _deploy_shared("damaged")
+    assert out["status"] == "pending approval" and out["adds_server"] is True, out
+
+
+def test_the_server_is_judged_against_the_release_live_under_the_lock(agent_tree, placed, healthy):
+    """A deploy that read the row while a server was live, and waited for
+    the lock while a rollback took that server away, judges the release
+    live when it holds the lock: its server arrives, so it waits."""
+    root = _shared(agent_tree)
+
+    async def run() -> None:
+        one = await _deploy_direct(root)
+        app_id = one["app_id"]
+        _write(root, {"server/index.ts": SERVER_OK})
+        two = await _deploy_direct(root)
+        assert two["status"] == "pending approval", two
+        await app_deploy.approve_pending(task_store.get_app(app_id), "alice-sub")
+        (root / "server" / "index.ts").write_text(SERVER_OK.replace('"1"', '"2"'))
+        lock = app_deploy._deploy_lock(app_id)
+        await lock.acquire()
+        deploy = asyncio.create_task(_deploy_direct(root))
+        for _ in range(500):
+            if lock._waiters:
+                break
+            await asyncio.sleep(0.01)
+        back = await app_deploy.rollback_folder(task_store.get_app(app_id), by_person=True)
+        assert back["release"] == 1, back
+        lock.release()
+        out = await deploy
+        assert out["status"] == "pending approval" and out["adds_server"] is True, out
+        await app_supervisor.stop_all()
+
+    asyncio.run(run())
+
+
+def test_the_rollback_reads_the_row_again_under_the_lock(agent_tree):
+    """The route hands the rollback a row read before the lock: a release
+    that started waiting since is seen, and the rollback is refused."""
+    root = _shared(agent_tree)
+    assert _deploy_shared()["status"] == "ok"
+    (root / "client" / "index.html").write_text("<p>v2</p>")
+    two = _deploy_shared()
+    assert two["status"] == "ok", two
+    stale = task_store.get_app(two["app_id"])
+    (root / "app.json").write_text(json.dumps({"title": "Board", "egress": ["api.example.com"]}))
+    assert _deploy_shared()["status"] == "pending approval"
+    with pytest.raises(app_deploy.DeployError, match="waiting for approval"):
+        asyncio.run(app_deploy.rollback_folder(stale, by_person=True))
+    assert releases.current_number(task_store.get_app(two["app_id"])) == 2
+
+
+def test_the_pending_notification_names_the_secret_and_the_switch_before_the_server(agent_tree, monkeypatch):
+    told: list[str] = []
+
+    async def fire(title, body, **kw):
+        told.append(body)
+    monkeypatch.setattr("services.notifications.notification_manager.fire_notification", fire)
+    _shared(agent_tree)
+    row = task_store.get_app(_deploy_shared()["app_id"])
+    asyncio.run(app_deploy._notify_pending(row, 2, adds_server=True))
+    assert told[-1].startswith("This release of the app runs its own program on your OtoDock."), told
+    asyncio.run(app_deploy._notify_pending(row, 2, lowers=True, adds_server=True))
+    assert told[-1].startswith("This release turns off approval for every deploy"), told
+    asyncio.run(app_deploy._notify_pending(row, 2, "API_KEY is not set", lowers=True, adds_server=True))
+    assert told[-1].startswith("API_KEY is not set: set it"), told
+
+
+def test_the_agents_rollback_never_brings_back_a_server_the_live_release_has_not(agent_tree, placed, healthy):
+    """The agent's rollback_app from a release without a server back to one
+    with a server is refused with a sentence; the person's Roll back from
+    the menu does it."""
+    root = _shared(agent_tree, server=SERVER_OK)
+
+    async def run() -> str:
+        one = await _first_with_server(root)
+        assert one["status"] == "ok", one
+        shutil.rmtree(root / "server")
+        assert (await _deploy_direct(root))["status"] == "ok"
+        await app_supervisor.stop_all()
+        return one["app_id"]
+
+    app_id = asyncio.run(run())
+    app_supervisor._instances.clear()
+    app_supervisor._locks.clear()
+    row = client.get(f"/v1/apps/{app_id}").json()
+    assert row["has_server"] is False and "rollback_adds_server" not in row, row
+    r = _hook("rollback", {"slug": "board", "visibility": "agent"}, sid=SID_SHARED)
+    assert r.status_code == 409, r.text
+    assert "A person rolls it back from the app's menu." in r.json()["detail"]
+    assert releases.current_number(task_store.get_app(app_id)) == 2
+    r = client.post(f"/v1/apps/{app_id}/rollback")
+    assert r.status_code == 200 and r.json()["release"] == 1, r.text
+
+
+def test_code_that_adds_a_server_runs_before_approval_on_empty_data_and_reaches_no_site(
+        agent_tree, placed, healthy, monkeypatch):
+    """The deploy's render of a release that adds a server, and the preview
+    of such a working tree at every start, run as code a person has not
+    approved: on empty data, and with none of the approved sites. Once a
+    person approved the release that brings it, the preview reaches them."""
+    from services.apps import app_render
+    seen: list[tuple[bool, bool]] = []
+
+    async def recording(row, tree_dir, *, approved, seed):
+        seen.append((approved, seed))
+        return app_render.RenderReport()
+
+    monkeypatch.setattr(app_render, "render_tree", recording)
+    monkeypatch.setattr(app_supervisor, "_allow_hosts", lambda row: ["203.0.113.7"])
+    root = _shared(agent_tree, {"title": "Board", "egress": ["api.example.com"]})
+    first = _deploy_shared()
+    app_id = first["app_id"]
+    assert client.post(f"/v1/apps/{app_id}/deploy/approve").status_code == 200
+    row = task_store.get_app(app_id)
+    data = releases.app_data_dir(row)
+    data.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(data / "app.db")
+    con.execute("CREATE TABLE t (x)")
+    con.commit()
+    con.close()
+    (root / "client" / "index.html").write_text("<p>v2</p>")
+    assert _deploy_shared()["status"] == "ok"
+    assert seen[-1] == (True, True), seen                     # code that goes live unasked
+    _write(root, {"server/index.ts": SERVER_OK})
+    assert _deploy_shared()["status"] == "pending approval"
+    assert seen[-1] == (False, False), seen
+
+    def last_start() -> str:
+        return json.dumps(placed.of("app_server_start")[-1])
+
+    async def run() -> None:
+        await app_deploy.cut_preview(task_store.get_app(app_id), root)
+        assert not (releases.preview_dir(row) / "data" / "app.db").exists()
+        await app_supervisor.start(task_store.get_app(app_id), app_supervisor.PREVIEW)
+        assert "203.0.113.7" not in last_start()
+        await app_supervisor.stop(app_id, app_supervisor.PREVIEW)
+        await app_supervisor.ensure_up(task_store.get_app(app_id), app_supervisor.PREVIEW)
+        assert "203.0.113.7" not in last_start()
+        await app_deploy.approve_pending(task_store.get_app(app_id), "alice-sub")
+        assert "203.0.113.7" in last_start()                   # the live server, approved
+        await app_deploy.cut_preview(task_store.get_app(app_id), root)
+        await app_supervisor.start(task_store.get_app(app_id), app_supervisor.PREVIEW)
+        assert "203.0.113.7" in last_start()
+        await app_supervisor.stop_all()
+
+    asyncio.run(run())
+
+
+def test_a_new_app_with_its_switch_on_and_a_server_names_the_server_too(agent_tree, monkeypatch):
+    """A first release is judged for its server like any other: a new app
+    with the approval switch on and a server waits for both, and the answer,
+    the notification and the status say it brings a server."""
+    told: list[str] = []
+
+    async def fire(title, body, **kw):
+        told.append(body)
+    monkeypatch.setattr("services.notifications.notification_manager.fire_notification", fire)
+    _shared(agent_tree, {"title": "Board", "deploy_requires_approval": True}, server=SERVER_OK)
+    body = _deploy_shared()
+    assert body["status"] == "pending approval" and body["adds_server"] is True, body
+    assert told and told[0].startswith("This release of the app runs its own program on your OtoDock."), told
+    assert client.get(f"/v1/apps/{body['app_id']}/deploy/status").json()["adds_server"] is True
+
+
+def test_a_new_app_whose_first_release_brings_a_server_waits_with_nothing_else_to_approve(
+        agent_tree, placed, healthy, monkeypatch):
+    """No app server goes live before a person said yes: a new app with an
+    empty manifest and a server waits on its card, says why, starts nothing,
+    and goes live with its server at the approval. A new app with no server
+    goes live as before."""
+    told: list[str] = []
+
+    async def fire(title, body, **kw):
+        told.append(body)
+    monkeypatch.setattr("services.notifications.notification_manager.fire_notification", fire)
+    _shared(agent_tree, server=SERVER_OK)
+    body = _deploy_shared()
+    assert body["status"] == "pending approval" and body["adds_server"] is True, body
+    assert body["manifest_changed"] is False and body["live_release"] == 0, body
+    assert told == ["This release of the app runs its own program on your OtoDock. Open the app to approve "
+                    "or reject it."], told
+    app_id = body["app_id"]
+    status = client.get(f"/v1/apps/{app_id}/deploy/status").json()
+    assert status["adds_server"] is True and status["manifest_approved"] and status["release"] == 0, status
+    assert not placed.of("app_server_start")
+
+    async def run() -> None:
+        out = await app_deploy.approve_pending(task_store.get_app(app_id), "alice-sub")
+        assert out["status"] == "ok" and out["release"] == 1, out
+        assert app_supervisor.get(app_id).state == "up" and len(placed.of("app_server_start")) == 1
+        await app_supervisor.stop_all()
+
+    asyncio.run(run())
+    plain = _shared(agent_tree, slug="plain")
+    assert plain.is_dir()
+    assert _deploy_shared("plain")["status"] == "ok"
+
+
+def test_an_unpinned_app_deployed_again_with_its_server_waits_again(agent_tree, placed, healthy):
+    """The agent's hard unpin removes the row and its approval: the next
+    deploy is a new app's first release, so its server waits once more."""
+    root = _shared(agent_tree, server=SERVER_OK)
+
+    async def run() -> None:
+        await _first_with_server(root)
+        await app_supervisor.stop_all()
+
+    asyncio.run(run())
+    app_supervisor._instances.clear()
+    app_supervisor._locks.clear()
+    assert _hook("unpin", {"slug": "board", "visibility": "agent"}, sid=SID_SHARED).json()["status"] == "ok"
+    again = _deploy_shared()
+    assert again["status"] == "pending approval" and again["adds_server"] is True, again
+
+
+def test_the_agents_rollback_between_two_releases_with_a_server_goes_on(agent_tree, placed, healthy):
+    """The refusal reads the live release too: from a release with a server
+    back to an older one with a server, the agent's rollback_app works as in
+    1.9.1."""
+    root = _shared(agent_tree, server=SERVER_OK)
+
+    async def run() -> str:
+        one = await _first_with_server(root)
+        assert one["status"] == "ok", one
+        (root / "server" / "index.ts").write_text(SERVER_OK.replace('"1"', '"2"'))
+        assert (await _deploy_direct(root))["status"] == "ok"
+        await app_supervisor.stop_all()
+        return one["app_id"]
+
+    app_id = asyncio.run(run())
+    app_supervisor._instances.clear()
+    app_supervisor._locks.clear()
+    r = _hook("rollback", {"slug": "board", "visibility": "agent"}, sid=SID_SHARED)
+    assert r.status_code == 200 and r.json()["release"] == 1, r.text
+    assert releases.current_number(task_store.get_app(app_id)) == 1
+
+
+def test_a_deploy_that_read_no_row_judges_the_release_a_deploy_before_it_took_live(agent_tree, monkeypatch):
+    """Two first deploys of one new slug: the one that read no row before the
+    lock finds, under the lock, a client-only release the other took live.
+    Its server arrives, so it waits."""
+    root = _shared(agent_tree)
+    first = _deploy_shared()
+    assert first["status"] == "ok", first
+    _write(root, {"server/index.ts": SERVER_OK})
+    real = task_store.get_app_by_slug
+    monkeypatch.setattr(task_store, "get_app_by_slug",
+                        lambda agent, username, slug: None if slug == "board" else real(agent, username, slug))
+    body = _deploy_shared()
+    assert body["status"] == "pending approval" and body["adds_server"] is True, body
+    assert releases.current_number(task_store.get_app(first["app_id"])) == 1
+
+
+def test_the_approval_names_the_copy_the_card_showed_by_its_tree(agent_tree):
+    """A number is handed out again after a reject: the card's click names
+    the waiting copy's tree too, so it never takes another copy live. A
+    click without it works as before."""
+    root = _shared(agent_tree, MEDIA_APP)
+    first = _deploy_shared()
+    app_id = first["app_id"]
+    shown = client.get(f"/v1/apps/{app_id}/deploy/status").json()["pending_sha"]
+    assert shown
+    assert client.post(f"/v1/apps/{app_id}/deploy/reject").status_code == 200
+    (root / "client" / "index.html").write_text("<p>another copy</p>")
+    second = _deploy_shared()
+    assert second["release"] == first["release"], second
+    sig = task_store.manifest_sig(task_store.get_app(app_id))
+    r = client.post(f"/v1/apps/{app_id}/deploy/approve", json={"release": second["release"], "sig": sig,
+                                                                "sha": shown})
+    assert r.status_code == 409 and "review it again" in r.json()["detail"], r.text
+    now = client.get(f"/v1/apps/{app_id}/deploy/status").json()["pending_sha"]
+    assert now and now != shown
+    r = client.post(f"/v1/apps/{app_id}/deploy/approve", json={"release": second["release"], "sig": sig,
+                                                                "sha": now})
+    assert r.status_code == 200, r.text

@@ -48,6 +48,9 @@ export interface Task {
   effective_model_tier?: number | null
   tier_label?: string
   pin_warnings?: string[]
+  // A user-scope task its own person cannot run: the refusal's sentence, for
+  // the notice on their row ('' otherwise; absent on an older proxy).
+  engine_notice?: string
   // A definition's kind — the words of TASK_KIND in lib/kinds/task.ts
   // (scheduled, one_time, trigger, continuation, app, delegate); absent on
   // an older proxy.
@@ -71,6 +74,10 @@ export interface Task {
   // Who is told: the lowest per-agent role an agent-scope task's
   // notifications reach. Optional: absent on an older proxy.
   notify_audience?: AgentRole
+  // A one-shot whose time passed with nothing left to run it: it fires on a
+  // Run, or is deleted, and is never shown as active. Optional: absent on an
+  // older proxy.
+  will_not_fire?: boolean
   can_run: boolean
   can_delete: boolean
   can_pause: boolean

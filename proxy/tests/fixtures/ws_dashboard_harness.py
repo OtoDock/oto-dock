@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from fastapi import WebSocketDisconnect
 
 from core.execution_layer import MachineReach, ResumeVerdict
+from tests import _engines
 
 # Every stub resolves models to this so frames are deterministic.
 TEST_MODEL = "test-model"
@@ -201,6 +202,16 @@ class FakeExecutionLayer:
         self.reconnect_waits: list[str] = []
         # Sessions whose machine's reconnect grace still holds them.
         self.grace_held: set[str] = set()
+        # Reads of what a session produced unread before a turn's row
+        # (``record_waiting_turns``); ``on_waiting_read`` acts as the engine's
+        # own turn being recorded there.
+        self.waiting_reads: list[str] = []
+        self.on_waiting_read = None
+
+    async def record_waiting_turns(self, sid: str) -> None:
+        self.waiting_reads.append(sid)
+        if self.on_waiting_read is not None:
+            self.on_waiting_read(sid)
 
     async def start_session(self, sid: str, agent_cfg) -> None:
         if self.start_gate is not None:
@@ -247,7 +258,8 @@ class FakeExecutionLayer:
 
     def prepare_config_dir(self, agent_name: str, *, username: str = "",
                            scope: str = "user", external_home=None,
-                           no_shell: bool = False, read_only: bool = False):
+                           no_shell: bool = False, read_only: bool = False,
+                           outside_picks=None, kind_rule=None):
         from core.layers.cli import config_dir as cli_cd
         return cli_cd.ensure_persistent_claude_dir(
             agent_name, username=username, scope=scope)
@@ -400,7 +412,7 @@ class FakeInteractiveSession:
         self.session_id = session_id
         self.chat_id = chat_id
         self.alive = True
-        self._turn_open = False  # read by streaming_chat_ids (connect snapshot)
+        self._turn_open = False  # read by lane_status.working_chat_ids (connect snapshot)
         self.target = "local"
         # read by the viewer's reset replays (ws/dashboard_pty._mirror_replay)
         self.is_remote = False
@@ -457,7 +469,9 @@ class FakeInteractiveSession:
     def resize(self, rows: int, cols: int) -> None:
         self.resizes.append((rows, cols))
 
-    def submit_prompt(self, text: str) -> None:
+    def submit_prompt(self, text: str, *, settle: bool = False, typed: bool = False) -> None:
+        # A person's own first message is typed as given (``typed``).
+        assert typed, "the warm-up's first message is a person's own"
         self.submitted.append(text)
 
     def set_pending_seed(self, digest: str) -> None:
@@ -466,6 +480,11 @@ class FakeInteractiveSession:
     async def close(self, *, reason: str = "closed") -> None:
         self.alive = False
         self.closed_reasons.append(reason)
+
+
+#: The compute machine that serves the platform's place in the harness.
+HARNESS_COMPUTE = {"id": "compute-0123456789ab", "name": "Compute", "pairing_scope": "compute",
+                   "satellite_version": "", "compute_address": ""}
 
 
 def stub_dashboard_seams(monkeypatch, fake_layer: FakeExecutionLayer):
@@ -477,15 +496,24 @@ def stub_dashboard_seams(monkeypatch, fake_layer: FakeExecutionLayer):
     """
     from core.session import session_manager as sm
     monkeypatch.setattr(sm, "_cli_layer", fake_layer)
-    monkeypatch.setitem(sm._LAYERS, "claude-code-cli", fake_layer)
+    _engines.hold(monkeypatch, "claude-code-cli", fake_layer)
 
     from services.remote import remote_status
     from storage import remote_store
     monkeypatch.setattr(remote_status, "resolve_execution_target",
                         lambda *a, **k: ("local", None))
+    # The platform's place is served by one compute machine, which the fake
+    # layer stands for: the builders place a session there, the layer lookup
+    # answers the fake for that placement, and a test that wants none
+    # connected patches ``serving_compute_machine`` to None.
     from core import placement as _placement
-    monkeypatch.setattr(remote_store, "placement_of",
-                        lambda *a, **k: _placement.LOCAL_PLACEMENT)
+    monkeypatch.setattr(remote_status, "serving_compute_machine",
+                        lambda *a, **k: dict(HARNESS_COMPUTE))
+    monkeypatch.setattr(
+        remote_store, "placement_of",
+        lambda *a, compute=None, **k: (_placement.from_machine(_placement.KIND_COMPUTE, compute)
+                                       if compute else _placement.LOCAL_PLACEMENT))
+    monkeypatch.setattr(sm, "_get_remote_layer", lambda: fake_layer)
 
     from core.config import config_builder as cb
     monkeypatch.setattr(cb.mcp_registry, "build_session_mcp_config",

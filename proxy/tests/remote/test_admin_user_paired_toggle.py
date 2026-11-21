@@ -206,7 +206,9 @@ def test_session_start_refuses_user_paired_when_disabled(monkeypatch):
          patch("storage.database.get_platform_setting",
                side_effect=lambda k: "0" if k == "allow_user_paired_machines" else ""):
         mock_store.get_agent.return_value = fake_agent
-        with pytest.raises(RuntimeError, match="disabled by admin"):
+        with pytest.raises(RuntimeError, match=(
+                "An admin turned off personal computers for agents. Ask an admin to turn them back on, "
+                "or pick another machine for this agent.")):
             get_execution_layer("test-agent", user_sub="user-1")
 
 

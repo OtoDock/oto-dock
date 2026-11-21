@@ -58,22 +58,24 @@ def _strip_toml_mcp_sections(toml: str, drop_keys: set[str]) -> str:
 def _resolve_satellite_mcp_path_info(slug: str):
     """Resolve an MCP slug → ``(category, satellite_name, platform_dir, manifest)``.
 
-    The satellite installs MCPs under ``mcps/<category>/<name>`` keyed on the
-    MANIFEST's ``category`` + ``name`` — which can disagree with the platform's
-    historical on-disk ``mcps/<dir-group>/<dir-name>`` layout (e.g.
-    ``custom/notifications-mcp`` on disk but ``category: core`` → installed at
-    ``core/notifications-mcp``; ``community/workspace-mcp`` dir but
-    ``name: google-workspace``). The remote path rewrite MUST use the manifest
-    values or the satellite spawns a binary at a path that doesn't exist and the
-    MCP fails to start. Shared by the JSON (Claude CLI) and TOML (Codex) twins
-    so both rewrite identically.
+    The satellite installs a tool under ``mcps/<category>/<key>``: the
+    manifest's ``category`` and the key the sync installs it under,
+    ``machine_tools.key_of`` (the tool's folder on the platform), which is the
+    one owner of that name. Both can differ from the platform's on-disk
+    ``mcps/<dir-group>/<dir-name>``: ``custom/notifications-mcp`` with
+    ``category: core`` is installed at ``core/notifications-mcp``, and the
+    folder ``custom/computer-mcp`` of the tool named ``computer-control`` is
+    installed at ``custom/computer-mcp``. The remote path rewrite uses these,
+    or the satellite spawns a program at a path that does not exist and the
+    tool fails to start. Shared by the JSON (Claude CLI) and TOML (Codex)
+    twins so both rewrite identically.
 
-    ``slug`` is the mcpServers key / TOML ``[mcp_servers.<slug>]`` section name —
-    the manifest's ``server_name`` (or ``name``). Resolve by name first, then
-    scan by ``server_name``; ``satellite_name`` is the manifest's canonical name
-    when found via the server_name fallback, else the slug.
+    ``slug`` is the mcpServers key / TOML ``[mcp_servers.<slug>]`` section name,
+    the manifest's ``server_name`` (or ``name``): resolved by name first, then
+    by ``server_name``. Without a manifest ``satellite_name`` is the slug.
     """
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_manifest_store, mcp_registry
+    from services.remote import machine_tools
     sat_category = ""
     sat_name = slug
     platform_dir = ""
@@ -81,52 +83,46 @@ def _resolve_satellite_mcp_path_info(slug: str):
     try:
         manifest = mcp_registry.get_manifest(slug)
         if manifest is None:
-            for m in mcp_registry._manifests.values():
-                if getattr(m, "server_name", "") == slug:
-                    manifest = m
-                    sat_name = m.name
-                    break
+            manifest = next((m for m in mcp_manifest_store._manifests.values()
+                             if getattr(m, "server_name", "") == slug), None)
         if manifest is not None:
             sat_category = manifest.category or ""
+            sat_name = machine_tools.key_of(manifest)
             platform_dir = str(manifest.mcp_dir.resolve())
     except OSError:
         pass
     return sat_category, sat_name, platform_dir, manifest
 
 
-def _gateway_json_entry(
-    server: dict, name: str, facts: dict, sat_port: int, session_id: str, gateway_mode: bool,
-) -> dict:
+def _gateway_json_entry(server: dict, name: str, facts: dict, sat_port: int, session_id: str) -> dict:
     """A credential-gateway entry (``mcp_gateway.entry_url``) as the
     satellite config carries it: a sidecar keeps the tunnel's
     ``/mcp/<name>/`` shape with the session id (the tunnel's forward adds
-    the credential there); a vendor entry dials the machine's own loopback
-    gateway when the machine runs one, and otherwise keeps the inline shape
-    (the vendor URL and the header's value) until the machine updates. The
-    Authorization sentinel stays where the session token belongs and is
-    removed where it does not: no vendor ever receives a session token."""
+    the credential there), and a vendor entry dials the machine's own
+    loopback gateway, which adds the vendor's credential. The Authorization
+    sentinel stays, so the session token reaches the tunnel or the gateway
+    and never a vendor."""
     path = facts.get("path") or "/"
-    headers = dict(server.get("headers") or {})
     if facts.get("proxy_local") or facts.get("tunneled"):
         sess = f"?session_id={session_id}" if session_id else ""
         server["url"] = f"http://127.0.0.1:{sat_port}/mcp/{name}{path}{sess}"
-    elif gateway_mode:
-        server["url"] = f"http://127.0.0.1:{sat_port}{GATEWAY_PATH_PREFIX}/{name}{path}"
     else:
-        server["url"] = f"{facts.get('upstream', '')}{path}"
-        headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
-        if facts.get("value"):
-            headers[str(facts.get("header") or "Authorization")] = str(facts["value"])
-        server["headers"] = headers
-        if not headers:
-            server.pop("headers", None)
+        server["url"] = f"http://127.0.0.1:{sat_port}{GATEWAY_PATH_PREFIX}/{name}{path}"
     return server
+
+
+def _callback_bearer(proxy_api_key: str) -> str:
+    """The token the sentinel becomes: the callback kind with the session
+    token's claims; the given key itself when it is no live session token
+    (a test's placeholder word)."""
+    from auth.session_token import callback_token_for
+    return callback_token_for(proxy_api_key) or proxy_api_key
 
 
 def _rewrite_mcp_json_for_remote(
     mcp_config: dict, sat_port: int, *, target_os: str = "linux",
     session_id: str = "", secret_bundle_keys: set | frozenset = frozenset(),
-    proxy_api_key: str = "", gateway: dict | None = None, gateway_mode: bool = False,
+    proxy_api_key: str = "", gateway: dict | None = None,
 ) -> dict:
     """Rewrite JSON MCP config (CLI format) for remote execution.
 
@@ -149,7 +145,7 @@ def _rewrite_mcp_json_for_remote(
 
         facts = (gateway or {}).get(name) if "url" in server else None
         if facts is not None and gateway_key_of(server["url"]) == name:
-            server = _gateway_json_entry(server, name, facts, sat_port, session_id, gateway_mode)
+            server = _gateway_json_entry(server, name, facts, sat_port, session_id)
         # Rewrite SSE/HTTP URLs to point at the satellite's local tunnel.
         # `name` here is the mcpServers key — that's the same slug used
         # in the tunnel allowlist `/mcp/<slug>/...`.
@@ -238,17 +234,25 @@ def _rewrite_mcp_json_for_remote(
         if "env" in server and sat_port:
             server["env"] = _rewrite_env_for_remote(server["env"], sat_port)
 
-        # Per-session JWT for Docker MCPs that call back to the proxy hooks
-        # (file-tools, server.proxy_callbacks) and for every gateway entry
-        # that keeps the sentinel. The shared build config carries the
-        # sentinel bearer; overwrite it with the real session JWT
-        # (proxy_api_key already IS one, minted per-session above). The
-        # tunnel forwards it unchanged and the proxy judges it.
+        # The shared build config carries a sentinel bearer: a gateway
+        # entry's (the session sentinel) becomes the session's own token,
+        # which the machine's gateway table is keyed by; a Docker tool's
+        # callback entry's (the callback sentinel) becomes the callback kind
+        # minted from it (the container arrives on the public listener,
+        # where a session token reaches nothing), the key itself where it is
+        # no live token (a test's word).
         if proxy_api_key:
-            from auth.session_token import SESSION_JWT_SENTINEL_BEARER
+            from auth.session_token import (
+                CALLBACK_JWT_SENTINEL_BEARER,
+                SESSION_JWT_SENTINEL_BEARER,
+            )
             headers = dict(server.get("headers") or {})
-            if headers.get("Authorization") == SESSION_JWT_SENTINEL_BEARER:
+            auth = headers.get("Authorization")
+            if auth == SESSION_JWT_SENTINEL_BEARER:
                 headers["Authorization"] = f"Bearer {proxy_api_key}"
+                server["headers"] = headers
+            elif auth == CALLBACK_JWT_SENTINEL_BEARER:
+                headers["Authorization"] = f"Bearer {_callback_bearer(proxy_api_key)}"
                 server["headers"] = headers
 
         rewritten[name] = server
@@ -277,21 +281,18 @@ def _rewrite_mcp_toml_for_remote(
     toml_content: str, sat_port: int, *, target_os: str = "linux",
     session_id: str = "", proxy_api_key: str = "",
     secret_bundle_keys: set | frozenset = frozenset(),
-    gateway: dict | None = None, gateway_mode: bool = False,
+    gateway: dict | None = None,
 ) -> str:
     """Rewrite TOML MCP config (Codex format) for remote execution.
 
     - ``command``/``args`` platform mcps paths → the satellite install path,
-      resolved category/name-aware via ``_resolve_satellite_mcp_path_info`` +
-      ``_rewrite_stdio_paths`` (the exact logic the JSON/CLI twin uses). A naive
-      global ``mcps`` prefix swap is WRONG here: it preserves the on-disk
-      dir-group/name, but the satellite installs under
-      ``mcps/<manifest-category>/<manifest-name>`` — so every MCP whose dir-group
-      ≠ category (``custom/`` dir + ``core`` category: memory/task/display/
-      meetings/triggers/location/notifications/...) or whose dir-name ≠ name
-      (``workspace-mcp`` → ``google-workspace``) got a non-existent path and
-      failed to start under Codex. (Claude was immune — its JSON twin always
-      resolved via the manifest.)
+      by category and folder via ``_resolve_satellite_mcp_path_info`` +
+      ``_rewrite_stdio_paths`` (the exact logic the JSON/CLI twin uses). A plain
+      global ``mcps`` prefix swap is wrong here: it keeps the on-disk dir-group,
+      but the satellite installs under ``mcps/<manifest-category>/<folder>``, so
+      every MCP whose dir-group ≠ category (``custom/`` dir + ``core`` category:
+      memory/task/display/meetings/triggers/location/notifications/...) would
+      get a path that does not exist and fail to start under Codex.
     - ``url = "http://localhost:<port>/<path>"`` → satellite tunnel URL
       (loopback Docker MCPs only; slug comes from the ``[mcp_servers.<slug>]``
       header so the tunnel path matches the allowlist regex); a
@@ -310,7 +311,10 @@ def _rewrite_mcp_toml_for_remote(
     """
     import re
 
-    from auth.session_token import SESSION_JWT_SENTINEL_BEARER
+    from auth.session_token import (
+        CALLBACK_JWT_SENTINEL_BEARER,
+        SESSION_JWT_SENTINEL_BEARER,
+    )
     from core.config import deployment
     from services.mcp import mcp_registry
 
@@ -332,14 +336,6 @@ def _rewrite_mcp_toml_for_remote(
 
     def _esc(v: str) -> str:
         return v.replace("\\", "\\\\").replace('"', '\\"')
-
-    # The inline shape's header line per slug: a vendor entry on a machine
-    # below the gateway version.
-    inline_headers: dict[str, tuple[str, str]] = {
-        slug: (str(f.get("header") or "Authorization"), str(f.get("value") or ""))
-        for slug, f in (gateway or {}).items()
-        if not f.get("proxy_local") and not f.get("tunneled") and not gateway_mode
-    }
 
     out_lines: list[str] = []
     current_slug: str | None = None
@@ -380,7 +376,7 @@ def _rewrite_mcp_toml_for_remote(
         if um and facts is not None and gateway_key_of(
                 f"{um.group(2)}{um.group(3)}{um.group(4) or ''}{um.group(5) or ''}") == current_slug:
             entry = _gateway_json_entry(
-                {"url": "", "headers": {}}, cast("str", current_slug), facts, sat_port, session_id, gateway_mode,
+                {"url": ""}, cast("str", current_slug), facts, sat_port, session_id,
             )
             out_lines.append(f'{um.group(1)}{_esc(entry["url"])}{um.group(6)}{nl}')
             continue
@@ -405,7 +401,7 @@ def _rewrite_mcp_toml_for_remote(
                 )
                 continue
 
-        # command / args → category/name-aware satellite path. Only swaps path
+        # command / args → the satellite path by category and folder. Only swaps path
         # prefixes (never introduces quotes/backslashes), so the TOML escaping of
         # the original value is preserved as-is.
         if current_slug:
@@ -443,8 +439,9 @@ def _rewrite_mcp_toml_for_remote(
         # subprocesses, so every callback MCP needs these here (see docstring).
         # HTTP MCPs have no env block → naturally skipped.
         em = env_re.match(body)
-        if em and sat_port and proxy_api_key:
+        if em:
             head, inner, trail = em.group(1), em.group(2), em.group(3)
+            callbacks = bool(sat_port and proxy_api_key)
             # Codex gates configured MCP **tool calls** natively, via the
             # mcpServer/elicitation/request approval (handled by the codex
             # approval bridge → decide_tool_permission) — NOT via a transport
@@ -464,44 +461,36 @@ def _rewrite_mcp_toml_for_remote(
             # (config_builder only injects PROXY_API_KEY) so it's added fresh
             # here, correctly pointing at the satellite tunnel.
             pairs = []
-            if '"PROXY_URL"' not in inner:
+            if callbacks and '"PROXY_URL"' not in inner:
                 pairs.append(("PROXY_URL", f"http://127.0.0.1:{sat_port}"))
-            if '"PROXY_API_KEY"' not in inner:
+            if callbacks and '"PROXY_API_KEY"' not in inner:
                 pairs.append(("PROXY_API_KEY", proxy_api_key))
-            if current_slug in secret_bundle_keys and '"OTO_MCP_FETCH_TOKEN"' not in inner:
+            if callbacks and current_slug in secret_bundle_keys and '"OTO_MCP_FETCH_TOKEN"' not in inner:
                 from core.credentials import mcp_broker
                 pairs.append((
                     "OTO_MCP_FETCH_TOKEN",
                     mcp_broker.mint_token(session_id, cast("str", current_slug)),
                 ))
             if not pairs:
-                out_lines.append(line)
+                out_lines.append(f'{head}{inner}}}{trail}{nl}')
                 continue
             adds = ", ".join(f'"{k}" = "{_esc(v)}"' for k, v in pairs)
             sep = "" if inner.strip() == "" else ", "
             out_lines.append(f'{head}{inner.rstrip()}{sep}{adds} }}{trail}{nl}')
             continue
 
-        # The inline shape: a vendor entry below the gateway version carries
-        # its header's value where the sentinel stood; an empty value drops
-        # the line (the vendor answers the MCP), and no session token ever
-        # reaches a vendor.
+        # The sentinel bearers, as the JSON twin above swaps them: a gateway
+        # entry's for the session's own token, a Docker tool's callback
+        # entry's for the callback kind minted from it.
         am2 = auth_re.match(body)
-        if am2 and current_slug in inline_headers:
-            header, value = inline_headers[current_slug]
-            if value:
-                out_lines.append(
-                    f'{am2.group(1)}"{_esc(header)}" = "{_esc(value)}"{am2.group(2)}{nl}'
-                )
-            continue
-
-        # Per-session JWT for Docker MCPs that call back to the proxy hooks
-        # (file-tools, server.proxy_callbacks) and for every gateway entry
-        # that keeps the sentinel: swap it for the real session JWT; the
-        # tunnel forwards it unchanged and the proxy judges it.
         if am2 and proxy_api_key and SESSION_JWT_SENTINEL_BEARER in body:
             out_lines.append(
-                f'{am2.group(1)}"Authorization" = "Bearer {_esc(proxy_api_key)}"'
+                f'{am2.group(1)}"Authorization" = "Bearer {_esc(proxy_api_key)}"{am2.group(2)}{nl}'
+            )
+            continue
+        if am2 and proxy_api_key and CALLBACK_JWT_SENTINEL_BEARER in body:
+            out_lines.append(
+                f'{am2.group(1)}"Authorization" = "Bearer {_esc(_callback_bearer(proxy_api_key))}"'
                 f'{am2.group(2)}{nl}'
             )
             continue
@@ -537,13 +526,12 @@ def _rewrite_stdio_paths(
     path that doesn't exist and MCP init fails.
 
     ``platform_dir`` is the manifest's absolute on-disk source directory
-    (e.g. ``/<platform>/mcps/community/workspace-mcp``). When provided,
-    we do an exact-prefix substitution to ``~/<otodock>/mcps/<cat>/<name>``
-    — load-bearing for MCPs whose manifest ``name`` differs from the
-    platform dir name (e.g. ``workspace-mcp`` dir / ``google-workspace``
-    manifest name). The earlier regex variant matched
-    ``<platform_mcps>/<any-cat>/<mcp_name>`` and would silently miss
-    those, leaving Linux paths in the satellite config.
+    (e.g. ``/<platform>/mcps/community/workspace-mcp``). When provided, it is
+    swapped as an exact prefix for ``~/<otodock>/mcps/<cat>/<mcp_name>``, where
+    ``mcp_name`` is the folder key ``_resolve_satellite_mcp_path_info`` gives
+    (``machine_tools.key_of``): a tool whose manifest ``name`` differs from its
+    folder (``workspace-mcp`` / ``google-workspace``) keeps its folder, and the
+    platform's Linux path never reaches the satellite config.
 
     Falls back to plain prefix swap when ``platform_dir`` is empty.
     """
@@ -578,7 +566,6 @@ def _rewrite_env_for_remote(env: dict, sat_port: int) -> dict:
     no path is included here.
     """
     rewritten = dict(env)
-    for key, value in rewritten.items():
-        if isinstance(value, str) and key == "PROXY_URL":
-            rewritten[key] = f"http://127.0.0.1:{sat_port}"
+    if isinstance(rewritten.get("PROXY_URL"), str):
+        rewritten["PROXY_URL"] = f"http://127.0.0.1:{sat_port}"
     return rewritten

@@ -1,9 +1,6 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { createPortal } from 'react-dom'
 import type { DocumentVersion } from '@/api/documents'
-import { pushEscHandler } from '@/lib/escStack'
-import { usePortalRoot } from '@/components/ui/portalRoot'
-import { anchorBoxOf, usePopoverPlacement, type AnchorBox } from '@/components/ui/popoverPosition'
+import { usePortalMenu } from '@/hooks/usePortalMenu'
 import { pushTime } from './documentTabs'
 import { POPOVER } from '../../ui/classes'
 
@@ -22,76 +19,15 @@ interface Props {
 /**
  * The Versions button of the document pane and its menu: "Live" first, then
  * every version of the file in this chat, newest first ("Version N", its
- * time, the turn). Portaled (the pane clips), a radio menu by keyboard
- * (arrows, Home, End, Enter, Space; Tab and Esc close it and give the focus
- * back to the button), closed by a press outside, a resize, a scroll or the
- * window losing focus (a press inside the editor).
+ * time, the turn). A radio menu by keyboard (arrows, Home, End, Enter,
+ * Space; Tab and Esc close it and give the focus back to the button), on
+ * `usePortalMenu` with the pane's options menu: also closed by the window's
+ * blur (a press in the editor), a resize or a scroll that moves the button.
  */
 export default function DocumentVersionsMenu({ versions, current, failed, livePermissions, onPick }: Props) {
-  const [anchor, setAnchor] = useState<AnchorBox | null>(null)
-  const open = anchor !== null
-  const buttonRef = useRef<HTMLButtonElement | null>(null)
-  const panelRef = useRef<HTMLDivElement | null>(null)
-  const portalRoot = usePortalRoot()
-  const placement = usePopoverPlacement(anchor, panelRef, { align: 'right' })
-
-  const close = (refocus = true) => {
-    setAnchor(null)
-    if (refocus) buttonRef.current?.focus()
-  }
-  const toggle = () => {
-    if (anchor) { close(); return }
-    const rect = buttonRef.current?.getBoundingClientRect()
-    if (rect) setAnchor(anchorBoxOf(rect))
-  }
-
-  useEffect(() => {
-    if (!open) return
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node
-      if (!panelRef.current?.contains(t) && !buttonRef.current?.contains(t)) close(false)
-    }
-    const onMove = () => close(false)
-    // Only a scroll that moves the button: not the menu's own list, not the
-    // chat streaming beside the pane.
-    const onScroll = (e: Event) => {
-      const btn = buttonRef.current
-      if (e.target instanceof Node && btn && !e.target.contains(btn)) return
-      close(false)
-    }
-    document.addEventListener('mousedown', onDown)
-    window.addEventListener('resize', onMove)
-    window.addEventListener('scroll', onScroll, true)
-    window.addEventListener('blur', onMove)
-    const popEsc = pushEscHandler(() => close(), () => panelRef.current)
-    return () => {
-      document.removeEventListener('mousedown', onDown)
-      window.removeEventListener('resize', onMove)
-      window.removeEventListener('scroll', onScroll, true)
-      window.removeEventListener('blur', onMove)
-      popEsc()
-    }
-  }, [open])
-
-  // Focus the checked item when the menu opens.
-  useEffect(() => {
-    if (!open || !placement) return
-    const items = panelRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]:not([disabled])')
-    const checked = panelRef.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]')
-    ;(checked ?? items?.[0])?.focus()
-  }, [open, placement])
-
-  const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
-    const items = Array.from(panelRef.current?.querySelectorAll<HTMLButtonElement>(
-      '[role="menuitemradio"]:not([disabled])') ?? [])
-    const at = items.indexOf(document.activeElement as HTMLButtonElement)
-    const move = (i: number) => { e.preventDefault(); items[(i + items.length) % items.length]?.focus() }
-    if (e.key === 'ArrowDown') move(at + 1)
-    else if (e.key === 'ArrowUp') move(at - 1)
-    else if (e.key === 'Home') move(0)
-    else if (e.key === 'End') move(items.length - 1)
-    else if (e.key === 'Tab') { e.preventDefault(); close() }
-  }
+  const { open, buttonRef, panelRef, style, portalRoot, close, toggle, onKeyDown } = usePortalMenu({
+    align: 'right', items: '[role="menuitemradio"]', focus: '[aria-checked="true"]:not([disabled])', closeOnMove: true,
+  })
 
   const pick = (snapshotId: string | null) => {
     close()
@@ -119,16 +55,13 @@ export default function DocumentVersionsMenu({ versions, current, failed, livePe
           <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
         </svg>
       </button>
-      {anchor && createPortal(
+      {open && createPortal(
         <div
           ref={panelRef}
           role="menu"
           aria-label="Versions"
           onKeyDown={onKeyDown}
-          style={{
-            position: 'fixed', zIndex: 60, top: placement?.top ?? 0, left: placement?.left ?? 0,
-            visibility: placement ? 'visible' : 'hidden',
-          }}
+          style={style}
           className={`w-60 max-h-80 overflow-y-auto ${POPOVER} py-1`}
         >
           <button type="button" role="menuitemradio" aria-checked={!current} className={item} onClick={() => pick(null)}>

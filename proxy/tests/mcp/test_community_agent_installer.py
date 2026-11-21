@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -1914,6 +1916,48 @@ class TestDashboardSeeding:
                 if a["slug"] == "my-brief"]
         assert len(rows) == 1
 
+    def test_a_late_joiners_copy_is_never_written_through_a_link(self, tmp_path, temp_db):
+        import config as app_config
+        from services.community.community_agent_installer import on_user_added_to_agent
+        from storage import database as db
+        self._install_dash(
+            tmp_path,
+            dashboards=[{"slug": "my-brief", "file": "brief.html", "visibility": "user"}],
+            dashboard_files={"brief.html": "<h1>Brief</h1>"},
+        )
+        agent_dir = app_config.get_agent_dir("dash-agent")
+        victim = agent_dir / "workspace" / "victim.html"
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_text("keep")
+        _make_user("bob-sub", "bob@test.com")
+        db.add_user_agent("bob-sub", "dash-agent", "viewer", "test")
+        bob = db.get_username_by_sub("bob-sub")
+        apps = agent_dir / "users" / bob / "workspace" / "apps"
+        apps.mkdir(parents=True, exist_ok=True)
+        (apps / "my-brief.html").unlink(missing_ok=True)
+        (apps / "my-brief.html").symlink_to(victim)
+        assert on_user_added_to_agent("dash-agent", "bob-sub", "viewer")["dashboards"] == 1
+        assert victim.read_text() == "keep" and not (apps / "my-brief.html").is_symlink()
+        # A linked folder on the way: nothing written, nothing pinned.
+        _make_user("carol-sub", "carol@test.com")
+        db.add_user_agent("carol-sub", "dash-agent", "viewer", "test")
+        carol = db.get_username_by_sub("carol-sub")
+        elsewhere = agent_dir / "workspace" / "elsewhere"
+        elsewhere.mkdir()
+        carol_ws = agent_dir / "users" / carol / "workspace"
+        carol_ws.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(carol_ws / "apps", ignore_errors=True)
+        (carol_ws / "apps").symlink_to(elsewhere)
+        assert on_user_added_to_agent("dash-agent", "carol-sub", "viewer")["dashboards"] == 0
+        assert list(elsewhere.iterdir()) == [] and db.get_app_by_slug("dash-agent", carol, "my-brief") is None
+        # A source copy that is a link is not read.
+        src = agent_dir / "config" / "community" / "dashboards" / "my-brief.html"
+        src.unlink()
+        src.symlink_to(victim)
+        _make_user("dave-sub", "dave@test.com")
+        db.add_user_agent("dave-sub", "dash-agent", "viewer", "test")
+        assert on_user_added_to_agent("dash-agent", "dave-sub", "viewer")["dashboards"] == 0
+
     def test_auto_pin_opt_out_skips_late_joiners(self, tmp_path, temp_db):
         from services.community.community_agent_installer import on_user_added_to_agent
         from storage import database as db
@@ -2039,6 +2083,91 @@ def _enabled_model(layer: str) -> str:
     return "pin-test-model"
 
 
+class TestTaskModeAndTimeout:
+    """``permission_mode`` and ``timeout_seconds`` on a template task
+    (``services/scheduler/task_fields``, ``permission_modes.stored_mode``):
+    a template's task names only what ``edit_task`` itself could set."""
+
+    def test_stored_mode_holds_the_columns_words(self):
+        from core.permission_modes import AUTO_REVIEW_MODE, stored_mode
+        assert stored_mode(None) == "" and stored_mode("") == "" and stored_mode("dontAsk") == ""
+        assert stored_mode("autoReview") == AUTO_REVIEW_MODE
+        assert stored_mode("bypassPermissions") is None and stored_mode(1) is None
+
+    def test_clean_timeout_holds_the_bounds(self):
+        from services.scheduler.task_fields import clean_timeout
+        assert clean_timeout(None) == 600 and clean_timeout("") == 600
+        assert clean_timeout(60) == 60 and clean_timeout(7200) == 7200
+        assert clean_timeout(59) is None and clean_timeout(7201) is None
+        assert clean_timeout("600") is None and clean_timeout(True) is None and clean_timeout(1.5) is None
+
+    def test_auto_is_refused_on_an_engine_with_no_reviewer(self):
+        from services.scheduler import task_fields
+        no_review = SimpleNamespace(permission_modes=("ask",))
+        with patch("core.session.session_manager.get_layer_capabilities", return_value=no_review), \
+                patch("core.session.session_manager.resolve_execution_path", return_value="direct-llm"):
+            assert "Auto needs an engine with its own review; direct-llm has none" in \
+                task_fields.mode_problem("agent", None, "autoReview")
+            assert task_fields.mode_problem("agent", None, "") == ""
+            assert task_fields.mode_problem("agent", None, None) == ""
+
+    def test_the_fields_parse_persist_and_an_old_record_keeps_the_defaults(self, tmp_path, temp_db):
+        from services.community.community_agent_template_store import (
+            load_template_from_dict,
+            load_template_from_dir,
+            template_to_persistable_dict,
+        )
+        tdir = _write_template(tmp_path, slug="mode-parse", tasks=[
+            _pinned_task(permission_mode="autoReview", timeout_seconds=1800),
+            _pinned_task(slug="plain-task", permission_mode="dontAsk"),
+            _pinned_task(slug="bare-task")])
+        template = load_template_from_dir(tdir)
+        assert [(t.permission_mode, t.timeout_seconds) for t in template.tasks] == \
+            [("autoReview", 1800), ("", 600), ("", 600)]
+        record = template_to_persistable_dict(template)
+        again = load_template_from_dict(record).tasks
+        assert [(t.permission_mode, t.timeout_seconds) for t in again] == \
+            [("autoReview", 1800), ("", 600), ("", 600)]
+        # A record written before these keys existed reads as today's rows.
+        for item in record["tasks"]:
+            item.pop("permission_mode")
+            item.pop("timeout_seconds")
+        old = load_template_from_dict(record).tasks
+        assert [(t.permission_mode, t.timeout_seconds) for t in old] == [("", 600)] * 3
+
+    @pytest.mark.parametrize(("field", "value", "words"), [
+        ("permission_mode", "bypassPermissions", "invalid mode"),
+        ("timeout_seconds", 30, "from 60 to 7200"),
+        ("timeout_seconds", 7201, "from 60 to 7200"),
+    ])
+    def test_a_word_or_a_timeout_out_of_bounds_is_refused(self, tmp_path, temp_db, field, value, words):
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
+        )
+        tdir = _write_template(tmp_path, slug="mode-bad", tasks=[_pinned_task(**{field: value})])
+        with pytest.raises(TemplateValidationError, match=words):
+            load_template_from_dir(tdir)
+
+    def test_a_mode_and_timeout_reach_the_seeded_row(self, tmp_path, temp_db):
+        from storage import database as db
+        out = _install_pinned(tmp_path, _pinned_task(permission_mode="autoReview", timeout_seconds=1800))
+        assert out["task_pins_dropped"] == []
+        row = next(t for t in db.list_dynamic_tasks(agent="pin-agent")
+                   if t["community_template_item_slug"] == "weekly-brief")
+        assert (row["permission_mode"], row["timeout_seconds"]) == ("autoReview", 1800)
+
+    def test_auto_on_an_engine_with_no_reviewer_is_dropped_and_named(self, tmp_path, temp_db):
+        from storage import database as db
+        with patch("services.scheduler.task_fields.mode_problem",
+                   lambda agent, layer, mode: "It has no reviewer." if mode else ""):
+            out = _install_pinned(tmp_path, _pinned_task(permission_mode="autoReview"))
+        assert out["task_pins_dropped"] == ["The task 'weekly-brief' runs on Don't Ask. The engine it runs on has no reviewer."]
+        row = next(t for t in db.list_dynamic_tasks(agent="pin-agent")
+                   if t["community_template_item_slug"] == "weekly-brief")
+        assert row["permission_mode"] == ""
+
+
 class TestTaskPins:
     def test_the_fields_parse_persist_and_read_back_and_an_old_record_has_none(self, tmp_path, temp_db):
         from services.community.community_agent_template_store import (
@@ -2047,16 +2176,16 @@ class TestTaskPins:
             template_to_persistable_dict,
         )
         tdir = _write_template(tmp_path, slug="pin-parse", tasks=[
-            _pinned_task(override_model="claude-fable-5-1", layer="claude-code-cli", notification_mode="none"),
+            _pinned_task(override_model="claude-fable-5-2", layer="claude-code-cli", notification_mode="none"),
             _pinned_task(slug="plain-task")])
         template = load_template_from_dir(tdir)
         pinned, plain = template.tasks
         assert (pinned.override_model, pinned.layer, pinned.notification_mode) == \
-            ("claude-fable-5-1", "claude-code-cli", "none")
+            ("claude-fable-5-2", "claude-code-cli", "none")
         assert (plain.override_model, plain.layer, plain.notification_mode) == (None, None, "manual")
         again = load_template_from_dict(template_to_persistable_dict(template)).tasks
         assert [(t.override_model, t.layer, t.notification_mode) for t in again] == \
-            [("claude-fable-5-1", "claude-code-cli", "none"), (None, None, "manual")]
+            [("claude-fable-5-2", "claude-code-cli", "none"), (None, None, "manual")]
         # A record written before 1.9.0 carries none of the three keys.
         record = template_to_persistable_dict(template)
         for item in record["tasks"]:
@@ -2088,7 +2217,7 @@ class TestTaskPins:
         from storage import database as db
         from storage.agents import agent_store
         out = _install_pinned(tmp_path,
-                              _pinned_task(override_model="claude-fable-5-1", layer="no-such-engine"),
+                              _pinned_task(override_model="claude-fable-5-2", layer="no-such-engine"),
                               _pinned_task(slug="other-brief", override_model="no-such-model"))
         notes = out["task_pins_dropped"]
         assert len(notes) == 2, notes
@@ -2158,3 +2287,116 @@ def test_a_revalidated_empty_template_manifest_comes_from_the_cache(monkeypatch)
     monkeypatch.setattr(cat, "MANIFEST_CACHE_TTL_SECONDS", -1)
     assert asyncio.run(cat.fetch_manifest("empty")) == {}
     assert sent == [None, "e1"]
+
+
+class TestToolLimits:
+    """``mcps.json`` ``limits`` and ``agent.json`` ``team_account``: parsed,
+    refused with a private mode, kept in the persisted record, and written
+    as rows at install whether or not the tool is enabled yet."""
+
+    def _template(self, tmp_path, limits, **extra):
+        tdir = _write_template(tmp_path, agent_json_extra=extra)
+        (tdir / "mcps.json").write_text(json.dumps({"required": [], "limits": limits}))
+        return tdir
+
+    def test_limits_parse_into_rows(self, tmp_path, temp_db):
+        from services.community.community_agent_template_store import (
+            ToolLimit,
+            load_template_from_dir,
+            template_to_persistable_dict,
+        )
+        tdir = self._template(tmp_path, {
+            "google-workspace": {"runs": ["search_gmail_messages", "list_gmail_labels", "search_gmail_messages"],
+                                 "chats": "read_only"},
+            "crm": {"chats": ["find"]},
+        })
+        template = load_template_from_dir(tdir)
+        assert template.tool_limits == [
+            ToolLimit("google-workspace", "runs", "custom", ["list_gmail_labels", "search_gmail_messages"]),
+            ToolLimit("google-workspace", "chats", "read_only", []),
+            ToolLimit("crm", "chats", "custom", ["find"]),
+        ]
+        assert template.team_account is False and template.team_account_floor == "editor"
+        kept = template_to_persistable_dict(template)["tool_limits"]
+        assert kept[0] == {"mcp": "google-workspace", "governs": "runs", "access": "custom",
+                           "functions": ["list_gmail_labels", "search_gmail_messages"]}
+
+    @pytest.mark.parametrize("limits", [
+        {"crm": {"outside": "read_only"}},
+        {"crm": {"runs": "read_write"}},
+        {"crm": {"runs": []}},
+        {"crm": {"runs": "all"}},
+    ])
+    def test_a_limit_outside_the_shape_is_refused(self, tmp_path, temp_db, limits):
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
+        )
+        tdir = self._template(tmp_path, limits)
+        with pytest.raises(TemplateValidationError) as exc:
+            load_template_from_dir(tdir)
+        assert "mcps.json" in str(exc.value)
+
+    def test_the_team_account_needs_a_collaborative_mode(self, tmp_path, temp_db):
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
+        )
+        tdir = self._template(tmp_path, {}, team_account=True, team_account_floor="manager")
+        template = load_template_from_dir(tdir)
+        assert template.team_account and template.team_account_floor == "manager"
+        tdir = _write_template(tmp_path, slug="private-one",
+                               agent_json_extra={"team_account": True, "collaborative": False})
+        with pytest.raises(TemplateValidationError) as exc:
+            load_template_from_dir(tdir)
+        assert "team_account" in str(exc.value)
+        tdir = _write_template(tmp_path, slug="bad-floor", agent_json_extra={"team_account_floor": "owner"})
+        with pytest.raises(TemplateValidationError):
+            load_template_from_dir(tdir)
+
+    def test_an_install_writes_the_rows_and_the_agents_columns(self, tmp_path, temp_db):
+        from services.community.community_agent_installer import (
+            install_from_extracted_template,
+        )
+        from services.community.community_agent_template_store import (
+            load_template_from_dir,
+        )
+        from storage.agents import agent_store, outside_store
+        tdir = self._template(tmp_path, {"google-workspace": {"runs": ["list_gmail_labels"], "chats": "read_only"}},
+                              team_account=True, team_account_floor="contributor")
+        template = load_template_from_dir(tdir)
+        with patch("services.notifications.notification_manager.fire_notification", new=AsyncMock()), \
+                patch("services.mcp.mcp_registry.get_all_manifests", return_value={}):
+            asyncio.run(install_from_extracted_template(
+                template=template, target_slug="limited-install", installer_user_sub=ADMIN_SUB,
+                installer_role="admin", source_label="test"))
+        assert outside_store.get_tool_picks("limited-install", governs="runs") == {
+            "google-workspace": {"access": "custom", "functions": ["list_gmail_labels"], "granted": [], "changed_at": ""}}
+        assert outside_store.get_tool_picks("limited-install", governs="chats")["google-workspace"]["access"] == "read_only"
+        assert outside_store.get_tool_picks("limited-install") == {}
+        row = agent_store.get_agent("limited-install")
+        assert row["team_account"] is True and row["team_account_floor"] == "contributor"
+
+
+def test_a_new_agents_context_is_written_with_no_link_followed(tmp_path, monkeypatch):
+    """The template's context lands beneath the new agent's real folder: a
+    config folder replaced by a link gets nothing written where it points."""
+    from types import SimpleNamespace
+
+    import config as app_config
+    from services.community import community_agent_installer as cai
+    agents = tmp_path / "agents"
+    (agents / "fresh").mkdir(parents=True)
+    monkeypatch.setattr(app_config, "AGENTS_DIR", agents)
+    template = SimpleNamespace(context_files={"context/a.md": "Hello {agent_slug}"},
+                               setup_md="Set up {agent_slug}", user_setup_md="Welcome")
+    assert cai._copy_template_context(agents / "fresh", template, "fresh") == (1, True)
+    assert (agents / "fresh" / "config" / "context" / "a.md").read_text() == "Hello fresh"
+    assert (agents / "fresh" / "config" / "user-setup.md").read_text() == "Welcome"
+    stand_in = tmp_path / "stand-in"
+    stand_in.mkdir()
+    (agents / "other").mkdir()
+    (agents / "other" / "config").symlink_to(stand_in)
+    with pytest.raises(OSError):
+        cai._copy_template_context(agents / "other", template, "other")
+    assert list(stand_in.iterdir()) == []

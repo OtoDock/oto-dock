@@ -80,7 +80,7 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
   // ── 1. install failed ──
   if (install?.status === 'failed') {
     return (
-      <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs">
+      <div className="w-full py-2 text-xs">
         <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-sm border border-status-danger-solid bg-status-danger-bg text-status-danger-fg">
           <span className="truncate min-w-0">
             <strong>Install failed:</strong> {install.error ?? 'Unknown error.'}
@@ -108,7 +108,7 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
     const copying = currentMcp === WORKSPACE_ROW
     const files = install.progress[WORKSPACE_ROW]?.filesTotal ?? 0
     return (
-      <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-tertiary">
+      <div className="w-full py-2 text-xs text-tertiary">
         <div className="flex flex-col gap-1">
           <div className="h-1 w-full bg-surface-muted rounded-sm overflow-hidden">
             <div
@@ -149,7 +149,7 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
   // ── 2b. post-install pre-warm boot check ──
   if (install?.status === 'verifying') {
     return (
-      <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-tertiary">
+      <div className="w-full py-2 text-xs text-tertiary">
         <div className="flex flex-col gap-1">
           <div className="h-1 w-full bg-surface-muted rounded-sm overflow-hidden">
             <div className="h-full w-full bg-status-info-solid animate-pulse" />
@@ -167,7 +167,7 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
       install.doneAt && now - install.doneAt < 1500) {
     const warnCount = install.warmupFailures?.length ?? 0
     return (
-      <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-tertiary">
+      <div className="w-full py-2 text-xs text-tertiary">
         <div className="flex items-center justify-between gap-3">
           <span className="truncate opacity-80">
             {warnCount > 0

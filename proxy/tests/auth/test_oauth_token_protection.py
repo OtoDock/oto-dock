@@ -4,19 +4,14 @@ Verifies that OAuth credential files (``*-tokens/*.json``) are:
   * Excluded from the dashboard file-tree at the API layer
   * Refused by the dashboard file-read/write API
   * Refused by the agent permission hook (Read / Write / Bash)
-  * Manifest-driven — a future MCP that declares
-    ``path_env.X.role: "credentials_dir"`` auto-inherits protection
 
-The on-disk MCP (workspace-mcp's google.auth lib) still reads the
-file via direct OS I/O — that's intentional and outside the scope of
-this hook. Only Anthropic-tool access + the dashboard API surface are
-gated.
+The set is the frozen list of folder names earlier releases gave a
+session's token copies; no release writes them now.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -29,64 +24,10 @@ from auth.path_policy import (
 from services import path_roles
 from services.mcp import mcp_registry
 
-# ---------------------------------------------------------------------------
-# Manifest-driven subpath collection
-# ---------------------------------------------------------------------------
 
-
-def test_get_protected_subpaths_includes_workspace_mcp(monkeypatch):
-    """workspace-mcp declares `google-tokens` via its path_env block, so
-    the set must include it after manifests are loaded."""
-    # Build a stub manifest with the same shape workspace-mcp uses.
-    from services.mcp.mcp_registry import McpManifest, PathEnvDecl
-    stub = MagicMock(spec=McpManifest)
-    stub.path_env = {
-        "WORKSPACE_MCP_CREDENTIALS_DIR": PathEnvDecl(
-            role="credentials_dir", subpath="google-tokens",
-        ),
-    }
-    monkeypatch.setattr(mcp_registry, "_manifests", {"workspace-mcp": stub})
-    assert "google-tokens" in mcp_registry.get_protected_credentials_subpaths()
-
-
-def test_get_protected_subpaths_handles_multi_value(monkeypatch):
-    """Multi-value path_env entries with credentials_dir refs are also
-    collected (defensive — current MCPs don't use this shape for
-    credentials, but the framework allows it)."""
-    from services.mcp.mcp_registry import McpManifest, PathEnvDecl, PathEnvValueRef
-    stub = MagicMock(spec=McpManifest)
-    stub.path_env = {
-        "MULTI": PathEnvDecl(
-            role="",  # multi-value mode
-            values=[
-                PathEnvValueRef(role="workspace"),
-                PathEnvValueRef(
-                    role="credentials_dir", subpath="multi-tokens",
-                ),
-            ],
-        ),
-    }
-    monkeypatch.setattr(mcp_registry, "_manifests", {"stub-mcp": stub})
-    assert "multi-tokens" in mcp_registry.get_protected_credentials_subpaths()
-
-
-def test_get_protected_subpaths_skips_non_credentials_roles(monkeypatch):
-    """Workspace-role path_env entries (`subpath: "downloads/google-drive"`)
-    are NOT collected — only `credentials_dir`."""
-    from services.mcp.mcp_registry import McpManifest, PathEnvDecl
-    stub = MagicMock(spec=McpManifest)
-    stub.path_env = {
-        "ATTACH": PathEnvDecl(role="workspace", subpath="downloads/google-drive"),
-    }
-    monkeypatch.setattr(mcp_registry, "_manifests", {"stub-mcp": stub})
-    assert "downloads/google-drive" not in mcp_registry.get_protected_credentials_subpaths()
-
-
-def test_get_protected_subpaths_returns_empty_when_no_manifests(monkeypatch):
-    """Empty registry → empty set (never None / never raises)."""
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
-    result = mcp_registry.get_protected_credentials_subpaths()
-    assert result == frozenset()
+def test_the_protected_names_are_the_two_earlier_releases_used():
+    assert mcp_registry.get_protected_credentials_subpaths() == frozenset(
+        {"google-tokens", "google-analytics-tokens"})
 
 
 # ---------------------------------------------------------------------------

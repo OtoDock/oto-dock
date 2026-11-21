@@ -52,10 +52,9 @@ The sockets, and what each does with a type it does not know:
   the snapshot document ``services/sharing/chat_snapshot.build`` writes
   (``version: 1``), keyed by the persisted ``event_type`` — an unknown
   kind renders as a collapsed card with the raw row.
-* **The audio socket** (``ws/audio.py``), **the app socket**
-  (``api/apps/app_proxy.py``: ``catalog`` / ``catalog_ack``) and **the
-  satellite protocol** (``ws/satellite.py``, ``core/remote/*``) are their
-  own protocols and are not catalogued here.
+* **The audio socket** (``ws/audio.py``) and **the satellite protocol**
+  (``ws/satellite.py``, ``core/remote/*``) are their own protocols and
+  are not catalogued here.
 
 The ``error`` frame is ONE string with THREE shapes — the dashboard's
 ``ErrorFrame`` (``message``), the phone and duplex daemon sockets'
@@ -98,6 +97,7 @@ DELEGATE_SPAWN = "delegate_spawn"
 DELEGATE_RESULT = "delegate_result"
 SCHEDULE_WAKE = "schedule_wake"  # the platform's own prompt into a chat (the row of a scheduled wake or of the resume after a move; only the wake sends the frame)
 CHECK_VERDICT = "check_verdict"
+WRAPUP = "wrapup"  # the wrap-up after a call: an event row under the conversation (services/phone/wrapup.py)
 PERMISSION_PROMPT = "permission_prompt"
 PLAN_REVIEW = "plan_review"
 QUESTION = "question"
@@ -158,6 +158,7 @@ WARMUP_HEARTBEAT = "warmup_heartbeat"
 WARMUP_READY = "warmup_ready"
 WARMUP_FAILED = "warmup_failed"
 PRE_WARMUP_READY = "pre_warmup_ready"
+PRE_WARMUP_REFUSED = "pre_warmup_refused"
 CHAT_HISTORY = "chat_history"
 CHAT_HISTORY_DELTA = "chat_history_delta"
 CHAT_STATUS = "chat_status"
@@ -173,6 +174,7 @@ CHAT_VIEW_ONLY = "chat_view_only"
 ENGINE_SWITCHED = "engine_switched"
 SWITCH_ENGINE_DENIED = "switch_engine_denied"
 LIVENESS = "liveness"
+TARGET_MISMATCH = "target_mismatch"   # target_check's answer: the banner's fields, or none
 TITLE_UPDATED = "title_updated"
 TURN_COMPLETE = "turn_complete"
 
@@ -211,6 +213,7 @@ SATELLITE_UPDATING = "satellite_updating"
 SATELLITE_UPDATED = "satellite_updated"
 SATELLITE_UPDATE_FAILED = "satellite_update_failed"
 SATELLITE_UPDATE_SYNC = "satellite_update_sync"
+MACHINE_LINK = "machine_link"   # a machine connected or left: the page reads its places again
 
 # The connection itself.
 SERVER_INFO = "server_info"
@@ -323,6 +326,7 @@ FRAMES: dict[str, Frame] = {
     WARMUP_READY: Frame(False, None),
     WARMUP_FAILED: Frame(False, None),
     PRE_WARMUP_READY: Frame(False, None),
+    PRE_WARMUP_REFUSED: Frame(False, None),
     CHAT_HISTORY: Frame(False, None),
     CHAT_HISTORY_DELTA: Frame(True, None),
     CHAT_STATUS: Frame(False, None),
@@ -338,6 +342,7 @@ FRAMES: dict[str, Frame] = {
     ENGINE_SWITCHED: Frame(False, None),
     SWITCH_ENGINE_DENIED: Frame(False, None),
     LIVENESS: Frame(False, None),
+    TARGET_MISMATCH: Frame(False, None),
     TITLE_UPDATED: Frame(False, None),
     TURN_COMPLETE: Frame(False, None),   # origin-routed: it targets chats the view is not showing
     PTY_OUTPUT: Frame(True, None),
@@ -372,6 +377,7 @@ FRAMES: dict[str, Frame] = {
     SATELLITE_UPDATED: Frame(False, None),
     SATELLITE_UPDATE_FAILED: Frame(False, None),
     SATELLITE_UPDATE_SYNC: Frame(False, None),
+    MACHINE_LINK: Frame(False, None),
     SERVER_INFO: Frame(False, None),
     PONG: Frame(False, None),
 }
@@ -616,6 +622,7 @@ SUBTYPE_MEETING_TURN_START = "meeting_turn_start"
 SUBTYPE_MEETING_TURN_END = "meeting_turn_end"
 SUBTYPE_MEETING_CONCLUDED = "meeting_concluded"
 SUBTYPE_MEETING_AGENT_FAILED = "meeting_agent_failed"
+SUBTYPE_MEETING_AGENT_STOPPED = "meeting_agent_stopped"  # the memory guard stopped its engine; it stays
 SUBTYPE_MEETING_AGENT_LEFT = "meeting_agent_left"
 SUBTYPE_MEETING_FAILED = "meeting_failed"
 # Live only: a turn that could not wait in the chat's queue (its row was
@@ -627,6 +634,11 @@ SUBTYPE_MACHINE_RECONNECTING = "machine_reconnecting"
 # again. Persisted once in a task run's chat when the task's own machine gave
 # way to the agent's default (``services/scheduler/task_run._record_target``).
 SUBTYPE_MACHINE_NOT_ANSWERING = "machine_not_answering"
+# A cut turn whose machine has not reported, a while after the restart: the
+# chat is told once, with no abort flags. Its own subtype: the card that may
+# follow is another row, not this one again (``open_turns._closing_row_in``).
+SUBTYPE_TURN_WAITING = "turn_waiting"
+SUBTYPE_TURN_DROPPED = "turn_dropped"  # an Escape dropped a terminal's turn (``_check_dropped_turn``)
 # A permission request the engine raised on its own channel that was refused
 # with no person's answer (``core/session/engine_prompts``): ``message`` names
 # the call and why (nobody answered in time, a phone call, an older
@@ -636,6 +648,13 @@ SUBTYPE_ENGINE_PROMPT_REFUSED = "engine_prompt_refused"
 # says from where to where and whether its memory came with it; ``reason`` is
 # ``failed`` for a move that did not finish. The frame's word (``CHAT_MOVED``).
 SUBTYPE_CHAT_MOVED = CHAT_MOVED
+# The chat's session was rebuilt at its agent's request
+# (services/remote/chat_reload.py): ``message`` says why, ``reason`` is one
+# of the ``MOVED_*`` words below (a reload that did not happen, a chain that
+# stopped, a chat that did not continue by itself). The live frame with
+# ``terminal`` set and no message tells a viewer the chat's new terminal is
+# up; it is never a row.
+SUBTYPE_SESSION_RELOADED = "session_reloaded"
 # The chat's line about its machine's tools (services/mcp/mcp_sync.py): its
 # session started with tools still installing there, named; a second line
 # says how they ended. ``message`` is the sentence.
@@ -645,18 +664,36 @@ SUBTYPE_TOOLS_INSTALLING = "tools_installing"
 # right after the person's (``photos_not_attached_block`` below),
 # ``message`` the sentence, ``count`` how many.
 SUBTYPE_PHOTOS_NOT_ATTACHED = "photos_not_attached"
-PHOTOS_NOT_ATTACHED_ONE = "The photo did not reach the agent. Attach it again to send it."
-PHOTOS_NOT_ATTACHED_MANY = "The photos did not reach the agent. Attach them again to send them."
+PHOTOS_NOT_ATTACHED_ONE = "The photo did not reach the agent. Attach it again as JPEG or PNG."
+PHOTOS_NOT_ATTACHED_MANY = "The photos did not reach the agent. Attach them again as JPEG or PNG."
+# A turn that started on its machine without files still on their way there:
+# the push goes on behind it (``core/remote/upload_inflight``, which holds the
+# notice's words).
+SUBTYPE_FILES_LATE = "files_late"
 # The refusal of a message whose text is empty and none of whose photos and
 # files reached the agent: nothing of it is sent, no row is written.
 NOTHING_REACHED_THE_AGENT = ("None of the photos or files reached the agent, so nothing was sent. "
-                             "Attach them again to send them.")
+                             "Attach them again, with photos as JPEG or PNG.")
+# The refusal of something new while the platform holds new work for an
+# update (``core.drain``) and it cannot wait in a chat's queue: a new chat's
+# first message, a new meeting, a call. An app's click is refused with the
+# short reason.
+PLATFORM_UPDATING = "OtoDock is updating. Send it again in a few minutes."
+REASON_UPDATING = "updating"
 # A ``chat_moved`` row's ``reason``: the move did not finish; the agent moved
 # the chat ten times in a row with no message from a person, so it does not
 # continue by itself; the agent's move could not resume the chat by itself.
+# A ``session_reloaded`` row takes the same three for its reload.
 MOVED_FAILED = "failed"
 MOVED_RESUME_STOPPED = "resume_stopped"
 MOVED_RESUME_SKIPPED = "resume_skipped"
+# A ``session_reloaded`` line about the agent's own account of a tool: one
+# left the agent, or its default moved. No reload of the agent's own. Also
+# the line of a chat that changed AI account.
+MOVED_ACCOUNT_CHANGED = "account_changed"
+# A ``session_reloaded`` line of a chat whose change of AI account waits for
+# the text typed in its terminal to be sent or cleared.
+MOVED_ACCOUNT_CHANGE_WAITS = "account_change_waits"
 # ``chat_move_progress.phase``: the platform's own staging copy, the bytes on
 # the wire, the commit on the target.
 MOVE_PHASE_STAGE = "stage"
@@ -666,6 +703,11 @@ MOVE_PHASES: tuple[str, ...] = (MOVE_PHASE_STAGE, MOVE_PHASE_COPY, MOVE_PHASE_CO
 # A ``schedule_wake`` row's ``source`` when the platform resumed a chat after
 # the agent moved it (no ``source``: a scheduled self-continuation).
 WAKE_SOURCE_MOVE = "move"
+# The same after the agent reloaded the chat's session.
+WAKE_SOURCE_RELOAD = "reload"
+# The same after the platform itself cut the chat's turn (a restart, a lost
+# machine) and continued it (``services/scheduler/continue_pass.py``).
+WAKE_SOURCE_CONTINUE = "continue"
 # ``server_turn_start.cause``: the review of finished background work (its
 # nudge row and ``bg_*_complete`` frame came just before), a worker's result
 # answered, a scheduled wake, a backgrounded warmup's first turn.
@@ -679,10 +721,12 @@ SERVER_TURN_CAUSES: frozenset[str] = frozenset({
 SYSTEM_SUBTYPES: frozenset[str] = frozenset({
     SUBTYPE_SESSION_RESEEDED, SUBTYPE_UNDELIVERED_INPUT, SUBTYPE_TURN_ENDED, SUBTYPE_BG_WAKE,
     SUBTYPE_CONTEXT_COMPRESSED, SUBTYPE_MACHINE_RECONNECTING, SUBTYPE_MACHINE_NOT_ANSWERING,
-    SUBTYPE_ENGINE_PROMPT_REFUSED, SUBTYPE_CHAT_MOVED, SUBTYPE_TOOLS_INSTALLING,
-    SUBTYPE_PHOTOS_NOT_ATTACHED, SUBTYPE_MEETING_STARTED, SUBTYPE_MEETING_TURN_START,
+    SUBTYPE_TURN_WAITING, SUBTYPE_TURN_DROPPED,
+    SUBTYPE_ENGINE_PROMPT_REFUSED, SUBTYPE_CHAT_MOVED, SUBTYPE_SESSION_RELOADED, SUBTYPE_TOOLS_INSTALLING,
+    SUBTYPE_PHOTOS_NOT_ATTACHED, SUBTYPE_FILES_LATE, SUBTYPE_MEETING_STARTED,
+    SUBTYPE_MEETING_TURN_START,
     SUBTYPE_MEETING_TURN_END, SUBTYPE_MEETING_CONCLUDED, SUBTYPE_MEETING_AGENT_FAILED,
-    SUBTYPE_MEETING_AGENT_LEFT, SUBTYPE_MEETING_FAILED,
+    SUBTYPE_MEETING_AGENT_STOPPED, SUBTYPE_MEETING_AGENT_LEFT, SUBTYPE_MEETING_FAILED,
 })
 # The raw CLI subtypes the pump never persists (they drive registries).
 SYSTEM_SUBTYPES_TRANSIENT: tuple[str, ...] = ("task_started", "task_progress")
@@ -975,6 +1019,8 @@ class SystemFrame(_PerChat, total=False):
     mcp: str
     pct: int
     phase: str
+    terminal: bool
+    resets_at: str
 
 
 class MetadataFrame(_PerChat, total=False):
@@ -1240,6 +1286,7 @@ class SteeredFrame(_PerChat, _QueueAttachments, _SteerMeta):
 
 class ModeChangedFrame(_PerChat):
     mode: str
+    refusal: NotRequired[str]  # why a live terminal took no pick: the button shows ``mode`` again
 
 
 class ModelChangedFrame(_PerChat):
@@ -1301,6 +1348,13 @@ class WarmupFailedFrame(TypedDict, total=False):
 
 class PreWarmupReadyFrame(TypedDict):
     session_id: str
+
+
+class PreWarmupRefusedFrame(TypedDict, total=False):
+    agent: str
+    execution_path: str
+    reason: str           # a WARMUP_FAILED_REASONS word
+    error: str
 
 
 class ChatHistoryFrame(TypedDict, total=False):
@@ -1408,6 +1462,14 @@ class SwitchEngineDeniedFrame(TypedDict, total=False):
 class LivenessFrame(TypedDict):
     chat_id: str
     process_alive: bool
+
+
+class TargetMismatchFrame(TypedDict, total=False):
+    chat_id: str
+    pinned_target: str
+    pinned_label: str
+    resolved_target: str
+    resolved_label: str
 
 
 class TitleUpdatedFrame(TypedDict):
@@ -1568,9 +1630,14 @@ class SatelliteUpdateSyncFrame(TypedDict):
     inflight: list
 
 
+class MachineLinkFrame(TypedDict):
+    machine_id: str
+
+
 class ServerInfoFrame(TypedDict):
     build_id: str
     version: str
+    updating: NotRequired[bool]  # new work is held for an update (core.drain): absent at connect when not
 
 
 class PongFrame(TypedDict):
@@ -1626,6 +1693,7 @@ IN_CHAT = "chat"
 IN_ARTIFACT_INTERACTION = ARTIFACT_INTERACTION
 IN_APP_ACTION = APP_ACTION
 IN_RESUME_CHAT = "resume_chat"
+IN_LEAVE_CHAT = "leave_chat"     # the page shows no chat (the new-chat view)
 IN_CHAT_READ = CHAT_READ
 IN_PERMISSION_RESPONSE = "permission_response"
 IN_QUESTION_RESPONSE = "question_response"
@@ -1644,6 +1712,7 @@ IN_COMPACT_CONTEXT = "compact_context"
 IN_MOVE_CHAT = "move_chat"
 IN_SWITCH_ENGINE = "switch_engine"
 IN_PROBE_LIVENESS = "probe_liveness"
+IN_TARGET_CHECK = "target_check"
 IN_IMPLEMENT_PLAN = "implement_plan"
 IN_ABORT = "abort"
 IN_CANCEL_QUEUED = "cancel_queued"
@@ -1681,6 +1750,7 @@ INBOUND: dict[str, Inbound] = {
     IN_ARTIFACT_INTERACTION: Inbound("_on_artifact_interaction", MID_STREAM_SAME, drives=True),
     IN_APP_ACTION: Inbound("_on_app_action", MID_STREAM_SAME, drives=True),
     IN_RESUME_CHAT: Inbound("_on_resume_chat", MID_STREAM_DETACH),
+    IN_LEAVE_CHAT: Inbound("_on_leave_chat", MID_STREAM_DETACH),
     IN_CHAT_READ: Inbound("_on_chat_read", MID_STREAM_SAME),
     IN_PERMISSION_RESPONSE: Inbound("_on_permission_response", MID_STREAM_SAME, drives=True),
     IN_QUESTION_RESPONSE: Inbound("_on_question_response", MID_STREAM_SAME, drives=True),
@@ -1699,6 +1769,7 @@ INBOUND: dict[str, Inbound] = {
     IN_MOVE_CHAT: Inbound("_on_move_chat", MID_STREAM_DROP),
     IN_SWITCH_ENGINE: Inbound("_on_switch_engine", MID_STREAM_DROP, drives=True),
     IN_PROBE_LIVENESS: Inbound("_on_probe_liveness", MID_STREAM_DROP),
+    IN_TARGET_CHECK: Inbound("_on_target_check", MID_STREAM_SAME),
     IN_IMPLEMENT_PLAN: Inbound("_on_implement_plan", MID_STREAM_DROP, drives=True),
     IN_ABORT: Inbound("_on_abort", MID_STREAM_SAME, drives=True),
     IN_CANCEL_QUEUED: Inbound("_on_cancel_queued", MID_STREAM_SAME),

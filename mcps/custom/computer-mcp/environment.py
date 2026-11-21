@@ -13,8 +13,12 @@ lazily by ``screen.py`` / ``executor.py``, never here).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
+import tempfile
+import time
+from dataclasses import dataclass
 
 
 class DeviceUnavailable(Exception):
@@ -280,3 +284,114 @@ def check_macos_grants(input_needed: bool) -> None:
         missing.append("accessibility")
     if missing:
         raise DeviceUnavailable(grant_message(missing))
+
+
+@dataclass(frozen=True)
+class Window:
+    """A window as the system reports it: an id that stays while the window
+    lives, its process, its program's name and its title."""
+
+    id: object
+    pid: int | None
+    program: str
+    title: str
+
+
+def desktop():
+    """The module that reads this system's windows (and on Windows the rights of
+    their programs, on macOS Secure Input), imported only on its own system;
+    ``None`` where there is none (no display, Wayland, another system)."""
+    kind = os_kind()
+    if kind == "windows":
+        import desktop_windows
+
+        return desktop_windows
+    if kind == "darwin":
+        import desktop_macos
+
+        return desktop_macos
+    if display_backend() == "x11":
+        import desktop_x11
+
+        return desktop_x11
+    return None
+
+
+class DesktopLock:
+    """One lock file per desktop, so two tool processes (two chats on one
+    computer) never drive one screen at once. The system drops it when its
+    process ends."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._fh = None
+
+    def acquire(self, timeout: float) -> bool:
+        """True once held (or when the file cannot be opened at all: the lock
+        is a guard, and a guard never fails a call), False after ``timeout``."""
+        end = time.monotonic() + max(0.0, timeout)
+        try:
+            fh = open(self.path, "a+b")  # held open for as long as the lock is held
+        except OSError as e:
+            import logging
+
+            logging.getLogger("computer-mcp").warning("computer: no desktop lock (%s)", type(e).__name__)
+            return True
+        while True:
+            if _try_lock(fh):
+                self._fh = fh
+                return True
+            if time.monotonic() >= end:
+                fh.close()
+                return False
+            time.sleep(0.05)
+
+    def release(self) -> None:
+        fh, self._fh = self._fh, None
+        if fh is None:
+            return
+        with contextlib.suppress(OSError):
+            _unlock(fh)
+        fh.close()
+
+
+def _try_lock(fh) -> bool:
+    try:
+        if os_kind() == "windows":
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock(fh) -> None:
+    if os_kind() == "windows":
+        import msvcrt
+
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def desktop_lock() -> DesktopLock:
+    """The lock of the desktop this process drives: per user (in the user's
+    own runtime folder when there is one, never a folder another user can
+    write first), and per X display on Linux, with the screen number dropped
+    (``:0`` and ``:0.0`` are one desktop)."""
+    who = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
+    display = os.environ.get("DISPLAY", "")
+    if ":" in display and "." in display.rsplit(":", 1)[1]:
+        display = display.rsplit(".", 1)[0]
+    name = "".join(c if c.isalnum() else "-" for c in display or "screen")
+    folder = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return DesktopLock(os.path.join(folder, f"otodock-computer-{who}-{name}.lock"))

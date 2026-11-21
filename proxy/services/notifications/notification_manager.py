@@ -139,6 +139,8 @@ def _notify_coalesce_key(frame: dict) -> tuple | None:
         return (t, frame.get("transfer_id") or frame.get("id"))
     if t == wire.SATELLITE_UPDATE_SYNC:
         return (t,)
+    if t == wire.MACHINE_LINK:
+        return (t, frame.get("machine_id"))
     return None
 
 
@@ -1639,10 +1641,41 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
 # --- Scheduling ---
 
 _scheduler_ref = None  # Set at startup
+#: The loop the manager started on: where a notice found on a worker thread
+#: is delivered (``fire_from_thread``).
+_loop: asyncio.AbstractEventLoop | None = None
+
+
+def fire_from_thread(**kw) -> None:
+    """``fire_notification(**kw)`` from wherever the caller stands: on the
+    loop, as a task; on a worker thread (a store write that found something
+    to tell), handed to the loop the manager started on. With no loop the
+    notice is dropped with a warning, never raised into the writer."""
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is not None:
+        from core import background
+        background.spawn(fire_notification(**kw), name=str(kw.get("title", ""))[:40],
+                         owner="notifications")
+        return
+    loop = _loop
+    if loop is None or loop.is_closed():
+        logger.warning("No loop to deliver the notice %r", kw.get("title"))
+        return
+    future = asyncio.run_coroutine_threadsafe(fire_notification(**kw), loop)
+
+    def _done(f) -> None:
+        if not f.cancelled() and f.exception() is not None:
+            logger.error("The notice %r was not delivered: %s", kw.get("title"), f.exception())
+    future.add_done_callback(_done)
 
 
 def start() -> None:
     """Initialize notification system. Called at proxy startup after scheduler.start()."""
+    global _loop
+    _loop = asyncio.get_running_loop()
     _register_audience_invalidation()
     _schedule_audience_warmup()
     if config.SCHEDULER_MODE == "standalone":
@@ -1761,7 +1794,14 @@ async def _fire_scheduled_notification(notification_id: str) -> None:
     if not notif or not notif.get("enabled"):
         return
 
-    await fire_notification(
+    await fire_stored_notification(notif)
+
+
+async def fire_stored_notification(notif: dict) -> list[dict]:
+    """Fire a stored notification row. Its schedule and a person's Fire now
+    send the same thing: its agent and its chat ride along, which give the
+    row its button."""
+    return await fire_notification(
         title=notif["title"],
         body=notif["body"],
         severity=notif["severity"],
@@ -1769,7 +1809,7 @@ async def _fire_scheduled_notification(notification_id: str) -> None:
         target=notif.get("target"),
         source=notif["source"],
         source_id=notif.get("source_id"),
-        notification_id=notification_id,
+        notification_id=notif["id"],
         agent_slug=notif.get("agent_slug"),
         chat_id=notif.get("chat_id"),
         audience=notif.get("audience"),

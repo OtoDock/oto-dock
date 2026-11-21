@@ -39,7 +39,7 @@
     "multi_value_envs": {
       "OTO_ALLOWED_ROOTS": ":"
     },
-    "permission_mode": "default",
+    "permission_mode": "ask",
     "resume": false,
     "session_id_for_resume": "",
     "system_prompt": "You are a test agent.",
@@ -91,7 +91,7 @@
     "multi_value_envs": {
       "OTO_ALLOWED_ROOTS": ":"
     },
-    "permission_mode": "default",
+    "permission_mode": "ask",
     "resume": false,
     "session_id_for_resume": "",
     "system_prompt": "You are a test agent.",
@@ -174,7 +174,7 @@
     "multi_value_envs": {
       "OTO_ALLOWED_ROOTS": ":"
     },
-    "permission_mode": "default",
+    "permission_mode": "autoReview",
     "resume": false,
     "session_id_for_resume": "",
     "system_prompt": "You are a test agent.",
@@ -185,7 +185,7 @@
       "bin/gh": "#!/bin/sh\n# The platform's gh: the real gh runs with the session's GitHub token\n# in its own environment, fetched per command from the credential\n# broker; the session's environment never holds it.\nd=$(dirname \"$0\")\nexec \"${OTO_HOOK_PY:-python3}\" -I \"$d/../credential_helper.py\" run github.com gh -- \"$@\"\n",
       "bin/gh.cmd": "@if \"%OTO_HOOK_PY%\"==\"\" set \"OTO_HOOK_PY=python\"\r\n@\"%OTO_HOOK_PY%\" -I \"%~dp0..\\credential_helper.py\" run github.com gh -- %*\r\n@exit /b %errorlevel%\r\n"
     },
-    "cli_permission_mode": "default"
+    "cli_permission_mode": "auto"
   },
   "claude_resume_judge": {
     "claude_dir_relative": "workspace/.claude",
@@ -240,7 +240,7 @@
     "cli_permission_mode": "default"
   },
   "codex_interactive_resume_thread": {
-    "agents_md_content": "You are a test agent.",
+    "agents_md_content": "You are a test agent.\n\n# Network in your shell\n\nIn some modes your shell commands run in a sandbox with no network. When a\ncommand fails there because it cannot reach a host (a `git push`, `gh`,\n`curl`, the platform itself), or git's credential helper says the platform\ncannot be reached, request the same command again, once, with escalated\npermissions instead of giving up, reporting the failure or working around\nit. The request is reviewed, and the command then runs with the network.\nIf it fails again, say so.\n",
     "client_type": "dashboard",
     "codex_dir_relative": "users/alice/.codex",
     "codex_hooks_floor": false,
@@ -252,7 +252,8 @@
       "PROXY_API_KEY": "JWT",
       "PROXY_URL": "http://127.0.0.1:18400",
       "OTO_HOOKS_DIR": "/users/alice/.codex",
-      "OTO_HOOK_PY": "python3"
+      "OTO_HOOK_PY": "python3",
+      "LESSSECURE": "1"
     },
     "hook_scripts": {
       "permission_gate.py": "#gate"
@@ -263,10 +264,10 @@
     "multi_value_envs": {
       "OTO_ALLOWED_ROOTS": ":"
     },
-    "permission_mode": "",
+    "permission_mode": "plan",
     "resume": true,
     "sandbox_mode": "read-only",
-    "system_prompt": "You are a test agent.",
+    "system_prompt": "You are a test agent.\n\n# Network in your shell\n\nIn some modes your shell commands run in a sandbox with no network. When a\ncommand fails there because it cannot reach a host (a `git push`, `gh`,\n`curl`, the platform itself), or git's credential helper says the platform\ncannot be reached, request the same command again, once, with escalated\npermissions instead of giving up, reporting the failure or working around\nit. The request is reviewed, and the command then runs with the network.\nIf it fails again, say so.\n",
     "term": "",
     "thread_id": "thread-abc",
     "use_native_permissions": false,
@@ -276,10 +277,11 @@
       "bin/gh.cmd": "@if \"%OTO_HOOK_PY%\"==\"\" set \"OTO_HOOK_PY=python\"\r\n@\"%OTO_HOOK_PY%\" -I \"%~dp0..\\credential_helper.py\" run github.com gh -- %*\r\n@exit /b %errorlevel%\r\n"
     },
     "codex_attended_floor": false,
-    "cli_permission_mode": "plan"
+    "cli_permission_mode": "plan",
+    "codex_session_text": true
   },
   "codex_judge_full_fs": {
-    "agents_md_content": "You are a test agent.",
+    "agents_md_content": "You are a test agent.\n\n# Network in your shell\n\nIn some modes your shell commands run in a sandbox with no network. When a\ncommand fails there because it cannot reach a host (a `git push`, `gh`,\n`curl`, the platform itself), or git's credential helper says the platform\ncannot be reached, request the same command again, once, with escalated\npermissions instead of giving up, reporting the failure or working around\nit. The request is reviewed, and the command then runs with the network.\nIf it fails again, say so.\n",
     "client_type": "dashboard",
     "codex_dir_relative": "workspace/.codex",
     "codex_hooks_floor": false,
@@ -291,7 +293,8 @@
       "PROXY_API_KEY": "JWT",
       "PROXY_URL": "http://127.0.0.1:18400",
       "OTO_HOOKS_DIR": "/workspace/.codex",
-      "OTO_HOOK_PY": "python3"
+      "OTO_HOOK_PY": "python3",
+      "LESSSECURE": "1"
     },
     "hook_scripts": {
       "permission_gate.py": "#gate"
@@ -305,7 +308,7 @@
     "permission_mode": "judge",
     "resume": false,
     "sandbox_mode": "read-only",
-    "system_prompt": "You are a test agent.",
+    "system_prompt": "You are a test agent.\n\n# Network in your shell\n\nIn some modes your shell commands run in a sandbox with no network. When a\ncommand fails there because it cannot reach a host (a `git push`, `gh`,\n`curl`, the platform itself), or git's credential helper says the platform\ncannot be reached, request the same command again, once, with escalated\npermissions instead of giving up, reporting the failure or working around\nit. The request is reviewed, and the command then runs with the network.\nIf it fails again, say so.\n",
     "term": "",
     "thread_id": "",
     "use_native_permissions": false,
@@ -315,10 +318,11 @@
       "bin/gh.cmd": "@if \"%OTO_HOOK_PY%\"==\"\" set \"OTO_HOOK_PY=python\"\r\n@\"%OTO_HOOK_PY%\" -I \"%~dp0..\\credential_helper.py\" run github.com gh -- %*\r\n@exit /b %errorlevel%\r\n"
     },
     "codex_attended_floor": true,
-    "cli_permission_mode": "default"
+    "cli_permission_mode": "default",
+    "codex_session_text": true
   },
   "codex_local_endpoint_ollama": {
-    "agents_md_content": "You are a test agent.\n\n# Tools on this model provider\n\nThis session runs on an Ollama server. Your MCP servers' tools load on demand:\nthe function list starts with the built-in tools and tool_search, and a search\nbrings in the tools that match. So the servers listed under \"Available Tools\n(MCPs)\" are callable here after a search. Search before you say a tool is\nmissing. If tool_search is absent from your function list, or a call to a\nfound tool fails as unsupported, the Ollama server is older than 0.34: stop\nand say so plainly, then suggest updating Ollama or running this agent on the\nDirect LLM engine. Never work around a missing tool: do not run an MCP server's command from the shell, do not guess at tool names, do not search the filesystem or read configuration files for credentials, and do not call the platform's HTTP API yourself.\n",
+    "agents_md_content": "You are a test agent.\n\n# Tools on this model provider\n\nThis session runs on an Ollama server. Your MCP servers' tools load on demand:\nthe function list starts with the built-in tools and tool_search, and a search\nbrings in the tools that match. So the servers listed under \"Available Tools\n(MCPs)\" are callable here after a search. Search before you say a tool is\nmissing. If tool_search is absent from your function list, or a call to a\nfound tool fails as unsupported, the Ollama server is older than 0.34: stop\nand say so plainly, then suggest updating Ollama or running this agent on the\nDirect LLM engine. Never work around a missing tool: do not run an MCP server's command from the shell, do not guess at tool names, do not search the filesystem or read configuration files for credentials, and do not call the platform's HTTP API yourself.\n\n# Network in your shell\n\nIn some modes your shell commands run in a sandbox with no network. When a\ncommand fails there because it cannot reach a host (a `git push`, `gh`,\n`curl`, the platform itself), or git's credential helper says the platform\ncannot be reached, request the same command again, once, with escalated\npermissions instead of giving up, reporting the failure or working around\nit. The request is reviewed, and the command then runs with the network.\nIf it fails again, say so.\n",
     "client_type": "dashboard",
     "codex_dir_relative": "users/alice/.codex",
     "codex_hooks_floor": false,
@@ -331,7 +335,8 @@
       "PROXY_API_KEY": "JWT",
       "PROXY_URL": "http://127.0.0.1:18400",
       "OTO_HOOKS_DIR": "/users/alice/.codex",
-      "OTO_HOOK_PY": "python3"
+      "OTO_HOOK_PY": "python3",
+      "LESSSECURE": "1"
     },
     "hook_scripts": {
       "permission_gate.py": "#gate"
@@ -348,10 +353,10 @@
     "multi_value_envs": {
       "OTO_ALLOWED_ROOTS": ":"
     },
-    "permission_mode": "",
+    "permission_mode": "ask",
     "resume": false,
     "sandbox_mode": "workspace-write",
-    "system_prompt": "You are a test agent.\n\n# Tools on this model provider\n\nThis session runs on an Ollama server. Your MCP servers' tools load on demand:\nthe function list starts with the built-in tools and tool_search, and a search\nbrings in the tools that match. So the servers listed under \"Available Tools\n(MCPs)\" are callable here after a search. Search before you say a tool is\nmissing. If tool_search is absent from your function list, or a call to a\nfound tool fails as unsupported, the Ollama server is older than 0.34: stop\nand say so plainly, then suggest updating Ollama or running this agent on the\nDirect LLM engine. Never work around a missing tool: do not run an MCP server's command from the shell, do not guess at tool names, do not search the filesystem or read configuration files for credentials, and do not call the platform's HTTP API yourself.\n",
+    "system_prompt": "You are a test agent.\n\n# Tools on this model provider\n\nThis session runs on an Ollama server. Your MCP servers' tools load on demand:\nthe function list starts with the built-in tools and tool_search, and a search\nbrings in the tools that match. So the servers listed under \"Available Tools\n(MCPs)\" are callable here after a search. Search before you say a tool is\nmissing. If tool_search is absent from your function list, or a call to a\nfound tool fails as unsupported, the Ollama server is older than 0.34: stop\nand say so plainly, then suggest updating Ollama or running this agent on the\nDirect LLM engine. Never work around a missing tool: do not run an MCP server's command from the shell, do not guess at tool names, do not search the filesystem or read configuration files for credentials, and do not call the platform's HTTP API yourself.\n\n# Network in your shell\n\nIn some modes your shell commands run in a sandbox with no network. When a\ncommand fails there because it cannot reach a host (a `git push`, `gh`,\n`curl`, the platform itself), or git's credential helper says the platform\ncannot be reached, request the same command again, once, with escalated\npermissions instead of giving up, reporting the failure or working around\nit. The request is reviewed, and the command then runs with the network.\nIf it fails again, say so.\n",
     "term": "",
     "thread_id": "",
     "use_native_permissions": false,
@@ -361,10 +366,11 @@
       "bin/gh.cmd": "@if \"%OTO_HOOK_PY%\"==\"\" set \"OTO_HOOK_PY=python\"\r\n@\"%OTO_HOOK_PY%\" -I \"%~dp0..\\credential_helper.py\" run github.com gh -- %*\r\n@exit /b %errorlevel%\r\n"
     },
     "codex_attended_floor": true,
-    "cli_permission_mode": "default"
+    "cli_permission_mode": "default",
+    "codex_session_text": true
   },
   "codex_oauth_dashboard": {
-    "agents_md_content": "You are a test agent.",
+    "agents_md_content": "You are a test agent.\n\n# Network in your shell\n\nIn some modes your shell commands run in a sandbox with no network. When a\ncommand fails there because it cannot reach a host (a `git push`, `gh`,\n`curl`, the platform itself), or git's credential helper says the platform\ncannot be reached, request the same command again, once, with escalated\npermissions instead of giving up, reporting the failure or working around\nit. The request is reviewed, and the command then runs with the network.\nIf it fails again, say so.\n",
     "auth_json": {
       "auth_mode": "chatgpt",
       "tokens": {
@@ -385,7 +391,8 @@
       "PROXY_API_KEY": "JWT",
       "PROXY_URL": "http://127.0.0.1:18400",
       "OTO_HOOKS_DIR": "/users/alice/.codex",
-      "OTO_HOOK_PY": "python3"
+      "OTO_HOOK_PY": "python3",
+      "LESSSECURE": "1"
     },
     "hook_scripts": {
       "permission_gate.py": "#gate"
@@ -397,10 +404,10 @@
     "multi_value_envs": {
       "OTO_ALLOWED_ROOTS": ":"
     },
-    "permission_mode": "",
+    "permission_mode": "autoReview",
     "resume": false,
     "sandbox_mode": "workspace-write",
-    "system_prompt": "You are a test agent.",
+    "system_prompt": "You are a test agent.\n\n# Network in your shell\n\nIn some modes your shell commands run in a sandbox with no network. When a\ncommand fails there because it cannot reach a host (a `git push`, `gh`,\n`curl`, the platform itself), or git's credential helper says the platform\ncannot be reached, request the same command again, once, with escalated\npermissions instead of giving up, reporting the failure or working around\nit. The request is reviewed, and the command then runs with the network.\nIf it fails again, say so.\n",
     "term": "",
     "thread_id": "",
     "use_native_permissions": false,
@@ -410,23 +417,28 @@
       "bin/gh.cmd": "@if \"%OTO_HOOK_PY%\"==\"\" set \"OTO_HOOK_PY=python\"\r\n@\"%OTO_HOOK_PY%\" -I \"%~dp0..\\credential_helper.py\" run github.com gh -- %*\r\n@exit /b %errorlevel%\r\n"
     },
     "codex_attended_floor": true,
-    "cli_permission_mode": "default"
+    "cli_permission_mode": "auto",
+    "codex_session_text": true
   },
   "codex_task_hooks_floor": {
-    "agents_md_content": "You are a test agent.",
+    "agents_md_content": "You are a test agent.\n\n# Network in your shell\n\nIn some modes your shell commands run in a sandbox with no network. When a\ncommand fails there because it cannot reach a host (a `git push`, `gh`,\n`curl`, the platform itself), or git's credential helper says the platform\ncannot be reached, request the same command again, once, with escalated\npermissions instead of giving up, reporting the failure or working around\nit. The request is reviewed, and the command then runs with the network.\nIf it fails again, say so.\n",
+    "auth_json": {
+      "OPENAI_API_KEY": "sk-openai",
+      "auth_mode": "apikey"
+    },
     "client_type": "task",
     "codex_dir_relative": "users/alice/.codex",
     "codex_hooks_floor": true,
     "cwd_relative": "users/alice",
     "effort": "high",
     "env": {
-      "CODEX_API_KEY": "sk-openai",
       "OTO_ALLOWED_ROOTS": "/users/alice/workspace:/workspace",
       "OTO_SESSION_ID": "sess-1",
       "PROXY_API_KEY": "JWT",
       "PROXY_URL": "http://127.0.0.1:18400",
       "OTO_HOOKS_DIR": "/users/alice/.codex",
-      "OTO_HOOK_PY": "python3"
+      "OTO_HOOK_PY": "python3",
+      "LESSSECURE": "1"
     },
     "hook_scripts": {
       "permission_gate.py": "#gate"
@@ -437,10 +449,10 @@
     "multi_value_envs": {
       "OTO_ALLOWED_ROOTS": ":"
     },
-    "permission_mode": "",
+    "permission_mode": "autoReview",
     "resume": false,
     "sandbox_mode": "workspace-write",
-    "system_prompt": "You are a test agent.",
+    "system_prompt": "You are a test agent.\n\n# Network in your shell\n\nIn some modes your shell commands run in a sandbox with no network. When a\ncommand fails there because it cannot reach a host (a `git push`, `gh`,\n`curl`, the platform itself), or git's credential helper says the platform\ncannot be reached, request the same command again, once, with escalated\npermissions instead of giving up, reporting the failure or working around\nit. The request is reviewed, and the command then runs with the network.\nIf it fails again, say so.\n",
     "term": "",
     "thread_id": "",
     "use_native_permissions": false,
@@ -450,190 +462,7 @@
       "bin/gh.cmd": "@if \"%OTO_HOOK_PY%\"==\"\" set \"OTO_HOOK_PY=python\"\r\n@\"%OTO_HOOK_PY%\" -I \"%~dp0..\\credential_helper.py\" run github.com gh -- %*\r\n@exit /b %errorlevel%\r\n"
     },
     "codex_attended_floor": false,
-    "cli_permission_mode": "auto"
-  },
-  "claude_auto_review_sat156": {
-    "system_prompt": "You are a test agent.",
-    "permission_mode": "autoReview",
     "cli_permission_mode": "auto",
-    "client_type": "dashboard",
-    "model": "claude-sonnet-5",
-    "effort": "high",
-    "max_thinking_tokens": 100000,
-    "env": {
-      "PROXY_URL": "http://127.0.0.1:18400",
-      "PROXY_API_KEY": "JWT",
-      "OTO_SESSION_ID": "sess-1",
-      "OTO_ALLOWED_ROOTS": "/users/alice/workspace:/workspace",
-      "OTO_HOOKS_DIR": "/users/alice/.claude",
-      "OTO_HOOK_PY": "python3",
-      "CLAUDE_CODE_OAUTH_401_WAIT_MS": "20000"
-    },
-    "cwd_relative": "users/alice",
-    "work_cwd": "",
-    "term": "",
-    "hook_scripts": {
-      "permission_gate.py": "#gate"
-    },
-    "command_wrappers": {
-      "bin/gh": "#!/bin/sh\n# The platform's gh: the real gh runs with the session's GitHub token\n# in its own environment, fetched per command from the credential\n# broker; the session's environment never holds it.\nd=$(dirname \"$0\")\nexec \"${OTO_HOOK_PY:-python3}\" -I \"$d/../credential_helper.py\" run github.com gh -- \"$@\"\n",
-      "bin/gh.cmd": "@if \"%OTO_HOOK_PY%\"==\"\" set \"OTO_HOOK_PY=python\"\r\n@\"%OTO_HOOK_PY%\" -I \"%~dp0..\\credential_helper.py\" run github.com gh -- %*\r\n@exit /b %errorlevel%\r\n"
-    },
-    "use_native_permissions": false,
-    "multi_value_envs": {
-      "OTO_ALLOWED_ROOTS": ":"
-    },
-    "claude_dir_relative": "users/alice/.claude",
-    "resume": false,
-    "session_id_for_resume": "",
-    "credentials_json": {
-      "claudeAiOauth": {
-        "accessToken": "at",
-        "refreshToken": "",
-        "expiresAt": 5,
-        "scopes": [],
-        "subscriptionType": "",
-        "rateLimitTier": ""
-      }
-    },
-    "disallowed_tools": [
-      "Artifact",
-      "ArtifactCheck",
-      "ArtifactComments",
-      "ArtifactData",
-      "CronCreate",
-      "CronDelete",
-      "CronList",
-      "PushNotification",
-      "RemoteTrigger",
-      "ScheduleWakeup",
-      "mcp__claude_ai_Gmail__authenticate",
-      "mcp__claude_ai_Gmail__complete_authentication",
-      "mcp__claude_ai_Google_Calendar__authenticate",
-      "mcp__claude_ai_Google_Calendar__complete_authentication",
-      "mcp__claude_ai_Google_Drive__authenticate",
-      "mcp__claude_ai_Google_Drive__complete_authentication"
-    ],
-    "mcp_config": {
-      "mcpServers": {
-        "display": {
-          "command": "/opt/otodock/mcps/custom/display-mcp/venv/bin/python",
-          "args": [
-            "/opt/otodock/mcps/custom/display-mcp/server.py"
-          ],
-          "env": {
-            "PROXY_URL": "http://127.0.0.1:18400"
-          }
-        },
-        "file-tools": {
-          "type": "http",
-          "url": "http://127.0.0.1:18400/mcp/file-tools/mcp/?session_id=sess-1",
-          "headers": {
-            "Authorization": "Bearer JWT"
-          }
-        }
-      }
-    }
-  },
-  "claude_ask_interactive_sat156": {
-    "system_prompt": "You are a test agent.",
-    "permission_mode": "ask",
-    "cli_permission_mode": "default",
-    "client_type": "dashboard",
-    "model": "claude-sonnet-5",
-    "effort": "high",
-    "max_thinking_tokens": 100000,
-    "env": {
-      "PROXY_URL": "http://127.0.0.1:18400",
-      "PROXY_API_KEY": "JWT",
-      "OTO_SESSION_ID": "sess-1",
-      "OTO_ALLOWED_ROOTS": "/users/alice/workspace:/workspace",
-      "OTO_HOOKS_DIR": "/users/alice/.claude",
-      "OTO_HOOK_PY": "python3"
-    },
-    "cwd_relative": "users/alice",
-    "work_cwd": "",
-    "term": "",
-    "hook_scripts": {
-      "permission_gate.py": "#gate"
-    },
-    "command_wrappers": {
-      "bin/gh": "#!/bin/sh\n# The platform's gh: the real gh runs with the session's GitHub token\n# in its own environment, fetched per command from the credential\n# broker; the session's environment never holds it.\nd=$(dirname \"$0\")\nexec \"${OTO_HOOK_PY:-python3}\" -I \"$d/../credential_helper.py\" run github.com gh -- \"$@\"\n",
-      "bin/gh.cmd": "@if \"%OTO_HOOK_PY%\"==\"\" set \"OTO_HOOK_PY=python\"\r\n@\"%OTO_HOOK_PY%\" -I \"%~dp0..\\credential_helper.py\" run github.com gh -- %*\r\n@exit /b %errorlevel%\r\n"
-    },
-    "use_native_permissions": true,
-    "multi_value_envs": {
-      "OTO_ALLOWED_ROOTS": ":"
-    },
-    "claude_dir_relative": "users/alice/.claude",
-    "resume": false,
-    "session_id_for_resume": "",
-    "disallowed_tools": [
-      "Artifact",
-      "ArtifactCheck",
-      "ArtifactComments",
-      "ArtifactData",
-      "CronCreate",
-      "CronDelete",
-      "CronList",
-      "PushNotification",
-      "RemoteTrigger",
-      "ScheduleWakeup",
-      "mcp__claude_ai_Gmail__authenticate",
-      "mcp__claude_ai_Gmail__complete_authentication",
-      "mcp__claude_ai_Google_Calendar__authenticate",
-      "mcp__claude_ai_Google_Calendar__complete_authentication",
-      "mcp__claude_ai_Google_Drive__authenticate",
-      "mcp__claude_ai_Google_Drive__complete_authentication"
-    ]
-  },
-  "codex_auto_review_sat156": {
-    "system_prompt": "You are a test agent.",
-    "permission_mode": "autoReview",
-    "cli_permission_mode": "auto",
-    "client_type": "dashboard",
-    "model": "gpt-5.6-sol",
-    "effort": "high",
-    "max_thinking_tokens": 100000,
-    "env": {
-      "PROXY_URL": "http://127.0.0.1:18400",
-      "PROXY_API_KEY": "JWT",
-      "OTO_SESSION_ID": "sess-1",
-      "OTO_ALLOWED_ROOTS": "/users/alice/workspace:/workspace",
-      "OTO_HOOKS_DIR": "/users/alice/.codex",
-      "OTO_HOOK_PY": "python3"
-    },
-    "cwd_relative": "users/alice",
-    "work_cwd": "",
-    "term": "",
-    "hook_scripts": {
-      "permission_gate.py": "#gate"
-    },
-    "command_wrappers": {
-      "bin/gh": "#!/bin/sh\n# The platform's gh: the real gh runs with the session's GitHub token\n# in its own environment, fetched per command from the credential\n# broker; the session's environment never holds it.\nd=$(dirname \"$0\")\nexec \"${OTO_HOOK_PY:-python3}\" -I \"$d/../credential_helper.py\" run github.com gh -- \"$@\"\n",
-      "bin/gh.cmd": "@if \"%OTO_HOOK_PY%\"==\"\" set \"OTO_HOOK_PY=python\"\r\n@\"%OTO_HOOK_PY%\" -I \"%~dp0..\\credential_helper.py\" run github.com gh -- %*\r\n@exit /b %errorlevel%\r\n"
-    },
-    "use_native_permissions": false,
-    "multi_value_envs": {
-      "OTO_ALLOWED_ROOTS": ":"
-    },
-    "codex_dir_relative": "users/alice/.codex",
-    "thread_id": "",
-    "codex_hooks_floor": false,
-    "codex_attended_floor": true,
-    "agents_md_content": "You are a test agent.",
-    "resume": false,
-    "interactive_first_prompt": "",
-    "sandbox_mode": "workspace-write",
-    "auth_json": {
-      "auth_mode": "chatgpt",
-      "tokens": {
-        "id_token": "ID",
-        "access_token": "NEW",
-        "refresh_token": "",
-        "account_id": "A"
-      }
-    },
-    "mcp_config_toml": "[features]\ndefault_mode_request_user_input = true\n\n[mcp_servers.display]\ncommand = \"/opt/otodock/mcps/custom/display-mcp/venv/bin/python\"\nargs = [\"/opt/otodock/mcps/custom/display-mcp/server.py\"]\nenv = { PROXY_URL = \"http://10.0.0.1:8400\", \"PROXY_URL\" = \"http://127.0.0.1:18400\", \"PROXY_API_KEY\" = \"JWT\" }\n\n[mcp_servers.file-tools]\nurl = \"http://127.0.0.1:18400/mcp/file-tools/mcp/?session_id=sess-1\"\n"
+    "codex_session_text": true
   }
 }

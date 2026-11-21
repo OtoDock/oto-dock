@@ -44,6 +44,12 @@ DEFAULT_MUSIC_SECONDS = 30
 SFX_MIN_SECONDS = 0.5
 SFX_MAX_SECONDS = 30.0
 
+# ElevenLabs is retiring music_v1 and eleven_text_to_sound_v2 (the sound
+# effects default) and asks callers to name the replacement explicitly. The
+# first music model is the default.
+MUSIC_MODELS = ("music_v2_5", "music_v2")
+SFX_MODEL = "eleven_text_to_sound_v3"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("music-gen")
 
@@ -102,9 +108,9 @@ async def list_tools() -> list[Tool]:
                     },
                     "model": {
                         "type": "string",
-                        "enum": ["music_v1", "music_v2"],
-                        "default": "music_v1",
-                        "description": "ElevenLabs music model.",
+                        "enum": list(MUSIC_MODELS),
+                        "default": MUSIC_MODELS[0],
+                        "description": "ElevenLabs music model: music_v2_5 (default, the newest) or music_v2.",
                     },
                     "instrumental": {
                         "type": "boolean",
@@ -289,6 +295,21 @@ def _get_save_path(save_path: str | None, prefix: str) -> str:
     return full
 
 
+# A button pressed by someone who may only read the workspace, or who reaches
+# no folder of the agent, runs this tool over a read only workspace or none.
+SAVE_REFUSED = "This session cannot save files here, so nothing was made."
+
+
+def _save_refusal() -> str | None:
+    """Asked before any paid call: the sentence when the workspace every save
+    is anchored under takes no write (read only, or not there), else None.
+    The vendor is never paid for a file that cannot be kept. An unset
+    ``AUDIO_SAVE_DIR`` is left to ``_get_save_path``'s own error."""
+    if AUDIO_SAVE_DIR and not os.access(AUDIO_SAVE_DIR, os.W_OK):
+        return SAVE_REFUSED
+    return None
+
+
 # ---------------------------------------------------------------------------
 # ElevenLabs API
 # ---------------------------------------------------------------------------
@@ -351,8 +372,8 @@ async def _handle_compose(args: dict) -> list[TextContent]:
             f"{MUSIC_MAX_SECONDS} (got {duration:g})."
         ))]
 
-    model = args.get("model", "music_v1")
-    if model not in ("music_v1", "music_v2"):
+    model = args.get("model", MUSIC_MODELS[0])
+    if model not in MUSIC_MODELS:
         return [TextContent(type="text", text=f"Error: unknown model: {model}")]
     instrumental = bool(args.get("instrumental", False))
 
@@ -362,6 +383,9 @@ async def _handle_compose(args: dict) -> list[TextContent]:
         "model_id": model,
         "force_instrumental": instrumental,
     }
+    refused = _save_refusal()
+    if refused:
+        return [TextContent(type="text", text=refused)]
     try:
         audio = await _eleven_post("/v1/music", body)
     except httpx.HTTPStatusError as e:
@@ -388,7 +412,7 @@ async def _handle_sfx(args: dict) -> list[TextContent]:
     if not ELEVENLABS_API_KEY:
         return [TextContent(type="text", text=_missing_key_msg())]
 
-    body: dict = {"text": prompt, "loop": bool(args.get("loop", False))}
+    body: dict = {"text": prompt, "loop": bool(args.get("loop", False)), "model_id": SFX_MODEL}
 
     if args.get("duration_seconds") is not None:
         try:
@@ -413,6 +437,9 @@ async def _handle_sfx(args: dict) -> list[TextContent]:
             ))]
         body["prompt_influence"] = influence
 
+    refused = _save_refusal()
+    if refused:
+        return [TextContent(type="text", text=refused)]
     try:
         audio = await _eleven_post("/v1/sound-generation", body)
     except httpx.HTTPStatusError as e:

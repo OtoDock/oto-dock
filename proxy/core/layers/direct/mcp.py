@@ -11,15 +11,15 @@ Architecture:
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import threading
 import time
 from typing import TYPE_CHECKING, cast
 
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession
 from mcp.client.sse import sse_client
-from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.exceptions import McpError
 
@@ -28,21 +28,34 @@ if TYPE_CHECKING:
 
 import config
 from core import placement
+from core.stdio_path_interceptor import STANDIN_ENV, marker_fingerprint
 
 logger = logging.getLogger("mcp-manager")
 
-# Timeout for individual tool calls (seconds). The default bounds phone
-# calls and app-action clicks (a caller / a click must never wait longer);
-# chat, task and meeting sessions use the chat figure (Codex's 300 s) so a
-# document render or a browser flow behind a sidecar MCP can finish.
+#: This engine's id, as its capabilities name it (``layer.py``).
+ENGINE_ID = "direct-llm"
+
+# Timeout for individual tool calls (seconds). The default bounds an
+# app-action click (a click must never wait longer); every Direct session,
+# a call's too, uses the chat figure (Codex's 300 s) so a document render or
+# a browser flow behind a sidecar MCP can finish.
 TOOL_CALL_TIMEOUT = 60
 TOOL_CALL_TIMEOUT_CHAT = 300
+
+
+class TimedOut(str):
+    """A call's text when the client stopped waiting at its cap: a model
+    reads it as the text it is, and ``execute_tools`` marks the call
+    ``timed_out`` for a caller that answers someone (an app's button)."""
 
 # How long one MCP server may take to connect and list its tools before the
 # session starts without it: the servers start together, so this bounds the
 # whole start too. Above a cold start of a large stdio venv, below the app
 # actions' 90 s backstop (``services/apps/headless_exec.py``).
 MCP_START_TIMEOUT_S = 60.0
+# On a call an HTTP server (a tool in its own container, a vendor's) gets a
+# shorter start: one that does not answer is left out and the call starts.
+PHONE_HTTP_START_S = 15.0
 
 # The registry's Claude-JSON config format spells streamable HTTP as "http"
 # (the CLI's alias for it) — both spellings are the same transport here. The
@@ -120,53 +133,50 @@ def stop_mcp_thread(join_timeout: float = 2.0) -> None:
 _MCP_FILE_BLOCKS = ("image", "resource")
 
 
-# --- The config build's lock ---
-# One build at a time per build identity, which is what names the file
-# ``build_session_mcp_config`` writes and the manager reads back
-# (``user-mcp-configs/[sessions/<sha(session_id)>/]<agent>-<sha("agent")>.json``),
-# so a second build of the same identity waits for the first and reads back
-# a whole file. Taken in worker threads only, around a job that awaits
-# nothing, so no loop ever waits on a thread that waits on the loop; an
-# entry leaves the map with its last holder.
-
-class _BuildLock:
-    __slots__ = ("lock", "holders")
-
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.holders = 0
-
-
-_build_locks: dict[tuple, _BuildLock] = {}
-_build_locks_guard = threading.Lock()
-
-
-@contextlib.contextmanager
-def _build_lock(key: tuple):
-    with _build_locks_guard:
-        entry = _build_locks.get(key)
-        if entry is None:
-            entry = _build_locks[key] = _BuildLock()
-        entry.holders += 1
+def _marker_of(server_config: dict) -> dict | None:
+    """The stand-in's marker on an entry (``OTO_TOOL_STANDIN``), or None."""
+    raw = (server_config.get("env") or {}).get(STANDIN_ENV)
     try:
-        with entry.lock:
-            yield
-    finally:
-        with _build_locks_guard:
-            entry.holders -= 1
-            if entry.holders == 0 and _build_locks.get(key) is entry:
-                del _build_locks[key]
+        marker = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def _log_warm_failure(conn: "MCPServerConnection", task: asyncio.Task) -> None:
+    """A call's tool that did not start beside the model: one line (its first
+    call tries again and says why). A session that ended meanwhile says
+    nothing."""
+    if task.cancelled() or conn.closed:
+        return
+    error = task.exception()
+    refused = task.result() if error is None else str(error)
+    if refused:
+        logger.info("MCP server '%s' did not start with its call: %s", conn.name, refused)
+
+
+def _defs_key(defs: list[dict]) -> str:
+    """What a list says about each tool, as the model is given it."""
+    return json.dumps(sorted([d.get("name"), d.get("description"), d.get("input_schema")] for d in defs),
+                      sort_keys=True, default=str)
 
 
 class MCPServerConnection:
     """Wraps a single MCP server connection (stdio or SSE)."""
+
+    #: Whether the tools' own annotations are kept after a list. A program
+    #: of the platform's own (``sandbox_program.SandboxProgram``) has none.
+    records_hints = True
 
     def __init__(self, name: str, server_config: dict,
                  credential_env: dict[str, str] | None = None,
                  session_id: str = "",
                  sandbox_builder=None,
                  agent_name: str = "",
-                 tool_timeout: int = TOOL_CALL_TIMEOUT):
+                 tool_timeout: int = TOOL_CALL_TIMEOUT,
+                 start_timeout: float | None = None,
+                 machine_id: str = "",
+                 main_loop: asyncio.AbstractEventLoop | None = None):
         self.name = name
         self.config = server_config
         self.credential_env = credential_env
@@ -174,6 +184,19 @@ class MCPServerConnection:
         self.sandbox_builder = sandbox_builder  # SandboxBuilder or None
         self.agent_name = agent_name
         self.tool_timeout = tool_timeout  # per-call cap, set by the manager
+        # A remote server's bound to connect and list, set by the manager
+        # for a call; None (and every stdio server) is MCP_START_TIMEOUT_S.
+        self.start_timeout = start_timeout
+        # The compute machine a stdio server's process runs on ("": this
+        # host) and the loop its link lives on (core/remote/tool_relay.py).
+        self.machine_id = machine_id
+        self.main_loop = main_loop
+        # Its open failed because the machine's link was gone: the relay
+        # keeps no child to say so (``AgentMCPManager.tools_lost``).
+        self.link_lost = False
+        # Why its open was refused before anything started (the machine has
+        # not built the tool yet): the sentence its call answers.
+        self.refused = ""
         # Set by start(), with _closing; what runs after it casts the reads.
         self.session: ClientSession | None = None
         self.tools: list[dict] = []  # Anthropic API format
@@ -191,11 +214,29 @@ class MCPServerConnection:
         # for this connection's whole lifetime — see start() for why.
         self._closing: asyncio.Event | None = None
         self._owner_task: asyncio.Task | None = None
+        # A program that waits for the agent's first call (the stand-in's
+        # marker, ``services/mcp/tool_listing.py``): its tools come from the
+        # answers saved for the session's scope, kept apart from ``tools`` (a
+        # failed start's teardown clears that one) until ``ensure_started``.
+        self.pending = False
+        self.saved_tools: list[dict] = []
+        # A call's tool (a warm marker): its program starts with the session,
+        # beside the model, and the session's estimate counted it, so no
+        # start of it is judged or counted again.
+        self.warm = False
+        self.warming: asyncio.Task | None = None
+        self.closed = False
+        self._start_lock: asyncio.Lock | None = None
+        # Where a start keeps what the program answered: ``(scope, fp)``.
+        self.capture: tuple[tuple[str, str], str] | None = None
+        # What a start with the session kept, with its ``(scope, fp)``: the
+        # program then rests until its first call (``rest_until_called``).
+        self.kept: tuple[dict, tuple[str, str], str] | None = None
 
     async def start(self) -> None:
         """Connect to the MCP server and discover tools.
 
-        ``stdio_client`` / ``ClientSession`` are anyio context managers, and
+        The transport's client and ``ClientSession`` are anyio context managers, and
         anyio requires a cancel scope to be EXITED in the same task that
         entered it. So we run the whole lifecycle — enter → hold open → exit —
         inside one dedicated owner task (``_serve``), and only return here once
@@ -221,10 +262,12 @@ class MCPServerConnection:
         until close() signals teardown. Enter and exit both happen here, in one
         task, satisfying anyio's same-task cancel-scope requirement."""
         server_type = self.config.get("type", "stdio")
+        local = server_type == "stdio"
+        bound = MCP_START_TIMEOUT_S if local or self.start_timeout is None else self.start_timeout
         try:
             try:
-                async with asyncio.timeout(MCP_START_TIMEOUT_S):
-                    if server_type == "stdio":
+                async with asyncio.timeout(bound):
+                    if local:
                         await self._start_stdio()
                     elif server_type == "sse" or server_type in _REMOTE_STREAMABLE:
                         await self._start_remote()
@@ -245,17 +288,17 @@ class MCPServerConnection:
                 # resolve, a process that never speaks) is left out like a
                 # failed one; the contexts it entered are exited below.
                 raise RuntimeError(
-                    f"did not answer within {MCP_START_TIMEOUT_S:.0f} s; the session starts without it"
+                    f"did not answer within {bound:.0f} s; the session starts without it"
                 ) from None
-            for tool in tools_result.tools:
-                namespaced = f"mcp__{self.name}__{tool.name}"
-                self.tools.append({
-                    "name": namespaced,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema or {"type": "object", "properties": {}},
-                    "_original_name": tool.name,
-                    "_server": self.name,
-                })
+            # Set at once: a start in flight leaves the list the model has
+            # (a call's tool lists its saved answers while its program starts).
+            self.tools = [{
+                "name": f"mcp__{self.name}__{tool.name}",
+                "description": tool.description or "",
+                "input_schema": tool.inputSchema or {"type": "object", "properties": {}},
+                "_original_name": tool.name,
+                "_server": self.name,
+            } for tool in tools_result.tools]
 
             logger.info(
                 "MCP server '%s': %s tools discovered",
@@ -263,10 +306,13 @@ class MCPServerConnection:
             )
             # The tools' own annotations: the permission tier of a tool no
             # manifest rule names (services/mcp/mcp_permissions).
-            from services.mcp.mcp_permissions import record_tool_hints
-            await asyncio.to_thread(record_tool_hints, self.name, [
-                (tool.name, tool.annotations.model_dump(exclude_none=True) if tool.annotations else None)
-                for tool in tools_result.tools])
+            if self.records_hints:
+                from services.mcp.mcp_permissions import record_tool_hints
+                await asyncio.to_thread(record_tool_hints, self.name, [
+                    (tool.name, tool.annotations.model_dump(exclude_none=True) if tool.annotations else None)
+                    for tool in tools_result.tools])
+            if self.capture is not None:
+                await self._keep_answers(result, tools_result)
         except Exception as e:  # noqa: BLE001  # the mcp client raises anything at start: the server gets no tools
             # Error isolation: a failed server just has no tools (matches the
             # previous behaviour). Tear down whatever was entered, in THIS task.
@@ -285,6 +331,125 @@ class MCPServerConnection:
         finally:
             await self._teardown()
 
+    async def _keep_answers(self, init, tools_result) -> None:
+        """What the program answered, kept for the session's scope (the
+        platform's own client read it), when nothing was saved or the saved
+        list differs. Best effort."""
+        from services.mcp import tool_listing
+        scope, fp = cast("tuple", self.capture)
+        self.capture = None
+        tools = [t.model_dump(mode="json", by_alias=True, exclude_none=True) for t in tools_result.tools]
+        if self.saved_tools and _defs_key(self.saved_tools) == _defs_key(self._defs(tools)):
+            return
+        listing = {"initialize": init.model_dump(mode="json", by_alias=True, exclude_none=True),
+                   "lists": {"tools/list": tools}}
+        try:
+            if await asyncio.to_thread(tool_listing.keep, scope, self.name, fp, listing):
+                self.kept = (listing, scope, fp)
+        except Exception:  # noqa: BLE001  # a store that fails keeps nothing: the next session starts it again
+            logger.warning("MCP server '%s': its answers were not kept", self.name, exc_info=True)
+
+    async def rest_until_called(self) -> bool:
+        """A program the session started only to answer its lists, whose
+        answers were kept: stopped, its tools still listed from them, to start
+        again at its first call (the CLI engines' stand-in stops it the same
+        way, ``StandIn._maybe_stop``). False when it runs on: nothing was
+        kept, or it is a call's tool."""
+        kept, self.kept = self.kept, None
+        if kept is None or self.warm or self.session is None or self.closed:
+            return False
+        await self._stop_owner()
+        self.wait_for_first_call(*kept)
+        logger.info("tool %s of %s stopped until its first call: its answers are kept",
+                    self.name, (self.session_id or "")[:8])
+        return True
+
+    def _defs(self, tools: list[dict]) -> list[dict]:
+        """MCP tool objects as this client lists them to the model."""
+        return [{
+            "name": f"mcp__{self.name}__{t.get('name')}",
+            "description": t.get("description") or "",
+            "input_schema": t.get("inputSchema") or {"type": "object", "properties": {}},
+            "_original_name": t.get("name"),
+            "_server": self.name,
+        } for t in tools if isinstance(t, dict) and t.get("name")]
+
+    def wait_for_first_call(self, saved: dict, scope: tuple[str, str], fp: str) -> None:
+        """Answer from the saved listing and start at the first call."""
+        self.saved_tools = self._defs(((saved.get("lists") or {}).get("tools/list")) or [])
+        self.tools = list(self.saved_tools)
+        self.pending = True
+        self.capture = (scope, fp)
+
+    async def ensure_started(self) -> str:
+        """Start a program that waited for its first call: "" once it runs,
+        else the sentence the call answers (the connection then keeps waiting,
+        the next call tries again). The session's box judges the start."""
+        if self._start_lock is None:
+            self._start_lock = asyncio.Lock()
+        async with self._start_lock:
+            if not self.pending:
+                return ""
+            label = str((_marker_of(self.config) or {}).get("label") or self.name)
+            if self.closed:
+                return f"The {label} tool did not start. Its session has ended."
+            admission = await self._admission()
+            if admission is not None and not admission:
+                return str(admission.user_message or "")
+            began = time.monotonic()
+            await self.start()
+            if self.session is None:
+                await self._teardown()
+                self.tools = list(self.saved_tools)
+                if admission:
+                    await self._give_back()
+                return self.refused or f"The {label} tool did not start. Its program stopped before it answered."
+            self.pending = False
+            if self.closed:
+                return f"The {label} tool did not start. Its session has ended."
+            logger.info("tool %s of %s started on its first call in %d ms", self.name,
+                        (self.session_id or "")[:8], int((time.monotonic() - began) * 1000))
+            # The session keeps the list it was given; a changed one is kept
+            # for its next session (``_keep_answers``).
+            self.tools = list(self.saved_tools)
+            return ""
+
+    async def _admission(self):
+        """The admission of a late start: judged on the session's box, or
+        None for a call's tool (the session's estimate counted it)."""
+        return None if self.warm else await self._admit()
+
+    async def _stop_owner(self) -> None:
+        """The owner task told to leave its contexts, and waited for: the
+        program ends and its place on the machine is free."""
+        if self._closing is not None:
+            self._closing.set()
+        task, self._owner_task = self._owner_task, None
+        if task is not None:
+            with contextlib.suppress(Exception):
+                await task
+
+    async def _admit(self, *, judged: bool = True):
+        """The session's box asked for room for one more program, on the
+        proxy's own loop (the admission's condition lives there): judged at
+        a late start, counted for a program that starts with the session.
+        None when no loop is there to ask."""
+        if self.main_loop is None or not self.session_id:
+            return None
+        from core import concurrency
+        fut = asyncio.run_coroutine_threadsafe(
+            concurrency.grow(self.session_id, judged=judged, server=self.name), self.main_loop)
+        return await asyncio.wrap_future(fut)
+
+    async def _give_back(self) -> None:
+        """A start the session's box counted that did not happen: its
+        program given back (``concurrency.shrink``), on the proxy's loop."""
+        if self.main_loop is None or not self.session_id:
+            return
+        from core import concurrency
+        fut = asyncio.run_coroutine_threadsafe(concurrency.shrink(self.session_id, self.name), self.main_loop)
+        await asyncio.wrap_future(fut)
+
     async def _teardown(self) -> None:
         """Exit all context managers, in reverse order. MUST run in the owner
         task (``_serve``) so anyio cancel scopes are exited where they began."""
@@ -297,72 +462,117 @@ class MCPServerConnection:
         self.session = None
         self.tools.clear()
 
-    async def _start_stdio(self) -> None:
-        """Start a stdio MCP server subprocess."""
-        command = self.config["command"]
-        args = self.config.get("args", [])
-
-        # Build minimal env with session-scoped auth token + OTO_* vars.
-        # Username + role come from the sandbox config (matches CLI/Codex
-        # — same source of truth, so OTO_* values are consistent).
+    def base_env(self) -> dict[str, str]:
+        """The env a stdio program gets before its secrets: the session's
+        own and the entry's (the stand-in's marker aside). Its fingerprint
+        reads this one, so the exit's per-build placeholders never move it."""
         from core.sandbox.env_builder import build_session_env
-        _username = (
-            self.sandbox_builder.cfg.username if self.sandbox_builder else ""
-        )
-        _user_role = (
-            self.sandbox_builder.cfg.role if self.sandbox_builder else ""
-        )
         env = build_session_env(
             self.session_id or "", self.agent_name,
             credential_env=self.credential_env,
-            username=_username,
-            user_role=_user_role,
+            username=self.sandbox_builder.cfg.username if self.sandbox_builder else "",
+            user_role=self.sandbox_builder.cfg.role if self.sandbox_builder else "",
         )
+        env.update(self.config.get("env", {}))
+        env.pop(STANDIN_ENV, None)
+        return env
 
-        # Merge server-specific env vars from MCP config
-        server_env = self.config.get("env", {})
-        env.update(server_env)
+    async def _start_stdio(self) -> None:
+        """A stdio MCP server's process, on the session's compute machine."""
+        command = self.config["command"]
+        args = self.config.get("args", [])
 
-        # Credential broker: merge this MCP's brokered secrets in-process.
-        # Direct-LLM spawns MCPs inside the proxy, so there's no stdio interceptor
-        # to fetch over HTTP — read straight from the per-session store
-        # provisioned in _start_impl. No-op while secrets remain in server_env;
-        # after the source-strip this becomes the sole delivery path.
-        from core.credentials import mcp_broker
+        # Minimal env with the session-scoped auth token and the OTO_* vars;
+        # username and role come from the sandbox config (matches CLI/Codex,
+        # so OTO_* values are consistent), then the entry's own.
+        env = self.base_env()
+
+        # Credential broker: this MCP's brokered secrets, read straight from
+        # the per-session store provisioned in _start_impl (the process has
+        # no stdio interceptor to fetch them over HTTP).
+        from core.credentials import credential_exit, mcp_broker
         _bundle = mcp_broker.get(self.session_id, self.name)
         if _bundle:
             env.update(_bundle.env)
+        # The credential exit's variables: a placeholder in
+        # the bundle is swapped for its value only through the exit. A tool
+        # whose exit entry names a host the session keeps direct (an
+        # engine's) starts with its own list, as the spawn fetch gives it.
+        env.update(credential_exit.env_of(self.session_id or ""))
+        if _bundle:
+            env.update(credential_exit.own_direct(self.session_id or "", _bundle.exit, env))
 
-        # Wrap in bwrap if sandbox is enabled for this session.
-        # Each stdio MCP subprocess gets its own bwrap mount namespace
-        # with the same mounts as CLI MCPs (system, workspace, mcps dir).
-        if self.sandbox_builder:
-            inner_cmd = [command] + args
-            wrapped = self.sandbox_builder.build_command_prefix(inner_cmd)
-            command = wrapped[0]   # "bwrap"
-            args = wrapped[1:]     # bwrap flags + "--" + original command + args
-            # Apply sandbox env restrictions (PATH, HOME)
-            env.update(self.sandbox_builder.get_env_overrides())
+        if not self.machine_id:
+            # The platform starts no tool itself.
+            self.refused = placement.NO_COMPUTE_SENTENCE
+            raise RuntimeError(self.refused)
+        await self._start_relayed(command, args, env)
 
-        # Below the proxy's CPU priority, like every session process.
-        from core.sandbox import pty_relay
-        command, *args = pty_relay.niced([command, *args])
+    async def _start_relayed(self, command: str, args: list, env: dict[str, str]) -> None:
+        """The stdio server's process on the session's compute machine,
+        behind the same pair of streams ``stdio_client`` gives: the MCP
+        client here does not change. The machine renders the session's
+        sandbox description around the argv, so a server never runs bare."""
+        if self.sandbox_builder is None or self.main_loop is None:
+            raise RuntimeError(f"MCP server '{self.name}' has no sandbox to run in on a compute machine")
+        from mcp.client.stdio import get_default_environment
 
-        params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=env,
+        from core.remote import tool_relay
+        from services.remote import machine_tools
+        # A tool the machine builds itself opens only once it is built there
+        # at the platform's version: otherwise the call answers one sentence
+        # and the install is asked for.
+        tool_dir, self.refused = machine_tools.relay_gate(self.machine_id, self.name)
+        if self.refused:
+            self.main_loop.call_soon_threadsafe(machine_tools.ask, self.machine_id)
+            raise RuntimeError(self.refused)
+        env.update(self.sandbox_builder.get_env_overrides())
+        cm = tool_relay.relay_client(
+            self.machine_id, self.session_id, self.name,
+            description=self._relay_description(),
+            argv=[command, *args],
+            env={**get_default_environment(), **env},
+            main_loop=self.main_loop,
+            on_end=self._relay_ended,
+            exit_block=self._relay_exit_block(),
+            tool_dir=tool_dir,
         )
-
-        # stdio_client is an async context manager that returns (read, write) streams
-        cm = stdio_client(params)
-        streams = await cm.__aenter__()
+        try:
+            streams = await cm.__aenter__()
+        except tool_relay.LinkLost:
+            self.link_lost = True
+            raise
+        except RuntimeError as e:
+            # The machine's own answer when the folder is not there: the
+            # memo said it was, so it forgets the tool and a run builds it.
+            if machine_tools.INSTALLING_SENTENCE in str(e):
+                self.refused = machine_tools.INSTALLING_SENTENCE
+                machine_tools.note_not_there(self.machine_id, self.name)
+                self.main_loop.call_soon_threadsafe(machine_tools.ask, self.machine_id)
+            raise
         self._cm_stack.append(cm)
-
-        # ClientSession wraps the streams
         session_cm = ClientSession(*streams)
         self.session = await session_cm.__aenter__()
         self._cm_stack.append(session_cm)
+
+    def _relay_description(self) -> dict:
+        """The sandbox the open is rendered in: the session's own."""
+        return self.sandbox_builder.describe().to_dict()
+
+    def _relay_exit_block(self) -> dict | None:
+        """The session's exit door for the machine: the same
+        block a start payload carries, on each tool's open."""
+        from core.credentials import credential_exit, mcp_broker
+        from core.remote import mcp_gateway_push
+        secret = credential_exit.machine_secret(self.session_id)
+        return (credential_exit.machine_block(self.session_id, mcp_broker.bundles_of(self.session_id),
+                                              mcp_gateway_push.token_hash_of(secret)) if secret else None)
+
+    def _relay_ended(self, _lost: bool) -> None:
+        """The relayed process is gone. A call then fails with a ``McpError``
+        that alone would not mark the server dead, and an app button heals
+        on the mark."""
+        self.dead = True
 
     async def _start_remote(self) -> None:
         """Connect to a remote MCP server (SSE or streamable HTTP)."""
@@ -399,21 +609,43 @@ class MCPServerConnection:
         headers = headers or None
 
         server_type = self.config.get("type", "sse")
+        factory = self._client_factory(url)
 
         if server_type in _REMOTE_STREAMABLE:
-            cm = streamablehttp_client(url, headers=headers)
+            cm = streamablehttp_client(url, headers=headers, **factory)
             streams = await cm.__aenter__()
             self._cm_stack.append(cm)
             # streamablehttp_client returns (read, write, get_session_id) — 3-tuple
             session_cm = ClientSession(streams[0], streams[1])
         else:
-            sse_cm = sse_client(url, headers=headers)
+            sse_cm = sse_client(url, headers=headers, **factory)
             sse_streams = await sse_cm.__aenter__()
             self._cm_stack.append(sse_cm)
             session_cm = ClientSession(*sse_streams)
 
         self.session = await session_cm.__aenter__()
         self._cm_stack.append(session_cm)
+
+    def _client_factory(self, url: str) -> dict:
+        """The credential gateway's entry on this proxy's listener keeps the
+        SDK's client. A Docker sidecar (or, self-hosted, any loopback host)
+        keeps it too, except on a hosted install, where it is dialled only
+        inside the install's tool networks (``pinned_http.docker_tool``: a
+        loopback URL a manifest names is refused there). Any other remote
+        MCP, a manifest's URL, goes through the checked transport
+        (``admin_host``: public only on a hosted install)."""
+        from urllib.parse import urlsplit
+
+        from core.config import deployment
+        from core.credentials import mcp_gateway
+        from services.infra import pinned_http
+        from services.mcp import mcp_registry
+        host = urlsplit(url).hostname or ""
+        if deployment.is_proxy_local_mcp_host(host, mcp_registry.get_manifest(self.name)):
+            policy = None if mcp_gateway.is_own_entry(url) else pinned_http.tool_policy()
+            return {} if policy is None else {
+                "httpx_client_factory": pinned_http.mcp_client_factory(policy)}
+        return {"httpx_client_factory": pinned_http.mcp_client_factory(pinned_http.admin_host)}
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Call a tool on this server. Returns the result as a string. A
@@ -424,6 +656,10 @@ class MCPServerConnection:
         """``call_tool`` with the result's image blocks and embedded
         resources beside the text (MCP JSON shape), for the platform to keep
         when the MCP opts the tool in (``services/mcp/result_files.py``)."""
+        if self.pending:
+            refused = await self.ensure_started()
+            if refused:
+                return refused, []
         if not self.session:
             self.dead = True
             return f"Error: MCP server '{self.name}' is not connected", []
@@ -447,7 +683,7 @@ class MCPServerConnection:
             return ("\n".join(parts) if parts else "(empty result)"), blocks
         except asyncio.TimeoutError:
             # A slow tool is NOT a dead server — timeouts never mark dead.
-            return f"Error: Tool '{tool_name}' timed out after {self.tool_timeout}s", []
+            return TimedOut(f"Error: Tool '{tool_name}' timed out after {self.tool_timeout}s"), []
         except McpError as e:
             # A JSON-RPC error answered by a LIVE server: some servers (the
             # github sidecar) report a tool's own failure this way instead of
@@ -483,15 +719,18 @@ class MCPServerConnection:
         The actual ``__aexit__`` runs inside ``_serve`` (the task that entered
         the contexts), satisfying anyio's same-task cancel-scope rule. Awaiting
         the owner task guarantees the stdio reader is cancelled and the MCP
-        subprocess is terminated before we return. Idempotent.
+        subprocess is terminated before we return. Idempotent. A start in
+        flight finishes first (its lock), so the program it opened is closed
+        here too.
         """
-        if self._closing is not None:
-            self._closing.set()
-        task = self._owner_task
-        self._owner_task = None
-        if task is not None:
+        self.closed = True
+        if self.warming is not None and not self.warming.done():
             with contextlib.suppress(Exception):
-                await task
+                await self.warming  # a call's start beside the model ends first
+        if self._start_lock is not None and self._start_lock.locked():
+            async with self._start_lock:
+                pass
+        await self._stop_owner()
 
 
 class AgentMCPManager:
@@ -503,21 +742,24 @@ class AgentMCPManager:
                  session_id: str = "",
                  sandbox_builder=None,
                  prebuilt_config: tuple | None = None,
-                 enable_http_transport: bool = False,
                  tool_timeout: int = TOOL_CALL_TIMEOUT,
-                 external: bool = False,
                  included_mcps: set[str] | None = None,
-                 user_role: str = "",
-                 scope: str = "user"):
+                 machine_id: str = "",
+                 lazy: bool = False,
+                 programs: tuple = ()):
         self.agent_name = agent_name
         self.phone_mode = phone_mode
-        # The person's effective role on the agent and the scope the build
-        # judges the manifests' audience with, as the session's builder did
-        # (``mcp_registry.audience_refusal``): a user-scope session of a
-        # viewer never gets an editor-audience MCP's tools on this engine
-        # either. An empty role is "no person known" and filters nothing.
-        self.user_role = user_role
-        self.scope = scope
+        # The programs of the platform's own this session carries, by name
+        # (``sandbox_program.ProgramSpec`` each): held beside the servers,
+        # never among them, so no tool list, index or catalog sees one.
+        self.program_specs = tuple(programs)
+        self.programs: dict = {}
+        # A program whose entry carries the stand-in's marker waits for the
+        # agent's first call when the session's scope has its answers saved
+        # (every session the pool builds, a call's warm ones starting at
+        # once beside the model; never an app button's, which starts what it
+        # calls, and the listing job's build carries no marker).
+        self.lazy = lazy
         # The pool's start future: a second caller for the same session
         # during the first start awaits it and shares the outcome (the pool
         # sets it when it registers the manager, so its readers cast).
@@ -525,33 +767,23 @@ class AgentMCPManager:
         # When set, ONLY these mcpServers keys start (the app-action executor
         # warms the MCPs an app's manifest names, not the agent's full set).
         self.included_mcps = included_mcps
-        # An EXTERNAL session (a phone caller who is not a platform user)
-        # never attaches the platform-management MCPs — the rebuild below
-        # applies the same exclusion rule the phone builder used, so the
-        # tools cannot exist here when the prompt says they do not.
-        self.external = external
         self.credential_env = credential_env
-        # The ``mcpServers`` keys the session's builder left out (a kind's
-        # ``exclude_from``, a credential or audience refusal): the rebuild
-        # below knows the phone and external facts alone, so a task's, a
-        # meeting's and a ``shared_chat`` session's exclusions arrive here
-        # by name, the way the CLI engines never read them from the file.
+        # The ``mcpServers`` keys this session does not start although the
+        # builder's config names them: what the builder left out by its kind
+        # (by name, as a second filter) and what this engine has as builtins.
         self.excluded_mcps = excluded_mcps or set()
         self.session_id = session_id
-        # Sidecar HTTP MCPs (registry Claude-JSON ``type: "http"``) are opt-in
-        # per manager: the app-action executor and Direct-LLM chat / task /
-        # meeting sessions enable them (their schemas ride the deferred-tools
-        # catalog, and the chat call cap is 300 s); phone calls keep them off
-        # — a document render must never hang a caller.
-        self.enable_http_transport = enable_http_transport
+        # The compute machine its stdio servers' processes run on, "" for this
+        # host (``placement.compute_of`` of the session's placement).
+        self.machine_id = machine_id
+        self._main_loop: asyncio.AbstractEventLoop | None = None
         # Per-call cap handed to every connection (see TOOL_CALL_TIMEOUT).
         self.tool_timeout = tool_timeout
         self.sandbox_builder = sandbox_builder  # SandboxBuilder or None
-        # Optional (config_path, secret_bundles) built by the CALLER — used by
-        # the headless app-action executor, whose identity (personal-app owner
-        # creds, task-context exclusions) differs from the agent-scope
-        # dashboard build _start_impl does by default. When set, _start_impl
-        # provisions THESE bundles instead of rebuilding.
+        # (config_path, secret_bundles) built by the CALLER, as the CLI
+        # engines take theirs: the session's builder (its person, the chat's
+        # choice of account, its kind's exclusions, the outside picks and the
+        # audience gate) or the app-action executor. None starts nothing.
         self.prebuilt_config = prebuilt_config
         self.servers: dict[str, MCPServerConnection] = {}
         self._tool_index: dict[str, MCPServerConnection] = {}  # namespaced_name -> server
@@ -559,101 +791,102 @@ class AgentMCPManager:
 
     async def start(self) -> None:
         """Load MCP config and start all servers (dispatched to MCP I/O thread)."""
+        self._main_loop = asyncio.get_running_loop()
         await _run_on_mcp_loop(self._start_impl())
 
-    def _build_config(self) -> tuple[object, dict, dict | None]:
-        """The session's MCP config (built, or the caller's prebuilt one),
-        its secret bundles with the token files delivered, and the
-        ``mcpServers`` read back: a worker thread's job, one build at a time
-        per build identity (``_build_lock``). Never on a loop: the build
-        reads the store and the manifests, writes the file, and an
-        installation binding mints its token only where no loop runs
-        (``github_apps.ensure_installation_token``). The servers are None
-        when there is no config to read."""
-        from core.credentials import credential_files
-        if self.prebuilt_config is not None:
-            key: tuple[str, ...] = ("prebuilt", str(self.prebuilt_config[0]))
-        else:
-            key = ("build", self.agent_name, self.session_id)
-        with _build_lock(key):
-            # is_remote=False (fail-closed default, explicit here): Direct-LLM
-            # starts MCP subprocesses IN the proxy process and is ALWAYS
-            # local, so a satellite_only device MCP must never reach this
-            # path — it would drive the SERVER's screen/input.
-            if self.prebuilt_config is not None:
-                mcp_config_path, secret_bundles = self.prebuilt_config
-            else:
-                from services.mcp import mcp_registry
-                mcp_config_path, _, _, secret_bundles, _ = mcp_registry.build_session_mcp_config(
-                    self.agent_name, None,
-                    phone_mode=self.phone_mode,
-                    placement=placement.LOCAL_PLACEMENT,
-                    external=self.external,
-                    session_id=self.session_id,
-                    user_role=self.user_role,
-                    task_scope=self.scope,
-                )
-            secret_bundles = dict(secret_bundles or {})
-            if self.prebuilt_config is None:
-                # A builder that hands in its bundles (an app button) has
-                # delivered the files for ITS identity; re-delivering the
-                # agent scope here would replace a personal owner's file.
-                credential_files.deliver_token_files(
-                    secret_bundles, self.agent_name, user_sub="", session_scope="agent",
-                )
-            if not mcp_config_path or not mcp_config_path.exists():
-                logger.info("No MCP config for agent '%s'", self.agent_name)
-                return mcp_config_path, secret_bundles, None
-            try:
-                mcp_config = json.loads(mcp_config_path.read_text())
-            except (json.JSONDecodeError, OSError) as e:
-                logger.error("Failed to read MCP config for '%s': %s", self.agent_name, e)
-                return mcp_config_path, secret_bundles, None
-            return mcp_config_path, secret_bundles, mcp_config.get("mcpServers", {})
+    def _read_config(self) -> tuple[dict, dict | None]:
+        """The secret bundles and the ``mcpServers`` of the config the caller
+        built, read back: a worker thread's job, never on a loop. The servers
+        are None when there is no config to read."""
+        if self.prebuilt_config is None:
+            return {}, None
+        mcp_config_path, secret_bundles = self.prebuilt_config
+        secret_bundles = dict(secret_bundles or {})
+        if not mcp_config_path or not mcp_config_path.exists():
+            logger.info("No MCP config for agent '%s'", self.agent_name)
+            return secret_bundles, None
+        try:
+            mcp_config = json.loads(mcp_config_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error("Failed to read MCP config for '%s': %s", self.agent_name, e)
+            return secret_bundles, None
+        return secret_bundles, mcp_config.get("mcpServers", {})
+
+    async def _push_exit_values(self, secret_bundles: dict) -> None:
+        """A session whose tools run on the compute machine: the values
+        behind its placeholders pushed into that machine's table by the push
+        registry before the first tool starts (the gateway's own channel,
+        keyed by the session's exit secret: this layer mints a token per
+        child, so no one child's token can key them)."""
+        from core.credentials import credential_exit
+        if not self.machine_id or not secret_bundles or self._main_loop is None:
+            return
+        secret = credential_exit.machine_secret(self.session_id)
+        if not secret:
+            return
+        from core.remote import mcp_gateway_push
+        fut = asyncio.run_coroutine_threadsafe(
+            mcp_gateway_push.push_session(self.session_id, self.machine_id, mcp_gateway_push.token_hash_of(secret)),
+            self._main_loop,
+        )
+        try:
+            await asyncio.wrap_future(fut)
+        except Exception:
+            logger.exception("Direct session %s: the exit's values were not pushed", self.session_id[:8])
 
     async def _start_impl(self) -> None:
         """Internal: runs on the dedicated MCP I/O event loop; the config is
-        built in a worker thread first (``_build_config``), so a session
-        start holds neither loop."""
+        read in a worker thread first (``_read_config``), so a session start
+        holds neither loop."""
         from core.credentials import mcp_broker
-        _path, secret_bundles, servers_config = await asyncio.to_thread(self._build_config)
+        secret_bundles, servers_config = await asyncio.to_thread(self._read_config)
         # Credential broker: provision THIS session's per-MCP secret
         # bundles so _start_stdio can merge each server's secrets in-process.
         # Direct-LLM has no stdio interceptor / HTTP fetch — it reads the store
-        # directly. Provisioned from THIS build (agent scope) so the bundle keys
-        # match the mcpServers keys read below. Idempotent — a no-op when there
-        # are no secret bundles.
+        # directly. Idempotent — a no-op when there are no secret bundles.
         mcp_broker.provision(self.session_id, secret_bundles)
+        await self._push_exit_values(secret_bundles)
+        self._make_programs()
         if servers_config is None:
             return
         if not servers_config:
             logger.info("Agent '%s' has no MCP servers", self.agent_name)
             return
 
-        # Start servers in parallel, skipping the ones the session's builder
-        # left out (the phone and external exclusions are already applied
-        # by build_session_mcp_config above).
+        # Start servers in parallel, skipping the excluded ones.
         tasks = []
+        counted: list[MCPServerConnection] = []
         for name, srv_config in servers_config.items():
             if name in self.excluded_mcps:
-                logger.info("Skipping MCP the session's builder left out: %s", name)
+                logger.info("Skipping an excluded MCP: %s", name)
                 continue
             if self.included_mcps is not None and name not in self.included_mcps:
                 continue
-            if srv_config.get("type") == "http" and not self.enable_http_transport:
-                logger.info(
-                    "Skipping http-transport MCP '%s' "
-                    "(not enabled for this manager)", name
-                )
-                continue
-
             conn = MCPServerConnection(name, srv_config,
                                        credential_env=self.credential_env,
                                        session_id=self.session_id,
                                        sandbox_builder=self.sandbox_builder,
                                        agent_name=self.agent_name,
-                                       tool_timeout=self.tool_timeout)
+                                       tool_timeout=self.tool_timeout,
+                                       start_timeout=PHONE_HTTP_START_S if self.phone_mode else None,
+                                       machine_id=self.machine_id,
+                                       main_loop=self._main_loop)
             self.servers[name] = conn
+            marker = _marker_of(srv_config)
+            conn.warm = bool(marker and marker.get("warm") is True)
+            if self.lazy and await self._waits_for_first_call(conn):
+                if conn.warm:
+                    # A call's tool: listed from its answers now, its program
+                    # started beside the model; a call meanwhile waits for it.
+                    conn.warming = asyncio.ensure_future(conn.ensure_started())
+                    conn.warming.add_done_callback(functools.partial(_log_warm_failure, conn))
+                continue
+            if marker is not None and not conn.warm:
+                # The estimate counted it as waiting for its first call: a
+                # program that starts with the session is counted here, as the
+                # stand-in's start with its session is.
+                if await conn._admit(judged=False):
+                    counted.append(conn)
             tasks.append(self._start_server(conn))
 
         if tasks:
@@ -661,6 +894,13 @@ class AgentMCPManager:
             for result in results:
                 if isinstance(result, Exception):
                     logger.error("MCP server start failed: %s", result)
+        for conn in counted:
+            if conn.session is None:
+                await conn._give_back()
+        # A program started only for its answers rests until its first call.
+        for conn in list(self.servers.values()):
+            if await conn.rest_until_called() and conn in counted:
+                await conn._give_back()
 
         # Build tool index
         for conn in self.servers.values():
@@ -673,12 +913,61 @@ class AgentMCPManager:
             "%s tools ready", self.agent_name, len(self.servers), total_tools
         )
 
+    def _make_programs(self) -> None:
+        """The session's programs, each to start at its first call. On a
+        call, one that asks for it starts now, beside the model."""
+        from core.layers.direct.sandbox_program import SandboxProgram
+        for spec in self.program_specs:
+            program = SandboxProgram(spec, session_id=self.session_id, sandbox_builder=self.sandbox_builder,
+                                     agent_name=self.agent_name, machine_id=self.machine_id,
+                                     main_loop=self._main_loop)
+            self.programs[spec.name] = program
+            if self.phone_mode and spec.starts_with_call:
+                program.start_soon()
+
+    async def _waits_for_first_call(self, conn: MCPServerConnection) -> bool:
+        """Whether ``conn`` answers from the answers saved for this session's
+        scope and starts at its first call. A marked stdio entry with nothing
+        saved starts now and its answers are kept for the next session."""
+        marker = _marker_of(conn.config)
+        from services.mcp.mcp_manifest_types import is_stdio_transport
+        if marker is None or not is_stdio_transport(conn.config.get("type")):
+            return False
+        from core.session.session_state import get_session_security
+        from services.mcp import tool_listing
+        ctx = get_session_security(self.session_id) if self.session_id else None
+        if ctx is None:
+            return False
+        scope = tool_listing.scope_of(ctx)
+        argv = [conn.config["command"], *conn.config.get("args", [])]
+        fp = marker_fingerprint(marker, conn.base_env(), argv)
+        try:
+            saved = await asyncio.to_thread(tool_listing.saved, scope, conn.name, fp)
+        except Exception:  # noqa: BLE001  # no saved answer to read: the program starts with the session
+            logger.warning("MCP server '%s': its saved answers could not be read", conn.name, exc_info=True)
+            saved = None
+        if saved is None:
+            conn.capture = (scope, fp)
+            return False
+        conn.wait_for_first_call(saved, scope, fp)
+        return True
+
     async def _start_server(self, conn: MCPServerConnection) -> None:
         """Start a single MCP server with error isolation."""
         try:
             await conn.start()
         except Exception as e:  # noqa: BLE001  # one MCP server's start must not stop the others from starting
             logger.error("Failed to start MCP server '%s': %s", conn.name, e)
+
+    def tools_lost(self) -> bool:
+        """Whether the session's relayed tools are gone: their machine's link
+        went (also while one opened), or it no longer serves the port they
+        reach the platform by. A tool the machine could not start is no loss."""
+        if not self.machine_id:
+            return False
+        from core.remote import tool_relay
+        return (any(c.link_lost for c in [*list(self.servers.values()), *list(self.programs.values())])
+                or tool_relay.session_lost(self.machine_id, self.session_id))
 
     def has_tool(self, namespaced_name: str) -> bool:
         """Whether a namespaced tool was discovered on a started server that
@@ -737,7 +1026,8 @@ class AgentMCPManager:
         Returns:
             list of {"tool_use_id": str, "content": str}, with
             ``"file_blocks"`` (the result's image blocks and embedded
-            resources, MCP JSON) when it carried any
+            resources, MCP JSON) when it carried any and ``"timed_out"``
+            when the client stopped waiting at its cap
         """
         self.last_activity = time.monotonic()
         return await _run_on_mcp_loop(self._execute_tools_impl(tool_calls))
@@ -750,6 +1040,8 @@ class AgentMCPManager:
                 "tool_use_id": call["id"],
                 "content": result,
             }
+            if isinstance(result, TimedOut):
+                out["timed_out"] = True
             if blocks:
                 out["file_blocks"] = blocks
             return out
@@ -776,10 +1068,11 @@ class AgentMCPManager:
 
     async def _close_impl(self) -> None:
         """Internal: runs on the dedicated MCP I/O event loop."""
-        tasks = [conn.close() for conn in self.servers.values()]
+        tasks = [conn.close() for conn in (*self.servers.values(), *self.programs.values())]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.servers.clear()
+        self.programs.clear()
         self._tool_index.clear()
         logger.info("Closed MCP manager for agent '%s'", self.agent_name)
 
@@ -799,25 +1092,27 @@ class MCPPool:
         credential_env: dict[str, str] | None = None,
         excluded_mcps: set[str] | None = None,
         sandbox_builder=None,
-        enable_http_transport: bool = False,
         tool_timeout: int = TOOL_CALL_TIMEOUT,
-        external: bool = False,
-        user_role: str = "",
-        scope: str = "user",
+        prebuilt_config: tuple | None = None,
+        machine_id: str = "",
+        programs: tuple = (),
     ) -> AgentMCPManager:
         """Get an existing manager or create and start a new one.
 
-        ``enable_http_transport`` / ``tool_timeout`` are the session policy
-        (``layer.direct_mcp_policy``): sidecar HTTP MCPs + the chat call cap
-        for chats, tasks and meetings; stdio-only + 60 s for phone calls.
-        ``external`` marks a session whose caller is not a platform user
-        (the management MCPs are never started for it). ``user_role`` and
-        ``scope`` are what the build judges the manifests' audience with,
-        and ``excluded_mcps`` the server keys the session's builder left
-        out (``AgentMCPManager``).
+        ``tool_timeout`` is the per-call cap (the chat's for every Direct
+        session, the default for the app buttons). ``prebuilt_config`` is the
+        session's builder's config and bundles, ``excluded_mcps`` the server
+        keys it does not start. ``machine_id`` is the compute machine its
+        stdio servers run on. ``programs`` are the programs of the
+        platform's own the session carries. A manager whose relayed tools
+        were lost is closed and never handed out again under its id.
         """
+        lost: AgentMCPManager | None = None
         async with self._lock:
             mgr = self._managers.get(session_id)
+            if mgr is not None and mgr.tools_lost():
+                lost, mgr = mgr, None
+                del self._managers[session_id]
             existing = mgr is not None
             if existing:
                 cast("AgentMCPManager", mgr).last_activity = time.monotonic()
@@ -828,15 +1123,18 @@ class MCPPool:
                     excluded_mcps=excluded_mcps,
                     session_id=session_id,
                     sandbox_builder=sandbox_builder,
-                    enable_http_transport=enable_http_transport,
                     tool_timeout=tool_timeout,
-                    external=external,
-                    user_role=user_role,
-                    scope=scope,
+                    prebuilt_config=prebuilt_config,
+                    machine_id=machine_id,
+                    lazy=True,
+                    programs=programs,
                 )
                 mgr.started = asyncio.get_running_loop().create_future()
                 self._managers[session_id] = mgr
         mgr = cast("AgentMCPManager", mgr)  # the one found under the lock, or the one added
+        if lost is not None:
+            with contextlib.suppress(Exception):
+                await lost.close()
 
         if existing:
             # A manager another caller is still starting: wait for that start
@@ -891,11 +1189,14 @@ class MCPPool:
         async with self._lock:
             names: set[str] = set()
             for mgr in self._managers.values():
-                names |= set(mgr.servers.keys())
+                names |= {name for name, conn in mgr.servers.items() if not conn.pending}
             return names
 
-    async def reap_idle(self, timeout: int = 0) -> None:
-        """Close managers idle for longer than timeout seconds."""
+    async def reap_idle(self, timeout: int = 0, *, keep: frozenset[str] = frozenset()) -> None:
+        """Close managers idle for longer than timeout seconds. ``keep``
+        are the sessions that live: a manager's own clock moves only at a
+        tool's or a program's call, and a session that takes turns without
+        one still holds its manager."""
         if timeout <= 0:
             timeout = config.get_idle_timeout()
 
@@ -904,7 +1205,7 @@ class MCPPool:
 
         async with self._lock:
             for sid, mgr in list(self._managers.items()):
-                if now - mgr.last_activity > timeout:
+                if sid not in keep and now - mgr.last_activity > timeout:
                     to_reap.append((sid, mgr))
                     del self._managers[sid]
 

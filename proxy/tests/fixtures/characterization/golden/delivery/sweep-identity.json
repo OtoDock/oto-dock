@@ -1,0 +1,74 @@
+{
+ "a person's chat whose owner left": [
+  "user-viewer",
+  "viewer",
+  false,
+  true
+ ],
+ "a person's own chat": [
+  "user-viewer",
+  "editor",
+  false,
+  false
+ ],
+ "a phone chat with nothing stored": [
+  null,
+  "viewer",
+  false,
+  false
+ ],
+ "a shared chat as the person": [
+  "user-manager",
+  "editor",
+  true,
+  false
+ ],
+ "a shared chat below the editor tier": [
+  "user-viewer",
+  "viewer",
+  true,
+  true
+ ],
+ "a shared chat with nothing stored": [
+  null,
+  "viewer",
+  false,
+  false
+ ],
+ "a stored role": [
+  null,
+  "editor",
+  false,
+  false
+ ],
+ "a task chat as a stored person": [
+  "user-viewer",
+  "editor",
+  false,
+  false
+ ],
+ "a task chat with nothing stored": [
+  null,
+  "manager",
+  false,
+  false
+ ],
+ "a task chat, the creator's role read again": [
+  null,
+  "editor",
+  false,
+  false
+ ],
+ "by the agent itself": [
+  null,
+  "editor",
+  false,
+  false
+ ],
+ "no owner": [
+  null,
+  "manager",
+  false,
+  false
+ ]
+}

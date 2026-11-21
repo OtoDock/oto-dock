@@ -10,18 +10,48 @@ loop. ws_client calls these; __main__ and the update tests import them directly.
     dir, and relaunches (inbound ``update_required`` / WS close 4007).
   * ``_finalize_post_update_state`` resolves the in-flight update after a successful
     auth (the post-auth counterpart to ``__main__._check_post_update_state``).
+  * ``claim_update`` / ``release_update`` let one update apply at a time, and never
+    the version already running.
 """
 import asyncio
 import contextlib
 import logging
 import os
 import time
+from pathlib import Path
 
 from .. import config
 from ..config import otodock_dir, relaunch_self, venv_exe
 from ..host import auth_paths
 
 logger = logging.getLogger("satellite")
+
+# Whether this process applies an update now (``claim_update``): an apply ends
+# in the process's exit, and a second frame read before it must not start a
+# second apply over the same folders.
+_applying = False
+
+
+def claim_update(payload: dict) -> str:
+    """Take the one apply this process runs for ``payload``, or say why not:
+    the target is the version running here, or an update is being applied.
+    Synchronous, so two frames read one after the other never both take it.
+    The apply's caller releases it (``release_update``) when the apply comes
+    back without the exit it ends in."""
+    global _applying
+    target = str(payload.get("target_version") or "")
+    if target and target == config.SATELLITE_VERSION:
+        return f"it already runs {target}"
+    if _applying:
+        return "an update is already being applied"
+    _applying = True
+    return ""
+
+
+def release_update() -> None:
+    """The apply came back without exiting: a later update may apply."""
+    global _applying
+    _applying = False
 
 
 def _windows_schedule_detached_uninstall(script, oto_dir) -> bool:
@@ -344,6 +374,40 @@ def _finalize_post_update_state(oto_dir, running_version: str) -> None:
         shutil.rmtree(sat_prev, ignore_errors=True)
 
 
+#: The credential exit's packages, a lock of their own beside requirements.txt.
+EXIT_REQUIREMENTS = "requirements-exit.txt"
+
+
+def install_exit_packages(python: str, satellite_dir: Path) -> bool:
+    """The credential exit's packages (``requirements-exit.txt``) into the
+    venv of ``python``, best effort and from wheels alone: a host with no
+    wheel for one of them (cryptography on a 32-bit ARM without piwheels)
+    fails fast, keeps its update, and runs no exit (the listener says why
+    at boot, and the platform leaves the tools that need a key out of its
+    sessions). Never
+    raises. True when installed, or when the package carries no such file."""
+    import subprocess
+    req = satellite_dir / EXIT_REQUIREMENTS
+    if not req.is_file():
+        return True
+    try:
+        # No prompt and no stdin: an index that asks for credentials fails
+        # at once instead of waiting out the timeout.
+        done = subprocess.run(  # called from the update, which blocks the loop by design
+            [python, "-m", "pip", "install", "-q", "--no-input", "--only-binary", ":all:", "-r", str(req)],
+            stdin=subprocess.DEVNULL, timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Update: the credential exit's packages were not installed (%s): this machine runs no exit",
+                       type(exc).__name__)
+        return False
+    if done.returncode != 0:
+        logger.warning("Update: the credential exit's packages were not installed (rc=%s): this machine runs no "
+                       "exit", done.returncode)
+        return False
+    return True
+
+
 async def _self_update_and_restart(payload: dict) -> None:
     """Apply a tarball update from the proxy and restart via systemd.
 
@@ -405,10 +469,7 @@ async def _self_update_and_restart(payload: dict) -> None:
             shutil.rmtree(sat_new, ignore_errors=True)
         sat_new.mkdir(parents=True, exist_ok=True)
         with tarfile.open(fileobj=io.BytesIO(tarball_bytes), mode="r:gz") as tar:
-            for member in tar.getmembers():
-                if not auth_paths.is_path_under_root(sat_new / member.name, sat_new):
-                    raise ValueError(f"tarball escaped: {member.name}")
-            tar.extractall(sat_new, filter="data")
+            auth_paths.unpack_tarball(tar, sat_new)
 
         # 3. Stage the venv into satellite.new/. The "reuse when reqs match"
         #    optimization is Unix-only — Windows can't safely `shutil.move`
@@ -486,6 +547,7 @@ async def _self_update_and_restart(payload: dict) -> None:
                     with contextlib.suppress(OSError):
                         marker.unlink()
                     return
+            install_exit_packages(str(venv_exe(new_venv_target, "python")), sat_new)
 
             # Signal runner.ps1 to do the swap on next start. The name +
             # format here must match runner.ps1's marker contract.
@@ -569,6 +631,7 @@ async def _self_update_and_restart(payload: dict) -> None:
                 with contextlib.suppress(OSError):
                     marker.unlink()
                 return
+        install_exit_packages(str(venv_exe(sat_root / "venv", "python")), sat_root)
 
         # 6. Trigger service-manager restart and exit. The boot guard in
         #    the new code will verify auth within 60s and finalize (or

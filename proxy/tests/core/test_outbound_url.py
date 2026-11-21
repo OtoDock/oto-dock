@@ -128,3 +128,39 @@ def test_the_two_mcps_carry_byte_copies():
     for mcp in ("transcribe-mcp", "image-search-mcp"):
         copy = REPO_ROOT / "mcps" / "custom" / mcp / "_url_guard.py"
         assert copy.read_bytes() == ours, f"{copy} drifted from outbound_url.py — copy it again"
+
+
+def test_the_sandbox_dial_rule_is_the_shims(monkeypatch):
+    """What a session's exit may dial from outside the namespace: public
+    passes, the carves pass, every other private address, loopback, the
+    metadata address, the unspecified address, the host's own addresses and
+    its on-link subnets never; the mapped and NAT64 forms count as their
+    IPv4; a carve never opens loopback or the metadata address."""
+    import ipaddress
+    owns = lambda ip: str(ip) in ("151.101.1.69", "2a04:4e42::323")
+    onlink = (ipaddress.ip_network("93.184.216.0/24"),)
+    carves = {"192.168.1.5", "10.9.0.3", "93.184.216.34"}
+
+    def refused(address: str) -> bool:
+        return outbound_url.sandbox_dial_refused(address, carves=carves, onlink=onlink, owns=owns)
+    assert refused("151.101.1.69") and refused("2a04:4e42::323")
+    assert refused("93.184.216.35") and not refused("93.184.216.34")
+    assert refused("::ffff:93.184.216.35") and refused("64:ff9b::93.184.216.35") and refused("64:ff9b::151.101.1.69")
+    assert not refused("151.101.1.70") and not refused("8.8.8.8") and not refused("2606:4700::1111")
+    assert not refused("192.168.1.5") and not refused("10.9.0.3")
+    assert refused("192.168.1.6") and refused("10.9.0.4") and refused("172.17.0.1")
+    assert refused("127.0.0.1") and refused("169.254.169.254") and refused("0.0.0.0") and refused("::1")
+    assert refused("fd00:ec2::254") and refused("not-an-address")
+    assert outbound_url.sandbox_dial_refused("127.0.0.1", carves={"127.0.0.1"}, owns=owns)
+    assert outbound_url.sandbox_dial_refused("169.254.169.254", carves={"169.254.169.254"}, owns=owns)
+    # Nothing carved, nothing on link: public alone.
+    assert not outbound_url.sandbox_dial_refused("8.8.8.8", owns=owns)
+    assert outbound_url.sandbox_dial_refused("192.168.1.5", owns=owns)
+
+
+def test_the_host_owns_its_addresses_and_the_onlink_read_gives_networks():
+    import ipaddress
+    assert outbound_url.host_owns(ipaddress.ip_address("127.0.0.1")) is True
+    assert outbound_url.host_owns(ipaddress.ip_address("93.184.216.34")) is False
+    nets = outbound_url.read_onlink()
+    assert all(isinstance(n, ipaddress.IPv4Network) and not str(n).startswith("169.254.") for n in nets)

@@ -1,12 +1,13 @@
 import { useState, type ReactNode } from 'react'
-import { useApproveApp, type AppAction, type AppInboundHook, type AppSecret, type PinnedApp } from '../../api/apps'
+import { useApproveApp, type AppAction, type AppArgProp, type AppInboundHook, type AppSecret, type PinnedApp } from '../../api/apps'
 import AppSettingsPanel from './AppSettingsPanel'
-import { type ActionFloor } from '../../lib/permissions'
+import { ROLE, type ActionFloor } from '../../lib/permissions'
 import { placePhrase } from '../../api/remoteMachines'
 import { SITE, TARGET_LOCAL } from '../../lib/placement'
 import { appKind } from '../../lib/kinds/app'
 import Button from '../ui/Button'
 import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT } from '../ui/classes'
+import { mediaServerSentence } from './appRow'
 
 /**
  * Approval card — shared between the standing apps overlay, the Dock
@@ -102,37 +103,75 @@ function ParamChip({ k, v }: { k: string; v?: string }) {
   )
 }
 
+/** What the page fills in a property, in words: a file it names, or a value. */
+function fillWords(p: AppArgProp | undefined): string {
+  if (p?.file === 'write') return 'a file the page names, to write'
+  if (p?.file === 'read') return 'a file the page names'
+  return 'filled by the page'
+}
+
+/** Whether an operation of a list names a file, and to write it. */
+function opFileMode(fields: Record<string, AppArgProp> | undefined): 'read' | 'write' | '' {
+  const modes = Object.values(fields ?? {}).map((f) => f?.file)
+  if (modes.includes('write')) return 'write'
+  if (modes.includes('read')) return 'read'
+  return ''
+}
+
+/** A tool button's list of named operations: how many, which, and which
+ * of them names a file, each in a sentence of its own. */
+function ListLine({ p }: { p: AppArgProp }) {
+  const ops = (p.items?.oneOf ?? [])
+    .map((v) => ({ op: v.properties?.op?.const, mode: opFileMode(v.properties) }))
+    .filter((v): v is { op: string; mode: 'read' | 'write' | '' } => !!v.op)
+  return (
+    <span>
+      Sends up to {p.maxItems ?? 1} change{(p.maxItems ?? 1) > 1 ? 's' : ''} of these kinds:{' '}
+      {ops.map(({ op }, i) => (
+        <span key={op}>{i > 0 ? ', ' : ''}<code className="font-mono text-2xs">{op}</code></span>
+      ))}.
+      {ops.filter(({ mode }) => mode).map(({ op, mode }) => (
+        <span key={`${op}-file`}>
+          {' '}<code className="font-mono text-2xs">{op}</code> names a file{mode === 'write' ? ' to write' : ''}.
+        </span>
+      ))}
+    </span>
+  )
+}
+
 function chipValue(v: unknown): string {
   const s = typeof v === 'string' ? v : JSON.stringify(v)
   return s.length > 24 ? `${s.slice(0, 24)}…` : s
 }
 
 const FLOOR_WHO: Record<ActionFloor, string> = {
-  manager: 'managers',
-  editor: 'editors and managers',
-  contributor: 'contributors, editors and managers',
+  manager: 'Only managers of this agent can use it',
+  editor: 'Only editors and managers of this agent can use it',
+  contributor: 'Only contributors, editors and managers of this agent can use it',
+  external: 'Members and external identities can use it.',
 }
 const FLOOR_LABEL: Record<ActionFloor, string> = {
   manager: 'managers only',
   editor: 'editors and up',
   contributor: 'contributors and up',
+  external: 'external identities too',
 }
 
-/** A button that acts for the agent with no floor: anyone the app reaches. */
-const NO_FLOOR_LABEL = 'everyone who opens the app'
-const NO_FLOOR_WHO = 'Anyone who opens the app can press it'
+/** A button that acts for the agent with no floor: every member the app reaches. */
+const NO_FLOOR_LABEL = 'members who open the app'
+const NO_FLOOR_WHO = 'Members who open the app can press it'
 /** A folder the platform makes once the manifest is approved (`files.create`). */
 export const CREATES_FOLDER = 'Creates the folder'
 const CHIP = 'rounded-sm bg-surface-muted px-1 py-px text-3xs font-medium text-secondary'
 
 /** Who may press: the floor, or for a button that acts for the agent with
- *  none, everyone who opens the app. */
+ *  none, every member who opens the app. */
 function FloorChip({ role, acts = false }: { role?: ActionFloor; acts?: boolean }) {
   if (!role) {
     return acts ? <span title={NO_FLOOR_WHO} className={CHIP}>{NO_FLOOR_LABEL}</span> : null
   }
   return (
-    <span title={`Only ${FLOOR_WHO[role]} of this agent can use it`} className={CHIP}>
+    <span title={FLOOR_WHO[role]} className={CHIP}>
       {FLOOR_LABEL[role]}
     </span>
   )
@@ -142,7 +181,9 @@ function FloorChip({ role, acts = false }: { role?: ActionFloor; acts?: boolean 
  * "Exact manifest" expander, never inline. Shared with the deploy
  * card (a pending release carries its manifest). */
 export function ActionLine({ ac }: { ac: AppAction }) {
-  const pageFills = Object.keys(ac.args_schema?.properties ?? {})
+  const props = ac.args_schema?.properties ?? {}
+  const pageFills = Object.keys(props).filter((k) => props[k]?.type !== 'array')
+  const lists = Object.values(props).filter((p) => p?.type === 'array')
   return (
     <li className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
       <span className="font-medium text-primary">{ac.label}</span>
@@ -152,7 +193,8 @@ export function ActionLine({ ac }: { ac: AppAction }) {
           {Object.entries(ac.fixed_args ?? {}).map(([k, v]) => (
             <ParamChip key={k} k={k} v={chipValue(v)} />
           ))}
-          {pageFills.map((k) => <ParamChip key={k} k={k} v="filled by the page" />)}
+          {pageFills.map((k) => <ParamChip key={k} k={k} v={fillWords(props[k])} />)}
+          {lists.map((p, i) => <ListLine key={i} p={p} />)}
           {ac.mcp_available === false && (
             <span className="text-status-warning-fg">Its MCP is unavailable right now</span>
           )}
@@ -182,8 +224,8 @@ export function ActionLine({ ac }: { ac: AppAction }) {
           {pageFills.map((k) => <ParamChip key={k} k={k} v="filled by the page" />)}
         </>
       ) : (
-        <span className="break-all">
-          Sends to the chat: “{(ac.prompt || '').slice(0, 100)}{(ac.prompt || '').length > 100 ? '…' : ''}”
+        <span className="[overflow-wrap:anywhere]">
+          {ac.new_chat ? 'Starts a new chat with' : 'Sends to the chat'}: “{(ac.prompt || '').slice(0, 100)}{(ac.prompt || '').length > 100 ? '…' : ''}”
         </span>
       )}
       <FloorChip role={ac.min_role} acts={BUTTON_TYPES.includes(ac.type)} />
@@ -200,10 +242,12 @@ const PLATFORM_METHOD_WORDS: Record<string, string> = {
   'files.list': 'the entries of a folder under its declared read prefixes',
   'files.read': 'a text file under its declared read prefixes',
   'files.write': 'to write a text file under its declared write prefixes',
+  'files.media': 'to show a video, an audio file or a picture from the folders it reads. The page can read what it shows.',
   'setup.status': 'whether your setup of this agent is pending, and which tools are ready for you',
   'setup.complete': 'to mark your setup of this agent complete when you press its button. A manager may also complete the agent’s own setup.',
   'app.audience': 'who uses this app and with what role. That is its members and the people it is shared with. It also lists the agents it is placed in, and their members. Only the app’s editors and managers may read it on a page. So may an admin, or the owner of a personal app. The app’s own server may read it too.',
   'viewer.data.read': 'your own saved data in this app, a small document each viewer keeps for themselves',
+  'app.forget_copies': 'to remove the older copies of its database that the platform keeps for a rollback. Then what it deleted is gone from those too. A rollback after that keeps today\u2019s data. Only the app\u2019s own server may ask.',
   'viewer.data.write': 'to save your own data in this app, in a document of your own that nobody else reads',
 }
 
@@ -220,6 +264,7 @@ const PLATFORM_METHOD_SHORT: Record<string, string> = {
   'setup.complete': 'completing your setup',
   'app.audience': 'who uses it',
   'viewer.data.read': 'your saved data',
+  'app.forget_copies': 'removing its old database copies',
   'viewer.data.write': 'saving your data',
 }
 
@@ -354,6 +399,7 @@ export function ManifestBlocks({ app, onSetSecret }: {
   ]
   const placedCalls = Object.keys(ex.methods ?? {})
   const uses = app.bindings ?? []
+  const follows = new Set(app.bindings_follow ?? [])
   const needMcps = neededMcps(app)
   const needProviders = neededProviders(app)
   const steps = Object.entries(app.steps ?? {})
@@ -373,6 +419,7 @@ export function ManifestBlocks({ app, onSetSecret }: {
       {(files.read.length > 0 || files.write.length > 0) && (
         <Group heading="Files">
           {files.read.length > 0 && <li>Reads files under {codeList(files.read)}</li>}
+          {mediaServerSentence(app) && <li data-testid="media-server-line">{mediaServerSentence(app)}</li>}
           {files.write.length > 0 && (
             <li>
               Writes files under {codeList(files.write)}
@@ -385,7 +432,7 @@ export function ManifestBlocks({ app, onSetSecret }: {
       {(hosts.length > 0 || links.length > 0) && (
         <Group heading="Hosts">
           {hosts.length > 0 && (
-            <li>Its server may reach {codeList(hosts)} and DNS. It may also reach other sites that share their address, as on a CDN. It can never reach your local network or the platform.</li>
+            <li>Its program may reach {codeList(hosts)}. It may also reach other sites at the same address. It can never reach your local network or OtoDock itself.</li>
           )}
           {links.length > 0 && (
             <li data-testid="external-links-line">
@@ -478,7 +525,11 @@ export function ManifestBlocks({ app, onSetSecret }: {
       {uses.length > 0 && (
         <Group heading="Uses other apps" count={uses.length}>
           {uses.map((b) => (
-            <li key={b.name}>Calls the app <Code>{b.app}</Code> of agent <Code>{b.agent}</Code> as <Code>{b.name}</Code></li>
+            <li key={b.name}>
+              {follows.has(b.name)
+                ? <><Code>{b.app}</Code>, of the <Code>{b.agent}</Code> agent in its department</>
+                : <><Code>{b.app}</Code>, of the agent <Code>{b.agent}</Code></>}
+            </li>
           ))}
         </Group>
       )}
@@ -572,9 +623,22 @@ function summaryLines(app: PinnedApp): SummaryLine[] {
       key: 'buttons', testId: 'summary-buttons',
       text: <>{buttons.length} button{buttons.length > 1 ? 's' : ''}: {few(buttons.map((a) => a.label))}</>,
     })
+    // A button that never uses the open chat: it costs a chat of its own
+    // at every press, so the summary says which ones.
+    const fresh = buttons.filter((a) => a.new_chat)
+    if (fresh.length) {
+      out.push({
+        key: 'new-chat', testId: 'summary-new-chat',
+        text: <>Starts a new chat each time: {few(fresh.map((a) => a.label))}</>,
+      })
+    }
   }
-  if (data.length) {
-    const words = Array.from(new Set(data.map((a) => (
+  // Showing a picture or a video the app already reads is no power of its
+  // own: the files line names that reach, so the short list leaves it out
+  // (Details keeps the declared method).
+  const used = data.filter((a) => a.method !== 'files.media')
+  if (used.length) {
+    const words = Array.from(new Set(used.map((a) => (
       a.type === 'data_feed' ? `the live ${a.feed} feed` : PLATFORM_METHOD_SHORT[a.method || ''] || a.method || a.label
     ))))
     out.push({ key: 'data', testId: 'summary-data', text: <>Uses the platform for {few(words)}</> })
@@ -585,7 +649,7 @@ function summaryLines(app: PinnedApp): SummaryLine[] {
   for (const path of files.create ?? []) {
     out.push({ key: `creates-${path}`, testId: 'summary-creates', text: <>{CREATES_FOLDER} <Code>{path}</Code></> })
   }
-  if (app.egress?.length) out.push({ key: 'hosts', text: <>Its server may reach {few(codeItems(app.egress))}</> })
+  if (app.egress?.length) out.push({ key: 'hosts', text: <>Its program may reach {few(codeItems(app.egress))}</> })
   const ext = app.external
   if (ext?.links.length) out.push({ key: 'links', text: <>Its page may open {few(codeItems(ext.links))}</> })
   if (ext?.challenge.length) out.push({ key: 'challenge', text: <>Bot check before {few(codeItems(ext.challenge))}</> })
@@ -652,9 +716,33 @@ function summaryLines(app: PinnedApp): SummaryLine[] {
       text: <>Answers the agents it is placed in with {few(placedCalls.map((n) => <>the <Code>{n}</Code> call</>))}</>,
     })
   }
+  // The calls a caller may use once a manager adds the app on the agent's
+  // External identities card.
+  const outsideCalls = Object.entries(ex.methods ?? {}).filter(([, e]) => e.min_role === ROLE.EXTERNAL).map(([n]) => n)
+  if (outsideCalls.length) {
+    out.push({
+      key: 'outside-calls', testId: 'summary-outside-calls',
+      text: <>External identities may use {few(outsideCalls.map((n) => <>the <Code>{n}</Code> call</>))} once a manager adds the app</>,
+    })
+  }
+  // One line for the apps it reads in its own department (the server says
+  // which bindings follow it), one for those it names an agent for.
   const uses = app.bindings ?? []
-  if (uses.length) {
-    out.push({ key: 'uses', text: <>Uses {few(uses.map((b) => <>the <Code>{b.app}</Code> app of agent <Code>{b.agent}</Code></>))}</> })
+  const follows = new Set(app.bindings_follow ?? [])
+  const inDepartment = uses.filter((b) => follows.has(b.name)).length
+  const named = uses.length - inDepartment
+  if (inDepartment) {
+    out.push({
+      key: 'uses-department', testId: 'summary-uses-department',
+      text: inDepartment === 1 ? 'Uses 1 app of another agent in its department'
+        : `Uses ${inDepartment} apps of other agents in its department`,
+    })
+  }
+  if (named) {
+    out.push({
+      key: 'uses', testId: 'summary-uses',
+      text: named === 1 ? 'Uses 1 app of another agent' : `Uses ${named} apps of other agents`,
+    })
   }
   // One line for the MCPs an app needs (a template app lists every tool
   // its cards describe — seven lines said the same thing on a phone), the

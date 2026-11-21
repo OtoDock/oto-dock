@@ -66,10 +66,18 @@ async def remove_synced_setup_file(agent: str, abs_path: Path | None, rel_path: 
     config write back), author clear, live-delete fan-out, and a commit in
     the owning git repo when the file is tracked (so the dashboard revert
     button cannot silently resurrect a completed setup)."""
-    if abs_path is None or not await asyncio.to_thread(abs_path.is_file):
+    from core.agent_folder import agent_root
+    from services.infra import safe_fs
+    if abs_path is None:
+        return False
+    # Looked at and removed beneath the agent's real folder with no link
+    # followed on the way: a link at the name goes, its target stays.
+    root = agent_root(agent)
+    kind = await asyncio.to_thread(safe_fs.kind_beneath, root, rel_path)
+    if kind.st is None or kind.kind == "dir":
         return False
     try:
-        await asyncio.to_thread(abs_path.unlink)
+        await asyncio.to_thread(safe_fs.unlink_beneath, root, rel_path)
     except Exception:
         logger.exception("complete-setup: failed to remove %s for %s", rel_path, agent)
         return False
@@ -87,7 +95,7 @@ async def remove_synced_setup_file(agent: str, abs_path: Path | None, rel_path: 
     try:
         from services.infra import git_writer
         rel_in_repo = str(abs_path.relative_to(repo_dir))
-        if git_writer.is_tracked(repo_dir, rel_in_repo):
+        if await asyncio.to_thread(git_writer.is_tracked, repo_dir, rel_in_repo):
             await asyncio.to_thread(git_writer.commit_paths, repo_dir, [abs_path],
                                     f"Complete setup: remove {abs_path.name}")
     except Exception:

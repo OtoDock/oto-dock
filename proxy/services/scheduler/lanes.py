@@ -17,9 +17,10 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from typing import cast
+from typing import NamedTuple, cast
 
 import config
+from core import placement
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.automation import run_status
@@ -280,6 +281,180 @@ async def _await_lane_quiescence(chat_id: str, *, ceiling_seconds: float = 1800.
         await asyncio.sleep(1.0)
 
 
+# Why a round on a lane's chat still waits, from the store (``_lane_waits``).
+LANE_WAITS_CUT = "cut"            # a cut turn of the chat nobody settled
+LANE_WAITS_EARLIER = "earlier"    # an earlier follow-up of the lane is still live
+_LANE_POLL_S = 2.0
+# A follow-up never starts a session beside a turn its machine may still
+# hold: at the gate's ceiling it ends with these words instead.
+LANE_MACHINE_AWAY = ("The worker's machine has not come back, so this follow-up was not "
+                     "started. Send it again with {call} once the machine is back.")
+LANE_NOT_TAKEN_UP = ("The lane's last turn was cut and has not been taken up again, so this "
+                     "follow-up was not started. Send it again with {call} in a while.")
+
+
+def lane_words(words: str, chat_id: str) -> str:
+    """The gate's sentence with the call that sends the follow-up again."""
+    return words.format(call=f'delegate(continue_id="{chat_id}")')
+
+
+class LaneNotStarted(RuntimeError):
+    """The lane gate ended a follow-up before its round opened: nothing of
+    it ran. The run's report says "was not started", never "failed"."""
+
+
+class LaneWait(NamedTuple):
+    """Why a round still waits at the lane gate (``why``: "" for nothing),
+    the words that end it at the gate's ceiling, whether somebody holds the
+    cut turn (``held``: the continue pass claimed its record, or an adoption
+    took it for its replay), and whether an earlier follow-up of the lane is
+    still in line (``behind``: live, its round not opened)."""
+    why: str = ""
+    words: str = ""
+    held: bool = False
+    behind: bool = False
+
+
+def _lane_waits(chat_id: str, run_id: str) -> LaneWait:
+    """Why a round of ``run_id`` on a lane's chat must still wait: a cut turn
+    of the chat nobody settled, or an earlier follow-up of the lane still
+    live (rounds run in the order they were delegated). The run's own record
+    never holds it (a reopened run).
+
+    A cut turn's record is unsettled in four states, and a session started
+    beside any of them would end the turn's process or run beside it:
+
+    * ``waiting`` and parked: its machine has not reported. Nothing runs here.
+    * ``waiting`` and claimed: an adoption replays the turn. Its pump runs on
+      the chat from a moment after the claim to a moment before the record
+      settles or goes back to the pass.
+    * ``pending``: the continue pass has not taken it yet.
+    * ``running``: the pass holds it. It starts the chat's session, then the
+      continued turn's pump runs on the chat until the record settles.
+
+    ``held`` is true only while a holder of this process has the record
+    (``cut_turns.held``): it moves the record on at its end. A ``waiting``
+    or ``running`` record whose holder is gone (a process that died) is held
+    by nobody, so the gate does not wait twice the ceiling on it.
+
+    So an unsettled record does not mean nobody took the turn up: the gate
+    reads the chat's pump for that (``_await_lane_turn``). An earlier
+    follow-up with no session on its row has not opened its round: it is in
+    line ahead of this one (``behind``), where one whose round is open is
+    the lane's running turn. Synchronous: the DB executor."""
+    from services.scheduler import cut_turns
+    from storage.chat import cut_records
+    rounds = task_store.live_delegate_rounds(chat_id)
+    ahead = [r["id"] for r in rounds]
+    earlier = rounds[:ahead.index(run_id)] if run_id in ahead else []
+    behind = any(not (r.get("session_id") or "") for r in earlier)
+    record = cut_records.unsettled_of(chat_id)
+    if record is not None and (record.get("run_id") or "") != run_id:
+        state, sid = record["state"], record.get("session_id") or ""
+        held = state in (cut_records.WAITING, cut_records.RUNNING) and cut_turns.held(record["id"])
+        # Parked: its machine has not come back. Any other: it did, or the
+        # platform's own turn waits for the pass.
+        parked = state == cut_records.WAITING and bool(sid) and cut_turns.waiting(sid)
+        words = LANE_MACHINE_AWAY if parked else LANE_NOT_TAKEN_UP
+        return LaneWait(LANE_WAITS_CUT, lane_words(words, chat_id), held=held, behind=behind)
+    if earlier:
+        return LaneWait(LANE_WAITS_EARLIER, behind=behind)
+    return LaneWait()
+
+
+def _lane_turn_runs(chat_id: str) -> bool:
+    """A turn runs on the lane's chat now (its pump is open): a taken-back
+    turn among them (a replay's, the continue pass's)."""
+    from core.events.stream_pump import _active_pumps
+    pump = _active_pumps.get(chat_id)
+    return pump is not None and not pump.is_done
+
+
+async def _await_lane_turn(chat_id: str, run_id: str, *,
+                           ceiling_seconds: float | None = None) -> None:
+    """Wait while the store says the lane is not this round's yet
+    (``_lane_waits``). The ceiling counts from when the lane began to wait
+    for its present reason, so a follow-up that waited out a cut turn does
+    not pass the one ahead of it the moment the turn's record settles. The
+    rules for a lane with no turn count quiet time on top: from the last
+    moment a turn ran on the chat, so nothing is passed or ended in the
+    moment after a turn's end, while the one ahead starts its session. What
+    the ceiling does, read at every poll past it:
+
+    * A turn runs on the chat (a replay, the pass's continue, a person's own
+      turn, an earlier follow-up's round) and no earlier follow-up is in
+      line: the gate returns and the live-turn wait that follows waits that
+      turn out, as without a restart. A follow-up is never ended behind a
+      turn that runs.
+    * A turn runs and an earlier follow-up is still in line: the gate waits
+      on. The one ahead takes the turn's end first, so two follow-ups never
+      leave the gate for one turn's end and start side by side.
+    * No turn runs and an earlier follow-up is in line with no cut turn
+      unsettled (it waits for its slot, or is a moment before its round):
+      the gate waits on, once more the ceiling at most, then passes it. An
+      earlier follow-up whose round is open with no turn on the chat is
+      passed once the lane has been quiet for the ceiling: its session is
+      starting.
+    * A cut turn a holder of this process holds with no turn on the chat
+      yet (the pass is starting it, an adoption is between its claim and its
+      pump): the gate waits on. The holder settles it or hands it back at its
+      end, so this is waited for once more the ceiling at most. A holder that
+      is gone holds nothing.
+    * A cut turn nobody holds and no turn on the chat (its machine has not
+      come back, the pass has not taken it): the follow-up ends with its
+      words (``LaneNotStarted``). A session started beside that turn would
+      end its process.
+
+    A store that cannot be read holds nothing."""
+    import psycopg
+
+    from storage.pg import run_db
+    ceiling = (float(config.LANE_GATE_CEILING_S) if ceiling_seconds is None
+               else ceiling_seconds)
+    since = ran_at = last_heartbeat = time.monotonic()
+    why = ""
+    while True:
+        try:
+            wait = await run_db(_lane_waits, chat_id, run_id)
+        except psycopg.Error:
+            logger.debug("Lane gate: the store could not be read for chat %s", chat_id[:8],
+                         exc_info=True)
+            return
+        if not wait.why:
+            return
+        # Read after the store's answer, with no await between it and the
+        # verdict: a pump that registered during the read is seen.
+        runs = _lane_turn_runs(chat_id)
+        now = time.monotonic()
+        if wait.why != why:
+            since, why = now, wait.why
+        if runs:
+            ran_at = now
+        waited = now - since
+        # How long the lane has had no turn, for the rules that need none.
+        quiet = now - max(since, ran_at)
+        if waited >= ceiling and (runs or quiet >= ceiling):
+            stuck = quiet >= 2 * ceiling
+            if runs:
+                if not wait.behind:
+                    logger.warning("Lane gate ceiling reached for chat %s (%ss): a turn runs "
+                                   "on the lane, waiting it out", chat_id[:8], int(ceiling))
+                    return
+            elif wait.why == LANE_WAITS_EARLIER:
+                if not wait.behind or stuck:
+                    logger.warning("Lane gate ceiling reached for chat %s (%ss): an earlier "
+                                   "follow-up is still live, going on", chat_id[:8], int(ceiling))
+                    return
+            elif not wait.held or stuck:
+                raise LaneNotStarted(wait.words)
+        if now - last_heartbeat >= 60.0:
+            logger.info("Task %s waits at the lane gate of chat %s (%s%s%s)", run_id, chat_id[:8],
+                        wait.why, ", a turn runs" if runs else ", held" if wait.held else "",
+                        ", behind an earlier follow-up" if wait.behind else "")
+            last_heartbeat = now
+        await asyncio.sleep(_LANE_POLL_S)
+
+
 def _lane_pump_wedged(pump) -> bool:
     """Can the prior round's open pump still make progress? Healthy live
     pumps get a quiescence wait instead of a reap — a reap here would cancel
@@ -290,20 +465,18 @@ def _lane_pump_wedged(pump) -> bool:
     if _remote_layer is not None and sid in _remote_layer._sessions:
         info = _remote_layer._sessions[sid]
         return _remote_layer.remote_stream_severed(sid) or info.cli_dead
-    from core.layers.cli.session import _persistent_sessions
-    ps = _persistent_sessions.get(sid)
-    if ps is not None:
-        return ps.proc is None or ps.proc.returncode is not None
-    from core.layers.codex.session import _codex_sessions
     from core.layers.direct.session import _direct_sessions
-    if sid in _codex_sessions or sid in _direct_sessions:
+    if sid in _direct_sessions:
         return False
     # No live session backs the pump at all — orphaned producer.
     return True
 
 
 async def _settle_prior_lane(chat_id: str, run_id: str) -> bool:
-    """Run-start lane gate: wait out a HEALTHY prior round / user turn (the
+    """Run-start lane gate: wait for the lane to be this round's by the
+    store (``_await_lane_turn``: a cut turn nobody settled, an earlier
+    follow-up; a turn that runs is never a reason to end the follow-up
+    there), then wait out a HEALTHY prior round / user turn (the
     delivery-side quiescence gate never covered run START — the reap used to
     cancel live turns), then reap only what is genuinely wedged. Returns True
     when a reap happened — the round must then respawn, never reuse: a
@@ -311,6 +484,7 @@ async def _settle_prior_lane(chat_id: str, run_id: str) -> bool:
     reusing would put two concurrent stdout readers on one CLI, while the
     respawn path's stale-live guard closes the old process first."""
     from core.events.stream_pump import _active_pumps
+    await _await_lane_turn(chat_id, run_id)
     prior = _active_pumps.get(chat_id)
     if prior is None or prior.is_done:
         return False
@@ -340,7 +514,10 @@ async def _try_reuse_warm_session(
     - the session lives on the machine this run resolved to;
     - the session was task-spawned (is_task): a dashboard-warmed session on
       the lane chat runs under the viewer's context/subscription/env — a
-      task round must not ride it."""
+      task round must not ride it;
+    - the session is bound to the round's payer (``spender.serves``): a lane
+      continued by another person pays for that round, on their account."""
+    from core.config import spender
     from core.session import session_state as _state
     from core.session.session_manager import _remote_layer
     if _remote_layer is None or layer is not _remote_layer:
@@ -348,9 +525,13 @@ async def _try_reuse_warm_session(
     info = _remote_layer._sessions.get(session_id)
     if info is None or not info.alive or info.cli_dead or info.turn_active:
         return False
-    if info.machine_id != (agent_cfg.execution_target or ""):
+    if not placement.runs_on(agent_cfg.execution_target or placement.LOCAL, info.machine_id,
+                             platform_machine=info.compute):
         return False
     if not (_state._sessions.get(session_id) or {}).get("is_task"):
+        return False
+    payer = spender.Spender(getattr(agent_cfg, "subscription_user_sub", "") or None, "round")
+    if not await asyncio.to_thread(spender.serves, session_id, payer):
         return False
     if await _remote_layer.is_session_process_dead(session_id):
         return False
@@ -361,11 +542,14 @@ async def _try_reuse_warm_session(
     return True
 
 
-async def _close_for_model_change(session_id: str, run_id: str, *, slot_target: str) -> bool:
+async def _close_for_model_change(session_id: str, run_id: str, *, slot_target: str,
+                                  reason: str = "model-change") -> bool:
     """Close a continued lane's live session before a round that changed the
-    worker's model (``TaskDefinition.respawn_for_model``), so the round's
-    spawn resumes the conversation on the new model: a live local process
-    would be reused as it is, and a warm remote one ridden.
+    worker's model (``TaskDefinition.respawn_for_model``), or its payer
+    (``reason`` ``payer-change``: a lane continued by another person), so
+    the round's spawn resumes the conversation on the new model or account:
+    a live local process would be reused as it is, and a warm remote one
+    ridden.
 
     Called after the round's last lane gate, so no turn of the lane is open;
     the close runs under the holding layer's session lock, which a delivery
@@ -374,19 +558,41 @@ async def _close_for_model_change(session_id: str, run_id: str, *, slot_target: 
     under ``session_id``, which is also this round's: it is taken back
     (blocking, as the round's own ``task_slot`` took it) so the new process
     is counted. Returns True when a live session was closed."""
+    from core.session import chat_rebuild
     from core.session.session_manager import find_layer_for_session
-    holder = find_layer_for_session(session_id)
-    if holder is None:
+    held = find_layer_for_session(session_id) is not None
+    # Inside the run, so never an idle check: the round's last lane gate
+    # passed, and the lock is what a delivery into the session holds. The
+    # layer that holds the session closes it, whatever the round's target.
+    closed = await chat_rebuild.close_chat_session(
+        {"session_id": session_id}, reason=reason, require_idle=False, lock=True)
+    if not closed:
+        if held:
+            # Its machine is away: nothing is sent there, and the machine
+            # closes the process it still tracks before it starts the
+            # round's under the same id.
+            logger.info(
+                "Task %s: session %s is on a machine that is away, nothing closed: "
+                "the worker's model changed, the machine ends the old process when "
+                "the round starts there", run_id, session_id[:8]
+            )
         return False
-    async with holder.session_lock(session_id):
-        await holder.close_session(session_id)
     logger.info(
-        "Task %s: closed live session %s — the worker's "
-        "model changed, the round resumes it on the new one", run_id, session_id[:8]
+        "Task %s: closed live session %s (%s), the round resumes it",
+        run_id, session_id[:8], reason
     )
     from core import concurrency
     await concurrency.acquire(session_id, "task", target=slot_target, blocking=True)
     return True
+
+
+def serves_another_payer(session_id: str, task) -> bool:
+    """Whether a continue round's live session is bound to another payer
+    than the round's (``core/config/spender.py``): another person
+    continued the lane. A session outside the pool, or none, is never
+    another payer's. Synchronous: the DB executor."""
+    from core.config import spender
+    return bool(session_id) and not spender.serves(session_id, spender.run_spender(task))
 
 
 def _post_run_session_action(chat_row: dict | None) -> tuple[str, bool]:
@@ -544,18 +750,16 @@ _report_holds: dict[str, int] = {}
 async def tell_run_parked(task, chat_id: str) -> None:
     """A run's turn waits on a person's answer while nobody views its chat:
     the people the drive gate lets answer it are told once (the creator of a
-    user-scope task, else the agent's editors and managers)."""
-    from auth import roles
-    from auth.providers import acting_role_of
-    from core.session.visibility import SCOPE_USER
+    user-scope task, else who hears the agent's own work: its editors and
+    managers and every admin)."""
+    from core.session.visibility import SCOPE_USER, agent_work_audience
     from services.notifications import notification_manager
     from storage.pg import run_db
 
     def _people() -> list[str]:
         if task.scope == SCOPE_USER and task.created_by:
             return [task.created_by]
-        return [r["sub"] for r in task_store.get_agent_users(task.agent)
-                if roles.can_edit(acting_role_of(r["sub"], task.agent))]
+        return agent_work_audience(task.agent)
 
     who = "A delegated worker" if task.on_complete_agent else "A task run"
     for sub in await run_db(_people):
@@ -566,6 +770,29 @@ async def tell_run_parked(task, chat_id: str) -> None:
             severity="info", scope="user", target=sub, source="task",
             source_id=task.id, agent_slug=task.agent, chat_id=chat_id,
         )
+
+
+async def tell_chat_waits(agent: str, chat_id: str, person: str,
+                          chat_row: dict | None) -> None:
+    """A woken turn of a chat waits on its person's answer while nobody
+    views it: they are told once. ``person`` is who the turn runs as, else
+    the chat's own owner; a chat no person owns tells nobody."""
+    from core.session.visibility import is_synthetic_owner
+    who = person
+    if not who:
+        owner = (chat_row or {}).get("user_sub") or ""
+        who = "" if is_synthetic_owner(owner) else owner
+    if not who:
+        return
+    from services.notifications import notification_manager
+    await notification_manager.fire_notification(
+        "A chat waits on your answer",
+        f"{agent} was woken in a chat (a delegated result, a scheduled wake, a "
+        f"finished background job or a message sent with an API key) and its next "
+        f"step waits for your answer there. Open the chat to answer.",
+        severity="info", scope="user", target=who, source="delegation",
+        agent_slug=agent, chat_id=chat_id,
+    )
 
 
 def hold_report(*keys: str) -> None:
@@ -637,7 +864,7 @@ async def _chat_turn_produce(layer, session_id: str, prompt: str,
 async def _run_echo_turn_pumped(layer, session_id: str, chat_id: str,
                                 agent: str, result_prompt: str, *,
                                 person: str = "", only_as_chat_turn: bool = False,
-                                claim: object | None = None) -> str | None:
+                                claim: object | None = None, source: str = "") -> str | None:
     """Run a delegate-echo turn through a headless ChatStreamPump on the
     delegating chat.
 
@@ -667,12 +894,13 @@ async def _run_echo_turn_pumped(layer, session_id: str, chat_id: str,
 
     ``claim``: the chat's claim the caller already holds (the fresh-spawn
     rung prepares the chat under it); released once the pump registers.
+    ``source``: what started the turn, as ``chat_rebuild.rebuild_and_resume``
+    names it.
     """
     from core.events.stream_pump import ChatStreamPump, _active_pumps
     from core.events.task_producer import task_produce
     from core.session import visibility as _vis
     from core.session.session_state import get_permission_queue
-    from core.session.visibility import is_synthetic_owner
     from storage.pg import run_db
 
     # Read before the pump check: nothing may await between it and the
@@ -705,26 +933,17 @@ async def _run_echo_turn_pumped(layer, session_id: str, chat_id: str,
         scope="agent" if _vis.is_shared_only(agent) else "user",
         driver_tells_parked=True,   # _tell_parked below
     )
+    # Who the platform runs this turn for and what started it (a delegated
+    # result, a wake): nobody watches it, so a usage limit that cuts it asks
+    # with these whether it goes on (``pool_limits.after_limit``). A caller
+    # that names no source (a review, a monitor) keeps the limit's card.
+    pump.driven_for, pump.driven_by = person or "", source
     _active_pumps[chat_id] = pump
     q.release(claim)
     pump.start()
 
     async def _tell_parked() -> None:
-        who = person
-        if not who:
-            owner = (chat_row or {}).get("user_sub") or ""
-            who = "" if is_synthetic_owner(owner) else owner
-        if not who:
-            return
-        from services.notifications import notification_manager
-        await notification_manager.fire_notification(
-            "A chat waits on your answer",
-            f"{agent} was woken in a chat (a delegated result, a scheduled wake or a "
-            f"finished background job) and its next step waits for your answer there. "
-            f"Open the chat to answer.",
-            severity="info", scope="user", target=who, source="delegation",
-            agent_slug=agent, chat_id=chat_id,
-        )
+        await tell_chat_waits(agent, chat_id, person, chat_row)
 
     # A _TaskTurnStalled reap persisted the partial turn and closed the chat
     # status — delivered as far as it went; never fall through to another rung

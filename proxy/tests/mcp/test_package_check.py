@@ -122,6 +122,14 @@ def test_a_container_package_s_rules(tmp_path):
     assert any("version must be set for a docker" in e for e in out["errors"])
 
 
+def test_a_package_that_says_it_runs_with_the_platform_is_told_it_starts_at_first_call(tmp_path):
+    server = dict(_manifest()["server"], starts="with_platform")
+    out = ci.check_package(_folder(tmp_path, _manifest(server=server), files={"icon.png": _png(256, 256)}))
+    assert out["ok"] is True and out["errors"] == []
+    assert out["warnings"] == ["server.starts: with_platform is for the platform's own tools, "
+                               "so this package's server starts at its first call"]
+
+
 def test_conventions_are_warnings(tmp_path):
     root = _folder(tmp_path, _manifest(author="", author_url="http://x",
                                        env={"OTO_AGENT_NAME": "x", "PROXY_URL": "y"},

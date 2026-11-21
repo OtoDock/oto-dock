@@ -28,8 +28,8 @@
 # fresh isolated /proc. NO cap_add (SYS_ADMIN dropped), NOT --privileged. Net a
 # privilege REDUCTION vs a root-run proxy.
 
-ARG PYTHON_IMAGE=python:3.13.18-slim-trixie@sha256:ae14d4ce8771606477a81446e7ef429edd6762305fc50c84507c1041fa8285d1
-ARG NODE_IMAGE=node:26.13.0-trixie-slim@sha256:e4db4c914bf8ad241bd24804fc25d272d89bad97e68cdc8a1414862790a02c39
+ARG PYTHON_IMAGE=python:3.13.18-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+ARG NODE_IMAGE=node:26.13.1-trixie-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc
 
 # --- Node stage: source the pinned Node (same Debian release and glibc as the base) ---
 FROM ${NODE_IMAGE} AS node
@@ -51,8 +51,8 @@ RUN npm ci
 COPY dashboard/ ./
 RUN npm run build
 
-# --- Final image ---
-FROM ${PYTHON_IMAGE}
+# --- Base: the system, the runtimes and the deps every later stage shares ---
+FROM ${PYTHON_IMAGE} AS base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -97,12 +97,14 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # and the releases were tested on. OTODOCK_PASST_BUILD=required fails the build
 # rather than ship any other pasta.
 # Same script the satellite + bare-metal installs run, so the sandbox sees
-# identical tools everywhere. Copied first (small, changes rarely) for layer
-# caching. (VERSIONS.md is NOT needed here — the installer carries its own
+# identical tools everywhere. Only the installer and the one file it reads beside
+# itself are copied here: this layer and every heavy one after it stay cached when
+# any other script changes, and the rest of scripts/ comes with the app code below.
+# (VERSIONS.md is NOT needed here — the installer carries its own
 # pinned defaults (uv, pnpm, Bun, sympy, the CLIs; the mirror tests hold them
 # equal; Node comes from the node stage above, so its Node step is skipped) —
 # so it's copied later to keep doc edits from busting this expensive layer.)
-COPY scripts/ /opt/otodock/scripts/
+COPY scripts/install-baseline-tools.sh scripts/oto-git-credential-helper /opt/otodock/scripts/
 RUN OTODOCK_PASST_BUILD=required bash /opt/otodock/scripts/install-baseline-tools.sh \
  && rm -rf /var/lib/apt/lists/*
 
@@ -133,15 +135,43 @@ RUN python -m venv /opt/otodock/proxy/venv \
 COPY audio/ /opt/otodock/audio/
 RUN /opt/otodock/proxy/venv/bin/pip install -e /opt/otodock/audio
 
+# The compute service is this image started as the platform's own compute
+# machine (proxy/compute_start.py): the satellite runs from a venv of its own
+# (psutil, setproctitle), as on a bare-metal install. bwrap, pasta and ip
+# come from the baseline tools above.
+COPY satellite/requirements.txt /opt/otodock/satellite-requirements.txt
+COPY satellite/requirements-exit.txt /opt/otodock/satellite-requirements-exit.txt
+RUN python -m venv /opt/otodock/satellite/venv \
+ && /opt/otodock/satellite/venv/bin/pip install --no-cache-dir -r /opt/otodock/satellite-requirements.txt \
+ && /opt/otodock/satellite/venv/bin/pip install --no-cache-dir -r /opt/otodock/satellite-requirements-exit.txt \
+ && rm /opt/otodock/satellite-requirements.txt /opt/otodock/satellite-requirements-exit.txt
+
+# --- The bundled tools' environments, built by the platform's own bootstrap ---
+# The same scan, interpreter pin and markers as a boot's, so a container's first
+# start reads every tool fresh and builds nothing. Only /tools-out leaves this
+# stage: the scratch folders keep the secrets `config` generates on import out
+# of the image, and uv's cache stays behind with the stage.
+FROM base AS tools
+WORKDIR /opt/otodock/proxy
+COPY proxy/ /opt/otodock/proxy/
+COPY mcps/ /opt/otodock/mcps/
+RUN mkdir -p /tmp/build \
+ && PLATFORM_DATA_DIR=/tmp/build PLATFORM_CONFIG_DIR=/tmp/build \
+    /opt/otodock/proxy/venv/bin/python -m services.mcp.mcp_venv_bootstrap --build-image /tools-out
+
+# --- Final image ---
+FROM base
+
 # Satellite source — the proxy reads its SATELLITE_VERSION at boot (ws/satellite.py)
 # and serves it as the pairing tarball (api/remote/remote_machines.py). Source only;
 # .dockerignore strips its venv/__pycache__. Should the tree ever be absent,
 # the proxy degrades gracefully — see ws/satellite.py::satellite_source_available.
 COPY satellite/ /opt/otodock/satellite/
 
-# App code + MCP manifests + VERSIONS.md (baked). Volumes/binds overlay agents/
-# + config.env at runtime. .dockerignore strips secrets, user data, venvs,
+# App code + scripts + MCP manifests + VERSIONS.md (baked). Volumes/binds overlay
+# agents/ + config.env at runtime. .dockerignore strips secrets, user data, venvs,
 # sessions, logs. VERSIONS.md last so doc edits don't bust the layers above.
+COPY scripts/ /opt/otodock/scripts/
 COPY VERSIONS.md /opt/otodock/VERSIONS.md
 COPY proxy/ /opt/otodock/proxy/
 COPY mcps/ /opt/otodock/mcps/
@@ -162,25 +192,33 @@ COPY --from=dashboard /build/dist /opt/otodock/dashboard/dist
 # copy-up ~400 MB into a fat layer. Everything else (app code, mcps, dashboard,
 # bin, …) is small and is owned by 1000 so the runtime can read/execute it AND
 # create its writable children — proxy/sessions, recover-bin, media-cache,
-# host-media-cache (lazy mkdir), mcps/*/.env + bundled venvs. The agents volume +
+# host-media-cache (lazy mkdir), mcps/*/.env. The agents volume +
 # config.env are chowned at boot by the compose init sidecar (volumes start root-
 # owned). Excluding venv also avoids __pycache__ EACCES noise on the app code.
 RUN groupadd -g 1000 oto && useradd -u 1000 -g 1000 -m -s /bin/bash oto \
  && chown 1000:1000 /opt/otodock \
- && find /opt/otodock -mindepth 1 -maxdepth 1 ! -name proxy \
+ && find /opt/otodock -mindepth 1 -maxdepth 1 ! -name proxy ! -name satellite \
       -exec chown -R 1000:1000 {} + \
- && find /opt/otodock/proxy -mindepth 1 -maxdepth 1 ! -name venv \
+ && find /opt/otodock/proxy /opt/otodock/satellite -mindepth 1 -maxdepth 1 ! -name venv \
       -exec chown -R 1000:1000 {} + \
- && chown 1000:1000 /opt/otodock/proxy
+ && chown 1000:1000 /opt/otodock/proxy /opt/otodock/satellite \
+ && mkdir -p /opt/otodock/compute /opt/otodock/compute-link \
+ && chown 1000:1000 /opt/otodock/compute /opt/otodock/compute-link
+
+# The tools' environments from the stage above, owned as a boot's own build
+# would leave them. After the chown: a chown -R over them would copy ~900 MB
+# up into a second fat layer.
+COPY --from=tools --chown=1000:1000 /tools-out/ /opt/otodock/mcps/
 
 WORKDIR /opt/otodock/proxy
 EXPOSE 8400
 
-# Liveness — the proxy serves /health once uvicorn + DB are up. The start
-# period covers a release's first boot (the bundled MCP venvs are built and the
-# database migrated, minutes on a small host): compose stops waiting for the
-# proxy the moment Docker calls it unhealthy, so the period matches what
-# scripts/upgrade.sh itself waits. A success is still reported at once.
+# Liveness — the proxy serves /health (200) once the database is migrated and
+# uvicorn listens; the bundled tools' environments are already in the image,
+# so a first boot holds no new work for them. The start period covers a long
+# migration on a small host: compose stops waiting
+# for the proxy the moment Docker calls it unhealthy, so the period matches
+# what scripts/upgrade.sh itself waits. A success is still reported at once.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=300s --retries=6 \
   CMD ["sh", "-c", "curl -fsS http://localhost:8400/health || exit 1"]
 

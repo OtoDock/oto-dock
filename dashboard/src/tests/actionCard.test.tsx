@@ -211,13 +211,15 @@ describe('ActionCard', () => {
     mockRoutes(state({ resolved: true, outcome: {
       status: 'running', text: 'The department Lady G is being installed.', job_id: 'setjob-1',
       members: [{ template: 'yacht-manager', display_name: 'Yacht Manager', slug: 'yacht-manager', status: 'installed', detail: '' },
-                { template: 'yacht-crew', display_name: 'Yacht Crew', slug: 'yacht-crew', status: 'installing', detail: '' }],
+                { template: 'yacht-crew', display_name: 'Yacht Crew', slug: 'yacht-crew', status: 'installing', detail: '' },
+                { template: 'yacht-finance', display_name: 'Yacht Finance', slug: 'fin-b', action: 'move', status: 'adopted', detail: '' }],
       lines: ['Installed Yacht Manager as yacht-manager.'],
     } }), () => ({}))
     renderCard()
     await screen.findByText('The department Lady G is being installed.')
     expect(screen.getByText('Installed')).toBeInTheDocument()
     expect(screen.getByText('Installing')).toBeInTheDocument()
+    expect(screen.getByText('Moved')).toBeInTheDocument()
     expect(screen.getByText('Installed Yacht Manager as yacht-manager.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Move' })).toBeDisabled()
   })

@@ -17,6 +17,7 @@ import { BADGE_BASE, BADGE_TONE, CARD, DIALOG_PANEL } from '../components/ui/cla
 import InfoTip from '../components/ui/InfoTip'
 import { CheckboxRow, SaveState } from '../components/ui/SettingsControls'
 import { useSaveState } from '../hooks/useSaveState'
+import MachineToolsLine from '../components/MachineToolsLine'
 
 export function MyMachinesSection() {
   const dialogs = useDialogs()
@@ -153,6 +154,7 @@ export function MyMachinesSection() {
                       {m.capabilities?.os_user ? ` · ${m.capabilities.os_user}` : ''}
                     </p>
                     <MachineLinkNotice linkOk={m.link_ok} downS={m.link_down_s} error={m.link_error} detail={expanded} />
+                    <MachineToolsLine machine={m} />
                   </div>
                 </div>
                 <svg

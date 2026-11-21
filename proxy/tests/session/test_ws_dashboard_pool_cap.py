@@ -207,3 +207,32 @@ class TestGate:
         assert [f["type"] for f in sent] == ["error", "done"]
         assert sent[-1]["chat_id"] == "chat-1"
         assert calls["warmups"] == 0
+
+
+class TestAKeysMark:
+    """A session a key's turn ran on carries the key's mark while work that
+    turn started still runs. Once that work has ended, the person's own next
+    message recycles it, so their turn runs on a session of their own (their
+    device grant and their own browser back)."""
+
+    @pytest.mark.parametrize(("marked", "background", "mid_turn", "recycled"), [
+        (True, 0, False, True), (True, 1, False, False), (False, 0, False, False), (True, 0, True, False)])
+    def test_a_persons_message_recycles_a_session_a_key_left(self, conn, monkeypatch, marked, background,
+                                                             mid_turn, recycled):
+        from core.session import background_leash, key_rows
+        from ws import dashboard_chat_send as mod
+
+        class _Pump:
+            is_done = False
+        if mid_turn:
+            monkeypatch.setitem(mod._active_pumps, "chat-1", _Pump())
+        monkeypatch.setattr(background_leash, "background_pending_count", lambda s: background)
+        c, sent, calls = conn
+        if marked:
+            key_rows.mark_session("sess-1")
+        try:
+            _drive(c, _status(allowed=True))
+        finally:
+            key_rows.forget_session("sess-1")
+        assert (calls["closed"] == ["sess-1"]) is recycled
+        assert calls["warmups"] == (1 if recycled else 0)

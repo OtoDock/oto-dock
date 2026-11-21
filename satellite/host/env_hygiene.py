@@ -67,8 +67,9 @@ _NESTED_CLAUDE_SESSION_VARS = frozenset({
 # flags"): they change how a session's permission gate and trackers behave,
 # so a satellite started from a shell that carries them (an agent's shell in
 # a Codex chat) must not hand them to every session it spawns: a stray
-# OTO_HOOK_BRIDGED or OTO_HOOK_DENY_ONLY would let a Claude session's gate
-# stand aside. Dropped unconditionally, as the nested session identity is.
+# OTO_HOOK_DENY_ONLY would change how a Claude session's gate answers.
+# OTO_HOOK_BRIDGED, which no release sets now, goes too. Dropped
+# unconditionally, as the nested session identity is.
 _PER_SPAWN_HOOK_FLAGS = frozenset({
     "OTO_HOOK_DENY_ONLY", "OTO_HOOK_NO_FORWARD", "OTO_HOOK_BRIDGED", "OTO_INTERACTIVE",
 })

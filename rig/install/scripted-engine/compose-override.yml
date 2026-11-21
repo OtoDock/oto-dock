@@ -1,0 +1,6 @@
+# The rig's one addition to a person's install: the folder of its Claude Code
+# wrapper (scripted-engine/claude), which CLAUDE_BIN in .env names.
+services:
+  otodock-proxy:
+    volumes:
+      - ./rig-bin:/opt/rig-bin:ro

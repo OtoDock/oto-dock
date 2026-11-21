@@ -14,6 +14,7 @@ import pytest
 
 import config
 from auth.path_policy import SecurityContext
+from core import placement
 from core.session import session_events as se, session_state
 from services.checks import documents as d, evaluator, kinds
 from storage import database as task_store
@@ -174,7 +175,7 @@ def test_a_kind_that_is_not_available_is_a_visible_error(rig):
 def test_resolve_target_kinds(rig):
     t = asyncio.run(evaluator.resolve_target(SID, "claude"))
     assert t.kind == "chats" and t.username == "alice" and t.user_sub == "alice-sub"
-    assert t.placement.is_local and t.cwd == "/users/alice"
+    assert t.placement.kind == placement.KIND_LOCAL and t.cwd == "/users/alice"
     # A task run's session.
     task_store.create_run("run-1", "task-1", AGENT, "scheduled", None, "p", task_type="scheduled",
                           scope="user", created_by="alice-sub")

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
 import sys
 import uuid
 
@@ -31,9 +32,14 @@ pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="posix shell scr
 class _WS:
     def __init__(self):
         self.sent: list[dict] = []
+        self.bulk: list[dict] = []
 
     async def enqueue_send(self, msg):
         self.sent.append(msg)
+
+    async def enqueue_bulk(self, msg):
+        self.bulk.append(msg)
+        return True
 
     def ack(self) -> dict:
         acks = [m for m in self.sent if m.get("type") == "ack"]
@@ -42,6 +48,9 @@ class _WS:
 
     def output(self) -> str:
         return "".join(m.get("text", "") for m in self.sent if m.get("type") == "step_output")
+
+    def bulk_output(self) -> str:
+        return "".join(m.get("text", "") for m in self.bulk if m.get("type") == "step_output")
 
 
 @pytest.fixture
@@ -266,6 +275,30 @@ async def test_the_scripts_exit_is_the_verdict_and_nothing_it_left_behind_surviv
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the memory guard runs on Linux")
+async def test_a_step_the_memory_guard_stops_says_so_in_its_output(sat):
+    """The guard's stop of a running step: its verdict's output ends with the
+    sentence, the exit is the kill (mutation: no sentence written)."""
+    from satellite.sessions import memory_guard as mg
+    cfg, _agents = sat
+    sm = SessionManager(cfg)
+    ws = _WS()
+    task = asyncio.create_task(sm.step_run(_frame("#!/bin/sh\necho start\nsleep 30\necho never\n",
+                                                  timeout=60), ws))
+    for _ in range(100):
+        if sm._steps and "start" in ws.output():
+            break
+        await asyncio.sleep(0.05)
+    guard = mg.Guard(lambda: [u for u in sm.memory_units() if u.kind == "step"], compute=False)
+    [step] = [w for w in await asyncio.to_thread(guard.walk) if w.unit.kind == "step"]
+    await asyncio.to_thread(guard.stop, step, step.parts[0], guard.numbers(8192), 0.0, why="reserve", now=0.0)
+    await asyncio.wait_for(task, timeout=10)
+    ack = ws.ack()
+    assert ack["exit_code"] == -9 and "never" not in ack["output"]
+    assert ack["output"].rstrip().endswith(mg.SENTENCES["step"]), ack["output"]
+
+
+@pytest.mark.asyncio
 async def test_a_failure_before_the_script_runs_still_answers(sat, monkeypatch):
     """No verdict would leave the proxy waiting the whole timeout for it."""
     cfg, agents = sat
@@ -369,3 +402,130 @@ async def test_a_windows_machine_without_the_baseline_answers_the_sentence(sat, 
     ack = ws.ack()
     assert ack["status"] == "error"
     assert ack["error"] == "Scripts need bash on this computer: install the baseline tools."
+
+
+# ── a compute machine: the platform's sandbox, nothing unsandboxed ─────────
+
+
+def _compute_cfg(tmp_path) -> SatelliteConfig:
+    (tmp_path / "agents").mkdir(exist_ok=True)
+    (tmp_path / "mcps").mkdir(exist_ok=True)
+    return SatelliteConfig(machine_id="c", machine_secret="s", platform_url="ws://127.0.0.1:8400/v1/satellite",
+                           agents_dir=tmp_path / "agents", mcps_dir=tmp_path / "mcps", compute=True)
+
+
+def _compute_frame(**over) -> dict:
+    msg = {"type": "step_run", "command_id": "step-c", "delivery_id": str(uuid.uuid4()), "run": "sync.sh",
+           "sandbox": {"agent": "a", "binds": [], "mcp_binds": [], "mcps_root": "/m", "extra_binds": [], "cwd": "/workspace",
+                       "proxy_port": 8400, "forwards": ["proxy"]},
+           "argv": ["/usr/bin/env", "bash", "/app/sync.sh"], "env": {"OTODOCK_STEP_TOKEN": "t"}, "timeout": 30}
+    msg.update(over)
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_a_compute_machine_refuses_a_step_with_no_sandbox(tmp_path):
+    ws = _WS()
+    frame = _frame("#!/bin/sh\necho x\n")
+    await step_runner.run_compute_step(frame, ws, _compute_cfg(tmp_path), 45000, {})
+    assert ws.ack()["status"] == "error" and "sandbox" in ws.ack()["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_compute_step_needs_the_local_link(tmp_path):
+    ws = _WS()
+    await step_runner.run_compute_step(_compute_frame(), ws, _compute_cfg(tmp_path), 0, {})
+    assert ws.ack()["status"] == "error" and "local link" in ws.ack()["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_compute_step_refuses_a_field_its_render_does_not_know(tmp_path):
+    ws = _WS()
+    frame = _compute_frame(sandbox={**_compute_frame()["sandbox"], "new_mask": True})
+    await step_runner.run_compute_step(frame, ws, _compute_cfg(tmp_path), 45000, {})
+    assert ws.ack()["status"] == "error" and "new_mask" in ws.ack()["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_compute_step_runs_what_the_render_built_and_acks_its_verdict(tmp_path, monkeypatch):
+    seen: dict = {}
+
+    def render_command(desc, cfg, *, tunnel_port, argv, bin_path="", swap_binary=False):
+        seen.update(tunnel_port=tunnel_port, argv=argv, swap=swap_binary, tmp=desc.tmp_size_mb)
+        return ["/bin/sh", "-c", 'echo hello; echo token=$OTODOCK_STEP_TOKEN; exit 3']
+
+    from satellite.sessions import sandbox_host
+    monkeypatch.setattr(sandbox_host, "render_command", render_command)
+    ws = _WS()
+    running: dict = {}
+    await step_runner.run_compute_step(_compute_frame(), ws, _compute_cfg(tmp_path), 45000, running)
+    ack = ws.ack()
+    assert ack["status"] == "ok" and ack["exit_code"] == 3
+    # The bounded lane: every session of the install shares the control lane
+    # here, and it drops the oldest frame of any kind when full.
+    assert "hello" in ws.bulk_output() and ws.output() == ""
+    assert "token=t" in ack["output"]
+    assert seen == {"tunnel_port": 45000, "argv": ["/usr/bin/env", "bash", "/app/sync.sh"], "swap": False, "tmp": 0}
+    assert running == {}
+
+
+@pytest.mark.asyncio
+async def test_a_compute_step_writes_nothing_of_its_own_on_the_machine(tmp_path, monkeypatch):
+    """The scratch is the platform's, under the agent's folder."""
+    from satellite.sessions import sandbox_host
+    monkeypatch.setattr(sandbox_host, "render_command",
+                        lambda desc, cfg, *, tunnel_port, argv, bin_path="", swap_binary=False: ["/bin/true"])
+    monkeypatch.setattr(step_runner, "otodock_dir", lambda: tmp_path / ".oto-dock")
+    ws = _WS()
+    await step_runner.run_compute_step(_compute_frame(), ws, _compute_cfg(tmp_path), 45000, {})
+    assert ws.ack()["status"] == "ok"
+    assert not step_runner.steps_root().exists()
+
+
+@pytest.mark.asyncio
+async def test_a_paired_machine_refuses_a_step_with_a_sandbox(sat):
+    cfg, _agents = sat
+    sm = SessionManager(cfg)
+    ws = _WS()
+    await sm.step_run(_compute_frame(), ws)
+    assert ws.ack()["status"] == "error" and "sandboxed" in ws.ack()["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not all(shutil.which(t) for t in ("pasta", "bwrap")), reason="needs pasta and bwrap")
+async def test_a_real_compute_step_cannot_source_a_sibling_its_sandbox_does_not_bind(tmp_path, monkeypatch):
+    """The platform stages the signed script alone and binds that folder at
+    ``/app``: a file beside the script in the release is not there to source,
+    so a redeploy that changes only that file changes nothing a step runs."""
+    monkeypatch.setattr(step_runner, "otodock_dir", lambda: tmp_path / ".oto-dock")
+    cfg = _compute_cfg(tmp_path)
+    agent = cfg.agents_dir / "a"
+    release = agent / "app-releases" / "shared" / "x" / "1" / "scripts"
+    run_dir = agent / "app-releases" / "shared" / "x" / "steps" / "d1"
+    release.mkdir(parents=True)
+    (run_dir / "app" / "scripts").mkdir(parents=True)
+    (agent / "workspace").mkdir()
+    script = "#!/bin/sh\n. /app/scripts/lib.sh\necho after-source\n"
+    (release / "sync.sh").write_text(script)
+    (release / "lib.sh").write_text("echo SIBLING-RAN\n")
+    (run_dir / "app" / "scripts" / "sync.sh").write_text(script)
+    (run_dir / "payload.json").write_text("{}")
+    steps = "app-releases/shared/x/steps/d1"
+    sandbox = {**_compute_frame()["sandbox"], "mcps_root": str(cfg.mcps_dir),
+               "binds": [{"root": "agents", "rel": "workspace", "sandbox": "/workspace", "rw": True}],
+               "extra_binds": [{"root": "agents", "rel": f"{steps}/app", "sandbox": "/app", "rw": False},
+                               {"root": "agents", "rel": steps, "sandbox": "/step", "rw": False}]}
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp"}
+
+    async def run(argv: list[str]) -> dict:
+        ws = _WS()
+        await step_runner.run_compute_step(_compute_frame(sandbox=sandbox, argv=argv, env=env), ws, cfg, 45000, {})
+        return ws.ack()
+
+    # The staged script is what the sandbox holds at /app, and it is all of it.
+    listed = await run(["/bin/sh", "-c", "cd /app && find . -type f"])
+    assert listed["status"] == "ok" and listed["output"].split() == ["./scripts/sync.sh"], listed
+    ack = await run(["/bin/sh", "/app/scripts/sync.sh"])
+    assert ack["status"] == "ok" and ack["exit_code"] not in (0, None), ack
+    assert "SIBLING-RAN" not in ack["output"] and "after-source" not in ack["output"]
+    assert "lib.sh" in ack["output"]

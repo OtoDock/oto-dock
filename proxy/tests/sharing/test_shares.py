@@ -162,6 +162,7 @@ def test_share_routes_are_human_only():
 def test_links_need_the_confirm_and_a_chat_share_makes_a_snapshot(tmp_path, monkeypatch):
     import config
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    (tmp_path / AGENT).mkdir()
     row = _personal()
     # No password on the account and no passkey: the link route says which
     # confirm it lacks instead of making the link.

@@ -36,28 +36,89 @@ def _bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _cookie() -> dict:
+    from tests.fixtures.ws_dashboard_harness import session_cookie
+    return {"Cookie": f"session={session_cookie('user-admin')}"}
+
+
 def test_implement_plan_is_gone(temp_db):
-    token = live_session_token(SID, "pa", user_sub="user-admin")
     r = TestClient(app).post(f"/v1/sessions/{SID}/implement-plan",
                              json={"plan_path": "x.md", "mode": "acceptEdits"},
-                             headers=_bearer(token))
+                             headers=_cookie())
     # 404, or 405 when another router's session pattern matches the path.
     assert r.status_code in (404, 405)
 
 
-def test_a_token_whose_person_is_gone_is_refused_by_the_session_routes(temp_db):
+def test_the_session_control_routes_are_off_a_session_tokens_list(temp_db):
+    """No tool calls the session control routes (pending, abort) with a
+    session token: the list refuses them with its sentence before the
+    route runs, for a person's token and a no-person one
+    (``auth/external_endpoints.SESSION_ROUTES``)."""
+    from auth.external_endpoints import SESSION_ROUTE_DETAIL
+    for token in (live_session_token(SID, "pa", user_sub="user-admin"), live_session_token(SID, "pa")):
+        for method, path in (("GET", f"/v1/sessions/{SID}/pending"), ("POST", f"/v1/sessions/{SID}/abort"),
+                             ("GET", "/v1/models")):
+            r = TestClient(app).request(method, path, headers=_bearer(token))
+            assert (r.status_code, r.json()["detail"]) == (403, SESSION_ROUTE_DETAIL), (method, path)
+
+
+@pytest.mark.asyncio
+async def test_abort_and_close_end_a_direct_llm_session_and_find_no_other(temp_db, monkeypatch):
+    """Both routes close a session Direct LLM's pool holds. A session a
+    machine runs is in no pool of the platform's: the answer is
+    ``not_found``, nothing is sent to its machine and its record stays (its
+    Stop and its close go through its chat)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from core.layers.direct import session as direct_session
+    from core.remote.remote_execution import RemoteExecutionLayer
+    from core.remote.remote_session_info import RemoteSessionInfo
+    from core.session import session_manager
+    token = f"Bearer {live_session_token(SID, 'pa', user_sub='user-admin')}"
+    routes = ((sessions.abort_session_endpoint, "aborted"), (sessions.close_session_endpoint, "closed"))
+    tools_closed = AsyncMock()
+    monkeypatch.setattr(direct_session.mcp_pool, "close_session", tools_closed)
+    for route, word in routes:
+        monkeypatch.setitem(direct_session._direct_sessions, SID, object())
+        assert await route(SID, authorization=token) == {"status": word, "session_id": SID}
+        assert SID not in direct_session._direct_sessions
+        assert await route(SID, authorization=token) == {"status": "not_found", "session_id": SID}
+    assert [c.args for c in tools_closed.await_args_list] == [(SID,), (SID,)]
+
+    cm = MagicMock()
+    cm.send_command = AsyncMock()
+    cm.send_fire_and_forget = AsyncMock()
+    remote = RemoteExecutionLayer(cm)
+    remote._sessions[SID] = RemoteSessionInfo(
+        session_id=SID, machine_id="m-1", agent_name="pa", execution_path="claude-code-cli",
+        event_queue=asyncio.Queue())
+    monkeypatch.setattr(session_manager, "_remote_layer", remote)
+    for route, _word in routes:
+        assert await route(SID, authorization=token) == {"status": "not_found", "session_id": SID}
+    assert SID in remote._sessions and remote._sessions[SID].alive
+    cm.send_command.assert_not_awaited()
+    cm.send_fire_and_forget.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_token_whose_person_is_gone_is_refused_by_the_session_routes(temp_db):
+    """The routes' own holder judgment, asked as the route asks it (the
+    middleware's list stands in front of the HTTP path)."""
     ghost = live_session_token(SID, "pa", user_sub="user-nobody")
-    r = TestClient(app).get(f"/v1/sessions/{SID}/pending", headers=_bearer(ghost))
-    assert r.status_code == 401
+    with pytest.raises(HTTPException) as ei:
+        await sessions.get_session_pending(SID, authorization=f"Bearer {ghost}")
+    assert ei.value.status_code == 401
     # The same route with a living person's token passes the auth and
     # answers about the session itself.
     alive = live_session_token(SID, "pa", user_sub="user-admin")
-    r = TestClient(app).get(f"/v1/sessions/{SID}/pending", headers=_bearer(alive))
-    assert r.status_code == 404 and r.json()["detail"] == "No pending result"
+    with pytest.raises(HTTPException) as ei:
+        await sessions.get_session_pending(SID, authorization=f"Bearer {alive}")
+    assert ei.value.status_code == 404 and ei.value.detail == "No pending result"
     # A token with no person (an agent-scope run) is not judged here.
     service = live_session_token(SID, "pa")
-    r = TestClient(app).get(f"/v1/sessions/{SID}/pending", headers=_bearer(service))
-    assert r.status_code == 404
+    with pytest.raises(HTTPException) as ei:
+        await sessions.get_session_pending(SID, authorization=f"Bearer {service}")
+    assert ei.value.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -119,133 +180,6 @@ async def test_a_non_ascii_session_id_is_refused_not_an_error(temp_db):
     with pytest.raises(HTTPException) as ei:
         await sessions.verify_session_match_async(f"Bearer {token}", "sessión")
     assert ei.value.status_code == 403
-
-
-def test_the_plan_routes_never_serve_the_service_accounts_own_plans(temp_db, tmp_path,
-                                                                    monkeypatch):
-    """A session with no plans folder of its own (none registered, or not
-    made yet) lists nothing and reads nothing: the proxy account's own
-    ``~/.claude/plans`` belong to no session, and neither does it answer
-    the master key without one."""
-    import config
-    plans = tmp_path / "home" / ".claude" / "plans"
-    plans.mkdir(parents=True)
-    (plans / "operator.md").write_text("private")
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(config, "API_KEY", "master-test-key")
-    client = TestClient(app)
-    token = live_session_token(SID, "pa", user_sub="user-admin")
-    r = client.get(f"/v1/plans?session_id={SID}", headers=_bearer(token))
-    assert r.status_code == 200 and r.json() == {"plans": []}
-    r = client.get(f"/v1/plans/operator.md?session_id={SID}", headers=_bearer(token))
-    assert r.status_code == 404
-    master = "Bearer master-test-key"
-    assert asyncio.run(sessions.list_plans(master, None)) == {"plans": []}
-    with pytest.raises(HTTPException) as ei:
-        asyncio.run(sessions.get_plan_file("operator.md", master, None))
-    assert ei.value.status_code == 404
-
-
-class _NoMachine:
-    """A connection manager the plan routes must never reach."""
-
-    def __getattr__(self, name):
-        raise AssertionError(f"the plan routes asked the machine ({name})")
-
-
-@pytest.mark.asyncio
-async def test_a_remote_session_answers_its_plans_from_the_chat_rows(temp_db, monkeypatch,
-                                                                     loop_db_guard):
-    """A remote session's plans are the ones its chat reviewed (the rows the
-    pump writes at plan review, remote chats included): listed and read from
-    the database in a worker, never asked of the machine and never cached on
-    the proxy's disk."""
-    from types import SimpleNamespace
-
-    import config
-    from core.remote import satellite_connection
-    from storage import database as task_store
-    task_store.create_chat("chat-remote-plans", "user-admin", "pa")
-    task_store.update_chat("chat-remote-plans", session_id=SID)
-    task_store.add_chat_plan("chat-remote-plans", "first.md", "# first\n")
-    task_store.add_chat_plan("chat-remote-plans", "second.md", "# second, édition\n")
-    info = SimpleNamespace(machine_id="m1", agent_name="pa")
-    monkeypatch.setattr(sessions, "_get_remote_session_info",
-                        lambda sid: info if sid == SID else None)
-    monkeypatch.setattr(satellite_connection, "get_connection_manager", _NoMachine)
-    bearer = f"Bearer {live_session_token(SID, 'pa', user_sub='user-admin')}"
-    with loop_db_guard.active():
-        listed = (await sessions.list_plans(bearer, SID))["plans"]
-        read = await sessions.get_plan_file("second.md", bearer, SID)
-        with pytest.raises(HTTPException) as ei:
-            await sessions.get_plan_file("other.md", bearer, SID)
-    assert [p["filename"] for p in listed] == ["second.md", "first.md"]  # newest first
-    assert listed[0]["size"] == len("# second, édition\n".encode())
-    assert all(isinstance(p["modified"], float) and p["modified"] > 0 for p in listed)
-    assert read == {"content": "# second, édition\n", "filename": "second.md"}
-    assert ei.value.status_code == 404
-    assert not (config.SESSIONS_DIR / "remote-plans" / SID).exists()
-    # A remote session whose chat reviewed no plan lists nothing.
-    other = "55555555-5555-5555-5555-555555555555"
-    monkeypatch.setattr(sessions, "_get_remote_session_info", lambda sid: info)
-    other_bearer = f"Bearer {live_session_token(other, 'pa', user_sub='user-admin')}"
-    assert await sessions.list_plans(other_bearer, other) == {"plans": []}
-
-
-def _loop_witness(monkeypatch, root) -> list[tuple[str, bool]]:
-    """Record, for every filesystem call on a path under ``root``, whether it
-    ran on an event loop's thread."""
-    import builtins
-    import io
-    import os
-
-    seen: list[tuple[str, bool]] = []
-
-    def on_loop() -> bool:
-        try:
-            asyncio.get_running_loop()
-            return True
-        except RuntimeError:
-            return False
-
-    for mod, name in ((os, "stat"), (os, "lstat"), (os, "scandir"), (os, "listdir"),
-                      (os, "open"), (io, "open"), (builtins, "open")):
-        real = getattr(mod, name)
-
-        def wrapped(path, *a, _real=real, _name=name, **k):
-            if isinstance(path, (str, os.PathLike)) and str(root) in os.fspath(path):
-                seen.append((_name, on_loop()))
-            return _real(path, *a, **k)
-        monkeypatch.setattr(mod, name, wrapped)
-    return seen
-
-
-def test_the_local_plan_routes_read_off_the_loop_with_a_size_cap(temp_db, tmp_path, monkeypatch):
-    """A local session's plans folder is listed and read in a worker thread,
-    and a plan larger than the cap is refused instead of read whole."""
-    from core.session import session_state
-    claude = tmp_path / ".claude"
-    plans = claude / "plans"
-    plans.mkdir(parents=True)
-    (plans / "a.md").write_text("# a")
-    (plans / "big.md").write_bytes(b"x" * 65)
-    (plans / "notes.txt").write_text("not a plan")
-    (plans / "folder.md").mkdir()
-    monkeypatch.setattr(sessions, "PLAN_MAX_BYTES", 64, raising=False)
-    monkeypatch.setitem(session_state._session_claude_dirs, SID, str(claude))
-    client = TestClient(app)
-    token = live_session_token(SID, "pa", user_sub="user-admin")
-    seen = _loop_witness(monkeypatch, tmp_path)
-    r = client.get(f"/v1/plans?session_id={SID}", headers=_bearer(token))
-    assert r.status_code == 200
-    assert sorted(p["filename"] for p in r.json()["plans"]) == ["a.md", "big.md"]
-    r = client.get(f"/v1/plans/a.md?session_id={SID}", headers=_bearer(token))
-    assert r.status_code == 200 and r.json() == {"content": "# a", "filename": "a.md"}
-    assert seen and not [name for name, on in seen if on], seen
-    r = client.get(f"/v1/plans/big.md?session_id={SID}", headers=_bearer(token))
-    assert r.status_code == 413
-    r = client.get(f"/v1/plans/folder.md?session_id={SID}", headers=_bearer(token))
-    assert r.status_code == 404
 
 
 @pytest.mark.parametrize("path, body", [

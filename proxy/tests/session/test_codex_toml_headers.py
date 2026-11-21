@@ -153,9 +153,19 @@ import tomllib
 from core.layers.codex.layer import CodexCLIExecutionLayer as _Layer
 
 
+def _merged(base: dict, own: dict) -> dict:
+    out = dict(base)
+    for key, value in own.items():
+        out[key] = _merged(out[key], value) if isinstance(value, dict) and isinstance(
+            out.get(key), dict) else value
+    return out
+
+
 def _written_config(tmp_path, **kwargs) -> dict:
-    _Layer._write_config_toml(tmp_path, "prompt", **kwargs)
-    return tomllib.loads((tmp_path / "config.toml").read_text())
+    """What the session runs with: the home's config.toml, the session's own
+    part over it (the profile, or the app-server thread's config map)."""
+    _text, own = _Layer._write_config_toml(tmp_path, "prompt", **kwargs)
+    return _merged(tomllib.loads((tmp_path / "config.toml").read_text()), own)
 
 
 def test_config_toml_root_keys_always_present(tmp_path):
@@ -211,6 +221,15 @@ def test_config_toml_interactive_puts_codex_worktrees_beside_the_config_dir(tmp_
     for kwargs in ({"client_type": "dashboard", "sandbox_codex_dir": "/workspace/.codex"},
                    {"interactive": True}):
         assert "desktop" not in _written_config(tmp_path, **kwargs)
+
+
+def test_a_terminal_never_shows_the_model_picker_at_a_limit(tmp_path):
+    # Near a limit the TUI puts a model picker in place of its composer, and
+    # text the platform types would choose in it. The pool moves accounts by
+    # model itself. A headless session has no picker, so no table.
+    assert _written_config(tmp_path, interactive=True)["notice"]["hide_rate_limit_model_nudge"] is True
+    for kwargs in ({"client_type": "dashboard"}, {"client_type": "task"}):
+        assert "notice" not in _written_config(tmp_path, **kwargs)
 
 
 def test_config_toml_local_endpoint_wire_api_responses(tmp_path):
@@ -290,14 +309,18 @@ def test_config_toml_local_endpoint_env_key_only_when_keyed(tmp_path):
 
 
 def test_config_toml_is_owner_only(tmp_path):
-    # config.toml can carry an inline MCP bearer — must be locked 0600 like
-    # auth.json, not world/group readable.
+    # The session's own files carry its tool sections (an inline MCP bearer)
+    # and config.toml the provider: every one locked 0600 like auth.json,
+    # and the bearer never in the home's shared file.
     _Layer._write_config_toml(
-        tmp_path, "prompt",
+        tmp_path, "prompt", session_id="s-1", interactive=True,
         mcp_toml='[mcp_servers.x.http_headers]\n"Authorization" = "Bearer secret"',
     )
-    mode = (tmp_path / "config.toml").stat().st_mode & 0o777
-    assert mode == 0o600, oct(mode)
+    for name in ("config.toml", "s-1.config.toml", "s-1.session.json"):
+        mode = (tmp_path / name).stat().st_mode & 0o777
+        assert mode == 0o600, (name, oct(mode))
+    assert "secret" not in (tmp_path / "config.toml").read_text()
+    assert "Bearer secret" in (tmp_path / "s-1.config.toml").read_text()
 
 
 def test_agents_md_gets_the_tools_note_only_on_a_local_endpoint(tmp_path):
@@ -306,20 +329,24 @@ def test_agents_md_gets_the_tools_note_only_on_a_local_endpoint(tmp_path):
     # tells the local model the truth for its server, hosted models need
     # nothing. An openai_compatible endpoint gets the server list.
     from core.layers.codex.helpers import LOCAL_PROVIDER_TOOL_NOTE
-    _Layer._write_config_toml(
+    text, _own = _Layer._write_config_toml(
         tmp_path, "You are X.", local_endpoint="http://127.0.0.1:8080/v1",
         local_provider="openai_compatible",
     )
-    text = (tmp_path / "AGENTS.md").read_text()
+    from core.layers.codex.helpers import BOX_NETWORK_NOTE
+    assert not (tmp_path / "AGENTS.md").exists()
     assert text.startswith("You are X.")
-    assert text.endswith(LOCAL_PROVIDER_TOOL_NOTE + "\n")
+    # The provider's note, then the note on the shell's network every Codex
+    # session reads.
+    assert text.endswith(LOCAL_PROVIDER_TOOL_NOTE + "\n\n" + BOX_NETWORK_NOTE + "\n")
     assert text.count("# Tools on this model provider") == 1
     assert "llama.cpp and LM Studio drop it" in text
     assert "tool_search" not in LOCAL_PROVIDER_TOOL_NOTE  # no such function there
 
     hosted = tmp_path / "hosted"
-    _Layer._write_config_toml(hosted, "You are X.")
-    assert (hosted / "AGENTS.md").read_text() == "You are X."
+    hosted.mkdir()
+    text, _own = _Layer._write_config_toml(hosted, "You are X.")
+    assert text == "You are X.\n\n" + BOX_NETWORK_NOTE + "\n"
 
 
 def test_agents_md_note_follows_the_provider(tmp_path):
@@ -331,12 +358,11 @@ def test_agents_md_note_follows_the_provider(tmp_path):
         OLLAMA_PROVIDER_TOOL_NOTE,
         local_provider_note,
     )
-    _Layer._write_config_toml(
+    text, _own = _Layer._write_config_toml(
         tmp_path, "You are X.", local_endpoint="http://127.0.0.1:11434/v1",
         local_provider="ollama",
     )
-    text = (tmp_path / "AGENTS.md").read_text()
-    assert text.endswith(OLLAMA_PROVIDER_TOOL_NOTE + "\n")
+    assert OLLAMA_PROVIDER_TOOL_NOTE + "\n" in text
     assert "older than 0.34" in text
     assert local_provider_note("") == LOCAL_PROVIDER_TOOL_NOTE
     assert local_provider_note("Ollama") == OLLAMA_PROVIDER_TOOL_NOTE

@@ -1,0 +1,71 @@
+{
+ "absent": {
+  "parsed": null
+ },
+ "another tool relocated": {
+  "parsed": {
+   "subdir": "char-mcp",
+   "tools": [
+    "a"
+   ]
+  }
+ },
+ "climbing": {
+  "refused": "char-mcp: invalid result_files block — result_files.subdir '..' must be one plain folder name matching ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$, not a device or platform folder"
+ },
+ "default subdir": {
+  "parsed": {
+   "subdir": "char-mcp",
+   "tools": [
+    "a"
+   ]
+  }
+ },
+ "default subdir of a dotted name": {
+  "parsed": {
+   "subdir": "mcp-files",
+   "tools": [
+    "a"
+   ]
+  }
+ },
+ "device": {
+  "refused": "char-mcp: invalid result_files block — result_files.subdir 'COM1' must be one plain folder name matching ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$, not a device or platform folder"
+ },
+ "glob": {
+  "refused": "char-mcp: invalid result_files block — result_files.tools entry 'a*' is not a tool name (letters, digits, '_', '-', '.'; no glob)"
+ },
+ "named": {
+  "parsed": {
+   "subdir": "maps",
+   "tools": [
+    "a",
+    "b.c"
+   ]
+  }
+ },
+ "no tools": {
+  "refused": "char-mcp: invalid result_files block — result_files.tools must be a non-empty list of tool names"
+ },
+ "not an object": {
+  "refused": "char-mcp: invalid result_files block — result_files must be an object, got list"
+ },
+ "relocated star": {
+  "refused": "char-mcp: invalid result_files block — a tool both outputs and result_files keep"
+ },
+ "relocated tool": {
+  "refused": "char-mcp: invalid result_files block — a tool both outputs and result_files keep"
+ },
+ "reserved": {
+  "refused": "char-mcp: invalid result_files block — result_files.subdir 'Uploads' must be one plain folder name matching ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$, not a device or platform folder"
+ },
+ "too many": {
+  "refused": "char-mcp: invalid result_files block — result_files.tools lists more than 64 tools"
+ },
+ "tool not text": {
+  "refused": "char-mcp: invalid result_files block — result_files.tools entry 3 is not a tool name (letters, digits, '_', '-', '.'; no glob)"
+ },
+ "twice": {
+  "refused": "char-mcp: invalid result_files block — result_files.tools names a tool twice"
+ }
+}

@@ -19,7 +19,9 @@ export default function GeneralTab() {
   const { stateOf, run } = useSaveState()
 
   // The saved settings fill the form when they arrive or change (in render).
-  const [filledFrom, setFilledFrom] = useState(data)
+  // The guard starts empty: settings already loaded when the tab mounts fill
+  // it on the first render, never leaving the form's defaults to be saved.
+  const [filledFrom, setFilledFrom] = useState<typeof data>(undefined)
   if (data && filledFrom !== data) {
     setFilledFrom(data)
     setCompanyName(data.company_name)

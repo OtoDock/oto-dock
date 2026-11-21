@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from adapters.phone import PHONE_CONTEXT, PHONE_OUTBOUND
 from services.phone import phone_config_seed as seed
 from services.phone.phone_config_seed import seed_phone_config
@@ -106,3 +108,20 @@ def test_seed_preserves_admin_edited_values(temp_db):
     assert json.loads(
         task_store.get_platform_setting("phone_thinking_phrases")) == {"en": ["righto"]}
     assert task_store.get_platform_setting("phone_thinking_filler_delay_s") == "1.25"
+
+
+@pytest.mark.parametrize("key", ["vad_context", "voice_vad_context"])
+def test_the_detectors_feed_is_no_setting_and_a_stored_row_is_left_alone(temp_db, key):
+    """The feed of the speech detector is not chosen by a setting, for calls
+    or for voice conversations. The seed writes no row for it on a fresh
+    install. A row an earlier build stored stays as it is: nothing deletes
+    it, and the phone service is sent it with the other rows and reads
+    nothing of it."""
+    from services.phone.phone_config import assemble_phone_config
+
+    seed_phone_config()
+    assert f"phone_{key}" not in task_store.get_all_platform_settings()
+    assert key not in assemble_phone_config(classifier=False)["settings"]
+    task_store.set_platform_setting(f"phone_{key}", "on")
+    seed_phone_config()
+    assert task_store.get_platform_setting(f"phone_{key}") == "on"

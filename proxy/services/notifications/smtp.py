@@ -25,6 +25,21 @@ class SmtpConfig:
     use_tls: bool
 
 
+class _CheckedSMTP(smtplib.SMTP):
+    """smtplib's client, its connection made to a checked address
+    (``pinned_http.admin_host``: the mail server an admin named, on this
+    machine, the LAN or the internet, and a public one only on a hosted
+    install). STARTTLS wraps that socket and names the host as before."""
+
+    def _get_socket(self, host, port, timeout):
+        from services.infra import pinned_http
+        return pinned_http.checked_socket(host, port, pinned_http.admin_host, timeout)
+
+
+def _connect(host: str, port: int) -> smtplib.SMTP:
+    return _CheckedSMTP(host, port, timeout=10)
+
+
 def load_smtp_config() -> SmtpConfig | None:
     """Load SMTP configuration from platform_settings. Returns None if not configured."""
     settings = db.get_all_platform_settings()
@@ -87,10 +102,10 @@ def send_email(to: str, subject: str, html_body: str,
 
     try:
         if cfg.use_tls:
-            server = smtplib.SMTP(cfg.host, cfg.port, timeout=10)
+            server = _connect(cfg.host, cfg.port)
             server.starttls()
         else:
-            server = smtplib.SMTP(cfg.host, cfg.port, timeout=10)
+            server = _connect(cfg.host, cfg.port)
 
         if cfg.user and cfg.password:
             server.login(cfg.user, cfg.password)
@@ -108,10 +123,10 @@ def test_smtp_connection(host: str, port: int, user: str, password: str,
     """Test SMTP connection. Optionally send a test email."""
     try:
         if use_tls:
-            server = smtplib.SMTP(host, port, timeout=10)
+            server = _connect(host, port)
             server.starttls()
         else:
-            server = smtplib.SMTP(host, port, timeout=10)
+            server = _connect(host, port)
 
         if user and password:
             server.login(user, password)

@@ -19,6 +19,7 @@ import pytest
 from core import placement
 from core.sandbox.sandbox import SandboxBuilder, SandboxConfig
 from core.session import session_state
+from tests._compute import serve
 
 AGENT = "judge-agent"
 
@@ -71,6 +72,29 @@ def test_a_judge_sees_what_the_session_sees_and_writes_nothing(tree, role, usern
     assert "/config" not in judge
 
 
+def test_a_judge_runs_from_a_home_of_its_own_and_may_write_there(tree):
+    """A judge gets a home like any session that runs from its scope's folder
+    (``session_home_for``), so on a machine that makes homes no session
+    writes the store's own files. The read-only profile flips the identity's
+    table; the home is bound apart from it and stays writable."""
+    import dataclasses
+
+    from core.sandbox import session_home
+    from core.sandbox.session_config_dir import session_home_for
+    sid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    cfg = _cfg(tree, read_only=True, config_visible=False)
+    store = cfg.host_claude_dir
+    pl = placement.PlacementCapabilities(kind=placement.KIND_COMPUTE, machine_id="c-1",
+                                         session_homes=frozenset({".claude", ".codex"}))
+    ctx = SimpleNamespace(placement=pl, external_home="", wrapup="", open_line=False, read_only=True)
+    home = session_home_for(str(store), sid, execution_path="claude-code-cli", ctx=ctx)
+    assert home == f"{store}/own/{sid}"
+    session_home.prepare(store, sid, ("projects",))
+    desc = SandboxBuilder(dataclasses.replace(cfg, session_home=home)).describe()
+    assert desc.home is not None and desc.home.rw is True
+    assert desc.home.sandbox == f"/users/alice/{store.name}/own/{sid}"
+
+
 def test_a_judge_never_mounts_config_whatever_the_role(tree):
     # A manager's ordinary session mounts /config RW; the judge's build passes
     # config_visible=False and gets none of it.
@@ -78,14 +102,17 @@ def test_a_judge_never_mounts_config_whatever_the_role(tree):
     assert "/config" not in _rw(_cfg(tree, "manager", "alice", config_visible=False, read_only=True))
 
 
-def test_the_direct_layer_refuses_writes_through_the_same_table(tree):
+def test_the_direct_layer_refuses_writes_through_the_same_table(tree, monkeypatch):
+    import config
     from core.layers.direct import files as df
+    monkeypatch.setattr(config, "AGENTS_DIR", tree[0])
     cfg = _cfg(tree, "manager", "alice", config_visible=False, read_only=True)
     mounts = df.mount_table(cfg)
+    cwd = df.session_cwd(cfg)
     with pytest.raises(df.FileToolError) as e:
-        df.resolve(mounts, "/users/alice/workspace/a.md", cwd=df.session_cwd(cfg), writing=True)
+        df.locate(mounts, "/users/alice/workspace/a.md", cwd=cwd, writing=True)
     assert "read-only" in str(e.value)
-    assert df.resolve(mounts, "/users/alice/workspace/a.md", cwd=df.session_cwd(cfg), writing=False)
+    assert df.locate(mounts, "/users/alice/workspace/a.md", cwd=cwd)[0] == "/users/alice/workspace/a.md"
 
 
 # ── the gate ────────────────────────────────────────────────────────────────
@@ -139,23 +166,18 @@ def test_the_direct_gate_agrees():
     assert b.decide(b.TIER_EDIT, "judge") == "deny"
     assert b.decide(b.TIER_DESTRUCTIVE, "judge") == "deny"
     assert b.decide(b.TIER_EDIT, "plan") == "deny"
-    assert b.decide(b.TIER_EDIT, "acceptEdits") == "allow"
+    assert b.decide(b.TIER_EDIT, "autoReview") == "allow"
 
 
-def test_codex_gets_read_only_without_plan():
+def test_a_judges_codex_sandbox_is_read_only():
+    """On a machine paired with full access too. The machine runs a judge in
+    the default collaboration mode, never plan, by the mode it is shipped
+    (``satellite/tests/test_codex_session.py``,
+    ``test_plan_follows_the_live_sandbox_unless_a_judge``)."""
     from core.layers.codex.helpers import permission_to_sandbox
-    from core.layers.codex.session import CodexAppServerSession
     assert permission_to_sandbox("judge") == "read-only"
     assert permission_to_sandbox("plan") == "read-only"
     assert permission_to_sandbox("judge", allow_full_fs=True) == "read-only"
-    judge = CodexAppServerSession(session_id="s", agent_name="a", model="m", sandbox_mode="read-only",
-                                  working_dir="", config_dir="", permission_mode="judge")
-    plan = CodexAppServerSession(session_id="s2", agent_name="a", model="m", sandbox_mode="read-only",
-                                 working_dir="", config_dir="", permission_mode="plan")
-    assert judge._collaboration_mode()["mode"] == "default"
-    assert plan._collaboration_mode()["mode"] == "plan"
-    judge.set_mode("plan", "read-only")
-    assert judge._collaboration_mode()["mode"] == "plan"
 
 
 def test_a_judge_leaves_the_scopes_settings_as_every_session_has_them(tmp_path, monkeypatch):
@@ -197,6 +219,12 @@ def _stub_builder(monkeypatch, captured: dict, *, target=("local", None)):
     monkeypatch.setattr(cli_cd, "ensure_persistent_claude_dir", _claude_dir)
     monkeypatch.setattr(tcb, "resolve_task_identity", lambda *a, **k: tcb.TaskIdentity(
         username="alice", role="manager", scope="user", creds_user_sub="alice-sub"))
+    # The judged turn's person: a contributor who holds the agent (a judge is
+    # paid like the turn it judges, ``core/config/spender.py``).
+    from auth import roles
+    from storage import database as task_store
+    task_store.upsert_user("alice-sub", "alice@judge.test", "Alice", "member")
+    task_store.add_user_agent("alice-sub", AGENT, roles.CONTRIBUTOR, "alice-sub")
     monkeypatch.setattr(tcb.agent_store, "get_delegation_targets", lambda *a, **k: [])
     monkeypatch.setattr(tcb.agent_store, "is_admin_only", lambda *a, **k: False)
     monkeypatch.setattr(tcb.agent_store, "get_agent", lambda *a, **k: {
@@ -206,9 +234,16 @@ def _stub_builder(monkeypatch, captured: dict, *, target=("local", None)):
         return fn(*a, **k)
     monkeypatch.setattr(tcb.asyncio, "to_thread", _to_thread)
     monkeypatch.setattr(tcb.remote_status, "resolve_execution_target", lambda *a, **k: target)
-    monkeypatch.setattr(tcb.remote_store, "placement_of",
-                        lambda value, *a, **k: placement.LOCAL_PLACEMENT if placement.is_local(value)
-                        else placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, label="laptop", has_display=False))
+    # A compute machine serves the platform's place: a run resolved there is
+    # built on it (the platform runs no session itself).
+    serve(monkeypatch)
+
+    def _placement_of(value, *a, compute=None, **k):
+        if compute:
+            return placement.from_machine(placement.KIND_COMPUTE, compute)
+        return (placement.LOCAL_PLACEMENT if placement.is_local(value)
+                else placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, label="laptop", has_display=False))
+    monkeypatch.setattr(tcb.remote_store, "placement_of", _placement_of)
     monkeypatch.setattr(tcb.remote_store, "get_target_browser_settings", lambda *a, **k: None)
 
     def _build_mcp(*a, **k):
@@ -232,9 +267,15 @@ def _stub_builder(monkeypatch, captured: dict, *, target=("local", None)):
                         lambda *a, **k: ("sub-test", {}))
     monkeypatch.setattr(oe, "build_oto_env", lambda **k: {})
     monkeypatch.setattr(oe, "OTO_MULTI_VALUE_ENVS", {}, raising=False)
-    from core.remote import satellite_connection as sc
+    from core.remote import satellite_connection as sc, satellite_link
     monkeypatch.setattr(sc, "get_connection_manager",
-                        lambda: SimpleNamespace(satellite_supports_pty=lambda *_: True))
+                        lambda: SimpleNamespace(satellite_supports_pty=lambda *_: True,
+                                                compute_machine_ids=frozenset,
+                                                is_compute=lambda _mid: False,
+                                                exit_state=lambda _mid: (0, False),
+                                                exit_report=lambda _mid: {},
+                                                is_connected=lambda _mid: True,
+                                                links=satellite_link.MachineLinks(None)))
 
 
 def _task(**over):
@@ -330,15 +371,10 @@ def test_a_judges_machine_the_guard_refuses_runs_on_the_resolvers_answer(monkeyp
 # ── the remote payload ─────────────────────────────────────────────────────
 
 
-def _remote_layer(supports_checks: bool):
+def _remote_layer():
     from core.remote.remote_execution import RemoteExecutionLayer
     lay = RemoteExecutionLayer(MagicMock())
-    lay._cm.satellite_supports_local_model_provider.return_value = True
-    lay._cm.satellite_supports_local_model_catalog.return_value = True
-    lay._cm.satellite_supports_codex_hooks_floor.return_value = True
-    lay._cm.satellite_supports_checks.return_value = supports_checks
-    lay._cm.satellite_version.return_value = "0.5.123" if supports_checks else "0.5.122"
-    lay._cm.satellite_name.return_value = "drill-sat"
+    lay._cm.satellite_version.return_value = "0.5.171"
     return lay
 
 
@@ -354,15 +390,13 @@ def _remote_config(**over):
 
 
 @pytest.mark.asyncio
-async def test_a_judge_on_a_machine_ships_the_sandbox_by_version():
+async def test_a_judge_on_a_machine_ships_the_read_only_sandbox():
     machine = {"capabilities": json.dumps({"local_tunnel_port": 18400, "os": "linux"}),
                "pairing_scope": "admin"}
     with patch("storage.remote_store.get_remote_machine", return_value=machine):
-        new = (await _remote_layer(True)._build_start_payload("s1", _remote_config(), "codex-cli")).payload
-        old = (await _remote_layer(False)._build_start_payload("s2", _remote_config(), "codex-cli")).payload
-        claude = (await _remote_layer(True)._build_start_payload("s3", _remote_config(), "claude-code-cli")).payload
-    assert new["sandbox_mode"] == "read-only" and new["permission_mode"] == "judge"
-    assert old["sandbox_mode"] == "workspace-write"          # the gate alone below 0.5.123
+        codex = (await _remote_layer()._build_start_payload("s1", _remote_config(), "codex-cli")).payload
+        claude = (await _remote_layer()._build_start_payload("s3", _remote_config(), "claude-code-cli")).payload
+    assert codex["sandbox_mode"] == "read-only" and codex["permission_mode"] == "judge"
     # The satellite writes this list into the scope's shared settings.json:
     # the judge's write tools stay off it (the gate over the tunnel refuses them).
     assert not {"Write", "Edit", "MultiEdit", "NotebookEdit"} & set(claude["disallowed_tools"])
@@ -540,6 +574,151 @@ def test_a_missing_verdict_is_asked_for_once_then_an_error(judged, monkeypatch):
     assert v2.status == "error" and "no verdict" in v2.reason and len(seen2) == 2
 
 
+_PASS = "```json\n{\"pass\": true, \"summary\": \"fine\"}\n```"
+
+
+def _closes(monkeypatch) -> list:
+    """The one closer replaced by a record of what it was asked to close."""
+    from core.session import chat_rebuild
+    closes: list = []
+
+    async def close(chat, *, reason, require_idle, lock, fallback_layer=None):
+        closes.append((chat.get("id"), chat.get("session_id"), reason, require_idle, lock))
+        return True
+    monkeypatch.setattr(chat_rebuild, "close_chat_session", close)
+    return closes
+
+
+def _judge(check, judged):
+    """The judge section, then the close it started beside its verdict."""
+    from core import background
+    from services.checks.kinds import judge_kind
+
+    async def go():
+        v = await judge_kind.run(check, judged, _changed(judged), round_no=1)
+        await asyncio.gather(*background.running("checks"))
+        return v
+    return asyncio.run(go())
+
+
+def test_a_judges_session_closes_with_its_verdict(judged, monkeypatch):
+    # Nothing continues a judge's run: its session closes once the verdict
+    # is read, through the one closer, which keeps the judge's chat. The
+    # judged session, which gets the findings, is never the one closed.
+    closes = _closes(monkeypatch)
+    seen = _fake_scheduler(monkeypatch, [
+        "```json\n{\"pass\": false, \"findings\": [{\"location\": \"a.py:3\", \"severity\": \"error\", "
+        "\"text\": \"off by one\"}], \"summary\": \"one bug\"}\n```"])
+    v = _judge(_check(), judged)
+    assert v.status == "fail" and v.findings[0]["location"] == "a.py:3"
+    assert closes == [(f"task-{seen[0]._run_id}", "sess-judge-1", "judged", True, True)]
+    assert judged.session_id not in {c[1] for c in closes}
+
+
+def test_a_judge_asked_again_closes_after_its_second_answer(judged, monkeypatch):
+    # The re-prompt continues the judge's open session: nothing is closed
+    # before it, and the one close comes after the second answer, also when
+    # that answer still carries no verdict.
+    from core import background
+    from services.scheduler import scheduler
+    for answers, status in ((["no json here", _PASS], "pass"), (["nothing", "still nothing"], "error")):
+        closes = _closes(monkeypatch)
+        seen = _fake_scheduler(monkeypatch, answers)
+        inner = scheduler.trigger_task_now
+
+        async def trigger(task, inner=inner, closes=closes, **kw):
+            assert not closes and not background.running("checks"), "closed before the re-prompt"
+            return await inner(task, **kw)
+        monkeypatch.setattr(scheduler, "trigger_task_now", trigger)
+        v = _judge(_check(), judged)
+        assert v.status == status and len(seen) == 2
+        assert seen[1].continue_session == "sess-judge-1"
+        assert closes == [(f"task-{seen[0]._run_id}", "sess-judge-1", "judged", True, True)]
+
+
+def test_a_reprompt_that_started_a_fresh_session_closes_that_one(judged, monkeypatch):
+    # A continue whose conversation could not be resumed runs in a fresh
+    # session of the same chat (TaskRun, "no resumable conversation"): the
+    # session left warm is that one.
+    from services.scheduler import scheduler
+    from storage import database as task_store
+    closes = _closes(monkeypatch)
+    seen = _fake_scheduler(monkeypatch, ["no json here", _PASS])
+    inner = scheduler.trigger_task_now
+
+    async def trigger(task, **kw):
+        run_id = await inner(task, **kw)
+        if task.continue_session:
+            task_store.update_run(run_id, session_id="sess-judge-2")
+        return run_id
+    monkeypatch.setattr(scheduler, "trigger_task_now", trigger)
+    v = _judge(_check(), judged)
+    assert v.status == "pass" and len(seen) == 2
+    assert closes == [(f"task-{seen[0]._run_id}", "sess-judge-2", "judged", True, True)]
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+def test_a_judge_run_that_did_not_complete_is_closed_by_its_run(judged, monkeypatch, status):
+    # A failed or cancelled run's session is closed by the run itself
+    # (TaskRun.failed, TaskRun.cancelled): the judge asks no second close.
+    from services.checks.kinds import judge_kind
+    closes = _closes(monkeypatch)
+
+    async def one_run(task, *, timeout, cancelled, trigger_source):
+        return {"id": "run-x", "status": status, "chat_id": "task-run-x", "session_id": "sess-x"}
+    monkeypatch.setattr(judge_kind, "_one_run", one_run)
+    v = _judge(_check(), judged)
+    assert v.status == "error" and closes == []
+
+
+def test_a_slow_close_never_holds_the_verdict(judged, monkeypatch):
+    # The close runs beside the verdict, tracked as a background task: the
+    # evaluator stores the verdict without waiting for it, and a planned stop
+    # gives it its grace (core.background.cancel_all).
+    from core import background
+    from core.session import chat_rebuild
+    from services.checks.kinds import judge_kind
+    _fake_scheduler(monkeypatch, [_PASS])
+    started: list = []
+
+    async def close(chat, **kw):
+        started.append(chat["session_id"])
+        await asyncio.Event().wait()
+    monkeypatch.setattr(chat_rebuild, "close_chat_session", close)
+
+    async def go():
+        v = await asyncio.wait_for(judge_kind.run(_check(), judged, _changed(judged), round_no=1), 5)
+        pending = background.running("checks")
+        await asyncio.sleep(0)
+        for t in pending:
+            t.cancel()
+        return v, len(pending)
+    v, pending = asyncio.run(go())
+    assert v.status == "pass" and pending == 1 and started == ["sess-judge-1"]
+
+
+def test_a_turn_open_on_the_judges_chat_keeps_its_session_for_the_reaper(judged, monkeypatch):
+    # A person who opened the judge's chat and spoke in it: the closer
+    # refuses (ChatBusy), the refusal is no failure, the idle reaper takes
+    # the session later as before.
+    from core import background
+    from core.session import chat_rebuild
+    from services.checks.kinds import judge_kind
+    _fake_scheduler(monkeypatch, [_PASS])
+
+    async def close(chat, **kw):
+        raise chat_rebuild.ChatBusy(chat["id"])
+    monkeypatch.setattr(chat_rebuild, "close_chat_session", close)
+
+    async def go():
+        v = await judge_kind.run(_check(), judged, _changed(judged), round_no=1)
+        tasks = background.running("checks")
+        await asyncio.gather(*tasks)
+        return v, tasks
+    v, tasks = asyncio.run(go())
+    assert v.status == "pass" and len(tasks) == 1 and tasks[0].exception() is None
+
+
 def test_the_threshold_and_the_cap_and_the_platform_placement(judged, monkeypatch):
     from services.checks.kinds import judge_kind
     from storage.checks import db_checks
@@ -566,7 +745,6 @@ def test_a_cut_evaluation_stops_the_judge_run(judged, monkeypatch):
     # re-prompt, the sync pause); when it cuts anyway, the run is cancelled
     # rather than left spending for a verdict nobody reads.
     from services.checks import evaluator
-    from services.checks.kinds import judge_kind
     from services.scheduler import scheduler
     from storage import database as task_store
     check = _check(timeout=600)
@@ -576,11 +754,14 @@ def test_a_cut_evaluation_stops_the_judge_run(judged, monkeypatch):
     cancelled: list = []
     monkeypatch.setattr(scheduler, "platform_cancel_run", lambda rid, reason: cancelled.append(rid))
 
+    from services.scheduler import run_wait
+
     async def cut():
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(judge_kind.wait_run("run-hung", timeout=60, cancelled=lambda: False), 0.3)
+            await asyncio.wait_for(run_wait.wait_run(
+                "run-hung", timeout=60, cancelled=lambda: False, what="the check's judge"), 0.3)
     asyncio.run(cut())
-    assert cancelled == ["run-hung"] and "run-hung" not in judge_kind._run_futures
+    assert cancelled == ["run-hung"] and "run-hung" not in run_wait._run_futures
 
 
 @pytest.mark.parametrize("command,reads", [
@@ -638,3 +819,31 @@ def test_a_cut_evaluation_stops_the_judge_run(judged, monkeypatch):
 def test_a_judge_reads_git_only_in_its_reading_forms(command, reads):
     from auth.git_reads import read_only_git
     assert read_only_git(command) is reads
+
+
+def test_an_input_is_read_as_it_was_authorized(judged, tmp_path, monkeypatch):
+    """The answer authorized is the answer opened: an input swapped for a
+    link after its check is not read, and its target never reaches the
+    judge's prompt."""
+    from auth import path_policy
+    from auth.path_policy import SecurityContext
+    from services.checks.kinds import judge_kind
+    agent_dir = tmp_path / "agents" / AGENT
+    notes = agent_dir / "users/alice/workspace/notes.md"
+    notes.parent.mkdir(parents=True, exist_ok=True)
+    notes.write_text("ALICE-NOTES")
+    secret = agent_dir / "config/secret.md"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("CONFIG-SECRET")
+    real_check = path_policy.check_host_path_access
+
+    def check_then_swap(path, security, **kw):
+        answer = real_check(path, security, **kw)
+        if path.name == "notes.md" and not notes.is_symlink():
+            notes.unlink()
+            notes.symlink_to(secret)
+        return answer
+    monkeypatch.setattr(path_policy, "check_host_path_access", check_then_swap)
+    editor = SecurityContext(role="editor", username="alice", agent=AGENT, is_admin_agent=False)
+    got = dict(judge_kind._read_inputs(AGENT, editor, ["users/alice/workspace/notes.md"]))
+    assert "CONFIG-SECRET" not in got["users/alice/workspace/notes.md"]

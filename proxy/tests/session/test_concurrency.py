@@ -21,12 +21,14 @@ regardless of the host the suite runs on.
 import asyncio
 import json
 import time
+import types
 
 import pytest
 import pytest_asyncio
 
 import config
 import core.concurrency as C
+from core import concurrency_scan
 from tests._timing import bound
 
 
@@ -42,6 +44,8 @@ async def env(monkeypatch):
     C._session_added_at.clear()
     C._session_owner.clear()
     C._line.clear()
+    concurrency_scan._grow_debits.clear()
+    concurrency_scan._session_grown.clear()
     C._reserved_mb = 0
     C._parked_tasks = 0
     C._live_cache = None
@@ -56,6 +60,7 @@ async def env(monkeypatch):
     C._session_est.clear()
     C._session_added_at.clear()
     C._session_owner.clear()
+    concurrency_scan._grow_debits.clear()
     C._reserved_mb = 0
     C._parked_tasks = 0
 
@@ -87,7 +92,7 @@ async def test_gate2_veto_denies_without_eviction(env, monkeypatch):
 
     async def spy(*a, **k):
         called["n"] += 1
-        return C._Scan(None, 0, 0)
+        return concurrency_scan._Scan(None, 0, 0)
     monkeypatch.setattr(C, "_oldest_evictable_local", spy)
 
     # Budget has room (GATE 1 fine) and tracked sessions can't account for the
@@ -137,8 +142,8 @@ async def test_gate2_session_pressure_evicts_by_accounting(env, monkeypatch):
     async def fake_oldest(min_idle, **_kw):
         for sid in ("s0", "s1", "s2"):
             if sid in C._sessions:
-                return C._Scan((sid, "cli", False), 0, 0)
-        return C._Scan(None, 0, 0)
+                return concurrency_scan._Scan((sid, "cli", False), 0, 0)
+        return concurrency_scan._Scan(None, 0, 0)
 
     async def fake_evict(sid, source, is_pw=False):
         async with C._cond:
@@ -241,9 +246,12 @@ async def test_direct_estimate_counts_stdio_mcps(tmp_path):
     assert await C.acquire("d4", "chat", execution_path="direct-llm",
                            mcp_config_path=str(tmp_path / "missing.json"))
     assert C._session_est["d3"] == C._session_est["d4"] == 200
-    # A subprocess engine is HEAVY whatever its config holds.
+    # A subprocess engine with its config: its base and a program per tool
+    # that starts with it (300 + 8 × 65), never above HEAVY; no config, HEAVY.
     assert await C.acquire("c", "chat", execution_path="claude-code-cli", mcp_config_path=str(cfg))
-    assert C._session_est["c"] == 1000
+    assert C._session_est["c"] == 820
+    assert await C.acquire("c2", "chat", execution_path="claude-code-cli")
+    assert C._session_est["c2"] == 1000
     # Meetings count the same way.
     assert await C.acquire_meeting_slots(["m"], targets={"m": "local"},
                                          exec_paths={"m": "direct-llm"}, mcp_paths={"m": str(cfg)})
@@ -404,7 +412,7 @@ async def test_eviction_on_gate1_full(env, monkeypatch):
         await C.acquire(f"s{i}", "chat")     # budget full (reserved 5000)
 
     async def fake_oldest(min_idle, **_kw):
-        return C._Scan(("s0", "cli", False) if "s0" in C._sessions else None, 0, 0)
+        return concurrency_scan._Scan(("s0", "cli", False) if "s0" in C._sessions else None, 0, 0)
 
     async def fake_evict(sid, source, is_pw=False):
         async with C._cond:
@@ -433,7 +441,7 @@ async def test_eviction_denies_when_no_candidate(monkeypatch):
 
 
 async def _async_none():
-    return C._Scan(None, 0, 0)
+    return concurrency_scan._Scan(None, 0, 0)
 
 
 @pytest.mark.asyncio
@@ -475,7 +483,7 @@ async def test_per_user_cap_refuses_then_admits_after_release(monkeypatch):
 
     async def spy(min_idle, **kw):
         scans.append(kw)
-        return C._Scan(None, 0, 0)
+        return concurrency_scan._Scan(None, 0, 0)
     monkeypatch.setattr(C, "_oldest_evictable_local", spy)
     assert await C.acquire("a", "chat", user_sub="u1")
     assert await C.acquire("b", "chat", user_sub="u1")
@@ -507,8 +515,8 @@ async def test_two_admits_of_one_person_at_the_cap_admit_one(monkeypatch):
         for sid in others:
             if sid in C._sessions:
                 others.remove(sid)
-                return C._Scan((sid, "cli", False), 0, 0)
-        return C._Scan(None, 0, 0)
+                return concurrency_scan._Scan((sid, "cli", False), 0, 0)
+        return concurrency_scan._Scan(None, 0, 0)
 
     async def fake_evict(sid, source, is_pw=False):
         async with C._cond:
@@ -580,7 +588,7 @@ async def test_queued_head_retries_on_its_slice(monkeypatch):
 
     async def ages_in(*a, **k):
         calls["n"] += 1
-        return C._Scan(("s0", "cli", False) if calls["n"] >= 3 and "s0" in C._sessions
+        return concurrency_scan._Scan(("s0", "cli", False) if calls["n"] >= 3 and "s0" in C._sessions
                        else None, 0, 0)
 
     async def fake_evict(sid, source, is_pw=False):
@@ -645,6 +653,11 @@ async def test_queued_waiter_cancelled_leaves_no_ticket_and_no_slot(monkeypatch)
 @pytest.mark.asyncio
 async def test_prewarm_allowed_needs_room_for_two_and_the_person_below_the_cap(
         env, monkeypatch):
+    # A pre-warm starts on the compute machine that serves, here one beside
+    # the platform whose box is the host's own: the host's gates are read.
+    from core.session import session_manager
+    monkeypatch.setattr(session_manager, "compute_placement_for",
+                        lambda *_a, **_k: types.SimpleNamespace(machine_id=""))
     for i in range(3):
         assert await C.acquire(f"s{i}", "chat")
     assert C.prewarm_allowed()                       # 3 of 5 HEAVY: room for two
@@ -673,7 +686,7 @@ async def test_speculative_admit_never_evicts_and_denies_quietly(monkeypatch):
 
     async def spy(*a, **k):
         scans.append(k)
-        return C._Scan(None, 0, 0)
+        return concurrency_scan._Scan(None, 0, 0)
     monkeypatch.setattr(C, "_oldest_evictable_local", spy)
     for i in range(4):
         assert await C.acquire(f"s{i}", "chat")
@@ -715,7 +728,7 @@ async def test_eviction_path_ram_veto_reports_host_memory(env, monkeypatch):
     env["mb"] = 500
 
     async def fake_oldest(min_idle, **_kw):
-        return C._Scan(("s0", "cli", False) if "s0" in C._sessions else None, 0, 0)
+        return concurrency_scan._Scan(("s0", "cli", False) if "s0" in C._sessions else None, 0, 0)
 
     async def fake_evict(sid, source, is_pw=False):
         async with C._cond:
@@ -745,7 +758,7 @@ async def test_stats_shape_and_breakdown():
     await C.acquire("p1", "phone")
     await C.acquire("k1", "task", blocking=True)
     st = C.get_stats()
-    assert set(st) == {"sessions", "tasks", "by_surface", "satellites"}
+    assert set(st) == {"sessions", "tasks", "by_surface", "satellites", "compute"}
     assert set(st["sessions"]) == {
         "active", "reserved_mb", "budget_mb", "available_mb", "total_mb",
         "fit_heavy", "fit_light",
@@ -806,9 +819,10 @@ class TestSwapCredit:
         assert self._credit(monkeypatch, 4096, 0) == 0
 
 
-class TestStdioMcpCount:
-    """The Direct-LLM estimate counts the stdio servers of a generated MCP
-    config; which transport is stdio is the manifest module's answer."""
+class TestStdioCounts:
+    """The estimate counts the stdio servers of a generated MCP config, late
+    (a stand-in) or with the session; which transport is stdio is the
+    manifest module's answer."""
 
     def test_counts_stdio_servers_by_the_transport_authority(self, tmp_path):
         from services.mcp.mcp_manifest_types import is_stdio_transport
@@ -817,9 +831,139 @@ class TestStdioMcpCount:
         cfg = tmp_path / "mcp-config.json"
         cfg.write_text(json.dumps({"mcpServers": {
             "a": {"command": "x"},
-            "b": {"type": "stdio", "command": "y"},
+            "b": {"type": "stdio", "command": "y", "env": {"OTO_TOOL_STANDIN": "{}"}},
             "c": {"type": "http", "url": "http://h"},
             "d": "not a server",
         }}), encoding="utf-8")
-        assert C._stdio_mcp_count(str(cfg)) == 2
-        assert C._stdio_mcp_count(str(tmp_path / "missing.json")) == 0
+        assert concurrency_scan._stdio_counts(str(cfg)) == (1, 1)
+        assert concurrency_scan._stdio_counts(str(tmp_path / "missing.json")) is None
+
+    def test_a_codex_build_is_read_from_its_servers_beside_the_toml(self, tmp_path):
+        toml = tmp_path / "agent-x-mcp.toml"
+        toml.write_text("[mcp_servers.a]\ncommand = 'x'\n")
+        (tmp_path / "agent-x-mcp.servers.json").write_text(json.dumps({
+            "a": {"command": "x", "env": {"OTO_TOOL_STANDIN": "{}"}},
+            "b": {"command": "y"},
+        }))
+        assert concurrency_scan._stdio_counts(str(toml)) == (1, 1)
+
+    def test_a_calls_warm_tool_counts_as_its_stand_in_and_its_program(self, tmp_path):
+        """A call's tool starts with its session behind a stand-in: the call
+        is admitted at that size, and its start is never grown again."""
+        cfg = tmp_path / "mcp-config.json"
+        cfg.write_text(json.dumps({"mcpServers": {
+            "a": {"command": "x", "env": {"OTO_TOOL_STANDIN": '{"warm":true}'}},
+            "b": {"command": "y", "env": {"OTO_TOOL_STANDIN": '{"warm":false}'}},
+            "c": {"command": "z", "env": {"OTO_TOOL_STANDIN": "not json"}},
+        }}), encoding="utf-8")
+        assert concurrency_scan._stdio_counts(str(cfg)) == (3, 1)
+        est = concurrency_scan._estimate_mb("claude-code-cli", (3, 1))
+        assert est == min(config.SESSION_EST_HEAVY_MB, concurrency_scan._ENGINE_BASE_MB
+                          + 3 * concurrency_scan._STANDIN_MB + concurrency_scan._STDIO_MCP_MB)
+
+
+# --- a tool's program started later grows its session ----------------------
+
+def _late_config(tmp_path, late: int, with_chat: int = 0) -> str:
+    servers = {f"l{i}": {"command": "x", "env": {"OTO_TOOL_STANDIN": "{}"}} for i in range(late)}
+    servers.update({f"w{i}": {"command": "x"} for i in range(with_chat)})
+    cfg = tmp_path / "late.json"
+    cfg.write_text(json.dumps({"mcpServers": servers}))
+    return str(cfg)
+
+
+@pytest.mark.asyncio
+async def test_a_cli_session_reserves_its_engine_and_stand_ins_then_grows_per_start(tmp_path):
+    cfg = _late_config(tmp_path, late=10, with_chat=1)
+    assert await C.acquire("s", "chat", execution_path="claude-code-cli", mcp_config_path=cfg)
+    assert C._session_est["s"] == 300 + 10 * 10 + 65
+    assert await C.grow("s", judged=True)
+    assert C._session_est["s"] == 300 + 10 * 10 + 2 * 65
+    assert C._reserved_mb == C._session_est["s"]
+    # Never past HEAVY in all.
+    for _ in range(20):
+        assert await C.grow("s", judged=True)
+    assert C._session_est["s"] == 1000 and C._reserved_mb == 1000
+
+
+@pytest.mark.asyncio
+async def test_a_late_start_is_refused_on_a_full_box_with_a_sentence(tmp_path, env):
+    cfg = _late_config(tmp_path, late=10)
+    assert await C.acquire("s", "chat", execution_path="claude-code-cli", mcp_config_path=cfg)
+    C._budget_mb = C._reserved_mb + 10  # the budget has 10 MB left
+    refused = await C.grow("s", judged=True)
+    assert not refused and refused.reason == "tool_memory"
+    assert refused.user_message == ("There is not enough free memory to start this tool right now. "
+                                    "Try again in a few minutes.")
+    assert C._session_est["s"] == 400
+    # The live read refuses it too.
+    C._budget_mb = 100_000
+    env["mb"] = C._floor_mb + 10
+    C._live_cache = None
+    assert not await C.grow("s", judged=True)
+    # A program that starts with its session is counted whatever the room.
+    assert await C.grow("s", judged=False)
+    assert C._session_est["s"] == 465
+
+
+@pytest.mark.asyncio
+async def test_a_late_start_is_never_refused_by_the_session_count(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "OTODOCK_MAX_LOCAL_SESSIONS", 1)
+    cfg = _late_config(tmp_path, late=3)
+    assert await C.acquire("s", "chat", execution_path="claude-code-cli", mcp_config_path=cfg)
+    assert await C.grow("s", judged=True)
+    assert C._session_est["s"] == 330 + 65
+
+
+@pytest.mark.asyncio
+async def test_an_untracked_or_full_size_session_grows_by_nothing(tmp_path, monkeypatch):
+    assert await C.grow("never-admitted", judged=True)
+    assert "never-admitted" not in C._session_est
+    assert await C.acquire("h", "chat", execution_path="claude-code-cli")  # HEAVY, no config
+    C._budget_mb = C._reserved_mb  # no room at all
+    assert await C.grow("h", judged=True)  # nothing to add, nothing judged
+    assert C._session_est["h"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_gives_its_program_back_and_never_more(tmp_path):
+    cfg = _late_config(tmp_path, late=3)
+    assert await C.acquire("s", "chat", execution_path="claude-code-cli", mcp_config_path=cfg)
+    base = C._session_est["s"]
+    assert await C.grow("s", judged=True)
+    await C.shrink("s")
+    assert C._session_est["s"] == base and C._reserved_mb == base
+    await C.shrink("s")  # nothing more was grown
+    assert C._session_est["s"] == base and C._reserved_mb == base
+    await C.shrink("never-admitted")
+    C.release("s")
+    assert C._reserved_mb == 0 and "s" not in concurrency_scan._session_grown
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_at_the_cap_gives_back_only_what_its_tool_added(tmp_path):
+    """Near HEAVY a start adds less than a program, or nothing: its failure
+    gives back what that tool's start added, never another running tool's
+    share."""
+    cfg = _late_config(tmp_path, late=3)
+    assert await C.acquire("s", "chat", execution_path="claude-code-cli", mcp_config_path=cfg)
+    C._session_est["s"] = C._reserved_mb = config.SESSION_EST_HEAVY_MB - C._STDIO_MCP_MB
+    assert await C.grow("s", judged=False, server="a")  # the last program that fits
+    assert C._session_est["s"] == config.SESSION_EST_HEAVY_MB
+    assert await C.grow("s", judged=False, server="b")  # at the cap: adds nothing
+    await C.shrink("s", "b")
+    assert C._session_est["s"] == config.SESSION_EST_HEAVY_MB == C._reserved_mb
+    await C.shrink("s", "a")
+    assert C._session_est["s"] == config.SESSION_EST_HEAVY_MB - C._STDIO_MCP_MB == C._reserved_mb
+    C.release("s")
+    assert C._reserved_mb == 0 and "s" not in concurrency_scan._session_grown
+
+
+@pytest.mark.asyncio
+async def test_a_grow_is_debited_while_it_materializes(tmp_path):
+    cfg = _late_config(tmp_path, late=3)
+    assert await C.acquire("s", "chat", execution_path="claude-code-cli", mcp_config_path=cfg)
+    C._session_added_at["s"] -= 600  # its admission's debit is over
+    before = concurrency_scan._growin_debit_mb()
+    assert await C.grow("s", judged=True)
+    assert concurrency_scan._growin_debit_mb() - before >= 60

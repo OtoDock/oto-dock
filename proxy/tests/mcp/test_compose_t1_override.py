@@ -88,6 +88,9 @@ def test_override_generated_on_t1(tmp_path, t1):
     assert svc["container_name"] == "otodock-testid-mcp-camoufox"
     assert svc["image"] == "ghcr.io/otodock/camoufox:0.0.68"
     assert data["networks"]["default"]["ipam"]["config"][0]["subnet"] == "10.201.0.0/24"
+    # A container the platform put to sleep stays stopped across a restart
+    # of Docker; one that ends on its own comes back.
+    assert svc["restart"] == "unless-stopped"
 
 
 def test_override_idempotent_and_subnet_stable(tmp_path, t1):
@@ -164,6 +167,21 @@ def test_override_respects_base_declared_limits(tmp_path, t1, monkeypatch):
     assert "mem_limit" not in svc
     assert "memswap_limit" not in svc
     assert "logging" not in svc
+
+
+def test_override_gives_every_service_the_tools_oom_score(tmp_path, t1, monkeypatch):
+    """Compose merges per key: the override's score wins over a base compose's
+    lower one, and a higher one stays with no override key."""
+    monkeypatch.setattr(config, "OTODOCK_MCP_DEFAULT_MEM_LIMIT", "2g")
+    m = _mk_manifest(tmp_path)
+    (m.mcp_dir / "docker-compose.yml").write_text(yaml.safe_dump({"services": {
+        "camoufox": {"build": ".", "oom_score_adj": -1000},
+        "side": {"image": "x", "oom_score_adj": 900},
+    }}))
+    path = cr.ensure_t1_override(m)
+    services = yaml.safe_load(path.read_text())["services"]
+    assert services["camoufox"]["oom_score_adj"] == 500
+    assert "oom_score_adj" not in services["side"]
 
 
 def test_override_noop_on_t2(tmp_path, monkeypatch):

@@ -8,7 +8,7 @@ lifetime — every SSO login returned 503 "OIDC not configured" until a manual
 proxy restart. ensure_oidc_discovery() now re-attempts discovery at request
 time, rate-limited, with explicit env vars always winning.
 
-HTTP is mocked via httpx.AsyncClient (patched inside oidc_provider).
+HTTP is mocked through oidc_provider._client.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def test_login_url_none_without_discovery(monkeypatch):
 async def test_ensure_noop_without_discovery_url(monkeypatch):
     monkeypatch.setattr(config, "OIDC_DISCOVERY_URL", "")
     mc = _mock_get(_DISCOVERY_DOC)
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
+    with patch("auth.providers.oidc_provider._client", return_value=mc):
         await ensure_oidc_discovery()
     assert mc.get.await_count == 0
 
@@ -96,7 +96,7 @@ async def test_ensure_noop_without_discovery_url(monkeypatch):
 @pytest.mark.asyncio
 async def test_lazy_discovery_success():
     mc = _mock_get(_DISCOVERY_DOC)
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
+    with patch("auth.providers.oidc_provider._client", return_value=mc):
         await ensure_oidc_discovery()
     assert config.OIDC_AUTHORIZE_URL == "https://idp.example.com/authorize"
     assert config.OIDC_TOKEN_URL == "https://idp.example.com/token"
@@ -112,7 +112,7 @@ async def test_lazy_discovery_success():
 async def test_lazy_discovery_recovered_once(caplog):
     """Once recovered, further ensures are no-ops — no second fetch."""
     mc = _mock_get(_DISCOVERY_DOC)
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
+    with patch("auth.providers.oidc_provider._client", return_value=mc):
         await ensure_oidc_discovery()
         await ensure_oidc_discovery()
     assert mc.get.await_count == 1
@@ -121,7 +121,7 @@ async def test_lazy_discovery_recovered_once(caplog):
 @pytest.mark.asyncio
 async def test_failure_rate_limited_then_retries(caplog):
     mc = _mock_get_failing()
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
+    with patch("auth.providers.oidc_provider._client", return_value=mc):
         with caplog.at_level("WARNING", logger="otodock"):
             await ensure_oidc_discovery()
             await ensure_oidc_discovery()  # inside the retry window — skipped
@@ -139,7 +139,7 @@ async def test_failure_rate_limited_then_retries(caplog):
 async def test_explicit_env_var_wins(monkeypatch):
     monkeypatch.setattr(config, "OIDC_TOKEN_URL", "https://custom.example.com/token")
     mc = _mock_get(_DISCOVERY_DOC)
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
+    with patch("auth.providers.oidc_provider._client", return_value=mc):
         await ensure_oidc_discovery()
     assert config.OIDC_TOKEN_URL == "https://custom.example.com/token"
     assert config.OIDC_AUTHORIZE_URL == "https://idp.example.com/authorize"
@@ -148,7 +148,7 @@ async def test_explicit_env_var_wins(monkeypatch):
 @pytest.mark.asyncio
 async def test_concurrent_ensures_single_fetch():
     mc = _mock_get(_DISCOVERY_DOC)
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
+    with patch("auth.providers.oidc_provider._client", return_value=mc):
         await asyncio.gather(ensure_oidc_discovery(), ensure_oidc_discovery())
     assert mc.get.await_count == 1
     assert config.OIDC_AUTHORIZE_URL == "https://idp.example.com/authorize"
@@ -156,7 +156,7 @@ async def test_concurrent_ensures_single_fetch():
 
 def test_oidc_url_503_while_idp_down():
     mc = _mock_get_failing()
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
+    with patch("auth.providers.oidc_provider._client", return_value=mc):
         resp = client.get("/auth/oidc-url")
     assert resp.status_code == 503
     assert resp.json()["detail"] == "OIDC not configured"
@@ -164,7 +164,7 @@ def test_oidc_url_503_while_idp_down():
 
 def test_oidc_url_recovers_without_restart():
     mc = _mock_get(_DISCOVERY_DOC)
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
+    with patch("auth.providers.oidc_provider._client", return_value=mc):
         resp = client.get("/auth/oidc-url")
     assert resp.status_code == 200
     assert resp.json()["url"].startswith("https://idp.example.com/authorize?")
@@ -176,7 +176,7 @@ def test_sso_starts_are_bounded_per_address(monkeypatch):
                         {"max": 2, "window": 60, "base_block": 60, "max_block": 600})
     rate_limiter._attempts.clear()
     mc = _mock_get(_DISCOVERY_DOC)
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
+    with patch("auth.providers.oidc_provider._client", return_value=mc):
         # Each from a client without the state cookie: every start counts.
         codes = [TestClient(app).get("/auth/oidc-url").status_code for _ in range(4)]
     assert codes[:2] == [200, 200] and codes[-1] == 429
@@ -194,7 +194,7 @@ def test_a_full_state_store_refuses_a_start_and_keeps_every_live_state(monkeypat
     monkeypatch.setattr(providers, "_oauth_states", {})
     rate_limiter._attempts.clear()
     mc = _mock_get(_DISCOVERY_DOC)
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
+    with patch("auth.providers.oidc_provider._client", return_value=mc):
         assert [client.get("/auth/oidc-url").status_code for _ in range(3)] == [200] * 3
         live = list(providers._oauth_states)
         refused = client.get("/auth/oidc-url")
@@ -231,7 +231,7 @@ def sso(monkeypatch):
     monkeypatch.setattr(config, "TRUSTED_PROXIES", [])
     lan_check.reset_state()
     rate_limiter._attempts.clear()
-    with patch("auth.providers.oidc_provider.httpx.AsyncClient",
+    with patch("auth.providers.oidc_provider._client",
                return_value=_mock_get(_DISCOVERY_DOC)):
         yield
     rate_limiter._attempts.clear()

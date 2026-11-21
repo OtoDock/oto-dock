@@ -114,6 +114,13 @@ export function useMeetingIdentity(core: StreamCore) {
       appendBlock({ type: 'system', subtype, agentName: data.agent_display_name || data.agent, agentColor: data.agent_color })
       return true
     }
+    if (subtype === SYSTEM_SUBTYPE.MEETING_AGENT_STOPPED) {
+      // Its engine was stopped and starts again at its next turn: the
+      // meeting's own line about it, and the agent stays in the meeting.
+      ensureAssistantMsg()
+      appendBlock({ type: 'system', subtype, message: data.message })
+      return true
+    }
     if (subtype === SYSTEM_SUBTYPE.MEETING_FAILED) {
       // The meeting never started (admission denial, spawn failure…) —
       // clear the pill state and show the reason where the "meeting is
@@ -124,7 +131,7 @@ export function useMeetingIdentity(core: StreamCore) {
       setMeetingLeftParticipants(new Set())
       meetingSpeakerRef.current = null
       ensureAssistantMsg()
-      appendBlock({ type: 'system', subtype: SYSTEM_SUBTYPE.MEETING_FAILED, message: data.message })
+      appendBlock({ type: 'system', subtype: SYSTEM_SUBTYPE.MEETING_FAILED, message: data.message, reason: data.reason })
       return true
     }
     return false

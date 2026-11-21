@@ -9,7 +9,7 @@ per-session fan-out (the hot path is untouched: ``include_idle`` defaults False)
 
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -39,9 +39,12 @@ def _setup(monkeypatch, *, sessions, identities, connected, agents_by_machine):
     import core.remote.satellite_connection as sc
     import core.session.session_manager as sm
     import storage.files.sync_state_store as ss
+    from services.remote import workspace_fanout
+    workspace_fanout._idle_identities.clear()     # kept a few seconds per machine and agent
     layer = _FakeLayer(sessions, identities)
     monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
-    fake_cm = SimpleNamespace(get_connected_machines=lambda: list(connected))
+    fake_cm = SimpleNamespace(get_connected_machines=lambda: list(connected),
+                              compute_machine_ids=frozenset, is_compute=lambda mid: False)
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
     monkeypatch.setattr(
         ss, "agents_for_machine",
@@ -143,7 +146,7 @@ async def test_has_candidates_false_when_nothing_connected(temp_db, monkeypatch)
 # --- fan_out_write: include_idle unions idle targets; default is active-only -
 
 @pytest.mark.asyncio
-async def test_fan_out_write_include_idle_unions_idle(temp_db, monkeypatch):
+async def test_fan_out_write_include_idle_unions_idle(temp_db, monkeypatch, tmp_path):
     from services.remote import workspace_fanout
     monkeypatch.setattr(
         workspace_fanout, "fanout_targets",
@@ -152,12 +155,24 @@ async def test_fan_out_write_include_idle_unions_idle(temp_db, monkeypatch):
     idle_mock = AsyncMock(return_value=["mIdle"])
     monkeypatch.setattr(workspace_fanout, "idle_connected_targets", idle_mock)
     fake_cm = AsyncMock()
+    fake_cm.is_connected = MagicMock(return_value=True)
+    fake_cm.get_connection = MagicMock(return_value=object())
+    fake_cm.push_file.return_value = True
+    import config
     import core.remote.satellite_connection as sc
+    from core.remote import machine_push_lane
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    (tmp_path / "agent-1" / "workspace").mkdir(parents=True)
+    (tmp_path / "agent-1" / "workspace" / "x.md").write_bytes(b"data")
+    machine_push_lane.reset()
 
     await workspace_fanout.fan_out_write(
         "agent-1", "workspace/x.md", b"data", include_idle=True,
     )
+    # The fan-out names the file for the idle machine's lane, which pushes it.
+    assert await workspace_fanout.drain_fan_outs()
+    machine_push_lane.reset()
 
     idle_mock.assert_awaited_once()
     assert fake_cm.push_file.await_count == 1

@@ -46,9 +46,9 @@ def _seed_agent(slug: str) -> None:
 def maps(temp_db, monkeypatch):
     """google-maps installed and on for the platform; agents alpha and beta,
     with the MCP enabled on alpha by its manager."""
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_manifest_store
     from storage.mcp import mcp_store
-    monkeypatch.setitem(mcp_registry._manifests, "google-maps", _maps_manifest())
+    monkeypatch.setitem(mcp_manifest_store._manifests, "google-maps", _maps_manifest())
     mcp_store.set_mcp_enabled("google-maps", True)
     for slug in ("alpha", "beta"):
         _seed_agent(slug)
@@ -103,9 +103,9 @@ def test_assigned_to_all_is_not_enough_without_the_mcp_on_the_agent(maps):
 
 
 def test_no_maps_mcp_installed_gives_none(maps, monkeypatch):
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_manifest_store
     _instance(maps, "default", "k-alpha", agents=["alpha"])
-    monkeypatch.delitem(mcp_registry._manifests, "google-maps", raising=False)
+    monkeypatch.delitem(mcp_manifest_store._manifests, "google-maps", raising=False)
     assert lifecycle._maps_geocode_key("alpha") == ""
 
 

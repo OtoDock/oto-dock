@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, act } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 
 // ─── AI Engines settings card: status-truthful rows (an expired row must not
@@ -17,6 +17,10 @@ vi.mock('@/api/executionLayers', async (importOriginal) => {
   return {
     ...mod,
     useUserExecutionLayers: () => ({ data: layersRef.current, isLoading: false }),
+    // The list's own reads (the pool's order when it opens, the live numbers it polls) need a query client the
+    // page test does not mount: answered here as a list at rest.
+    useListReading: () => ({ pending: false, reread: () => {} }),
+    useAccountsLive: () => ({ data: undefined }),
     useUserAddSubscription: () => ({
       mutate: (vars: unknown) => { added.push(vars) }, isPending: false, isError: false, error: null,
     }),
@@ -36,6 +40,7 @@ vi.mock('@/api/auth', () => ({ fetchCurrentUser: vi.fn(async () => null) }))
 vi.mock('@/lib/nativeBridge', () => ({ setNativeAuthInProgress: vi.fn() }))
 
 import { ExecutionLayersSection } from '@/pages/UserSettings.aiEngines'
+import { ADOPT_WINDOW_MS, REORDER_AFTER_MS } from '@/components/engines/useSettledOrder'
 import { accountEmail, accountName, loginEndsIn, type Subscription } from '@/api/executionLayers'
 import { claudeLike, codexLike } from './fixtures/engines'
 
@@ -291,3 +296,83 @@ describe('warmupFailSubtype', () => {
     expect(warmupFailSubtype('anything_else')).toBe('session_error')
   })
 })
+
+
+describe('AI Engines settings card: the order and what runs', () => {
+  it('a tick shows its saved state where the card is, and the card moves only after the quiet spell', () => {
+    vi.useFakeTimers()
+    try {
+      const first = sub({ id: 's1', label: 'First', oauth_email: 'a@example.com' })
+      const second = sub({ id: 's2', label: 'Second', oauth_email: 'b@example.com' })
+      const { rerender } = renderSection([layer([first, second])])
+      fireEvent.click(screen.getByText('Claude Code', { selector: 'span' }))
+      const names = () => screen.getAllByText(/^(First|Second)$/).map((el) => el.textContent)
+      expect(names()).toEqual(['First', 'Second'])
+      act(() => { vi.advanceTimersByTime(ADOPT_WINDOW_MS + 10) })
+      const tick = screen.getAllByLabelText('Personal use')[0]
+      tick.focus()
+      fireEvent.click(tick)
+      // The server's answer: the unticked account goes last.
+      layersRef.current = [layer([second, { ...first, use_personal: false }])]
+      rerender(<MemoryRouter><ExecutionLayersSection /></MemoryRouter>)
+      expect(names()).toEqual(['First', 'Second'])
+      expect(screen.getAllByLabelText('Personal use')[0]).not.toBeChecked()
+      act(() => { vi.advanceTimersByTime(REORDER_AFTER_MS + 10) })
+      expect(names()).toEqual(['Second', 'First'])
+      // The tick that was used keeps the focus through the move (the keyboard's and a reader's place).
+      expect(document.activeElement).toBe(screen.getAllByLabelText('Personal use')[1])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a reconnected account takes its place in the order after the spell', () => {
+    vi.useFakeTimers()
+    try {
+      const first = sub({ id: 's1', label: 'First', oauth_email: 'a@example.com' })
+      const second = sub({ id: 's2', label: 'Second', oauth_email: 'b@example.com', status: 'expired' })
+      const { rerender } = renderSection([layer([first, second])])
+      fireEvent.click(screen.getByText('Claude Code', { selector: 'span' }))
+      const names = () => screen.getAllByText(/^(First|Second)$/).map((el) => el.textContent)
+      act(() => { vi.advanceTimersByTime(ADOPT_WINDOW_MS + 10) })
+      fireEvent.click(screen.getByText('Reconnect'))
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))   // the dialog closes: a change in the list
+      // The same account signed in again: active, and the pool uses it first. No tick changed.
+      layersRef.current = [layer([{ ...second, status: 'active' }, first])]
+      rerender(<MemoryRouter><ExecutionLayersSection /></MemoryRouter>)
+      expect(names()).toEqual(['First', 'Second'])
+      act(() => { vi.advanceTimersByTime(REORDER_AFTER_MS + 10) })
+      expect(names()).toEqual(['Second', 'First'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('an account working shows the pulsing dot, the count and each model with its count, most first', () => {
+    renderCard([sub({ live: { sessions: 7, per_model: [{ name: 'Opus 5.5', sessions: 6 }, { name: 'Fable 5.2', sessions: 1 }] } }),
+                sub({ id: 's2', live: { sessions: 0, per_model: [] } })])
+    expect(screen.getByText(/7 running/)).toBeInTheDocument()
+    const models = screen.getByText('Opus 5.5 ×6, Fable 5.2 ×1')
+    // On a phone the models take their own row under the name's; beside it from sm up, after a dot.
+    expect(models.className).toContain('basis-full')
+    expect(models.className).toContain('sm:basis-auto')
+    expect(models).toHaveTextContent('· Opus 5.5 ×6, Fable 5.2 ×1')
+    expect(screen.getAllByText(/running/)).toHaveLength(1)
+  })
+
+  it('one model working alone is named with no count, and an account with nothing working shows nothing', () => {
+    renderCard([sub({ live: { sessions: 3, per_model: [{ name: 'Opus 5.5', sessions: 3 }] } }),
+                sub({ id: 's2', live: { sessions: 0, per_model: [] } })])
+    expect(screen.getByText(/3 running/)).toBeInTheDocument()
+    expect(screen.getByText('Opus 5.5')).toBeInTheDocument()
+    expect(screen.queryByText(/×/)).toBeNull()
+    expect(screen.getAllByText(/running/)).toHaveLength(1)
+  })
+
+  it('a session with no model keeps one model from reading as all of them: its count shows', () => {
+    renderCard([sub({ live: { sessions: 2, per_model: [{ name: 'Opus 5.5', sessions: 1 }] } })])
+    expect(screen.getByText(/2 running/)).toBeInTheDocument()
+    expect(screen.getByText('Opus 5.5 ×1')).toBeInTheDocument()
+  })
+})
+

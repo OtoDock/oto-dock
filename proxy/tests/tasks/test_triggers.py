@@ -751,7 +751,7 @@ def test_agent_trigger_on_personal_subscription_points_at_the_agent_surface(temp
         _register(scope="agent", subscription_id=sid)
     msg = str(ei.value)
     assert "personal" in msg
-    assert "Agent Settings → MCPs → github-mcp → Subscribe to events for this agent" in msg
+    assert "Agent Settings → MCPs → github-mcp → one of its accounts → Subscribe to events" in msg
 
 
 def test_user_trigger_on_agent_subscription_points_at_connected_accounts(temp_db):
@@ -781,7 +781,7 @@ def test_a_trigger_made_before_its_subscription_is_bound_later(temp_db):
     assert row["subscription_id"] is None
     personal = _seed_subscription(scope="user", owner="user-test", agent=None)
     ok, err = trigger_manager.update_trigger(row["id"], {"subscription_id": personal})
-    assert not ok and "Subscribe to events for this agent" in (err or "")
+    assert not ok and "one of its accounts → Subscribe to events" in (err or "")
     sid = _seed_subscription(scope="service", owner="", agent="agent-x")
     ok, err = trigger_manager.update_trigger(row["id"], {"subscription_id": sid})
     assert ok and err is None

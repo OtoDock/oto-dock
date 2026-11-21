@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
 
 import pytest
@@ -29,6 +30,14 @@ from core.session.session_state import (
     set_session_mode,
     set_session_security,
 )
+from tests.execution import direct_program
+
+
+@pytest.fixture(autouse=True)
+def _file_program(monkeypatch):
+    """The file program runs in this process, on the test's own tree."""
+    direct_program.install(monkeypatch)
+
 
 _STUB_PROVIDER = "stub-builtins-test"
 AGENT = "pa"
@@ -102,6 +111,8 @@ class _FakeMCP:
 @pytest.fixture
 def direct_session(tmp_path, monkeypatch):
     agents = tmp_path / "agents"
+    # The file tools open beneath the agent's folder as the config names it.
+    monkeypatch.setattr("config.AGENTS_DIR", agents)
     for d in ("workspace", "knowledge/memory", "users/alice/workspace", "users/alice/.claude"):
         (agents / AGENT / d).mkdir(parents=True)
     (agents / AGENT / "workspace" / "notes.md").write_text("alpha\nbeta\n")
@@ -114,8 +125,10 @@ def direct_session(tmp_path, monkeypatch):
     )
     from core.layers.direct.session import DirectSession
     monkeypatch.setattr("core.layers.direct.session.config.get_agent_model", lambda agent: "")
+    # An id per test: a session's permission queue binds to the loop of its
+    # first waiter, and each test runs on a loop of its own.
     session = DirectSession(
-        session_id="builtins-runner", agent_name=AGENT,
+        session_id=f"builtins-runner-{uuid.uuid4().hex[:8]}", agent_name=AGENT,
         system_prompt="You are a test agent.", provider=_STUB_PROVIDER,
     )
     session.model = "test-model"

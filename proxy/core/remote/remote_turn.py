@@ -14,7 +14,6 @@ import contextlib
 import logging
 import time
 import uuid
-from collections import Counter
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
@@ -23,11 +22,11 @@ from core.events import turn_ending
 from core.events.common_events import DONE, ERROR, CommonEvent
 from core.remote import upload_inflight
 from core.remote.remote_session_info import RemoteSessionInfo
+from core.session import session_kind
 from core.session.background_frames import (
     log_between_turns_census,
-    read_stale_line,
 )
-from core.session.session_state import get_session_user_tz
+from core.session.session_state import get_session_client_type, get_session_user_tz
 
 logger = logging.getLogger("remote-layer")
 
@@ -48,6 +47,16 @@ def record_resume_handle(info: RemoteSessionInfo, handle: str) -> None:
     local layer uses."""
     if handle and handle != info.resume_handle:
         info.resume_handle = handle
+
+
+def _barrier_ceiling(session_id: str, kwargs: dict) -> float:
+    """How long a turn waits for its files at most. Someone speaking hears the
+    wait: every spoken turn says what of the last answer was heard, a duplex
+    chat's included, and a call's follow-up turn is known by its session."""
+    if ("barge_in_chars" in kwargs
+            or get_session_client_type(session_id) == session_kind.PHONE.name):
+        return upload_inflight.BARRIER_SPOKEN_S
+    return upload_inflight.BARRIER_MAX_S
 
 
 if TYPE_CHECKING:
@@ -85,10 +94,14 @@ class RemoteTurnMixin(_Host):
         # ``/v1/upload`` returns before its satellite push completes
         # (``api/media/uploads.py``), so a prompt referencing a just-attached
         # file must wait for the bytes to land on the machine first. Bounded —
-        # a wedged push logs and the turn proceeds (the pre-existing
-        # best-effort failure mode). Returns immediately (no wait) when
-        # nothing is in flight, i.e. the vast majority of turns.
-        await upload_inflight.wait_settled(info.agent_name, machine_id=info.machine_id)
+        # at a bound the turn proceeds without the file, and the agent and the
+        # chat are told. Returns immediately (no wait) when nothing is in
+        # flight, i.e. the vast majority of turns.
+        if info.files_synced and not await upload_inflight.wait_settled(
+                info.agent_name, machine_id=info.machine_id,
+                ceiling=_barrier_ceiling(session_id, kwargs)):
+            message = await upload_inflight.turn_goes_on_without_files(
+                session_id, info.machine_id, info.agent_name, message)
 
         inject_time = kwargs.get("inject_time", False)
         settle_after_result = kwargs.get("settle_after_result", 0)
@@ -96,10 +109,24 @@ class RemoteTurnMixin(_Host):
         # Inject the time prefix on the proxy side so the satellite doesn't
         # need to know the user's TZ. Satellite is told inject_time=False —
         # we pre-inject here using the session's user_tz (or platform fallback).
+        from core.session import start_context
+        message = start_context.fence_turn(message)
         if inject_time:
             user_tz = get_session_user_tz(session_id)
             message = f"[Current time: {config.format_current_time(user_tz)}]\n\n{message}"
-            inject_time = False
+        # The start's riding part on the conversation's first turn, then the
+        # other chats of the agent on change, as the local sessions say it.
+        # Claude Code on a satellite that says so takes the block as its own
+        # message, which the CLI's terminal never draws; elsewhere it leads
+        # the turn's text.
+        start = await start_context.prelude(session_id, parallel=inject_time)
+        own_message = bool(start.block) and \
+            start_context.engine_door(info.execution_path) == start_context.DOOR_MESSAGE and \
+            self._cm.satellite_takes_start_context(info.machine_id)
+        lead = start.line if own_message else start.prefix
+        if lead:
+            message = f"{lead}\n\n{message}"
+        inject_time = False
 
         # If this turn follows an abort, wait for the satellite's
         # `session_aborted` confirmation first so the dying CLI's flushed output
@@ -115,8 +142,7 @@ class RemoteTurnMixin(_Host):
             )
 
         if not adapter.owns_event_queue:
-            # Drain any stale events left over from a previous aborted turn —
-            # analog of PersistentSession._drain_stale_output on local. (An
+            # Drain any stale events left over from a previous aborted turn. (An
             # engine whose router owns the queue has no stragglers here: a
             # prior turn's leftovers went to a bg buffer or the now-discarded
             # prior consumer.)
@@ -131,6 +157,7 @@ class RemoteTurnMixin(_Host):
         info.proxy_killed = False
         info.last_event_at = time.monotonic()
         info.task_turn = bool(settle_after_result and settle_after_result > 0)
+        info.own_message_turn = own_message
         await adapter.begin_turn(info, settle_after_result)
 
         # Pre-mint the command_id so we can correlate the satellite's
@@ -151,7 +178,9 @@ class RemoteTurnMixin(_Host):
                 "message": message,
                 "execution_path": info.execution_path,
                 "inject_time": inject_time,
+                **({"start_context": start.block} if own_message else {}),
             }, command_id=command_id)
+            start.started()
         except RuntimeError as e:
             # If the satellite reports there's no live session to take the
             # message, flag it so the dashboard's auto-resume path spawns a
@@ -215,6 +244,31 @@ class RemoteTurnMixin(_Host):
                     yield event
         finally:
             info.turn_active = False
+            # Lines the turn's end kept, or that came meanwhile: the reader
+            # between turns takes them once the producer lets the session go.
+            from core.remote.remote_bg_commands import lines_wait, wake_reader
+            if not adapter.owns_event_queue and lines_wait(info):
+                wake_reader(info, self._cm)
+
+    async def record_waiting_turns(self, session_id: str) -> None:
+        """The stale drain, run before a new turn writes the person's
+        message: a turn the engine ran by itself that waits on the queue is
+        recorded above that message. A turn or a capture holding the session
+        reads it itself; the send's own drain stays the backstop."""
+        info = self._sessions.get(session_id)
+        if info is None or self._adapter(info).owns_event_queue:
+            return
+        from core.remote.remote_bg_commands import lines_wait
+        if not lines_wait(info):
+            return
+        try:
+            await asyncio.wait_for(info.lock.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            return
+        try:
+            await self._drain_stale_events(info)
+        finally:
+            info.lock.release()
 
     async def _drain_stale_events(self, info: RemoteSessionInfo) -> None:
         """Drain frames buffered on ``info.event_queue`` between turns. Log a
@@ -226,22 +280,6 @@ class RemoteTurnMixin(_Host):
         satellite's post-turn drain forwarded it while nobody listened) is
         CAPTURED to the chat instead of dropped — the pre-send rule that
         makes the next bracket the user turn's own."""
-        from core.events import wake_capture as _wake
-        from core.remote.remote_bg_commands import queue_frame_reader
-        drained: Counter[str] = Counter()
-        while True:
-            try:
-                ev = info.event_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if isinstance(ev, dict) and _wake.is_wake_init(ev):
-                drained["wake_captured"] += 1
-                await _wake.capture_wake_turn(
-                    info.session_id, ev, queue_frame_reader(info),
-                    source="remote_stale_drain",
-                )
-                continue
-            # A sub-agent's lines and the task frames are background work
-            # the satellite forwarded while the main agent was idle.
-            drained[read_stale_line(info.session_id, ev) if isinstance(ev, dict) else "?"] += 1
+        from core.remote.remote_bg_commands import read_between_turns
+        _, drained = await read_between_turns(info, self._cm, quiet_s=0, source="remote_stale_drain")
         log_between_turns_census(f"Remote session {info.session_id[:8]}", drained)

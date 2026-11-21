@@ -2,7 +2,7 @@
   "name": "music-gen-mcp",
   "label": "Music Generation",
   "description": "AI music and sound-effect generation (ElevenLabs Music & SFX)",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "category": "custom",
   "server": {
     "runtime": "python",
@@ -12,7 +12,10 @@
     "tool_timeout_sec": 600
   },
   "credentials": {
-    "type": "none"
+    "type": "none",
+    "exit": [
+      {"key": "ELEVENLABS_API_KEY", "header": "xi-api-key", "hosts": ["api.elevenlabs.io"]}
+    ]
   },
   "instances": {
     "delivery": "env",

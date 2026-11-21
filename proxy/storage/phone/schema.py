@@ -123,11 +123,14 @@ def init_audio_telephony(conn) -> None:
             -- numbers where caller-ID cannot be trusted. Existing installs get
             -- the same defaults via run_migrations (no migration-only state).
             identity_mode TEXT NOT NULL DEFAULT 'caller'
-                CHECK (identity_mode IN ('caller', 'shared', 'user')),
+                CHECK (identity_mode IN ('caller', 'shared', 'user', 'agent')),
             identity_user_sub TEXT REFERENCES users(sub) ON DELETE SET NULL,
             role TEXT NOT NULL DEFAULT 'viewer'
                 CHECK (role IN ('viewer', 'editor', 'manager')),
             remember_callers BOOLEAN NOT NULL DEFAULT TRUE,
+            -- The agent's own line ('agent'): the management tools the
+            -- route ticks open, by MCP name; [] = none of them.
+            line_tools JSONB NOT NULL DEFAULT '[]',
             -- Where the agent may hand the caller (``transfer_call``): the
             -- admin's list of {label, number}; [] = no transfers on the line.
             transfer_targets JSONB NOT NULL DEFAULT '[]',

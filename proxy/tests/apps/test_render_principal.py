@@ -106,7 +106,7 @@ def test_the_cookie_is_a_viewer_of_one_app_and_403_everywhere_else():
     me = client.get("/auth/me")
     assert me.status_code == 200, me.text
     user = me.json()["user"]
-    assert user["render"] is True and user["platform_configured"] is True
+    assert user["render"] is True
     assert user["agents"] == [AGENT] and user["must_change_password"] is False
     r = client.get(f"/v1/apps/{row['id']}")
     assert r.status_code == 200 and r.json()["kind"] == "folder"

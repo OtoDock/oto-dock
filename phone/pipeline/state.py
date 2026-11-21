@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 from pipeline.audio_tap import OutgoingAudioTap
@@ -85,6 +86,12 @@ class CallState:
     _speech_audio_buf: bytearray = field(default_factory=bytearray)
     _turn_timer: asyncio.Task | None = None
     _user_silent: SilenceEvent = field(default_factory=SilenceEvent)
+    # The inbound line's recent frames that can only be the caller's, as
+    # (time, RMS, seconds): what the orphan sweep reads to tell the caller's
+    # words from the agent's own voice returning on the line. Emptied by a
+    # frame inside the own-voice tail and at every take (pipeline/turn.py
+    # ``_note_line_frame``). Five seconds of 20 ms frames.
+    _line_frames: deque = field(default_factory=lambda: deque(maxlen=250))
 
     # Barge-in pause/confirm/commit: VAD speech during playback PAUSES the
     # sender (reversible — the engine turn and TTS synthesis keep running);

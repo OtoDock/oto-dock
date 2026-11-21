@@ -177,6 +177,29 @@ def test_a_scheduled_notification_keeps_its_audience_at_its_fire(monkeypatch):
     assert fired[-1]["audience"] == "contributor"
 
 
+def test_a_notification_fired_by_hand_keeps_its_agent_and_chat_as_its_schedule_does(monkeypatch):
+    # The row's button opens its chat: "Fire now" used to drop the agent and
+    # the chat, so the same notification had no button when fired by hand.
+    from api.notifications import notifications as napi
+    fired: list[dict] = []
+
+    async def _fire(**kw):
+        fired.append(kw)
+        return []
+    monkeypatch.setattr(nm, "fire_notification", _fire)
+    row = notification_store.create_notification(
+        "later", "b", scope="agent", target=AG, source="mcp", source_id="src-1",
+        notification_type="one_time", run_at="2099-01-01T00:00:00", audience="contributor",
+        agent_slug=AG, chat_id="chat-1")
+    asyncio.run(nm._fire_scheduled_notification(row["id"]))
+    asyncio.run(napi.fire_notification_now(row["id"], user=UserContext(
+        sub=ADMIN, email="a@x.test", name="Admin", role="admin", agents=[AG])))
+    by_schedule, by_hand = fired
+    assert by_hand == by_schedule
+    assert by_hand["agent_slug"] == AG and by_hand["chat_id"] == "chat-1"
+    assert by_hand["source_id"] == "src-1" and by_hand["audience"] == "contributor"
+
+
 # ── the REST fields ───────────────────────────────────────────────────────
 
 

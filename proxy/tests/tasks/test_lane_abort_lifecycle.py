@@ -138,8 +138,8 @@ def test_reaper_leash_recent_hook_activity(temp_db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_delete_chat_closes_remote_session(monkeypatch):
-    from api.agents import chats as chats_mod
     from core.session import session_manager
+    from services.agents import chat_removal
 
     closed: list[str] = []
     remote = MagicMock()
@@ -147,20 +147,20 @@ async def test_delete_chat_closes_remote_session(monkeypatch):
     remote.close_session = AsyncMock(side_effect=closed.append)
     monkeypatch.setattr(session_manager, "_remote_layer", remote)
 
-    await chats_mod._close_chat_session(
+    await chat_removal.close_chat_session(
         {"session_id": "sess-del-1", "agent": "pa"})
     assert closed == ["sess-del-1"]
 
 
 @pytest.mark.asyncio
 async def test_delete_chat_noop_without_live_session(monkeypatch):
-    from api.agents import chats as chats_mod
     from core.session import session_manager
+    from services.agents import chat_removal
     monkeypatch.setattr(session_manager, "_remote_layer", None)
     # No registry holds the session — must be a silent no-op.
-    await chats_mod._close_chat_session(
+    await chat_removal.close_chat_session(
         {"session_id": "sess-del-absent", "agent": "pa"})
-    await chats_mod._close_chat_session({"session_id": "", "agent": "pa"})
+    await chat_removal.close_chat_session({"session_id": "", "agent": "pa"})
 
 
 # --- A2: warm-session reuse decision ----------------------------------------
@@ -172,6 +172,8 @@ class _Info:
         self.alive = alive
         self.cli_dead = cli_dead
         self.turn_active = turn_active
+        self.files_synced = True
+        self.compute = False
 
 
 class _Cfg:
@@ -252,6 +254,10 @@ def test_lane_pump_wedged_states(monkeypatch):
     remote._sessions = {}
     monkeypatch.setattr(session_manager, "_remote_layer", None)
     assert _lane_pump_wedged(pump) is True           # no backing session
+    # A Direct LLM session the platform holds itself has no process to lose.
+    from core.layers.direct import session as direct_session
+    monkeypatch.setitem(direct_session._direct_sessions, sid, MagicMock())
+    assert _lane_pump_wedged(pump) is False
 
 
 @pytest.mark.asyncio

@@ -18,15 +18,16 @@ export interface PlatformSettings {
   // Storage & retention
   session_retention_enabled: boolean
   session_retention_days: string
+  // The working-files window: uploads and screenshots.
+  working_files_retention_enabled: boolean
+  working_files_retention_days: string
+  // Days chats are kept; empty unless an operator set it.
+  chat_rows_retention_days: string
   // The archive of removed people: its own toggle and days (0 keeps for ever)
   offboarded_retention_enabled: boolean
   offboarded_retention_days: string
   // Automatic MCP updates (weekly; community MCPs)
   mcp_auto_update_enabled: boolean
-  // The apps' store review ask (default ON) and the days before the second
-  // ask (90, from 30 to 730).
-  store_review_enabled: boolean
-  store_review_days: number
   // Read each OAuth account's session and weekly usage from the vendor
   // (default ON): the pool routes on it, the AI Engines cards show it.
   subscription_windows_enabled: boolean
@@ -95,7 +96,7 @@ export interface SatelliteStat {
   machine_id: string
   name: string
   online: boolean
-  active_sessions: number
+  active_sessions: number | null
   max_sessions: number | null
   cpu_pct: number
   mem_pct: number

@@ -1,4 +1,5 @@
-"""scripts/upgrade.sh, run against a fake ``docker`` and ``curl`` on PATH.
+"""scripts/upgrade.sh, run against a fake ``docker``, ``curl``, ``ip`` and
+``sleep`` on PATH, with a refusing fake of every command that acts on the host.
 
 The upgrade checks the target release's compose files against the install's
 own .env before it changes anything, writes no line of .env but
@@ -11,19 +12,26 @@ release again; once something ran it leaves the new files and points at the
 dump. The ``config`` checks run through the real Compose
 loader where one is installed (it needs no daemon), so the refusal of a
 hostname in OTO_AUDIOSOCKET_PUBLIC_HOST is the loader's own. install.sh lists
-an override after the base file on the COMPOSE_FILE line it writes.
+an override after the base file on the COMPOSE_FILE line it writes. A server
+of 2.0.0 or later waits for its open work between the pull and the swap; an
+older one is asked nothing and the script says what that means.
 """
 from __future__ import annotations
 
 import gzip
 import json
 import os
+import pty
+import select
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
+
+from tests.deploy.fake_docker import host_calls, host_commands_named, write_host_fakes
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "scripts"
@@ -31,12 +39,26 @@ REAL_DOCKER = shutil.which("docker")
 
 # A stand-in for the docker CLI. Every call is logged as a JSON argv line.
 # `ps` applies the label filters (and -a) to FAKE_CONTAINERS; `exec` answers
-# like pg_dump, and `psql -tAc` with FAKE_DB_VERSION, FAKE_FLOOR or
-# FAKE_KEYS; `inspect` reports FAKE_HEALTH for a health format and
+# pg_dump, `psql -tAc` with FAKE_DB_VERSION, FAKE_FLOOR or FAKE_KEYS, and the
+# admin command line in the server container: `drain` prints two of the
+# verb's lines (FAKE_DRAIN_RC=1: the refusal instead, exit 1; FAKE_DRAIN_HOLD
+# names a folder where it writes `started` and waits for `release`), `resume`
+# prints its line, `compute` prints FAKE_COMPUTE_LINE and exits FAKE_COMPUTE_RC.
+# Any other `exec` fails (exit 97). `run` of the folders' compare (the image's
+# Python as the entrypoint, the script by its path in the image or as `-c`
+# text) prints FAKE_SPLIT; with none, a `-c` text is run for real on what it
+# was fed, and an image named in FAKE_NO_COMPARE has no script of its own
+# (exit 2). `compose config --format json` prints FAKE_CONFIG_JSON. `inspect`
+# of a container's image answers its `image` (sha256:running by default), of
+# FAKE_HEALTH for a health format and
 # FAKE_STATUS (running) for a status one; `image inspect` knows
 # FAKE_LOCAL_IMAGES; `compose config` runs the real docker when REAL_DOCKER is
 # set, else exits FAKE_CONFIG_RC (FAKE_BARE_CONFIG_RC for a call without -f,
-# the check of the files in place); `compose pull` and `compose up` exit
+# the check of the files in place, which also fails after an up when
+# FAKE_REFUSED_AFTER_UP is set: the old files put back); a plain `compose config`, the read of the
+# project's name, prints `name: FAKE_PROJECT` (otodock), or fails with
+# Compose's own line when FAKE_PARSE_RC says the folder's files do not parse;
+# `compose pull` and `compose up` exit
 # FAKE_PULL_RC and FAKE_UP_RC (FAKE_UP_RC for the first up only).
 # The recover-bin carry: `compose config --volumes` prints FAKE_VOLUMES;
 # `inspect` of the mounts prints FAKE_MOUNTS, of the writable layer
@@ -56,7 +78,7 @@ REAL_DOCKER = shutil.which("docker")
 # FAKE_ENV_LOG gets the COMPOSE_PROJECT_NAME each `compose` pull, stop, up
 # and run saw.
 FAKE_DOCKER = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a") as fh:
     fh.write(json.dumps(args) + "\n")
@@ -95,7 +117,8 @@ if args[:1] == ["ps"]:
         if not want_all and not c.get("running", True):
             continue
         if all(c["labels"].get(l.partition("=")[0]) == l.partition("=")[2] for l in labels):
-            print(fmt.replace("{{.ID}}", c["id"]).replace("{{.Names}}", c.get("name", c["id"])))
+            line = fmt.replace("{{.ID}}", c["id"]).replace("{{.Names}}", c.get("name", c["id"]))
+            print(re.sub(r'\{\{\.Label "([^"]+)"\}\}', lambda m: c["labels"].get(m.group(1), ""), line))
     sys.exit(0)
 if args[:1] == ["exec"]:
     if "du" in args:
@@ -110,7 +133,39 @@ if args[:1] == ["exec"]:
         else:
             print(os.environ.get("FAKE_KEYS", ""))
         sys.exit(0)
-    print("-- dump of " + args[1])
+    if "pg_dump" in args:
+        print("-- dump of " + args[1])
+        sys.exit(0)
+    if args[2:4] == ["/opt/otodock/proxy/venv/bin/python", "/opt/otodock/proxy/admin_cli.py"]:
+        if args[4] == "compute":
+            if os.environ.get("FAKE_COMPUTE_SIGNAL"):
+                import signal
+                os.kill(os.getppid(), getattr(signal, "SIG" + os.environ["FAKE_COMPUTE_SIGNAL"]))
+            print(os.environ.get("FAKE_COMPUTE_LINE", "The compute machine is signed in."))
+            sys.exit(int(os.environ.get("FAKE_COMPUTE_RC", "0")))
+        if args[4] == "resume":
+            print("The platform takes new work again.")
+            sys.exit(0)
+        if args[4] == "drain" and os.environ.get("FAKE_DRAIN_RC", "0") != "0":
+            sys.stderr.write("admin_cli: The server did not answer the drain. It is not running, "
+                             "or it is older than 2.0.\n")
+            sys.exit(int(os.environ["FAKE_DRAIN_RC"]))
+        if args[4] == "drain":
+            print("Waiting for open work: 2 turns. Up to 10 minutes.", flush=True)
+            hold = os.environ.get("FAKE_DRAIN_HOLD")
+            if hold:
+                import time
+                open(os.path.join(hold, "started"), "w").close()
+                for _ in range(600):
+                    if os.path.exists(os.path.join(hold, "release")):
+                        break
+                    time.sleep(0.05)
+            print("Nothing is working. New work is held until the platform is back.")
+            sys.exit(0)
+    sys.stderr.write("fake docker: an exec it does not know: " + " ".join(args) + "\n")
+    sys.exit(97)
+if args[:1] == ["logs"]:
+    print("old server: its last line before the swap")
     sys.exit(0)
 if args[:1] == ["inspect"]:
     fmt = args[args.index("-f") + 1] if "-f" in args else ""
@@ -122,7 +177,10 @@ if args[:1] == ["inspect"]:
         started = c.get("started", "2026-10-01T09:00:00.123456789Z")
         print(fmt.replace("{{.State.Status}}", status).replace("{{.State.StartedAt}}", started))
         sys.exit(0)
-    if "Mounts" in fmt:
+    if "{{.Image}}" in fmt:
+        c = next((c for c in cs if c["id"] == args[-1]), {})
+        print(c.get("image", "sha256:running"))
+    elif "Mounts" in fmt:
         print("\n".join(os.environ.get("FAKE_MOUNTS", "/opt/otodock/agents").split()))
     elif "SizeRw" in fmt:
         print(os.environ.get("FAKE_SIZE_RW", "4096"))
@@ -130,6 +188,20 @@ if args[:1] == ["inspect"]:
         print(os.environ.get("FAKE_HEALTH", "healthy"))
     else:
         print(os.environ.get("FAKE_STATUS", "running"))
+    sys.exit(0)
+PY = "/opt/otodock/proxy/venv/bin/python"
+if args[:1] == ["run"] and PY in args:
+    fed = sys.stdin.read()
+    image = args[args.index(PY) + 1]
+    if "-c" not in args and image in os.environ.get("FAKE_NO_COMPARE", "").split():
+        sys.stderr.write("python: can't open file '/opt/otodock/scripts/compose_mounts.py'\n")
+        sys.exit(2)
+    if os.environ.get("FAKE_SPLIT"):
+        print(os.environ["FAKE_SPLIT"])
+    elif "-c" in args:
+        import subprocess
+        done = subprocess.run([sys.executable, "-c", args[args.index("-c") + 1]], input=fed, text=True)
+        sys.exit(done.returncode)
     sys.exit(0)
 if args[:2] == ["image", "inspect"]:
     sys.exit(0 if args[2] in os.environ.get("FAKE_LOCAL_IMAGES", "").split() else 1)
@@ -155,11 +227,22 @@ if args[:1] == ["compose"]:
     if sub == "config":
         if os.environ.get("REAL_DOCKER"):
             os.execv(os.environ["REAL_DOCKER"], [os.environ["REAL_DOCKER"], *args])
+        if args == ["compose", "config"]:
+            if os.environ.get("FAKE_PARSE_RC", "0") != "0":
+                sys.stderr.write('service "otodock-compute" has neither an image nor a build context '
+                                 'specified: invalid compose project\n')
+                sys.exit(int(os.environ["FAKE_PARSE_RC"]))
+            print("name: " + os.environ.get("FAKE_PROJECT", "otodock"))
+            sys.exit(0)
         if "--images" in args:
             print("\n".join(os.environ.get("FAKE_IMAGES", "").split()))
         if "--volumes" in args:
             print("\n".join(os.environ.get("FAKE_VOLUMES", "").split()))
+        if "--format" in args and os.environ.get("FAKE_CONFIG_JSON"):
+            print(os.environ["FAKE_CONFIG_JSON"])
         if "-f" not in args:
+            if ups and os.environ.get("FAKE_REFUSED_AFTER_UP"):
+                sys.exit(1)
             sys.exit(int(os.environ.get("FAKE_BARE_CONFIG_RC", "0")))
         sys.exit(int(os.environ.get("FAKE_CONFIG_RC", "0")))
     if sub == "pull":
@@ -209,6 +292,9 @@ if not src or not os.path.isfile(src):
 shutil.copyfile(src, dest)
 '''
 
+# A stand-in for sleep: the seconds asked for are logged, none are slept.
+FAKE_SLEEP = '#!/bin/sh\necho "$*" >> "${FAKE_SLEEP_LOG:-/dev/null}"\n'
+
 # A stand-in for `ip -o -4 addr show`: one line per address in FAKE_IP_ADDRS,
 # each call logged to FAKE_IP_LOG.
 FAKE_IP = r'''#!/usr/bin/env python3
@@ -235,6 +321,9 @@ NEVER_PROXY = dict(NEW_PROXY, running=False, status="created", started=NEVER)
 # A community MCP's container: another compose project, a name free to say anything.
 EVIL_PG = {"id": "evil-pg", "labels": {"com.docker.compose.project": "otodock-x-mcp-otodock-postgres",
                                        "com.docker.compose.service": "otodock-postgres"}}
+
+# The admin command line as the script runs it in the server container.
+ADMIN_CLI = ["/opt/otodock/proxy/venv/bin/python", "/opt/otodock/proxy/admin_cli.py"]
 
 OLD_EXAMPLE = "PROXY_PORT=8400\nDASHBOARD_PUBLIC_URL=http://localhost:8400\n"
 NEW_EXAMPLE = OLD_EXAMPLE + (
@@ -264,7 +353,10 @@ def fakebin(tmp_path):
     _write_exec(b / "docker", FAKE_DOCKER)
     _write_exec(b / "curl", FAKE_CURL)
     _write_exec(b / "ip", FAKE_IP)
-    return b
+    _write_exec(b / "sleep", FAKE_SLEEP)
+    write_host_fakes(b)
+    yield b
+    assert host_calls(b) == [], "a script reached a command that acts on the host"
 
 
 @pytest.fixture
@@ -317,7 +409,7 @@ def _install(tmp_path, env_text: str, *, phone_file: bool = True, override: str 
     return inst
 
 
-def _run(inst, tmp_path, fakebin, *args, containers=(PG, PROXY), real_config=False, **extra):
+def _env(tmp_path, fakebin, containers=(PG, PROXY), real_config=False, **extra) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("POSTGRES_", "OTODOCK_", "COMPOSE_", "OTO_"))}
     env.update({
@@ -327,12 +419,18 @@ def _run(inst, tmp_path, fakebin, *args, containers=(PG, PROXY), real_config=Fal
         "FAKE_CURL_LOG": str(tmp_path / "curl.log"),
         "FAKE_RAW_ROOT": str(tmp_path / "raw"),
         "FAKE_RUN_LOG": str(tmp_path / "run.log"),
+        "FAKE_SLEEP_LOG": str(tmp_path / "sleep.log"),
     })
     if real_config:
         env["REAL_DOCKER"] = REAL_DOCKER
     env.update(extra)
+    return env
+
+
+def _run(inst, tmp_path, fakebin, *args, containers=(PG, PROXY), real_config=False, **extra):
     return subprocess.run(
-        ["bash", str(SCRIPTS / "upgrade.sh"), *args], cwd=inst, env=env,
+        ["bash", str(SCRIPTS / "upgrade.sh"), *args], cwd=inst,
+        env=_env(tmp_path, fakebin, containers, real_config, **extra),
         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120,
     )
 
@@ -654,7 +752,9 @@ def test_no_running_postgres_stops_before_anything_changes(tmp_path, fakebin, ra
     before = _tree(inst)
     r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=(EVIL_PG, PROXY))
     assert r.returncode != 0
-    assert "no running otodock-postgres" in r.stderr
+    # Another project's container named for the database is never taken for it.
+    assert ("no container of the project otodock is OtoDock's database. These projects have an otodock-postgres "
+            "service: otodock-x-mcp-otodock-postgres.") in _said(r)
     assert _tree(inst) == before
     assert _snapshots(inst) == []
     assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
@@ -677,6 +777,11 @@ def test_a_failure_before_up_puts_the_files_back(tmp_path, fakebin, raw, failure
     assert not _did(tmp_path, "up")
     assert "back as they were" in _said(r)
     assert "nothing was migrated" in _said(r)
+    # Old files beside an override that already names otodock-compute: compose refuses
+    # the folder, and the run that put them back is the one that says so.
+    refused = ("docker compose refuses this folder's files now. If your override names otodock-compute, run the "
+               "update again, or take that part out to use docker compose until you do: 1.6.1 has no such service.")
+    assert (refused in _said(r)) == ("FAKE_BARE_CONFIG_RC" in failure)
     (snap,) = _snapshots(inst)
     assert list(snap.glob("*.sql.gz"))  # the dump is kept
     assert not list(inst.glob("*.upgrade-tmp"))
@@ -792,6 +897,39 @@ def test_a_rollback_that_cannot_start_the_old_release_says_what_to_do(tmp_path, 
     assert "docker ps -a --filter label=com.docker.compose.project=otodock" in said
     assert "back on 1.6.1, with the files" not in said
     assert _tree(inst) == before  # the files went back before the second up
+    assert "holds new work" not in said  # this server was never asked to hold any
+    # The old files went back beside an override that names otodock-compute, which the
+    # old release does not have: compose refuses the folder, and the person is told why.
+    refused = ("docker compose refuses this folder's files now. If your override names otodock-compute, take that "
+               "part out first: 1.6.1 has no such service.")
+    assert refused not in said
+    (tmp_path / "docker.log").unlink()
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_UP_RC="1", FAKE_UP_AGAIN_RC="1", FAKE_REFUSED_AFTER_UP="1",
+             FAKE_STATUS="exited", FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, NEVER_PROXY]))
+    assert r.returncode == 1 and "putting 1.6.1 back did not finish" in _said(r)
+    assert refused in _said(r)
+
+
+def test_a_rollback_to_files_compose_refuses_starts_nothing(tmp_path, fakebin, raw):
+    """The old files go back beside an override that names otodock-compute:
+    compose refuses them, so an up cannot start the old release. The
+    rollback tried it anyway, met the old server still running and said it
+    was "still starting", waited for it and ran a third up. Now it runs no
+    up after the files are back and says why the folder is refused."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_UP_RC="1", FAKE_UP_AGAIN_RC="1", FAKE_REFUSED_AFTER_UP="1",
+             FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, PROXY]))
+    said = _said(r)
+    assert r.returncode == 1 and "putting 1.6.1 back did not finish" in said
+    assert [a for a in _calls(tmp_path) if a[:2] == ["compose", "up"]] == [_calls_up_once(tmp_path)]
+    assert "still starting" not in said and "starting 1.6.1 again" not in said
+    assert ("docker compose refuses this folder's files now. If your override names otodock-compute, take that "
+            "part out first: 1.6.1 has no such service.") in said
+
+
+def _calls_up_once(tmp_path) -> list[str]:
+    (first,) = [a for a in _calls(tmp_path) if a[:2] == ["compose", "up"]][:1]
+    return first
 
 
 def _never_undone(r, inst) -> None:
@@ -853,7 +991,7 @@ def test_a_named_project_is_the_one_every_lookup_and_compose_call_takes(tmp_path
     r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=(PG, PROXY),
              OTODOCK_COMPOSE_PROJECT="otodock-b")
     assert r.returncode != 0
-    assert "no running otodock-postgres container found" in r.stderr
+    assert "no container of the project otodock-b is OtoDock's database" in _said(r)
     assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
     (tmp_path / "docker.log").unlink()
     r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=(mine(PG), mine(PROXY)),
@@ -873,6 +1011,148 @@ def test_a_named_project_is_the_one_every_lookup_and_compose_call_takes(tmp_path
     assert set((tmp_path / "env.log").read_text().split()) == {"otodock"}
     (snap,) = _snapshots(inst)
     assert "project=otodock-b" in (snap / "manifest").read_text().splitlines()
+
+
+# ── the project when docker compose refuses the folder's files ───────────────
+
+# The fix the update's own refusal asks for: an override that names
+# otodock-compute, under an installed release whose compose file has no such
+# service. Compose then refuses the folder until the update ran.
+NO_PARSE = {"FAKE_PARSE_RC": "1"}
+REFUSED_FOLDER = ("docker compose does not accept this folder's files, and the containers started from this folder "
+                  "name no single project.")
+RUN_AGAIN_NAMED = "Run again with OTODOCK_COMPOSE_PROJECT=<the project of this install>."
+
+
+def _of(c: dict, project: str, folder, **more) -> dict:
+    """``c`` as a container docker compose started from ``folder`` in ``project``."""
+    return dict(c, id=f"{c['id']}-{project}", **more,
+                labels={**c["labels"], "com.docker.compose.project": project,
+                        "com.docker.compose.project.working_dir": str(folder)})
+
+
+def _projects_used(tmp_path) -> set[str]:
+    """The project every label lookup named, and the one every compose pull, stop and up ran under."""
+    named = {a[i + 1].rpartition("=")[2] for a in _calls(tmp_path) if a[:1] == ["ps"] for i, x in enumerate(a)
+             if x == "--filter" and a[i + 1].startswith("label=com.docker.compose.project=")}
+    return named | set((tmp_path / "env.log").read_text().split())
+
+
+@pytest.mark.parametrize("project", ["otodock", "acme"])
+def test_a_folder_compose_refuses_takes_the_project_of_its_own_containers(tmp_path, fakebin, raw, project):
+    """Under the name ``otodock``, a guess, a second stack would start beside
+    the running one on the same named volumes, a second Postgres on the live
+    data folder among them. The project is read from the containers this
+    folder started, another install on the same daemon is never taken, and
+    --no-db-backup changes nothing of it."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    mine = [_of(c, project, inst) for c in (PG, PROXY, PHONE)]
+    theirs = [_of(c, "other", tmp_path / "elsewhere") for c in (PG, PROXY)]
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--no-db-backup", containers=(*theirs, *mine), **NO_PARSE,
+             FAKE_ENV_LOG=str(tmp_path / "env.log"))
+    assert r.returncode == 0, r.stderr
+    assert _did(tmp_path, "up") and _projects_used(tmp_path) == {project}
+    # With the dump: this project's database, never the other install's.
+    (tmp_path / "docker.log").unlink()
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=(*theirs, *mine), **NO_PARSE,
+             FAKE_ENV_LOG=str(tmp_path / "env.log"))
+    assert r.returncode == 0, r.stderr
+    dumps = [a for a in _calls(tmp_path) if a[:1] == ["exec"] and "pg_dump" in a]
+    assert [a[1] for a in dumps] == [f"pg-t2-{project}"]
+    (snap,) = [s for s in _snapshots(inst) if (s / "manifest").is_file()]
+    assert f"project={project}" in (snap / "manifest").read_text().splitlines()
+
+
+@pytest.mark.parametrize("containers", ["none", "another-folder", "two-projects"])
+def test_a_folder_compose_refuses_with_no_single_project_stops_the_update(tmp_path, fakebin, raw, containers):
+    """No container of this folder says the project (the stack was removed,
+    the folder was moved), or two projects were started from it: the update
+    stops before it reads or changes anything, and never guesses a name."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    before = _tree(inst)
+    found = {"none": [],
+             "another-folder": [_of(c, "acme", tmp_path / "elsewhere") for c in (PG, PROXY)],
+             "two-projects": [_of(PG, "acme", inst), _of(PROXY, "acme", inst), _of(PROXY, "old", inst)]}[containers]
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--no-db-backup", containers=found, **NO_PARSE)
+    assert r.returncode == 1
+    # The refusal names the projects that hold a database, and never says which one to take.
+    dbs = "" if containers == "none" else " These projects have an otodock-postgres service: acme."
+    assert f"{REFUSED_FOLDER}{dbs} {RUN_AGAIN_NAMED}" in _said(r)
+    assert "unless you changed it" not in _said(r)
+    assert _tree(inst) == before and _snapshots(inst) == []
+    assert not [a for a in _calls(tmp_path) if a[:1] in (["compose"], ["exec"], ["run"]) and a[:2] != ["compose", "version"]
+                and a != ["compose", "config"]]
+    # Named by the person, the project is taken as said.
+    started = json.dumps([_of(PG, "acme", inst), _of(PROXY, "acme", inst)])
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--no-db-backup", containers=found, **NO_PARSE,
+             OTODOCK_COMPOSE_PROJECT="acme", FAKE_ENV_LOG=str(tmp_path / "env.log"),
+             FAKE_CONTAINERS_AFTER_UP=started)
+    assert r.returncode == 0, r.stderr
+    assert _projects_used(tmp_path) == {"acme"}
+
+
+HOLDS_NO_DATABASE = ("no container of the project otodock is OtoDock's database. These projects have an "
+                     "otodock-postgres service: acme. Run again with OTODOCK_COMPOSE_PROJECT=<the project of this "
+                     "install>. If none is, start this install's stack first.")
+
+
+@pytest.mark.parametrize("how", ["typed", "typed-folder-refused", "resolved-by-compose"])
+def test_a_project_that_holds_no_database_stops_the_update(tmp_path, fakebin, raw, how):
+    """The folder was moved or its containers removed, and the project is a
+    name no container carries: typed after the refusal's hint, or the one
+    compose makes of a new folder's name. Another project's database runs
+    on this daemon. With --no-db-backup nothing else stopped the update
+    before `up`, so a second stack would start beside the one that runs, on
+    the same named volumes. The update refuses before it reads or changes
+    anything and names the projects that hold a database."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    before = _tree(inst)
+    theirs = [_of(c, "acme", tmp_path / "elsewhere") for c in (PG, PROXY)]
+    env = {"typed": {"OTODOCK_COMPOSE_PROJECT": "otodock"},
+           "typed-folder-refused": {"OTODOCK_COMPOSE_PROJECT": "otodock", **NO_PARSE},
+           "resolved-by-compose": {}}[how]
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--no-db-backup", containers=theirs, **env)
+    assert r.returncode == 1
+    assert HOLDS_NO_DATABASE in _said(r)
+    assert not _did(tmp_path, "up") and not _did(tmp_path, "pull")
+    assert _tree(inst) == before and _snapshots(inst) == []
+    # A daemon with no OtoDock database at all checks nothing: the name is taken as before.
+    (tmp_path / "docker.log").unlink()
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--no-db-backup", containers=(PROXY,), **env)
+    assert HOLDS_NO_DATABASE not in _said(r)
+
+
+def test_a_folder_compose_refuses_is_found_through_a_link_and_with_its_containers_stopped(tmp_path, fakebin, raw):
+    """Compose records the folder as the shell named it or as the disk does:
+    both are tried. Stopped containers still say their project. With the
+    stack stopped the dump has no database to read, and the script names a
+    start that works while compose refuses the folder."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    link = tmp_path / "link"
+    link.symlink_to(inst)
+    for recorded in (link, inst):
+        (tmp_path / "docker.log").unlink(missing_ok=True)
+        (tmp_path / "env.log").unlink(missing_ok=True)
+        mine = [_of(c, "acme", recorded) for c in (PG, PROXY)]
+        r = subprocess.run(["bash", str(SCRIPTS / "upgrade.sh"), "--to", "1.7.0", "--no-db-backup"], cwd=link,
+                           env=_env(tmp_path, fakebin, mine, PWD=str(link), **NO_PARSE,
+                                    FAKE_ENV_LOG=str(tmp_path / "env.log")),
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, r.stderr
+        assert _projects_used(tmp_path) == {"acme"}
+    (tmp_path / "docker.log").unlink()
+    stopped = [_of(c, "acme", inst, running=False) for c in (PG, PROXY)]
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=stopped, **NO_PARSE)
+    assert r.returncode == 1
+    assert ("no running otodock-postgres container found: start the database (docker start pg-t2-acme) and re-run, "
+            "or pass --no-db-backup when you have a fresh backup of your own.") in _said(r)
+    assert "docker compose up -d" not in _said(r)
+    assert not _did(tmp_path, "pull") and not _did(tmp_path, "up")
+    (tmp_path / "docker.log").unlink()
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--no-db-backup", containers=stopped, **NO_PARSE,
+             FAKE_ENV_LOG=str(tmp_path / "env.log"))
+    assert r.returncode == 0, r.stderr
+    assert _projects_used(tmp_path) == {"acme"}
 
 
 def test_optional_example_files_fail_quietly(tmp_path, fakebin, raw):
@@ -1002,12 +1282,20 @@ def _runs(tmp_path) -> list[dict]:
 
 
 def _order(tmp_path) -> list[str]:
-    """pull, carry, up as they ran: `docker cp` and `compose run` are the two
-    ends of one pipeline (they start together), so either is "carry"."""
+    """pull, carry, drain, stop, up (and resume) as they ran: `docker cp` and
+    `compose run` are the two ends of one pipeline (they start together), so
+    either is "carry"; drain and resume are the admin command line's verbs
+    run in the server container."""
     steps: list[str] = []
     for a in _calls(tmp_path):
-        step = "carry" if a[:1] == ["cp"] else (
-            next((s for s in ("pull", "run", "up") if s in a), "") if a[:1] == ["compose"] else "")
+        if a[:1] == ["cp"]:
+            step = "carry"
+        elif a[:1] == ["exec"] and a[2:4] == ADMIN_CLI:
+            step = a[4]
+        elif a[:1] == ["compose"]:
+            step = next((s for s in ("pull", "run", "stop", "up") if s in a), "")
+        else:
+            step = ""
         step = "carry" if step == "run" else step
         if step and (not steps or steps[-1] != step):
             steps.append(step)
@@ -1232,6 +1520,24 @@ def test_a_value_that_is_not_yes_or_no_warns_in_the_dry_run_and_stops_the_real_r
     assert not _did(tmp_path, "pull") and not _did(tmp_path, "up")
 
 
+def test_a_second_run_that_stops_in_its_checks_says_why_compose_refuses_the_folder(tmp_path, fakebin, raw_1_8):
+    """The admin added otodock-compute to the override, as the first run's
+    refusal asked, and the second run stops in a check of its own. The folder
+    stays one docker compose refuses, and the stop says so, as a stop after
+    the files were written already does."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + BAD_YESNO)
+    mine = [_of(c, "otodock", inst) for c in (PG, PROXY)]
+    r = _run(inst, tmp_path, fakebin, "--to", "1.8.0", containers=mine, **NO_PARSE, FAKE_BARE_CONFIG_RC="1")
+    said = _said(r)
+    assert r.returncode != 0 and "not yes/no words" in said and "stopped before changing anything" in said
+    assert ("docker compose refuses this folder's files now. If your override names otodock-compute, run the update "
+            "again, or take that part out to use docker compose until you do: 1.6.1 has no such service.") in said
+    # A folder compose accepts is told nothing of it.
+    (tmp_path / "docker.log").unlink()
+    r = _run(inst, tmp_path, fakebin, "--to", "1.8.0")
+    assert "stopped before changing anything" in _said(r) and "refuses this folder's files" not in _said(r)
+
+
 def test_the_yes_no_rule_is_judged_only_for_a_target_of_1_8_0_or_later(tmp_path, fakebin, raw):
     inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + BAD_YESNO)
     r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--dry-run")
@@ -1435,3 +1741,688 @@ def test_a_scheme_value_in_the_shell_is_named_and_set_aside(tmp_path, fakebin, c
     assert r.returncode == 0, r.stderr
     assert "your shell sets COLLABORA_SSL_TERMINATION" in r.stderr
     assert "COLLABORA_SSL_TERMINATION=true" in (inst / ".env").read_text()
+
+
+# ── the wait for open work before the swap ───────────────────────────────────
+
+CANNOT_WAIT = ("This install runs {}, which cannot wait for open work. Chats and tasks that are "
+               "running when the update starts are cut, and they do not continue by themselves. "
+               "Run the update when nothing is running. From 2.0 on an update waits for open work.")
+PAUSE = "Press Ctrl+C to stop now. The update goes on in 10 seconds."
+NO_ANSWER = ("The running server did not say it had finished, so the update does not wait. "
+             "Open work is cut and continues after the update.")
+ON_2_1 = SECRET_ENV + PHONE_LINE + "OTODOCK_VERSION=2.1.0\n"
+ON_2_0 = SECRET_ENV + PHONE_LINE + "OTODOCK_VERSION=2.0.0\n"
+ON_1_9_1 = SECRET_ENV + PHONE_LINE + "OTODOCK_VERSION=1.9.1\n"
+# A candidate of 1.9.1: older than 2.0, and old enough to update to it.
+ON_1_9_1_RC = SECRET_ENV + PHONE_LINE + "OTODOCK_VERSION=1.9.1-rc2\n"
+
+
+@pytest.fixture
+def raw_2_1(raw):
+    """The published files of v2.1.0 as well: an upgrade from 2.0.0 has a target."""
+    rel = raw / "v2.1.0"
+    (rel / "scripts").mkdir(parents=True)
+    (rel / "docker-compose.yml").write_text("# the 2.1.0 base file\n")
+    (rel / "docker-compose.phone.yml").write_text("# the 2.1.0 phone overlay\n")
+    shutil.copy2(SCRIPTS / "compose_mounts.py", rel / "scripts" / "compose_mounts.py")
+    return raw
+
+
+def _admin(tmp_path) -> list[list[str]]:
+    """Every admin command line call the script ran in a container."""
+    return [a for a in _calls(tmp_path) if a[:1] == ["exec"] and a[2:4] == ADMIN_CLI]
+
+
+def _sleeps(tmp_path) -> list[str]:
+    log = tmp_path / "sleep.log"
+    return log.read_text().split() if log.exists() else []
+
+
+def _words(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_no_script_run_here_names_a_host_command_without_a_fake(tmp_path, fakebin):
+    """upgrade.sh and install.sh run with the host's PATH behind the fakes: a
+    script may name systemctl, loginctl or sudo only while the fake folder
+    holds it, and every fake is what its name resolves to."""
+    fakes = {p.name for p in fakebin.iterdir()}
+    assert {"docker", "curl", "ip", "sleep"} <= fakes
+    for script in ("upgrade.sh", "install.sh"):
+        assert host_commands_named(SCRIPTS / script) <= fakes, script
+    for name in sorted(fakes):
+        found = subprocess.run(["bash", "-c", f"command -v {name}"], env=_env(tmp_path, fakebin),
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+        assert found == str(fakebin / name), name
+
+
+@pytest.mark.parametrize("carry, order", [
+    ({}, ["pull", "drain", "stop", "up", "resume"]),
+    ({**BIN_TARGET, "FAKE_DIFF_BIN": "1"}, ["pull", "carry", "drain", "stop", "up", "resume"]),
+], ids=["no-bin-to-carry", "after-the-carry"])
+def test_a_server_of_2_0_waits_for_open_work_between_the_pull_and_the_swap(
+        tmp_path, fakebin, raw_2_1, carry, order):
+    inst = _install(tmp_path, ON_2_0)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG, PROXY, COLLABORA), **carry)
+    assert r.returncode == 0, r.stderr
+    assert _order(tmp_path) == order
+    assert _admin(tmp_path) == [["exec", "proxy-t2", *ADMIN_CLI, "drain", "--bound", "600"],
+                                ["exec", "proxy-t2", *ADMIN_CLI, "resume"]]
+    # The verb's own lines, as the script's.
+    assert "upgrade.sh: waiting for open work, up to 10 minutes, before the swap\n" in r.stdout
+    assert "upgrade.sh: Waiting for open work: 2 turns. Up to 10 minutes.\n" in r.stdout
+    assert "upgrade.sh: Nothing is working. New work is held until the platform is back.\n" in r.stdout
+    assert "cannot wait for open work" not in r.stdout and NO_ANSWER not in r.stderr
+    # The swap is one up of the whole stack.
+    ups = [a for a in _calls(tmp_path) if a[:2] == ["compose", "up"]]
+    assert ups == [["compose", "up", "-d", "--remove-orphans"]]
+    assert "done: this install runs 2.1.0 (was 2.0.0)" in r.stdout
+
+
+@pytest.mark.parametrize("env_line, shell, bound, words", [
+    ("OTODOCK_DRAIN_BOUND_S=120\n", {}, "120", "2 minutes"),
+    ("OTODOCK_DRAIN_BOUND_S=120\n", {"OTODOCK_DRAIN_BOUND_S": "0"}, "0", "0 seconds"),
+    ("", {"OTODOCK_DRAIN_BOUND_S": "90"}, "90", "90 seconds"),
+    ("OTODOCK_DRAIN_BOUND_S=soon\n", {}, "600", "10 minutes"),
+])
+def test_the_wait_takes_its_bound_from_the_shell_then_the_env_file(
+        tmp_path, fakebin, raw_2_1, env_line, shell, bound, words):
+    inst = _install(tmp_path, ON_2_0 + env_line)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", "--dry-run", **shell)
+    assert r.returncode == 0, r.stderr
+    assert f"  - wait for open work, up to {words}, before the swap\n" in r.stdout
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", **shell)
+    assert r.returncode == 0, r.stderr
+    assert _admin(tmp_path)[0] == ["exec", "proxy-t2", *ADMIN_CLI, "drain", "--bound", bound]
+
+
+def test_a_candidate_of_2_0_can_wait_too(tmp_path, fakebin, raw_2_1):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + "OTODOCK_VERSION=2.0.0-rc1\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0")
+    assert r.returncode == 0, r.stderr
+    assert _order(tmp_path) == ["pull", "drain", "up", "resume"]
+    # The dump, the wait and its end are everything the script runs inside a container.
+    assert [a for a in _changes(tmp_path) if a[:1] == ["exec"]] == [
+        ["exec", "pg-t2", "pg_dump", "-U", "otodock", "--clean", "--if-exists", "otodock"],
+        ["exec", "proxy-t2", *ADMIN_CLI, "drain", "--bound", "600"],
+        ["exec", "proxy-t2", *ADMIN_CLI, "resume"]]
+
+
+@pytest.mark.parametrize("env_text, runs", [(ON_1_9_1, "1.9.1"), (ON_1_9_1_RC, "1.9.1-rc2")], ids=["1.9.1", "1.9.1-rc2"])
+def test_a_server_older_than_2_0_is_asked_nothing_and_the_script_says_so(
+        tmp_path, fakebin, raw_2_1, env_text, runs):
+    inst = _install(tmp_path, env_text)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", "--dry-run", containers=(PG, PROXY, COLLABORA))
+    assert r.returncode == 0, r.stderr
+    said = _words(r.stdout)
+    assert said.count(CANNOT_WAIT.format(runs)) == 1
+    assert said.index("cannot wait for open work") < said.index("dry run: nothing is changed")
+    assert "wait for open work, up to" not in said and PAUSE not in said
+    assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
+    assert _tree(inst) == before
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG, PROXY, COLLABORA))
+    assert r.returncode == 0, r.stderr
+    said = _words(r.stdout)
+    assert said.count(CANNOT_WAIT.format(runs)) == 1
+    assert said.index("cannot wait for open work") < said.index("backing up the database")
+    # No terminal: the run goes on at once.
+    assert PAUSE not in said and "10" not in _sleeps(tmp_path)
+    execs = [a for a in _changes(tmp_path) if a[:1] == ["exec"]]
+    assert execs == [["exec", "pg-t2", "pg_dump", "-U", "otodock", "--clean", "--if-exists", "otodock"]]
+    assert _order(tmp_path) == ["pull", "stop", "up"]
+
+
+def test_an_unknown_release_is_asked_nothing_either(tmp_path, fakebin, raw_2_1):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    (inst / "docker-compose.yml").write_text(
+        "services:\n  otodock-proxy:\n    image: ghcr.io/otodock/otodock-proxy:latest\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0")
+    assert r.returncode == 0, r.stderr
+    assert CANNOT_WAIT.format("an older release") in _words(r.stdout)
+    assert _admin(tmp_path) == [] and _order(tmp_path) == ["pull", "up"]
+
+
+@pytest.mark.parametrize("rc, said", [
+    ("1", NO_ANSWER),
+    ("3", "No server is running, so no work is open. The update goes on."),
+    ("2", "The running server is older than 2.0 and cannot wait. Open work is cut by the update."),
+])
+def test_a_drain_the_server_does_not_answer_warns_and_the_upgrade_goes_on(tmp_path, fakebin, raw_2_1, rc, said):
+    """Each answer of the drain has its sentence (3: nothing runs, 2: an older
+    command line), and the old server's last log lines stay with the run's
+    files: its own log leaves with its container."""
+    inst = _install(tmp_path, ON_2_0)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", FAKE_DRAIN_RC=rc)
+    assert r.returncode == 0, r.stderr
+    assert f"upgrade.sh: {said}\n" in r.stderr
+    # What the verb said is passed on.
+    assert "upgrade.sh: admin_cli: The server did not answer the drain." in r.stdout
+    assert _order(tmp_path) == ["pull", "drain", "up", "resume"]
+    assert "done: this install runs 2.1.0 (was 2.0.0)" in r.stdout
+    [log] = list((inst / "backups").glob("upgrade-*/otodock-proxy.log"))
+    assert log.read_text() == "old server: its last line before the swap\n"
+
+
+def test_an_older_server_asked_nothing_still_leaves_its_last_log_lines(tmp_path, fakebin, raw_2_1):
+    inst = _install(tmp_path, ON_1_9_1)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0")
+    assert r.returncode == 0, r.stderr
+    assert _admin(tmp_path) == []
+    calls = _calls(tmp_path)
+    logs = [i for i, a in enumerate(calls) if a[:1] == ["logs"]]
+    up = next(i for i, a in enumerate(calls) if a[:1] == ["compose"] and "up" in a)
+    assert logs and logs[0] < up
+    assert list((inst / "backups").glob("upgrade-*/otodock-proxy.log"))
+
+
+def test_no_running_server_means_nothing_to_wait_for(tmp_path, fakebin, raw_2_1):
+    inst = _install(tmp_path, ON_2_0)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", "--dry-run", containers=(PG,))
+    assert r.returncode == 0 and "wait for open work" not in r.stdout
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG,),
+             FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, PROXY]))
+    assert r.returncode == 0, r.stderr
+    assert _admin(tmp_path) == [] and _order(tmp_path) == ["pull", "up"]
+
+
+def test_the_dry_run_names_the_wait_and_asks_the_server_nothing(tmp_path, fakebin, raw_2_1):
+    inst = _install(tmp_path, ON_2_0)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", "--dry-run", containers=(PG, PROXY, COLLABORA))
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    wait = lines.index("  - wait for open work, up to 10 minutes, before the swap")
+    assert lines.index("  - run docker compose pull") < wait
+    assert wait < lines.index("  - stop Collabora (its open documents save to the running server)")
+    assert "cannot wait for open work" not in r.stdout
+    assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
+    assert _tree(inst) == before
+
+
+def test_a_run_stopped_while_the_server_waits_calls_the_drain_off(tmp_path, fakebin, raw_2_1):
+    """The operator stops the run during the wait: nothing was swapped, so
+    the files go back and the server is told to take new work again."""
+    inst = _install(tmp_path, ON_2_0)
+    before = _tree(inst)
+    hold = tmp_path / "hold"
+    hold.mkdir()
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPTS / "upgrade.sh"), "--to", "2.1.0"], cwd=inst,
+        env=_env(tmp_path, fakebin, FAKE_DRAIN_HOLD=str(hold)),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 60
+        while not (hold / "started").exists():
+            assert proc.poll() is None and time.monotonic() < deadline, "the drain never started"
+            time.sleep(0.05)
+        proc.terminate()
+    finally:
+        (hold / "release").touch()
+        _out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 143, err
+    assert _order(tmp_path) == ["pull", "drain", "resume"]
+    assert _admin(tmp_path)[-1] == ["exec", "proxy-t2", *ADMIN_CLI, "resume"]
+    assert "back as they were" in _words(err)
+    assert _tree(inst) == before
+    assert not _did(tmp_path, "stop") and not _did(tmp_path, "up")
+
+
+def test_an_up_rolled_back_after_the_wait_calls_the_drain_off(tmp_path, fakebin, raw_2_1):
+    # The old server never stopped (the shape Compose 2.26 leaves): it holds
+    # new work until it is told the update is off.
+    inst = _install(tmp_path, ON_2_0)
+    waiting = dict(NEVER_PROXY, name="0123456789ab_otodock-otodock-proxy-1")
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", FAKE_UP_RC="1",
+             FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, PROXY, waiting]))
+    assert r.returncode == 1, r.stderr
+    assert "this install is back on 2.0.0" in _said(r)
+    assert _order(tmp_path) == ["pull", "drain", "up", "resume"]
+    assert _admin(tmp_path)[-1] == ["exec", "proxy-t2", *ADMIN_CLI, "resume"]
+
+
+def test_a_rollback_that_stops_says_how_long_new_work_is_held(tmp_path, fakebin, raw_2_1):
+    """Nothing calls the drain off here, since the script cannot say what runs:
+    the admin reads the limit and how to end it."""
+    inst = _install(tmp_path, ON_2_0)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", FAKE_UP_RC="1", FAKE_UP_AGAIN_RC="1",
+             FAKE_STATUS="exited", FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, NEVER_PROXY]))
+    assert r.returncode == 1, r.stderr
+    said = _said(r)
+    assert "putting 2.0.0 back did not finish" in said
+    assert "It takes new work again by itself" in said and "within 15 minutes" in said
+    assert "bash otodock-admin.sh resume" in said
+
+
+def test_a_failure_once_the_swap_started_calls_the_drain_off(tmp_path, fakebin, raw_2_1):
+    """The old server may still run, and it would hold new work for 15 minutes
+    with no reason given. To a new one the call means nothing."""
+    inst = _install(tmp_path, ON_2_0)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", FAKE_HEALTH="starting", OTODOCK_UPGRADE_WAIT_S="0")
+    assert r.returncode != 0 and "may already be migrated" in _said(r)
+    assert [a[4] for a in _admin(tmp_path)] == ["drain", "resume"]
+
+
+def test_an_update_that_recreates_nothing_ends_not_holding(tmp_path, fakebin, raw_2_1):
+    """A run on the version it is on, the script's own advice after a failure:
+    up recreates nothing, so the server that drained is the one that answers.
+    It takes new work again before the script says done."""
+    inst = _install(tmp_path, ON_2_1)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0")
+    assert r.returncode == 0, r.stderr
+    assert "its compose files and .env lines" in _words(r.stdout)
+    assert [a[4] for a in _admin(tmp_path)] == ["drain", "resume"]
+    calls = _calls(tmp_path)
+    up = max(i for i, a in enumerate(calls) if a[:2] == ["compose", "up"])
+    resume = next(i for i, a in enumerate(calls) if a[:1] == ["exec"] and a[2:5] == [*ADMIN_CLI, "resume"])
+    assert up < resume
+    assert "done: this install runs 2.1.0" in r.stdout
+
+
+def _at_a_terminal(inst, tmp_path, fakebin, *args, **extra) -> tuple[int, str]:
+    """upgrade.sh with a terminal on stdin, stdout and stderr: its exit
+    status and everything it printed."""
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(["bash", str(SCRIPTS / "upgrade.sh"), *args], cwd=inst,
+                                env=_env(tmp_path, fakebin, **extra),
+                                stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+        slave = -1
+        printed, deadline = b"", time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if not select.select([master], [], [], 1.0)[0]:
+                continue
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:  # the terminal closed with the script
+                break
+            if not chunk:
+                break
+            printed += chunk
+        return proc.wait(timeout=30), _words(printed.decode(errors="replace"))
+    finally:
+        for fd in (master, slave):
+            if fd >= 0:
+                os.close(fd)
+
+
+def test_at_a_terminal_an_update_that_cannot_wait_leaves_ten_seconds_to_stop(tmp_path, fakebin, raw_2_1):
+    inst = _install(tmp_path, ON_1_9_1)
+    rc, said = _at_a_terminal(inst, tmp_path, fakebin, "--to", "2.1.0", "--dry-run")
+    assert rc == 0, said
+    assert CANNOT_WAIT.format("1.9.1") in said and PAUSE not in said
+    assert "10" not in _sleeps(tmp_path)
+    rc, said = _at_a_terminal(inst, tmp_path, fakebin, "--to", "2.1.0")
+    assert rc == 0, said
+    assert said.index(CANNOT_WAIT.format("1.9.1")) < said.index(PAUSE) < said.index("backing up the database")
+    assert _sleeps(tmp_path).count("10") == 1
+    assert _admin(tmp_path) == []
+    # From 2.0 nothing is asked of the person: the server waits instead.
+    (tmp_path / "two").mkdir()
+    inst2 = _install(tmp_path / "two", ON_2_0)
+    rc, said = _at_a_terminal(inst2, tmp_path, fakebin, "--to", "2.1.0")
+    assert rc == 0, said
+    assert PAUSE not in said and _sleeps(tmp_path).count("10") == 1
+    assert [a[4] for a in _admin(tmp_path)] == ["drain", "resume"]
+
+
+# ── the compute machine: ROLL's wait after the swap, the shared folders ──────
+
+COMPUTE = {"id": "compute-t2", "labels": {"com.docker.compose.project": "otodock",
+                                          "com.docker.compose.service": "otodock-compute"}}
+
+
+def test_after_the_swap_the_update_waits_for_the_compute_machine(tmp_path, fakebin, raw_2_1):
+    """ROLL is the list the wait walks: the server's health, then the
+    compute machine's sign-in. The one drain before the swap runs in the
+    server's container, never in the compute machine's."""
+    inst = _install(tmp_path, ON_2_0)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG, PROXY, COMPUTE))
+    assert r.returncode == 0, r.stderr
+    said = _words(r.stdout)
+    assert said.index("waiting for open work") < said.index("waiting for the server to report healthy")
+    assert said.index("waiting for the server to report healthy") < said.index(
+        "waiting for the compute machine to sign in") < said.index("done: this install runs 2.1.0")
+    assert "The compute machine is signed in." in said
+    admin = _admin(tmp_path)
+    assert {a[1] for a in admin} == {"proxy-t2"}
+    assert ["exec", "proxy-t2", *ADMIN_CLI, "compute", "--wait", "300"] in admin
+
+
+def test_a_compute_machine_that_does_not_sign_in_is_said_and_the_update_ends(tmp_path, fakebin, raw_2_1):
+    inst = _install(tmp_path, ON_2_0)
+    line = ("The compute machine is not signed in. Claude Code and Codex chats run on the "
+            "platform itself until it is.")
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG, PROXY, COMPUTE),
+             FAKE_COMPUTE_RC="1", FAKE_COMPUTE_LINE=line, OTODOCK_UPGRADE_WAIT_S="60")
+    assert r.returncode == 0, r.stderr
+    assert line in _words(r.stdout) and "done: this install runs 2.1.0" in _words(r.stdout)
+    assert (f"It may still be preparing its tools. To see why, run docker compose logs otodock-compute in {inst}."
+            in _words(r.stderr))
+    assert ["exec", "proxy-t2", *ADMIN_CLI, "compute", "--wait", "60"] in _admin(tmp_path)
+
+
+def test_an_install_without_a_compute_service_is_not_waited_for(tmp_path, fakebin, raw_2_1):
+    inst = _install(tmp_path, ON_2_0)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0")
+    assert r.returncode == 0, r.stderr
+    assert "compute machine" not in _words(r.stdout)
+    assert not any("compute" in a for a in _admin(tmp_path))
+
+
+SPLIT = ("Your compose override mounts {} for otodock-proxy only. Chats run in otodock-compute, which must see "
+         "the same folders. Add the same mounts under otodock-compute in your override, then run the update again "
+         "right away: OTODOCK_COMPOSE_PROJECT={} bash upgrade.sh --to {}")
+# Said when the installed release's compose file has no otodock-compute: the fixed override breaks it.
+UNTIL_THEN = ("Until then docker compose in this folder refuses the override, because {} has no otodock-compute. "
+              "The running containers are not affected.")
+
+
+UNTOUCHED = "stopped before changing anything: the running stack was not touched."
+
+
+def _compares(tmp_path) -> list[list[str]]:
+    """Each run of the folders' compare: a container of an image, its Python as the entrypoint."""
+    return [a for a in _calls(tmp_path) if a[:1] == ["run"] and "--entrypoint" in a]
+
+
+def test_an_override_that_moves_a_shared_folder_for_the_proxy_alone_stops_the_update(tmp_path, fakebin, raw_2_1):
+    """The compute machine would work in another folder, and nothing else runs
+    a chat. The update stops before the dump and before the pull: it names
+    each folder, the fix and the exact second run, and nothing of the install
+    was touched or written."""
+    inst = _install(tmp_path, ON_2_0)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG, dict(PROXY, image="sha256:old"), COMPUTE),
+             FAKE_SPLIT="/opt/otodock/agents\n/opt/my-tools", **BIN_TARGET, FAKE_DIFF_BIN="1")
+    assert r.returncode == 1
+    assert SPLIT.format("/opt/otodock/agents, /opt/my-tools", "otodock", "2.1.0") in _said(r)
+    # The installed file has no otodock-compute here: the person is told what the fix does to the folder.
+    assert UNTIL_THEN.format("2.0.0") in _said(r)
+    assert UNTOUCHED in _said(r) and "back as they were" not in _said(r)
+    assert _tree(inst) == before and _snapshots(inst) == []
+    assert "OTODOCK_COMPUTE_SESSIONS" not in (inst / ".env").read_text()
+    # Read with the image of the server that runs, the target's own compare
+    # handed to its Python, and no network. No dump, no pull, no wait for
+    # open work, no copy of the recover bin.
+    (run,) = _compares(tmp_path)
+    at = run.index("--entrypoint")
+    assert run[at:at + 3] == ["--entrypoint", "/opt/otodock/proxy/venv/bin/python", "sha256:old"]
+    assert run[at + 3:] == ["-c", (SCRIPTS / "compose_mounts.py").read_text().rstrip("\n")]
+    assert run[run.index("--network") + 1] == "none" and "--rm" in run
+    assert _order(tmp_path) == [] and not _admin(tmp_path)
+    assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
+    # What it compared: the files the upgraded stack loads, the new base file standing in for the old.
+    read = [a for a in _calls(tmp_path) if a[:1] == ["compose"] and a[-3:] == ["config", "--format", "json"]]
+    assert read and all(any(x.endswith("/new/docker-compose.yml") for x in a) for a in read)
+
+
+def test_the_compare_runs_for_real_on_the_files_the_upgraded_stack_loads(tmp_path, fakebin, raw_2_1):
+    """The script's text is handed to the image's Python whole, and what it
+    prints is what the person reads: the agents folder moved for the proxy
+    alone, and a sandbox option the override still hands the proxy."""
+    def vol(source, target):
+        return {"type": "volume", "source": source, "target": target}
+    config = {"services": {
+        "otodock-proxy": {"volumes": [vol("/srv/agents", "/opt/otodock/agents"),
+                                      vol("otodock-skills", "/opt/otodock/mcps/skills")],
+                          "security_opt": ["seccomp=unconfined", "no-new-privileges:true"]},
+        "otodock-compute": {"volumes": [vol("otodock-agents", "/opt/otodock/agents"),
+                                        vol("otodock-skills", "/opt/otodock/mcps/skills")]}}}
+    inst = _install(tmp_path, ON_2_0)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG, PROXY, COMPUTE),
+             FAKE_CONFIG_JSON=json.dumps(config))
+    assert r.returncode == 1
+    assert SPLIT.format("/opt/otodock/agents", "otodock", "2.1.0") in _said(r)
+    assert "Your compose override sets seccomp=unconfined for otodock-proxy." in _said(r)
+    assert UNTOUCHED in _said(r)
+
+
+def test_a_dry_run_says_the_override_would_stop_the_update(tmp_path, fakebin, raw_2_1):
+    inst = _install(tmp_path, ON_2_0)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", "--dry-run", containers=(PG, PROXY, COMPUTE),
+             FAKE_SPLIT="/opt/otodock/agents")
+    assert r.returncode == 0, r.stderr
+    assert SPLIT.format("/opt/otodock/agents", "otodock", "2.1.0") in _said(r)
+    assert "(the real run stops here)" in _said(r)
+    assert "dry run: nothing is changed" in r.stdout and _tree(inst) == before and _snapshots(inst) == []
+    assert _order(tmp_path) == []
+
+
+@pytest.mark.parametrize("server", ["none", "stopped", "older-without-the-compare"])
+def test_the_folders_are_compared_with_what_this_install_has(tmp_path, fakebin, raw_2_1, server):
+    """A stopped server's image compares as well as a running one's, before
+    anything changes. With no server container, or one whose image cannot
+    run the compare, the pulled image does it after the pull: the update
+    then stops before the swap and puts .env and the compose files back."""
+    inst = _install(tmp_path, ON_2_0)
+    before = _tree(inst)
+    extra = {"FAKE_SPLIT": "/opt/otodock/agents", "FAKE_IMAGES": "ghcr.io/otodock/otodock-proxy:2.1.0"}
+    containers = {"none": (PG,), "stopped": (PG, dict(PROXY, running=False, image="sha256:old")),
+                  "older-without-the-compare": (PG, dict(PROXY, image="sha256:old"))}[server]
+    if server == "older-without-the-compare":
+        (raw_2_1 / "v2.1.0" / "scripts" / "compose_mounts.py").unlink()     # not fetched: the image's own copy
+        # Its server holds a recover bin the update would carry: a refused update carries nothing.
+        extra.update(BIN_TARGET, FAKE_NO_COMPARE="sha256:old", FAKE_DIFF_BIN="1")
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=containers, **extra)
+    assert r.returncode == 1
+    assert SPLIT.format("/opt/otodock/agents", "otodock", "2.1.0") in _said(r)
+    assert _tree(inst) == before
+    images = [a[a.index("--entrypoint") + 2] for a in _compares(tmp_path)]
+    if server == "stopped":
+        assert images == ["sha256:old"] and UNTOUCHED in _said(r) and _order(tmp_path) == []
+    else:
+        assert images[-1] == "ghcr.io/otodock/otodock-proxy:2.1.0" and len(images) == (2 if server != "none" else 1)
+        assert "back as they were" in _said(r) and _order(tmp_path) == ["pull"]
+    # A dry run with no server to read the folders with says when they are compared.
+    if server == "none":
+        (tmp_path / "docker.log").unlink()
+        r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", "--dry-run", containers=containers, **extra)
+        assert r.returncode == 0, r.stderr
+        assert "compare the folders of otodock-proxy and otodock-compute (after the pull" in _words(r.stdout)
+        assert _compares(tmp_path) == []
+
+
+NOT_COMPARED = "the folders of your override could not be compared with otodock-compute's: compare them yourself."
+# What `docker compose config --format json` gives the compare when both services mount the same folders.
+MATCHED = {"FAKE_CONFIG_JSON": json.dumps({"services": {"otodock-proxy": {"volumes": []},
+                                                        "otodock-compute": {"volumes": []}}})}
+
+
+def test_a_compare_that_could_not_run_says_so(tmp_path, fakebin, raw_2_1):
+    """No server container to read the folders with, and the pulled image
+    cannot run the compare either: a split override would go through
+    unread, so the person is told to compare them. A compare that ran says
+    nothing of it, nor does a release that ships no compare."""
+    inst = _install(tmp_path, ON_2_0)
+    after = {"FAKE_CONTAINERS_AFTER_UP": json.dumps([PG, PROXY, COMPUTE])}
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG,), **after)
+    assert r.returncode == 0, r.stderr
+    assert NOT_COMPARED in _said(r)
+    (tmp_path / "docker.log").unlink()
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG, PROXY, COMPUTE), **MATCHED)
+    assert r.returncode == 0, r.stderr
+    assert _compares(tmp_path) and NOT_COMPARED not in _said(r)
+    (tmp_path / "docker.log").unlink()
+    (raw_2_1 / "v2.1.0" / "scripts" / "compose_mounts.py").unlink()
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG,), **after)
+    assert r.returncode == 0, r.stderr
+    assert NOT_COMPARED not in _said(r)
+
+
+def _rig_words() -> dict[str, str]:
+    """The sentences the rig's upgrade scenario looks for in the update's log, read from its file."""
+    import ast
+    found: dict[str, str] = {}
+    for node in ast.parse((REPO / "rig" / "upgrade" / "u10_upgrade.py").read_text()).body:
+        if not isinstance(node, ast.Assign):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except ValueError:
+            continue
+        target = node.targets[0]
+        pairs = [(target.id, value)] if isinstance(target, ast.Name) else zip((e.id for e in target.elts), value, strict=True)
+        found.update({name: v for name, v in pairs if isinstance(v, str)})
+    return found
+
+
+def test_the_rigs_upgrade_scenario_reads_a_refusal_as_the_script_prints_it(tmp_path, fakebin, candidate):
+    """The scenario judges the update by sentences of its log, with the line
+    breaks folded: the refusal wraps its lines. Every sentence it looks for
+    is one the script prints, a refused run prints none of the later steps'
+    words, and a run that goes through prints each of them."""
+    rig = _rig_words()
+    inst = _install(tmp_path, ON_1_9_1)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.0.0", "--compose-dir", str(candidate), FAKE_SPLIT="/opt/rig-bin")
+    words = _words(r.stdout + r.stderr)
+    assert r.returncode == 1
+    assert rig["PROXY_ALONE"] in words and rig["UNTOUCHED"] in words and rig["REFUSES_UNTIL"] in words
+    assert rig["AGAIN"].format("otodock", "2.0.0", candidate) in words
+    assert not any(rig[late] in words for late in ("DUMP", "PULL", "SWAP"))
+    (tmp_path / "docker.log").unlink()
+    r = _run(inst, tmp_path, fakebin, "--to", "2.0.0", "--compose-dir", str(candidate))
+    words = _words(r.stdout + r.stderr)
+    assert r.returncode == 0, r.stderr
+    assert all(rig[step] in words for step in ("DUMP", "PULL", "SWAP", "CANNOT_WAIT"))
+    assert rig["PROXY_ALONE"] not in words and rig["UNTOUCHED"] not in words
+
+
+def test_shared_folders_that_match_change_nothing(tmp_path, fakebin, raw_2_1):
+    inst = _install(tmp_path, ON_2_0 + "OTODOCK_COMPUTE_SESSIONS=local\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG, PROXY, COMPUTE), **MATCHED)
+    assert r.returncode == 0, r.stderr
+    assert "override" not in _words(r.stdout + r.stderr)
+    # A line an earlier build wrote is the server's to name at its start, never this script's.
+    assert "OTODOCK_COMPUTE_SESSIONS=local" in (inst / ".env").read_text().splitlines()
+    assert "OTODOCK_COMPUTE_SESSIONS" not in r.stdout + r.stderr
+    (summary,) = [ln for ln in r.stdout.splitlines() if ln.strip().startswith(".env:")]
+    assert _words(summary) == ".env: OTODOCK_VERSION=2.1.0"
+
+
+def test_a_sandbox_privilege_an_override_hands_the_proxy_is_named_and_kept(tmp_path, fakebin, raw_2_1):
+    """The proxy starts no sandbox. An override that still relaxes its
+    container widens nothing the install did not have: the update goes on,
+    says which lines can go, and where a profile set there for the chats
+    belongs now."""
+    inst = _install(tmp_path, ON_2_0)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG, PROXY, COMPUTE),
+             FAKE_SPLIT="proxy: seccomp=unconfined\nproxy: apparmor=otodock_userns\nproxy: /dev/net/tun")
+    assert r.returncode == 0, r.stderr
+    assert ("Your compose override sets seccomp=unconfined, apparmor=otodock_userns, /dev/net/tun for otodock-proxy. "
+            "The server needs none of it now: chats run in otodock-compute. You can delete those lines. If you set "
+            "an AppArmor profile there for the chats, set OTODOCK_APPARMOR_PROFILE in .env instead: otodock-compute "
+            "reads it.") in _said(r)
+    assert _said(r).count("Your compose override sets") == 1 and len(_compares(tmp_path)) == 1    # said once
+    assert "for otodock-proxy only" not in _said(r)
+    assert "done: this install runs 2.1.0" in _words(r.stdout)
+
+
+def test_the_update_has_finished_before_it_waits_for_the_compute_machine(tmp_path, fakebin, raw_2_1):
+    """A run on the same version takes new work again before the compute wait,
+    and a Ctrl+C in that wait never says the database may be migrated."""
+    inst = _install(tmp_path, ON_2_1)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.1.0", containers=(PG, PROXY, COMPUTE))
+    assert r.returncode == 0, r.stderr
+    assert [a[4] for a in _admin(tmp_path)] == ["drain", "resume", "compute"]
+    (tmp_path / "two").mkdir()
+    inst2 = _install(tmp_path / "two", ON_2_0)
+    r = _run(inst2, tmp_path / "two", fakebin, "--to", "2.1.0", containers=(PG, PROXY, COMPUTE),
+             FAKE_COMPUTE_SIGNAL="INT")
+    assert r.returncode != 0
+    assert "may already be migrated" not in _said(r)
+
+
+# ── the oldest release an update to 2.0 starts from ──────────────────────────
+
+OLDER_THAN_1_9_1 = ("This install runs {}. Update it to 1.9.1 first with bash upgrade.sh --to 1.9.1, "
+                    "then run this again.")
+LATEST_IMAGE = "services:\n  otodock-proxy:\n    image: ghcr.io/otodock/otodock-proxy:latest\n"
+
+
+@pytest.fixture
+def raw_2_0(raw_2_1):
+    """The published files of v1.9.1, v2.0.0 and v2.0.1 as well."""
+    for version in ("1.9.1", "2.0.0", "2.0.1"):
+        rel = raw_2_1 / f"v{version}"
+        (rel / "scripts").mkdir(parents=True)
+        (rel / "docker-compose.yml").write_text(f"# the {version} base file\n")
+        (rel / "docker-compose.phone.yml").write_text(f"# the {version} phone overlay\n")
+        shutil.copy2(SCRIPTS / "compose_mounts.py", rel / "scripts" / "compose_mounts.py")
+    return raw_2_1
+
+
+def _on(version: str) -> str:
+    return SECRET_ENV + PHONE_LINE + f"OTODOCK_VERSION={version}\n"
+
+
+def _refused_untouched(r, inst, before, tmp_path, runs: str) -> None:
+    assert r.returncode == 1
+    assert OLDER_THAN_1_9_1.format(runs) in _said(r)
+    assert _tree(inst) == before and not (inst / "backups").exists()
+    assert not any(_did(tmp_path, sub) for sub in ("pull", "stop", "up", "run"))
+    assert not any("pg_dump" in a or a[:1] == ["cp"] for a in _calls(tmp_path))
+
+
+@pytest.mark.parametrize("env_text, db, runs", [
+    (_on("1.9.0"), "", "1.9.0"),
+    (SECRET_ENV + PHONE_LINE, "", "1.6.1"),        # the version the compose file names
+    (_on("1.9.0"), "1.8.0", "1.9.0"),              # an older database never lowers it
+    (_on("1.8.0"), "1.9.0", "1.9.0"),              # a newer database raises it
+    (_on("1.9.0-rc3"), "", "1.9.0-rc3"),
+], ids=["1.9.0", "compose-1.6.1", "older-db", "newer-db", "1.9.0-rc3"])
+def test_an_install_older_than_1_9_1_is_refused_2_0_before_anything_changes(
+        tmp_path, fakebin, raw_2_0, env_text, db, runs):
+    inst = _install(tmp_path, env_text)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.0.0", FAKE_DB_VERSION=db)
+    _refused_untouched(r, inst, before, tmp_path, runs)
+
+
+def test_an_unknown_version_takes_the_databases_and_is_refused_by_it(tmp_path, fakebin, raw_2_0):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    (inst / "docker-compose.yml").write_text(LATEST_IMAGE)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.0.1", FAKE_DB_VERSION="1.9.0")
+    _refused_untouched(r, inst, before, tmp_path, "1.9.0")
+
+
+def test_a_candidate_of_2_0_refuses_an_older_install_too(tmp_path, fakebin, candidate):
+    inst = _install(tmp_path, _on("1.9.0"))
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.0.0-rc1", "--compose-dir", str(candidate))
+    _refused_untouched(r, inst, before, tmp_path, "1.9.0")
+
+
+@pytest.mark.parametrize("env_text, target", [
+    (_on("1.8.0"), "1.9.1"),           # the step the refusal names stays open
+    (_on("1.6.1"), "1.9.1"),
+    (_on("1.9.1"), "2.0.0"),
+    (_on("1.9.1-rc2"), "2.0.0"),       # a candidate of 1.9.1 counts as 1.9.1
+    (_on("2.0.0"), "2.0.1"),
+    (_on("2.0.0-rc1"), "2.0.1"),
+], ids=["1.8.0-to-1.9.1", "1.6.1-to-1.9.1", "1.9.1-to-2.0.0", "1.9.1-rc2-to-2.0.0", "2.0.0-to-2.0.1",
+        "2.0.0-rc1-to-2.0.1"])
+def test_an_update_from_1_9_1_on_or_to_a_target_before_2_0_goes_on(tmp_path, fakebin, raw_2_0, env_text, target):
+    inst = _install(tmp_path, env_text)
+    r = _run(inst, tmp_path, fakebin, "--to", target, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "Update it to 1.9.1 first" not in _said(r)
+
+
+def test_an_unknown_version_with_no_database_goes_on(tmp_path, fakebin, raw_2_0):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    (inst / "docker-compose.yml").write_text(LATEST_IMAGE)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.0.0", "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "upgrading from an unknown release to 2.0.0" in r.stdout
+
+
+def test_a_candidate_of_2_0_takes_a_1_9_1_install(tmp_path, fakebin, candidate):
+    inst = _install(tmp_path, ON_1_9_1)
+    r = _run(inst, tmp_path, fakebin, "--to", "2.0.0-rc1", "--compose-dir", str(candidate), "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "Update it to 1.9.1 first" not in _said(r)

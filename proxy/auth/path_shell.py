@@ -9,6 +9,7 @@ the core data structures and path RBAC it builds on live in
 
 import base64
 import contextlib
+import dataclasses
 import ipaddress
 import posixpath
 import re
@@ -27,6 +28,11 @@ from auth.path_policy import (
     _check_path_arg,
     _check_remote_bash_path,
     _check_remote_protected_path,
+)
+from auth.path_shell_env import (
+    command_reveals_session_token,
+    ps_reveals_session_token,
+    reveals_session_token,
 )
 from auth.path_shell_hosts import local_refusal, rsync_shell_commands
 from auth.path_shell_remote import local_view, remote_command
@@ -149,7 +155,7 @@ _BASH_TIER_EXTENDED: set[str] = {
 }
 
 # Tier "admin": host-touching ops — containers, host services, remote SSH,
-# system package installation. On the local sandbox a platform admin's, and
+# system package installation. In a compute machine's sandbox a platform admin's, and
 # a manager's or editor's for ssh/scp/sftp/rsync to the hosts the agent's ssh-hosts
 # instances name (``path_shell_hosts``); on a paired machine the editor tier's.
 # rsync joins the tier when an operand is on another host.
@@ -330,10 +336,12 @@ def _host_state_asks(ctx: SecurityContext) -> bool:
     whose pairing grants full filesystem access (paired for host management;
     its path gate admits every host path), for a role the admin tier admits
     there (``_classify_command``'s gate for docker, systemctl and ssh, so the
-    ``ssh`` rule already held for exactly these roles). The local sandbox, a
-    machine with home-only access and a lower role keep the refusal."""
+    ``ssh`` rule already held for exactly these roles). A compute machine's
+    sandbox, a machine with home-only access and a lower role keep the
+    refusal."""
     placement = ctx.placement
-    return placement.is_remote and placement.allow_full_fs and roles.can_edit(ctx.role)
+    return (not placement.isolates_with_bwrap and placement.allow_full_fs
+            and roles.can_edit(ctx.role))
 
 
 def _catastrophe_seen(text: str, *, words: bool) -> str | None:
@@ -372,6 +380,105 @@ def _floor_denial(text: str, *, remote_host: bool = False,
     for pattern, reason in _HOST_STATE_PATTERNS:
         if pattern.search(local):
             return PathDecision(False, f"Bash denied: {reason}")
+    return None
+
+
+# The ``otodock`` command's verbs that use a person's API key
+# (``satellite/terminal/otodock_api.py``). The key sits under the machine's own
+# OtoDock folder, which a session's paths are refused; the command reads it
+# itself, so the plain shapes of its verbs are refused in every session, an
+# admin's included: the command, a wrapper or an interpreter in front of it,
+# any letter case. A guard, never a boundary: a command built from a variable
+# or handed to ``xargs``, and a session's own program, are not seen here.
+_KEY_COMMAND_VERBS = frozenset({"login", "logout", "agents", "chat", "tasks", "files", "notify"})
+_KEY_COMMAND_NAMES = frozenset({"otodock", "otodock.cmd", "otodock.py", "otodock_api.py",
+                                "otodock_api"})
+_KEY_VERBS_REFUSED = "the otodock command's API key verbs do not run in an agent's session"
+_KEY_COMMAND_WORD = "otodock"
+# What a shell drops from a word: Bash's quotes and backslash, PowerShell's
+# quotes and backtick.
+_BASH_QUOTING_RE = re.compile(r"['\"\\]")
+_PS_QUOTING_RE = re.compile(r"['\"`]")
+# The letters a PowerShell backtick turns into a control character, never
+# into the letter itself.
+_PS_ESCAPE_LETTERS = frozenset("0abefnrtuv")
+
+
+def _names_a_key_verb(words: list[str]) -> bool:
+    """A word that names the command with a key verb right after it,
+    wherever it stands: ``env -u X otodock chat``, ``python3 otodock.py
+    chat``, ``OTODOCK chat`` and ``python3 -m terminal.otodock_api chat``
+    read as ``otodock chat``. A word names it by its base name, or by the
+    last part of a dotted module name."""
+    for i, word in enumerate(words[:-1]):
+        name = word.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if ((name in _KEY_COMMAND_NAMES or name.rsplit(".", 1)[-1] in _KEY_COMMAND_NAMES)
+                and words[i + 1] in _KEY_COMMAND_VERBS):
+            return True
+    return False
+
+
+def _key_command_refusal(segment: str) -> PathDecision | None:
+    """``otodock chat ...`` and its kin in a session: a person's API key is
+    not an agent's to use. Read as the shell reads the segment's words, so
+    ``oto''dock`` and ``o\\todock`` are the command too; a segment that does
+    not parse is left to the rest of the gate."""
+    view = words_view(segment)
+    text = _BASH_QUOTING_RE.sub("", segment) if view is None else view
+    if _KEY_COMMAND_WORD not in text.lower():
+        return None
+    try:
+        words = shlex.split(segment if view is None else view)
+    except ValueError:
+        return None
+    if _names_a_key_verb(words):
+        return PathDecision(False, f"Bash denied: {_KEY_VERBS_REFUSED}")
+    return None
+
+
+def _powershell_words(segment: str) -> list[str]:
+    """A PowerShell segment's words as that shell reads them: quotes are
+    dropped wherever they stand (``oto''dock`` is ``otodock``), a backtick
+    gives the next character (a control character for an escape letter),
+    and a blank ends a word only outside quotes."""
+    words: list[str] = []
+    word: list[str] = []
+    started = False
+    quote = ""
+    i, n = 0, len(segment)
+    while i < n:
+        ch = segment[i]
+        if ch == "`" and quote != "'" and i + 1 < n:
+            i += 1
+            started = True
+            word.append("\x00" if segment[i] in _PS_ESCAPE_LETTERS else segment[i])
+        elif quote:
+            if ch == quote:
+                quote = ""
+            else:
+                word.append(ch)
+        elif ch in "'\"":
+            quote = ch
+            started = True
+        elif ch.isspace():
+            if started:
+                words.append("".join(word))
+                word, started = [], False
+        else:
+            started = True
+            word.append(ch)
+        i += 1
+    if started:
+        words.append("".join(word))
+    return words
+
+
+def _key_command_refusal_ps(segment: str) -> PathDecision | None:
+    """``_key_command_refusal`` for a PowerShell segment."""
+    if _KEY_COMMAND_WORD not in _PS_QUOTING_RE.sub("", segment).lower():
+        return None
+    if _names_a_key_verb(_powershell_words(segment)):
+        return PathDecision(False, f"PowerShell denied: {_KEY_VERBS_REFUSED}")
     return None
 
 
@@ -1527,7 +1634,7 @@ def _path_looking_tokens(segment: str) -> list[str]:
 
 
 def _classify_segment(
-    segment: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
+    segment: str, ctx: SecurityContext, *, native_paths: bool, depth: int,
     dangerous_only: bool = False, remote_host: bool = False,
     host_asks: bool = False,
 ) -> PathDecision:
@@ -1557,7 +1664,7 @@ def _classify_segment(
     for inner in inners:
         if not inner.strip():
             continue
-        r = _check_command_string(inner, ctx, is_remote=is_remote, depth=depth + 1,
+        r = _check_command_string(inner, ctx, native_paths=native_paths, depth=depth + 1,
                                   dangerous_only=dangerous_only, remote_host=remote_host,
                                   host_asks=host_asks)
         if not r.allowed:
@@ -1573,7 +1680,7 @@ def _classify_segment(
                                words=True)
         if denied is not None:
             return denied
-    outer = _classify_command(lifted, ctx, is_remote=is_remote, depth=depth,
+    outer = _classify_command(lifted, ctx, native_paths=native_paths, depth=depth,
                               dangerous_only=dangerous_only, remote_host=remote_host,
                               host_asks=host_asks)
     if not outer.allowed:
@@ -1625,10 +1732,10 @@ class _CommandCheck:
     find_exec_tier: str
     ssh_destructive: bool
 
-    def __init__(self, ctx: SecurityContext, *, is_remote: bool, depth: int,
+    def __init__(self, ctx: SecurityContext, *, native_paths: bool, depth: int,
                  dangerous_only: bool, remote_host: bool, host_asks: bool) -> None:
         self.ctx = ctx
-        self.is_remote = is_remote
+        self.native_paths = native_paths
         self.depth = depth
         self.dangerous_only = dangerous_only
         self.remote_host = remote_host
@@ -1638,7 +1745,7 @@ class _CommandCheck:
     def bash_path_decision(self, rp: str, *, writing: bool) -> PathDecision:
         """A path argument against the remote resolver on a machine, the
         local path policy otherwise."""
-        if self.is_remote:
+        if self.native_paths:
             return _check_remote_bash_path(rp, self.ctx, writing=writing)
         return _check_path_arg(rp, self.ctx, writing=writing)
 
@@ -1657,7 +1764,7 @@ class _CommandCheck:
             if denied is not None:
                 return denied
         if self.dangerous_only:
-            if self.is_remote and not self.remote_host:
+            if self.native_paths and not self.remote_host:
                 denied = _remote_protected_denial(None, seg, self.ctx)
                 if denied is not None:
                     return denied
@@ -1705,7 +1812,7 @@ class _CommandCheck:
         inners = (_find_exec_inners(segment) if cmd_name == "find"
                   else rsync_shell_commands(segment) if cmd_name == "rsync" else [])
         for exec_inner in inners:
-            r = _check_command_string(exec_inner, self.ctx, is_remote=self.is_remote,
+            r = _check_command_string(exec_inner, self.ctx, native_paths=self.native_paths,
                                       depth=self.depth + 1,
                                       dangerous_only=self.dangerous_only,
                                       remote_host=self.remote_host,
@@ -1728,7 +1835,7 @@ class _CommandCheck:
         remotes += remote_shell_paths(cmd_name, segment)
         for remote in remotes:
             if remote:
-                r = _check_command_string(remote, self.ctx, is_remote=self.is_remote,
+                r = _check_command_string(remote, self.ctx, native_paths=self.native_paths,
                                           depth=self.depth + 1,
                                           dangerous_only=True, remote_host=True)
                 if not r.allowed:
@@ -1739,7 +1846,7 @@ class _CommandCheck:
     def floor_pass(self, cmd_name: str, segment: str) -> PathDecision | None:
         """The floor pass's answer (``None`` outside it)."""
         if self.dangerous_only:
-            if self.is_remote and not self.remote_host:
+            if self.native_paths and not self.remote_host:
                 denied = _remote_protected_denial(cmd_name, segment, self.ctx)
                 if denied is not None:
                     return denied
@@ -1754,16 +1861,16 @@ class _CommandCheck:
         return None
 
     def role_gate(self, cmd_name: str, tier: str, segment: str) -> PathDecision | None:
-        """The admin tier's role gate (``None`` when the role passes); on the
-        local sandbox the attached SSH hosts' opening, whose option files are
-        path-checked here."""
+        """The admin tier's role gate (``None`` when the role passes); in a
+        compute machine's sandbox the attached SSH hosts' opening, whose option
+        files are path-checked here."""
         if tier == TIER_ADMIN:
-            if self.is_remote:
+            if not self.ctx.placement.isolates_with_bwrap:
                 if not roles.can_edit(self.ctx.role):
                     return PathDecision(
                         False,
                         f"Bash denied: '{cmd_name}' is restricted to manager / "
-                        f"editor / admin roles on remote satellites (current role: "
+                        f"editor / admin roles on a paired remote machine (current role: "
                         f"{self.ctx.role}).",
                     )
             elif not roles.is_admin(self.ctx.role):
@@ -1820,8 +1927,37 @@ class _CommandCheck:
         return PathDecision(allowed=True, permission_tier=tier, destructive=destructive)
 
 
+def _asks_at_least(decision: PathDecision) -> PathDecision:
+    """``decision`` with its tier raised to the one that asks, when it is an
+    allow below it (a read, an edit)."""
+    if (not decision.allowed
+            or _TIER_ORDER.get(decision.permission_tier or "read", 0) >= _TIER_ORDER["ask"]):
+        return decision
+    return dataclasses.replace(decision, permission_tier="ask")
+
+
 def _classify_command(
-    segment: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
+    segment: str, ctx: SecurityContext, *, native_paths: bool, depth: int,
+    dangerous_only: bool = False, remote_host: bool = False,
+    host_asks: bool = False,
+) -> PathDecision:
+    """``_classify_command_tier``, and a segment that prints the session's
+    own token asks (``auth/path_shell_env.py``: a guard, the token's reach
+    is the boundary). Read on the segment with its shell structure peeled;
+    a wrapper's inner command comes back here by the recursion. The floor
+    pass and another host's command carry no tier to raise."""
+    decision = _classify_command_tier(
+        segment, ctx, native_paths=native_paths, depth=depth, dangerous_only=dangerous_only,
+        remote_host=remote_host, host_asks=host_asks)
+    if dangerous_only or remote_host:
+        return decision
+    if reveals_session_token(_strip_shell_structure(segment) or segment):
+        return _asks_at_least(decision)
+    return decision
+
+
+def _classify_command_tier(
+    segment: str, ctx: SecurityContext, *, native_paths: bool, depth: int,
     dangerous_only: bool = False, remote_host: bool = False,
     host_asks: bool = False,
 ) -> PathDecision:
@@ -1829,7 +1965,7 @@ def _classify_command(
     structure, wrappers, the command's tier, role gate and path arguments.
     An ``ssh`` segment's remote command is judged as the other host's
     (``_CommandCheck.ssh_remote``) besides the segment's own classification."""
-    check = _CommandCheck(ctx, is_remote=is_remote, depth=depth,
+    check = _CommandCheck(ctx, native_paths=native_paths, depth=depth,
                           dangerous_only=dangerous_only, remote_host=remote_host,
                           host_asks=host_asks)
 
@@ -1855,11 +1991,11 @@ def _classify_command(
     #    wrapper-stripped remainder.
     kind, inner = _unwrap_segment(segment)
     if kind == "string":
-        return _check_command_string(inner, ctx, is_remote=is_remote, depth=depth + 1,
+        return _check_command_string(inner, ctx, native_paths=native_paths, depth=depth + 1,
                                      dangerous_only=dangerous_only, remote_host=remote_host,
                                      host_asks=host_asks)
     if kind == "segment" and inner != segment and inner.strip():
-        return _classify_segment(inner, ctx, is_remote=is_remote, depth=depth + 1,
+        return _classify_segment(inner, ctx, native_paths=native_paths, depth=depth + 1,
                                  dangerous_only=dangerous_only, remote_host=remote_host,
                                  host_asks=host_asks)
 
@@ -1920,9 +2056,10 @@ def _classify_command(
         tier = TIER_ADMIN
 
     # Admin-tier role gating (host-touching ops — docker/systemctl/ssh/apt).
-    # Local sandbox: admin, and ssh/scp/rsync to the agent's attached hosts
-    # for a manager or editor. Remote satellite: open to manager/editor/admin
-    # (pairing is a trust act; the path policy is the real boundary there).
+    # A compute machine's sandbox: admin, and ssh/scp/rsync to the agent's
+    # attached hosts for a manager or editor. A paired remote machine: open to
+    # manager/editor/admin (pairing is a trust act; the path policy is the real
+    # boundary there).
     decision = check.role_gate(cmd_name, tier, segment)
     if decision is not None:
         return decision
@@ -1936,7 +2073,7 @@ def _classify_command(
 
 
 def _check_command_string(
-    command: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
+    command: str, ctx: SecurityContext, *, native_paths: bool, depth: int,
     dangerous_only: bool = False, remote_host: bool = False,
     host_asks: bool = False,
 ) -> PathDecision:
@@ -1982,11 +2119,11 @@ def _check_command_string(
         # substitution only exist here, so a host-state match that asks is
         # weighed here too.
         denied = _floor_denial(segment, remote_host=remote_host, host_asks=host_asks,
-                               words=True)
+                               words=True) or _key_command_refusal(segment)
         if denied is not None:
             return denied
         saw_destructive = saw_destructive or (state_asks and _host_state_seen(segment))
-        res = _classify_segment(segment, ctx, is_remote=is_remote, depth=depth,
+        res = _classify_segment(segment, ctx, native_paths=native_paths, depth=depth,
                                 dangerous_only=dangerous_only, remote_host=remote_host,
                                 host_asks=host_asks)
         if not res.allowed:
@@ -1995,7 +2132,12 @@ def _check_command_string(
         if _TIER_ORDER.get(t, 0) > _TIER_ORDER.get(max_tier, 0):
             max_tier = t
         saw_destructive = saw_destructive or res.destructive
-    return PathDecision(allowed=True, permission_tier=max_tier, destructive=saw_destructive)
+    decision = PathDecision(allowed=True, permission_tier=max_tier, destructive=saw_destructive)
+    if not dangerous_only and not remote_host and command_reveals_session_token(command):
+        # Read on the whole command too: a here-document's body is no
+        # segment, and ``cd /proc/self && cat environ`` names the file in two.
+        return _asks_at_least(decision)
+    return decision
 
 
 def _check_bash(command: str, ctx: SecurityContext) -> PathDecision:
@@ -2044,11 +2186,13 @@ def _check_bash(command: str, ctx: SecurityContext) -> PathDecision:
     if not command.strip():
         return PathDecision(False, "Empty bash command")
 
-    # Remote satellites have NO bwrap → the path-policy gate IS the boundary, so
-    # path args route through path_policy_v2 (home / full-FS for satellite-host,
-    # per-role RBAC for in-tree). Local sessions keep agent-tree RBAC (bwrap is
-    # the real boundary). Threaded into the recursion via _classify_segment.
-    is_remote = ctx.placement.is_remote
+    # A person's or an admin's machine sees its own paths, and has NO bwrap →
+    # the path-policy gate IS the boundary, so path args route through
+    # path_policy_v2 (home / full-FS for satellite-host, per-role RBAC for
+    # in-tree). A sandboxed session keeps agent-tree RBAC (bwrap is the real
+    # boundary). Threaded into the recursion via _classify_segment; the admin
+    # tier's role gate reads the sandbox itself.
+    native_paths = ctx.placement.needs_path_translation
     host_asks = _host_state_asks(ctx)
 
     # Admin on admin agent: unrestricted for normal ops (tier / cross-user PATH
@@ -2062,13 +2206,13 @@ def _check_bash(command: str, ctx: SecurityContext) -> PathDecision:
     # its gate mode admits the read tier only, so every command must be
     # classified, an admin's on an admin agent included.
     if ctx.is_admin_agent and roles.is_admin(ctx.role) and not getattr(ctx, "read_only", False):
-        floor = _check_command_string(command, ctx, is_remote=is_remote, depth=0,
+        floor = _check_command_string(command, ctx, native_paths=native_paths, depth=0,
                                       dangerous_only=True, host_asks=host_asks)
         if not floor.allowed:
             return floor
         return PathDecision(allowed=True, permission_tier="admin")
 
-    return _check_command_string(command, ctx, is_remote=is_remote, depth=0,
+    return _check_command_string(command, ctx, native_paths=native_paths, depth=0,
                                  host_asks=host_asks)
 
 
@@ -2507,7 +2651,7 @@ def _extract_powershell_paths(cmdlet: str, segment: str) -> tuple[list[str], lis
 
 
 def _classify_powershell_segment(
-    segment: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
+    segment: str, ctx: SecurityContext, *, native_paths: bool, depth: int,
     dangerous_only: bool = False,
 ) -> PathDecision:
     """Classify one PowerShell segment → PathDecision(allowed, tier, destructive).
@@ -2519,7 +2663,7 @@ def _classify_powershell_segment(
     role-gate / cross-user PATH; admin is unrestricted beyond the floor)."""
 
     def _ps_path_decision(rp: str, *, writing: bool) -> PathDecision:
-        if is_remote:
+        if native_paths:
             return _check_remote_bash_path(rp, ctx, writing=writing)
         return _check_path_arg(rp, ctx, writing=writing)
 
@@ -2530,7 +2674,7 @@ def _classify_powershell_segment(
     # The floor on a machine still refuses the paths the remote resolver
     # marks protected (mirrors the Bash floor).
     if dangerous_only:
-        if is_remote:
+        if native_paths:
             reads, writes = _extract_powershell_paths(cmdlet, segment)
             for rp, writing in [(p, False) for p in reads] + [(p, True) for p in writes]:
                 d = _check_remote_protected_path(rp, ctx, writing=writing)
@@ -2548,12 +2692,12 @@ def _classify_powershell_segment(
 
     # Admin-tier role gating (host / service control) — mirror _classify_segment.
     if tier == TIER_ADMIN:
-        if is_remote:
+        if not ctx.placement.isolates_with_bwrap:
             if not roles.can_edit(ctx.role):
                 return PathDecision(
                     False,
                     f"PowerShell denied: '{cmdlet}' is restricted to manager / "
-                    f"editor / admin roles on remote satellites (current role: "
+                    f"editor / admin roles on a paired remote machine (current role: "
                     f"{ctx.role}).",
                 )
         elif not roles.is_admin(ctx.role):
@@ -2579,7 +2723,7 @@ def _classify_powershell_segment(
 
 
 def _check_powershell_string(
-    command: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
+    command: str, ctx: SecurityContext, *, native_paths: bool, depth: int,
     dangerous_only: bool = False,
 ) -> PathDecision:
     """Check one PowerShell command string: _POWERSHELL_DANGEROUS_PATTERNS (raw,
@@ -2609,7 +2753,7 @@ def _check_powershell_string(
             inner = ""
         if not inner.strip():
             continue
-        r = _check_powershell_string(inner, ctx, is_remote=is_remote, depth=depth + 1,
+        r = _check_powershell_string(inner, ctx, native_paths=native_paths, depth=depth + 1,
                                      dangerous_only=dangerous_only)
         if not r.allowed:
             return r
@@ -2628,7 +2772,7 @@ def _check_powershell_string(
     # → recurse on the inner so it gets full classification + cross-user paths.
     unwrapped = _ps_unwrap_shell(command)
     if unwrapped is not None and unwrapped.strip() and unwrapped != command:
-        return _check_powershell_string(unwrapped, ctx, is_remote=is_remote, depth=depth + 1,
+        return _check_powershell_string(unwrapped, ctx, native_paths=native_paths, depth=depth + 1,
                                         dangerous_only=dangerous_only)
     try:
         segments = _split_powershell_segments(command)
@@ -2638,10 +2782,16 @@ def _check_powershell_string(
         return PathDecision(allowed=True, permission_tier="read")
     max_tier, saw_destructive = "read", False
     for segment in segments:
-        res = _classify_powershell_segment(segment, ctx, is_remote=is_remote, depth=depth,
+        denied = _key_command_refusal_ps(segment)
+        if denied is not None:
+            return denied
+        res = _classify_powershell_segment(segment, ctx, native_paths=native_paths, depth=depth,
                                            dangerous_only=dangerous_only)
         if not res.allowed:
             return res
+        if not dangerous_only and ps_reveals_session_token(segment):
+            # Printing the session's own token asks (auth/path_shell_env.py).
+            res = _asks_at_least(res)
         t = res.permission_tier or "read"
         if _TIER_ORDER.get(t, 0) > _TIER_ORDER.get(max_tier, 0):
             max_tier = t
@@ -2678,7 +2828,7 @@ def _check_powershell(command: str, ctx: SecurityContext) -> PathDecision:
     if not command.strip():
         return PathDecision(False, "Empty PowerShell command")
 
-    is_remote = ctx.placement.is_remote
+    native_paths = ctx.placement.needs_path_translation
 
     # Admin on admin agent: unrestricted for normal ops EXCEPT the
     # irreversible-catastrophe floor (Format-Volume, Clear-Disk, bare-root
@@ -2687,13 +2837,13 @@ def _check_powershell(command: str, ctx: SecurityContext) -> PathDecision:
     # catastrophe is caught too). Mirrors _check_bash; admin can still run these by
     # hand on the box. (Cred + agent-config backstops above already ran.)
     if ctx.is_admin_agent and roles.is_admin(ctx.role):
-        floor = _check_powershell_string(command, ctx, is_remote=is_remote, depth=0,
+        floor = _check_powershell_string(command, ctx, native_paths=native_paths, depth=0,
                                          dangerous_only=True)
         if not floor.allowed:
             return floor
         return PathDecision(allowed=True, permission_tier="admin")
 
-    return _check_powershell_string(command, ctx, is_remote=is_remote, depth=0)
+    return _check_powershell_string(command, ctx, native_paths=native_paths, depth=0)
 
 
 # ---------------------------------------------------------------------------
@@ -2705,14 +2855,14 @@ def _check_webfetch(url: str, ctx: SecurityContext) -> PathDecision:
     """Block WebFetch to private/internal IPs for non-admin agents.
 
     An external session (a phone caller who is not a platform user) may
-    fetch the public web from a local sandbox, where the netns blackholes
-    every private range regardless of what a hostname resolves to. On a
-    remote target there is no netns and this gate sees only literal
+    fetch the public web from a compute machine's sandbox, where the netns
+    blackholes every private range regardless of what a hostname resolves
+    to. On a paired machine there is no netns and this gate sees only literal
     addresses, so external sessions get no WebFetch there at all.
     """
     if ctx.is_admin_agent and roles.is_admin(ctx.role):
         return _ALLOW
-    if is_external_ctx(ctx) and ctx.placement.is_remote:
+    if is_external_ctx(ctx) and not ctx.placement.isolates_with_bwrap:
         return PathDecision(
             False, "WebFetch is not available on external routes on a remote machine",
         )

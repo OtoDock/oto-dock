@@ -7,13 +7,14 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 //
 // The connect form of a GitHub-App kind asks for no services and says what
 // to do; a GitHub-App account's card lists its installations and opens the
-// install page; the service-identity dropdown offers an installation and
-// posts its id; the admin row picks the kind, pastes the key into a
+// install page; an agent's Add an account offers an owned installation and
+// sends its id; the admin row picks the kind, pastes the key into a
 // textarea and posts the kind with the fields; the subscribe modal's app
 // mode says events come through the app's webhook. The panel re-reads the
-// list when the setup page reports; a bound installation that left the list
-// shows as unavailable; the bind's warning and refusal reach the manager; a
-// cut repository list says so; a pick list with nothing to pick cannot submit.
+// list when the setup page reports; an agent's account acting as an
+// installation that left the list says why in the server's words, and can
+// be removed; the add's warning and refusal reach the manager; a cut
+// repository list says so; a pick list with nothing to pick cannot submit.
 
 vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({ authConfig: {}, user: { sub: 'u1', role: 'admin', agent_roles: {} } }),
@@ -31,12 +32,18 @@ import * as authApi from '@/api/auth'
 import type { AccountSummary, Integration } from '@/api/credentials'
 import { OAuthAccountForm } from '@/components/accounts/OAuthAccountForm'
 import { AccountCard } from '@/components/accounts/AccountCard'
-import { ServiceAccountBindingDropdown } from '@/components/ServiceAccountBindingDropdown'
+import { AgentAccounts } from '@/components/accounts/AgentAccounts'
 import { SubscribeToEventsModal } from '@/components/accounts/SubscribeToEventsModal'
 import McpServersPage from '@/pages/admin/McpServersPage'
 import { InstallationsPanel } from '@/components/accounts/InstallationsPanel'
-import { useClearAgentServiceBinding, useSetAgentServiceBinding } from '@/api/serviceAccounts'
+import {
+  useAddAgentServiceAccount,
+  useRemoveAgentServiceAccount,
+  useSetAgentServiceDefault,
+  useSetAgentServiceReach,
+} from '@/api/serviceAccounts'
 import { OAUTH_APP_KIND, REGISTRATION_MODE_APP } from '@/lib/kinds/oauthApp'
+import { answerDialog, personClick, renderWithDialogs } from './dialogsHarness'
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
 
@@ -331,8 +338,8 @@ describe('the installations panel', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['webhook-event-catalog', 'github-mcp'] })
   })
 
-  it('re-reads the subscribe pickers after a Refresh and a binding change', async () => {
-    mockApi([], { '/app/installations/refresh': { status: 'ok', installations: [] }, '/service-binding': { status: 'ok' } })
+  it("re-reads the subscribe pickers after a Refresh and a change to an agent's accounts", async () => {
+    mockApi([], { '/app/installations/refresh': { status: 'ok', installations: [] }, '/service-accounts': { status: 'ok', accounts: [] } })
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const invalidate = vi.spyOn(qc, 'invalidateQueries')
     render(<MemoryRouter><QueryClientProvider client={qc}>
@@ -340,15 +347,27 @@ describe('the installations panel', () => {
     </QueryClientProvider></MemoryRouter>)
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['webhook-event-catalog', 'github-mcp'] }))
-    invalidate.mockClear()
-    const { result } = renderHook(() => ({ set: useSetAgentServiceBinding(), clear: useClearAgentServiceBinding() }), {
+    const { result } = renderHook(() => ({
+      add: useAddAgentServiceAccount(), reach: useSetAgentServiceReach(),
+      makeDefault: useSetAgentServiceDefault(), remove: useRemoveAgentServiceAccount(),
+    }), {
       wrapper: ({ children }) => <QueryClientProvider client={qc}>{children}</QueryClientProvider>,
     })
-    await act(() => result.current.set.mutateAsync({ agentName: 'a1', mcpName: 'github-mcp', accountLabel: 'alice' }))
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['webhook-event-catalog', 'github-mcp'] })
-    invalidate.mockClear()
-    await act(() => result.current.clear.mutateAsync({ agentName: 'a1', mcpName: 'github-mcp' }))
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['webhook-event-catalog', 'github-mcp'] })
+    const vars = { agentName: 'a1', mcpName: 'github-mcp', accountLabel: 'alice' }
+    const writes = [
+      () => result.current.add.mutateAsync({ ...vars, installationId: '10' }),
+      () => result.current.reach.mutateAsync({ ...vars, installationId: '10', readOnly: true }),
+      () => result.current.makeDefault.mutateAsync(vars),
+      () => result.current.remove.mutateAsync(vars),
+    ]
+    for (const write of writes) {
+      invalidate.mockClear()
+      await act(write)
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['webhook-event-catalog', 'github-mcp'] })
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['agent-service-account-options', 'a1', 'github-mcp'] })
+      // A removal takes the account's subscriptions with it.
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['subscriptions'] })
+    }
   })
 
   it('says a cut repository list has more', () => {
@@ -359,74 +378,92 @@ describe('the installations panel', () => {
   })
 })
 
-const bindingOf = (installationId: string) => ({
-  label: 'alice', owner_sub: 'u1', owner_name: 'Alice', owner_email: '', set_by: '', set_at: '',
-  installation_id: installationId, installation_account: 'alice',
+const agentAccount = (installationId: string, extra: Record<string, unknown> = {}) => ({
+  label: 'alice', display_email: 'alice', owner_sub: 'u1', owner_name: 'Alice', is_default: true,
+  stands: true, mine: true, installation_id: installationId, installation_account: 'alice',
+  kind: OAUTH_APP_KIND.GITHUB_APP, repositories: [], read_only: false, ...extra,
 })
 
-describe('the service-identity dropdown', () => {
-  it('shows a bound installation that left the list as unavailable, and clears it', async () => {
+function agentAccounts(agentName = 'a1') {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return renderWithDialogs(<MemoryRouter><QueryClientProvider client={qc}>
+    <AgentAccounts agentName={agentName} mcpName="github-mcp" chatsUseThem={false} />
+  </QueryClientProvider></MemoryRouter>)
+}
+
+describe("an agent's own GitHub accounts", () => {
+  it('shows an installation that stopped working in the server\'s words, and removes it', async () => {
     const calls: Call[] = []
+    // The server's STOPPED sentence (api/mcp/service_account_set.py), for a
+    // suspended, gone or no longer owned installation.
+    const problem = 'This installation no longer works for this agent. Remove it, then add the account again.'
     mockApi(calls, {
       '/service-account-options': {
+        reach_supported: true,
         my_accounts: [{ label: 'alice', display_email: 'alice', is_default: true, kind: OAUTH_APP_KIND.GITHUB_APP, installations: [
           { id: 10, account: 'alice', target_type: 'User', repository_selection: 'all', repositories_count: 0, suspended: true, admin: true },
         ] }],
-        current_binding: bindingOf('10'),
+        accounts: [agentAccount('10', { problem })],
       },
+      '/service-accounts?account_label=alice': { status: 'ok', accounts: [] },
     })
-    wrap(<ServiceAccountBindingDropdown agentName="a1" mcpName="github-mcp" callerSub="u1" />)
-    const select = await screen.findByRole('combobox') as HTMLSelectElement
-    const selected = select.options[select.selectedIndex]
-    expect(selected.textContent).toContain('Installation: alice via alice, unavailable')
-    expect(selected.disabled).toBe(true)
-    fireEvent.change(select, { target: { value: '__none__' } })
-    await waitFor(() => expect(calls.some(c => c.method === 'DELETE' && c.url.endsWith('/service-binding'))).toBe(true))
+    agentAccounts()
+    const row = await screen.findByTestId('service-account-row')
+    expect(within(row).getByText('Installation: alice')).toBeInTheDocument()
+    expect(within(row).getByText(problem)).toBeInTheDocument()
+    personClick(within(row).getByRole('button', { name: 'Remove alice' }))
+    await answerDialog('Remove')
+    await waitFor(() => expect(calls.some(c => c.method === 'DELETE')).toBe(true))
+    expect(calls.find(c => c.method === 'DELETE')!.url)
+      .toBe('/v1/agents/a1/mcps/github-mcp/service-accounts?account_label=alice')
   })
 
-  it('shows the bind\'s warning and a refusal', async () => {
+  it('shows the add\'s warning and a refusal', async () => {
     const options = {
+      reach_supported: true,
       my_accounts: [{ label: 'alice', display_email: 'alice', is_default: true, kind: OAUTH_APP_KIND.GITHUB_APP, installations: [
         { id: 10, account: 'alice', target_type: 'User', repository_selection: 'selected', repositories_count: 200, repositories_truncated: true, suspended: false, admin: true },
       ] }],
-      current_binding: null,
+      accounts: [],
     }
-    mockApi([], { '/service-account-options': options, '/service-binding': { status: 'ok', installation_id: '10', warning: 'GitHub could not be reached; try again in a minute' } })
-    wrap(<ServiceAccountBindingDropdown agentName="a1" mcpName="github-mcp" callerSub="u1" />)
-    const select = await screen.findByRole('combobox')
-    const inst = Array.from(select.querySelectorAll('option')).find(o => o.textContent?.includes('Installation: alice'))!
-    expect(inst.textContent).toContain('200+ repositories')
+    mockApi([], { '/service-account-options': options, '/service-accounts': { status: 'ok', accounts: [], warning: 'GitHub could not be reached. Try again in a minute.' } })
+    const first = agentAccounts()
+    const select = await screen.findByRole('combobox', { name: 'Add an account' })
+    const inst = Array.from(select.querySelectorAll('option')).find(o => o.textContent === 'Installation: alice via alice')!
     fireEvent.change(select, { target: { value: inst.getAttribute('value') } })
-    expect(await screen.findByText('GitHub could not be reached; try again in a minute')).toBeInTheDocument()
+    // The account stands: the warning shows in the warning colour.
+    expect(await screen.findByText('GitHub could not be reached. Try again in a minute.')).toHaveClass('text-status-warning-fg')
+    first.unmount()
 
-    mockApi([], { '/service-account-options': options, '/service-binding': { ok: false, status: 404, text: async () => JSON.stringify({ detail: 'Installation 10 cannot be this agent\'s identity: this installation is not one you own on GitHub' }) } })
-    const { container } = wrap(<ServiceAccountBindingDropdown agentName="a2" mcpName="github-mcp" callerSub="u1" />)
-    const second = await within(container).findByRole('combobox')
-    const pick = Array.from(second.querySelectorAll('option')).find(o => o.textContent?.includes('Installation: alice'))!
+    mockApi([], { '/service-account-options': options, '/service-accounts': { ok: false, status: 404, text: async () => JSON.stringify({ detail: 'Installation 10 cannot be this agent\'s account. It is not one you own on GitHub.' }) } })
+    const { container } = agentAccounts('a2')
+    const second = await within(container).findByRole('combobox', { name: 'Add an account' })
+    const pick = Array.from(second.querySelectorAll('option')).find(o => o.textContent === 'Installation: alice via alice')!
     fireEvent.change(second, { target: { value: pick.getAttribute('value') } })
-    expect(await within(container).findByText(/not one you own on GitHub/)).toBeInTheDocument()
+    expect(await within(container).findByText(/not one you own on GitHub/)).toHaveClass('text-status-danger-fg')
   })
 
-  it('offers an owned installation and posts its id', async () => {
+  it('offers an owned installation and sends its id', async () => {
     const calls: Call[] = []
     mockApi(calls, {
       '/service-account-options': {
+        reach_supported: true,
         my_accounts: [{ label: 'alice', display_email: 'alice', is_default: true, kind: OAUTH_APP_KIND.GITHUB_APP, installations: [
           { id: 10, account: 'alice', target_type: 'User', repository_selection: 'selected', repositories_count: 1, suspended: false, admin: true },
           { id: 11, account: 'octo', target_type: 'Organization', repository_selection: 'all', repositories_count: 0, suspended: false, admin: false },
         ] }],
-        current_binding: null,
+        accounts: [],
       },
-      '/service-binding': { status: 'ok' },
+      '/service-accounts': { status: 'ok', accounts: [] },
     })
-    wrap(<ServiceAccountBindingDropdown agentName="a1" mcpName="github-mcp" callerSub="u1" />)
-    const select = await screen.findByRole('combobox')
+    agentAccounts()
+    const select = await screen.findByRole('combobox', { name: 'Add an account' })
     const options = Array.from(select.querySelectorAll('option')).map(o => o.textContent)
-    expect(options.some(o => o?.includes('Installation: alice (1 repository) via alice'))).toBe(true)
+    expect(options).toEqual(['Add an account', 'alice', 'Installation: alice via alice', 'Connect another account'])
     expect(options.some(o => o?.includes('Installation: octo'))).toBe(false)
     const inst = Array.from(select.querySelectorAll('option')).find(o => o.textContent?.includes('Installation: alice'))!
     fireEvent.change(select, { target: { value: inst.getAttribute('value') } })
-    await waitFor(() => expect(calls.some(c => c.method === 'PUT' && c.url.endsWith('/service-binding'))).toBe(true))
+    await waitFor(() => expect(calls.some(c => c.method === 'PUT' && c.url.endsWith('/service-accounts'))).toBe(true))
     const put = calls.find(c => c.method === 'PUT')!
     expect(put.body).toEqual({ account_label: 'alice', installation_id: '10' })
   })

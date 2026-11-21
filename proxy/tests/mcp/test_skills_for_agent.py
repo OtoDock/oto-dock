@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from services.mcp import mcp_registry
+from services.mcp import mcp_agent_skills, mcp_registry
 from storage.mcp import mcp_store
 
 
@@ -69,7 +69,7 @@ def test_returns_id_content_loading_triples(temp_db, tmp_path):
         {"id": "alpha-skill", "file": "skills/a.md", "content": "Alpha body.",
          "loading": "always"},
     ])
-    with patch.object(mcp_registry, "get_agent_mcps", return_value=[m]):
+    with patch.object(mcp_agent_skills, "get_agent_mcps", return_value=[m]):
         skills = mcp_registry.get_skills_for_agent("pa", context="dashboard")
     assert skills == [("alpha-skill", "Alpha body.", "always")]
 
@@ -90,7 +90,7 @@ def test_audience_filters_by_the_session_role_when_told(temp_db, tmp_path):
     tier when they know the person's role, and filter nothing when they
     are not told (every existing caller)."""
     m = _tiered_manifest(tmp_path)
-    with patch.object(mcp_registry, "get_agent_mcps", return_value=[m]):
+    with patch.object(mcp_agent_skills, "get_agent_mcps", return_value=[m]):
         ids = lambda role: [s[0] for s in mcp_registry.get_skills_for_agent("pa", context="", user_role=role)]
         assert ids(None) == ["everyone-skill", "mcp-authoring", "owner-skill"]
         assert ids("viewer") == ["everyone-skill"]
@@ -105,8 +105,8 @@ def test_audience_filters_by_the_session_role_when_told(temp_db, tmp_path):
 def test_materialization_keys_the_audience_on_the_person(temp_db, tmp_path):
     m = _tiered_manifest(tmp_path)
     roles_by_name = {"vince": "viewer", "edna": "editor"}
-    with patch.object(mcp_registry, "get_agent_mcps_all_placements", return_value=[m]), \
-            patch.object(mcp_registry, "_role_of_username",
+    with patch.object(mcp_agent_skills, "get_agent_mcps_all_placements", return_value=[m]), \
+            patch.object(mcp_agent_skills, "_role_of_username",
                          side_effect=lambda u, a: roles_by_name.get(u)):
         ids = lambda **kw: [s[0] for s in mcp_registry.get_on_demand_skills_for_materialization("pa", **kw)]
         assert ids() == ["everyone-skill", "mcp-authoring"]
@@ -123,14 +123,14 @@ def test_role_of_username_reads_the_users_table(temp_db):
     username = db_users.get_username_by_sub("user-author")
     assert username
     db_users.add_user_agent("user-author", "pa", "editor", "user-admin")
-    assert mcp_registry._role_of_username(username, "pa") == "editor"
+    assert mcp_agent_skills._role_of_username(username, "pa") == "editor"
     db_users.set_user_agent_role("user-author", "pa", "viewer")
-    assert mcp_registry._role_of_username(username, "pa") == "viewer"
-    assert mcp_registry._role_of_username("nobody-here", "pa") is None
+    assert mcp_agent_skills._role_of_username(username, "pa") == "viewer"
+    assert mcp_agent_skills._role_of_username("nobody-here", "pa") is None
 
 
 def test_frontmatter_never_reaches_prompt_content(temp_db, tmp_path):
-    with patch.object(mcp_registry, "get_agent_mcps",
+    with patch.object(mcp_agent_skills, "get_agent_mcps",
                       return_value=[_voice_manifest(tmp_path)]):
         skills = mcp_registry.get_skills_for_agent("pa", context="dashboard")
     (_sid, content, loading) = skills[0]
@@ -141,7 +141,7 @@ def test_frontmatter_never_reaches_prompt_content(temp_db, tmp_path):
 
 
 def test_exclude_from_matches_real_context(temp_db, tmp_path):
-    with patch.object(mcp_registry, "get_agent_mcps",
+    with patch.object(mcp_agent_skills, "get_agent_mcps",
                       return_value=[_voice_manifest(tmp_path)]):
         on_phone = mcp_registry.get_skills_for_agent("pa", context="phone")
         on_dash = mcp_registry.get_skills_for_agent("pa", context="dashboard")
@@ -150,7 +150,7 @@ def test_exclude_from_matches_real_context(temp_db, tmp_path):
 
 
 def test_empty_context_excludes_nothing(temp_db, tmp_path):
-    with patch.object(mcp_registry, "get_agent_mcps",
+    with patch.object(mcp_agent_skills, "get_agent_mcps",
                       return_value=[_voice_manifest(tmp_path)]):
         skills = mcp_registry.get_skills_for_agent("pa", context="")
     assert [s[0] for s in skills] == ["narrated-video"]
@@ -159,7 +159,7 @@ def test_empty_context_excludes_nothing(temp_db, tmp_path):
 def test_db_disable_wins_over_manifest(temp_db, tmp_path):
     mcp_store.set_agent_skill("pa", "narrated-video", enabled=False,
                               exclude_from=[])
-    with patch.object(mcp_registry, "get_agent_mcps",
+    with patch.object(mcp_agent_skills, "get_agent_mcps",
                       return_value=[_voice_manifest(tmp_path)]):
         skills = mcp_registry.get_skills_for_agent("pa", context="dashboard")
     assert skills == []
@@ -169,7 +169,7 @@ def test_db_exclude_from_overrides_manifest_default(temp_db, tmp_path):
     # Row clears the phone exclusion → skill appears on phone again.
     mcp_store.set_agent_skill("pa", "narrated-video", enabled=True,
                               exclude_from=[])
-    with patch.object(mcp_registry, "get_agent_mcps",
+    with patch.object(mcp_agent_skills, "get_agent_mcps",
                       return_value=[_voice_manifest(tmp_path)]):
         skills = mcp_registry.get_skills_for_agent("pa", context="phone")
     assert [s[0] for s in skills] == ["narrated-video"]
@@ -180,7 +180,7 @@ def test_missing_skill_file_is_skipped(temp_db, tmp_path):
         {"id": "ok-skill", "file": "skills/ok.md", "content": "OK body."},
     ])
     m.skills.append(mcp_registry.SkillDef(id="ghost", file="skills/none.md"))
-    with patch.object(mcp_registry, "get_agent_mcps", return_value=[m]):
+    with patch.object(mcp_agent_skills, "get_agent_mcps", return_value=[m]):
         skills = mcp_registry.get_skills_for_agent("pa", context="dashboard")
     assert [s[0] for s in skills] == ["ok-skill"]
 
@@ -206,7 +206,7 @@ def test_inline_reader_never_reads_outside_the_mcp_folder(temp_db, tmp_path):
     """The inline reader confines every skills[].file to its MCP folder,
     symlinks judged by their target, directories skipped."""
     m = _manifest_with_escaping_skills(tmp_path, "m4", "always")
-    with patch.object(mcp_registry, "get_agent_mcps", return_value=[m]):
+    with patch.object(mcp_agent_skills, "get_agent_mcps", return_value=[m]):
         skills = mcp_registry.get_skills_for_agent("pa", context="dashboard")
     assert [s[0] for s in skills] == ["ok-skill"]
     assert not any("leak" in body for _sid, body, _l in skills)
@@ -214,7 +214,7 @@ def test_inline_reader_never_reads_outside_the_mcp_folder(temp_db, tmp_path):
 
 def test_on_demand_reader_never_hands_out_a_source_outside_the_mcp_folder(temp_db, tmp_path):
     m = _manifest_with_escaping_skills(tmp_path, "m5", "on_demand")
-    with patch.object(mcp_registry, "get_agent_mcps_all_placements", return_value=[m]):
+    with patch.object(mcp_agent_skills, "get_agent_mcps_all_placements", return_value=[m]):
         out = mcp_registry.get_on_demand_skills_for_materialization("pa")
     assert [o[0] for o in out] == ["ok-skill"]
     for _sid, source, *_ in out:
@@ -256,8 +256,96 @@ def test_skill_catalog_lists_on_demand_skills_with_the_same_filters(temp_db, tmp
          "loading": "on_demand"},
     ])
     mcp_store.set_agent_skill("pa", "gone-guide", enabled=False, exclude_from=[])
-    with patch.object(mcp_registry, "get_agent_mcps", return_value=[m]):
+    with patch.object(mcp_agent_skills, "get_agent_mcps", return_value=[m]):
         dash = mcp_registry.get_skill_catalog_for_agent("pa", context="dashboard")
         phone = mcp_registry.get_skill_catalog_for_agent("pa", context="phone")
     assert dash == [("beta-guide", "Beta guide"), ("zeta-guide", "Zeta parameters")]
     assert phone == [("zeta-guide", "Zeta parameters")]
+
+
+def test_an_outside_homes_set_follows_the_picks(temp_db, tmp_path):
+    """The config dir of an outside session (a caller's own tree) holds the
+    on-demand skills of the tools the one rule admits: never a hard-denied
+    MCP's, never an unpicked one's; a picked tool's skill lands."""
+    from services.mcp import outside_picks
+    denied = _manifest_with_skills(tmp_path, "delegation-mcp", [
+        {"id": "delegation-guide", "file": "skills/d.md", "content": "Delegate.", "loading": "on_demand"}])
+    unpicked = _manifest_with_skills(tmp_path, "crm", [
+        {"id": "crm-guide", "file": "skills/c.md", "content": "CRM.", "loading": "on_demand"}])
+    picked = _manifest_with_skills(tmp_path, "file-tools", [
+        {"id": "file-tools-guide", "file": "skills/f.md", "content": "Files.", "loading": "on_demand"}])
+    with patch.object(mcp_agent_skills, "get_agent_mcps_all_placements", return_value=[denied, unpicked, picked]), \
+            patch.object(mcp_agent_skills, "get_agent_mcps", return_value=[denied, unpicked, picked]):
+        ids = lambda **kw: [s[0] for s in mcp_registry.get_on_demand_skills_for_materialization("pa", **kw)]
+        # A person's or the agent's own dir: the whole set, as before.
+        assert ids() == ["delegation-guide", "crm-guide", "file-tools-guide"]
+        assert ids(outside_picks=outside_picks.NOTHING) == []
+        one = outside_picks.OutsidePicks(tools={"file-tools": outside_picks.ToolPick("read_only", ())})
+        assert ids(outside_picks=one) == ["file-tools-guide"]
+
+
+def test_an_outside_homes_set_is_what_the_sessions_own_filter_admits(temp_db, tmp_path):
+    """A picked tool's skill with its own phone or external exclusion, or an
+    audience above a caller, stays out of the caller's dir as it stays out
+    of the session's catalog: the two read one filter."""
+    from auth import roles
+    from services.mcp import outside_picks
+    crm = _manifest_with_skills(tmp_path, "crm", [
+        {"id": "crm-guide", "file": "skills/g.md", "content": "Guide.", "loading": "on_demand"},
+        {"id": "crm-staff-only", "file": "skills/s.md", "content": "Staff.", "loading": "on_demand",
+         "default_exclude_from": ["phone", "external"]},
+        {"id": "crm-admin-guide", "file": "skills/a.md", "content": "Admins.", "loading": "on_demand",
+         "audience": "owner"},
+    ])
+    picks = outside_picks.OutsidePicks(tools={"crm": outside_picks.ToolPick("read_write", ())})
+    with patch.object(mcp_agent_skills, "get_agent_mcps_all_placements", return_value=[crm]), \
+            patch.object(mcp_agent_skills, "get_agent_mcps", return_value=[crm]):
+        materialized = [s[0] for s in mcp_registry.get_on_demand_skills_for_materialization("pa", outside_picks=picks)]
+        catalog = [c[0] for c in mcp_registry.get_skill_catalog_for_agent(
+            "pa", "phone", external=True, shared_chat=True, user_role=roles.EXTERNAL, outside_picks=picks)]
+        assert materialized == catalog == ["crm-guide"]
+        # An admin's row that turns a skill off keeps it out of the dir too.
+        mcp_store.ensure_agent_skill("pa", "crm-guide", False, [])
+        assert [s[0] for s in mcp_registry.get_on_demand_skills_for_materialization("pa", outside_picks=picks)] == []
+
+
+def test_a_skill_file_is_read_as_it_was_authorized(temp_db, tmp_path):
+    """The file the resolver admitted is the file read, beneath the tool's
+    folder with no link followed: a skill swapped for a link after its
+    check is skipped, its target never reaching a prompt."""
+    m = _manifest_with_skills(tmp_path, "m1", [
+        {"id": "alpha-skill", "file": "skills/a.md", "content": "Alpha body.", "loading": "always"},
+    ])
+    (tmp_path / "elsewhere.md").write_text("ELSEWHERE")
+    real_resolve = mcp_agent_skills._mmp.resolve_skill_file
+
+    def resolve_then_swap(mcp_dir, rel):
+        answer = real_resolve(mcp_dir, rel)
+        (m.mcp_dir / "skills" / "a.md").unlink()
+        (m.mcp_dir / "skills" / "a.md").symlink_to(tmp_path / "elsewhere.md")
+        return answer
+    with patch.object(mcp_agent_skills, "get_agent_mcps", return_value=[m]), \
+            patch.object(mcp_agent_skills._mmp, "resolve_skill_file", resolve_then_swap):
+        skills = mcp_registry.get_skills_for_agent("pa", context="dashboard")
+    assert skills == []
+
+
+def test_an_always_skill_is_read_as_it_was_authorized(temp_db, tmp_path):
+    """The prompt's inline skill bodies read the file the resolver admitted,
+    beneath the tool's folder with no link followed."""
+    from configuration import prompts
+    from services.mcp import mcp_manifest_parse
+    m = _manifest_with_skills(tmp_path, "m2", [
+        {"id": "always-skill", "file": "skills/a.md", "content": "Always body.", "loading": "always"},
+    ])
+    (tmp_path / "elsewhere.md").write_text("ELSEWHERE")
+    real_resolve = mcp_manifest_parse.resolve_skill_file
+
+    def resolve_then_swap(mcp_dir, rel):
+        answer = real_resolve(mcp_dir, rel)
+        (m.mcp_dir / "skills" / "a.md").unlink()
+        (m.mcp_dir / "skills" / "a.md").symlink_to(tmp_path / "elsewhere.md")
+        return answer
+    with patch.object(mcp_registry, "get_manifest", return_value=m), \
+            patch.object(mcp_manifest_parse, "resolve_skill_file", resolve_then_swap):
+        assert prompts._always_skill_bodies("m2") == []

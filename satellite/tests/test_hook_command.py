@@ -188,6 +188,23 @@ def test_the_hook_writers_leave_unchanged_files_alone(tmp_path):
     assert (claude / "permission_gate.py").read_text() == "# gate 2\n"
 
 
+def test_the_status_line_reports_usage_only_when_the_platform_shipped_its_script(tmp_path):
+    import json
+
+    from satellite.sessions import cli_session
+    claude = tmp_path / ".claude"
+    claude.mkdir()
+    cli_session._write_hook_scripts(claude, {"permission_gate.py": "# gate\n"})
+    cli_session._write_cli_hooks(claude, ["CronCreate"])
+    # An older platform ships no reporter and has no route for it.
+    assert "statusLine" not in json.loads((claude / "settings.json").read_text())
+    cli_session._write_hook_scripts(claude, {"usage_report.py": "# usage\n"})
+    cli_session._write_cli_hooks(claude, ["CronCreate"])
+    line = json.loads((claude / "settings.json").read_text())["statusLine"]
+    assert line == {"type": "command", "command": sat_config.hook_command(claude / "usage_report.py"),
+                    "padding": 0}
+
+
 def test_session_tools_env_names_the_dir_the_interpreter_and_the_path(tmp_path):
     import os
     env = sat_config.session_tools_env({"PATH": "/usr/bin", "OTO_HOOKS_DIR": "/users/a/.claude",

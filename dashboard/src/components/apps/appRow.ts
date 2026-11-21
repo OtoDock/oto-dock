@@ -1,6 +1,7 @@
 import type { PinnedApp } from '../../api/apps'
 import { appKind } from '../../lib/kinds/app'
 import { GRANTEE_KIND } from '../../api/shares'
+import type { SummaryLine } from './AppApprovalCard'
 
 /**
  * What a row of the Apps strip looks like (APPS.md; SHARING.md "A placed
@@ -75,4 +76,27 @@ export function unpinWords(app: UnpinRow): { action: string; question: string; d
     question: everyone ? `Unpin “${title}” for everyone?` : `Unpin “${title}”?`,
     detail: 'The workspace file and the approved actions are kept. Ask the agent to pin it back anytime.',
   }
+}
+
+/** The deploy card's line for a server an app brings. The words say what it
+ * does, never "server" or "code". The template dialogs say it in their own
+ * sentence (lib/status/templateApps.ts). */
+export function addsServerLine(testId: string): SummaryLine {
+  return { key: 'adds-server', testId, text: 'Runs its own program on your OtoDock' }
+}
+
+/** Whether the page may hand the media it shows to a server of the app, and
+ *  the sentence that says it: it declares `files.media`, and the release the
+ *  card asks about runs a server (the one that waits, else the live one). A
+ *  media link's address needs no sign-in, so whoever the server passes it to
+ *  gets the file. That is a power of its own, so Details always says it, on
+ *  the deploy card and in the template dialogs. Empty when it does not apply. */
+export function mediaServerSentence(
+  app: Pick<PinnedApp, 'pending_release' | 'pending_has_server' | 'has_server' | 'actions' | 'egress'>,
+): string {
+  const server = app.pending_release ? !!app.pending_has_server : !!app.has_server
+  // Only a platform action carries a method (the manifest's own entry).
+  if (!server || !app.actions.some((a) => a.method === 'files.media')) return ''
+  return 'While the app is open, its program can get the videos, audio and pictures it shows you.'
+    + ((app.egress?.length ?? 0) > 0 ? ' It can send them to the sites it may reach.' : '')
 }

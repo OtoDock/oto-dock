@@ -12,8 +12,10 @@ import { useDialogs } from '../../components/ui/dialogs'
 import { isReachableMachine } from '../../lib/status/machine'
 import { TaskSettingsDialog } from './AgentSchedules.modals'
 import { AUTO_REVIEW_MODE } from '../../lib/engines/modes'
+import EngineNotice from '../../components/common/EngineNotice'
 import Button from '../../components/ui/Button'
-import { BADGE_BASE, BADGE_TONE, CARD, BUTTON_DANGER_QUIET } from '../../components/ui/classes'
+import { BADGE_TONE, CARD, BUTTON_DANGER_QUIET } from '../../components/ui/classes'
+import { TaskStateBadge } from '../../components/common/TaskStateBadge'
 
 /** The task's own machine beside its model chip: "on <name>", offline said. */
 function TaskMachine({ task }: { task: Task }) {
@@ -152,6 +154,7 @@ export default function AgentSchedules() {
                   <td className="px-4 py-3">
                     <div className="font-medium text-primary">{task.name}</div>
                     <TransferredFrom row={task} className="block" />
+                    {task.engine_notice && <EngineNotice message={task.engine_notice} className="my-1" />}
                     <div className="flex items-center gap-1.5 flex-wrap">
                       <span className="text-xs text-tertiary font-mono">{task.id}</span>
                       <TaskModelChip task={task} />
@@ -175,9 +178,7 @@ export default function AgentSchedules() {
                     </span>
                   </td>
                   <td className="px-4 py-3">
-                    <span className={`${BADGE_BASE} ${task.enabled ? BADGE_TONE.success : BADGE_TONE.neutral}`}>
-                      {task.enabled ? 'Active' : 'Paused'}
-                    </span>
+                    <TaskStateBadge task={task} />
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-1.5 flex-wrap">
@@ -253,6 +254,7 @@ export default function AgentSchedules() {
               <div className="min-w-0 flex-1" data-testid="task-card-main">
                 <p className="text-sm font-medium text-primary">{task.name}</p>
                 <TransferredFrom row={task} className="block" />
+                {task.engine_notice && <EngineNotice message={task.engine_notice} className="my-1" />}
                 <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
                   <span className="text-xs text-tertiary font-mono break-all">{task.id}</span>
                   <TaskModelChip task={task} />
@@ -261,9 +263,7 @@ export default function AgentSchedules() {
                 </div>
               </div>
               <div className="flex gap-1 shrink-0" data-testid="task-card-status">
-                <span className={`${BADGE_BASE} ${task.enabled ? BADGE_TONE.success : BADGE_TONE.neutral}`}>
-                  {task.enabled ? 'Active' : 'Paused'}
-                </span>
+                <TaskStateBadge task={task} />
               </div>
             </div>
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-secondary">

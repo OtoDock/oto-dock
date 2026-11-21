@@ -35,8 +35,13 @@ class Engine:
     config_dir: str          # the scope config dir under the session's root (".claude" / ".codex")
     credential_kind: str     # credentials_update.kind — FROZEN wire ("claude" / "codex")
     credential_filename: str # the credential file inside config_dir the platform rewrites
+    credential_payload_key: str  # the start payload key that carries the credential file's content
     turn_replay: bool        # Mode C: per-turn retention buffer, _command_id/_seq tags,
-                             # sessions_alive report, resume_session_stream replay
+                             # resume_session_stream replay; the sessions_alive list names a
+                             # live session of the engine only under a platform that replays
+                             # its turns (the auth answer's ``replays_turns_of``)
+    replayed_by_default: bool  # a platform whose auth answer names no ``replays_turns_of``
+                             # replays this engine's turns
     revives_dead_process: bool  # the session class re-warms its own dead process on the
                              # next turn (Codex: thread/resume in run_turn); False = a dead
                              # process is reported as an ack error so the PROXY respawns
@@ -74,7 +79,9 @@ ENGINES: dict[str, Engine] = {
         config_dir=".claude",
         credential_kind="claude",
         credential_filename=".credentials.json",
+        credential_payload_key="credentials_json",
         turn_replay=True,
+        replayed_by_default=True,
         revives_dead_process=False,
         headless=".sessions.cli_session:CLISession",
         pty=".terminal.pty_session:PtySession",
@@ -90,7 +97,9 @@ ENGINES: dict[str, Engine] = {
         config_dir=".codex",
         credential_kind="codex",
         credential_filename="auth.json",
-        turn_replay=False,
+        credential_payload_key="auth_json",
+        turn_replay=True,
+        replayed_by_default=False,
         revives_dead_process=True,
         headless=".sessions.codex_session:CodexSession",
         pty=".terminal.codex_pty_session:CodexPtySession",
@@ -100,6 +109,9 @@ ENGINES: dict[str, Engine] = {
 BY_CREDENTIAL_KIND: dict[str, Engine] = {e.credential_kind: e for e in ENGINES.values()}
 BY_PIN_KEY: dict[str, Engine] = {e.pin_key: e for e in ENGINES.values()}
 BY_BINARY: dict[str, Engine] = {e.binary: e for e in ENGINES.values()}
+# The engines whose turns a platform replays when its auth answer names none.
+DEFAULT_REPLAYS: frozenset[str] = frozenset(
+    e.execution_path for e in ENGINES.values() if e.replayed_by_default)
 
 
 def engine_for(execution_path: str) -> Engine:

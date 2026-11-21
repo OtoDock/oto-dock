@@ -175,6 +175,8 @@ export function useInteractiveChat(
   // sessionInteractive; reset whenever a (re)warm lands so a fresh terminal
   // always opens on the terminal, not a stale snapshot.
   const [showRichView, setShowRichView] = useState(false)
+  const showRichViewRef = useRef(showRichView)
+  useLayoutEffect(() => { showRichViewRef.current = showRichView })
   // A live switch (kill+rewarm) is in flight — locks the toggle until
   // the re-warm's warmup_ready lands, so it can't be double-fired.
   const [switching, setSwitching] = useState(false)
@@ -184,7 +186,13 @@ export function useInteractiveChat(
   // socket's messages in order and the switch awaits its whole re-warm, so
   // an error frame during an `asked` switch is the switch's own.
   // `before` is the chat's mode before the switch: a refused switch puts it back.
-  const switchRef = useRef<{ chatId: string; phase: 'asked' | 'spawning'; before: '' | 'interactive' | '-p' } | null>(null)
+  // A mode pick on a live terminal starts it again the same way (`mode`, the
+  // permission mode before the pick, and `keepHistory`, the view it was made
+  // from): it ends like a switch, and also on the pick's own answer.
+  const switchRef = useRef<{
+    chatId: string; phase: 'asked' | 'spawning'; before: '' | 'interactive' | '-p'
+    mode?: { before: string; keepHistory: boolean }
+  } | null>(null)
   const storedModeRef = useRef(storedExecMode)
   useLayoutEffect(() => { storedModeRef.current = storedExecMode })
   const beginSwitch = useCallback((chatId: string) => {
@@ -204,12 +212,32 @@ export function useInteractiveChat(
     const sw = switchRef.current
     if (sw && chatId && sw.chatId === chatId) sw.phase = 'spawning'
   }, [])
-  const switchErrored = useCallback((message: string) => {
+  // Returns the permission mode to put back when the error refused a mode
+  // pick's restart (every error before its warm-up starts is the pick's:
+  // the chat gate, the placement lock), else null.
+  const switchErrored = useCallback((message: string): string | null => {
     const sw = switchRef.current
-    if (sw?.phase !== 'asked' || message !== SWITCH_REFUSED) return
+    if (sw?.phase !== 'asked') return null
+    if (sw.mode) {
+      endSwitch()
+      return sw.mode.before
+    }
+    if (message !== SWITCH_REFUSED) return null
     setChatExecMode(sw.before)
     endSwitch()
+    return null
   }, [endSwitch])
+  // The server answered a mode pick with the chat's mode (a refusal, or a
+  // terminal that was no longer live): no restart follows.
+  const modeAnswered = useCallback(() => {
+    const sw = switchRef.current
+    if (sw?.mode && sw.phase === 'asked') endSwitch()
+  }, [endSwitch])
+  // Whether a switch or a pick's restart of this chat runs: the old
+  // terminal's exit is then part of it, not the end of the chat's terminal.
+  const restarting = useCallback((chatId: string | null) => (
+    !!chatId && switchRef.current?.chatId === chatId
+  ), [])
   const switchFailed = useCallback(() => {
     if (switchRef.current) endSwitch()
   }, [endSwitch])
@@ -250,6 +278,14 @@ export function useInteractiveChat(
     return 'switched'
   }, [ws, beginSwitch])
 
+  // A mode pick on the viewed chat's live terminal: the server closes it and
+  // starts it again in the mode (the caller sends the pick). The page shows
+  // the history while it starts, and comes back to the view it was on.
+  const restartInMode = useCallback((chatId: string, beforeMode: string) => {
+    beginSwitch(chatId)
+    if (switchRef.current) switchRef.current.mode = { before: beforeMode, keepHistory: showRichViewRef.current }
+  }, [beginSwitch])
+
   // Fire any switch deferred while a turn was streaming (call on turn-end).
   const flushDeferredSwitch = useCallback((chatId: string | null) => {
     if (deferredSwitchRef.current === null || !chatId) return
@@ -274,7 +310,12 @@ export function useInteractiveChat(
   // Restore the toggle from a chat's stored execution_mode (chat_history meta).
   // sessionInteractive stays false until a warmup_ready{interactive} arrives, so
   // a dead interactive chat shows its DB history with the toggle reflected ON.
-  const restoreFromMeta = useCallback((executionMode: string | undefined) => {
+  // A mode pick's restart whose chat's history arrives has passed the
+  // server's refusals: the terminal is closed and the row holds the pick, so
+  // an error from here on never puts the old mode back (`switchErrored`).
+  const restoreFromMeta = useCallback((executionMode: string | undefined, chatId?: string) => {
+    const sw = switchRef.current
+    if (sw?.mode && sw.phase === 'asked' && chatId && sw.chatId === chatId) sw.phase = 'spawning'
     // Store the chat's explicit override ('' | 'interactive' | '-p'); the
     // effective toggle is derived from it + the agent default.
     const m = executionMode === 'interactive' || executionMode === '-p' ? executionMode : ''
@@ -345,8 +386,11 @@ export function useInteractiveChat(
     data: { interactive?: boolean; chat_id?: string },
   ): WarmupReadyResult => {
     const isInteractive = !!data.interactive
+    // A (re)warm opens on the terminal, not a stale rich snapshot, except a
+    // mode pick's restart made from the history, which comes back there.
+    const keepHistory = !!switchRef.current?.mode?.keepHistory && isInteractive
     setSessionInteractive(isInteractive)
-    setShowRichView(false)  // a (re)warm landed → open on the terminal, not a stale rich snapshot
+    setShowRichView(keepHistory)
     endSwitch()  // a re-warm landed → any in-flight live switch is done
     return isInteractive ? 'interactive' : 'none'
   }, [endSwitch])
@@ -366,6 +410,9 @@ export function useInteractiveChat(
     switchStarted,
     switchErrored,
     switchFailed,
+    modeAnswered,
+    restarting,
+    restartInMode,
     toggle,
     performSwitch,
     flushDeferredSwitch,

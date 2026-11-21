@@ -21,6 +21,9 @@ vi.mock('@/api/executionLayers', async (importOriginal) => {
   })
   return {
     ...mod,
+    // The list's own reads need a query client this test does not mount: answered as a list at rest.
+    useListReading: () => ({ pending: false, reread: () => {} }),
+    useAccountsLive: () => ({ data: undefined }),
     useAdminExecutionLayers: () => ({
       data: [{
         name: 'claude-code-cli', display_name: 'Anthropic Claude Code', capabilities: claudeLike(),
@@ -112,6 +115,17 @@ describe('Admin AI Engines: a login that ends soon', () => {
   it("another admin's row: its owner renews it", () => {
     renderRow({ is_mine: false, owner_sub: 'local:other' })
     expect(hint()).toHaveTextContent('Its owner renews it by signing in to the same account again.')
+  })
+
+  it("another admin's row names no email, and what runs on it shows inline", () => {
+    render(<SubscriptionRow sub={oauthRow({ is_mine: false, owner_sub: 'local:other', label: '', oauth_email: '',
+                                            live: { sessions: 1, per_model: [{ name: 'Sonnet 5.5', sessions: 1 }] } })}
+                            layer="claude-code-cli" vendorId="anthropic" accountName="Claude" />)
+    expect(screen.queryByText(/@example\.com/)).toBeNull()
+    expect(screen.getByText('Claude account')).toBeInTheDocument()
+    expect(screen.queryByText('anthropic OAuth')).toBeNull()
+    expect(screen.getByText(/1 running/)).toBeInTheDocument()
+    expect(screen.getByText('Sonnet 5.5')).toHaveTextContent('· Sonnet 5.5')
   })
 
   it('an owner-less row: it cannot be renewed in place', () => {

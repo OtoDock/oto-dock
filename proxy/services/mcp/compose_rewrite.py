@@ -142,9 +142,10 @@ _SIZE_INTERPOLATION_RE = re.compile(
 _PLATFORM_SERVICES = (
     "otodock-proxy", "otodock-postgres", "docker-socket-proxy", "otodock-phone",
     "otodock-db-init", "otodock-agents-init", "file-tools", "collabora",
+    "otodock-compute", "otodock-tools-copy",
 )
 _RESERVED_PLATFORM_NAMES = frozenset({
-    *_PLATFORM_SERVICES, "file-tools-mcp", "collabora-agent",
+    *_PLATFORM_SERVICES, "file-tools-mcp", "collabora-agent", "otodock-proxy-compute",
 })
 _PLATFORM_CONTAINER_RE = re.compile(
     r"^otodock[-_](?:"
@@ -191,13 +192,15 @@ def _reject_reserved_name(kind: str, value: object, mcp_name: str) -> None:
 # Named volumes the platform compose owns that no community MCP may mount:
 # attaching one hands the sidecar the Postgres unix socket (which the image
 # trusts: an instant superuser), the raw heap files, the SSH keys, the session
-# state or the recover bin (every person's deleted files). The agents volume is the one legitimate reach (the ``${HOST_AGENTS_DIR}``
+# state, the recover bin (every person's deleted files) or the tools the
+# compute service builds and runs for every session. The agents volume is the one legitimate reach (the ``${HOST_AGENTS_DIR}``
 # contract maps onto it, and a healed pull-form file names it directly), so it
 # is not listed. Case-insensitive, like the service names.
 _PLATFORM_VOLUMES = frozenset({
     "otodock-pgdata", "otodock-pgsock", "otodock-mcps", "otodock-skills",
     "otodock-ssh-keys", "otodock-sessions", "otodock-recover-bin",
-    "otodock-collabora-proof",
+    "otodock-collabora-proof", "otodock-compute", "otodock-compute-link",
+    "otodock-compute-tools",
 })
 
 
@@ -257,6 +260,12 @@ def _reject_manifest_volume_declarations(data: dict, mcp_name: str) -> None:
 _LOG_DEFAULTS = {"driver": "json-file", "options": {"max-size": "10m", "max-file": "5"}}
 
 
+#: Every Docker MCP container's OOM score: above the proxy and Postgres (the
+#: default 0), equal to a compute session's, so among the expendable ones the
+#: kernel ends the biggest.
+TOOL_OOM_SCORE_ADJ = 500
+
+
 def _default_mem_limit() -> str:
     """The configured sidecar memory floor; '' when injection is disabled."""
     raw = str(getattr(config, "OTODOCK_MCP_DEFAULT_MEM_LIMIT", "2g")).strip().lower()
@@ -274,6 +283,12 @@ def _mapping_at(node: dict, *keys: str) -> dict:
     return level if isinstance(level, dict) else {}
 
 
+# A Docker tool's own service: a container the platform put to sleep stays
+# stopped across a restart of Docker or of the host, and one that ends on its
+# own (a watchdog's exit) comes back.
+TOOL_RESTART = "unless-stopped"
+
+
 def _missing_default_bounds(svc: dict) -> dict:
     """Default resource-bound keys ``svc`` doesn't declare itself.
 
@@ -283,6 +298,12 @@ def _missing_default_bounds(svc: dict) -> dict:
     injection. mem and memswap are set EQUAL — no swap growth, so a leaky
     sidecar OOM-restarts (`restart: always` self-heals) instead of dragging
     the host into thrash and vetoing session admission.
+
+    The OOM score is the one bound an MCP cannot lower: the kernel takes a
+    tool before the control plane, so a service at or above
+    ``TOOL_OOM_SCORE_ADJ`` keeps its own value and anything else (none, a
+    lower value, a negative one that would make the container unkillable)
+    gets ``TOOL_OOM_SCORE_ADJ``.
     """
     out: dict = {}
     mem = _default_mem_limit()
@@ -292,6 +313,9 @@ def _missing_default_bounds(svc: dict) -> dict:
         out["memswap_limit"] = mem
     if "logging" not in svc:
         out["logging"] = copy.deepcopy(_LOG_DEFAULTS)
+    own_score = svc.get("oom_score_adj")
+    if not isinstance(own_score, int) or isinstance(own_score, bool) or own_score < TOOL_OOM_SCORE_ADJ:
+        out["oom_score_adj"] = TOOL_OOM_SCORE_ADJ
     return out
 
 
@@ -648,9 +672,48 @@ def _harden_compose(
             {_NET_KEY: {"aliases": [service_name]}} if key == target else {_NET_KEY: {}}
         )
         svc.update(_missing_default_bounds(svc))
+        if key == target:
+            svc["restart"] = TOOL_RESTART
     out["networks"] = {_NET_KEY: {"external": True, "name": network_name}}
     _declare_volumes(out, declared, external)
     return out
+
+
+def network_exit_keys(closed: bool) -> dict:
+    """The keys a ``network_exit`` MCP's service gets: the variable its
+    entrypoint reads and, while closed, the one capability the platform adds
+    (its entrypoint, still root, closes the container's own exit with it and
+    drops it before the browser starts) and no new privileges after."""
+    keys: dict = {"environment": {"OTODOCK_LOCAL_NETWORK": "closed" if closed else "open"}}
+    if closed:
+        keys["cap_add"] = ["NET_ADMIN"]
+        keys["security_opt"] = ["no-new-privileges:true"]
+    return keys
+
+
+def _drop_own_exit_keys(svc: dict) -> None:
+    """Remove a key whose value is exactly what ``network_exit_keys`` adds;
+    anything else in it stays for the hardening to strip, and warn about."""
+    own = network_exit_keys(True)
+    for key in ("cap_add", "security_opt"):
+        if svc.get(key) == own[key]:
+            svc.pop(key)
+
+
+def _apply_network_exit(svc: dict, closed: bool) -> None:
+    """Merge ``network_exit_keys`` into a service, after the hardening
+    stripped the catalog's own capabilities and options."""
+    keys = network_exit_keys(closed)
+    env = svc.get("environment")
+    if isinstance(env, list):
+        env = [e for e in env if not str(e).startswith("OTODOCK_LOCAL_NETWORK=")]
+        env.append(f"OTODOCK_LOCAL_NETWORK={keys['environment']['OTODOCK_LOCAL_NETWORK']}")
+        svc["environment"] = env
+    else:
+        svc["environment"] = {**(env if isinstance(env, dict) else {}), **keys["environment"]}
+    for key in ("cap_add", "security_opt"):
+        if key in keys:
+            svc[key] = keys[key]
 
 
 def transform_compose_dict(
@@ -661,6 +724,7 @@ def transform_compose_dict(
     container_name: str,
     network_name: str,
     mcp_name: str,
+    exit_closed: bool | None = None,
 ) -> dict:
     """Pure transform: build-from-context compose dict → pull-form compose dict.
 
@@ -689,6 +753,8 @@ def transform_compose_dict(
     svc.pop("build", None)
     svc["image"] = image
     svc["container_name"] = container_name
+    if exit_closed is not None:
+        _apply_network_exit(svc, exit_closed)
     _reject_interpolation(out, mcp_name)
     return out
 
@@ -700,6 +766,15 @@ _HEADER = (
     "# was rewritten to PULL the pre-built image and join the shared network.\n"
     "# Source of truth = the catalog repo + services/mcp/compose_rewrite.py.\n"
 )
+
+
+def _exit_closed(manifest) -> bool | None:
+    """None for an MCP that declares no ``network_exit``; else whether its
+    container's local network is closed (the approval off)."""
+    if not getattr(manifest, "network_exit", False):
+        return None
+    from services.mcp import mcp_egress
+    return not mcp_egress.network_access_enabled(manifest)
 
 
 def _plan_pull_compose(manifest) -> tuple[Path, object, dict] | None:
@@ -731,6 +806,7 @@ def _plan_pull_compose(manifest) -> tuple[Path, object, dict] | None:
     services = _checked_services(data, manifest.name)
     service_name = deployment.mcp_service_name(manifest)
     expected = f"otodock-{config.INSTALL_ID}-mcp-{manifest.name}"
+    exit_closed = _exit_closed(manifest)
 
     if any("build" in s for s in services.values()):
         if not srv.image:
@@ -747,12 +823,20 @@ def _plan_pull_compose(manifest) -> tuple[Path, object, dict] | None:
             container_name=expected,
             network_name=config.OTODOCK_NETWORK,
             mcp_name=manifest.name,
+            exit_closed=exit_closed,
         )
         return compose_path, data, planned
 
     target = _pick_pull_target(services, service_name)
+    source = data
+    if exit_closed is not None:
+        # A file this rewrite already wrote carries the platform's own exit
+        # keys: dropped before the hardening, which warns about every key it
+        # strips, and set again below.
+        source = copy.deepcopy(data)
+        _drop_own_exit_keys(source["services"][target])
     planned = _harden_compose(
-        data, target=target, service_name=service_name,
+        source, target=target, service_name=service_name,
         network_name=config.OTODOCK_NETWORK, mcp_name=manifest.name,
     )
     # A container_name stamped by a PREVIOUS install identity is re-stamped.
@@ -770,6 +854,8 @@ def _plan_pull_compose(manifest) -> tuple[Path, object, dict] | None:
         and current != expected
     ):
         svc["container_name"] = expected
+    if exit_closed is not None:
+        _apply_network_exit(svc, exit_closed)
     _reject_interpolation(planned, manifest.name)
     return compose_path, data, planned
 
@@ -1002,9 +1088,12 @@ def ensure_t1_override(manifest, *, force_realloc: bool = False) -> Path | None:
         if subnet:
             _picked_subnets[project] = subnet
 
-    svc: dict = {"container_name": project}
+    svc: dict = {"container_name": project, "restart": TOOL_RESTART}
     if srv.image:
         svc["image"] = srv.image
+    exit_closed = _exit_closed(manifest)
+    if exit_closed is not None:
+        svc.update(network_exit_keys(exit_closed))
     services_override: dict = {svc_key: svc}
     # Default resource bounds for every base service that declares none of its
     # own (compose overrides merge per-key, so an entry carrying only

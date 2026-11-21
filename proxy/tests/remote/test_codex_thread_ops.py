@@ -1,13 +1,11 @@
 """Remote steer and compact tunnel twins (proxy side) + the codex
 config.toml write-time validation gate.
 
-``RemoteExecutionLayer.steer/compact`` version-gate BEFORE sending (an old
-satellite silently drops unknown frames — the ack would only burn its
-timeout) and keep the strict accept semantics the callers rely on:
-``dashboard_chat`` queues the message iff steer returned False, and
-``_handle_compact_context`` reports "not supported" on None. Codex steers
-through ``codex_steer`` (satellite ≥ 0.5.98), the Claude CLI through
-``steer_turn`` (≥ 0.5.128) with the result-seen guard held on this side.
+``RemoteExecutionLayer.steer/compact`` keep the strict accept semantics the
+callers rely on: ``dashboard_chat`` queues the message iff steer returned
+False, and ``_handle_compact_context`` reports "not supported" on None. Codex
+steers through ``codex_steer``, the Claude CLI through ``steer_turn`` with the
+result-seen guard held on this side.
 """
 
 from __future__ import annotations
@@ -32,7 +30,7 @@ def _claude_state(**fields) -> ClaudeRemoteState:
     )
 
 
-def _layer(*, execution_path="codex-cli", supported=True, ack=None,
+def _layer(*, execution_path="codex-cli", ack=None,
            send_error: Exception | None = None, engine_state=None):
     layer = RemoteExecutionLayer.__new__(RemoteExecutionLayer)
     layer._sessions = {
@@ -41,16 +39,13 @@ def _layer(*, execution_path="codex-cli", supported=True, ack=None,
             machine_id="machine-1", agent_name="agent-1",
             engine_state=engine_state, last_activity=0.0,
             last_event_at=time.monotonic(), task_turn=False, turn_active=False,
+            files_synced=True, engine_turn=None,
         ),
     }
     send = AsyncMock(return_value=ack or {})
     if send_error is not None:
         send.side_effect = send_error
-    layer._cm = SimpleNamespace(
-        supports_codex_thread_ops=lambda mid: supported,
-        satellite_supports_steer_turn=lambda mid: supported,
-        send_command=send,
-    )
+    layer._cm = SimpleNamespace(send_command=send)
     return layer
 
 
@@ -59,12 +54,6 @@ class TestRemoteSteer:
     async def test_unknown_session_false(self):
         layer = _layer()
         assert await layer.steer("nope", "hi") is False
-        layer._cm.send_command.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_old_satellite_gated_before_send(self):
-        layer = _layer(supported=False)
-        assert await layer.steer("sess-1", "hi") is False
         layer._cm.send_command.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -88,9 +77,24 @@ class TestRemoteSteer:
         layer._cm.send_command.assert_not_awaited()
 
 
+    @pytest.mark.asyncio
+    async def test_a_steer_waits_for_its_files_at_the_short_bound_and_tells_the_agent_and_the_chat(self, monkeypatch):
+        from core.remote import satellite_connection as sc, upload_inflight
+        wait = AsyncMock(return_value=False)
+        told = AsyncMock()
+        monkeypatch.setattr(upload_inflight, "wait_settled", wait)
+        monkeypatch.setattr(upload_inflight, "_tell_chat_files_late", told)
+        monkeypatch.setattr(sc, "get_connection_manager", lambda: SimpleNamespace(is_connected=lambda mid: True))
+        layer = _layer(ack={"steered": True})
+        assert await layer.steer("sess-1", "hi") is True
+        wait.assert_awaited_once_with("agent-1", machine_id="machine-1",
+                                      ceiling=upload_inflight.BARRIER_TIMEOUT_S)
+        told.assert_awaited_once_with("sess-1", "machine-1")
+        assert layer._cm.send_command.await_args.args[1]["text"] == f"{upload_inflight.FILES_LATE_PROMPT}\n\nhi"
+
+
 class TestRemoteClaudeSteer:
-    """The Claude CLI twin: ``steer_turn`` on a satellite that handles it,
-    the result-seen guard on this side (the satellite cannot tell a foreign
+    """The Claude CLI twin: ``steer_turn``, the result-seen guard on this side (the satellite cannot tell a foreign
     result from the driven one), strict accept."""
 
     @pytest.mark.asyncio
@@ -105,6 +109,21 @@ class TestRemoteClaudeSteer:
         assert state.steer_written is True and state.steer_pending == 0
 
     @pytest.mark.asyncio
+    async def test_refused_while_a_permission_card_is_parked(self):
+        """The card is the question: a typed message takes the queue (and
+        the card's auto-deny), never the turn's stdin."""
+        from core.events.stream_pump import _pending_permissions
+        layer = _layer(execution_path="claude-code-cli", ack={"steered": True},
+                       engine_state=_claude_state())
+        _pending_permissions["sess-1"] = {"request_id": "r1"}
+        try:
+            assert await layer.steer("sess-1", "go") is False
+            layer._cm.send_command.assert_not_awaited()
+        finally:
+            _pending_permissions.pop("sess-1", None)
+        assert await layer.steer("sess-1", "go") is True
+
+    @pytest.mark.asyncio
     async def test_no_turn_state_refuses_without_rpc(self):
         layer = _layer(execution_path="claude-code-cli", ack={"steered": True})
         assert await layer.steer("sess-1", "hi") is False
@@ -114,13 +133,6 @@ class TestRemoteClaudeSteer:
     async def test_result_seen_refuses_without_rpc(self):
         layer = _layer(execution_path="claude-code-cli", ack={"steered": True},
                        engine_state=_claude_state(result_seen=True))
-        assert await layer.steer("sess-1", "hi") is False
-        layer._cm.send_command.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_old_satellite_gated_before_send(self):
-        layer = _layer(execution_path="claude-code-cli", supported=False,
-                       engine_state=_claude_state())
         assert await layer.steer("sess-1", "hi") is False
         layer._cm.send_command.assert_not_awaited()
 
@@ -156,67 +168,11 @@ class TestRemoteClaudeSteer:
         assert await task is True
         assert state.steer_pending == 0 and state.steer_written is True
 
-    def test_the_gate_is_the_version(self):
-        from core.remote.satellite_connection import (
-            SatelliteConnection,
-            SatelliteConnectionManager,
-        )
-        cm = SatelliteConnectionManager()
-        for mid, ver in [("new", "0.5.128"), ("old", "0.5.127"), ("future", "0.6.0")]:
-            cm._connections[mid] = SatelliteConnection(
-                machine_id=mid, ws=None, satellite_version=ver,
-            )
-        assert cm.satellite_supports_steer_turn("new")
-        assert cm.satellite_supports_steer_turn("future")
-        assert not cm.satellite_supports_steer_turn("old")
-        assert not cm.satellite_supports_steer_turn("absent")
-
-
-    @pytest.mark.asyncio
-    async def test_a_satellite_that_reads_will_retry_keeps_the_turn_through_a_retry(self):
-        """0.5.131 keeps a Codex turn running through an error Codex retries;
-        on an older satellite the turn ends on it, so the proxy's translator
-        keeps the ERROR there instead of ending the turn silently."""
-        import asyncio
-        from unittest.mock import MagicMock
-
-        from core.layers.codex.remote import CodexRemoteAdapter
-        from core.remote.remote_session_info import RemoteSessionInfo
-        from core.remote.satellite_connection import (
-            SatelliteConnection,
-            SatelliteConnectionManager,
-        )
-        cm = SatelliteConnectionManager()
-        for mid, ver in [("new", "0.5.131"), ("old", "0.5.130")]:
-            cm._connections[mid] = SatelliteConnection(
-                machine_id=mid, ws=None, satellite_version=ver,
-            )
-        assert cm.satellite_supports_codex_retry_read("new")
-        assert not cm.satellite_supports_codex_retry_read("old")
-        adapter = CodexRemoteAdapter.__new__(CodexRemoteAdapter)
-
-        async def no_router(info):
-            return None
-
-        adapter._route_notifications = no_router
-        for mid, ends in (("new", False), ("old", True)):
-            info = RemoteSessionInfo(session_id=f"s-{mid}", machine_id=mid, agent_name="a",
-                                     execution_path="codex-cli", event_queue=asyncio.Queue())
-            adapter.init_session(info, MagicMock(model="gpt-5.5"), cm)
-            assert info.engine_state.translator.retried_errors_end_turn is ends
-            await info.engine_state.router_task
-
 
 class TestRemoteCompact:
     @pytest.mark.asyncio
     async def test_non_codex_none(self):
         layer = _layer(execution_path="claude-code-cli")
-        assert await layer.compact("sess-1") is None
-        layer._cm.send_command.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_old_satellite_gated_before_send(self):
-        layer = _layer(supported=False)
         assert await layer.compact("sess-1") is None
         layer._cm.send_command.assert_not_awaited()
 
@@ -247,12 +203,14 @@ class TestWriteConfigTomlGuard:
         CodexCLIExecutionLayer._write_config_toml(
             tmp_path, "prompt",
             '[mcp_servers.x]\ncommand = "python3"\nenv = { "A" = "1" }',
-            interactive=True, trusted_cwd="/tmp/w",
+            interactive=True, trusted_cwd="/tmp/w", session_id="s-1",
         )
         import tomllib
-        text = (tmp_path / "config.toml").read_text()
-        tomllib.loads(text)  # parses
-        assert "default_mode_request_user_input" in text
+        tomllib.loads((tmp_path / "config.toml").read_text())  # parses
+        profile = tomllib.loads((tmp_path / "s-1.config.toml").read_text())
+        assert profile["features"]["default_mode_request_user_input"] is True
+        assert profile["mcp_servers"]["x"]["env"] == {"A": "1"}
+        assert profile["developer_instructions"].startswith("prompt")
 
     def test_invalid_mcp_block_raises_and_writes_nothing(self, tmp_path):
         from core.layers.codex.layer import CodexCLIExecutionLayer

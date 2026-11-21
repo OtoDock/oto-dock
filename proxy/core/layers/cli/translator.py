@@ -66,6 +66,12 @@ _SILENT_SYSTEM_SUBTYPES = frozenset({
     # 2.1.312, the transcript's stand-in record of a rewind.
     "rewind_stand_in",
 })
+# The frames Claude Code prints for every ``SessionStart`` (and ``Setup``)
+# hook command, whatever the spawn's flags: one at its start, one per change
+# of its output while it runs, one at its end with the whole output. The
+# platform registers ten such commands (the start's parts), and a response
+# holds the start's data at a compaction: never a row, never a frame.
+_HOOK_FRAME_SUBTYPES = frozenset({"hook_started", "hook_progress", "hook_response"})
 
 # Cap on per-agent preview strings inside a workflow_progress tree so a busy
 # workflow can't blow the satellite WS frame/queue caps.
@@ -190,6 +196,76 @@ def _rejected_resets_at(info: dict) -> str:
     return turn_ending.epoch_to_iso(reached.get("resetsAt")) if isinstance(reached, dict) else ""
 
 
+# Claude Code 2.1.322 opens no limit menu for Fable's weekly limit nor when
+# the vendor says credits are required (an ``errorCode`` the row's
+# ``rate_limit_info`` carries when the vendor's answer names it); 2.1.323
+# and later open it for both (read in the 2.1.322 and 2.1.325 bundles).
+_NO_MENU_BEFORE_2_1_323 = frozenset({"seven_day_overage_included"})
+_NO_MENU_CODE_BEFORE_2_1_323 = "credits_required"
+
+
+def _cli_older(version, than: tuple[int, int, int]) -> bool:
+    """Whether a row's CLI ``version`` (``x.y.z``) is older than ``than``. A
+    version that cannot be read counts as new."""
+    parts = str(version or "").split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return False
+    return tuple(int(p) for p in parts) < than
+
+
+#: The ``error`` of the message Claude Code writes for a request the vendor
+#: refused for its sign-in (a 401 or 403 it could not renew past, with the
+#: platform's blank renewal token every one): the stream's assistant frame
+#: and the transcript's row alike. ``oauth_org_not_allowed`` is the account's
+#: plan, which no renewal repairs.
+SIGN_IN_REFUSED = "authentication_failed"
+
+
+def api_error_ending(row: dict) -> turn_ending.TurnEnding:
+    """The typed ending of an API-error row of Claude Code's transcript
+    (``isApiErrorMessage``), the terminal's twin of the stream's: a limit when
+    the row says ``error: "rate_limit"``, its text is the limit notice, or the
+    pool's markers call it one, with the reset and the window of its
+    ``apiErrorParams.rate_limit_info`` (the stream event's own shape); any
+    other API error an ``error`` ending with the engine's words, and so a
+    row of the vendor's brief throttle, which says ``rate_limit`` too: one
+    the CLI marks ``apiErrorIsTransient``, or one that carries the CLI's own
+    sentence, the sign the stream reads. Either ends the terminal's turn:
+    the engine's turn loop returns on the row."""
+    from services.engines.pool_rests import _THROTTLE_COOLDOWN_S, throttle_cooldown_for
+    message = row.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    text = "".join(
+        b.get("text", "") for b in (content or []) if isinstance(b, dict) and b.get("type") == "text"
+    ).strip() if isinstance(content, list) else ""
+    params = row.get("apiErrorParams")
+    info = params.get("rate_limit_info") if isinstance(params, dict) else None
+    info = info if isinstance(info, dict) else {}
+    if row.get("apiErrorIsTransient") is True or turn_ending.is_brief_throttle_text(text):
+        return turn_ending.TurnEnding(reason=turn_ending.ERROR, detail=text)
+    if row.get("error") == SIGN_IN_REFUSED:
+        return turn_ending.TurnEnding(reason=turn_ending.ERROR, detail=text, sign_in=True)
+    if (row.get("error") == "rate_limit" or turn_ending.is_limit_text(text)
+            or (throttle_cooldown_for(text) or 0) >= _THROTTLE_COOLDOWN_S):
+        return turn_ending.TurnEnding(reason=turn_ending.LIMIT, resets_at=_rejected_resets_at(info),
+                                      detail=text, window=_reached_window(info))
+    return turn_ending.TurnEnding(reason=turn_ending.ERROR, detail=text)
+
+
+def limit_menu_opens(row: dict) -> bool:
+    """Whether the terminal opened its own limit menu on this row: a rejected
+    limit with a reset, not on overage, of a type the row's CLI version serves
+    (each transcript row carries its ``version``)."""
+    params = row.get("apiErrorParams")
+    info = params.get("rate_limit_info") if isinstance(params, dict) else None
+    if not (isinstance(info, dict) and info.get("status") == "rejected" and info.get("resetsAt")
+            and not info.get("isUsingOverage")):
+        return False
+    return not (_cli_older(row.get("version"), (2, 1, 323))
+                and (info.get("rateLimitType") in _NO_MENU_BEFORE_2_1_323
+                     or info.get("errorCode") == _NO_MENU_CODE_BEFORE_2_1_323))
+
+
 class ClaudeCLIEventTranslator:
     """Stateful per-turn translator: raw NDJSON → ClaudeStreamChunk.
 
@@ -198,9 +274,8 @@ class ClaudeCLIEventTranslator:
     `reset_for_settle()` when entering settle mode after a `result` event
     (preserves cross-turn counters but wipes parsing state).
 
-    All event semantics match `PersistentSession.send_message` exactly —
-    this class exists to let remote sessions reuse the same logic without
-    duplicating code.
+    The one reading of a Claude Code stream: a machine session's adapter
+    feeds it the lines the machine forwards.
     """
 
     __slots__ = (
@@ -225,6 +300,8 @@ class ClaudeCLIEventTranslator:
         "_limit_notice",
         "_limit_resets_at",
         "_limit_window",
+        "_refused_sign_in",
+        "_hook_failure_logged",
     )
 
     def __init__(self, session_id: str) -> None:
@@ -292,6 +369,10 @@ class ClaudeCLIEventTranslator:
         self._limit_notice: str = ""
         self._limit_resets_at: str = ""
         self._limit_window: str = ""
+        # The vendor refused the turn's sign-in (its message's ``error``).
+        self._refused_sign_in: bool = False
+        # A failed hook command is logged once per start (``_note_hook_frame``).
+        self._hook_failure_logged = False
 
     def reset_for_new_turn(self) -> None:
         """Full reset for a brand-new turn.
@@ -323,9 +404,8 @@ class ClaudeCLIEventTranslator:
     def feed(self, data: dict) -> list[ClaudeStreamChunk]:
         """Parse one raw NDJSON event into zero or more chunks.
 
-        Mirrors the dispatch in PersistentSession.send_message lines 682-1056
-        exactly. No I/O, no state external to this class (except the
-        cross-turn counters).
+        No I/O, no state external to this class (except the cross-turn
+        counters).
         """
         if not isinstance(data, dict):
             return []
@@ -373,7 +453,13 @@ class ClaudeCLIEventTranslator:
         """System events: init, task_started/_progress/_notification (subagents
         + dynamic workflows), compacting, compact_boundary, other."""
         subtype = data.get("subtype", "")
+        if subtype in _HOOK_FRAME_SUBTYPES:
+            self._note_hook_frame(data)
+            return []
+
         if subtype == "init":
+            # A start's hooks ran before this frame: the next start logs anew.
+            self._hook_failure_logged = False
             # MCP init — log but don't yield
             mcp_servers = data.get("mcp_servers", [])
             connected = [s["name"] for s in mcp_servers if s.get("status") == "connected"]
@@ -464,12 +550,31 @@ class ClaudeCLIEventTranslator:
                     )]
             return started
 
+        if subtype == "compact_boundary":
+            # The summary took the start's data with it, by the platform's
+            # session id (the CLI's may differ): where the engine reports it,
+            # so every reader of the stream, a call's included, gets it.
+            from core.session import start_context
+            start_context.compacted(self.session_id)
         # All other subtypes (compacting, compact_boundary, etc.) — yield
         return [ClaudeStreamChunk(
             event_type="system",
             event_data={"subtype": subtype, **data},
             session_id=self.actual_session_id,
         )]
+
+    def _note_hook_frame(self, data: dict) -> None:
+        """Log a hook command that failed, by its name and exit code: once per
+        start (the ten parts fail together), and never its output, which can
+        hold the start's data."""
+        if data.get("subtype") != "hook_response" or self._hook_failure_logged:
+            return
+        if data.get("outcome") in (None, "success") and not data.get("exit_code"):
+            return
+        self._hook_failure_logged = True
+        logger.warning("[%s] the engine's hook %s failed (exit %s, %s)", self.session_id[:8],
+                       data.get("hook_name") or data.get("hook_event") or "?",
+                       data.get("exit_code"), data.get("outcome") or "no outcome")
 
     def _handle_task_started(self, data: dict) -> list[ClaudeStreamChunk]:
         """Register a subagent spawn / a background command / start a
@@ -666,16 +771,21 @@ class ClaudeCLIEventTranslator:
     def _note_limit_notice(self, data: dict) -> None:
         """Claude Code answers a usage limit with a synthetic assistant message
         (model ``<synthetic>``, ``error: "rate_limit"``) and then an error
-        result; the message's text is the notice the ending carries."""
+        result; the message's text is the notice the ending carries. The
+        vendor's brief throttle says ``rate_limit`` too and is no limit of the
+        account: its frame has no field for it (the transcript's row has
+        ``apiErrorIsTransient``), so its own sentence is read."""
         data_message = data.get("message")
         message = data_message if isinstance(data_message, dict) else {}
         text = "".join(
             b.get("text", "") for b in (message.get("content") or [])
             if isinstance(b, dict) and b.get("type") == "text"
         ).strip()
-        if data.get("error") == "rate_limit" or (
+        if (data.get("error") == "rate_limit" and not turn_ending.is_brief_throttle_text(text)) or (
                 message.get("model") == "<synthetic>" and turn_ending.is_limit_text(text)):
             self._limit_notice = text or self._limit_notice
+        if data.get("error") == SIGN_IN_REFUSED and not data.get("parent_tool_use_id"):
+            self._refused_sign_in = True
 
     def _note_narration(self, data: dict) -> None:
         """A narration block: the server's summary of the prose the model
@@ -1069,7 +1179,7 @@ class ClaudeCLIEventTranslator:
             # The engine's own error result (a dropped connection, a bad
             # request): the process answered and stays, the ending says so.
             chunks.extend(self._ending_chunks(turn_ending.TurnEnding(
-                reason=turn_ending.ERROR, detail=error_text.strip(),
+                reason=turn_ending.ERROR, detail=error_text.strip(), sign_in=self._refused_sign_in,
             )))
         elif (result_text and not self.has_emitted_text
                 and result_text != RESUME_HANDSHAKE_RESULT):

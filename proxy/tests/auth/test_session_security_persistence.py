@@ -68,6 +68,19 @@ def test_serialize_is_json_safe_and_roundtrips(iso):
     assert session_state._deserialize_security_ctx(d) == ctx  # set restored
 
 
+def test_the_outside_facts_roundtrip(iso):
+    """The picks an outside session was built with: the knowledge folders and
+    the per-server grants come back as tuples (a pair's None stays None)."""
+    ctx = _ctx(role="external", username="", principal="external", external_claim="phone:+1",
+               outside_files_write=True, outside_web=False, outside_knowledge=("faq", "shared/lib"),
+               outside_grants=(("crm", ("find", "list")), ("call-control-mcp", None), ("bare", ())))
+    d = session_state._serialize_security_ctx(ctx)
+    json.dumps(d)
+    back = session_state._deserialize_security_ctx(json.loads(json.dumps(d)))
+    assert back == ctx
+    assert back.outside_grants[1] == ("call-control-mcp", None) and back.outside_grants[2] == ("bare", ())
+
+
 def test_deserialize_tolerates_field_drift(iso):
     d = session_state._serialize_security_ctx(_ctx())
     d["some_future_field"] = "ignored"  # unknown key dropped
@@ -116,7 +129,7 @@ def test_the_mode_and_the_floor_survive_a_restart(iso, monkeypatch):
     monkeypatch.setattr(session_state, "_session_modes", {})
     monkeypatch.setattr(session_state, "_session_token_floor", {})
     monkeypatch.setattr(session_state, "_reloaded_state", {})
-    session_state.register_session_state("sess-1", "default", _ctx(), token_minted_at=1790000000)
+    session_state.register_session_state("sess-1", "ask", _ctx(), token_minted_at=1790000000)
     on_disk = json.loads(session_state._SECURITY_INDEX.read_text())["sess-1"]
     assert (on_disk["_mode"], on_disk["_floor"]) == ("ask", 1790000000)
     session_state.set_session_mode("sess-1", "plan")
@@ -150,7 +163,7 @@ def test_an_older_index_reloads_with_no_mode_and_no_floor(iso, monkeypatch):
     session_state._SECURITY_INDEX.write_text(json.dumps({"sess-1": d}))
     session_state.load_session_security()
     assert session_state.reloaded_state("sess-1") == ("", 0)
-    session_state.restore_session_state("sess-1", "default", 0)
+    session_state.restore_session_state("sess-1", "ask", 0)
     assert "sess-1" not in session_state._session_token_floor  # no floor, as before
 
 
@@ -240,7 +253,7 @@ _INDEX_KEYS = {
     "target_kind", "target_label", "target_agents_dir", "target_machine_id", "target_home_dir",
     "target_allow_full_fs", "target_claude_runtime_root", "target_os_user", "target_os",
     "target_user_dirs", "target_device_grants", "target_otodock_dir", "target_mcps_dir",
-    "target_unresolved_home_dir", "target_unresolved_otodock_dir",
+    "target_unresolved_home_dir", "target_unresolved_otodock_dir", "target_own_copy",
 }
 
 
@@ -275,7 +288,7 @@ def test_a_pre_upgrade_document_loads_with_its_placement_intact():
     assert p.os == "" and p.os_family == "darwin"
     # a document with none of the keys is a local session
     assert session_state._deserialize_security_ctx(
-        {"role": "viewer", "username": "", "agent": "a", "is_admin_agent": False}).placement.is_local
+        {"role": "viewer", "username": "", "agent": "a", "is_admin_agent": False}).placement.kind == placement.KIND_LOCAL
 
 
 
@@ -293,5 +306,5 @@ def test_a_replay_mark_ages_out_and_a_new_life_voids_it(iso, monkeypatch):
     session_state.mark_recover_pending("sess-9")
     assert session_state._sessions["sess-9"]["last_active"]  # pruned with its entry
     monkeypatch.setattr(session_state, "session_is_held", lambda sid: False)
-    session_state.register_session_state("sess-9", "default", None)
+    session_state.register_session_state("sess-9", "ask", None)
     assert session_state.take_recover_pending("sess-9") is False

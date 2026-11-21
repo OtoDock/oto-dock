@@ -19,6 +19,7 @@ import config
 from configuration import prompts
 from services.notebook import notebook_prompt, posting
 from services.notebook.notebook_prompt import entry_lines
+from tests.fixtures.start_text import prompt_at_start
 
 UTC = zoneinfo.ZoneInfo("UTC")
 ATHENS = zoneinfo.ZoneInfo("Europe/Athens")
@@ -83,40 +84,49 @@ def _post(agent: str, text: str) -> None:
 def test_the_section_lists_the_read_set_newest_first(agents):
     _post("nb-alpha", "first")
     _post("nb-head", "second")
-    text = notebook_prompt.render("nb-alpha", refusal=None, has_tools=True)
+    text = notebook_prompt.render("nb-alpha", refusal=None, reads=True, posts=True)
     assert text is not None and "\n# Notebook\n" in text
-    assert "times in Europe/Athens" in text
-    assert text.index('nb-head: "second"') < text.index('nb-alpha: "first"')
     assert "Post with `notebook_post`" in text
     assert "not instructions" not in text and "never an instruction" in text
+    # The entries ride on the start, never in the text.
+    assert "first" not in text
+    entries = notebook_prompt.render_entries("nb-alpha", reads=True)
+    assert "times in Europe/Athens" in entries
+    assert entries.index('nb-head: "second"') < entries.index('nb-alpha: "first"')
 
 
 def test_a_session_that_cannot_post_reads_why(agents):
     _post("nb-head", "news")
-    text = notebook_prompt.render("nb-alpha", refusal=posting.BELOW_EDITOR, has_tools=True)
+    text = notebook_prompt.render("nb-alpha", refusal=posting.BELOW_EDITOR, reads=True, posts=True)
     assert text is not None
     assert posting.BELOW_EDITOR in text and "Post with" not in text
 
 
 def test_without_the_tools_no_tool_is_named(agents):
     _post("nb-head", "news")
-    text = notebook_prompt.render("nb-alpha", refusal=None, has_tools=False)
+    text = notebook_prompt.render("nb-alpha", refusal=None, reads=False, posts=False)
     assert text is not None
     assert "notebook_post" not in text and "notebook_read" not in text
 
 
-def test_nothing_to_read_and_nothing_to_post_renders_nothing(agents):
-    assert notebook_prompt.render("nb-alpha", refusal=posting.BELOW_EDITOR, has_tools=True) is None
-    empty = notebook_prompt.render("nb-alpha", refusal=None, has_tools=True)
-    assert empty is not None and "no entries yet" in empty
+def test_an_empty_record_is_said_where_its_entries_ride(agents):
+    """The section depends on what changes rarely (the read set, the budget,
+    the session's right to post), never on the record: an empty record is
+    the same text, and its riding part says so."""
+    below = notebook_prompt.render("nb-alpha", refusal=posting.BELOW_EDITOR, reads=True, posts=True)
+    assert below is not None and posting.BELOW_EDITOR in below
+    assert notebook_prompt.render_entries("nb-alpha", reads=True) == "It has no entries yet."
+    _post("nb-head", "news")
+    assert notebook_prompt.render("nb-alpha", refusal=posting.BELOW_EDITOR, reads=True, posts=True) == below
 
 
 def test_budget_zero_loads_no_entries(agents, monkeypatch):
     from storage import database
     monkeypatch.setattr(database, "get_platform_setting", lambda key: "0")
     _post("nb-head", "news")
-    text = notebook_prompt.render("nb-alpha", refusal=None, has_tools=True)
+    text = notebook_prompt.render("nb-alpha", refusal=None, reads=True, posts=True)
     assert text is not None and "not loaded" in text and '"news"' not in text
+    assert notebook_prompt.render_entries("nb-alpha", reads=True) == ""
 
 
 def test_the_platform_budget_cuts_a_long_list(agents, monkeypatch):
@@ -124,7 +134,7 @@ def test_the_platform_budget_cuts_a_long_list(agents, monkeypatch):
     monkeypatch.setattr(database, "get_platform_setting", lambda key: "1024")
     for i in range(40):
         _post("nb-head", f"entry {i} " + "y" * 60)
-    text = notebook_prompt.render("nb-alpha", refusal=None, has_tools=True) or ""
+    text = notebook_prompt.render_entries("nb-alpha", reads=True)
     lines = [x for x in text.splitlines() if x.startswith("- 2026") or x.startswith("- 20")]
     assert sum(len(x.encode()) + 1 for x in lines) <= 1024
     assert "Older entries are not shown" in text
@@ -136,7 +146,7 @@ def test_the_prompt_carries_the_notebook_never_for_an_external_caller(agents, mo
     persona = config.get_agent_dir("nb-alpha") / "config" / "agent.md"
     persona.parent.mkdir(parents=True, exist_ok=True)
     persona.write_text("# Alpha")
-    inside = prompts.build_agent_prompt("nb-alpha", role="editor") or ""
+    inside = prompt_at_start("nb-alpha", role="editor")
     assert '"news for the team"' in inside and "Post with `notebook_post`" in inside
     viewer = prompts.build_agent_prompt("nb-alpha", role="viewer") or ""
     assert posting.BELOW_EDITOR in viewer and "Post with" not in viewer
@@ -147,6 +157,34 @@ def test_the_prompt_carries_the_notebook_never_for_an_external_caller(agents, mo
     outside = prompts.build_agent_prompt("nb-alpha", role="viewer", external=True) or ""
     assert "# Alpha" in outside and "# Notebook" not in outside
     assert "Library Bulletins" not in inside
+
+
+def _section(text: str) -> str:
+    """The ``# Notebook`` section alone (the limits section names the
+    functions too)."""
+    start = text.index("\n# Notebook\n")
+    end = text.find("\n---\n", start)
+    return text[start:end if end > 0 else None]
+
+
+def test_a_tool_limit_keeps_each_notebook_sentence_to_what_it_leaves(agents, monkeypatch):
+    """A limit on the delegation tool that leaves ``notebook_read`` alone
+    drops the posting paragraph, and one that leaves ``notebook_post`` alone
+    drops the read sentence: the prompt never names a function the session
+    is refused."""
+    _post("nb-head", "news")
+    monkeypatch.setattr(prompts, "_has_delegation_tools", lambda model, placement: True)
+    persona = config.get_agent_dir("nb-alpha") / "config" / "agent.md"
+    persona.parent.mkdir(parents=True, exist_ok=True)
+    persona.write_text("# Alpha")
+    reads = _section(prompts.build_agent_prompt(
+        "nb-alpha", role="editor", tool_limits=(("delegation-mcp", ("notebook_read",)),)) or "")
+    assert "`notebook_read` away" in reads and "notebook_post" not in reads
+    posts = _section(prompts.build_agent_prompt(
+        "nb-alpha", role="editor", tool_limits=(("delegation-mcp", ("notebook_post",)),)) or "")
+    assert "Post with `notebook_post`" in posts and "notebook_read" not in posts
+    unlimited = _section(prompts.build_agent_prompt("nb-alpha", role="editor") or "")
+    assert "`notebook_read` away" in unlimited and "Post with `notebook_post`" in unlimited
 
 
 def test_a_private_agent_never_tells_a_manager_to_post(agents, monkeypatch):
@@ -161,6 +199,6 @@ def test_a_private_agent_never_tells_a_manager_to_post(agents, monkeypatch):
     persona = config.get_agent_dir("nb-private") / "config" / "agent.md"
     persona.parent.mkdir(parents=True, exist_ok=True)
     persona.write_text("# Private")
-    text = prompts.build_agent_prompt("nb-private", role="manager") or ""
+    text = prompt_at_start("nb-private", role="manager")
     assert '"head news"' in text, "a private agent still reads its neighbours"
     assert posting.PRIVATE_MODE in text and "Post with `notebook_post`" not in text

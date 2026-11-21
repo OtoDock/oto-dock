@@ -15,7 +15,6 @@ import asyncio
 import json
 import logging
 import re
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
@@ -543,7 +542,6 @@ async def _finish(name: str, row: dict, *, installed: dict | None, result: dict,
     is the manifest before the switch (``None`` when the switch is being
     finished after the fact: the reconnect list then comes from the plan);
     ``ensure_start`` starts a container runtime even without a rename."""
-    from core.config import deployment
     from services.mcp import docker_manager, mcp_registry
 
     swap_result: dict = {
@@ -559,9 +557,8 @@ async def _finish(name: str, row: dict, *, installed: dict | None, result: dict,
         swap_result["renamed"], swap_result["kept"] = renames["renamed"], renames["kept"]
         refreshed = mcp_registry.get_manifest(name)
         new_is_container = refreshed is not None and _mt.is_container(refreshed.server)
-        self_host = deployment.current_mode() != deployment.EXTERNAL_POOL
         container_started = swap_result["container_started"] if new_is_container else None
-        if new_is_container and self_host and (
+        if new_is_container and (
             ensure_start or (renames["renamed"] and container_started is not None)
         ):
             # The installer started the container with the keys as they were
@@ -577,7 +574,7 @@ async def _finish(name: str, row: dict, *, installed: dict | None, result: dict,
         swap_result["container_started"] = container_started
         new_image = (cast("_mt.McpManifest", refreshed).server.image or "") if new_is_container else ""
         if (
-            old_image and old_image != new_image and self_host
+            old_image and old_image != new_image
             and (not new_is_container or container_started)
         ):
             await asyncio.to_thread(docker_manager.remove_image, old_image)
@@ -738,6 +735,9 @@ async def switch(name: str, *, from_url: str, to_url: str, manifest_hash: str,
             raise HTTPException(500, f"Switch failed: {detail}") from exc
 
         swap_result = await _finish(name, row, installed=installed, result=result, old_image=old_image)
+        # A new source's tool labels: listed again for the Outside people picks.
+        from services.mcp import tool_listing
+        tool_listing.schedule_after_install(name)
         return _reply(name, row, swap_result, install_log=result.get("install_log", ""))
 
 
@@ -762,9 +762,8 @@ async def reconcile_interrupted() -> list[str]:
     with the interrupted error; a folder that already holds the new source
     means the switch ended after its install, so it is finished on that
     source (the renames applied, the row ``switched`` with the error noted);
-    otherwise the row goes back to ``pending``. Then a ``<dir>.bak`` a crash
-    left beside any other community install (scanned as a same-name manifest
-    at every scan) is removed when the install's own manifest is in place.
+    otherwise the row goes back to ``pending``. Then every other update the
+    restart cut short is settled (``_settle_backups``): its backup put back.
     Returns the names moved back to pending."""
     from core.credentials import catalog_install_registry
     from services.mcp import mcp_registry
@@ -807,22 +806,45 @@ async def reconcile_interrupted() -> list[str]:
             ", ".join(finished),
         )
 
-    def _sweep() -> list[str]:
-        removed: list[str] = []
-        for m in list(mcp_registry.get_all_manifests().values()):
-            if m.category != "community":
-                continue
-            mcp_dir = Path(m.mcp_dir)
-            bak = mcp_dir.with_suffix(".bak")
-            if (
-                bak.is_dir() and (mcp_dir / "manifest.json").is_file()
-                and not catalog_install_registry.lock_for(m.name).locked()
-            ):
-                shutil.rmtree(bak, ignore_errors=True)
-                removed.append(str(bak))
-        return removed
-
-    removed = await asyncio.to_thread(_sweep)
+    put_back, removed = await asyncio.to_thread(_settle_backups)
+    if put_back:
+        logger.warning("Updates cut short by a restart, their tools put back as they were: %s",
+                       ", ".join(put_back))
     if removed:
-        logger.warning("Removed install backups left by an interrupted update: %s", removed)
+        logger.warning("Removed what was left of install backups: %s", removed)
+    if put_back or removed:
+        await mcp_registry.rescan()
     return moved
+
+
+def _settle_backups() -> tuple[list[str], list[str]]:
+    """A ``<tool>.bak`` beside a community tool whose install lock nobody
+    holds is an update the platform died in (a finished one removes it):
+    the backup goes back in place of the half-updated folder. One with no
+    manifest is what a failed removal left of a backup, with no tool to put
+    back, and goes. Answers ``(names put back, folders removed)``."""
+    from core.credentials import catalog_install_registry
+    from services.mcp import mcp_installer, mcp_manifest_store
+    put_back: list[str] = []
+    removed: list[str] = []
+    root = Path(config.MCPS_DIR) / "community"
+    if not root.is_dir():
+        return put_back, removed
+    for bak in sorted(root.glob(f"*{mcp_manifest_store.BACKUP_SUFFIX}")):
+        if not bak.is_dir() or bak.is_symlink():
+            continue
+        data = _read_manifest(bak)
+        mcp_dir = bak.with_suffix("")
+        name = str((data or {}).get("name") or mcp_dir.name)
+        if catalog_install_registry.lock_for(name).locked():
+            continue
+        try:
+            if data is None:
+                mcp_installer.remove_tree(bak)
+                removed.append(str(bak))
+            else:
+                installer._rollback_extracted_files(mcp_dir, bak)
+                put_back.append(name)
+        except OSError as exc:
+            logger.error("could not settle the install backup %s: %s", bak, exc)
+    return put_back, removed

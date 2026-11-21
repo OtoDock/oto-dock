@@ -47,13 +47,9 @@ from auth.providers import (
     require_auth,
     require_user,
 )
-from core import file_commit, layout
+from core import agent_folder, file_commit, layout
 from services.infra import safe_fs
-from services.infra.path_confinement import (
-    PathOutsideRoot,
-    join_under,
-    resolve_under,
-)
+from services.infra.path_confinement import join_under
 from services.media.upload_staging import _occupancy, _open_metas, _user_staging_dirname
 from storage import database as task_store
 from storage.agents import agent_store
@@ -199,27 +195,29 @@ def _check_target_dir(target_dir: str) -> None:
 
 def _resolve_upload_destination(
     user: UserContext, agent: str, target_dir: str, safe_name: str,
-    *, create: bool, landing_is_target: bool = False,
 ) -> tuple[Path, Path]:
     """Authorize + resolve the landing directory for an upload.
 
     The FULL chain the single-shot route has always run — agent existence,
     agent-scoped vs per-user landing, the workspace-tier gate for agent-scoped
-    targets, role-checked `safe_agent_path` for explicit target dirs, and the
-    resolved-path confinement check — shared by the single-shot route and the
-    chunked init/complete endpoints so the two paths can never drift. Chunked
-    callers run it TWICE by design: at init (fail before any bytes move) and
-    at complete (the caller's role may have changed since init). It reads the
-    DB, so callers run it on ``run_db``; the landing dir itself is created by
-    the file-commit thread through ``safe_fs`` (``create`` keeps the plain
-    mkdir for the callers that still want it).
+    targets, the role check — shared by the single-shot route, the folder
+    reservation and the chunked init/complete endpoints so they can never
+    drift. Chunked callers run it TWICE by design: at init (fail before any
+    bytes move) and at complete (the caller's role may have changed since
+    init). It reads the DB, so callers run it on ``run_db``; the landing dir
+    itself is created by the file-commit thread through ``safe_fs``.
 
-    ``landing_is_target``: the landing dir is ``target_dir`` itself, never
-    where ``target_dir/safe_name`` resolves (a folder reservation creates a
-    fresh name there by an exclusive mkdir; a link already holding the name
-    must not move the folder elsewhere).
+    Every branch names its landing folder as written and the files API's own
+    owner, ``safe_agent_path``, authorizes the folder where it RESOLVES: the
+    file lands in that folder under a name created there exclusively, never
+    where a name inside it resolves. The new name is judged as text by the
+    same API's rules a name carries (credentials, engine state, the
+    platform's own folders, library mirrors). The answer is the authorized
+    folder; the landing write opens it beneath
+    ``AGENTS_DIR`` with no link followed, so a link put in after this check
+    refuses the write instead of moving it.
 
-    Returns ``(upload_dir, agent_dir)``.
+    Returns ``(upload_dir, agent_root)``.
     """
     if target_dir:
         _check_target_dir(target_dir)
@@ -240,14 +238,7 @@ def _resolve_upload_destination(
 
     agent_dir = config.get_agent_dir(agent)
     if target_dir:
-        # Custom target — authorize the RESOLVED final path against the caller's
-        # per-agent role (fixes a role-var bug — was user.role — and defeats
-        # '..' / symlink scope-escape).
-        from api.agents.agents import safe_agent_path
-        target_file, _ = safe_agent_path(
-            agent_dir, agent, str(Path(target_dir)) + "/" + safe_name, user, writing=True,
-        )
-        upload_dir = agent_dir / Path(target_dir) if landing_is_target else target_file.parent
+        landing = str(Path(target_dir))
     elif is_agent_scoped:
         # Agent-scoped chat upload — a shared-workspace write, so the
         # workspace tier (contributor and up). Path policy
@@ -261,7 +252,7 @@ def _resolve_upload_destination(
                 detail="Contributor role or above is required to upload "
                        "to the shared workspace",
             )
-        upload_dir = agent_dir / layout.WORKSPACE / "uploads" / "files"
+        landing = f"{layout.WORKSPACE}/uploads/files"
     else:
         # Default chat-upload destination — dedicated subfolder under the
         # user's workspace to keep the root tidy. Workspace-page uploads
@@ -269,21 +260,26 @@ def _resolve_upload_destination(
         # the workspace-tidiness pattern used by image-gen-mcp
         # (`generated-assets/`) and the WS chat-photo path
         # (`uploads/photos/`).
-        upload_dir = (
-            layout.user_dir(agent_dir, username) / layout.WORKSPACE / "uploads" / "files"
-        )
+        landing = f"{layout.user_rel(username)}/{layout.WORKSPACE}/uploads/files"
 
-    # Every branch lands inside the agent tree by construction; re-check it
-    # on the RESOLVED landing dir so a symlink planted there cannot redirect
-    # the write, and hand back resolved paths so ``relative_to`` agrees.
-    agent_root = Path(os.path.realpath(agent_dir))
-    try:
-        upload_dir = resolve_under(upload_dir, agent_root)
-    except PathOutsideRoot as exc:
-        raise HTTPException(status_code=403, detail="Path outside agent directory") from exc
-    if create:
-        upload_dir.mkdir(parents=True, exist_ok=True)
-
+    from api.agents.files import (
+        _check_engine_state,
+        _check_library_mirror_write,
+        _check_oauth_protected,
+        safe_agent_path,
+    )
+    from core.remote.file_sync import is_platform_only_tree
+    upload_dir, _uname = safe_agent_path(agent_dir, agent, landing, user, writing=True)
+    agent_root = agent_folder.agent_root(agent)
+    folder_rel = upload_dir.relative_to(agent_root).as_posix()
+    # The new name, as text: the rules a name carries on its own (it is
+    # created there, never resolved).
+    name_rel = safe_name if folder_rel == "." else f"{folder_rel}/{safe_name}"
+    _check_oauth_protected(name_rel)
+    _check_engine_state(name_rel)
+    if is_platform_only_tree(name_rel):
+        raise HTTPException(status_code=403, detail="Access denied: path outside allowed scope")
+    _check_library_mirror_write(name_rel, agent)
     return upload_dir, agent_root
 
 
@@ -293,10 +289,18 @@ def _resolve_upload_destination(
 # ---------------------------------------------------------------------------
 
 
-def _landing_rel(upload_dir: Path) -> str:
-    """The landing dir as a rel beneath ``AGENTS_DIR``; a ``SafeFsError`` is
-    the caller's 403 (the resolved dir left the agents tree)."""
-    return safe_fs.rel_under(upload_dir, config.AGENTS_DIR)
+def _landing_rel(upload_dir: Path, agent: str) -> str:
+    """The landing dir as a rel beneath ``AGENTS_DIR``: the agent's own name,
+    then the folder below its real folder (the files API's ``_agent_rel``),
+    never the first part of where the folder resolves, so an agent folder
+    swapped for a link is refused at the open. A ``SafeFsError`` is the
+    caller's 403."""
+    from api.agents.files import _agent_rel
+    try:
+        return _agent_rel(agent, upload_dir, config.get_agent_dir(agent))
+    except ValueError:
+        raise safe_fs.EscapeRefused(errno.EXDEV, "the landing folder is outside the agent's folder",
+                                    str(upload_dir)) from None
 
 
 def _rel_to_agent_path(landed_rel: str) -> str:
@@ -434,7 +438,7 @@ async def upload_file(
         safe_name = f"file{ext}"
 
     upload_dir, agent_dir = await run_db(
-        _resolve_upload_destination, user, agent, target_dir, safe_name, create=False,
+        _resolve_upload_destination, user, agent, target_dir, safe_name,
     )
 
     # Quick size check via Content-Length header
@@ -444,7 +448,7 @@ async def upload_file(
     declared = int(content_length) if content_length and content_length.isdigit() else 0
 
     try:
-        landing_rel = _landing_rel(upload_dir)
+        landing_rel = _landing_rel(upload_dir, agent)
     except safe_fs.SafeFsError as exc:
         raise HTTPException(status_code=403, detail="Path outside agent directory") from exc
 
@@ -508,8 +512,9 @@ async def upload_file(
     # the upload over so the agent CLI can see it — in the BACKGROUND, so
     # the response (and the dashboard's workspace listing, which reads the
     # platform dir) doesn't stall for the length of a WAN transfer. A prompt
-    # referencing the file can't outrun the push: the remote turn dispatch
-    # barriers on in-flight pushes (``core/remote/upload_inflight``).
+    # referencing the file waits for the push: the remote turn dispatch
+    # barriers on in-flight pushes (``core/remote/upload_inflight``), and at a
+    # bound the turn goes on and the agent and the chat are told.
     # Best-effort like the old synchronous push — on failure the periodic
     # fingerprint sweep / next session-start sync reconciles.
     #
@@ -554,8 +559,8 @@ def _schedule_upload_push(
     (``core/remote/upload_inflight``). Never raises, never blocks. Returns
     True iff a push was actually scheduled (fan-out candidates exist).
 
-    The cheap in-memory candidate gate runs HERE (synchronously) so
-    local-only installs — no connected satellite — schedule nothing at all.
+    The cheap in-memory candidate gate runs HERE (synchronously), so an
+    upload no connected machine may receive schedules nothing at all.
     """
     try:
         from services.remote import workspace_fanout
@@ -600,9 +605,10 @@ async def _push_upload_to_active_remote_sessions(
       * ``/v1/upload`` runs this in the BACKGROUND via ``_schedule_upload_push``
         (the remote turn dispatch barriers on it — ``core/remote/upload_inflight``);
       * the ws/dashboard "Take Photo / Upload Photo" path and the hook-side
-        artifact writes (``api/hooks/hooks.py``) AWAIT it — they run inside a
-        message send / agent turn where the file must be on the machine before
-        the very next step reads it.
+        artifact writes (``api/hooks/hooks.py``) await it, which hands the file to
+        each machine's lane. They run inside a message send / agent turn, where
+        the file must be on the machine before the very next step reads it: the
+        turn's barrier and the tunnel's wait for the asking machine see to that.
     """
     from services.remote import workspace_fanout
     if not workspace_fanout.has_fanout_candidates(agent_slug, rel_path, include_idle=True):
@@ -936,11 +942,10 @@ async def reserve_upload_folder(
     require_agent_access(user, body.agent)
     name = _folder_name(body.name)
     upload_dir, _agent_root = await run_db(
-        _resolve_upload_destination, user, body.agent, body.target_dir, name, create=False,
-        landing_is_target=True,
+        _resolve_upload_destination, user, body.agent, body.target_dir, name,
     )
     try:
-        landing_rel = _landing_rel(upload_dir)
+        landing_rel = _landing_rel(upload_dir, body.agent)
         rel = await file_commit.run(_reserve_folder, landing_rel, name)
     except safe_fs.SafeFsError as exc:
         raise HTTPException(status_code=403, detail="Path outside agent directory") from exc
@@ -998,7 +1003,6 @@ async def chunked_upload_init(
         safe_name = "file"
     await run_db(
         _resolve_upload_destination, user, body.agent, body.target_dir, safe_name,
-        create=False,
     )
 
     allowed, retry_after = rate_limiter.hit("upload_init", user.sub)
@@ -1258,10 +1262,10 @@ async def chunked_upload_complete(
 
         upload_dir, _agent_dir = await run_db(
             _resolve_upload_destination, user, meta["agent"], meta.get("target_dir", ""),
-            meta["filename"], create=False,
+            meta["filename"],
         )
         try:
-            landing_rel = _landing_rel(upload_dir)
+            landing_rel = _landing_rel(upload_dir, meta["agent"])
         except safe_fs.SafeFsError as err:
             raise HTTPException(status_code=403, detail="Path outside agent directory") from err
         try:

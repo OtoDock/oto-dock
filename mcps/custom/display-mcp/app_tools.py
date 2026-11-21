@@ -173,11 +173,12 @@ APP_TOOLS: list[Tool] = [
                 "actions": {
                     "type": "array",
                     "description": (
-                        "Declared-actions manifest (≤16). Each: {id, label, "
+                        "Declared-actions manifest (≤32). Each: {id, label, "
                         "type: 'fire_task'|'send_prompt'|'mcp_tool'|'data_feed'|'platform', "
                         "task_id? (fire_task — must be a scheduled or trigger task of this agent), "
                         "prompt? (send_prompt — may use {{arg}} placeholders filled from the "
-                        "otodock.action args), mcp?/tool?/fixed_args? (mcp_tool — calls ONE tool "
+                        "otodock.action args), new_chat? (send_prompt — true makes the button "
+                        "start a new chat each time), mcp?/tool?/fixed_args? (mcp_tool — calls ONE tool "
                         "on one of this agent's MCPs directly, no agent turn), feed? (data_feed — "
                         "subscribe the page to a read-only live platform feed via otodock.feed: "
                         "'active_chats', 'project_lanes', 'sessions', 'tasks', 'notifications', "
@@ -191,7 +192,8 @@ APP_TOOLS: list[Tool] = [
                         "'viewer.data.read' / 'viewer.data.write' (a small document per viewer, "
                         "each page its own; single-file apps only)), min_role? "
                         "('contributor'|'editor'|'manager' "
-                        "— the lowest agent role that may use the action; everyone otherwise), "
+                        "— the lowest agent role that may use the action; every member otherwise; "
+                        "'external' opens a tool or task button to a shared link's visitors too), "
                         "args_schema? (fire_task/mcp_tool/platform — flat JSON-Schema object of "
                         "scalar props gating page-supplied args; strings need maxLength or enum; "
                         "see the skill; 'viewer.data.write' takes its doc or patch object with "
@@ -412,7 +414,8 @@ APP_TOOLS: list[Tool] = [
             "old one and switches only when it answers /_health — a broken "
             "server leaves the previous release running and the result says "
             "why. A changed app.json (or the app's 'deploys need approval' "
-            "switch, or a required secret with no value yet) lands as a PENDING "
+            "switch, a required secret with no value yet, or a server where the "
+            "live release has none) lands as a PENDING "
             "release until a person approves it on the card: relay 'pending "
             "approval' and the `waiting` reason to the user. Run check_app "
             "first. pin_app(slug) on such a folder does the same thing."
@@ -1022,6 +1025,12 @@ _SHARE_WORDS = {"agent": "an agent share", "department": "a department share",
                 "person": "your own accepted share"}
 
 
+def _floor_words(floor: str) -> str:
+    """A method's floor as a line says it: ``external`` opens it to
+    everyone, a member's role reads "and up"."""
+    return "everyone, external identities too" if floor == "external" else f"{floor} and up"
+
+
 def _placed_line(p: dict) -> str:
     """One line of ``list_apps`` for an app a share placed in this agent
     (SHARING.md "Agents use a placed app"): the home pair and the id, how it
@@ -1029,7 +1038,7 @@ def _placed_line(p: dict) -> str:
     pl = p.get("placement") or {}
     methods = (p.get("exports") or {}).get("methods") or {}
     calls = ", ".join(
-        f"{name}" + (f" ({spec.get('min_role')} and up)" if spec.get("min_role") else "")
+        f"{name}" + (f" ({_floor_words(spec.get('min_role'))})" if spec.get("min_role") else "")
         for name, spec in methods.items()
     )
     role = p.get("role") or ""
@@ -1068,8 +1077,13 @@ def _deploy_reply(slug: str, data: dict, again: str) -> list[TextContent | Image
     tail = ((f"\n{folders}" if folders else "") + (f"\n{warned}" if warned else "")
             + (f"\n{rendered}" if rendered else ""))
     if data.get("status") == "pending approval":
-        why = ("its app.json changed (or is new)" if data.get("manifest_changed")
-               else "this app's deploys need approval")
+        # Every reason the answer names (a server the live release has not
+        # waits too), read as booleans like the card.
+        reasons = [said for flag, said in (
+            ("manifest_changed", "its app.json changed (or is new)"),
+            ("adds_server", "it brings a server the live app does not run"),
+        ) if data.get(flag) is True]
+        why = " and ".join(reasons) or "this app's deploys need approval"
         # A required secret without a value parks the release too (APPS.md
         # "Secrets"): say which, and who sets it — never ask for the value.
         waiting = (f" Waiting: {data['waiting']}. A manager sets it in the app's Settings, from "
@@ -1080,11 +1094,12 @@ def _deploy_reply(slug: str, data: dict, again: str) -> list[TextContent | Image
         # the release that says so does. Read as a boolean, like the card.
         lowers = (" This release turns approval off for every later deploy; a person "
                   "approves it on the card." if data.get("lowers_approval") is True else "")
+        live = (f" Viewers keep release {data['live_release']} meanwhile." if data.get("live_release")
+                else " The app is not live until then.")
         return [TextContent(type="text", text=(
             f"Release {data.get('release')} of '{slug}' is WAITING FOR APPROVAL because {why}: "
             f"tell the user to open the app (app_id {data.get('app_id')}, page "
-            f"/apps/{data.get('app_id')}) and approve it on the card. Viewers keep "
-            f"release {data.get('live_release') or 'none'} meanwhile." + lowers + waiting + tail)),
+            f"/apps/{data.get('app_id')}) and approve it on the card." + live + lowers + waiting + tail)),
             *pictures]
     if data.get("status") != "ok":
         # The deploy answer's words (proxy services/apps/app_deploy.py
@@ -1175,6 +1190,9 @@ async def _handle_deploy_hook(op: str, arguments: dict) -> list[TextContent | Im
             lines.append(f"Release {data['pending_release']} waits for approval: "
                          f"{len(ch.get('added', []))} added, {len(ch.get('changed', []))} changed, "
                          f"{len(ch.get('removed', []))} removed file(s).")
+        if data.get("adds_server") is True:
+            lines.append("The pending release brings a server the live app does not run, so a "
+                         "person approves it on the card.")
         if data.get("deploy_requires_approval"):
             lines.append("Deploys of this app always wait for approval.")
         if data.get("lowers_approval") is True:
@@ -1256,7 +1274,9 @@ async def _handle_describe(arguments: dict) -> list[TextContent]:
         lines.append(f"  {words[kind]}:")
         for name, spec in entries.items():
             floor = ""
-            if spec.get("min_role"):
+            if spec.get("min_role") == "external":
+                floor = " [external identities too: a caller's session on an app a manager opened to them]"
+            elif spec.get("min_role"):
                 judged = ("judged at your role here as the share gives it" if placement and kind == "methods"
                           else f"on {data.get('agent')}")
                 floor = f" [{spec.get('min_role')} and up, {judged}]"

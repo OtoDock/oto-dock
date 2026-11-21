@@ -347,15 +347,17 @@ def _patch_targets(monkeypatch, manifests, mode):
     monkeypatch.setattr(deployment, "current_mode", lambda: mode)
 
 
-def test_community_targets_excludes_docker_on_t3(monkeypatch):
+def test_community_targets_keep_docker_on_a_hosted_install(monkeypatch):
+    import config
     from core.config import deployment
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
     _patch_targets(monkeypatch, [
         _Manifest("d", runtime="docker"),
         _Manifest("p", runtime="python"),
         _Manifest("core-x", runtime="docker", category="core"),
-    ], deployment.EXTERNAL_POOL)
+    ], deployment.MANAGED_SOCKPROX)
     names = {m.name for m in au.mcp_updater.community_targets()}
-    assert names == {"p"}  # docker dropped on T3, core never included
+    assert names == {"d", "p"}  # the hosted install updates its own containers, core never
 
 
 def test_community_targets_includes_docker_self_host(monkeypatch):
@@ -400,3 +402,38 @@ def test_in_window_sunday_vs_monday(monkeypatch):
     assert au._in_window(sunday_3am) is True
     assert au._in_window(sunday_6am) is False
     assert au._in_window(monday_3am) is False
+
+
+@pytest.mark.asyncio
+async def test_the_weekly_run_waits_for_a_compute_machine_and_says_so_once(monkeypatch, caplog):
+    """An update's build runs on a compute machine. With none connected the
+    run is skipped and stays due, so it starts when one is back."""
+    import asyncio
+    import logging
+    from types import SimpleNamespace
+
+    from services.mcp import mcp_autoupdate as au
+    state = SimpleNamespace(machine="")
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager",
+                        lambda: SimpleNamespace(building_machine=lambda: state.machine))
+    monkeypatch.setattr(au, "_reconciled", True)
+    monkeypatch.setattr(au, "_skipped_for_machine", False)
+    monkeypatch.setattr(au.mcp_updater, "auto_update_enabled", lambda: True)
+    monkeypatch.setattr(au, "_is_due", lambda now: (True, True))
+    claimed: list = []
+    monkeypatch.setattr(au, "_set_last_run", claimed.append)
+    started: list = []
+
+    async def _run(trigger):
+        started.append(trigger)
+    monkeypatch.setattr(au, "_run_guarded", _run)
+    with caplog.at_level(logging.INFO, logger=au.logger.name):
+        await au.maybe_run_weekly()
+        await au.maybe_run_weekly()
+    assert claimed == [] and started == []
+    assert [r.getMessage() for r in caplog.records].count(
+        "mcp autoupdate: no compute machine is connected, the weekly run waits for one") == 1
+    state.machine = "compute-own"
+    await au.maybe_run_weekly()
+    await asyncio.sleep(0.05)
+    assert len(claimed) == 1 and started == ["auto"]

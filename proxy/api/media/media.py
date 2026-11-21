@@ -55,6 +55,9 @@ router = APIRouter()
 # tokens minted by the hook pass expires_at="" (durable until chat delete).
 _WORKSPACE_TOKEN_TTL = 24 * 3600
 
+# The media kind of a file card's row (send_file, a document preview's download).
+_FILE_CARD = "file"
+
 
 class FdFileResponse(FileResponse):
     """A ``FileResponse`` over a descriptor the caller already checked.
@@ -100,10 +103,17 @@ def open_media_row(info: dict) -> tuple[int, os.stat_result, str]:
     return fd, st, rel
 
 
+class _MachineAway(Exception):
+    """The row's machine has no connection: the one case the serve calls the
+    file's computer offline (its 503)."""
+
+
 async def _repull_satellite_media(token: str, info: dict) -> tuple[Path, str] | None:
     """Re-fetch a satellite-host media file from the laptop on replay (the
     session-scoped / TTL'd copy is gone). Returns (served_path, mime), or None
-    when there's no origin, the machine is offline, or the pull fails."""
+    when there's no origin or the pull gave nothing while the machine is
+    connected (the file deleted or moved there, a refused read). Raises
+    ``_MachineAway`` when the machine has no connection."""
     origin = (info.get("origin_path") or "").strip()
     machine_id = (info.get("machine_id") or "").strip()
     if not origin or not machine_id:
@@ -112,7 +122,7 @@ async def _repull_satellite_media(token: str, info: dict) -> tuple[Path, str] | 
     from services.path_policy_v2 import PathRef
     cm = get_connection_manager()
     if cm.get_connection(machine_id) is None:
-        return None  # machine offline → caller surfaces a 503
+        raise _MachineAway
     host_dir = media_pipeline.host_cache_dir()
     dest = host_dir / f"repull-{token}{Path(origin).suffix}"
     ok = await cm.pull_file_to_path(
@@ -120,17 +130,22 @@ async def _repull_satellite_media(token: str, info: dict) -> tuple[Path, str] | 
     )
     if not ok or not dest.is_file():
         return None
-    served, mime, _ = await media_pipeline.ensure_playable_async(
-        dest, media_kind=info.get("media_kind", ""), dest_dir=host_dir,
-    )
+    if (info.get("media_kind") or "") == _FILE_CARD:
+        # A file card serves the file as it is: no probe, no conversion.
+        served, mime = dest, info.get("mime") or ""
+    else:
+        served, mime, _ = await media_pipeline.ensure_playable_async(
+            dest, media_kind=info.get("media_kind", ""), dest_dir=host_dir,
+        )
     await run_db(task_store.update_media_token_path, token, str(served), mime=mime)
     return served, mime
 
 
 async def _open_or_repull(token: str, info: dict) -> tuple[int, os.stat_result, str, dict]:
     """The checked descriptor for a row, re-pulling satellite-host media that
-    aged out of its cache. Every refusal is the client's 404 (or the 503 for
-    an offline machine): a holder learns nothing about what a path points at."""
+    aged out of its cache. Every refusal is the client's 404, the 503 only
+    for a machine with no connection: a holder learns nothing about what a
+    path points at."""
     try:
         fd, st, rel = await asyncio.to_thread(open_media_row, info)
         return fd, st, rel, info
@@ -146,14 +161,15 @@ async def _open_or_repull(token: str, info: dict) -> tuple[int, os.stat_result, 
         raise HTTPException(status_code=404, detail="media not found or expired") from exc
     # Satellite-host (Desktop/Downloads) media isn't retained on the
     # platform: re-pull it from the laptop on demand if it's connected.
-    result = await _repull_satellite_media(token, info)
+    try:
+        result = await _repull_satellite_media(token, info)
+    except _MachineAway:
+        raise HTTPException(
+            status_code=503,
+            detail="This file lives on the remote machine, which is "
+                   "offline. Reconnect it and try again.",
+        ) from None
     if result is None:
-        if (info.get("origin_path") or "").strip():
-            raise HTTPException(
-                status_code=503,
-                detail="This clip lives on the remote machine, which is "
-                       "offline. Reconnect it and try again.",
-            )
         raise HTTPException(status_code=404, detail="media file no longer exists")
     served, repulled_mime = result
     info = {**info, "abs_path": str(served), "mime": repulled_mime}
@@ -204,6 +220,12 @@ async def serve_media(
         # type instead of sniffing an attacker-shaped body into something
         # executable.
         headers = {"X-Content-Type-Options": "nosniff"}
+        # A download the document pane prepared (``document_downloads``) is
+        # named by its own file, the name the proxy derived from the
+        # document: the link's ``fn`` never reaches the header.
+        if (info.get("media_kind") or "") == "converted":
+            return FdFileResponse(fd, st, media_type=mime, filename=leaf,
+                                  headers={**headers, "Cache-Control": "no-store"})
         if download:
             # Attachment download. The client `fn` is often a caption/title
             # with no extension (e.g. a track name), so keep the saved file's

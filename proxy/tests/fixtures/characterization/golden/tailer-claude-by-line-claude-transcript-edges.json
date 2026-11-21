@@ -265,9 +265,16 @@
    "assistant_chars": 51,
    "compact_trigger": "",
    "compacted": false,
+   "ending": {
+    "detail": "API Error: 429 rate_limit_error: rate limit reached",
+    "reason": "limit",
+    "resets_at": "",
+    "window": ""
+   },
    "last_message": "",
-   "last_signal": null,
-   "last_signal_at": null,
+   "last_signal": "end_turn",
+   "last_signal_at": 1792189818.0,
+   "limit_menu": false,
    "persisted": 1,
    "question_pending": false,
    "title_set": false,
@@ -574,9 +581,7 @@
   }
  ],
  "snapshots": [],
- "throttles": [
-  "API Error: 429 rate_limit_error: rate limit reached"
- ],
+ "throttles": [],
  "titles": [
   [
    "u-person",

@@ -1,0 +1,26 @@
+{
+ "logged": [
+  [
+   "warning",
+   "Shutdown: engine-a a-sessio error: the close failed"
+  ]
+ ],
+ "order": [
+  "shutdown",
+  "shutdown_meetings",
+  "close a-session-1",
+  "close a-session-2",
+  "close b-session-1",
+  {
+   "args": [
+    "platform-stopping"
+   ],
+   "call": "close_all",
+   "kwargs": {
+    "local_only": true,
+    "timeout": 10.0
+   }
+  },
+  "close r-session-1"
+ ]
+}

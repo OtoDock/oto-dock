@@ -5,9 +5,9 @@ is truly over: how long to wait between stdout lines, whether to extend the
 wait on hook activity, when to exit settle mode.
 
 Pure: no I/O, no subprocess state. Inputs are the translator's cross-turn
-counters, the clock, and `get_hook_activity(session_id)`. Shared between
-local (`PersistentSession.send_message`) and remote (`RemoteExecutionLayer
-.send_message`) so both paths produce identical turn-end semantics.
+counters, the clock, and `get_hook_activity(session_id)`. The remote
+adapter's read loop (`ClaudeRemoteAdapter.stream_turn`) asks it for every
+turn-end decision.
 """
 
 from __future__ import annotations
@@ -109,6 +109,13 @@ def is_foreign_result(raw: dict, content_chunks: int) -> bool:
             and content_chunks <= 2)
 
 
+def result_chunks(chunks: list, skipped: bool) -> list:
+    """A result frame's chunks after the foreign check: a skipped result's
+    metadata (its own time and cost, the start's own message's included)
+    is not the turn's, so it never reaches the reply's footer."""
+    return [c for c in chunks if not (skipped and c.event_type == "metadata")]
+
+
 def chunk_is_content(chunk) -> bool:
     """Does this translator chunk prove the driven turn is streaming?
 
@@ -142,11 +149,16 @@ class ForeignSkipGate:
     """
 
     __slots__ = ("session_id", "translator", "content_since_skip", "skips",
-                 "deadline")
+                 "deadline", "own_message")
 
-    def __init__(self, session_id: str, translator: ClaudeCLIEventTranslator):
+    def __init__(self, session_id: str, translator: ClaudeCLIEventTranslator, *,
+                 own_message: bool = False):
         self.session_id = session_id
         self.translator = translator
+        # The turn sent the start's data as Claude Code's own message, which
+        # the CLI answers with an empty result of its own: the first skip is
+        # expected (``start_context.synthetic_line``).
+        self.own_message = own_message
         self.content_since_skip = 0
         self.skips = 0
         self.deadline: float | None = None
@@ -186,7 +198,8 @@ class ForeignSkipGate:
         if self.skips <= FOREIGN_RESULT_SKIP_CAP:
             suffix = (" (further skips unlogged)"
                       if self.skips == FOREIGN_RESULT_SKIP_CAP else "")
-            logger.warning(
+            logger.log(
+                logging.INFO if self.own_message and self.skips == 1 else logging.WARNING,
                 "[%s] skipping foreign result (skips=%d, result=%r)%s",
                 self.session_id[:8], self.skips,
                 str(raw.get("result", ""))[:80], suffix,
@@ -206,6 +219,12 @@ class SettleController:
            readline timeout. On timeout, caller calls
            `should_exit_on_silence(silence_duration)` to decide whether to
            exit or keep waiting (hook activity may still be running).
+        5. An `init` read in settle is the CLI's own wake turn, read inside
+           this stream: caller calls `note_wake_open()`, and
+           `note_wake_result()` at the `result` that closes it. The settle
+           holds in between, and while `wake_open` the caller runs the
+           checks of a turn before its result (a dead process, the silence
+           ceiling), which are the only bound of a wake turn.
     """
 
     __slots__ = (
@@ -217,6 +236,8 @@ class SettleController:
         "_settling",
         "_settle_start",
         "_last_heartbeat",
+        "_wake_open",
+        "_wake_due",
     )
 
     def __init__(
@@ -244,6 +265,13 @@ class SettleController:
         self._settling: bool = False
         self._settle_start: float = 0.0
         self._last_heartbeat: float = 0.0
+        # The CLI's own wake turn read in settle: its init seen, its result
+        # not yet.
+        self._wake_open: bool = False
+        # Background work was pending at the last look: the CLI opens its
+        # wake turn a moment after the work's end, so that end holds the
+        # settle for one more slice.
+        self._wake_due: bool = False
 
     # --- Public API ---
 
@@ -265,6 +293,25 @@ class SettleController:
         """True if no settle was requested (interactive chat path)."""
         return self.settle_after_result <= 0
 
+    @property
+    def wake_open(self) -> bool:
+        """True between a wake turn's init and its result, both read in
+        settle."""
+        return self._wake_open
+
+    def note_wake_open(self) -> None:
+        """An ``init`` read while settling: the CLI's own wake turn runs
+        inside this stream. An init before the result is the turn's own."""
+        if self._settling:
+            self._wake_open = True
+            self._wake_due = False
+
+    def note_wake_result(self) -> bool:
+        """A ``result`` read: whether it closed an open wake turn (the
+        review of the finished background work ran to its end)."""
+        was_open, self._wake_open = self._wake_open, False
+        return was_open
+
     def _registry(self):
         from core.session.session_state import get_subagent_registry
         return get_subagent_registry(self.session_id)
@@ -285,6 +332,8 @@ class SettleController:
         ceilings = _run_ceilings.get(self.session_id)
         if ceilings is not None:
             ceilings.started = self._settle_start
+        if self._registry().has_pending or self._bg_registry().has_pending:
+            self._wake_due = True
         self.translator.reset_for_settle()
         logger.info(
             "[%s] entering settle "
@@ -316,17 +365,25 @@ class SettleController:
         Returns False if the loop should keep waiting — background subagents are
         still working (their SubagentStop hooks haven't all landed) OR background
         bash commands are still running (their task_updated{completed} hasn't
-        arrived on stdout yet).
+        arrived on stdout yet) OR the CLI's own wake turn is open or due.
         """
         if not self._settling:
             return False
 
         reg = self._registry()
         bgreg = self._bg_registry()
-        if not reg.has_pending and not bgreg.has_pending:
+        pending = reg.has_pending or bgreg.has_pending
+        if not pending and not self._wake_open:
+            if self._wake_due:
+                # The work ended since the last look. Its wake turn's init
+                # follows the end by a moment: one more slice is read.
+                self._wake_due = False
+                return False
             # Every tracked subagent AND background command finished (or none
             # spawned) → turn over.
             return True
+        if pending:
+            self._wake_due = True
         if self.stopped():
             logger.info(
                 "[%s] settle: the person stopped the turn — "
@@ -335,6 +392,9 @@ class SettleController:
                 self.session_id[:8], reg.pending_count, bgreg.pending_count
             )
             return True
+        if self._wake_open:
+            # A silent tool of the wake turn is not its end: its result is.
+            return False
 
         # Pending subagents: TRUST the SubagentStop hook — do NOT settle on
         # stdout/hook silence. A subagent that's sleeping or doing slow
@@ -377,7 +437,6 @@ class SettleController:
         """Emit a periodic progress heartbeat during long settles.
 
         Called once per loop iteration. Only logs every 30s.
-        Mirrors PersistentSession.send_message lines 561-573.
         """
         if not self._settling:
             return
@@ -402,10 +461,7 @@ class SettleController:
     def log_presettle_heartbeat(
         self, *, agents_spawned: int, proc_alive: bool,
     ) -> None:
-        """Log a pre-settle heartbeat after 60s of no stdout activity.
-
-        Mirrors PersistentSession.send_message lines 602-617.
-        """
+        """Log a pre-settle heartbeat after 60s of no stdout activity."""
         last_hook = self._get_hook_activity(self.session_id)
         hook_ago = (
             f"{time.monotonic() - last_hook:.1f}s ago" if last_hook else "never"

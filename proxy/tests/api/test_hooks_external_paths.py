@@ -29,10 +29,11 @@ def test_caller_paths_map_into_the_tree(tmp_path):
     assert _sandbox_to_host("/.claude/plans/p.md", ctx, agent_dir) == f"{home}/.claude/plans/p.md"
     assert _sandbox_to_host("/.codex/x", ctx, agent_dir) == f"{home}/.codex/x"
     assert _sandbox_to_host("/context/notes.md", ctx, agent_dir) == f"{home}/context/notes.md"
-    # Viewer: /workspace is their own; editor: the shared one.
+    # An outside person's /workspace is their own folder, whatever role word
+    # the context carries: nothing outside maps to the shared workspace.
     assert _sandbox_to_host("/workspace/out.xlsx", ctx, agent_dir) == f"{home}/workspace/out.xlsx"
     editor = _ctx(home, role="editor")
-    assert _sandbox_to_host("/workspace/out.xlsx", editor, agent_dir) == str(agent_dir / "workspace" / "out.xlsx")
+    assert _sandbox_to_host("/workspace/out.xlsx", editor, agent_dir) == f"{home}/workspace/out.xlsx"
     assert _session_scope_root(ctx, agent_dir) == Path(home) / "workspace"
 
 

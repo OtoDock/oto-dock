@@ -47,6 +47,7 @@ export const TOOL_ROLES: Record<string, string> = {
   'AskUserQuestion': 'question',
   'request_user_input': 'question',
   'request_user_input_async': 'question',
+  'send_message_to_user_async': 'message',
   'CodexEscalation': 'escalation',
   'CodexTerminalInput': 'escalation',
   'view_image': 'read',
@@ -95,6 +96,7 @@ export const TOOL_PAYLOADS: Record<string, string> = {
   'AskUserQuestion': '',
   'request_user_input': '',
   'request_user_input_async': '',
+  'send_message_to_user_async': '',
   'CodexEscalation': '',
   'CodexTerminalInput': '',
   'view_image': 'path',
@@ -131,7 +133,7 @@ export const ROLE = {
   WEB_FETCH: 'web_fetch', WEB_SEARCH: 'web_search', SUBAGENT: 'subagent', CHECKLIST: 'todo',
   TASK_READ: 'task_read', TASK_WRITE: 'task_write', DISCOVERY: 'discovery', SKILL: 'skill',
   WORKFLOW: 'workflow', PLAN_ENTER: 'plan_enter', PLAN_EXIT: 'plan_exit', QUESTION: 'question',
-  ESCALATION: 'escalation',
+  ESCALATION: 'escalation', MESSAGE: 'message',
 } as const
 
 export const PAYLOAD = {

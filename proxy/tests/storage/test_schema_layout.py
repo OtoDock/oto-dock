@@ -23,6 +23,7 @@ EXPECTED_ORDER = [
     "init_usage",
     "init_mcp",
     "init_agents",
+    "init_outside",
     "init_departments",
     "init_storage_quotas",
     "init_community_requests",
@@ -35,6 +36,7 @@ EXPECTED_ORDER = [
     "init_execution_layers",
     "init_notifications",
     "init_mcp_autoupdate",
+    "init_mcp_tool_listings",
     "init_push",
     "init_webhooks",
     "init_triggers",
@@ -58,7 +60,7 @@ EXPECTED_ORDER = [
 
 HOMES = {
     "storage.identity.schema": ["init_identity"],
-    "storage.agents.schema": ["init_agents", "init_departments", "init_memory"],
+    "storage.agents.schema": ["init_agents", "init_outside", "init_departments", "init_memory"],
     "storage.knowledge.schema": ["init_knowledge_libraries"],
     "storage.chat.schema": ["init_chats", "init_meetings", "init_reply_reports"],
     "storage.cards.schema": ["init_cards"],
@@ -66,7 +68,8 @@ HOMES = {
     "storage.automation.schema": [
         "init_tasks", "init_notifications", "init_push", "init_webhooks", "init_triggers",
     ],
-    "storage.mcp.schema": ["init_mcp", "init_community_requests", "init_mcp_autoupdate"],
+    "storage.mcp.schema": ["init_mcp", "init_community_requests", "init_mcp_autoupdate",
+                           "init_mcp_tool_listings"],
     "storage.files.schema": [
         "init_recover_bin", "init_pinned_files", "init_file_sync", "init_file_transfers",
     ],
@@ -75,11 +78,11 @@ HOMES = {
     "storage.sharing.schema": ["init_shares"],
     "storage.checks.schema": ["init_checks"],
     "storage.move_schema": ["init_chat_moves", "init_engine_switch_leftovers"],
-    "storage.schema": [
-        "init_storage_quotas", "init_remote_machines", "init_pinned_apps",
-        "init_pinned_app_user_hides", "init_app_state", "init_app_handler_deliveries",
-        "init_app_secrets", "init_schema_meta",
+    "storage.apps.schema": [
+        "init_pinned_apps", "init_pinned_app_user_hides", "init_app_state",
+        "init_app_handler_deliveries", "init_app_secrets",
     ],
+    "storage.schema": ["init_storage_quotas", "init_remote_machines", "init_schema_meta"],
 }
 
 

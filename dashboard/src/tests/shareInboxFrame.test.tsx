@@ -52,7 +52,9 @@ describe('the notifications hook on a share_inbox frame', () => {
     vi.doMock('@/hooks/useNotificationSound', () => ({
       useNotificationSound: () => ({ stopDangerAlarm: () => {}, playForSeverity: () => {}, playPing: () => {} }),
     }))
-    vi.doMock('react-router-dom', () => ({ useNavigate: () => () => {} }))
+    vi.doMock('react-router-dom', () => ({
+      useNavigate: () => () => {}, useLocation: () => ({ pathname: '/', search: '' }),
+    }))
     vi.doMock('@/api/shares', async (importOriginal) => ({
       ...(await importOriginal<typeof import('@/api/shares')>()),
       useShareInbox: () => ({ data: { items: [], pending: 0 }, refetch: vi.fn() }),

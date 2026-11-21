@@ -30,8 +30,12 @@ class FakeWebSocket:
 
 
 @pytest.fixture(autouse=True)
-def _clean_registries():
+def _clean_registries(monkeypatch):
     duplex_attach._states.clear()
+    # A compute machine serves: a dead session can be started again. The
+    # test of the refusal takes it away.
+    from tests._compute import serve
+    serve(monkeypatch)
     yield
     duplex_attach._states.clear()
 
@@ -46,10 +50,9 @@ def _bridge(chat_id="chat-1", sub="user-admin"):
 class _ProbeLayer:
     """Headless layer stub with controllable liveness probes."""
 
-    def __init__(self, *, process_dead=False, alive=True, grace=None):
+    def __init__(self, *, process_dead=False, alive=True):
         self.process_dead = process_dead
         self.alive = alive
-        self._grace = grace  # None = no grace concept (local layers)
 
     async def is_session_process_dead(self, session_id):
         return self.process_dead
@@ -57,12 +60,8 @@ class _ProbeLayer:
     async def is_session_alive(self, session_id):
         return self.alive
 
-    def __getattr__(self, name):
-        # is_session_grace_held only exists when the fixture asked for it —
-        # mirrors the real layers (remote-only method, getattr-probed).
-        if name == "is_session_grace_held" and self._grace is not None:
-            return lambda sid: self._grace
-        raise AttributeError(name)
+    async def wait_session_reconnect(self, session_id, **kw):
+        return False
 
 
 def _attach_state(layer, sid="sid-dead"):
@@ -161,6 +160,41 @@ async def test_heal_failure_sends_session_dead_and_skips_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_a_voice_turn_with_no_compute_machine_hears_the_sentence_at_once(temp_db, monkeypatch, caplog):
+    """The chat's session ended and no compute machine can start it again.
+    A spoken turn does not wait: the voice engine gets the one sentence, to
+    log and to say, before anything of the session is touched (no resume
+    is prepared, nothing is built), and nothing is logged as an error."""
+    import logging
+
+    from core import placement
+    from tests._compute import serve_none
+    _make_chat(temp_db)
+    bridge = _bridge()
+    layer = _ProbeLayer(process_dead=True)
+    st = _attach_state(layer)
+    serve_none(monkeypatch)
+    healed: list = []
+
+    async def _heal(chat_id, dead_sid, layer, *, user_sub):
+        healed.append(dead_sid)
+        raise AssertionError("the heal ran with no compute machine")
+    monkeypatch.setattr(headless_resume, "resume_dead_session_headless", _heal)
+    dispatched = _capture_dispatch(monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        await duplex_attach.run_utterance(bridge, {"turn": 5, "text": "are you there"})
+
+    assert healed == [] and dispatched == {} and st.active_turn is None
+    assert bridge.engine_ws.sent == [{
+        "type": "error", "turn": 5,
+        "data": {"message": placement.NO_COMPUTE_SENTENCE, "say": placement.NO_COMPUTE_SENTENCE},
+    }]
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(placement.NO_COMPUTE_SENTENCE) <= 200, "the voice engine speaks a line of 200 characters at most"
+
+
+@pytest.mark.asyncio
 async def test_replaced_session_is_adopted_not_resurrected(temp_db, monkeypatch):
     """The dashboard's own auto-resume may have already repointed the chat to
     a FRESH session — the voice heal must ADOPT it, not resurrect the stale
@@ -190,9 +224,15 @@ async def test_replaced_session_is_adopted_not_resurrected(temp_db, monkeypatch)
 async def test_grace_held_session_is_not_healed(monkeypatch):
     """A satellite inside reconnect grace reads process-dead but is
     'reconnecting' — the heal must not respawn (it would abandon the
-    machine-side session over a 10s WS blip)."""
+    machine-side session over a 10s WS blip). The grace is the holder's
+    answer (``live_session``). A machine that does not come back within
+    the wait gets no turn either: the speaker hears that it is away."""
+    from core.session import session_manager
     bridge = _bridge()
-    st = _attach_state(_ProbeLayer(process_dead=True, grace=True))
+    layer = _ProbeLayer(process_dead=True)
+    st = _attach_state(layer)
+    monkeypatch.setattr(session_manager, "live_session", lambda sid: session_manager.LiveSession(
+        layer, "m-1", linked=False, grace=True) if sid == "sid-dead" else None)
 
     async def _never(chat_id, dead_sid, layer, *, user_sub):
         raise AssertionError("heal must not run during grace")
@@ -202,8 +242,252 @@ async def test_grace_held_session_is_not_healed(monkeypatch):
 
     await duplex_attach.run_utterance(bridge, {"turn": 4, "text": "hello"})
 
-    assert st.session_id == "sid-dead"
-    assert dispatched["sid"] == "sid-dead"  # dispatched as-is
+    assert st.session_id == "sid-dead" and dispatched == {}
+    said = duplex_attach.MACHINE_AWAY_SENTENCE
+    assert bridge.engine_ws.sent == [{"type": "error", "turn": 4, "data": {"message": said, "say": said}}]
+
+
+class _ComputeHolder(_ProbeLayer):
+    """The remote layer holding the chat's session on compute machine c-1:
+    alive over the machine's link, held by its grace while the link is down,
+    back at the first wait."""
+
+    def __init__(self, link):
+        super().__init__()
+        self.link = link
+        self.waited = 0
+
+    async def is_session_alive(self, session_id):
+        return self.link["up"]
+
+    async def wait_session_reconnect(self, session_id, **kw):
+        self.waited += 1
+        self.link["up"] = True
+        return True
+
+
+def _on_compute(monkeypatch, *, linked=True):
+    """The chat's session ``sid-live`` runs on compute machine c-1, as its
+    own record says; the engine's own layer in the proxy holds nothing, and
+    a machine away serves nothing new."""
+    from types import SimpleNamespace
+
+    from core import placement
+    from core.remote import satellite_connection, satellite_link
+    from core.session import session_manager, session_state
+    from services.remote import remote_status
+    link = {"up": linked}
+    holder = _ComputeHolder(link)
+    cm = SimpleNamespace(is_compute=lambda mid: link["up"] and mid == "c-1",
+                         is_connected=lambda mid: link["up"] and mid == "c-1",
+                         machine_dropped_recently=lambda mid: not link["up"],
+                         exit_state=lambda mid: (0, False), exit_report=lambda mid: {},
+                         links=satellite_link.MachineLinks(None))
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", lambda: cm)
+    monkeypatch.setattr(remote_status, "serving_compute_machine", lambda *a, **kw: None)
+    placed = placement.from_machine(placement.KIND_COMPUTE, {"id": "c-1", "pairing_scope": "compute"})
+    monkeypatch.setattr(session_state, "get_session_security",
+                        lambda sid: SimpleNamespace(placement=placed) if sid == "sid-live" else None)
+    monkeypatch.setattr(session_manager, "live_session", lambda sid: session_manager.LiveSession(
+        holder, "c-1", linked=link["up"], grace=not link["up"]) if sid == "sid-live" else None)
+
+    async def _never(chat_id, dead_sid, layer, *, user_sub):
+        raise AssertionError("the compute machine's live session was rebuilt")
+    monkeypatch.setattr(headless_resume, "resume_dead_session_headless", _never)
+    return holder, link
+
+
+class _AwayHolder(_ProbeLayer):
+    """The remote layer holding the chat's session on a compute machine that
+    is away and does not come back within a wait."""
+
+    def __init__(self):
+        super().__init__()
+        self.waits: list = []
+
+    async def is_session_alive(self, session_id):
+        return False
+
+    async def wait_session_reconnect(self, session_id, **kw):
+        self.waits.append(kw)
+        return False
+
+
+def _held_by_a_machine_that_is_away(monkeypatch, *, recent: bool, serves: bool = False, pin: str = "local"):
+    from types import SimpleNamespace
+
+    from core.remote import satellite_connection, satellite_link
+    from core.session import session_manager
+    from tests._compute import serve, serve_none
+    holder = _AwayHolder()
+    cm = SimpleNamespace(machine_dropped_recently=lambda mid: recent, is_compute=lambda mid: False,
+                         is_connected=lambda mid: False, exit_state=lambda mid: (0, False),
+                         exit_report=lambda mid: {}, links=satellite_link.MachineLinks(None))
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", lambda: cm)
+    monkeypatch.setattr(session_manager, "live_session", lambda sid: session_manager.LiveSession(
+        holder, "c-1" if pin == "local" else pin, linked=False, grace=True) if sid == "sid-live" else None)
+    (serve if serves else serve_none)(monkeypatch)
+
+    async def _never(chat_id, dead_sid, layer, *, user_sub):
+        raise AssertionError("a held session was rebuilt")
+    monkeypatch.setattr(headless_resume, "resume_dead_session_headless", _never)
+    return holder
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recent", [False, True])
+async def test_a_voice_turn_on_a_session_its_away_compute_machine_holds_hears_the_sentence(
+        temp_db, monkeypatch, recent, caplog):
+    """The compute machine stopped and still holds the chat's session (its
+    return takes it back). A spoken turn does not go to a machine that is
+    not there: it hears the sentence, the held session is left as it is and
+    nothing is rebuilt. A machine away past its reconnect window is not
+    waited for at all. One that dropped a moment ago gets the short wait
+    every door gives a link that may come back."""
+    import logging
+
+    from core import placement
+    _make_chat(temp_db, sid="sid-live", execution_path="claude-code-cli")
+    bridge = _bridge()
+    holder = _held_by_a_machine_that_is_away(monkeypatch, recent=recent)
+    st = _attach_state(holder, sid="sid-live")
+    dispatched = _capture_dispatch(monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        await duplex_attach.run_utterance(bridge, {"turn": 6, "text": "are you there"})
+
+    assert holder.waits == ([{}] if recent else [{"timeout": 0.0}])
+    assert dispatched == {} and st.session_id == "sid-live" and st.active_turn is None
+    assert bridge.engine_ws.sent == [{
+        "type": "error", "turn": 6,
+        "data": {"message": placement.NO_COMPUTE_SENTENCE, "say": placement.NO_COMPUTE_SENTENCE},
+    }]
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("why, kw", [
+    ("another compute machine serves", {"serves": True}),
+    ("the chat is pinned to a paired computer", {"pin": "m-paired"}),
+])
+async def test_a_voice_turn_never_goes_to_a_machine_that_is_away_whichever_holds_it(
+        temp_db, monkeypatch, why, kw):
+    """A typed message waits for the holder. A spoken turn cannot: it is
+    refused in words, with the sentence that fits. The compute sentence is
+    for a chat no compute machine can take. A chat on a paired computer,
+    and one whose session another compute machine could not take over,
+    hear that their machine is not connected. The held session is left as
+    it is."""
+    pin = kw.get("pin", "local")
+    _make_chat(temp_db, sid="sid-live", execution_path="claude-code-cli")
+    temp_db.update_chat("chat-1", execution_target=pin)
+    bridge = _bridge()
+    holder = _held_by_a_machine_that_is_away(monkeypatch, recent=False, **kw)
+    st = _attach_state(holder, sid="sid-live")
+    dispatched = _capture_dispatch(monkeypatch)
+
+    await duplex_attach.run_utterance(bridge, {"turn": 6, "text": "are you there"})
+
+    assert dispatched == {} and st.session_id == "sid-live" and st.active_turn is None, why
+    said = "The machine running this chat is not connected. Try again in a few minutes."
+    assert bridge.engine_ws.sent == [{"type": "error", "turn": 6, "data": {"message": said, "say": said}}]
+
+
+@pytest.mark.asyncio
+async def test_a_voice_turn_goes_to_a_holder_that_came_back_while_it_was_checked(temp_db, monkeypatch):
+    """The wait for the link ended without it, and the machine signed in
+    during the reads after: the session is live again and the turn is its."""
+    from core.session import session_manager
+    _make_chat(temp_db, sid="sid-live", execution_path="claude-code-cli")
+    bridge = _bridge()
+    holder = _held_by_a_machine_that_is_away(monkeypatch, recent=False)
+    reads = {"n": 0}
+
+    def _live(sid):
+        reads["n"] += 1
+        return session_manager.LiveSession(holder, "c-1", linked=reads["n"] > 1, grace=reads["n"] == 1)
+    monkeypatch.setattr(session_manager, "live_session", _live)
+    st = _attach_state(holder, sid="sid-live")
+    dispatched = _capture_dispatch(monkeypatch)
+
+    await duplex_attach.run_utterance(bridge, {"turn": 6, "text": "are you there"})
+
+    assert dispatched.get("sid") == "sid-live" and st.layer is holder and bridge.engine_ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_voice_turn_rides_the_session_the_compute_machine_runs(temp_db, monkeypatch):
+    """The first utterance reads the chat's layer as every chat door does:
+    the compute machine's session is the turn's, nothing is rebuilt."""
+    _make_chat(temp_db, sid="sid-live", execution_path="claude-code-cli")
+    holder, _link = _on_compute(monkeypatch)
+    dispatched = _capture_dispatch(monkeypatch)
+
+    await duplex_attach.run_utterance(_bridge(), {"turn": 1, "text": "hello"})
+
+    assert dispatched == {"sid": "sid-live", "layer": holder, "text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_a_first_voice_turn_while_the_compute_machine_reconnects_heals_nothing(
+        temp_db, monkeypatch):
+    """A compute machine that is reconnecting still holds the chat's
+    session: the reading is its holder's, the reconnect is waited for there,
+    and the turn goes to the holder. Nothing is rebuilt."""
+    _make_chat(temp_db, sid="sid-live", execution_path="claude-code-cli")
+    holder, _link = _on_compute(monkeypatch, linked=False)
+    dispatched = _capture_dispatch(monkeypatch)
+
+    await duplex_attach.run_utterance(_bridge(), {"turn": 1, "text": "hello"})
+
+    assert holder.waited == 1
+    assert dispatched == {"sid": "sid-live", "layer": holder, "text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_a_reading_taken_while_the_machine_was_away_is_its_holders(temp_db, monkeypatch):
+    """The bridge read the chat's layer while c-1 was reconnecting: the
+    holder's, never a layer of the platform's own (it runs no session). At
+    the next turn c-1 is back and the turn goes there, nothing healed."""
+    _make_chat(temp_db, sid="sid-live", execution_path="claude-code-cli")
+    holder, link = _on_compute(monkeypatch, linked=False)
+    bridge = _bridge()
+    st = await duplex_attach._resolve(bridge)
+    assert st.layer is holder
+    link["up"] = True
+    dispatched = _capture_dispatch(monkeypatch)
+
+    await duplex_attach.run_utterance(bridge, {"turn": 2, "text": "again"})
+
+    assert dispatched == {"sid": "sid-live", "layer": holder, "text": "again"}
+    assert st.layer is holder and holder.waited == 0
+
+
+@pytest.mark.asyncio
+async def test_a_voice_turn_rides_a_chat_pinned_to_a_paired_computer(temp_db, monkeypatch):
+    """The chat's pin decides, not the agent's target (the platform here):
+    the paired computer's session is the turn's, nothing is rebuilt."""
+    from core.session import session_manager
+    from services.remote import remote_status
+    from storage import remote_store
+    _make_chat(temp_db, sid="sid-live", execution_path="claude-code-cli")
+    temp_db.update_chat("chat-1", execution_target="m-1")
+    holder = _ProbeLayer()
+    monkeypatch.setattr(remote_store, "get_remote_machine", lambda m: {
+        "id": m, "pairing_scope": "admin", "registered_by": ""} if m == "m-1" else None)
+    monkeypatch.setattr(session_manager, "_get_remote_layer", lambda: holder)
+    monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **kw: ("local", None))
+    monkeypatch.setattr(session_manager, "live_session", lambda sid: session_manager.LiveSession(
+        holder, "m-1") if sid == "sid-live" else None)
+
+    async def _never(chat_id, dead_sid, layer, *, user_sub):
+        raise AssertionError("the paired computer's live session was rebuilt")
+    monkeypatch.setattr(headless_resume, "resume_dead_session_headless", _never)
+    dispatched = _capture_dispatch(monkeypatch)
+
+    await duplex_attach.run_utterance(_bridge(), {"turn": 1, "text": "hello"})
+
+    assert dispatched == {"sid": "sid-live", "layer": holder, "text": "hello"}
 
 
 @pytest.mark.asyncio

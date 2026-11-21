@@ -329,8 +329,13 @@ def test_the_route_answers_on_the_internal_listener_only_when_one_is_bound(monke
     up = _Upstream()
     _wire(monkeypatch, up)
     monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", 9)  # the test client is on port 80
+    # Off the internal listener a session's token is refused before the
+    # route (middleware._session_refusal); the route keeps its own answer
+    # for a caller that presents none.
     r = client.post("/v1/mcp-gateway/vendor/mcp", json=_RPC, headers=_token(sid))
-    assert r.status_code == 404 and up.requests == []
+    assert r.status_code == 401 and up.requests == []
+    assert client.post("/v1/mcp-gateway/vendor/mcp", json=_RPC).status_code == 404
+    assert up.requests == []
     monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", 80)
     r = client.post("/v1/mcp-gateway/vendor/mcp", json=_RPC, headers=_token(sid))
     assert r.status_code == 200 and len(up.requests) == 1
@@ -751,3 +756,52 @@ def test_the_table_forgets_old_counts_and_old_renewals(monkeypatch, refusals):
     monkeypatch.setattr(m, "_TABLE_MAX", 4)
     m._prune(now)
     assert list(m._entries) == [new] and list(m._renewed_at) == [new]
+
+
+def test_a_docker_tools_answer_comes_from_its_door_through_the_route(monkeypatch):
+    """The route streams what a Docker tool's door answers (``Answered``):
+    the list from the record, never the tool; a call as an event stream with
+    the token's session alone at the tool, no credential there, and the use
+    count given back at the end."""
+    from types import SimpleNamespace
+
+    from services.containers import door, state
+    from services.mcp import mcp_registry, tool_listing
+    sid = str(uuid.uuid4())
+    mcp_broker.provision(sid, {"dock-tools": mcp_broker.SecretBundle(gateway=GatewayCredential(
+        upstream="http://localhost:8936", path="/mcp/", allowlist_key="", header="", prefix="",
+        proxy_local=True, manifest="dock-tools", kind=mcp_gateway.CONTAINER))})
+    manifest = SimpleNamespace(name="dock-tools", label="Dock Tools", server_name="",
+                               server=SimpleNamespace(port=8936), mcp_dir=None)
+    monkeypatch.setattr(mcp_registry, "get_manifest", lambda n: manifest if n == "dock-tools" else None)
+    monkeypatch.setattr(tool_listing, "container_fingerprint", lambda m, account="": "fp")
+    record = {"initialize": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}},
+              "lists": {"tools/list": [{"name": "render", "inputSchema": {}}]}}
+    monkeypatch.setattr(tool_listing, "saved_platform", lambda key, fp: record)
+    seen: list[httpx.Request] = []
+
+    def tool(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        msg = json.loads(request.content)
+        if msg.get("method") == "initialize":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+        if "id" not in msg:
+            return httpx.Response(202)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_Body(
+            b'event: message\ndata: {"jsonrpc":"2.0","id":9,"result":{"content":[]}}\n\n'))
+    _wire(monkeypatch, tool)
+    door.reset_for_tests()
+    try:
+        r = client.post("/v1/mcp-gateway/dock-tools/mcp/", json=_RPC, headers=_token(sid))
+        assert r.status_code == 200 and r.json()["result"]["tools"][0]["name"] == "render"
+        assert seen == []
+        call = {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "render"}}
+        r = client.post("/v1/mcp-gateway/dock-tools/mcp/?session_id=forged", json=call, headers=_token(sid))
+        assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
+        assert b'"id": 9' in r.content or b'"id":9' in r.content
+        assert seen and all(dict(q.url.params) == {"session_id": sid} for q in seen)
+        assert all("authorization" not in q.headers for q in seen)
+        assert state.of("dock-tools").in_flight == 0
+    finally:
+        door.reset_for_tests()
+        mcp_broker.purge_session(sid)

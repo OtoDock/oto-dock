@@ -5,10 +5,8 @@ Part of the ``storage.database`` facade; import names from
 synchronous (called via ``asyncio.to_thread`` from async code).
 """
 
-import contextlib
 import json
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable
@@ -17,8 +15,9 @@ from typing import Any
 
 import psycopg
 
-from core.permission_modes import ASK_MODE, chat_row
+from core.permission_modes import ASK_MODE
 from core.session import session_kind
+from storage.chat import chat_pins
 from storage.chat.search_anchor import stamp_match_anchors
 from storage.pg import get_conn
 
@@ -180,7 +179,7 @@ def _search_failed(kind: str, query: str, exc: Exception) -> list[dict]:
 
 
 def search_chats(user_sub: str, agent: str, query: str, limit: int = 50, *,
-                 hide_agent_runs: bool = False) -> list[dict]:
+                 hide_agent_runs: bool = False, pinned_by: str | None = None) -> list[dict]:
     """Chats whose title or text holds every word of ``query`` (each as a
     prefix), newest first: the sidebar groups the answer by day, and a
     recent chat that names a word once must not lose its place to an old
@@ -190,8 +189,9 @@ def search_chats(user_sub: str, agent: str, query: str, limit: int = 50, *,
     carries the creator's sub, so the owner filter alone would leak it here);
     task mode searches through ``search_task_chats``. ``hide_agent_runs``
     leaves out the chats that carry an agent-scope run (below the editor
-    tier)."""
+    tier). ``pinned_by`` keeps only that person's pinned chats."""
     hidden = f"AND {_NO_AGENT_RUN}" if hide_agent_runs else ""
+    pinned = f"AND {chat_pins.PINNED_BY}" if pinned_by is not None else ""
     with get_conn() as conn:
         try:
             words = _query_words(conn, query)
@@ -202,15 +202,16 @@ def search_chats(user_sub: str, agent: str, query: str, limit: int = 50, *,
                 f"""SELECT c.* FROM chat_search s
                    JOIN chats c ON c.id = s.chat_id
                    WHERE s.user_sub = %s AND s.agent = %s
-                   AND {_NOT_TASK_ROW} {hidden}
+                   AND {_NOT_TASK_ROW} {hidden} {pinned}
                    AND s.search_vector @@ %s::tsquery
                    ORDER BY {_LIST_ORDER}
                    LIMIT %s""",
-                (user_sub, agent, _TASK_SOURCE_TYPES, tsquery, limit),
+                (user_sub, agent, _TASK_SOURCE_TYPES,
+                 *(() if pinned_by is None else (pinned_by,)), tsquery, limit),
             ).fetchall()
         except psycopg.Error as e:
             return _search_failed("chats", query, e)
-        results = [chat_row(r) for r in rows]
+        results = [dict(r) for r in rows]
         stamp_match_anchors(conn, results, tsquery, _format_tsquery(words, "B"))
         return results
 
@@ -315,7 +316,7 @@ def list_task_chats(agent: str, scope_user_sub: str | None = None,
               ORDER BY {_LIST_ORDER} LIMIT %s""",
             params,
         ).fetchall()
-        return [chat_row(r) for r in rows]
+        return [dict(r) for r in rows]
 
 
 def search_task_chats(agent: str, query: str, scope_user_sub: str | None = None,
@@ -347,7 +348,7 @@ def search_task_chats(agent: str, query: str, scope_user_sub: str | None = None,
             ).fetchall()
         except psycopg.Error as e:
             return _search_failed("tasks", query, e)
-        results = [chat_row(r) for r in rows]
+        results = [dict(r) for r in rows]
         stamp_match_anchors(conn, results, tsquery, _format_tsquery(words, "B"))
         return results
 
@@ -365,13 +366,13 @@ def create_chat(chat_id: str, user_sub: str, agent: str, permission_mode: str = 
         )
         conn.commit()
         row = conn.execute("SELECT * FROM chats WHERE id=%s", (chat_id,)).fetchone()
-        return chat_row(row)
+        return dict(row)
 
 
 def get_chat(chat_id: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM chats WHERE id=%s", (chat_id,)).fetchone()
-        return chat_row(row) if row else None
+        return dict(row) if row else None
 
 
 def get_chats_by_ids(chat_ids: list[str]) -> dict[str, dict]:
@@ -386,12 +387,13 @@ def get_chats_by_ids(chat_ids: list[str]) -> dict[str, dict]:
         rows = conn.execute(
             "SELECT * FROM chats WHERE id = ANY(%s)", (ids,),
         ).fetchall()
-        return {r["id"]: chat_row(r) for r in rows}
+        return {r["id"]: dict(r) for r in rows}
 
 
 def list_chats(user_sub: str, agent: str | None = None, limit: int = 50, *,
                hide_agent_runs: bool = False,
-               before: tuple[str, str] | None = None) -> list[dict]:
+               before: tuple[str, str] | None = None,
+               pinned_by: str | None = None) -> list[dict]:
     """List a chat-history owner's chats, newest first. Each row carries a
     computed ``unread`` bool: the last assistant response landed after the
     owner identity's read marker (``chat_reads`` is keyed by the same owner
@@ -399,7 +401,9 @@ def list_chats(user_sub: str, agent: str | None = None, limit: int = 50, *,
     any user opens them). ``hide_agent_runs`` leaves out the chats that carry
     an agent-scope run (a shared pool's workers, below the editor tier).
     ``before`` is the last shown row's ``(updated_at, id)``: the rows after
-    it in ``_LIST_ORDER``."""
+    it in ``_LIST_ORDER``. ``pinned_by`` keeps only that person's pinned
+    chats (the history's pinned view): every other condition stays, so the
+    view is never more than the history."""
     # Task-run chats never list in chat mode — their single home is the
     # sidebar's task mode (list_task_chats), delegate workers included.
     conditions = ["c.user_sub=%s", _NOT_TASK_ROW]
@@ -412,6 +416,9 @@ def list_chats(user_sub: str, agent: str | None = None, limit: int = 50, *,
     if before is not None:
         conditions.append(_AFTER_CURSOR)
         params.extend((before[0], before[0], before[1]))
+    if pinned_by is not None:
+        conditions.append(chat_pins.PINNED_BY)
+        params.append(pinned_by)
     where = f"WHERE {' AND '.join(conditions)}"
     params.append(limit)
     with get_conn() as conn:
@@ -425,7 +432,7 @@ def list_chats(user_sub: str, agent: str | None = None, limit: int = 50, *,
                 {where} ORDER BY {_LIST_ORDER} LIMIT %s""",
             params,
         ).fetchall()
-        return [chat_row(r) for r in rows]
+        return [dict(r) for r in rows]
 
 
 def list_unread_finished_chats(since: str, limit: int = 30) -> list[dict]:
@@ -452,7 +459,7 @@ def list_unread_finished_chats(since: str, limit: int = 30) -> list[dict]:
              ORDER BY c.last_response_at DESC LIMIT %s""",
             (since, _TASK_SOURCE_TYPES, limit),
         ).fetchall()
-        return [chat_row(r) for r in rows]
+        return [dict(r) for r in rows]
 
 
 def mark_chat_read(chat_id: str, owner_identity: str) -> None:
@@ -483,7 +490,7 @@ def list_chats_by_parent(parent_chat_id: str, limit: int = 50) -> list[dict]:
             "ORDER BY updated_at DESC LIMIT %s",
             (parent_chat_id, limit),
         ).fetchall()
-        return [chat_row(r) for r in rows]
+        return [dict(r) for r in rows]
 
 
 def list_chats_by_project(project_id: str, limit: int = 100) -> list[dict]:
@@ -497,48 +504,11 @@ def list_chats_by_project(project_id: str, limit: int = 100) -> list[dict]:
             "ORDER BY updated_at DESC LIMIT %s",
             (project_id, limit),
         ).fetchall()
-        return [chat_row(r) for r in rows]
-
-
-def get_agent_conversations(agent: str, *, source_type: str = "", source_types=(), offset: int = 0, limit: int = 50) -> list[dict]:
-    """Get all chats for an agent, ordered by most recent. Used by Conversations tab.
-
-    ``source_types`` is the resolved list of the kinds the tab lists (the
-    externally driven ones — ``session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES``;
-    dashboard and task chats live in the sidebar); ``source_type`` narrows to
-    one of them.
-    """
-    sql = "SELECT * FROM chats WHERE agent=%s"
-    params: list[Any] = [agent]
-    if source_type:
-        sql += " AND source_type=%s"
-        params.append(source_type)
-    if source_types:
-        sql += " AND source_type = ANY(%s)"
-        params.append(list(source_types))
-    sql += " ORDER BY updated_at DESC LIMIT %s OFFSET %s"
-    params.extend([limit, offset])
-    with get_conn() as conn:
-        rows = conn.execute(sql, params).fetchall()
-        return [chat_row(r) for r in rows]
-
-
-def count_agent_conversations(agent: str, *, source_type: str = "", source_types=()) -> int:
-    """Count all chats for an agent. Used by Conversations tab pagination."""
-    sql = "SELECT COUNT(*) AS cnt FROM chats WHERE agent=%s"
-    params: list[Any] = [agent]
-    if source_type:
-        sql += " AND source_type=%s"
-        params.append(source_type)
-    if source_types:
-        sql += " AND source_type = ANY(%s)"
-        params.append(list(source_types))
-    with get_conn() as conn:
-        return conn.execute(sql, params).fetchone()["cnt"]
+        return [dict(r) for r in rows]
 
 
 def update_chat(chat_id: str, **fields: Any) -> bool:
-    allowed = {"title", "session_id", "permission_mode", "model", "execution_path", "execution_target", "total_cost", "context_used", "context_max", "cache_read", "cache_write", "output_tokens", "last_turn_aborted", "last_abort_graceful", "codex_thread_id", "thread_goal", "pending_history_seed", "execution_mode", "title_generated", "tui_theme", "last_response_at", "parent_chat_id", "project_id", "delegate_role", "checks", "engine_cost_total", "engine_cost_session_id"}
+    allowed = {"title", "session_id", "permission_mode", "model", "execution_path", "execution_target", "total_cost", "context_used", "context_max", "cache_read", "cache_write", "output_tokens", "last_turn_aborted", "last_abort_graceful", "codex_thread_id", "thread_goal", "pending_history_seed", "execution_mode", "title_generated", "tui_theme", "last_response_at", "parent_chat_id", "project_id", "delegate_role", "checks", "engine_cost_total", "engine_cost_session_id", "external_identity_id"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False
@@ -789,7 +759,7 @@ def list_chats_with_pending_wakes(execution_target: str | None = None,
     # A chat holding notes alone has nothing for a sweep to deliver.
     out: list[dict] = []
     for r in rows:
-        row = chat_row(r)
+        row = dict(r)
         if any(not _is_note(w) for w in wake_records(row.pop("pending_delegate_wake"))):
             out.append(row)
     return out
@@ -932,7 +902,7 @@ def get_retention_candidate_chats(cutoff_iso: str, *,
                   AND updated_at < %s""",
             (list(fileless_paths), cutoff_iso),
         ).fetchall()
-        return [chat_row(r) for r in rows]
+        return [dict(r) for r in rows]
 
 
 def get_remote_retention_candidate_chats(cutoff_iso: str, *,
@@ -951,23 +921,25 @@ def get_remote_retention_candidate_chats(cutoff_iso: str, *,
                   AND updated_at < %s""",
             (list(fileless_paths), cutoff_iso),
         ).fetchall()
-        return [chat_row(r) for r in rows]
+        return [dict(r) for r in rows]
 
 
 def get_session_refs_by_target() -> dict[str, set[str]]:
     """Every session and thread id a row still points at, keyed by the
     row's stored ``execution_target`` as it is (the caller asks
-    ``core.placement`` which machine, if any, a value names);
+    ``core.placement`` which machine, if any, a value names), or by the
+    compute machine on another host its engine record lives on
+    (``compute_machine``: its pin stays ``local``);
     ``dynamic_tasks``' refs are under ``""``. The remote retention pass
     reads it after the flagging, so an aged chat's old ids are in no
     list."""
     by_target: dict[str, set[str]] = {"": set()}
     with get_conn() as conn:
         for r in conn.execute(
-            "SELECT execution_target, session_id, codex_thread_id FROM chats "
+            "SELECT execution_target, compute_machine, session_id, codex_thread_id FROM chats "
             "WHERE session_id IS NOT NULL OR codex_thread_id IS NOT NULL"
         ).fetchall():
-            bucket = by_target.setdefault(r["execution_target"] or "", set())
+            bucket = by_target.setdefault(r["compute_machine"] or r["execution_target"] or "", set())
             for ref in (r["session_id"], r["codex_thread_id"]):
                 if ref:
                     bucket.add(ref)
@@ -982,19 +954,21 @@ def get_session_refs_by_target() -> dict[str, set[str]]:
 
 
 def get_phone_chats(cutoff_iso: str | None = None) -> list[dict]:
-    """Phone conversations (``source_type='phone'``) — all of them, or only
-    those untouched since ``cutoff_iso``. The caller-data retention sweep and
-    "Forget all" delete them whole (rows, messages, session files) —
-    services/infra/external_retention.py."""
+    """The agent's phone conversations (``source_type='phone'`` with the
+    ``phone`` owner) — all of them, or only those untouched since
+    ``cutoff_iso``. The caller-data retention sweep and "Forget all" delete
+    them whole (rows, messages, session files) —
+    services/infra/external_retention.py. A call on a route tied to a person
+    is that person's own chat and is not caller data."""
     sql = ("SELECT id, agent, session_id, codex_thread_id, updated_at FROM chats "
-           "WHERE source_type = 'phone'")
+           "WHERE source_type = 'phone' AND user_sub = 'phone'")
     params: list = []
     if cutoff_iso:
         sql += " AND updated_at < %s"
         params.append(cutoff_iso)
     with get_conn() as conn:
         rows = conn.execute(sql + " ORDER BY updated_at", params).fetchall()
-        return [chat_row(r) for r in rows]
+        return [dict(r) for r in rows]
 
 
 def get_protected_session_refs(cutoff_iso: str) -> tuple[set[str], set[str]]:
@@ -1084,20 +1058,60 @@ def get_chat_by_session(session_id: str) -> dict | None:
             "SELECT * FROM chats WHERE session_id=%s ORDER BY updated_at DESC LIMIT 1",
             (session_id,),
         ).fetchone()
-        return chat_row(row) if row else None
+        return dict(row) if row else None
 
 
-def delete_chat(chat_id: str) -> bool:
-    # Collect proxy-cache media files to unlink before the chat row (and its
+def models_of_sessions(session_ids: list[str]) -> dict[str, str]:
+    """``get_chat_by_session``'s model for many sessions in one query: each
+    session's newest chat's model, an absent key for a session with no chat."""
+    if not session_ids:
+        return {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT ON (session_id) session_id, model FROM chats
+                WHERE session_id = ANY(%s) ORDER BY session_id, updated_at DESC""",
+            (list(session_ids),),
+        ).fetchall()
+    return {r["session_id"]: r["model"] or "" for r in rows}
+
+
+def delete_chat(chat_id: str, *, untouched_before: str = "",
+                with_reply_reports: bool = False) -> bool:
+    """One chat's rows (``delete_chat_bound``): True when they went. Its
+    cache-owned media copies stay: a caller that removes a chat for good goes
+    through ``services/agents/chat_removal``, which removes them too."""
+    return delete_chat_bound(chat_id, untouched_before=untouched_before,
+                             with_reply_reports=with_reply_reports)[0]
+
+
+def delete_chat_bound(chat_id: str, *, untouched_before: str = "",
+                      with_reply_reports: bool = False) -> tuple[bool, str, list[dict]]:
+    """One chat's rows, the session id the row named as it went (read by the
+    delete itself, so no bind lands between them), and the chat's
+    cache-owned media rows, whose copies the caller removes
+    (``services/agents/chat_removal.delete_rows``; storage opens no file).
+    ``untouched_before`` (the retention sweep) leaves a chat touched at or
+    after it wholly as it is, answering ``(False, "", [])``: the row is
+    locked and read first, so a person who reopened the chat since the
+    sweep's query loses nothing of it. ``with_reply_reports`` takes the
+    chat's reports in the same transaction: their ``chat_id`` is ``ON DELETE
+    SET NULL``, so after the row they could no longer be found."""
+    # The proxy-cache media rows, read before the chat row (and its
     # media_tokens, via CASCADE) disappear. In-place agent-tree files are NOT
     # cache_owned and are left untouched.
-    cache_paths = get_cache_owned_media_paths_for_chat(chat_id)
+    cache = get_cache_owned_media_for_chat(chat_id)
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT project_id FROM chats WHERE id=%s", (chat_id,),
+            "SELECT project_id, updated_at FROM chats WHERE id=%s FOR UPDATE", (chat_id,),
         ).fetchone()
         project_id = (row["project_id"] or "") if row else ""
-        cur = conn.execute("DELETE FROM chats WHERE id=%s", (chat_id,))
+        if untouched_before and (row is None or row["updated_at"] >= untouched_before):
+            conn.commit()
+            return False, "", []
+        if with_reply_reports:
+            from storage import db_reply_reports
+            db_reply_reports.delete_for_chat(chat_id, conn=conn)
+        gone = conn.execute("DELETE FROM chats WHERE id=%s RETURNING session_id", (chat_id,)).fetchone()
         conn.execute("DELETE FROM chat_search WHERE chat_id=%s", (chat_id,))
         conn.execute("DELETE FROM chat_reads WHERE chat_id=%s", (chat_id,))
         # Scoped Dock pins die with their scope: the chat's own pin always;
@@ -1117,24 +1131,24 @@ def delete_chat(chat_id: str) -> bool:
                     (project_id,),
                 )
         conn.commit()
-        deleted = cur.rowcount > 0
-    if deleted:
-        for p in cache_paths:
-            with contextlib.suppress(OSError):
-                os.unlink(p)
-    return deleted
+    if gone is None:
+        return False, "", []
+    return True, gone.get("session_id") or "", cache
 
 
 def add_chat_message(chat_id: str, role: str, content: str = "",
                      event_type: str = "", event_data: str = "",
-                     author_sub: str = "", *, sync_search: bool = True) -> int:
+                     author_sub: str = "", *, sync_search: bool = True,
+                     touch_chat: bool = True) -> int:
     """Persist one chat message. ``author_sub`` is the REAL sender's user_sub —
     set for Shared-only chats (where the chat row owner is a synthetic
     ``agent::{slug}``) so each message keeps its true attribution. Empty for
     single-owner chats (owner == sender) and assistant/event rows.
 
     ``sync_search=False`` skips the search-row rebuild (O(chat) work): a
-    caller writing many rows rebuilds once with ``rebuild_chat_search``."""
+    caller writing many rows rebuilds once with ``rebuild_chat_search``.
+    ``touch_chat=False`` leaves the chat's place in the list: a line the
+    platform writes into many chats at once moves none of them up."""
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         cur = conn.execute(
@@ -1145,8 +1159,9 @@ def add_chat_message(chat_id: str, role: str, content: str = "",
         row_id = cur.fetchone()["id"]
         conn.commit()
         # Also touch the chat's updated_at
-        conn.execute("UPDATE chats SET updated_at=%s WHERE id=%s", (now, chat_id))
-        conn.commit()
+        if touch_chat:
+            conn.execute("UPDATE chats SET updated_at=%s WHERE id=%s", (now, chat_id))
+            conn.commit()
         # Task-run chats are created untitled by the scheduler; stamp the
         # deterministic title from the first prompt here — the chat layer's
         # send-time titling never runs for scheduler-driven chats. First
@@ -1374,6 +1389,17 @@ def get_last_chat_message_id(chat_id: str) -> int:
     return int(row["m"]) if row and row["m"] is not None else 0
 
 
+def get_last_user_message_text(chat_id: str) -> str:
+    """``content`` of the most recent user message ('' if none)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT content FROM chat_messages WHERE chat_id=%s AND role=%s "
+            "ORDER BY id DESC LIMIT 1",
+            (chat_id, _ROLE_USER),
+        ).fetchone()
+    return (row["content"] or "") if row else ""
+
+
 def get_last_user_message_author(chat_id: str) -> str:
     """``author_sub`` of the most recent user message ('' if none/unset).
 
@@ -1410,6 +1436,14 @@ def enqueue_chat_input(chat_id: str, queue_id: str, author_sub: str, *, text: st
         ).fetchone()
         conn.commit()
     return dict(row) if row else None
+
+
+def chats_with_queued_input() -> list[str]:
+    """Every chat holding messages in ``chat_input_queue`` (the boot arms
+    each one's delivery)."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT DISTINCT chat_id FROM chat_input_queue").fetchall()
+    return sorted(r["chat_id"] for r in rows)
 
 
 def queued_chats_of(author_sub: str) -> list[dict]:
@@ -1487,6 +1521,23 @@ def delete_message_ranges_in(conn: psycopg.Connection, chat_id: str,
     if deleted:
         _rebuild_chat_search_row(conn, chat_id)
     return deleted
+
+
+def chat_rows_in_ranges(chat_id: str, ranges: list[tuple[int, int]]) -> list[dict]:
+    """The assistant and event rows of ``chat_id`` whose id falls in one of
+    ``ranges`` (each ``(after, upto)``, as ``delete_message_ranges_in`` reads
+    them), in id order: the blocks a turn saved early, which a truncated
+    replay after a restart must not write again."""
+    rows: dict[int, dict] = {}
+    with get_conn() as conn:
+        for after, upto in ranges:
+            for row in conn.execute(
+                "SELECT id, role, content, event_type, event_data FROM chat_messages "
+                "WHERE chat_id=%s AND id > %s AND id <= %s AND role <> %s ORDER BY id",
+                (chat_id, after, upto, _ROLE_USER),
+            ).fetchall():
+                rows[row["id"]] = dict(row)
+    return [rows[i] for i in sorted(rows)]
 
 
 def delete_chat_message_ranges(chat_id: str, ranges: list[tuple[int, int]]) -> int:
@@ -1593,6 +1644,34 @@ def get_last_todo_snapshot(chat_id: str, tool_name: str) -> list[dict]:
         return []
 
 
+def get_cost_rows(chat_ids: list[str], turn_type: str, fee_type: str) -> tuple[dict | None, list[dict]]:
+    """The cost gauge's rows over the chats' FULL history, whatever window a
+    view loaded: the newest ``turn_type`` row's data (None without one, or
+    when it does not read) and every readable ``fee_type`` row's, in id order.
+    The types are the wire's (the caller resolves them, a SQL literal reads
+    no descriptor). One scan of the chats' own rows: the CTE is materialized
+    because a plain ``ORDER BY id DESC LIMIT 1`` lets the planner walk the
+    primary key back through every chat's newer rows."""
+    def _data(raw: str | None) -> dict | None:
+        try:
+            data = json.loads(raw or "")
+        except (ValueError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            "WITH r AS MATERIALIZED (SELECT id, event_type, event_data FROM chat_messages "
+            "WHERE chat_id = ANY(%s) AND event_type = ANY(%s)) "
+            "SELECT event_type, event_data FROM r WHERE event_type = %s "
+            "OR id = (SELECT MAX(id) FROM r WHERE event_type = %s) ORDER BY id",
+            (list(chat_ids), [turn_type, fee_type], fee_type, turn_type),
+        ).fetchall()
+    turn = next((r for r in rows if r["event_type"] == turn_type), None)
+    return (_data(turn["event_data"]) if turn else None,
+            [d for r in rows if r["event_type"] == fee_type and (d := _data(r["event_data"])) is not None])
+
+
 # --- Media tokens (audio/video capability URLs; see schema.media_tokens) ---
 
 
@@ -1670,37 +1749,34 @@ def get_media_token(token: str) -> dict | None:
         return d
 
 
-def get_cache_owned_media_paths_for_chat(chat_id: str) -> list[str]:
-    """Cache-owned (proxy-side copy) media file paths for a chat — safe to
-    unlink when the chat is deleted. Agent-tree files are not cache_owned."""
+def get_cache_owned_media_for_chat(chat_id: str) -> list[dict]:
+    """A chat's cache-owned (proxy-side copy) media rows: what places each
+    copy (``abs_path``, ``session_id``, ``agent``, ``cache_owned``), safe to
+    remove when the chat is deleted. Agent-tree files are not cache_owned."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT abs_path FROM media_tokens WHERE chat_id=%s AND cache_owned=1",
+            "SELECT abs_path, session_id, agent, cache_owned FROM media_tokens "
+            "WHERE chat_id=%s AND cache_owned=1",
             (chat_id,),
         ).fetchall()
-        return [r["abs_path"] for r in rows]
+        return [dict(r) for r in rows]
 
 
-def sweep_expired_media_tokens() -> int:
-    """Delete expired media_tokens, unlinking any cache-owned files. Returns
-    the number of rows removed. Best-effort; safe to call periodically."""
+def sweep_expired_media_tokens() -> list[dict]:
+    """Delete expired media_tokens and return the rows deleted (what places
+    each file: ``abs_path``, ``session_id``, ``agent``, ``cache_owned``), so
+    the caller removes the cache-owned copies
+    (``media_pipeline.remove_cache_copies``; storage opens no file).
+    Best-effort; safe to call periodically."""
     now_iso = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT abs_path, cache_owned FROM media_tokens "
-            "WHERE expires_at <> '' AND expires_at < %s",
+            "DELETE FROM media_tokens WHERE expires_at <> '' AND expires_at < %s "
+            "RETURNING abs_path, session_id, agent, cache_owned",
             (now_iso,),
         ).fetchall()
-        for r in rows:
-            if r["cache_owned"]:
-                with contextlib.suppress(OSError):
-                    os.unlink(r["abs_path"])
-        conn.execute(
-            "DELETE FROM media_tokens WHERE expires_at <> '' AND expires_at < %s",
-            (now_iso,),
-        )
         conn.commit()
-        return len(rows)
+        return [dict(r) for r in rows]
 
 
 def get_chat_message_count(chat_id: str) -> int:
@@ -1759,6 +1835,16 @@ def get_chat_plans(chat_id: str) -> list[dict]:
             (chat_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def chat_plan_held_elsewhere(filename: str, chat_id: str) -> bool:
+    """Whether a chat other than ``chat_id`` holds a saved plan row named
+    ``filename`` (any chat's row when ``chat_id`` is empty)."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT 1 FROM chat_plans WHERE filename=%s AND chat_id<>%s LIMIT 1",
+            (filename, chat_id or ""),
+        ).fetchone() is not None
 
 
 def touch_chat(chat_id: str) -> None:

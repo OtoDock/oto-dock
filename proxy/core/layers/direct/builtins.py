@@ -15,10 +15,16 @@ unchanged, the dashboard's tool cards already render them):
 Two-pass gate, mirroring ``api.hooks.permission.decide_tool_permission`` for the
 CLI: Pass-1 is ``auth.path_policy.check_tool_access`` with the session's
 SecurityContext (RBAC, memory files, credentials, library mirrors), Pass-2
-is the tier × mode table above. Plan mode allows only the open tier. The
-mount table (``core/layers/direct/files.py``) is the hard boundary
-underneath — a viewer's read-only session has no writable root, so the
-write tools refuse without prompting.
+is the tier × mode table above. Plan mode allows only the open tier.
+
+Every file tool runs in the session's sandbox on the compute machine, in
+the file program (``file_program.py``): the kernel's mounts of the session's
+role table are the wall underneath. This module opens no file of a session.
+The mount table read as text (``core/layers/direct/files.py``) only words an
+early refusal: a viewer's read-only session has no writable root, so the
+write tools refuse without prompting. After a write the platform's
+bookkeeping runs here, and a Delete is judged in the sandbox and removed by
+the platform's own delete owner (``services/infra/file_bookkeeping.py``).
 
 Later items of the same plan register ``Skill`` and ``tool_search`` here.
 """
@@ -26,21 +32,23 @@ Later items of the same plan register ``Skill`` and ``tool_search`` here.
 from __future__ import annotations
 
 import asyncio
+import errno
+import functools
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from core.layers.direct import files as direct_files
-from core.layers.direct.files import FileToolError, Resolved
+from core.layers.direct import files as direct_files, sandbox_program
+from core.layers.direct.files import FileToolError
 from core.permission_modes import (
     AUTO_REVIEW_MODE,
     DONT_ASK_MODE,
     JUDGE_MODE,
     PLAN_MODE,
     UNATTENDED_MODE,
-    current_mode,
 )
 
 logger = logging.getLogger("direct-runner")
@@ -117,7 +125,6 @@ def call_tool_defs(*, ask_back: bool) -> list[dict]:
 def decide(tier: str, mode: str) -> str:
     """Pass-2: ``"allow"`` | ``"prompt"`` | ``"deny"`` for a builtin tier in a
     session mode — the CLI hook's dashboard branch, tier by tier."""
-    mode = current_mode(mode)
     if tier == TIER_OPEN:
         return "allow"
     if mode in (PLAN_MODE, JUDGE_MODE):
@@ -203,16 +210,6 @@ async def execute(session, name: str, args: dict) -> str:
 # File tools
 # ---------------------------------------------------------------------------
 
-def _resolve(session, raw: str, *, writing: bool) -> Resolved:
-    cfg = getattr(session, "sandbox_cfg", None)
-    if cfg is None:
-        raise FileToolError("file tools are not available in this session (no sandbox)")
-    mounts = session.mount_table()
-    return direct_files.resolve(
-        mounts, raw, cwd=direct_files.session_cwd(cfg), writing=writing,
-    )
-
-
 def _agent_dir(session):
     cfg = session.sandbox_cfg
     return cfg.host_agents_dir / cfg.agent_name
@@ -227,115 +224,256 @@ def _writer(session) -> str | None:
     return (getattr(ctx, "username", "") or None) if ctx else None
 
 
-async def _after_write(session, res: Resolved) -> None:
-    """The platform write bookkeeping (tombstone retire, author, library
-    projection, satellite fan-out) — best-effort after a successful write."""
-    from services.infra import file_bookkeeping
+@dataclass(frozen=True)
+class _Record:
+    """What a written file's bookkeeping needs, read before the program is
+    asked: a session that closes meanwhile changes none of it."""
+    agent: str
+    rel: str            # the file's path below the agent's folder
+    host: Path          # the platform's own copy, as the push opens it
+    writer: str | None
+
+
+def _record_of(session, vpath: str) -> _Record | None:
+    """The record of a file written at ``vpath``, None for a place with no
+    path below the agent's folder (no row is such a place and writable)."""
     cfg = session.sandbox_cfg
-    try:
-        rel = res.host.resolve().relative_to(_agent_dir(session).resolve()).as_posix()
-    except (OSError, ValueError):
-        return
-    try:
-        await file_bookkeeping.push_file_write(
-            cfg.agent_name, rel, res.host, writer=_writer(session),
-        )
-    except Exception:
-        logger.exception("write bookkeeping failed for %s", res.virtual)
+    place = direct_files.record_place(session.mount_table(), vpath, cfg.agent_name)
+    if place is None:
+        return None
+    return _Record(cfg.agent_name, place[0], place[1], _writer(session))
+
+
+def _after_write(record: _Record | None, tool: str, vpath: str) -> sandbox_program.Then:
+    """What follows the file program's answer to a write: the platform
+    write bookkeeping (tombstone retire, author, library projection,
+    satellite fan-out), for an answer that says the file was written. It
+    runs as one piece with the call (``sandbox_program.call``), so a stop
+    of the turn never leaves a written file with no record. Best-effort, as
+    ever: a failure is logged and the tool still succeeds."""
+    async def then(answer: dict) -> None:
+        from services.infra import file_bookkeeping
+        if answer.get("ok") is not True:
+            if sandbox_program.asked(answer):
+                # The file may be there with no author. The libraries'
+                # reconcile and a paired computer's next merge take it.
+                logger.warning("%s of %s was asked and not answered (%s): no record was made",
+                               tool, vpath, answer.get("code"))
+            return
+        if record is None:
+            logger.warning("%s of %s: no path below the agent's folder, no record was made", tool, vpath)
+            return
+        try:
+            await file_bookkeeping.push_file_write(record.agent, record.rel, record.host, writer=record.writer)
+        except Exception:
+            logger.exception("write bookkeeping failed for %s", vpath)
+        else:
+            logger.info("%s of %s recorded (%s)", tool, vpath, "with its author" if record.writer else "no author")
+    return then
+
+
+def _locate(session, raw: str, *, writing: bool = False) -> str:
+    """The normalized virtual path of a call, admitted on the text alone:
+    the file program opens it, in the session's sandbox. For ``writing`` a
+    read-only row is refused here with its sentence, and the kernel refuses
+    it underneath."""
+    cfg = getattr(session, "sandbox_cfg", None)
+    if cfg is None:
+        raise FileToolError("file tools are not available in this session (no sandbox)")
+    vpath, _row = direct_files.locate(session.mount_table(), raw, cwd=direct_files.session_cwd(cfg),
+                                      writing=writing)
+    return vpath
+
+
+def _program(session) -> direct_files.ProgramCall:
+    """One operation of the session's file program."""
+    return functools.partial(direct_files.call_program, session)
+
+
+def _landing_judge(session, tool: str, key: str, *, writing: bool = False) -> direct_files.LandingJudge:
+    """What decides on the place a link lands, before the file program
+    opens it: the text rules of the row (for ``writing``, a writable one),
+    then Pass-1 of the gate on that place, as on the path the model gave."""
+    def judge(asked: str, landed: str) -> None:
+        direct_files.landing(session.mount_table(), asked, landed, writing=writing)
+        from auth.path_policy import check_tool_access
+        from core.session.session_state import get_session_security
+        ctx = get_session_security(session.session_id)
+        if ctx is None:
+            raise FileToolError("Session is no longer active. Send a new message to continue.")
+        decision, _ = check_tool_access(tool, {key: landed}, ctx)
+        if not decision.allowed:
+            raise FileToolError(decision.reason or f"{tool} denied by the session's file policy")
+    return judge
 
 
 async def _read(session, args: dict) -> str:
-    res = _resolve(session, args.get("file_path", ""), writing=False)
-    return await asyncio.to_thread(
-        direct_files.read_numbered, res, args.get("offset"), args.get("limit"),
+    vpath = _locate(session, args.get("file_path", ""))
+    return await direct_files.read(
+        _program(session), vpath, args.get("offset"), args.get("limit"),
+        judge=_landing_judge(session, "Read", "file_path"),
     )
 
 
 async def _glob(session, args: dict) -> str:
-    cfg = session.sandbox_cfg
+    cfg = getattr(session, "sandbox_cfg", None)
     raw = args.get("path") or (direct_files.session_cwd(cfg) if cfg else "")
-    res = _resolve(session, raw, writing=False)
-    paths = await asyncio.to_thread(direct_files.glob_paths, res, args.get("pattern", ""))
-    if not paths:
-        return "(no matches)"
-    out = "\n".join(paths)
-    if len(paths) >= direct_files.GLOB_MAX_ENTRIES:
-        out += f"\n... (stopped at {direct_files.GLOB_MAX_ENTRIES} entries — narrow the pattern)"
+    vpath = _locate(session, raw)
+    found = await direct_files.glob(
+        _program(session), vpath, args.get("pattern", ""),
+        judge=_landing_judge(session, "Glob", "path"),
+    )
+    out = "\n".join(found.paths) if found.paths else "(no matches)"
+    if len(found.paths) >= direct_files.GLOB_MAX_ENTRIES:
+        out += f"\n... (stopped at {direct_files.GLOB_MAX_ENTRIES} entries: narrow the pattern)"
+    if found.unread:
+        # A search with a folder it could not open is not whole: it says so.
+        out += "\n" + direct_files.unread_line(found.unread)
     return out
 
 
 async def _write(session, args: dict) -> str:
-    res = _resolve(session, args.get("file_path", ""), writing=True)
-    existed = res.host.exists()
-    n = await asyncio.to_thread(direct_files.write_text, res, args.get("content", ""))
-    await _after_write(session, res)
-    return f"{'Updated' if existed else 'Created'} {res.virtual} ({n} bytes)"
+    vpath = _locate(session, args.get("file_path", ""), writing=True)
+    created, size = await direct_files.write(
+        _program(session), vpath, args.get("content", ""),
+        then=_after_write(_record_of(session, vpath), "Write", vpath),
+    )
+    return f"{'Created' if created else 'Updated'} {vpath} ({size} bytes)"
 
 
 async def _edit(session, args: dict) -> str:
-    res = _resolve(session, args.get("file_path", ""), writing=True)
-    count = await asyncio.to_thread(
-        direct_files.edit_text, res,
-        args.get("old_string", ""), args.get("new_string", ""),
+    vpath = _locate(session, args.get("file_path", ""), writing=True)
+    count = await direct_files.edit(
+        _program(session), vpath, args.get("old_string", ""), args.get("new_string", ""),
         bool(args.get("replace_all", False)),
+        then=_after_write(_record_of(session, vpath), "Edit", vpath),
     )
-    await _after_write(session, res)
-    return f"Edited {res.virtual} ({count} replacement{'s' if count != 1 else ''})"
+    if count is None:
+        return f"Edited {vpath}. {direct_files.EDIT_UNCOUNTED}"
+    return f"Edited {vpath} ({count} replacement{'s' if count != 1 else ''})"
+
+
+def _delete_reason(e: OSError) -> str:
+    """Why the platform's delete owner refused, in the model's words."""
+    from services.infra import safe_fs
+    if isinstance(e, safe_fs.SymlinkRefused):
+        return "the path goes through a symlink, so use the real path instead"
+    if e.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+        return "the file system refused the write (read-only or no permission)"
+    return e.strerror or str(e)
 
 
 async def _delete(session, args: dict) -> str:
-    res = _resolve(session, args.get("file_path", ""), writing=True)
-    host = res.host
-    if host.is_symlink():
-        raise FileToolError(f"{res.virtual} is a link — Delete removes regular files only")
-    if not host.exists():
-        raise FileToolError(f"File not found: {res.virtual}")
-    if host.is_dir():
-        raise FileToolError(f"{res.virtual} is a folder — Delete removes single files")
-    from services.infra import file_bookkeeping
+    """The sandbox judges the file, the platform's delete owner removes it.
+
+    The file program looks at the file in the session's sandbox (a regular
+    file, in a folder the kernel lets this session write) and answers what
+    tells that file from every other. The owner then removes the file only
+    when its own look shows the same file (``delete_platform_file``,
+    ``expect``): the capture for the Recover bin, the removal and the
+    tombstone in its one thread, then the library's delete and the push.
+
+    The removal is what follows the look's answer (``then``), so once it has
+    begun a stop of the turn cannot split it, and the next file call waits
+    for it. A stop before it has begun removes nothing: the handler notes
+    that it was stopped, on the loop the removal would begin on.
+
+    A removal that the owner was asked for and that came to neither an
+    outcome nor a refusal reads as not known: the file may be gone. What
+    the owner refuses is an ``OSError`` of its walk, its capture or its
+    removal, each before the file is gone. The tombstone's write comes after
+    it and raises the database's own errors."""
+    vpath = _locate(session, args.get("file_path", ""), writing=True)
     cfg = session.sandbox_cfg
-    skipped = await file_bookkeeping.delete_platform_file(
-        cfg.agent_name, _agent_dir(session), host.resolve(),
-    )
-    if skipped:
-        return f"Deleted {res.virtual} (too large for the Recover bin — this cannot be undone)"
-    return f"Deleted {res.virtual} (moved to the Recover bin)"
+    agent_dir = _agent_dir(session)
+    mounts = session.mount_table()
+    stopped = False
+    # Whether the owner was asked to remove the file. From there on a
+    # removal with no outcome is not known to have left the file.
+    began = False
+    # What the removal came to: whether the Recover bin's capture was skipped
+    # for size, or the sentence of why nothing was removed.
+    outcome: list[bool | FileToolError] = []
+
+    async def remove(path: str, answer: dict) -> None:
+        nonlocal began
+        if stopped or answer.get("ok") is not True:
+            return
+        from services.infra import file_bookkeeping
+        try:
+            expect = direct_files.file_facts(answer)
+            place = direct_files.record_place(mounts, path, cfg.agent_name)
+            if place is None:
+                raise FileToolError(f"{vpath} is not a regular file. Delete removes regular files only.")
+            began = True
+            outcome.append(await file_bookkeeping.delete_platform_file(
+                cfg.agent_name, agent_dir, agent_dir / place[0], expect=expect))
+        except FileToolError as e:
+            outcome.append(e)
+        except FileNotFoundError:
+            # Gone, or no longer the file the sandbox looked at.
+            outcome.append(FileToolError(f"File not found: {vpath}"))
+        except OSError as e:
+            if await asyncio.to_thread(os.path.islink, agent_dir):
+                outcome.append(FileToolError(
+                    f"cannot delete {vpath}: this agent's folder was moved to another "
+                    "place, and Delete does not work there."))
+            else:
+                outcome.append(FileToolError(f"cannot delete {vpath}: {_delete_reason(e)}"))
+
+    try:
+        answer = await direct_files.look(
+            _program(session), vpath,
+            judge=_landing_judge(session, "Delete", "file_path", writing=True), then=remove,
+        )
+    except asyncio.CancelledError:
+        stopped = True
+        raise
+    if answer.get("ok") is not True:
+        raise direct_files.refusal(answer, vpath, verb="delete")
+    if not outcome and began:
+        raise FileToolError(direct_files.DELETE_NOT_KNOWN.format(path=vpath))
+    came_to = outcome[0] if outcome else FileToolError(f"cannot delete {vpath}: the file tools failed")
+    if isinstance(came_to, FileToolError):
+        raise came_to
+    if came_to:
+        return f"Deleted {vpath} (too large for the Recover bin: this cannot be undone)"
+    return f"Deleted {vpath} (moved to the Recover bin)"
 
 
 # ---------------------------------------------------------------------------
 # Skill — the direct layer's activation surface for on-demand skills
 # ---------------------------------------------------------------------------
 
-def _skills_dir(session):
-    cfg = getattr(session, "sandbox_cfg", None)
-    if cfg is None:
-        raise FileToolError("skills are not available in this session (no sandbox)")
-    return Path(cfg.host_claude_dir) / "skills"
-
-
-def _available_skills(skills_dir) -> list[str]:
-    if not skills_dir.is_dir():
+async def _available_skills(session) -> list[str]:
+    """The skills in the session's skills folder, read by the file program
+    (the materializer lays each skill down as plain files, and the program
+    follows no link). None when the folder cannot be read."""
+    if getattr(session, "sandbox_cfg", None) is None:
         return []
-    return sorted(
-        p.name for p in skills_dir.iterdir()
-        if p.is_dir() and not p.name.startswith(".") and (p / "SKILL.md").is_file()
-    )
+    try:
+        return await direct_files.skill_names(_program(session))
+    except FileToolError:
+        return []
 
 
-def _read_skill(skills_dir, name: str) -> str:
+async def _read_skill(session, name: str) -> str:
     from services.mcp.mcp_manifest_types import SKILL_ID_MAX_LEN, SKILL_ID_RE
     from services.mcp.skill_format import strip_frontmatter
-    available = _available_skills(skills_dir)
-    hint = (
-        f" Available: {', '.join(available)}" if available
-        else " No on-demand skills are enabled for this session."
-    )
+    if getattr(session, "sandbox_cfg", None) is None:
+        raise FileToolError("skills are not available in this session (no sandbox)")
+
+    async def hint() -> str:
+        available = await _available_skills(session)
+        return (f" Available: {', '.join(available)}" if available
+                else " No on-demand skills are enabled for this session.")
+
     if not name or not SKILL_ID_RE.fullmatch(name) or len(name) > SKILL_ID_MAX_LEN:
-        raise FileToolError(f"name must be a skill id from the # Skills list.{hint}")
-    path = skills_dir / name / "SKILL.md"
-    if not path.is_file():
-        raise FileToolError(f"unknown skill '{name}'.{hint}")
-    body = strip_frontmatter(path.read_text(encoding="utf-8", errors="replace")).strip()
+        raise FileToolError(f"name must be a skill id from the # Skills list.{await hint()}")
+    text = await direct_files.skill(_program(session), name)
+    if text is None:
+        raise FileToolError(f"unknown skill '{name}'.{await hint()}")
+    body = strip_frontmatter(text).strip()
     return f"# Skill: {name}\n\n{body}" if body else f"# Skill: {name}\n\n(empty skill)"
 
 
@@ -385,7 +523,7 @@ async def _skill(session, args: dict) -> str:
     the guide's own MCP has deferred tools the guide names, they are loaded
     as a side effect (footer says which)."""
     name = str(args.get("name") or "").strip()
-    body = await asyncio.to_thread(_read_skill, _skills_dir(session), name)
+    body = await _read_skill(session, name)
     return body + _load_guide_tools(session, name, body)
 
 
@@ -413,12 +551,8 @@ register(Builtin(
 # tool_search — the deferred-tools loader (core/layers/direct/tool_catalog.py)
 # ---------------------------------------------------------------------------
 
-def _guides_available(session, guide_ids: list[str]) -> list[str]:
+def _guides_available(available: set[str], guide_ids: list[str]) -> list[str]:
     """Only the guides this session can actually load with `Skill`."""
-    try:
-        available = set(_available_skills(_skills_dir(session)))
-    except FileToolError:
-        return []
     return [g for g in guide_ids if g in available]
 
 
@@ -465,6 +599,8 @@ async def _tool_search(session, args: dict) -> str:
         )
     guide_lines: list[str] = []
     seen_servers: set[str] = set()
+    # The session's skills, read once and only when a server names a guide.
+    available: set[str] | None = None
     for n in names:
         desc = first_sentence(catalog.deferred[n].get("description", ""))
         suffix = "" if n in new_names else " (already loaded)"
@@ -472,7 +608,10 @@ async def _tool_search(session, args: dict) -> str:
         server = server_of(n)
         if server not in seen_servers:
             seen_servers.add(server)
-            guides = _guides_available(session, catalog.guides.get(server) or [])
+            wanted = catalog.guides.get(server) or []
+            if wanted and available is None:
+                available = set(await _available_skills(session))
+            guides = _guides_available(available or set(), wanted)
             if guides:
                 guide_lines.append(
                     f"guide for {server}: " + ", ".join(f"`{g}`" for g in guides)

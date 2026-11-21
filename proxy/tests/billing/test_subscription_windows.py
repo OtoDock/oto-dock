@@ -220,3 +220,38 @@ class TestLatestBySource:
         r = sw.latest([{"id": a, "layer": "claude-code-cli"}], now=NOW)[a]
         assert r.source == "claude_event" and r.windows["seven_day"].pct == 41.0
         assert r.scoped_for("fable").pct == 100.0 and r.reached == "scoped:fable"
+
+
+class TestHints:
+    """A session's own report (``hint``) is stored and read back only by
+    whoever asks for hints: the pool's routing, the day cap and the alerts
+    never see one."""
+
+    def test_a_hint_is_left_out_of_every_read_but_its_own(self, temp_db):
+        from storage.billing import subscription_store
+        a = _sub()["id"]
+        assert _insert(a, "2026-09-11T05:00:00+00:00", seven=40.0, source="poll")
+        assert subscription_store.insert_window_sample(
+            a, observed_at="2026-09-11T05:02:00+00:00", source="claude_statusline",
+            five_hour_pct=99.0, five_hour_resets_at="2026-09-11T10:00:00+00:00",
+            seven_day_pct=99.0, seven_day_resets_at="2026-09-16T06:00:00+00:00", hint=True)
+        newest = subscription_store.latest_window_samples([a])[a]
+        assert newest["source"] == "poll" and newest["hint"] is False
+        hint = subscription_store.latest_window_samples([a], hints=True)[a]
+        assert hint["source"] == "claude_statusline" and hint["hint"] is True
+        rows = subscription_store.window_samples_since(a, "2000-01-01T00:00:00+00:00")
+        assert [r["source"] for r in rows] == ["poll"]
+        from services.engines import subscription_windows as sw
+        assert sw.latest([{"id": a, "layer": "claude-code-cli"}], now=NOW)[a].windows["seven_day"].pct == 40.0
+        assert sw.shown([{"id": a, "layer": "claude-code-cli"}], now=NOW)[a].windows["seven_day"].pct == 99.0
+
+    def test_a_reading_coalesces_only_into_its_own_source(self, temp_db):
+        from storage.billing import subscription_store
+        a = _sub()["id"]
+        assert _insert(a, "2026-09-11T05:00:00+00:00", source="claude_event")
+        # The same values from the poll 20 s later are a poll of their own:
+        # the in-use check reads the newest poll.
+        assert _insert(a, "2026-09-11T05:00:20+00:00", source="poll")
+        assert not _insert(a, "2026-09-11T05:00:40+00:00", source="poll")
+        assert subscription_store.latest_window_samples([a], source="poll")[a]["observed_at"].startswith(
+            "2026-09-11T05:00:20")

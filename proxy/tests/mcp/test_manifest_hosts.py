@@ -14,7 +14,7 @@ import uuid
 import pytest
 
 from services.community import manifest_hosts
-from services.mcp import mcp_manifest_parse, mcp_registry
+from services.mcp import mcp_manifest_parse, mcp_manifest_store, mcp_registry
 from storage.identity import bearer_allowlist
 from storage.mcp import mcp_store
 from storage.pg import get_conn
@@ -40,7 +40,7 @@ def _data(name, *, url="https://mcp.vendor-h7.example/mcp", hosts=("mcp.vendor-h
 @pytest.fixture
 def reg(monkeypatch, tmp_path):
     """A registry of scratch manifests; ``put`` installs or replaces one."""
-    monkeypatch.setattr(mcp_registry, "_manifests", {})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {})
     names: list[str] = []
     ticks: list[int] = []
     from core.remote import mcp_gateway_push
@@ -52,7 +52,7 @@ def reg(monkeypatch, tmp_path):
         path.write_text(json.dumps(data))
         m = mcp_manifest_parse._parse_manifest(path)
         assert m is not None, data
-        mcp_registry._manifests[m.name] = m
+        mcp_manifest_store._manifests[m.name] = m
         mcp_store.set_mcp_enabled(m.name, enabled)
         names.append(m.name)
         return m
@@ -518,7 +518,7 @@ class TestRoutes:
         resp = client.delete(f"/v1/admin/oauth-bearer-allowlist/{row['id']}")
         assert resp.status_code == 409 and "Turn the MCP off or remove it" in resp.json()["detail"]
         # once the MCP is gone from the registry its row can go
-        mcp_registry._manifests.pop(n)
+        mcp_manifest_store._manifests.pop(n)
         ticks = len(reg.ticks)
         assert client.delete(f"/v1/admin/oauth-bearer-allowlist/{row['id']}").status_code == 200
         assert _rows(n) == set() and bearer_allowlist.approved_hosts(n) == set()
@@ -611,3 +611,296 @@ def test_the_migration_marks_every_row_admin_and_keys_by_source():
             conn.execute("SET search_path TO DEFAULT")
             conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
             conn.commit()
+
+
+def _exit_data(name, *, hosts=("api.vendor-h7.example",)):
+    """A stdio tool that sends a secret instance field in a header of its own."""
+    return {
+        "name": name, "label": name.title(), "description": "d", "version": "1.0.0", "category": "community",
+        "server": {"runtime": "node", "transport": "stdio", "command": "node", "source": "npm:x"},
+        "instances": {"delivery": "env", "fields": [
+            {"key": "VENDOR_KEY", "label": "Key", "input_type": "password", "secret": True}]},
+        "credentials": {"type": "none", "exit": [{"key": "VENDOR_KEY", "header": "X-Api-Key", "hosts": list(hosts)}]},
+    }
+
+
+class TestExit:
+    """``credentials.exit`` hosts are declared under the manifest's name: a
+    catalog literal applies by itself, a wildcard and a ZIP's wait."""
+
+    def test_hosts_of_lists_them_under_the_manifests_name(self, reg):
+        n = _name()
+        m = reg(_exit_data(n, hosts=("api.vendor-h7.example", "*.vendor-h7.example", "Cdn.Vendor-H7.example")))
+        assert manifest_hosts.hosts_of(m) == (n, ["*.vendor-h7.example", "api.vendor-h7.example",
+                                                  "cdn.vendor-h7.example"])
+        assert manifest_hosts.pending(m)["provider"] == n
+
+    def test_a_catalog_literal_host_applies_by_itself(self, reg):
+        n = _name()
+        reg(_exit_data(n))
+        assert manifest_hosts.after_install(n, from_catalog=True) is None
+        assert _rows(n) == {(n, "api.vendor-h7.example")}
+        assert bearer_allowlist.is_host_allowed(n, "api.vendor-h7.example")
+        assert _via(n) == {"api.vendor-h7.example": manifest_hosts.VIA_CATALOG}
+
+    def test_a_wildcard_waits_for_the_allow(self, reg):
+        n = _name()
+        m = reg(_exit_data(n, hosts=("api.vendor-h7.example", "*.vendor-h7.example")))
+        waiting = manifest_hosts.after_install(n, from_catalog=True)
+        assert _rows(n) == {(n, "api.vendor-h7.example")}
+        assert waiting["hosts"] == ["*.vendor-h7.example"] and waiting["provider"] == n
+        manifest_hosts.confirm(n, provider=n, hosts=waiting["hosts"], shown=manifest_hosts.digest(m), by="a")
+        assert _rows(n) == {(n, "api.vendor-h7.example"), (n, "*.vendor-h7.example")}
+        assert manifest_hosts.pending(m) is None
+
+    def test_a_zips_hosts_all_wait(self, reg):
+        n = _name()
+        m = reg(_exit_data(n, hosts=("api.vendor-h7.example", "*.vendor-h7.example")))
+        waiting = manifest_hosts.after_install(n, from_catalog=False)
+        assert _rows(n) == set()
+        assert waiting["hosts"] == ["*.vendor-h7.example", "api.vendor-h7.example"]
+        manifest_hosts.confirm(n, provider=n, hosts=waiting["hosts"], shown=manifest_hosts.digest(m), by="a")
+        assert _rows(n) == {(n, "*.vendor-h7.example"), (n, "api.vendor-h7.example")}
+
+    def test_beside_a_header_key_both_sets_are_declared_under_the_name(self, reg):
+        n = _name()
+        data = _data(n)
+        data["credentials"] = {
+            "type": "infra", "fields": [{"key": "KEY", "label": "Key", "input_type": "password"}],
+            "api_key_header": {"name": "X-Api-Key", "value_from": "KEY", "proposed_hosts": ["mcp.vendor-h7.example"]},
+            "exit": [{"key": "KEY", "header": "X-Api-Key", "hosts": ["api.vendor-h7.example", "*.vendor-h7.example"]}],
+        }
+        m = reg(data)
+        assert manifest_hosts.hosts_of(m) == (n, ["*.vendor-h7.example", "api.vendor-h7.example",
+                                                  "mcp.vendor-h7.example"])
+        waiting = manifest_hosts.after_install(n, from_catalog=True)
+        assert _rows(n) == {(n, "mcp.vendor-h7.example"), (n, "api.vendor-h7.example")}
+        assert waiting["hosts"] == ["*.vendor-h7.example"]
+
+    def test_an_exit_mcp_named_like_a_provider_waits(self, reg):
+        n = "google"
+        reg(_exit_data(n))
+        waiting = manifest_hosts.after_install(n, from_catalog=True)
+        assert _rows(n) == set() and waiting["hosts"] == ["api.vendor-h7.example"]
+
+    def test_disable_takes_the_rows_down_and_an_update_moves_them(self, reg):
+        n = _name()
+        reg(_exit_data(n))
+        manifest_hosts.after_install(n, from_catalog=True)
+        mcp_store.set_mcp_enabled(n, False)
+        manifest_hosts.after_disable(n)
+        assert _rows(n) == set() and bearer_allowlist.approved_hosts(n) == {(n, "api.vendor-h7.example")}
+        mcp_store.set_mcp_enabled(n, True)
+        manifest_hosts.after_enable(n)
+        assert _rows(n) == {(n, "api.vendor-h7.example")}
+        reg(_exit_data(n, hosts=("rest.vendor-h7.example",)))
+        manifest_hosts.after_install(n, from_catalog=True)
+        assert _rows(n) == {(n, "rest.vendor-h7.example")}
+        assert not bearer_allowlist.is_host_allowed(n, "api.vendor-h7.example")
+
+
+def test_an_exits_allow_outlives_an_update_a_disable_an_enable_and_a_boot(reg):
+    """The exit's hosts are rows like the tool's other hosts: an Allow of a
+    wildcard stays approved through a catalog update, a disable and an
+    enable, and a boot keeps the rows as they are with nothing waiting."""
+    n = _name()
+    m = reg(_exit_data(n, hosts=("api.vendor-h7.example", "*.vendor-h7.example")))
+    waiting = manifest_hosts.after_install(n, from_catalog=True)
+    manifest_hosts.confirm(n, provider=n, hosts=waiting["hosts"], shown=manifest_hosts.digest(m), by="a")
+    both = {(n, "api.vendor-h7.example"), (n, "*.vendor-h7.example")}
+    assert _rows(n) == both
+    manifest_hosts.seed_shipped()
+    assert _rows(n) == both and bearer_allowlist.approved_hosts(n) == both
+    reg(_exit_data(n, hosts=("api.vendor-h7.example", "*.vendor-h7.example")))
+    assert manifest_hosts.after_install(n, from_catalog=True) is None
+    mcp_store.set_mcp_enabled(n, False)
+    manifest_hosts.after_disable(n)
+    assert _rows(n) == set() and bearer_allowlist.approved_hosts(n) == both
+    mcp_store.set_mcp_enabled(n, True)
+    manifest_hosts.after_enable(n)
+    assert _rows(n) == both and bearer_allowlist.approved_hosts(n) == both
+    assert manifest_hosts.all_pending() == []
+    manifest_hosts.seed_shipped()
+    assert _rows(n) == both and manifest_hosts.pending(mcp_registry.get_manifest(n)) is None
+
+
+def test_a_catalog_install_approves_its_literal_exit_hosts_and_the_boot_keeps_them(reg):
+    """The literal host is approved and live with the origin recorded, the
+    wildcard waits for the Allow, and a boot changes neither."""
+    n = _name()
+    reg(_exit_data(n, hosts=("api.vendor-h7.example", "*.vendor-h7.example")))
+    assert manifest_hosts.after_install(n, from_catalog=True)["hosts"] == ["*.vendor-h7.example"]
+    assert _rows(n) == bearer_allowlist.approved_hosts(n) == {(n, "api.vendor-h7.example")}
+    assert bearer_allowlist.has_origin(n)
+    manifest_hosts.seed_shipped()
+    assert _rows(n) == {(n, "api.vendor-h7.example")}
+    assert manifest_hosts.pending(mcp_registry.get_manifest(n))["hosts"] == ["*.vendor-h7.example"]
+
+
+@pytest.mark.parametrize("origin", ["catalog", "none"])
+def test_a_boot_approves_no_host_its_ledger_lacks(reg, origin):
+    """A boot only brings up what the ledger holds. A literal exit host the
+    ledger lacks gets no row and no ledger entry at a boot, whatever the
+    origin row says (it names the last install whose allowlist step ran,
+    not the manifest in the folder), and waits for the Allow."""
+    n = _name()
+    reg(_exit_data(n))
+    if origin == "catalog":
+        manifest_hosts.after_install(n, from_catalog=True)
+        bearer_allowlist.set_mcp_hosts(n, approved={}, live=set(), by="")
+        assert bearer_allowlist.has_origin(n)
+    else:
+        assert not bearer_allowlist.has_origin(n)
+    assert bearer_allowlist.approved_hosts(n) == set()
+    manifest_hosts.seed_shipped()
+    assert _rows(n) == set() and bearer_allowlist.approved_hosts(n) == set()
+    assert manifest_hosts.pending(mcp_registry.get_manifest(n))["hosts"] == ["api.vendor-h7.example"]
+
+
+def test_a_zip_updates_allow_of_another_host_keeps_the_exits_host(reg):
+    """A ZIP update that adds a host to the header key: only that host
+    waits, and its Allow leaves the exit's host the first Allow gave
+    approved and live."""
+    n = _name()
+    data = _data(n)
+    data["credentials"] = {
+        "type": "infra", "fields": [{"key": "KEY", "label": "Key", "input_type": "password"}],
+        "api_key_header": {"name": "X-Api-Key", "value_from": "KEY", "proposed_hosts": ["mcp.vendor-h7.example"]},
+        "exit": [{"key": "KEY", "header": "X-Api-Key", "hosts": ["rest.vendor-h7.example"]}],
+    }
+    m = reg(data)
+    waiting = manifest_hosts.after_install(n, from_catalog=False)
+    manifest_hosts.confirm(n, provider=n, hosts=waiting["hosts"], shown=manifest_hosts.digest(m), by="a")
+    data["credentials"]["api_key_header"]["proposed_hosts"].append("new.vendor-h7.example")
+    m = reg(data)
+    waiting = manifest_hosts.after_install(n, from_catalog=False)
+    assert waiting["hosts"] == ["new.vendor-h7.example"]
+    manifest_hosts.confirm(n, provider=n, hosts=waiting["hosts"], shown=manifest_hosts.digest(m), by="a")
+    assert _rows(n) == {(n, "mcp.vendor-h7.example"), (n, "new.vendor-h7.example"), (n, "rest.vendor-h7.example")}
+    assert (n, "rest.vendor-h7.example") in bearer_allowlist.approved_hosts(n)
+
+
+def test_a_zips_exit_hosts_still_wait_after_a_boot(reg):
+    n = _name()
+    reg(_exit_data(n, hosts=("api.vendor-h7.example",)))
+    assert manifest_hosts.after_install(n, from_catalog=False)["hosts"] == ["api.vendor-h7.example"]
+    assert bearer_allowlist.has_origin(n)
+    manifest_hosts.seed_shipped()
+    assert _rows(n) == set()
+    assert manifest_hosts.pending(mcp_registry.get_manifest(n))["hosts"] == ["api.vendor-h7.example"]
+
+
+def test_the_boot_settles_a_shipped_tool_once(reg):
+    """The shipped tools are seeded by the catalog rule first, so the
+    settle that follows takes only the other MCPs that declare an exit,
+    and never one that declares none."""
+    own, community, bearer = _name(), _name(), _name()
+    shipped = _exit_data(own)
+    shipped["category"] = "custom"
+    reg(shipped)
+    reg(_exit_data(community))
+    reg(_data(bearer))
+    manifest_hosts.after_install(community, from_catalog=True)
+    assert manifest_hosts.settle_exits() == 1
+    assert _rows(own) == set()
+    assert manifest_hosts.seed_shipped() == 1 and _rows(own) == {(own, "api.vendor-h7.example")}
+
+
+def test_a_disabled_mcp_gets_no_row_at_boot(reg):
+    n = _name()
+    reg(_exit_data(n), enabled=False)
+    manifest_hosts.after_install(n, from_catalog=True)
+    manifest_hosts.seed_shipped()
+    assert _rows(n) == set() and bearer_allowlist.approved_hosts(n) == {(n, "api.vendor-h7.example")}
+
+
+def test_the_boot_keeps_every_host_of_a_header_key_and_its_exit(reg):
+    """A host the MCP's own header key and its exit both name is one pair:
+    it stays a row beside the exit's own host and the server's at a boot,
+    and the ledger holds all three."""
+    n = _name()
+    data = _data(n)
+    data["credentials"] = {
+        "type": "infra", "fields": [{"key": "KEY", "label": "Key", "input_type": "password"}],
+        "api_key_header": {"name": "X-Api-Key", "value_from": "KEY",
+                           "proposed_hosts": ["mcp.vendor-h7.example", "api.vendor-h7.example"]},
+        "exit": [{"key": "KEY", "header": "X-Api-Key",
+                  "hosts": ["api.vendor-h7.example", "rest.vendor-h7.example"]}],
+    }
+    reg(data)
+    manifest_hosts.after_install(n, from_catalog=True)
+    every = {(n, "mcp.vendor-h7.example"), (n, "api.vendor-h7.example"), (n, "rest.vendor-h7.example")}
+    assert _rows(n) == every
+    manifest_hosts.seed_shipped()
+    assert _rows(n) == every
+    assert bearer_allowlist.approved_hosts(n) == every
+
+
+def _shipped(name: str) -> dict:
+    """A shipped tool's manifest as the release carries it."""
+    import pathlib
+
+    from tests._paths import PROXY_DIR
+    path = pathlib.Path(PROXY_DIR).parent / "mcps" / "custom" / name / "manifest.json"
+    if not path.is_file():
+        pytest.skip(f"{name} is not in this checkout")
+    return json.loads(path.read_text())
+
+
+_EXIT_TOOLS = ("image-gen-mcp", "image-search-mcp", "music-gen-mcp", "video-gen-mcp")
+
+
+class TestShipped:
+    def test_the_boot_settles_every_literal_exit_host_of_the_shipped_tools(self, reg):
+        """A 1.9.1 install's first boot after the update, with an empty
+        allowlist: the shipped tools' exit hosts are declared and wait until
+        the boot's seeding settles every literal one, and then nothing waits
+        for an Allow in Admin, Security."""
+        shipped = {name: _shipped(name) for name in _EXIT_TOOLS}
+        for data in shipped.values():
+            reg(data)
+        # image-gen's one entry is the hosted relay's and leaves the public
+        # cut with its hosted block: there the tool declares nothing.
+        declaring = {name for name, data in shipped.items() if data["credentials"].get("exit")}
+        assert declaring >= set(_EXIT_TOOLS) - {"image-gen-mcp"}
+        waiting = {w["mcp_name"]: w["hosts"] for w in manifest_hosts.all_pending()}
+        assert set(waiting) == declaring
+        assert waiting["music-gen-mcp"] == ["api.elevenlabs.io"]
+        assert manifest_hosts.seed_shipped() == len(declaring)
+        assert manifest_hosts.all_pending() == []
+        assert bearer_allowlist.is_host_allowed("music-gen-mcp", "api.elevenlabs.io")
+
+    def test_the_relay_token_goes_toward_this_installs_relay(self, reg, monkeypatch):
+        """The build sends the hosted relay's token toward the install's own
+        relay (``mcp_session_config.exit_entry_hosts``), so the boot gives
+        that host its row: a relay base set in the install's settings is
+        allowed with nothing to approve, and the manifest's own name for the
+        relay gets no row."""
+        import config
+        data = _shipped("image-gen-mcp")
+        if not any(e.get("key") == "OTODOCK_RELAY_TOKEN" for e in data["credentials"].get("exit") or []):
+            pytest.skip("the relay's entry is not in this cut")
+        monkeypatch.setattr(config, "OTODOCK_RELAY_BASE", "https://relay.example.test")
+        reg(data)
+        manifest_hosts.seed_shipped()
+        assert bearer_allowlist.is_host_allowed("image-gen-mcp", "relay.example.test")
+        assert not bearer_allowlist.is_host_allowed("image-gen-mcp", "api.otodock.io")
+        assert manifest_hosts.all_pending() == []
+
+    def test_the_platforms_own_tools_join_at_boot_as_a_catalog_install_does(self, reg):
+        """A shipped tool's manifest arrives with a release, not through the
+        installer: the boot applies its hosts by the catalog rule, so a host
+        a release adds gets its row; a community tool waits for its install."""
+        own, community = _name(), _name()
+        shipped = _data(own, url="https://own.vendor-h7.example/mcp", hosts=("own.vendor-h7.example",))
+        shipped["category"] = "custom"
+        reg(shipped)
+        reg(_data(community))
+        assert manifest_hosts.seed_shipped() == 1
+        assert _rows(own) == {("vendor-h7", "own.vendor-h7.example")}
+        assert bearer_allowlist.is_host_allowed("vendor-h7", "own.vendor-h7.example")
+        assert _rows(community) == set()
+        # Idempotent: the rows stay, nothing is told.
+        ticks = len(reg.ticks)
+        assert manifest_hosts.seed_shipped() == 1
+        assert _rows(own) == {("vendor-h7", "own.vendor-h7.example")} and len(reg.ticks) == ticks

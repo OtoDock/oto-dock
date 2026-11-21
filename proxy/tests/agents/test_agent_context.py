@@ -19,14 +19,20 @@ import uuid
 import pytest
 
 from services.infra import external_data
-from services.mcp import dynamic_context, mcp_registry
+from services.mcp import (
+    dynamic_context,
+    dynamic_providers,
+    mcp_manifest_store,
+    mcp_registry,
+)
+from services.mcp.mcp_manifest_types import AgentContextBuilder
 from services.mcp.mcp_registry import (
     AgentContextBlock,
     CredentialConfig,
     McpManifest,
     ServerConfig,
 )
-from storage.identity import credential_store
+from storage.identity import credential_store, service_account_set
 from storage.pg import get_conn
 
 # ---------------------------------------------------------------------------
@@ -56,9 +62,9 @@ def _make_manifest(name: str, agent_context: list[AgentContextBlock]) -> McpMani
 @pytest.fixture
 def reset_manifests():
     """Snapshot + restore the module-level manifest cache so tests don't leak."""
-    saved = dict(mcp_registry._manifests)
+    saved = dict(mcp_manifest_store._manifests)
     yield
-    mcp_registry._manifests = saved
+    mcp_manifest_store._manifests = saved
 
 
 @pytest.fixture
@@ -275,7 +281,7 @@ class TestTokenMap:
         credential_store.set_account_display_email(
             user_sub, mcp_name, "default", "service@example.com",
         )
-        credential_store.set_service_agent_binding(
+        service_account_set.add_service_account_to_agent(
             mcp_name, agent_name, account_label="default", owner_sub=user_sub,
         )
         tokens = dynamic_context._build_token_map(
@@ -317,7 +323,7 @@ class TestBlockResolution:
     async def test_block_renders_with_substitution(
         self, reset_manifests, agent_name, mcp_name,
     ):
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(template="Hi ${agent.display_name} from ${agent.name}"),
         ])
         rendered = await dynamic_context._resolve_manifest_blocks(
@@ -330,7 +336,7 @@ class TestBlockResolution:
     async def test_block_skipped_when_required_token_empty(
         self, reset_manifests, agent_name, mcp_name,
     ):
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(
                 template="Use ${account.email}",
                 requires=["account.email"],
@@ -353,10 +359,10 @@ class TestBlockResolution:
         credential_store.set_account_display_email(
             user_sub, mcp_name, "default", "support@org.com",
         )
-        credential_store.set_service_agent_binding(
+        service_account_set.add_service_account_to_agent(
             mcp_name, agent_name, account_label="default", owner_sub=user_sub,
         )
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(
                 template="Use ${account.email}",
                 requires=["account.email"],
@@ -370,7 +376,7 @@ class TestBlockResolution:
     async def test_block_skipped_when_scope_user_and_session_agent(
         self, reset_manifests, agent_name, mcp_name,
     ):
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(template="user only", scope=["user"]),
         ])
         rendered = await dynamic_context._resolve_manifest_blocks(
@@ -381,7 +387,7 @@ class TestBlockResolution:
     async def test_block_skipped_when_scope_agent_and_session_user(
         self, reset_manifests, user_sub, agent_name, mcp_name,
     ):
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(template="agent only", scope=["agent"]),
         ])
         rendered = await dynamic_context._resolve_manifest_blocks(
@@ -393,7 +399,7 @@ class TestBlockResolution:
     async def test_scope_omitted_renders_in_both_scopes(
         self, reset_manifests, user_sub, agent_name, mcp_name,
     ):
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(template="universal: ${agent.name}"),
         ])
         u = await dynamic_context._resolve_manifest_blocks(
@@ -408,7 +414,7 @@ class TestBlockResolution:
     async def test_multiple_blocks_all_emit_in_declared_order(
         self, reset_manifests, agent_name, mcp_name,
     ):
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(template="first"),
             AgentContextBlock(template="second ${agent.name}"),
         ])
@@ -420,7 +426,7 @@ class TestBlockResolution:
     async def test_missing_token_substitutes_empty_when_not_required(
         self, reset_manifests, agent_name, mcp_name,
     ):
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(template="x=${unknown.token}|y=${agent.name}"),
         ])
         rendered = await dynamic_context._resolve_manifest_blocks(
@@ -443,7 +449,7 @@ class TestPythonAndManifestCoexist:
             return "FROM-PYTHON"
         dynamic_context.register(mcp_name, fake)
         try:
-            mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+            mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
                 AgentContextBlock(template="FROM-MANIFEST"),
             ])
             results = await dynamic_context.get_dynamic_contexts(
@@ -457,10 +463,42 @@ class TestPythonAndManifestCoexist:
         finally:
             dynamic_context._providers.pop(mcp_name, None)
 
+    async def test_a_lookup_only_mcp_runs_its_builder_blocks_alone(
+        self, reset_manifests, agent_name, mcp_name, monkeypatch,
+    ):
+        """An MCP the session does not attach (not picked for outside
+        people) keeps its lookups: the builder blocks run, the template-only
+        block and the Python provider do not."""
+        from services.mcp import builder_executor
+
+        async def fake_builder(*, block, tokens, **kw):
+            return "LOOKED-UP"
+        monkeypatch.setattr(builder_executor, "execute_builder", fake_builder)
+        dynamic_context.register(mcp_name, lambda agent_name, **kw: "FROM-PYTHON")
+        try:
+            mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
+                AgentContextBlock(template="FROM-MANIFEST"),
+                AgentContextBlock(template="${result.text}", builder=AgentContextBuilder(
+                    tool="mcp__x__lookup", args={}, timeout_seconds=5)),
+            ])
+            results = await dynamic_context.get_dynamic_contexts(
+                agent_name, [], user_sub="", user_role="", session_ctx={},
+                lookup_mcp_names=[mcp_name],
+            )
+            assert results == [(mcp_name, "LOOKED-UP")]
+            # Attached, the same MCP renders everything once.
+            results = await dynamic_context.get_dynamic_contexts(
+                agent_name, [mcp_name], user_sub="", user_role="", session_ctx={},
+                lookup_mcp_names=[mcp_name],
+            )
+            assert results == [(mcp_name, "FROM-PYTHON"), (mcp_name, "FROM-MANIFEST"), (mcp_name, "LOOKED-UP")]
+        finally:
+            dynamic_context._providers.pop(mcp_name, None)
+
     async def test_get_dynamic_contexts_with_no_kwargs_doesnt_crash(
         self, reset_manifests, agent_name, mcp_name,
     ):
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(template="agent=${agent.name}"),
         ])
         results = await dynamic_context.get_dynamic_contexts(agent_name, [mcp_name])
@@ -563,7 +601,7 @@ class TestTriggerRequiresGate:
         self, reset_manifests, agent_name, mcp_name,
     ):
         # A trigger-gated block must NOT render for plain chat sessions.
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(
                 template="Phone: ${trigger.phone}",
                 requires=["trigger.phone"],
@@ -578,7 +616,7 @@ class TestTriggerRequiresGate:
     async def test_trigger_required_block_renders_with_payload(
         self, reset_manifests, agent_name, mcp_name,
     ):
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(
                 template="Phone: ${trigger.phone}",
                 requires=["trigger.phone"],
@@ -595,7 +633,7 @@ class TestTriggerRequiresGate:
     ):
         # `requires` should accept dot-path tokens too — same walking
         # semantics as substitution so authors get a consistent contract.
-        mcp_registry._manifests[mcp_name] = _make_manifest(mcp_name, [
+        mcp_manifest_store._manifests[mcp_name] = _make_manifest(mcp_name, [
             AgentContextBlock(
                 template="Issue: ${trigger.body.issue.title}",
                 requires=["trigger.body.issue.title"],
@@ -770,7 +808,7 @@ def test_build_delegation_roster_tags_who_runs_each_engine(monkeypatch):
         "claude-code-cli", False, True, False, True)
     assert (codex["path"], codex["person"], codex["platform"], codex["is_default"]) == (
         "codex-cli", True, False, True)
-    line = dynamic_context._fmt_roster_layers([codex, cli])
+    line = dynamic_providers._fmt_roster_layers([codex, cli])
     assert line.startswith("codex-cli (default | person | models: m-x [default, t?]) · "
                            "claude-code-cli (agent default | platform | models: m-x [default, t?])")
     # Nobody runs anything: the whole allowlist, no who-tag, so the ids stay

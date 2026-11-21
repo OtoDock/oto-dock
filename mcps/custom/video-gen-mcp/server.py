@@ -2,12 +2,13 @@
 
 Stdio transport. Three tools on three providers, all BYO-key (instance config
 on the admin page):
-  - generate_video     — Veo 3.1 Fast (default), Veo 3.1, or Gemini Omni Flash
-  - generate_transition — Seedance 2.0 reference-to-video via fal.ai (default,
-    creative: the model sees both source videos, not just endpoint frames), or
-    Veo 3.1 / Fast first/last-frame on the extracted junction frames (seamless
-    by construction; fal-routed when FAL_API_KEY is set, Google direct as the
-    region-gated fallback)
+  - generate_video     — Gemini Omni Flash (default, Google), or Veo 3.1 Fast /
+    Veo 3.1 through fal.ai (Google no longer serves Veo on its own API)
+  - generate_transition — Seedance 2.0 reference-to-video via fal.ai (the
+    default with the fal.ai key; creative: the model sees both source videos,
+    not just endpoint frames), Gemini Omni Flash between the extracted junction
+    frames (the default without it, on the Google key), or Veo 3.1 / Fast
+    first/last-frame on those frames through fal.ai (seamless by construction)
   - edit_video         — Runway Aleph 2.0 (text-instruction video-to-video)
 
 Generated MP4s land in the agent workspace and an inline video player is
@@ -27,6 +28,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from mcp.server import Server
@@ -48,26 +50,34 @@ FAL_API_KEY = os.environ.get("FAL_API_KEY", "")
 VIDEO_SAVE_DIR = os.environ.get("VIDEO_SAVE_DIR", "")
 
 GOOGLE_BASE = "https://generativelanguage.googleapis.com"
+#: The hosts the Google AI key may go to: its credential exit entry in the
+#: manifest names the same ones (a test compares them). The exit fills the key
+#: toward these alone, and a download's other hosts get none.
+GOOGLE_KEY_HOSTS = ("generativelanguage.googleapis.com",)
+#: The redirects a download follows before it gives up.
+MAX_DOWNLOAD_HOPS = 5
 RUNWAY_BASE = "https://api.dev.runwayml.com"
 RUNWAY_VERSION = "2024-11-06"
 FAL_REST_BASE = "https://rest.fal.ai"
 FAL_QUEUE_URL = "https://queue.fal.run/bytedance/seedance-2.0/reference-to-video"
-# Veo first/last-frame routed through fal: Google gates FLF by region ("Your
-# use case is currently not supported" for EEA keys — live 2026-07-19 — while
-# t2v/i2v work), but fal's US-side endpoints run the same models for everyone,
-# billed on the FAL key. Input is (frame URLs, prompt); output {video: {url}}.
-FAL_VEO_FLF_URLS = {
-    "veo-3.1": "https://queue.fal.run/fal-ai/veo3.1/first-last-frame-to-video",
-    "veo-3.1-fast": "https://queue.fal.run/fal-ai/veo3.1/fast/first-last-frame-to-video",
+# Veo runs only through fal: Google no longer serves Veo 3.1 on the Gemini API
+# and names Gemini Omni Flash as its replacement there, while fal serves the
+# same Google models, billed on the FAL key. Per route: text to
+# video, image to video, first/last frame; output {video: {url}}.
+FAL_VEO_URLS = {
+    "veo-3.1": {
+        "text": "https://queue.fal.run/fal-ai/veo3.1",
+        "image": "https://queue.fal.run/fal-ai/veo3.1/image-to-video",
+        "frames": "https://queue.fal.run/fal-ai/veo3.1/first-last-frame-to-video",
+    },
+    "veo-3.1-fast": {
+        "text": "https://queue.fal.run/fal-ai/veo3.1/fast",
+        "image": "https://queue.fal.run/fal-ai/veo3.1/fast/image-to-video",
+        "frames": "https://queue.fal.run/fal-ai/veo3.1/fast/first-last-frame-to-video",
+    },
 }
 
-# Preview-labeled model IDs (2026-07) — isolate here so a GA rename is a
-# one-line fix.
-OMNI_MODEL = "gemini-omni-flash-preview"
-VEO_MODELS = {
-    "veo-3.1": "veo-3.1-generate-preview",
-    "veo-3.1-fast": "veo-3.1-fast-generate-preview",
-}
+OMNI_MODEL = "gemini-omni-1.2-flash"
 
 MODEL_LABELS = {
     "omni-flash": "Gemini Omni Flash",
@@ -78,6 +88,12 @@ MODEL_LABELS = {
 }
 
 VEO_DURATIONS = (4, 6, 8)
+# Omni takes any whole second in this range as `response_format.duration`.
+OMNI_MIN_SECONDS = 3
+OMNI_MAX_SECONDS = 15
+# Google: "First and last frame interpolation supports video durations from 3
+# to 10 seconds"; a longer one with both frames is an invalid argument.
+OMNI_TRANSITION_MAX_SECONDS = 10
 SEEDANCE_MIN_SECONDS = 4
 SEEDANCE_MAX_SECONDS = 15
 # Documented hard input caps — checked locally to save a doomed upload.
@@ -147,6 +163,10 @@ def _coerce_int(value, name: str) -> int:
 server = Server("video-gen")
 TOOL_ARGS = ToolArgs()
 
+# Listed always: a call without the fal.ai key gets the tool's own sentence
+# naming the key, never the argument check's "must be one of".
+VEO_OPTIONS = ("veo-3.1-fast", "veo-3.1")
+
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
@@ -157,11 +177,13 @@ async def list_tools() -> list[Tool]:
                 "Generate an AI video from a text description (optionally "
                 "animating a source image). The MP4 is saved to the workspace "
                 "and an inline video player is shown to the user.\n\n"
-                "Models: veo-3.1-fast (default) / veo-3.1 — exact 4, 6, or 8 "
-                "second clips, native audio, 1080p/4k and 9:16; consistently "
-                "the best visual quality in our testing. omni-flash — 720p "
-                "alternative that picks its own length (duration_seconds is a "
-                "target, ~10s max); noticeably weaker visuals.\n\n"
+                "Models: omni-flash (default) is Google's Gemini Omni Flash. "
+                "It makes 3 to 15 second clips with sound, at 720p, or 1080p and "
+                "4k upscaled, in 16:9 or 9:16. veo-3.1-fast and veo-3.1 are "
+                "Google's Veo 3.1 through fal.ai. They make exact 4, 6 or 8 "
+                "second clips with sound, at 720p, 1080p or 4k, and need the "
+                "fal.ai key. For Veo, a source image is uploaded to fal.ai, "
+                "where anyone with its link can open it for a day.\n\n"
                 "Pass `image_path` to animate an existing image "
                 "(image-to-video). By default the video is saved under the "
                 "workspace's `generated-assets/` subfolder; pass `save_path` "
@@ -176,13 +198,17 @@ async def list_tools() -> list[Tool]:
                     },
                     "model": {
                         "type": "string",
-                        "enum": ["veo-3.1-fast", "veo-3.1", "omni-flash"],
-                        "default": "veo-3.1-fast",
-                        "description": "veo-3.1-fast (default — best quality per cost) | veo-3.1 (top fidelity, pricier) | omni-flash (flexible length, weaker visuals).",
+                        "enum": ["omni-flash", *VEO_OPTIONS],
+                        "default": "omni-flash",
+                        "description": (
+                            "omni-flash (default, Gemini Omni Flash). "
+                            "veo-3.1-fast and veo-3.1 (Veo 3.1 through fal.ai, "
+                            "they need the fal.ai key; veo-3.1 costs more)."
+                        ),
                     },
                     "duration_seconds": {
                         "type": "integer",
-                        "description": "Clip length in seconds. Veo models: exactly 4, 6, or 8. omni-flash: a target — the model picks the final length (max ~10).",
+                        "description": "Clip length in seconds. omni-flash: 3 to 15. Veo models: exactly 4, 6, or 8.",
                     },
                     "aspect_ratio": {
                         "type": "string",
@@ -194,7 +220,7 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "enum": ["720p", "1080p", "4k"],
                         "default": "720p",
-                        "description": "Veo models only — omni-flash is always 720p. Higher resolutions cost more.",
+                        "description": "Higher resolutions cost more. On omni-flash, 1080p and 4k are upscaled from 720p.",
                     },
                     "image_path": {
                         "type": "string",
@@ -223,16 +249,18 @@ async def list_tools() -> list[Tool]:
                 "the start of the second. Returns the BRIDGE CLIP ONLY — "
                 "assemble first clip + bridge + second clip with the "
                 "video-tools MCP (or ship the bridge standalone).\n\n"
-                "Models: seedance (default, premium creative) — the model "
-                "watches BOTH source clips (motion, not just endpoint frames) "
-                "and invents a transition (4-15 seconds); source clips are "
-                "limited to 15s/50MB combined (trim junction segments first "
-                "if longer). veo-3.1 / veo-3.1-fast — seamless: the bridge is "
-                "generated between the first clip's last frame and the second "
-                "clip's first frame (4, 6, or 8 seconds), so both joins are "
-                "guaranteed to match; runs via fal.ai when FAL_API_KEY is set "
-                "(works everywhere), else via Google direct (region-gated — "
-                "'use case not supported' for EEA keys)."
+                "Models: seedance (premium creative, the default with the "
+                "fal.ai key) — the model watches BOTH source clips (motion, "
+                "not just endpoint frames) and invents a transition (4-15 "
+                "seconds); source clips are limited to 15s/50MB combined (trim "
+                "junction segments first if longer). omni-flash (the default "
+                "without the fal.ai key, on the Google key) — Gemini Omni Flash "
+                "animates from the first clip's last frame to the second "
+                "clip's first frame (3-10 seconds, 720p, with sound). "
+                "veo-3.1 / veo-3.1-fast — seamless: the bridge is generated "
+                "between the same two frames (4, 6, or 8 seconds), so both "
+                "joins are guaranteed to match. seedance and Veo need the "
+                "fal.ai key."
             ),
             inputSchema={
                 "type": "object",
@@ -247,7 +275,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "duration_seconds": {
                         "type": "integer",
-                        "description": "Bridge length in seconds. seedance: 4-15. Veo models: exactly 4, 6, or 8.",
+                        "description": "Bridge length in seconds. seedance: 4-15. omni-flash: 3-10. Veo models: exactly 4, 6, or 8.",
                     },
                     "prompt": {
                         "type": "string",
@@ -255,9 +283,13 @@ async def list_tools() -> list[Tool]:
                     },
                     "model": {
                         "type": "string",
-                        "enum": ["seedance", "veo-3.1", "veo-3.1-fast"],
-                        "default": "seedance",
-                        "description": "seedance (default, creative, needs FAL_API_KEY) | veo-3.1 / veo-3.1-fast (seamless first/last-frame; via fal.ai with FAL_API_KEY, else Google direct which is region-gated).",
+                        "enum": ["seedance", "omni-flash", *VEO_OPTIONS],
+                        "description": (
+                            "Leave it out for seedance with the fal.ai key and omni-flash without it. "
+                            "seedance (creative) | omni-flash (Gemini Omni Flash between the two "
+                            "junction frames, Google key) | veo-3.1 / veo-3.1-fast (seamless "
+                            "first/last-frame). seedance and Veo need FAL_API_KEY."
+                        ),
                     },
                     "aspect_ratio": {
                         "type": "string",
@@ -428,6 +460,21 @@ def _get_save_path(save_path: str | None, prefix: str) -> str:
     return full
 
 
+# A button pressed by someone who may only read the workspace, or who reaches
+# no folder of the agent, runs this tool over a read only workspace or none.
+SAVE_REFUSED = "This session cannot save files here, so nothing was made."
+
+
+def _save_refusal() -> str | None:
+    """Asked before any paid call: the sentence when the workspace every save
+    is anchored under takes no write (read only, or not there), else None.
+    The vendor is never paid for a file that cannot be kept. An unset
+    ``VIDEO_SAVE_DIR`` is left to ``_get_save_path``'s own error."""
+    if VIDEO_SAVE_DIR and not os.access(VIDEO_SAVE_DIR, os.W_OK):
+        return SAVE_REFUSED
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Shared plumbing: polling + streamed download
 # ---------------------------------------------------------------------------
@@ -449,21 +496,34 @@ async def _poll_until(check, desc: str):
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
-async def _download_to(url: str, path: str, *, headers: dict | None = None,
-                       follow_redirects: bool = False) -> None:
+async def _download_to(url: str, path: str, *, key_for=None) -> None:
     """Stream a (potentially large) video to ``path``. Writes to a ``.part``
     sibling and renames on completion, so an interrupted download never leaves
-    a truncated file at the final path."""
+    a truncated file at the final path. With ``key_for`` the download follows
+    each redirect itself, every hop with the headers ``key_for(hop)`` gives
+    (an HTTP client keeps a custom header across a redirect to another host),
+    so a key goes only where it is meant to. Without it, one request."""
     part = path + ".part"
     try:
-        async with httpx.AsyncClient(
-            timeout=DOWNLOAD_TIMEOUT, follow_redirects=follow_redirects,
-        ) as client:
-            async with client.stream("GET", url, headers=headers or {}) as resp:
-                resp.raise_for_status()
-                with open(part, "wb") as f:  # noqa: ASYNC230  # a streamed download written one network chunk at a time
-                    async for chunk in resp.aiter_bytes():
-                        f.write(chunk)
+        async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT, follow_redirects=False) as client:
+            for _hop in range(MAX_DOWNLOAD_HOPS + 1):
+                async with client.stream("GET", url, headers=key_for(url) if key_for else {}) as resp:
+                    if key_for and resp.is_redirect:
+                        location = resp.headers.get("location")
+                        if not location:
+                            raise RuntimeError("The provider redirected the download without saying where.")
+                        url = urljoin(url, location)
+                        if urlsplit(url).scheme != "https":
+                            raise RuntimeError("The provider redirected the download to an address without encryption.")
+                        continue
+                    resp.raise_for_status()
+                    with open(part, "wb") as f:  # noqa: ASYNC230  # a streamed download written one network chunk at a time
+                        async for chunk in resp.aiter_bytes():
+                            f.write(chunk)
+                    break
+            else:
+                raise RuntimeError(f"The provider redirected the download more than {MAX_DOWNLOAD_HOPS} times, "
+                                   f"last toward {urlsplit(url).hostname}.")
         if await asyncio.to_thread(os.path.getsize, part) == 0:
             raise RuntimeError("provider returned an empty video file")
         os.replace(part, path)
@@ -473,76 +533,20 @@ async def _download_to(url: str, path: str, *, headers: dict | None = None,
 
 
 # ---------------------------------------------------------------------------
-# Provider: Veo 3.1 (Google predictLongRunning)
+# Google AI key header (Gemini Omni Flash)
 # ---------------------------------------------------------------------------
 
 def _google_headers() -> dict:
     return {"x-goog-api-key": GOOGLE_AI_API_KEY}
 
 
-async def _veo_generate(model_key: str, prompt: str, duration: int, aspect_ratio: str,
-                        resolution: str, target_path: str,
-                        first_frame: tuple[str, bytes] | None = None,
-                        last_frame: tuple[str, bytes] | None = None) -> None:
-    """Submit a Veo generation (text-to-video, image-to-video, or first/last
-    frame), poll the long-running operation, and download the result.
-    ``first_frame`` / ``last_frame`` are (mime, bytes) tuples."""
-    # predictLongRunning instances take predict-style image parts
-    # (bytesBase64Encoded) — the generateContent inlineData shape is rejected
-    # with "`inlineData` isn't supported by this model" (verified live 2026-07-19).
-    instance: dict = {"prompt": prompt}
-    if first_frame:
-        instance["image"] = {
-            "mimeType": first_frame[0],
-            "bytesBase64Encoded": base64.b64encode(first_frame[1]).decode(),
-        }
-    if last_frame:
-        instance["lastFrame"] = {
-            "mimeType": last_frame[0],
-            "bytesBase64Encoded": base64.b64encode(last_frame[1]).decode(),
-        }
-    body = {
-        "instances": [instance],
-        "parameters": {
-            "aspectRatio": aspect_ratio,
-            "resolution": resolution,
-            "durationSeconds": duration,
-        },
-    }
-    model_id = VEO_MODELS[model_key]
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(
-            f"{GOOGLE_BASE}/v1beta/models/{model_id}:predictLongRunning",
-            headers=_google_headers(), json=body,
-        )
-        resp.raise_for_status()
-        op_name = resp.json().get("name", "")
-    if not op_name:
-        raise RuntimeError("Veo did not return an operation name")
-
-    async def check():
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            r = await client.get(f"{GOOGLE_BASE}/v1beta/{op_name}", headers=_google_headers())
-            r.raise_for_status()
-            data = r.json()
-        if not data.get("done"):
-            return None
-        if data.get("error"):
-            raise RuntimeError(f"Veo generation failed: {json.dumps(data['error'])[:300]}")
-        return data
-
-    data = await _poll_until(check, "Veo generation")
-    samples = (
-        (data.get("response") or {}).get("generateVideoResponse") or {}
-    ).get("generatedSamples") or []
-    uri = ((samples[0].get("video") or {}).get("uri") or "") if samples else ""
-    if not uri:
-        # Typically responsible-AI filtering — surface whatever the response says.
-        raise RuntimeError(
-            f"Veo returned no video (possibly filtered): {json.dumps(data.get('response') or {})[:300]}"
-        )
-    # The download URI redirects and requires the API key header on each hop.
-    await _download_to(uri, target_path, headers=_google_headers(), follow_redirects=True)
+def _google_key_for(url: str) -> dict:
+    """The Google key's header for a request to ``url``: toward a host it is
+    declared for and over HTTPS, nothing toward any other."""
+    parts = urlsplit(url)
+    if parts.scheme == "https" and (parts.hostname or "") in GOOGLE_KEY_HOSTS:
+        return _google_headers()
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -562,25 +566,28 @@ def _omni_extract_video(data: dict) -> tuple[bytes | None, str]:
     return None, ""
 
 
-async def _omni_generate(prompt: str, aspect_ratio: str, target_path: str,
-                         image: tuple[str, bytes] | None = None) -> None:
+async def _omni_generate(prompt: str, aspect_ratio: str, duration: int, resolution: str,
+                         target_path: str, image: tuple[str, bytes] | None = None,
+                         frames: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None) -> None:
     """Generate a video with Gemini Omni Flash via a synchronous interaction
     (the background-polling contract is still partially documented), then
-    download the result from inline data or the files API."""
-    input_parts: list[dict] = [{"type": "text", "text": prompt}]
-    task = "text_to_video"
-    if image:
-        input_parts.append({
-            "type": "image",
-            "data": base64.b64encode(image[1]).decode(),
-            "mime_type": image[0],
-        })
-        task = "image_to_video"
-    body = {
+    download the result from inline data or the files API. The length and the
+    resolution ride ``response_format``; a set duration wins over any length
+    the prompt names. ``frames`` (first, last) asks for the video between two
+    pictures: Google's interpolation, the two images ahead of the words as its
+    example sends them, and no ``task`` (none names it)."""
+    input_parts: list[dict] = [
+        {"type": "image", "data": base64.b64encode(data).decode(), "mime_type": mime}
+        for mime, data in frames or ()
+    ]
+    input_parts.append({"type": "text", "text": prompt})
+    body: dict = {
         "model": OMNI_MODEL,
         "input": input_parts,
-        "response_format": {"type": "video", "aspect_ratio": aspect_ratio, "delivery": "uri"},
-        "generation_config": {"video_config": {"task": task}},
+        "response_format": {
+            "type": "video", "aspect_ratio": aspect_ratio, "delivery": "uri",
+            "duration": f"{duration}s", "resolution": resolution,
+        },
         "background": False,
         # URI delivery REQUIRES the interaction to be stored ("store=true is
         # required when response format has video delivery set to URI" —
@@ -589,6 +596,16 @@ async def _omni_generate(prompt: str, aspect_ratio: str, target_path: str,
         "store": True,
         "stream": False,
     }
+    if image:
+        input_parts.append({
+            "type": "image",
+            "data": base64.b64encode(image[1]).decode(),
+            "mime_type": image[0],
+        })
+        # Google: try plain prompting first and set `task` only as a fallback;
+        # a single source image is pinned to image-to-video so the model
+        # animates it rather than taking it as a loose reference.
+        body["generation_config"] = {"video_config": {"task": "image_to_video"}}
     async with httpx.AsyncClient(timeout=OMNI_SYNC_TIMEOUT) as client:
         resp = await client.post(
             f"{GOOGLE_BASE}/v1beta/interactions", headers=_google_headers(), json=body,
@@ -621,7 +638,7 @@ async def _omni_generate(prompt: str, aspect_ratio: str, target_path: str,
         await _poll_until(check, "Omni Flash video file")
         if ":download" not in uri:
             uri = f"{GOOGLE_BASE}/v1beta/{file_name}:download?alt=media"
-    await _download_to(uri, target_path, headers=_google_headers(), follow_redirects=True)
+    await _download_to(uri, target_path, key_for=_google_key_for)
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +818,33 @@ async def _seedance_transition(video_a: str, video_b: str, style: str,
     await _download_to(video_url, target_path)
 
 
+async def _fal_veo_generate(model: str, prompt: str, duration: int, aspect_ratio: str,
+                            resolution: str, target_path: str,
+                            image: tuple[str, bytes] | None = None) -> None:
+    """Veo 3.1 text-to-video or image-to-video through fal's queue. A source
+    image is uploaded to the fal CDN (24 h lifecycle) and passed by URL."""
+    body: dict = {
+        "prompt": prompt,
+        "duration": f"{duration}s",
+        "resolution": resolution,
+        "aspect_ratio": aspect_ratio,
+        "generate_audio": True,
+        # fal's default rewrites a prompt its content check refused; the
+        # person's prompt runs as written or fails.
+        "auto_fix": False,
+    }
+    route = "text"
+    if image:
+        ext = "jpg" if image[0] == "image/jpeg" else image[0].split("/")[-1]
+        body["image_url"] = await _fal_upload(image[1], f"source.{ext}", image[0])
+        route = "image"
+    data = await _fal_queue_run(FAL_VEO_URLS[model][route], body, "Veo generation (fal)")
+    video_url = (data.get("video") or {}).get("url", "")
+    if not video_url:
+        raise RuntimeError("fal Veo generation completed but returned no video URL")
+    await _download_to(video_url, target_path)
+
+
 async def _fal_veo_flf_transition(model: str, video_a: str, video_b: str, style: str,
                                   duration: int, aspect_ratio: str, target_path: str) -> None:
     """Veo first/last-frame bridge via fal's queue: extract the junction frames
@@ -825,11 +869,25 @@ async def _fal_veo_flf_transition(model: str, video_a: str, video_b: str, style:
         "aspect_ratio": aspect_ratio,
         "generate_audio": True,
     }
-    data = await _fal_queue_run(FAL_VEO_FLF_URLS[model], body, "Veo transition (fal)")
+    data = await _fal_queue_run(FAL_VEO_URLS[model]["frames"], body, "Veo transition (fal)")
     video_url = (data.get("video") or {}).get("url", "")
     if not video_url:
         raise RuntimeError("fal Veo transition completed but returned no video URL")
     await _download_to(video_url, target_path)
+
+
+async def _omni_transition(video_a: str, video_b: str, style: str, duration: int,
+                           aspect_ratio: str, target_path: str) -> None:
+    """Gemini Omni Flash between the junction frames (clip A's last, clip B's
+    first), on the Google key: a transition for an install with no fal.ai key.
+    720p, Omni's native size: its 1080p and 4k are upscales a timeline can make
+    itself."""
+    last_a = await _extract_frame(video_a, "last")
+    first_b = await _extract_frame(video_b, "first")
+    prompt = (TRANSITION_BASE_PROMPT + " It starts exactly on the first image and "
+              "ends exactly on the second." + (f" {style}" if style else ""))
+    await _omni_generate(prompt, aspect_ratio, duration, "720p", target_path,
+                         frames=(("image/png", last_a), ("image/png", first_b)))
 
 
 # ---------------------------------------------------------------------------
@@ -909,8 +967,8 @@ async def _handle_generate(args: dict) -> list[TextContent]:
     if not prompt:
         return [TextContent(type="text", text="Error: prompt is required.")]
 
-    model = args.get("model", "veo-3.1-fast")
-    if model not in ("omni-flash", "veo-3.1", "veo-3.1-fast"):
+    model = args.get("model", "omni-flash")
+    if model not in ("omni-flash", *VEO_OPTIONS):
         return [TextContent(type="text", text=f"Error: unknown model: {model}")]
     try:
         duration = _coerce_int(args.get("duration_seconds"), "duration_seconds")
@@ -919,49 +977,54 @@ async def _handle_generate(args: dict) -> list[TextContent]:
     aspect_ratio = args.get("aspect_ratio", "16:9")
     resolution = args.get("resolution", "720p")
     image_path = (args.get("image_path") or "").strip()
+    veo = model in VEO_OPTIONS
 
     # Explicit range errors instead of silent clamping — a paid call should
     # produce what the agent asked for or fail loudly.
-    if model.startswith("veo") and duration not in VEO_DURATIONS:
+    if veo and duration not in VEO_DURATIONS:
         return [TextContent(type="text", text=(
             f"Error: duration_seconds must be 4, 6, or 8 for Veo models (got {duration})."
         ))]
-    if model == "omni-flash" and resolution != "720p":
+    if not veo and not OMNI_MIN_SECONDS <= duration <= OMNI_MAX_SECONDS:
         return [TextContent(type="text", text=(
-            "Error: omni-flash generates 720p only — use veo-3.1 or "
-            "veo-3.1-fast for 1080p/4k."
+            f"Error: duration_seconds must be between {OMNI_MIN_SECONDS} and "
+            f"{OMNI_MAX_SECONDS} for omni-flash (got {duration})."
         ))]
     if image_path and not await asyncio.to_thread(os.path.isfile, image_path):
         return [TextContent(type="text", text=f"Error: file not found: {image_path}")]
-    if not GOOGLE_AI_API_KEY:
+    if veo and not FAL_API_KEY:
+        return [TextContent(type="text", text=(
+            "Error: Veo runs only through fal.ai since Google shut it down on its own API. "
+            "Ask an admin to set FAL_API_KEY in the video-gen-mcp admin page, or use model omni-flash."
+        ))]
+    if not veo and not GOOGLE_AI_API_KEY:
         return [TextContent(type="text", text=_unavailable_msg("Google AI", "GOOGLE_AI_API_KEY"))]
 
     image = None
     if image_path:
         image = (_image_mime(image_path), await asyncio.to_thread(Path(image_path).read_bytes))
     label = MODEL_LABELS[model]
+    refused = _save_refusal()
+    if refused:
+        return [TextContent(type="text", text=refused)]
     path = _get_save_path(args.get("save_path"), "video")
     try:
-        if model == "omni-flash":
-            # Omni has no duration parameter — steer via the prompt.
-            omni_prompt = f"{prompt} Aim for a duration of about {duration} seconds."
-            await _omni_generate(omni_prompt, aspect_ratio, path, image=image)
+        if veo:
+            await _fal_veo_generate(model, prompt, duration, aspect_ratio, resolution, path, image=image)
         else:
-            await _veo_generate(model, prompt, duration, aspect_ratio, resolution,
-                                path, first_frame=image)
+            await _omni_generate(prompt, aspect_ratio, duration, resolution, path, image=image)
     except httpx.HTTPStatusError as e:
-        return [TextContent(type="text", text=(
-            f"Error: {_api_error_message('Google AI', 'GOOGLE_AI_API_KEY', e)}"
-        ))]
+        provider = ("fal.ai", "FAL_API_KEY") if veo else ("Google AI", "GOOGLE_AI_API_KEY")
+        return [TextContent(type="text", text=f"Error: {_api_error_message(*provider, e)}")]
     except Exception as e:
         logger.exception("Video generation failed: %s", e)
         return [TextContent(type="text", text=f"Error generating video: {e}")]
 
     played = await _push_video_player(path, f"{label}: {prompt[:80]}")
     suffix = " Video player displayed to user." if played else ""
-    duration_note = f"{duration}s" if model.startswith("veo") else f"~{duration}s (model-chosen)"
+    route = " via fal.ai" if veo else ""
     return [TextContent(type="text", text=(
-        f"Generated {duration_note} video with {label} ({resolution}, {aspect_ratio}"
+        f"Generated {duration}s video with {label}{route} ({resolution}, {aspect_ratio}"
         f"{', from image' if image else ''}). Saved to: {path}.{suffix}"
     ))]
 
@@ -975,8 +1038,10 @@ async def _handle_transition(args: dict) -> list[TextContent]:
         if not await asyncio.to_thread(os.path.isfile, p):
             return [TextContent(type="text", text=f"Error: file not found: {p}")]
 
-    model = args.get("model", "seedance")
-    if model not in ("veo-3.1", "veo-3.1-fast", "seedance"):
+    # Named or not, a call never runs on another model than its answer names:
+    # the cost rows price an unnamed call by that answer (``result_has``).
+    model = args.get("model") or ("seedance" if FAL_API_KEY else "omni-flash")
+    if model not in ("seedance", "omni-flash", *VEO_OPTIONS):
         return [TextContent(type="text", text=f"Error: unknown model: {model}")]
     try:
         duration = _coerce_int(args.get("duration_seconds"), "duration_seconds")
@@ -1002,44 +1067,46 @@ async def _handle_transition(args: dict) -> list[TextContent]:
                 f"(got {combined / 1024 / 1024:.0f} MB). Trim or compress the clips first "
                 "(video-tools can do this)."
             ))]
+    elif model == "omni-flash":
+        if duration < OMNI_MIN_SECONDS or duration > OMNI_TRANSITION_MAX_SECONDS:
+            return [TextContent(type="text", text=(
+                f"Error: duration_seconds must be between {OMNI_MIN_SECONDS} and "
+                f"{OMNI_TRANSITION_MAX_SECONDS} for omni-flash (got {duration})."
+            ))]
+        if not GOOGLE_AI_API_KEY:
+            return [TextContent(type="text", text=_unavailable_msg(
+                "Omni Flash transitions (Google AI)", "GOOGLE_AI_API_KEY"))]
     else:
         if duration not in VEO_DURATIONS:
             return [TextContent(type="text", text=(
                 f"Error: duration_seconds must be 4, 6, or 8 for Veo models (got {duration})."
             ))]
-        if not FAL_API_KEY and not GOOGLE_AI_API_KEY:
+        if not FAL_API_KEY:
             return [TextContent(type="text", text=_unavailable_msg(
-                "Veo transitions (fal.ai or Google AI)", "FAL_API_KEY or GOOGLE_AI_API_KEY"))]
+                "Veo transitions (fal.ai)", "FAL_API_KEY"))]
 
-    # Veo transitions prefer the fal route: same models, no regional FLF gate,
-    # billed on the FAL key. Google direct is the keyless-fal fallback (works
-    # only where Google allows FLF — not for EEA keys, live 2026-07-19).
-    via_fal = model == "seedance" or bool(FAL_API_KEY)
     label = MODEL_LABELS[model]
+    refused = _save_refusal()
+    if refused:
+        return [TextContent(type="text", text=refused)]
     path = _get_save_path(args.get("save_path"), "transition")
     try:
         if model == "seedance":
             await _seedance_transition(video_a, video_b, style, duration, aspect_ratio, path)
-        elif via_fal:
+        elif model == "omni-flash":
+            await _omni_transition(video_a, video_b, style, duration, aspect_ratio, path)
+        else:
             await _fal_veo_flf_transition(
                 model, video_a, video_b, style, duration, aspect_ratio, path,
             )
-        else:
-            last_a = await _extract_frame(video_a, "last")
-            first_b = await _extract_frame(video_b, "first")
-            prompt = TRANSITION_BASE_PROMPT + (f" {style}" if style else "")
-            await _veo_generate(
-                model, prompt, duration, aspect_ratio, "720p", path,
-                first_frame=("image/png", last_a), last_frame=("image/png", first_b),
-            )
     except httpx.HTTPStatusError as e:
-        provider = ("fal.ai", "FAL_API_KEY") if via_fal else ("Google AI", "GOOGLE_AI_API_KEY")
+        provider = ("Google AI", "GOOGLE_AI_API_KEY") if model == "omni-flash" else ("fal.ai", "FAL_API_KEY")
         return [TextContent(type="text", text=f"Error: {_api_error_message(*provider, e)}")]
     except Exception as e:
         logger.exception("Transition generation failed: %s", e)
         return [TextContent(type="text", text=f"Error generating transition: {e}")]
 
-    route = " via fal.ai" if via_fal and model != "seedance" else ""
+    route = " via fal.ai" if model in VEO_OPTIONS else ""
     played = await _push_video_player(path, f"Transition ({label})")
     suffix = " Video player displayed to user." if played else ""
     return [TextContent(type="text", text=(
@@ -1065,6 +1132,9 @@ async def _handle_edit(args: dict) -> list[TextContent]:
             "Trim or compress the clip first (video-tools can do this)."
         ))]
 
+    refused = _save_refusal()
+    if refused:
+        return [TextContent(type="text", text=refused)]
     path = _get_save_path(args.get("save_path"), "edit")
     try:
         await _runway_edit(video_path, prompt, path)

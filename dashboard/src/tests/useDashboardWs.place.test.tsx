@@ -1,13 +1,16 @@
 /**
  * A new chat's place rides its pre_warmup and its first warmup (never a
- * warmup of an existing chat, never a voice start), and a running move's
- * `chat_move_progress` lands in the chat's cached targets for the ring.
+ * warmup of an existing chat, never a voice start), a running move's
+ * `chat_move_progress` lands in the chat's cached targets for the ring, and a
+ * machine that came or went (`machine_link`) makes the page read every place
+ * again and ask again about the banner (`target_check`, `target_mismatch`).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useDashboardWs } from '@/hooks/useDashboardWs'
 import { chatTargetsKey, type ChatTargets } from '@/api/remoteMachines'
+import { useChatStore } from '@/store/chatStore'
 import { FakeWebSocket } from './fakeWebSocket'
 
 const TARGETS: ChatTargets = {
@@ -98,5 +101,60 @@ describe("a move's progress", () => {
     const { qc, receive } = setup(undefined)
     receive(frame)
     expect(qc.getQueryData(chatTargetsKey('c1'))).toBeUndefined()
+  })
+})
+
+describe('a machine that came or went', () => {
+  beforeEach(() => {
+    FakeWebSocket.instances = []
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  const PLACE_KEYS = [['chat-targets'], ['agent-run-targets'], ['agent-target-status'],
+    ['remote-machines'], ['my-remote-machines']]
+  const refreshed = (spy: { mock: { calls: unknown[][] } }) =>
+    spy.mock.calls.map((c) => JSON.stringify((c[0] as { queryKey: unknown }).queryKey))
+
+  it('reads every place again once for a burst, and asks about the banner', () => {
+    vi.useFakeTimers()
+    const { qc, sent, receive } = setup(undefined)
+    const spy = vi.spyOn(qc, 'invalidateQueries')
+    receive({ type: 'machine_link', machine_id: 'm-1' })
+    receive({ type: 'machine_link', machine_id: 'm-2' })
+    receive({ type: 'machine_link', machine_id: 'm-1' })
+    expect(sent('target_check')).toHaveLength(0)
+    act(() => { vi.advanceTimersByTime(300) })
+    expect(refreshed(spy).sort()).toEqual(PLACE_KEYS.map((k) => JSON.stringify(k)).sort())
+    expect(sent('target_check')).toEqual([{ type: 'target_check' }])
+    // The next machine is a refresh of its own.
+    receive({ type: 'machine_link', machine_id: 'm-3' })
+    act(() => { vi.advanceTimersByTime(300) })
+    expect(sent('target_check')).toHaveLength(2)
+  })
+
+  it("sets the chat's banner from the answer, and clears it", () => {
+    const { receive } = setup(undefined)
+    receive({ type: 'target_mismatch', chat_id: 'c-pin', pinned_target: 'm-1', pinned_label: 'Attic PC',
+              resolved_target: 'local', resolved_label: 'the OtoDock platform' })
+    expect(useChatStore.getState().byChat['c-pin']?.targetMismatch).toEqual({
+      pinnedTarget: 'm-1', pinnedLabel: 'Attic PC',
+      resolvedTarget: 'local', resolvedLabel: 'the OtoDock platform',
+    })
+    receive({ type: 'target_mismatch', chat_id: 'c-pin' })
+    expect(useChatStore.getState().byChat['c-pin']?.targetMismatch).toBeNull()
+  })
+
+  it('a socket that came back reads every place again', () => {
+    const { qc, hook } = setup(undefined)
+    const spy = vi.spyOn(qc, 'invalidateQueries')
+    const first = FakeWebSocket.instances[0]
+    first.readyState = FakeWebSocket.CLOSED
+    act(() => { hook.result.current.connect() })
+    act(() => { FakeWebSocket.instances[1].onopen?.() })
+    expect(refreshed(spy)).toEqual(expect.arrayContaining(PLACE_KEYS.map((k) => JSON.stringify(k))))
   })
 })

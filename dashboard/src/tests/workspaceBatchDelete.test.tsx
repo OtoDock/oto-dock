@@ -197,6 +197,20 @@ describe('the recover bin says when it was refused', () => {
     return onClose
   }
 
+  it('each entry says why it is there, a conflict as replaced by a newer version', () => {
+    // The server bins for two reasons only (recover_bin_store.VALID_REASONS):
+    // a "Recover your files" notice points at the conflict ones.
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <RecoverBinModal agent="ag" entries={[...entries, { ...entries[0], entry_id: 'e2',
+          rel_path: 'knowledge/docs/b.md', original_name: 'b.md', reason: 'conflict' as const, size: 8 }]}
+        onClose={vi.fn()} />
+      </QueryClientProvider>,
+    )
+    expect(screen.getByText(/Deleted · 3 B/)).toBeTruthy()
+    expect(screen.getByText(/Replaced by a newer version · 8 B/)).toBeTruthy()
+  })
+
   it('a restore that is refused shows its reason and keeps the list', async () => {
     fetchMock.mockImplementation(() => refusal(403, 'Only a manager can restore these.'))
     renderBin()

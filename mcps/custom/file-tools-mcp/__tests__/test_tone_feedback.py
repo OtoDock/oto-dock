@@ -210,3 +210,75 @@ def test_unparseable_operations_error_not_silent_copy(tmp_path, monkeypatch):
     assert result.startswith("Nothing saved:")
     assert "2 of 2 operations are not valid, so none ran" in result
     assert not Path(out).exists()
+
+
+def _ramp_row(tmp_path, monkeypatch, level, name):
+    """The 0 to 255 ramp after ``whites`` at ``level``: one value per input level."""
+    import numpy as np
+    from PIL import Image
+
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
+    src = _gradient(tmp_path)
+    out = str(tmp_path / name)
+    _run(images.handle_edit_image({
+        "path": src, "output_path": out,
+        "operations": [{"type": "whites", "level": level}],
+    }))
+    return np.asarray(Image.open(out).convert("L"), dtype=int)[0]
+
+
+def test_whites_moves_the_white_point_and_leaves_the_shadows(tmp_path, monkeypatch):
+    """whites is RELATIVE: positive lifts the bright tones toward white,
+    negative brings them down, the shadows stay, 0 is no change."""
+    import numpy as np
+
+    up = _ramp_row(tmp_path, monkeypatch, 50, "up.png")
+    down = _ramp_row(tmp_path, monkeypatch, -50, "down.png")
+    same = _ramp_row(tmp_path, monkeypatch, 0, "same.png")
+    assert list(same) == list(range(256))
+    assert up[224] >= 236 and up[192] >= 202          # the bright tones lift
+    assert up[255] == 255 and up[64] <= 65            # the top stays white, the shadows stay
+    assert down[255] <= 235 and down[224] <= 210      # the brightest come down
+    assert down[64] >= 63
+    for level in (100, -100, 20, -20):
+        row = _ramp_row(tmp_path, monkeypatch, level, f"r{level}.png")
+        assert (np.diff(row) >= 0).all(), level       # no tone passes another
+
+
+def test_whites_keeps_a_pictures_transparency(tmp_path, monkeypatch):
+    import numpy as np
+    from PIL import Image
+
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
+    src = tmp_path / "logo.png"
+    Image.new("RGBA", (16, 16), (230, 230, 230, 255)).save(src)
+    out = str(tmp_path / "logo-out.png")
+    _run(images.handle_edit_image({
+        "path": str(src), "output_path": out,
+        "operations": [{"type": "whites", "level": -60}],
+    }))
+    arr = np.asarray(Image.open(out))
+    assert arr.shape[2] == 4 and (arr[..., 3] == 255).all()
+    assert arr[..., 0].max() < 215
+
+
+def test_whites_keeps_a_grey_pictures_transparency_and_treats_cmyk_ink_as_tones():
+    """The alpha channel is found by the picture's mode, never by its count
+    of channels: a grey picture with transparency (LA) keeps it, and a CMYK
+    picture's fourth ink is a tone like the other three."""
+    import numpy as np
+    from PIL import Image
+
+    from formats.pdf import image_tone
+
+    job = type("Job", (), {})()
+    job.img = Image.new("LA", (16, 16), (230, 200))
+    image_tone.op_whites(job, None, {"level": -60})
+    arr = np.asarray(job.img)
+    assert job.img.mode == "LA" and (arr[..., 1] == 200).all()
+    assert arr[..., 0].max() < 215
+
+    job.img = Image.new("CMYK", (8, 8), (230, 230, 230, 230))
+    image_tone.op_whites(job, None, {"level": -60})
+    inks = np.asarray(job.img)
+    assert job.img.mode == "CMYK" and (inks == inks[..., :1]).all() and inks.max() < 215

@@ -14,6 +14,7 @@
     "url_template": "http://${docker_mcp_host}:${port}",
     "source": "docker:file-tools-mcp + collabora/code",
     "proxy_callbacks": true,
+    "starts": "with_platform",
     "tool_timeout_sec": 600
   },
 

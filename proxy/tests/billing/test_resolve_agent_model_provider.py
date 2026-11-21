@@ -85,9 +85,9 @@ def test_disabled_declared_default_falls_down_a_tier(monkeypatch):
 
 def test_disabled_default_on_claude_lands_on_sonnet_not_fable(monkeypatch):
     # The case the rule exists for: Opus 5.5 (tier 2, the declared default)
-    # disabled must NOT promote Fable 5.1 (tier 1) — it falls to Sonnet 5.
+    # disabled must NOT promote Fable 5.2 (tier 1) — it falls to Sonnet 5.
     rows = [
-        {"model_id": "claude-fable-5-1", "provider": "anthropic", "is_builtin": True,
+        {"model_id": "claude-fable-5-2", "provider": "anthropic", "is_builtin": True,
          "enabled": True, "tier": 1, "created_at": "2026-01-01"},
         {"model_id": "claude-opus-5-5", "provider": "anthropic", "is_builtin": True,
          "enabled": False, "tier": 2, "created_at": "2026-01-01"},
@@ -113,7 +113,7 @@ def test_disabled_default_on_codex_lands_on_terra_not_astra(monkeypatch):
 
 def test_tier_one_is_reached_only_when_nothing_at_or_below_the_default_is_enabled(monkeypatch):
     rows = [
-        {"model_id": "claude-fable-5-1", "provider": "anthropic", "is_builtin": True,
+        {"model_id": "claude-fable-5-2", "provider": "anthropic", "is_builtin": True,
          "enabled": True, "tier": 1, "created_at": "2026-01-01"},
         {"model_id": "claude-opus-5-5", "provider": "anthropic", "is_builtin": True,
          "enabled": False, "tier": 2, "created_at": "2026-01-01"},
@@ -121,7 +121,7 @@ def test_tier_one_is_reached_only_when_nothing_at_or_below_the_default_is_enable
          "enabled": False, "tier": 3, "created_at": "2026-01-01"},
     ]
     _wire(monkeypatch, ["anthropic"], models=rows, layer="claude-code-cli")
-    assert config.resolve_agent_model("caller") == "claude-fable-5-1"
+    assert config.resolve_agent_model("caller") == "claude-fable-5-2"
 
 
 # --- the pool filter ---------------------------------------------------------

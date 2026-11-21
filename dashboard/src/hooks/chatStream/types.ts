@@ -1,7 +1,7 @@
 import type { AttachedFileMeta, AttachedImageMeta, QueuedMessage } from '../../store/types'
 import type {
   ChatHistoryDeltaFrame, ChatHistoryFrame, ChatMovedFrame, NotificationCountFrame, NotificationFrame, NotificationSilentFrame,
-  PreWarmupReadyFrame, WarmupFailedFrame, WarmupReadyFrame, WarmupStartedFrame,
+  PreWarmupReadyFrame, PreWarmupRefusedFrame, SystemFrame, WarmupFailedFrame, WarmupReadyFrame, WarmupStartedFrame,
 } from '../../api/wireEvents'
 
 /** Per-page adapter for the queued-messages store (chatStore for AgentChat,
@@ -49,6 +49,8 @@ export interface UseChatStreamOptions {
   onWarmupStartedExtra?: (data: WarmupStartedFrame) => void
   /** pre_warmup_ready tail (chat: stash preWarmedRef). */
   onPreWarmupReady?: (data: PreWarmupReadyFrame) => void
+  /** pre_warmup_refused (chat: the new-chat notice). */
+  onPreWarmupRefused?: (data: PreWarmupRefusedFrame) => void
   /** Whether a warmup is currently in flight — drives onError's optimistic
    * bubble removal (chat: warmingUp state; task: false). */
   isWarmingUp?: boolean
@@ -68,9 +70,14 @@ export interface UseChatStreamOptions {
    * a move's outcome, broadcast to every tab that sees the chat. The page
    * re-resumes it so the next warmup runs where it went. */
   onChatMoved?: (data: ChatMovedFrame) => void
+  /** `session_reloaded` with `terminal` for the VIEWED chat (stale-guarded
+   * like onChatMoved, live only, no card): the agent's reload closed the
+   * chat's terminal and the new one is up. The page attaches to it. */
+  onTerminalReloaded?: (data: SystemFrame) => void
   /** chat_view_only for the VIEWED chat: a phone call drives it (read-only
-   * history until the call ends); null when the chat is its own again. */
-  onChatViewOnly?: (data: { chat_id: string; kind: string } | null) => void
+   * history until the call ends, `lock` the composer's sentence while a call
+   * holds the chat); null when the chat is its own again. */
+  onChatViewOnly?: (data: { chat_id: string; kind: string; lock?: string } | null) => void
   /** switch_engine ack for the VIEWED chat (stale-guarded like onChatMoved).
    * Arrives on the acting socket AND via per-user broadcast — idempotent. */
   onEngineSwitched?: (data: { chat_id: string; execution_path: string; model: string }) => void
@@ -90,6 +97,9 @@ export interface UseChatStreamOptions {
   /** The viewed chat's stored execution mode: the ack of a terminal pick or
    *  the echo of a refused one. */
   onExecutionModeChanged?: (executionMode: string) => void
+  /** A `mode_changed` the server answered a pick with: the chat's mode, with
+   *  `refusal` when a live terminal took no pick. */
+  onModeAnswered?: (refusal?: string) => void
   /** Fires after chat_history is applied (chat: deferred find-bar; task:
    * setChatReady(true)). */
   onChatHistoryLoaded?: (data: ChatHistoryFrame) => void

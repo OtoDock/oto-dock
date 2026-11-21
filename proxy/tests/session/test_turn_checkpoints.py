@@ -697,16 +697,117 @@ async def test_a_pump_beside_the_chats_own_writes_no_record(temp_db, quiet_end):
         _cleanup(owner)
 
 
-async def test_a_shutdown_that_ends_the_engine_reads_as_the_restart(temp_db, quiet_end):
+async def test_a_shutdown_that_ends_the_engine_keeps_the_record_and_writes_no_card(temp_db, quiet_end):
+    """The stop ended the engine: the run reads the restart's ending, the
+    record stays for the boot, and the chat gets neither a card nor abort
+    flags here (what it reads is the continue pass's to write)."""
     task_store.create_chat("ck-exit", "user-admin", "a1")
     exited = turn_ending.TurnEnding(reason=turn_ending.EXITED, exit_code=143).as_dict()
     pump, left = await _run("ck-exit", [
         CommonEvent(type=TEXT, data={"content": "working"}),
         CommonEvent(type=ERROR, data={"message": "exited", "ending": exited})], ending=True)
-    assert pump.last_ending.reason == turn_ending.RESTARTED
-    cards = [r[3] for r in _rows("ck-exit") if r[2] == wire.SYSTEM]
-    assert [c["reason"] for c in cards] == [turn_ending.RESTARTED]
+    assert pump.last_ending.reason == turn_ending.RESTARTED and pump.cut_by_platform
+    assert [r[3] for r in _rows("ck-exit") if r[2] == wire.SYSTEM] == []
+    assert [r[1] for r in _rows("ck-exit") if r[0] == "assistant"] == ["working"]
+    chat = task_store.get_chat("ck-exit")
+    assert not chat["last_turn_aborted"]
+    assert [(r["chat_id"], r["turn_token"]) for r in left] == [("ck-exit", pump._turn_token)]
+
+
+async def test_an_engine_that_exits_with_the_platform_up_keeps_its_card_and_no_record(temp_db, quiet_end):
+    task_store.create_chat("ck-exit-up", "user-admin", "a1")
+    exited = turn_ending.TurnEnding(reason=turn_ending.EXITED, exit_code=1).as_dict()
+    pump, left = await _run("ck-exit-up", [
+        CommonEvent(type=TEXT, data={"content": "working"}),
+        CommonEvent(type=ERROR, data={"message": "exited", "ending": exited})])
+    assert pump.last_ending.reason == turn_ending.EXITED and not pump.cut_by_platform
+    assert [c["reason"] for c in (r[3] for r in _rows("ck-exit-up") if r[2] == wire.SYSTEM)] == [
+        turn_ending.EXITED]
     assert left == []
+
+
+async def test_a_turn_the_person_stopped_under_the_stop_leaves_no_record(temp_db, quiet_end):
+    """A Stop that races the platform's stop is the person's ending: nothing
+    is left to continue."""
+    task_store.create_chat("ck-stopped", "user-admin", "a1")
+    q: asyncio.Queue = asyncio.Queue()
+    exited = turn_ending.TurnEnding(reason=turn_ending.EXITED, exit_code=143).as_dict()
+    for ev in (CommonEvent(type=TEXT, data={"content": "x"}),
+               CommonEvent(type=ERROR, data={"message": "exited", "ending": exited})):
+        q.put_nowait(ev)
+    pump = ChatStreamPump(chat_id="ck-stopped", session_id="sid-rec", event_queue=q, perm_queue=None,
+                          producer=asyncio.get_running_loop().create_task(asyncio.sleep(3600)))
+    pump.stopped = True
+    _active_pumps["ck-stopped"] = pump
+    stream_pump._platform_ending = True
+    try:
+        await pump.start()
+        await chat_writer.drain("ck-stopped", timeout=5)
+        assert not pump.cut_by_platform and open_turns.list_open() == []
+    finally:
+        stream_pump._platform_ending = False
+        _cleanup(pump)
+
+
+async def test_the_record_says_who_the_turn_runs_as_and_how(temp_db, quiet_end, monkeypatch):
+    """The facts a continue needs are on the row from the turn's start: the
+    person from the session's own security context, the kind from the
+    pump's driver, the mode, the machine, the run and the plan."""
+    from types import SimpleNamespace
+
+    from core.session import session_state
+    task_store.create_chat("ck-facts", "user-admin", "a1")
+    ctx = SimpleNamespace(username="who", placement=SimpleNamespace(machine_id="m-7"))
+    monkeypatch.setattr(session_state, "get_session_security", lambda sid: ctx)
+    monkeypatch.setattr(session_state, "recorded_session_mode", lambda sid: "ask")
+    monkeypatch.setattr(task_store, "get_user_sub_by_username",
+                        lambda name: "user-admin" if name == "who" else None)
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait(CommonEvent(type=TEXT, data={"content": "cut"}))
+    q.put_nowait(CommonEvent(type=PRODUCER_DONE, data={}))
+    pump = ChatStreamPump(chat_id="ck-facts", session_id="sid-rec", event_queue=q, perm_queue=None,
+                          producer=asyncio.get_running_loop().create_task(asyncio.sleep(3600)),
+                          source_type="task", implementing_plan="plan.md")
+    pump.run_id = "run-42"
+    _active_pumps["ck-facts"] = pump
+    stream_pump._platform_ending = True
+    try:
+        await pump.start()
+        await chat_writer.drain("ck-facts", timeout=5)
+        row = open_turns.get_open("ck-facts")
+        assert [row[name] for name in open_turns.FACTS] == [
+            "user-admin", "task", "ask", "m-7", "run-42", "plan.md"]
+        # A turn the stop cut did not implement its plan.
+        assert task_store.get_chat_plans("ck-facts") == []
+    finally:
+        stream_pump._platform_ending = False
+        _cleanup(pump)
+
+
+async def test_the_card_a_turn_waits_on_is_on_its_record(temp_db):
+    """Shown: on the row. Answered: cleared. Retired under the stop (the
+    closing sockets cancelled the hook's request): it stays, since the
+    person never answered."""
+    from core import drain
+    task_store.create_chat("ck-card", "user-admin", "a1")
+    pump = _pump("ck-card")
+    pump._turn_token = "tok-card"
+    open_turns.open_turn("ck-card", "tok-card", "sid-ck", kind="dashboard")
+    try:
+        await pump._show_permission({"request_id": "r1", "tool_name": "Bash", "event_type": "permission"})
+        await chat_writer.drain("ck-card", timeout=5)
+        assert json.loads(open_turns.get_open("ck-card")["card"]) == {
+            "tool": "Bash", "request_id": "r1", "event_type": "permission"}
+        await pump.resolve_active_permission()
+        await chat_writer.drain("ck-card", timeout=5)
+        assert open_turns.get_open("ck-card")["card"] == ""
+        await pump._show_permission({"request_id": "r2", "tool_name": "Write", "event_type": "permission"})
+        drain.note_stopping()
+        await pump._retire_prompt("r2", caller_gone=True)
+        await chat_writer.drain("ck-card", timeout=5)
+        assert json.loads(open_turns.get_open("ck-card")["card"])["tool"] == "Write"
+    finally:
+        _cleanup(pump)
 
 
 async def test_the_checkpoint_clock_is_thirty_seconds_of_the_loop(temp_db):

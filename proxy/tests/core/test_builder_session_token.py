@@ -14,12 +14,16 @@ import json
 import pytest
 import tomllib
 
+from tests._compute import serve
 from tests.fixtures.loop_builder_rig import AGENT, SHARED, install, run
 
 
 @pytest.fixture
 def rig(temp_db, monkeypatch, tmp_path):
     rec = install(monkeypatch, tmp_path)
+    # A compute machine serves the platform's place: the meeting's and the
+    # call's sessions are built on it (the platform runs none itself).
+    serve(monkeypatch)
     from services.mcp import mcp_registry
     from storage.agents import agent_store
     from storage.billing import subscription_store
@@ -71,7 +75,7 @@ def _meeting(agent: str, scope: str, creator: str, sid: str):
 def test_mint_session_env_writes_the_token_and_returns_its_floor():
     from auth.session_token import mint_session_env
     env: dict[str, str] = {}
-    floor = mint_session_env(env, "sid-mint", "char-agent", "user-viewer", external="")
+    floor = mint_session_env(env, "sid-mint", "char-agent", "user-viewer", external="", role="")
     claims = _claims(env["PROXY_API_KEY"])
     assert claims["user_sub"] == "user-viewer" and claims["sid"] == "sid-mint"
     assert claims["iat"] == floor > 0 and "ext" not in claims

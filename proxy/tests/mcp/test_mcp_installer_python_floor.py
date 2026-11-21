@@ -15,6 +15,13 @@ import pytest
 
 from services.mcp import mcp_installer
 
+
+def _install(*args, **kwargs):
+    """``install_mcp`` with its steps as this process's children, unless the
+    test names its own runner (the runner has no default)."""
+    kwargs.setdefault("run", mcp_installer.run_unconfined)
+    return mcp_installer.install_mcp(*args, **kwargs)
+
 _UNSAT_LOG = (
     b"Using Python 3.10.12 environment at: venv\n"
     b"  x No solution found when resolving dependencies:\n"
@@ -28,9 +35,23 @@ class _FakeProc:
     def __init__(self, rc: int, out: bytes):
         self.returncode = rc
         self._out = out
+        self.stdout = _Out(out)
 
     async def communicate(self):
         return self._out, None
+
+    async def wait(self):
+        return self.returncode
+
+
+class _Out:
+    """A stream answering ``read`` from fixed bytes, as a pipe would."""
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def read(self, n: int = -1) -> bytes:
+        chunk, self._data = (self._data, b"") if n < 0 else (self._data[:n], self._data[n:])
+        return chunk
 
 
 def _mcp_dir(tmp_path):
@@ -67,7 +88,7 @@ async def test_requirements_install_retries_with_python_floor(tmp_path, monkeypa
         return fut
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
-    r = await mcp_installer.install_mcp(
+    r = await _install(
         _mcp_dir(tmp_path), "python", "local",
         uv_bin=_fake_uv(tmp_path), python_bin="python3",
     )
@@ -92,7 +113,7 @@ async def test_requirements_install_no_retry_without_floor_in_log(tmp_path, monk
         return fut
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
-    r = await mcp_installer.install_mcp(
+    r = await _install(
         _mcp_dir(tmp_path), "python", "local",
         uv_bin=_fake_uv(tmp_path), python_bin="python3",
     )
@@ -116,7 +137,7 @@ async def test_requirements_retry_failure_surfaces_original_style_error(tmp_path
         return fut
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
-    r = await mcp_installer.install_mcp(
+    r = await _install(
         _mcp_dir(tmp_path), "python", "local",
         uv_bin=_fake_uv(tmp_path), python_bin="python3",
     )

@@ -21,7 +21,7 @@ const PENDING = {
 const TO_CLAUDE = {
   layer: 'claude-code-cli',
   layerLabel: 'Claude Code CLI',
-  model: 'claude-fable-5-1',
+  model: 'claude-fable-5-2',
 }
 
 function renderBanner(over: Partial<Parameters<typeof EngineSwitchBanner>[0]> = {}) {
@@ -165,7 +165,7 @@ describe('the bottom panel and its fade', () => {
 })
 
 describe('the chat page puts its banners in the bottom panel', () => {
-  it('ChatBanners, the lock line and the composer sit inside ChatBottomPanel in AgentChat', () => {
+  it('ChatBanners (the lock line among them) and the composer sit inside ChatBottomPanel in AgentChat', () => {
     // Mounting the whole page needs every hook it uses: the page's own
     // source is the cheaper proof that nothing above the fade is a banner.
     const page = readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),
@@ -175,7 +175,7 @@ describe('the chat page puts its banners in the bottom panel', () => {
     expect(open).toBeGreaterThan(0)
     expect(close).toBeGreaterThan(open)
     expect(page.split('<ChatBottomPanel>')).toHaveLength(2)
-    for (const child of ['<ChatBanners', '<ChatLockNotice', '<ChatComposerBar']) {
+    for (const child of ['<ChatBanners', '<ChatComposerBar']) {
       const at = page.indexOf(child)
       expect(at, child).toBeGreaterThan(open)
       expect(at, child).toBeLessThan(close)

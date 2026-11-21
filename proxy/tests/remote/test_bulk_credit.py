@@ -13,12 +13,13 @@ satellite acks a frame once it is delivered.
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 
 import pytest
 
-from core.remote import satellite_file_transfer as sft
+from core.remote import satellite_file_verbs
 from core.remote.satellite_connection import (
     CreditFailed,
     SatelliteConnection,
@@ -26,6 +27,7 @@ from core.remote.satellite_connection import (
     _BulkCredit,
 )
 from services.path_policy_v2 import PathRef
+from tests._descriptor import opened
 
 pytestmark = pytest.mark.asyncio
 
@@ -58,8 +60,11 @@ def _manager_with_writer():
 
 
 async def _ack(mgr, frame, status="ok"):
-    await mgr.handle_message("m1", {"type": "ack", "command_id": frame["command_id"],
-                                    "status": status, "error": ""})
+    ack = {"type": "ack", "command_id": frame["command_id"], "status": status, "error": ""}
+    if status == "ok" and frame.get("hash"):
+        # A satellite reports the file it committed on its last frame's ok.
+        ack.update(size=1, mtime_ns=1)
+    await mgr.handle_message("m1", ack)
 
 
 def _file_bytes(frame) -> int:
@@ -328,7 +333,7 @@ async def test_small_chunks_reassemble_on_an_old_satellite(monkeypatch):
     appends any size, truncates on index 0, and commits an agent-tree file on
     the hash and a satellite-host one on ``chunk_index + 1 >= total``."""
     monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 64)
-    monkeypatch.setattr(sft, "PUSH_SLOW_CHUNK_BYTES", 16)
+    monkeypatch.setattr(satellite_file_verbs, "PUSH_SLOW_CHUNK_BYTES", 16)
     mgr, conn, wire = _manager_with_writer()
     conn.bulk_credit.slow = True
     files: dict[str, bytes] = {}
@@ -367,7 +372,7 @@ async def test_a_credit_below_a_chunk_sends_small_frames_the_inline_write_too(mo
     """With the credit set below one chunk every frame is the slow chunk,
     a file that would fit one inline write included, so the credit paces."""
     monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 64)
-    monkeypatch.setattr(sft, "PUSH_SLOW_CHUNK_BYTES", 16)
+    monkeypatch.setattr(satellite_file_verbs, "PUSH_SLOW_CHUNK_BYTES", 16)
     mgr, conn, wire = _manager_with_writer()
     conn.bulk_credit.cap = 32
 
@@ -398,6 +403,8 @@ async def test_a_waiting_path_source_push_goes_before_the_running_one_takes_agai
     doc.write_bytes(bytes(1000))
     mgr, conn, wire = _manager_with_writer()
     conn.bulk_credit = _BulkCredit(cap=2048)
+    stack = contextlib.ExitStack()
+    big, doc = stack.enter_context(opened(big)), stack.enter_context(opened(doc))
     long_push = asyncio.create_task(mgr.push_file(
         "m1", PathRef("agent_tree", "big.bin"), big, agent_slug="a1"))
     while len(wire.sent) < 2:  # noqa: ASYNC110  # a fake wire's sent list: the fake has no event
@@ -418,6 +425,7 @@ async def test_a_waiting_path_source_push_goes_before_the_running_one_takes_agai
     await _settle()
     assert conn.bulk_credit.inflight == 0
     conn.writer_task.cancel()
+    stack.close()
 
 
 async def test_a_lost_frame_aborts_the_push_at_once(monkeypatch):
@@ -439,11 +447,11 @@ async def test_a_lost_frame_aborts_the_push_at_once(monkeypatch):
 async def test_a_transfer_frame_is_contact_for_the_heartbeat_monitor():
     import time
 
-    from core.remote.satellite_connection import _last_contact
+    from core.remote.satellite_connection import last_contact
     conn = SatelliteConnection(machine_id="m1", ws=_Wire())
     conn.last_heartbeat = time.monotonic() - 200       # queued behind a pull
     conn.last_transfer_at = time.monotonic() - 5
-    assert time.monotonic() - _last_contact(conn) < 10
+    assert time.monotonic() - last_contact(conn) < 10
 
 
 # --- the stale guard ----------------------------------------------------------
@@ -479,8 +487,9 @@ async def test_a_stale_ack_fails_the_push_and_hands_the_caller_the_machines_stat
 
 async def test_an_ok_ack_with_the_committed_stat_records_the_machines_copy(monkeypatch):
     """Every frame of a chunked push carries the expectation; the last ack's
-    stat is recorded as the machine's copy. A bare ack (an older satellite)
-    records nothing, and a push without an expectation sends none."""
+    stat is recorded as the machine's copy. A bare ok on the last frame
+    reports no written file: a refusal that records nothing. A push without
+    an expectation sends none."""
     from core.remote import remote_file_flow
     monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4)
     remote_file_flow._pull_stat_records.clear()
@@ -507,7 +516,7 @@ async def test_an_ok_ack_with_the_committed_stat_records_the_machines_copy(monke
             "exists": True, "size": 10, "mtime_ns": 777}
         sat.cancel()
         sat = asyncio.create_task(_satellite({}))
-        assert await mgr.push_file("m1", PathRef("agent_tree", "w/o.md"), b"v", agent_slug="a1")
+        assert not await mgr.push_file("m1", PathRef("agent_tree", "w/o.md"), b"v", agent_slug="a1")
         assert "expect" not in wire.sent[-1]
         assert ("m1", "a1", "w/o.md") not in remote_file_flow._pull_stat_records
     finally:

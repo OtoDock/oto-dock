@@ -290,3 +290,94 @@ class TestResultFiles:
             release.set()
         assert len(posted) == 2
         assert capsys.readouterr().out == ""
+
+
+# The failure event's input as Claude Code 2.1.325 sends it (probed): the
+# result is the ``error`` text the model reads, and there is no ``tool_response``.
+_STOPPED = {
+    "hook_event_name": "PostToolUseFailure",
+    "tool_name": "Bash",
+    "tool_input": {"command": "python3 grow.py", "description": "Grow"},
+    "tool_use_id": "toolu_stop",
+    "error": "Exit code 1\n\nThat command used too much memory and was stopped.",
+    "is_interrupt": False,
+    "duration_ms": 1419,
+}
+
+
+class TestFailedCalls:
+    """A failed call runs PostToolUseFailure, not PostToolUse: its card gets
+    the text the model read, flagged, so the cost engine skips it."""
+
+    def test_a_stopped_command_posts_its_sentence_flagged(self, monkeypatch):
+        posted = _run_main(monkeypatch, _STOPPED)
+        assert len(posted) == 1
+        body = posted[0]
+        assert body["result_content"] == _STOPPED["error"]
+        assert "That command used too much memory and was stopped." in body["result_content"]
+        assert body["is_error"] is True
+        assert body["summary"] == "error: Exit code 1"
+        assert body["tool_use_id"] == "toolu_stop"
+        assert body["tool_command"] == "python3 grow.py"
+
+    def test_a_failed_read_names_its_path(self, monkeypatch):
+        posted = _run_main(monkeypatch, {
+            "hook_event_name": "PostToolUseFailure", "tool_name": "Read",
+            "tool_input": {"file_path": "/workspace/missing.txt"}, "tool_use_id": "toolu_r",
+            "error": "File does not exist. Note: your current working directory is /workspace.",
+        })
+        assert posted[0]["is_error"] is True
+        assert posted[0]["tool_paths"] == ["/workspace/missing.txt"]
+        assert posted[0]["summary"].startswith("error: File does not exist.")
+
+    def test_an_mcp_failure_is_an_error_whatever_its_words(self, monkeypatch, capsys):
+        # A JSON-RPC error's text names no error: the event says it failed.
+        posted, out = _run_with_answers(monkeypatch, capsys, {
+            "hook_event_name": "PostToolUseFailure", "tool_name": "mcp__maps__static_map",
+            "tool_input": {}, "tool_use_id": "toolu_m", "error": "rpc failure on purpose",
+            "mcp_server": {"name": "maps"},
+        }, [{"status": "ok", "result_files": True}])
+        assert len(posted) == 1 and out == ""
+        assert posted[0]["is_error"] is True
+        assert posted[0]["summary"] == "error: rpc failure on purpose"
+
+    def test_a_failed_display_call_is_forwarded(self, monkeypatch):
+        # The display tools are skipped on success (the picture just appeared);
+        # a failure shows why it did not.
+        ok = _run_main(monkeypatch, {
+            "tool_name": "mcp__display__send_url", "tool_input": {}, "tool_response": [],
+        })
+        failed = _run_main(monkeypatch, {
+            "hook_event_name": "PostToolUseFailure", "tool_name": "mcp__display__send_url",
+            "tool_input": {}, "error": "Error: the link is not reachable",
+        })
+        assert ok == []
+        assert failed and failed[0]["is_error"] is True
+
+    def test_the_question_cards_stay_skipped(self, monkeypatch):
+        assert _run_main(monkeypatch, {
+            "hook_event_name": "PostToolUseFailure", "tool_name": "AskUserQuestion",
+            "tool_input": {}, "error": "refused",
+        }) == []
+
+    def test_a_long_error_is_capped_like_a_result(self, monkeypatch):
+        error = "\n".join(f"line {i}" for i in range(800))
+        posted = _run_main(monkeypatch, {**_STOPPED, "error": error})
+        assert posted[0]["result_content"].endswith("... (300 more lines)")
+
+    def test_an_error_that_is_not_text_becomes_text(self, monkeypatch):
+        posted = _run_main(monkeypatch, {**_STOPPED, "error": {"message": "odd"}})
+        assert posted[0]["is_error"] is True and "odd" in posted[0]["result_content"]
+
+    def test_a_terminal_posts_nothing_for_a_failure(self, monkeypatch):
+        posted = []
+        monkeypatch.setattr(forwarder.urllib.request, "urlopen",
+                            lambda req, timeout=0: posted.append(req))
+        monkeypatch.setattr(forwarder.sys, "stdin", io.StringIO(json.dumps({
+            **_STOPPED, "tool_name": "mcp__maps__static_map"})))
+        monkeypatch.setenv("OTO_INTERACTIVE", "1")
+        monkeypatch.setenv("OTO_SESSION_ID", "sess-hook-test")
+        monkeypatch.setenv("PROXY_URL", "http://proxy.test")
+        monkeypatch.setenv("PROXY_API_KEY", "k")
+        forwarder.main()
+        assert posted == []

@@ -15,16 +15,21 @@ from auth import tokens
 # credential for ``POST /v1/hooks/cli-credential``, kept from every MCP child.
 CLI_TOKEN_ENV = "OTO_CLI_TOKEN"
 
-# Sentinel Authorization bearer for Docker MCPs that call back to the proxy
-# (manifest ``server.proxy_callbacks``). The per-session MCP config carries this
-# placeholder at BUILD time (``build_session_mcp_config``); each per-layer
-# ``?session_id=`` injection site swaps it for a real, session-scoped JWT once
-# the session_id is known. Mirrors ``core.credentials.mcp_broker.BROKER_BEARER_PLACEHOLDER``
-# (vendor bearers) — a Docker MCP container is shared across sessions, so it
-# can't hold a session-scoped env token the way stdio MCPs do; the per-request
-# header is its equivalent.
+# The two sentinel Authorization bearers a per-session MCP config carries at
+# BUILD time (``build_session_mcp_config``), each swapped by every per-layer
+# ``?session_id=`` injection site for the token it stands for once the
+# session id is known (``swap_session_jwt_bearer``). The session sentinel is
+# a credentialed HTTP MCP's gateway entry: the gateway route takes the
+# session's own token. The callback sentinel is a Docker tool that calls the
+# proxy back (manifest ``server.proxy_callbacks``): a shared container cannot
+# hold a session-scoped env token the way a stdio MCP does, so it carries
+# the callback kind per request, good for the five file callbacks alone.
+# Mirrors ``core.credentials.mcp_broker.BROKER_BEARER_PLACEHOLDER`` (vendor
+# bearers).
 SESSION_JWT_PLACEHOLDER = "OTO_SESSION_JWT"
 SESSION_JWT_SENTINEL_BEARER = f"Bearer {SESSION_JWT_PLACEHOLDER}"
+CALLBACK_JWT_PLACEHOLDER = "OTO_CALLBACK_JWT"
+CALLBACK_JWT_SENTINEL_BEARER = f"Bearer {CALLBACK_JWT_PLACEHOLDER}"
 
 
 # The person each session's tokens are minted for, so the Docker MCP callback
@@ -56,15 +61,74 @@ def _session_user(session_id: str) -> str:
 def swap_session_jwt_bearer(
     auth_value: str, session_id: str, agent_name: str, user_sub: str = ""
 ) -> str | None:
-    """If ``auth_value`` is the session-JWT sentinel bearer, return the real
-    ``Bearer <jwt>`` minted for this session (for the person its own token
-    names, unless ``user_sub`` says otherwise); else return ``None`` (caller
-    leaves the header untouched — e.g. a real vendor bearer).
-    """
-    if auth_value != SESSION_JWT_SENTINEL_BEARER:
+    """The ``Bearer <token>`` a sentinel stands for, minted for this session
+    (for the person its own token names, unless ``user_sub`` says
+    otherwise): the session sentinel becomes the session's own token (a
+    gateway entry, whose route takes it), the callback sentinel the callback
+    kind a Docker tool calls back with, good for the five file callbacks and
+    nothing else. ``None`` for any other value (a real vendor bearer: the
+    caller leaves the header untouched)."""
+    if auth_value == SESSION_JWT_SENTINEL_BEARER:
+        user_sub = user_sub or _session_user(session_id)
+        return f"Bearer {create_session_token(session_id, agent_name, user_sub)}"
+    if auth_value == CALLBACK_JWT_SENTINEL_BEARER:
+        user_sub = user_sub or _session_user(session_id)
+        return f"Bearer {create_callback_token(session_id, agent_name, user_sub)}"
+    return None
+
+
+def create_callback_token(
+    session_id: str, agent_name: str, user_sub: str = "", *, issued_at: int | None = None,
+) -> str:
+    """The token a Docker tool (``server.proxy_callbacks``: file-tools,
+    video-tools) calls back with: the session token's claims under the
+    ``TOOL_CALLBACK`` kind, so it is judged for liveness and its holder as
+    the session's own token is, and reaches the five file callbacks alone
+    (``auth/external_endpoints.is_callback_endpoint_allowed``) on either
+    listener, since the container arrives on the public one."""
+    now = int(time.time()) if issued_at is None else int(issued_at)
+    return tokens.mint(tokens.TOOL_CALLBACK, {
+        "type": "tool_callback",
+        "sid": session_id,
+        "agent": agent_name,
+        "user_sub": user_sub,
+        "iat": now,
+        "exp": now + 24 * 3600,
+    })
+
+
+def validate_callback_token(token: str) -> dict | None:
+    """The claims of a live callback token, or None."""
+    return tokens.verify(token, tokens.TOOL_CALLBACK)
+
+
+def callback_token_for(session_token: str) -> str | None:
+    """A callback token with the session, agent, person and floor (``iat``)
+    of ``session_token``: for the sites that hold a session's token and
+    nothing else (the remote rewrite). None for a string that is no live
+    session token."""
+    claims = validate_session_token(session_token)
+    if not claims:
         return None
-    user_sub = user_sub or _session_user(session_id)
-    return f"Bearer {create_session_token(session_id, agent_name, user_sub)}"
+    iat = claims.get("iat")
+    return create_callback_token(
+        str(claims.get("sid") or ""), str(claims.get("agent") or ""),
+        str(claims.get("user_sub") or ""), issued_at=iat if isinstance(iat, int) else None,
+    )
+
+
+def _live_subject_claim(session_id: str) -> str:
+    """The ``subj`` claim of the session's registered SecurityContext: the
+    outside person a wrap-up writes the memory of ("" for every other
+    session, and before the context is registered)."""
+    if not session_id:
+        return ""
+    try:
+        from core.session.session_state import get_session_security
+    except ImportError:  # pragma: no cover — import-order safety only
+        return ""
+    ctx = get_session_security(session_id)
+    return getattr(ctx, "subject_id", "") or ""
 
 
 def _live_external_claim(session_id: str) -> str:
@@ -80,6 +144,17 @@ def _live_external_claim(session_id: str) -> str:
     return getattr(ctx, "external_claim", "") or ""
 
 
+def _live_built_role(session_id: str) -> str:
+    """The role a live session was built with (its registered
+    SecurityContext's), "" when none is registered."""
+    if not session_id:
+        return ""
+    from core.session.session_state import get_session_security
+    ctx = get_session_security(session_id)
+    role = getattr(ctx, "role", "") if ctx is not None else ""
+    return role if isinstance(role, str) else ""
+
+
 def create_session_token(
     session_id: str,
     agent_name: str,
@@ -87,6 +162,8 @@ def create_session_token(
     *,
     external: str | None = None,
     issued_at: int | None = None,
+    subject: str | None = None,
+    role: str | None = None,
 ) -> str:
     """Generate a JWT scoped to one agent session.
 
@@ -114,9 +191,21 @@ def create_session_token(
             spawn precisely so the tokens minted into the process env carry
             it; "" mints a plain token. Tokens carrying ``ext`` are accepted
             only while the session is live (``middleware.py``).
+        subject: the ``subj`` claim of the wrap-up after a conversation,
+            the outside person's identity row whose memory the memory API
+            maps it to. ``None`` derives it from the registered context,
+            as ``external``.
+        role: the ``role`` claim of a token that names a person: the role
+            its session was built with, which every route judges it at
+            (``auth/providers.session_role_cap``). ``None`` derives it from
+            the registered context, as ``external``.
     """
     if external is None:
         external = _live_external_claim(session_id)
+    if subject is None:
+        subject = _live_subject_claim(session_id)
+    if role is None:
+        role = _live_built_role(session_id)
     if session_id and user_sub:
         _remember_session_user(session_id, user_sub)
     now = int(time.time()) if issued_at is None else int(issued_at)
@@ -130,6 +219,10 @@ def create_session_token(
     }
     if external:
         payload["ext"] = external
+    if subject:
+        payload["subj"] = subject
+    if user_sub and role:
+        payload["role"] = role
     return tokens.mint(tokens.SESSION, payload)
 
 
@@ -140,6 +233,8 @@ def mint_session_env(
     person_sub: str,
     *,
     external: str | None,
+    role: str,
+    subject: str | None = None,
 ) -> int:
     """Write the session's token into ``env`` as ``PROXY_API_KEY``, naming
     ``person_sub`` ("" for nobody), and return its ``iat``: the session's
@@ -150,10 +245,14 @@ def mint_session_env(
     environment, laid last over the process env and written into a Codex
     config's stdio MCPs, so an engine's own token, which names nobody, never
     reaches them. ``external`` is the ``ext`` claim ("" for none, ``None`` to
-    derive it from the live session, as :func:`create_session_token`)."""
+    derive it from the live session, as :func:`create_session_token`).
+    ``role`` is the role the builder builds the session at: the token carries
+    it, so a session built below its person's role is judged at it wherever
+    the token is accepted."""
     issued_at = int(time.time())
     env["PROXY_API_KEY"] = create_session_token(
         session_id, agent_name, person_sub, external=external, issued_at=issued_at,
+        subject=subject, role=role,
     )
     return issued_at
 

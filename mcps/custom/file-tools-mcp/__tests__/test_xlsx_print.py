@@ -81,7 +81,7 @@ def test_a_sheet_of_its_own_setup_is_left_to_its_author(tmp_path, settings, mark
 def _marked(path, tmp_path) -> Path:
     folder = tmp_path / "marked"
     folder.mkdir()
-    return Path(print_marks.marked_copy(str(path), str(folder), own_copy=True))
+    return Path(print_marks.marked_copy(str(path), str(folder)))
 
 
 def _pictures(path) -> list[tuple[str, tuple[int, int, int], str]]:
@@ -147,7 +147,7 @@ def test_a_sheet_whose_drawing_cannot_be_read_is_left_unmarked(tmp_path):
     assert _plan(broken) == []
     folder = tmp_path / "marked"
     folder.mkdir()
-    assert print_marks.marked_copy(str(broken), str(folder), own_copy=True) == str(broken)
+    assert print_marks.marked_copy(str(broken), str(folder)) == str(broken)
     assert list(folder.iterdir()) == []
 
 

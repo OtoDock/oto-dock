@@ -40,10 +40,28 @@ def _ctx(
 class TestLocalSandbox:
     def test_contains_bwrap_sandbox(self):
         text = _build_execution_environment_section(_ctx("local"))
-        assert "local bwrap kernel sandbox" in text
+        assert "inside a **sandbox** on one of the platform's compute machines" in text
+        assert "platform host" not in text
+        assert "its own copy" not in text
         # Local should NOT mention home dirs or allow_full_fs.
         assert "Filesystem access" not in text
         assert "Full filesystem access" not in text
+
+    def test_compute_beside_the_platform_reads_as_the_sandbox(self):
+        ctx = SecurityContext(role="manager", username="alice", agent="my-agent", is_admin_agent=False,
+                              placement=placement.PlacementCapabilities(kind=placement.KIND_COMPUTE,
+                                                                        machine_id="c-1", label="Compute one"))
+        text = _build_execution_environment_section(ctx)
+        assert text == _build_execution_environment_section(_ctx("local"))
+
+    def test_compute_on_another_host_says_its_copy_is_synced(self):
+        ctx = SecurityContext(role="manager", username="alice", agent="my-agent", is_admin_agent=False,
+                              placement=placement.PlacementCapabilities(kind=placement.KIND_COMPUTE,
+                                                                        machine_id="c-2", label="Compute two",
+                                                                        own_copy=True))
+        text = _build_execution_environment_section(ctx)
+        assert "inside a **sandbox** on one of the platform's compute machines" in text
+        assert "This machine works on its own copy of these folders, which the platform keeps in sync." in text
 
 
 class TestUserRemoteHomeOnly:

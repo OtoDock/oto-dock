@@ -16,6 +16,7 @@ const wsMock = vi.hoisted(() => ({
   sendPlanReviewResponse: vi.fn(),
   sendQuestionResponse: vi.fn(),
   resumeChat: vi.fn(),
+  leaveChat: vi.fn(),
   implementPlan: vi.fn(),
   sendLocationResponse: vi.fn(),
   subscribe: vi.fn(() => () => {}),
@@ -214,5 +215,62 @@ describe('the background badges after a history rebuild', () => {
     expect(badges(result)).toEqual(['general-purpose:tuOld'])
     const spawn = result.current.messages.flatMap((m: any) => m.blocks).find((b: any) => b._toolId === 'tuOld')
     expect(spawn.isActive).toBe(true)
+  })
+})
+
+describe('the delegated badge after a history rebuild', () => {
+  const lane = { id: 'dyn-1', description: 'long lane', agent: 'worker' }
+  const spawnRow = () => row('event', '', 'delegate_spawn', { type: 'delegate_spawn', task_id: 'dyn-1', task_name: 'long lane', agent: 'worker' })
+  const resultRow = () => row('event', '', 'delegate_result', { task_id: 'dyn-1', task_name: 'long lane', agent: 'worker', status: 'completed' })
+  const describeOf = (r: { current: { activeAgents: Array<{ type: string; description: string }> } }) =>
+    r.current.activeAgents.filter((a) => a.type === 'delegate').map((a) => a.description)
+
+  it('a delegation started before the page shows at open and goes with its result frame', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({
+      type: 'chat_history', chat_id: 'chat-1', messages: [row('assistant', 'newest')],
+      running: { agents: [], commands: [], delegates: [lane] },
+    }))
+    expect(badges(result)).toEqual(['delegate:delegate-dyn-1'])
+    expect(describeOf(result)).toEqual(['long lane → worker'])
+    // A frame with no task id drops nothing (the by-name fallback).
+    act(() => captured.cb.onDelegateResult({ type: 'delegate_result', task_name: 'other', agent: 'worker', status: 'completed' }))
+    expect(badges(result)).toEqual(['delegate:delegate-dyn-1'])
+    act(() => captured.cb.onDelegateResult({ type: 'delegate_result', task_id: 'dyn-1', task_name: 'long lane', agent: 'worker', status: 'completed' }))
+    expect(badges(result)).toEqual([])
+  })
+
+  it('the terminal and history switch keeps it: the REST page lost the spawn', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({ type: 'chat_history', chat_id: 'chat-1', messages: [row('user', 'go'), spawnRow()] }))
+    expect(badges(result)).toEqual(['delegate:delegate-dyn-1'])
+    // The newest page no longer holds the spawn row (the history toggle, a chat_rows refetch).
+    act(() => result.current.seedDbHistory([row('assistant', 'a later answer')], true))
+    expect(badges(result)).toEqual(['delegate:delegate-dyn-1'])
+    expect(describeOf(result)).toEqual(['long lane → worker'])
+    // A refetch that brings its result ends it, the live frame missed.
+    act(() => result.current.seedDbHistory([row('assistant', 'later still'), resultRow()], true))
+    expect(badges(result)).toEqual([])
+  })
+
+  it('a scroll up that brings the spawn shows one badge for it', async () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({
+      type: 'chat_history', chat_id: 'chat-1', has_more: true, messages: [row('assistant', 'newest')],
+      running: { delegates: [lane] },
+    }))
+    older.rows = [spawnRow()]
+    await act(async () => { await result.current.loadOlder() })
+    expect(badges(result)).toEqual(['delegate:delegate-dyn-1'])
+  })
+
+  it('a Stop leaves a delegation running: the worker reports later', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({ type: 'chat_history', chat_id: 'chat-1', messages: [] }))
+    act(() => captured.cb.onDelegateSpawn({ type: 'delegate_spawn', task_id: 'dyn-1', task_name: 'long lane', agent: 'worker', prompt_preview: '' }))
+    act(() => captured.cb.onAborted({}))
+    const block = result.current.messages.flatMap((m: any) => m.blocks).find((b: any) => b.type === 'delegate')
+    expect(block.status).toBe('running')
+    expect(badges(result)).toEqual(['delegate:delegate-dyn-1'])
   })
 })

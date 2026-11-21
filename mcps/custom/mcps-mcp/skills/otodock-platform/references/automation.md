@@ -6,13 +6,22 @@ Work an agent does on its own. Three shapes: **recurring** (cron or plain interv
 fired in the creator's timezone), **one-time** (`run_at` or a delay; the row cleans
 itself up after firing), and **trigger-fired** (no schedule — runs when a wired trigger
 fires). Chats can also schedule a **continuation** — a bounded future wake of the same
-conversation, shown in the chat as a "Scheduled wake" card.
+conversation, shown in the chat as a "Scheduled wake" card. A wake arrives at its time,
+also when nobody writes in that chat, and a one-time wake is never dropped. In a person's
+own chat it runs in that chat's mode with its tools. In Ask, a step that needs approval
+waits for the person, who is told once.
 
 - **Scopes**: *user* (private to the creator — any user) vs *agent* (the agent's own work,
   with results in the shared workspace. It needs per-agent **editor+**, and only editors
   and managers see it and its runs. A contributor or a viewer sees only their own tasks,
   and the page says so). Agent-scope runs created by a
-  **manager/admin** get knowledge write access; editor-created stay read-only. A task or
+  **manager/admin** get knowledge write access; editor-created stay read-only. Only a
+  manager of the agent, or an admin, continues, steers, stops or answers such a run, or
+  changes its mode, model or engine. An editor reads "Only a manager of this agent can
+  continue this run. It can change the agent's knowledge." The same holds for a delegated
+  worker whose run writes knowledge, in the dashboard, by `continue_id` and by API key. A run with no
+  person in it changes the prompt, mode or checks of such a task only when its own run
+  holds that right. A task or
   trigger that runs without a person reaches the agent's shared workspace and knowledge,
   never a person's private folder, and the agent's settings only when its creator manages
   the agent (since 1.9.0). A **Shared only** agent offers the agent scope alone, so its
@@ -20,7 +29,9 @@ conversation, shown in the chat as a "Scheduled wake" card.
   fails each run with a message saying so.
 - **Completion notification** (required per task): *auto* (generic "Task Complete/
   Failed"), *manual* (the agent writes its own, with real results — the common choice),
-  *none* (silent). Failures always notify except in *none*.
+  *none* (silent). Failures notify except in *none*, with one exception: a run the platform
+  cut that cannot go on reads failed in its history and sends no notification (see **A restart**
+  below).
 - **Who is told** (a shared task): the row's **Settings** picks the lowest role that gets
   its notifications: **Everyone who uses the agent**, **Contributors, editors and
   managers**, **Editors and managers** (the default for a new task) or **Managers**.
@@ -45,8 +56,9 @@ conversation, shown in the chat as a "Scheduled wake" card.
   task that runs without a person never runs on a personal computer. A delegated job
   takes a machine the same way (`machine` on `delegate`). A chat lane may also run on
   the delegating person's own computer, even one that works for the whole agent. There
-  it works as that person, with their role and their own AI account, and it stops when
-  they lose the editor role or their place on the agent. When the machine is offline
+  it works as that person, with their role, and it stops when they lose the editor role
+  or their place on the agent. Like every chat lane, it runs on their own AI account,
+  wherever it runs. When the machine is offline
   at run time, the run uses the agent's usual place and its chat says so. A chat lane
   on the person's own computer waits for it instead. The round ends with "<name> is
   offline, so this work cannot run there now. Reconnect it, then continue the work."
@@ -64,13 +76,16 @@ conversation, shown in the chat as a "Scheduled wake" card.
 - **Model pinning**: a task can pin a specific model and engine for its runs, leaving
   the agent's default untouched — the lever for "lighter default, one demanding daily job
   on a strong model". Without a pin, a person's own task runs on the engine their new
-  chats take there. On a Shared-only agent it runs on the agent's default. A model
+  chats take there. On a Shared-only agent it runs on the agent's default, with the
+  subscriptions shared with agents. A chat lane runs on the engine its person's own chat
+  takes, on every agent, Shared-only ones included. A model
   pinned without an engine runs on the engine the task would take unpinned (the
-  person's own engine for their own task, else the agent's default) when that engine
+  person's own engine for their own task or chat lane, else the agent's default) when that engine
   offers it, else on the first engine of the agent's own order that does. Name the engine when the same model is on two engines and you want
   the other. Ask the user before
   pinning; read the current pin back from `list_tasks`
-  (`runs on: <model> [pinned|your engine|agent default|layer default, tier N]`) or
+  (`runs on: <model> [pinned|your engine|agent default|layer default|the chat's, tier N]`,
+  where `the chat's` marks a wake, which runs on its chat's model) or
   `get_task`, which also shows the prompt and warns when a pin no longer resolves;
   pick by capability tier (`[t1]` frontier … `[t4]` fast), never by the id's name.
   Both Scheduled Tasks pages show the effective model per task as a chip carrying the
@@ -93,6 +108,17 @@ conversation, shown in the chat as a "Scheduled wake" card.
   stays warm for that work up to its ceiling, and its output is not part of the run. On
   Claude, a headless chat's or task's background command stops after 30 minutes unless the
   agent gave it a longer timeout (2 hours at most); a longer job is a task of its own.
+- **A restart**: a run the platform cut is reopened under its own id. Its chat shows
+  "Continued after a restart", it goes on from where it stopped, and it ends with one
+  result and its usual notification. A run that had not started starts then, from its own
+  prompt. A one-time task or a scheduled wake that came due while OtoDock was down fires
+  once when it is back, and a delay counts from the task's creation. A recurring task's
+  missed fires are not caught up. After a restore or more than a day down nothing is
+  caught up, and the same holds for a run whose chat a person wrote in first: the run
+  fails with "Cut short when the platform restarted" and a delegating agent is told once.
+  A one-time task whose time has passed and that nothing will run reads **Will not run**
+  on the Scheduled Tasks pages: run it now or delete it.
+  During an update a fire waits: the run stays pending and starts when OtoDock is back.
 - **Transferred rows**: when a creator loses the editor role on the agent (or is
   removed from it, or deleted), their agent-scope tasks, triggers and notifications keep
   running under the admin who made the change and show "transferred from <person>" on
@@ -105,7 +131,8 @@ conversation, shown in the chat as a "Scheduled wake" card.
   name under it, and a new name given there changes that run only (the task's own name
   changes in its **Settings** or through the agent's `edit_task`); a finished run's chat
   can be continued — and, once over, switched to another engine/model from its picker
-  (editor+, on the subscriptions admins share with agents).
+  (editor+, a manager for a run that can change the agent's knowledge, on the
+  subscriptions admins share with agents).
 
 ## Triggers
 
@@ -124,6 +151,17 @@ managers by default, admins always).
   Monitoring → Triggers → Agent API Keys** (agent scope, manager) — shown once. Webhook
   payload fields substitute into task prompts and notification text as
   `{{placeholders}}`.
+- **Personal API keys** (**User Settings → Integrations → API Keys**, **+ Create key** *(any)*,
+  shown once, ends after 7, 30, 90 or 365 days): a key acts as its person on all their
+  agents or the ones it names, and does what its ticked permissions allow: send a chat
+  message and wait for the answer, run tasks and read their results, read and write
+  files in the person's own folder and the shared workspace, send the person a
+  notification, and fire their own webhook triggers. A key's turn does what that chat
+  can do, in the chat's mode. A key not made to run without asking sends only into chats
+  in Ask or Plan, where each change waits for the person's card in the dashboard, and it
+  runs no tasks. A key runs the person's own tasks and the agent's tasks they may run
+  from the dashboard: a manager any, an editor the ones they made. A key never answers a
+  permission card. The `otodock` command uses the same key.
 - **Vendor events**: connected integrations with an event API (GitHub, Linear, Slack,
   Microsoft 365, Zoom, Notion) register subscriptions automatically — subscribe from the
   account card under **User Settings → Integrations**, then create a trigger against the
@@ -133,9 +171,9 @@ managers by default, admins always).
   Organization webhooks permission and owner rights on the organization). A GitHub account
   connected through a GitHub App subscribes one of its installations instead, picked from
   a list. A subscription has a scope: **Subscribe as: Me** makes a personal one
-  (user-scope triggers only); **Subscribe as: <agent>**, or Agent Settings → MCPs →
-  **Subscribe to events for this agent** *(manager)*, subscribes the agent on its own
-  behalf through its service account, the only kind an agent-scope trigger (one that wakes
+  (user-scope triggers only); **Subscribe as: <agent>**, or Agent Settings → MCPs → one of
+  the agent's accounts → **Subscribe to events** *(manager)*, subscribes the agent on its own
+  behalf through that account, the only kind an agent-scope trigger (one that wakes
   a shared app, say) can link to. A user trigger links only to a personal subscription, an
   agent trigger only to that agent's; the trigger form's picker lists just the matching
   ones. Deleting a subscription that triggers still fire from asks twice; the triggers
@@ -209,6 +247,7 @@ Budgets (admin, **Admin → Usage**) cap only **platform-paid** usage (borrowed 
 direct engine) — never a user's own subscription. At 80% the user gets a warning; at
 100% new work is blocked until an admin raises the limit; blocked task runs record
 `limit_exceeded` silently. One quirk worth explaining if asked: when background work
-finishes while a chat is idle, the agent wakes to review it — an unprompted, metered
-turn behind a "Background work finished" marker. That's real work, not a phantom
-charge.
+finishes, the agent may start a turn by itself to review it: a metered turn under the
+line "Background work finished: the agent reviews it". It shows in the chat as it
+happens, Stop works on it, and a message sent during it joins it. That's real work, not a
+phantom charge.

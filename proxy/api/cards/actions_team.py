@@ -47,6 +47,7 @@ from services.knowledge import library_rules
 from storage import database as task_store, db_apps
 from storage.agents import agent_store, memory_store
 from storage.knowledge import db_knowledge_libraries
+from storage.pg import run_db
 
 AGENT_FIELD = {"type": "string", "maxLength": 40}
 # A path inside the person's workspace, as the agent names it.
@@ -94,6 +95,12 @@ def _scopes_of(agent: str) -> tuple[str, ...]:
     row = agent_store.get_agent(agent) or {}
     return visibility.available_scopes_for(bool(row.get("collaborative", True)),
                                            str(row.get("default_scope") or visibility.SCOPE_USER))
+
+
+def _names(*agents: str) -> list[str]:
+    """The agents' names as one job: ``display`` reads the agents' table
+    on a cold cache."""
+    return [display(agent) for agent in agents]
 
 
 def _joined(words: list[str]) -> str:
@@ -199,10 +206,7 @@ async def _hand_words(params: dict[str, Any], u) -> dict[str, str]:
     return {"title": title, "text": text, "label": "Hand over"}
 
 
-async def _hand_check(params: dict[str, Any], u) -> str | None:
-    if u.acting_sub is None:
-        return NOT_A_PERSON
-    agent = _agent_of(params)
+def _hand_agent_refusal(agent: str) -> str | None:
     if not agent_store.get_agent(agent):
         return NO_SUCH_AGENT.format(agent=agent)
     scopes = _scopes_of(agent)
@@ -210,6 +214,16 @@ async def _hand_check(params: dict[str, Any], u) -> str | None:
         return NO_PERSONAL_SPACE.format(agent=display(agent))
     if visibility.SCOPE_AGENT not in scopes:
         return NO_SHARED_SPACE.format(agent=display(agent))
+    return None
+
+
+async def _hand_check(params: dict[str, Any], u) -> str | None:
+    if u.acting_sub is None:
+        return NOT_A_PERSON
+    agent = _agent_of(params)
+    refusal = await run_db(_hand_agent_refusal, agent)
+    if refusal:
+        return refusal
     if not u.is_admin and not roles.can_write_workspace(u.effective_role(agent)):
         return HAND_NEEDS_CONTRIBUTOR
     username = await _username(u)
@@ -343,7 +357,7 @@ async def _promote_words(params: dict[str, Any], u) -> dict[str, str]:
     topic = quoted(_shown_topic(str(params.get("topic") or "")))
     new_name = str(params.get("new_name") or "")
     text = (f"Moves the topic {topic} from your private memory to the shared memory of "
-            f"{display(_agent_of(params))}, where every user of the agent reads it.")
+            f"{await run_db(display, _agent_of(params))}, where every user of the agent reads it.")
     if new_name:
         text += f" Its shared name will be {quoted(new_name)}."
     return {"title": f"Share the memory topic {topic} with the team", "text": text, "label": "Share"}
@@ -354,7 +368,7 @@ async def _promote_check(params: dict[str, Any], u) -> str | None:
     if u.acting_sub is None:
         return NOT_A_PERSON
     agent = _agent_of(params)
-    if not agent_store.get_agent(agent):
+    if not await run_db(agent_store.get_agent, agent):
         return memory_api._AGENT_GONE
     if not u.is_admin and not u.can_access_agent(agent):
         return NO_SUCH_AGENT.format(agent=agent)
@@ -390,7 +404,8 @@ async def _promote_run(params: dict[str, Any], options: dict[str, bool], u) -> O
         return Outcome(st.OUTCOME_FAILED, memory_api._NOT_YOUR_TIER)
     except memory_file.MemoryOpError as exc:
         return Outcome(st.OUTCOME_FAILED, plain(str(exc)))
-    return Outcome(st.OUTCOME_DONE, f"The topic {quoted(dst_rel)} is now shared with everyone on {display(agent)}.")
+    return Outcome(st.OUTCOME_DONE,
+                   f"The topic {quoted(dst_rel)} is now shared with everyone on {await run_db(display, agent)}.")
 
 
 PROMOTE_MEMORY = Action(
@@ -437,41 +452,51 @@ async def _share_words(params: dict[str, Any], u) -> dict[str, str]:
     where = "shared apps" if not dst_user else "personal apps"
     then = ("Its first release waits for approval there." if await asyncio.to_thread(_copy_waits, row)
             else "It goes live there once its checks pass.")
-    return {"title": f"Share the app {quoted(title)} with {display(target)}",
-            "text": (f"Copies the app {quoted(slug)} from {display(source)} to the {where} of {display(target)}. "
+    source_name, target_name = await run_db(_names, source, target)
+    return {"title": f"Share the app {quoted(title)} with {target_name}",
+            "text": (f"Copies the app {quoted(slug)} from {source_name} to the {where} of {target_name}. "
                      f"{then} The app's data stays here."),
             "label": "Share"}
+
+
+def _share_agents(source: str, target: str, u) -> tuple[str | None, str, str, tuple[str, ...]]:
+    """What a share's check reads of its agents: the refusal when one is
+    gone or closed to the person, else the two names and the target's
+    scopes."""
+    for agent in (source, target):
+        if not agent_store.get_agent(agent):
+            return NO_SUCH_AGENT.format(agent=agent), "", "", ()
+        if not u.is_admin and not u.can_access_agent(agent):
+            return NO_SUCH_AGENT.format(agent=agent), "", "", ()
+    return None, display(source), display(target), _scopes_of(target)
 
 
 async def _share_check(params: dict[str, Any], u) -> str | None:
     if u.acting_sub is None:
         return NOT_A_PERSON
     source, src_user, target, dst_user, slug = await _share_sides(params, u)
-    for agent in (source, target):
-        if not agent_store.get_agent(agent):
-            return NO_SUCH_AGENT.format(agent=agent)
-        if not u.is_admin and not u.can_access_agent(agent):
-            return NO_SUCH_AGENT.format(agent=agent)
+    refusal, source_name, target_name, scopes = await run_db(_share_agents, source, target, u)
+    if refusal:
+        return refusal
     if source == target:
         return SAME_AGENT
     if not src_user and not u.is_admin and not u.can_edit_agent(source):
-        return SHARE_NEEDS_EDITOR.format(agent=display(source))
+        return SHARE_NEEDS_EDITOR.format(agent=source_name)
     row = await asyncio.to_thread(task_store.get_app_by_slug, source, src_user, slug)
     if not row or not db_apps.app_kind_of(row).serves_tree:
-        return NO_SUCH_APP.format(slug=quoted(slug), agent=display(source))
-    scopes = _scopes_of(target)
+        return NO_SUCH_APP.format(slug=quoted(slug), agent=source_name)
     if dst_user and visibility.SCOPE_USER not in scopes:
-        return NO_PERSONAL_APPS.format(agent=display(target))
+        return NO_PERSONAL_APPS.format(agent=target_name)
     if not dst_user and visibility.SCOPE_AGENT not in scopes:
-        return NO_SHARED_APPS.format(agent=display(target))
+        return NO_SHARED_APPS.format(agent=target_name)
     if not dst_user and not u.is_admin and not u.can_edit_agent(target):
-        return ADD_NEEDS_EDITOR.format(agent=display(target))
+        return ADD_NEEDS_EDITOR.format(agent=target_name)
     taken = await asyncio.to_thread(task_store.get_app_by_slug, target, dst_user, slug)
     folder = config.get_agent_dir(target) / layout.scope_workspace(dst_user) / "apps" / slug if dst_user \
         else config.get_agent_dir(target) / layout.WORKSPACE / "apps" / slug
     folder_there = await asyncio.to_thread(folder.exists)
     if taken or folder_there:
-        return APP_TAKEN.format(slug=quoted(slug), agent=display(target))
+        return APP_TAKEN.format(slug=quoted(slug), agent=target_name)
     return None
 
 
@@ -556,15 +581,16 @@ async def _share_run(params: dict[str, Any], options: dict[str, bool], u) -> Out
     finally:
         await asyncio.to_thread(shutil.rmtree, folder, True)
     status = str(out.get("status") or "")
+    target_name = await run_db(display, target)
     if not reason and status == app_deploy.RESULT_PENDING_APPROVAL:
         return Outcome(st.OUTCOME_DONE,
-                       f"The app {quoted(slug)} is on {display(target)}. Its first release waits for approval there.")
+                       f"The app {quoted(slug)} is on {target_name}. Its first release waits for approval there.")
     if not reason and status == app_deploy.RESULT_OK:
-        return Outcome(st.OUTCOME_DONE, f"The app {quoted(slug)} is live on {display(target)}.")
+        return Outcome(st.OUTCOME_DONE, f"The app {quoted(slug)} is live on {target_name}.")
     left = await _undo_copy(target, dst_user, slug, tasks_before)
     text = f"The app {quoted(slug)} was not shared. {sentence(reason or _refused_words(out))}"
     if left:
-        text += f" These stay on {display(target)}: {', '.join(left)}."
+        text += f" These stay on {target_name}: {', '.join(left)}."
     return Outcome(st.OUTCOME_FAILED, text)
 
 
@@ -588,32 +614,38 @@ def _attachment(source: str, target: str, subdir: str) -> dict | None:
                  if a["source_agent"] == source and (a.get("subdir") or "") == subdir), None)
 
 
-def _attach_sides(params: dict[str, Any]) -> tuple[str, str, str, str]:
-    """The source, the target, the library's folder and the library in words."""
+def _attach_sides(params: dict[str, Any]) -> tuple[str, str, str, str, str, str]:
+    """The source, the target, the library's folder, the library in words,
+    and the source's and the target's names."""
     source, target = str(params["source_agent"]), str(params["target_agent"])
     subdir = library_rules.normalize_subdir(str(params.get("subdir") or ""))
-    lib = (f"the {quoted(subdir)} library of {display(source)}" if subdir
-           else f"the shared knowledge library of {display(source)}")
-    return source, target, subdir, lib
+    source_name, target_name = _names(source, target)
+    lib = (f"the {quoted(subdir)} library of {source_name}" if subdir
+           else f"the shared knowledge library of {source_name}")
+    return source, target, subdir, lib, source_name, target_name
 
 
 async def _attach_words(params: dict[str, Any], u) -> dict[str, str]:
-    source, target, subdir, lib = _attach_sides(params)
+    source, target, subdir, lib, source_name, target_name = await run_db(_attach_sides, params)
     existing = await asyncio.to_thread(_attachment, source, target, subdir)
     if existing is not None and params.get("writable") is not None:
         # The card changes an attachment that exists: it says which way.
         if params["writable"]:
-            return {"title": f"Let {display(target)} write to the library of {display(source)}",
-                    "text": f"{display(target)} already reads {lib}. This card lets it write there too.",
+            return {"title": f"Let {target_name} write to the library of {source_name}",
+                    "text": f"{target_name} already reads {lib}. This card lets it write there too.",
                     "label": "Allow writing"}
-        return {"title": f"Make the library of {display(source)} read-only for {display(target)}",
-                "text": f"{display(target)} already reads {lib}. This card makes it read-only.",
+        return {"title": f"Make the library of {source_name} read-only for {target_name}",
+                "text": f"{target_name} already reads {lib}. This card makes it read-only.",
                 "label": "Make read-only"}
-    text = f"{display(target)} reads {lib}"
+    text = f"{target_name} reads {lib}"
     text += " and may write to it." if params.get("writable") else "."
     text += " Its sessions see the files at their next start."
-    return {"title": f"Attach the library of {display(source)} to {display(target)}", "text": text,
+    return {"title": f"Attach the library of {source_name} to {target_name}", "text": text,
             "label": "Attach"}
+
+
+def _missing_agent(*agents: str) -> str | None:
+    return next((agent for agent in agents if not agent_store.get_agent(agent)), None)
 
 
 async def _attach_check(params: dict[str, Any], u) -> str | None:
@@ -622,9 +654,9 @@ async def _attach_check(params: dict[str, Any], u) -> str | None:
     if not roles.is_creator_or_above(u.role):
         return ATTACH_NEEDS_CREATOR
     source, target = str(params["source_agent"]), str(params["target_agent"])
-    for agent in (source, target):
-        if not agent_store.get_agent(agent):
-            return NO_SUCH_AGENT.format(agent=agent)
+    missing = await run_db(_missing_agent, source, target)
+    if missing is not None:
+        return NO_SUCH_AGENT.format(agent=missing)
     if source == target:
         return SAME_AGENT
     if not library_rules.may_wire_library(u, target):
@@ -634,14 +666,14 @@ async def _attach_check(params: dict[str, Any], u) -> str | None:
     if params.get("writable") and not u.is_admin and not u.can_edit_agent(source):
         return ("Writable attachment requires editor, manager, or admin role on the source agent. "
                 "Attach read-only instead.")
-    subdir = library_rules.normalize_subdir(str(params.get("subdir") or ""))
+    _source, _target, subdir, lib, source_name, target_name = await run_db(_attach_sides, params)
     if not await asyncio.to_thread(db_knowledge_libraries.is_promoted, source, subdir):
-        return NOT_A_LIBRARY.format(agent=display(source))
+        return NOT_A_LIBRARY.format(agent=source_name)
     existing = await asyncio.to_thread(_attachment, source, target, subdir)
     wanted = params.get("writable")
     if existing is not None and (wanted is None or bool(wanted) == bool(existing.get("writable"))):
         # Nothing would change: a card that leaves the flag alone does nothing.
-        return ALREADY_ATTACHED.format(target=display(target), lib=_attach_sides(params)[3])
+        return ALREADY_ATTACHED.format(target=target_name, lib=lib)
     return None
 
 
@@ -649,7 +681,7 @@ async def _attach_run(params: dict[str, Any], options: dict[str, bool], u) -> Ou
     refusal = await _attach_check(params, u)
     if refusal:
         return Outcome(st.OUTCOME_FAILED, refusal)
-    source, target, subdir, _lib = _attach_sides(params)
+    source, target, subdir, _lib, source_name, target_name = await run_db(_attach_sides, params)
     existing = await asyncio.to_thread(_attachment, source, target, subdir)
     wanted = params.get("writable")
     # A card that names no flag leaves an existing attachment's flag alone.
@@ -661,10 +693,10 @@ async def _attach_run(params: dict[str, Any], options: dict[str, bool], u) -> Ou
     except HTTPException as exc:
         return Outcome(st.OUTCOME_FAILED, sentence(str(exc.detail)))
     if result.get("created"):
-        return Outcome(st.OUTCOME_DONE, f"{display(target)} now reads the library of {display(source)}.")
+        return Outcome(st.OUTCOME_DONE, f"{target_name} now reads the library of {source_name}.")
     if writable:
-        return Outcome(st.OUTCOME_DONE, f"{display(target)} can now write to the library of {display(source)}.")
-    return Outcome(st.OUTCOME_DONE, f"{display(target)} now reads the library of {display(source)} without "
+        return Outcome(st.OUTCOME_DONE, f"{target_name} can now write to the library of {source_name}.")
+    return Outcome(st.OUTCOME_DONE, f"{target_name} now reads the library of {source_name} without "
                                     "writing to it.")
 
 
@@ -691,14 +723,19 @@ async def _followed_row(params: dict[str, Any], u) -> tuple[str, dict | None]:
     return agent, row
 
 
+def _name_if_there(agent: str) -> str | None:
+    return display(agent) if agent_store.get_agent(agent) else None
+
+
 async def _followed_check(params: dict[str, Any], u, move: str) -> str | None:
     if u.acting_sub is None:
         return NOT_A_PERSON
     agent, row = await _followed_row(params, u)
-    if not agent_store.get_agent(agent):
+    name = await run_db(_name_if_there, agent)
+    if name is None:
         return NO_SUCH_AGENT.format(agent=agent)
     if not row:
-        return NO_SUCH_APP.format(slug=quoted(str(params.get("app_slug") or "")), agent=display(agent))
+        return NO_SUCH_APP.format(slug=quoted(str(params.get("app_slug") or "")), agent=name)
     why = await asyncio.to_thread(app_follow.refusal, row, u, move)
     return why.detail if why else None
 

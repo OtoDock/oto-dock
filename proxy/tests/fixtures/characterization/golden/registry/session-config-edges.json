@@ -1,0 +1,57 @@
+{
+ "context_on_user_machine": {
+  "bash_env_keys": [],
+  "bundles": {},
+  "excluded": {},
+  "file": null,
+  "flat_env": {},
+  "instance_files": {},
+  "path": null,
+  "server_order": []
+ },
+ "context_only": {
+  "bash_env_keys": [],
+  "bundles": {},
+  "excluded": {},
+  "file": null,
+  "flat_env": {},
+  "instance_files": {},
+  "path": null,
+  "server_order": []
+ },
+ "device_only": {
+  "bash_env_keys": [],
+  "bundles": {},
+  "excluded": {
+   "char-browser": "Requires a remote machine (satellite)"
+  },
+  "file": null,
+  "flat_env": {},
+  "instance_files": {},
+  "path": null,
+  "server_order": []
+ },
+ "no_rows": {
+  "bash_env_keys": [],
+  "bundles": {},
+  "excluded": {},
+  "file": null,
+  "flat_env": {},
+  "instance_files": {},
+  "path": null,
+  "server_order": []
+ },
+ "only_nothing": {
+  "bash_env_keys": [],
+  "bundles": {},
+  "excluded": {
+   "char-browser": "Requires a remote machine (satellite)",
+   "char-satellite": "Requires a remote machine (satellite)"
+  },
+  "file": null,
+  "flat_env": {},
+  "instance_files": {},
+  "path": null,
+  "server_order": []
+ }
+}

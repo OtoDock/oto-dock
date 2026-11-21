@@ -278,7 +278,10 @@ async def test_a_terminal_tasks_question_is_written_once(seen, monkeypatch, tmp_
     monkeypatch.setattr(task_store, "update_chat", lambda cid, **kw: None)
     monkeypatch.setattr(task_store, "set_chat_title_if_unset", lambda cid, title: True)
     monkeypatch.setattr(task_store, "rebuild_chat_search", lambda cid: None)
-    journal = tmp_path / "transcript.jsonl"
+    import config
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)   # the tailer reads beneath an agent's folder only
+    (tmp_path / "ag").mkdir()
+    journal = tmp_path / "ag" / "transcript.jsonl"
     journal.write_text(json.dumps({"type": "assistant", "uuid": "a-q", "message": {
         "role": "assistant", "content": [
             {"type": "tool_use", "id": "t-q", "name": "AskUserQuestion", "input": questions}]}}) + "\n")

@@ -8,6 +8,7 @@ import SubagentInfo from './SubagentInfo'
 import BgCommandInfo from './BgCommandInfo'
 import DelegateTaskInfo, { DelegateResultFiles } from './DelegateTaskInfo'
 import CheckVerdictCard from './checks/CheckVerdictCard'
+import WrapupCard from './WrapupCard'
 import SystemEvent from './SystemEvent'
 import ImageGallery from './media/ImageGallery'
 import VideoPlayer from './media/VideoPlayer'
@@ -354,6 +355,9 @@ export default function BlockRenderer({
         />
       )
 
+    case 'wrapup':
+      return <WrapupCard state={block.state} outcome={block.outcome} followUps={block.followUps} wrote={block.wrote} />
+
     case 'permission':
       return (
         <PermissionDialog
@@ -496,7 +500,7 @@ export default function BlockRenderer({
           </div>
           <div className="px-3 py-2">
             <p className="text-xs text-tertiary truncate">
-              {block.model === 'gpt-image' ? 'GPT Image 1.5' : 'Nano Banana Pro'}
+              {block.model === 'gpt-image' ? 'GPT Image 2.6' : 'Nano Banana Pro'}
               {block.promptPreview && `: ${block.promptPreview}`}
             </p>
           </div>

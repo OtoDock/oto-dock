@@ -112,29 +112,37 @@ def test_reap_task_sessions_noop_when_recent_or_non_task(monkeypatch):
 
 import asyncio
 import json
+import os
 import threading
 
 import pytest
 
 import config
+from core import file_commit
 
 
 @pytest.fixture
 def index_iso(tmp_path, monkeypatch):
     path = tmp_path / "index.json"
+    # The module's own writer stays alive beside the test's, and the shutdown
+    # flush reaches every state file: nothing it holds may land on this path.
+    session_state._index_writer.reset_for_tests()
     monkeypatch.setattr(session_state, "_SESSION_INDEX", path)
-    monkeypatch.setattr(session_state, "_index_writer", session_state._IndexWriter())
+    monkeypatch.setattr(session_state, "_index_writer", file_commit.StateFile(
+        "session-index", lambda: session_state._SESSION_INDEX, session_state._encode_sessions,
+        fsync=True, delay=lambda: max(0.0, config.SESSION_INDEX_FLUSH_S)))
     monkeypatch.setattr(config, "SESSION_INDEX_FLUSH_S", 0.05)
     saved = dict(session_state._sessions)
     session_state._sessions.clear()
     writes = []
-    real = session_state._atomic_write
+    real = file_commit.atomic_replace
 
     def counting(p, blob, *, fsync):
-        writes.append(blob)
+        if p == session_state._SESSION_INDEX:
+            writes.append(blob)
         return real(p, blob, fsync=fsync)
 
-    monkeypatch.setattr(session_state, "_atomic_write", counting)
+    monkeypatch.setattr(file_commit, "atomic_replace", counting)
     yield path, writes
     session_state._sessions.clear()
     session_state._sessions.update(saved)
@@ -147,7 +155,7 @@ def test_records_on_a_loop_coalesce_into_one_compact_write(index_iso):
         for i in range(20):
             session_state._record_session_use(f"s{i}", client_type="dashboard")
         assert not path.exists()          # nothing on the loop, nothing yet
-        await asyncio.sleep(0.3)
+        assert await session_state._index_writer.written(timeout=30)
 
     asyncio.run(scenario())
     assert len(writes) == 1
@@ -166,8 +174,8 @@ def test_without_a_loop_the_write_is_immediate(index_iso):
 def test_an_older_generation_never_replaces_a_newer_one(index_iso):
     path, _ = index_iso
     w = session_state._index_writer
-    w._install('{"new": {}}', 2)
-    w._install('{"old": {}}', 1)
+    w._install(path, '{"new": {}}', 2)
+    w._install(path, '{"old": {}}', 1)
     assert json.loads(path.read_text()) == {"new": {}}
 
 
@@ -175,10 +183,10 @@ def test_a_failed_write_keeps_the_old_file_and_leaves_no_temp(index_iso, monkeyp
     path, _ = index_iso
     path.write_text('{"kept": {}}')
 
-    def boom(src, dst):
+    def boom(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(session_state.os, "replace", boom)
+    monkeypatch.setattr(os, "rename", boom)
     session_state._record_session_use("s-fail")
     assert json.loads(path.read_text()) == {"kept": {}}
     assert [p.name for p in path.parent.iterdir()] == ["index.json"]
@@ -193,7 +201,8 @@ def test_a_call_from_another_thread_lands_on_the_owner_loop(index_iso):
         t.start()
         t.join()
         assert writes == []               # the thread did not write by itself
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.01)         # its change reaches the owner loop
+        assert await session_state._index_writer.written(timeout=30)
 
     asyncio.run(scenario())
     assert len(writes) == 1

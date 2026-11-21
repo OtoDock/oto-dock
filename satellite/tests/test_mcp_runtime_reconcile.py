@@ -6,6 +6,7 @@ venvs/addons that lag THIS host's interpreter/node after an update. ``install_mc
 """
 
 import asyncio
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from satellite._vendored import mcp_installer
 from satellite._vendored.mcp_installer import InstallResult
 from satellite.sessions import mcp_install_support as mis
 
@@ -29,19 +31,32 @@ def _write_pyvenv(venv_dir: Path, major: int, minor: int, micro: int = 0) -> Non
     (venv_dir / "pyvenv.cfg").write_text(f"home = /usr/bin\nversion = {major}.{minor}.{micro}\n")
 
 
+def _finished_process(rc: int, out: bytes):
+    """A process that already ended, its output on a real stream: every read
+    ends at end-of-stream, as a pipe's does. Built inside the test's loop."""
+    from types import SimpleNamespace
+    stdout = asyncio.StreamReader()
+    stdout.feed_data(out)
+    stdout.feed_eof()
+
+    async def _wait():
+        return rc
+    return SimpleNamespace(returncode=rc, stdout=stdout, pid=0, wait=_wait)
+
+
 # ── helper units ────────────────────────────────────────────────────────
 
 
 def test_venv_python_minor_parses(tmp_path):
     v = tmp_path / "venv"
     _write_pyvenv(v, 3, 10, 5)
-    assert mis._venv_python_minor(v) == (3, 10)
+    assert mcp_installer.venv_python_minor(v) == (3, 10)
 
 
 def test_venv_python_minor_missing(tmp_path):
     v = tmp_path / "venv"
     v.mkdir()
-    assert mis._venv_python_minor(v) is None
+    assert mcp_installer.venv_python_minor(v) is None
 
 
 def test_needs_python_reconcile_logic(tmp_path):
@@ -71,7 +86,7 @@ async def test_reconcile_rebuilds_stale_interpreter(tmp_path):
     with patch.object(mis, "_uv_venv_pinned", new_callable=AsyncMock) as pin, \
          patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock,
                return_value=InstallResult(ok=True, log="ok", version_hash="h", venv_python="3.x")) as inst:
-        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv")
+        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv", compute=None)
 
     assert results == {"py-mcp": "ok-py-reconcile"}
     pin.assert_awaited_once()
@@ -91,7 +106,7 @@ async def test_reconcile_skips_current_interpreter(tmp_path):
     _write_pyvenv(mcp / "venv", sys.version_info[0], sys.version_info[1])
 
     with patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock) as inst:
-        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv")
+        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv", compute=None)
     assert results == {}
     inst.assert_not_awaited()
 
@@ -104,12 +119,10 @@ async def test_reconcile_node_major_change(tmp_path):
     (mcp / "node_modules").mkdir()
     (mcp / mis._RUNTIME_MARKER).write_text(json.dumps({"node_major": 22}))
 
-    fake = AsyncMock()
-    fake.communicate = AsyncMock(return_value=(b"ok", None))
-    fake.returncode = 0
+    fake = _finished_process(0, b"ok")
     with patch.object(mis, "_node_major", return_value=24), \
          patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=fake):
-        results = await mis.reconcile_mcp_runtimes(mcps, None)
+        results = await mis.reconcile_mcp_runtimes(mcps, None, compute=None)
     assert results == {"node-mcp": "ok-node-rebuild"}
     assert json.loads((mcp / mis._RUNTIME_MARKER).read_text())["node_major"] == 24
 
@@ -122,7 +135,7 @@ async def test_reconcile_node_absent_marker_records_only(tmp_path):
     (mcp / "node_modules").mkdir()
     with patch.object(mis, "_node_major", return_value=24), \
          patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
-        results = await mis.reconcile_mcp_runtimes(mcps, None)
+        results = await mis.reconcile_mcp_runtimes(mcps, None, compute=None)
     assert results == {}                 # nothing rebuilt on first encounter
     spawn.assert_not_awaited()
     assert json.loads((mcp / mis._RUNTIME_MARKER).read_text())["node_major"] == 24
@@ -130,7 +143,7 @@ async def test_reconcile_node_absent_marker_records_only(tmp_path):
 
 @pytest.mark.asyncio
 async def test_reconcile_empty_when_nothing_present(tmp_path):
-    assert await mis.reconcile_mcp_runtimes(tmp_path / "nope", None) == {}
+    assert await mis.reconcile_mcp_runtimes(tmp_path / "nope", None, compute=None) == {}
 
 
 @pytest.mark.asyncio
@@ -138,12 +151,14 @@ async def test_uv_venv_pinned_runs_under_the_installers_environment(tmp_path, mo
     monkeypatch.setenv("OTO_SATELLITE_PRIVATE", "1")
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("UV_PYTHON_INSTALL_MIRROR", "https://mirror.example/python")
-    fake = AsyncMock()
-    fake.communicate = AsyncMock(return_value=(b"", None))
-    fake.returncode = 0
-    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=fake) as spawn:
-        await mis._uv_venv_pinned("/usr/bin/uv", tmp_path / "m" / "venv", (3, 12), tmp_path / "m")
-    env = spawn.await_args.kwargs["env"]
+    seen: dict = {}
+
+    async def _run(cmd, **kw):
+        seen.update(kw)
+        return 0, ""
+    await mis._uv_venv_pinned("/usr/bin/uv", tmp_path / "m" / "venv", (3, 12), tmp_path / "m", _run)
+    env = seen["env"]
+    assert seen["step"] == "venv"
     assert "OTO_SATELLITE_PRIVATE" not in env
     assert env["UV_NO_CONFIG"] == "1" and env["UV_LINK_MODE"] == "copy"
     assert env["UV_PYTHON_INSTALL_DIR"].endswith(".uv-python")
@@ -159,7 +174,7 @@ async def test_reconcile_never_rebuilds_a_community_node_mcp(tmp_path):
     (mcp / mis._RUNTIME_MARKER).write_text(json.dumps({"node_major": 22}))
     with patch.object(mis, "_node_major", return_value=24), \
          patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
-        results = await mis.reconcile_mcp_runtimes(mcps, None)
+        results = await mis.reconcile_mcp_runtimes(mcps, None, compute=None)
     assert results == {"node-mcp": "skipped-bundled-node"}
     spawn.assert_not_awaited()
 
@@ -178,7 +193,7 @@ async def test_reconcile_never_builds_a_catalog_python_folder(tmp_path):
     with patch.object(mis, "_uv_venv_pinned", new_callable=AsyncMock), \
          patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock,
                return_value=InstallResult(ok=True, log="ok", version_hash="h")) as inst:
-        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv")
+        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv", compute=None)
 
     assert results == {"custom-py": "ok-py-reconcile", "community-py": "skipped-community-python"}
     inst.assert_awaited_once()
@@ -211,12 +226,10 @@ async def test_npm_rebuild_runs_under_the_installers_environment(tmp_path, monke
     installer's allowlisted environment, never the satellite's own."""
     monkeypatch.setenv("OTO_SATELLITE_PRIVATE", "1")
     mcps, _ = _node_mcp_due_for_rebuild(tmp_path)
-    fake = AsyncMock()
-    fake.communicate = AsyncMock(return_value=(b"ok", None))
-    fake.returncode = 0
+    fake = _finished_process(0, b"ok")
     with patch.object(mis, "_node_major", return_value=24), \
          patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=fake) as spawn:
-        results = await mis.reconcile_mcp_runtimes(mcps, None)
+        results = await mis.reconcile_mcp_runtimes(mcps, None, compute=None)
     assert results == {"node-mcp": "ok-node-rebuild"}
     env = spawn.await_args.kwargs["env"]
     assert env is not None and "OTO_SATELLITE_PRIVATE" not in env
@@ -237,7 +250,7 @@ async def test_a_hung_npm_rebuild_is_killed_and_retried_next_start(tmp_path, mon
     monkeypatch.setattr(mcp_installer, "DEFAULT_INSTALL_TIMEOUT", 1)
     mcps, mcp = _node_mcp_due_for_rebuild(tmp_path)
     with patch.object(mis, "_node_major", return_value=24):
-        results = await asyncio.wait_for(mis.reconcile_mcp_runtimes(mcps, None), 10)
+        results = await asyncio.wait_for(mis.reconcile_mcp_runtimes(mcps, None, compute=None), 10)
     assert results == {"node-mcp": "skipped-node-rebuild-fail"}
     assert json.loads((mcp / mis._RUNTIME_MARKER).read_text())["node_major"] == 22
     for _ in range(40):
@@ -259,7 +272,7 @@ def test_reconcile_ends_with_the_interpreter_prune(tmp_path):
     d = _make_mcp(tmp_path, "community", "pkg", {"name": "pkg", "server": {"runtime": "python"}})
     (d / "venv").mkdir()
     (d / "venv" / "pyvenv.cfg").write_text(f"home = {uvp / 'cpython-3.13.14-linux' / 'bin'}\n")
-    asyncio.run(mis.reconcile_mcp_runtimes(tmp_path, None))
+    asyncio.run(mis.reconcile_mcp_runtimes(tmp_path, None, compute=None))
     assert (uvp / "cpython-3.13.14-linux").is_dir()
     assert not (uvp / "cpython-3.11.9-linux").exists()
 
@@ -304,7 +317,7 @@ async def test_a_failed_rebuild_puts_the_old_venv_back(tmp_path, monkeypatch):
     with patch.object(mis, "_uv_venv_pinned", side_effect=half_made), \
          patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock,
                return_value=InstallResult(ok=False, log="error: offline")):
-        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv")
+        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv", compute=None)
     assert results == {"py-mcp": "failed"}
     assert (mcp / "venv" / "old-file").read_text() == "the old venv"
     assert not list(mcps.glob(".venv-aside-*"))
@@ -319,7 +332,7 @@ async def test_a_rebuild_that_succeeds_drops_the_old_venv(tmp_path, monkeypatch)
     with patch.object(mis, "_uv_venv_pinned", new_callable=AsyncMock), \
          patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock,
                return_value=InstallResult(ok=True, log="ok", version_hash="h")):
-        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv")
+        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv", compute=None)
     assert results == {"py-mcp": "ok-py-reconcile"}
     assert not (mcp / "venv" / "old-file").exists()
     assert not list(mcps.glob(".venv-aside-*"))
@@ -353,6 +366,21 @@ _NO_HEADERS = """  File "<string>", line 294, in <module>
 RequiredDependencyException: The headers or library files could not be found for libheif, a required dependency."""
 
 
+def test_a_failed_installs_cause_masks_a_sign_in_inside_an_address():
+    """The cause leaves this machine for the platform's log, its card and a
+    chat's prompt. A build script that prints its environment, or a tool
+    that names the index it could not reach, never carries the password."""
+    log = ("Resolved 3 packages\n"
+           "error: Failed to fetch `https://builder:s3cr3t-index@index.corp/simple/pkg/`\n"
+           "  Caused by: tunnel through http://builder:s3cr3t-proxy@proxy.corp:3128 refused\n")
+    out = mis.install_failure_cause(log)
+    assert "s3cr3t" not in out and "builder" not in out
+    assert "https://***@index.corp/simple/pkg/" in out and "http://***@proxy.corp:3128" in out
+    # A log with no cause line is cut from its end: masked too.
+    assert mis.install_failure_cause("PIP_INDEX_URL=https://u:s3cr3t@index.corp/simple") == (
+        "PIP_INDEX_URL=https://***@index.corp/simple")
+
+
 @pytest.mark.parametrize("log, cause", [
     (_NO_RUST, "Failed to build `rpds-py==0.30.0` / error: rustc not found / "
                "Caused by: `cargo metadata` exited with an error: cargo not found"),
@@ -383,6 +411,17 @@ def test_a_network_line_leads_the_cause_and_survives_the_cut():
     assert len(out) <= 600 and out.endswith("...")
 
 
+def test_a_build_the_memory_guard_stopped_says_so_first():
+    """The guard writes its sentence into the step's output before the kill:
+    the install's failure is that sentence, ahead of what the build printed
+    (mutation: the sentence is not one of the failure's lasting-never words)."""
+    from satellite.sessions.memory_guard import SENTENCES
+    said = SENTENCES["own"]
+    assert mis.install_failure_cause(f"Collecting x==1\n  Downloading x-1.tar.gz\n\n{said}\n") == said
+    out = mis.install_failure_cause(f"  × Failed to build `x==1`\n  ├─▶ The build backend returned an error\n\n{said}\n")
+    assert out.startswith(said + " / Failed to build")
+
+
 # ── the rebuild's marker and the venvs a stopped rebuild set aside ───────
 
 
@@ -405,7 +444,7 @@ async def test_a_rebuild_is_marked_reconciled_only_on_the_pin(tmp_path, monkeypa
     with patch.object(mis, "_uv_venv_pinned", side_effect=made), \
          patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock,
                return_value=InstallResult(ok=True, log="ok", version_hash="h", venv_python=venv_python)):
-        assert await mis.reconcile_mcp_runtimes(mcps, "/fake/uv") == {"py-mcp": "ok-py-reconcile"}
+        assert await mis.reconcile_mcp_runtimes(mcps, "/fake/uv", compute=None) == {"py-mcp": "ok-py-reconcile"}
     assert (mcp / mis._RUNTIME_MARKER).exists() is marked
 
 
@@ -443,3 +482,109 @@ def test_an_aside_whose_mcp_is_gone_is_dropped(tmp_path):
     (mcps / ".venv-aside-custom-gone-mcp").mkdir(parents=True)
     mis._settle_venv_asides(mcps, sys.version_info[:2])
     assert not list(mcps.glob(".venv-aside-*"))
+
+
+@pytest.mark.asyncio
+async def test_a_compute_machine_rebuilds_a_community_venv_whose_interpreter_is_gone(tmp_path, monkeypatch):
+    """A new image of a compute machine took away the Python a community
+    tool's venv ran on: its start builds the venv again from the manifest's
+    pinned source, every step in the machine's sandbox. A paired computer
+    leaves it alone, as before."""
+    from types import SimpleNamespace
+
+    from satellite.sessions import sandbox_host
+    mcp_dir = _make_mcp(tmp_path, "community", "cat-mcp", {
+        "name": "cat-mcp", "server": {"runtime": "python", "source": "pypi:cat-mcp@1.2.0"}})
+    (mcp_dir / "venv" / "bin").mkdir(parents=True)
+    (mcp_dir / "venv" / "bin" / "python").symlink_to(tmp_path / "gone" / "python3.12")
+    seen = {}
+
+    async def _install(*a, **kw):
+        seen.update(kw, source=a[2])
+        return SimpleNamespace(ok=True, log="", venv_python="3.13")
+    monkeypatch.setattr(sandbox_host, "build_run", lambda cfg: "the-sandboxed-run")
+    compute = SimpleNamespace(mcps_dir=tmp_path, compute=True)
+    with patch("satellite._vendored.mcp_installer.install_mcp", _install):
+        assert await mis.reconcile_mcp_runtimes(tmp_path, "/usr/bin/uv", compute=compute) == {
+            "cat-mcp": "ok-py-community-rebuild"}
+        assert seen["source"] == "pypi:cat-mcp@1.2.0" and seen["run"] == "the-sandboxed-run"
+        seen.clear()
+        assert await mis.reconcile_mcp_runtimes(tmp_path, "/usr/bin/uv", compute=None) == {"cat-mcp": "skipped-community-python"}
+        assert seen == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="the prune is POSIX only")
+async def test_a_reconcile_of_one_category_writes_nothing_outside_it(tmp_path, monkeypatch):
+    """The install's own compute machine reconciles the community folder it
+    keeps. A bundled tool whose venv lags is the platform's to rebuild, a
+    venv set aside beside the categories is not settled, and the prune takes
+    the community folder's interpreters alone. It builds no community tool
+    by itself: a build there runs inside a frame of the platform, which
+    names the proxy and the index, so one whose interpreter is gone is left
+    for the run its sign-in starts."""
+    from types import SimpleNamespace
+
+    from satellite.sessions import sandbox_host
+    custom = _make_mcp(tmp_path, "custom", "py-mcp", {"name": "py-mcp", "server": {"runtime": "python"}})
+    (custom / "requirements.txt").write_text("requests==2.31\n")
+    _write_pyvenv(custom / "venv", sys.version_info[0], sys.version_info[1] - 1)
+    (tmp_path / ".venv-aside-custom-gone-mcp").mkdir()
+    for folder in (tmp_path, tmp_path / "community"):
+        for name in ("cpython-3.13.14-linux", "cpython-3.9.1-linux"):
+            (folder / ".uv-python" / name / "bin").mkdir(parents=True)
+    used = tmp_path / "community" / ".uv-python" / "cpython-3.13.14-linux"
+    kept = _make_mcp(tmp_path, "community", "kept", {"name": "kept", "server": {"runtime": "python"}})
+    (kept / "venv").mkdir()
+    (kept / "venv" / "pyvenv.cfg").write_text(f"home = {used / 'bin'}\n")
+    gone = _make_mcp(tmp_path, "community", "cat-mcp", {
+        "name": "cat-mcp", "server": {"runtime": "python", "source": "pypi:cat-mcp@1.2.0"}})
+    (gone / "venv" / "bin").mkdir(parents=True)
+    (gone / "venv" / "bin" / "python").symlink_to(tmp_path / "gone" / "python3.12")
+    built: list[Path] = []
+
+    async def _install(mcp_dir, *a, **kw):
+        built.append(Path(mcp_dir))
+        return SimpleNamespace(ok=True, log="", venv_python="3.13")
+    monkeypatch.setattr(sandbox_host, "build_run", lambda cfg: "the-sandboxed-run")
+    compute = SimpleNamespace(mcps_dir=tmp_path, compute=True, own_tools=True)
+    with patch.object(mis, "_uv_venv_pinned", new_callable=AsyncMock) as pinned, \
+         patch("satellite._vendored.mcp_installer.install_mcp", _install):
+        results = await mis.reconcile_mcp_runtimes(tmp_path, "/usr/bin/uv", compute=compute,
+                                                   categories=mis.kept_categories(compute))
+    assert results == {"cat-mcp": "left-to-the-platform", "kept": "skipped-community-python"}
+    assert built == [] and not pinned.called
+    assert mis.environment_missing(gone, {"server": {"runtime": "python", "source": "pypi:cat-mcp@1.2.0"}})
+    assert (custom / "venv" / "pyvenv.cfg").is_file()
+    assert (tmp_path / ".venv-aside-custom-gone-mcp").is_dir()
+    assert sorted(p.name for p in (tmp_path / ".uv-python").iterdir()) == [
+        "cpython-3.13.14-linux", "cpython-3.9.1-linux"]
+    assert [p.name for p in (tmp_path / "community" / ".uv-python").iterdir()] == ["cpython-3.13.14-linux"]
+    # Every other machine reconciles every category, as before.
+    assert mis.kept_categories(SimpleNamespace(compute=True, own_copy=True)) is None
+    assert mis.kept_categories(SimpleNamespace(compute=False)) is None
+
+
+def test_a_pipe_a_build_left_never_holds_the_satellites_start(tmp_path):
+    """The start-time reconcile reads every bundled venv's config and the
+    prune walks every venv: a pipe left as a config holds neither, so the
+    machine still signs in."""
+    import os
+    import threading
+    mcps = tmp_path / "mcps"
+    mcp = _make_mcp(mcps, "core", "py-mcp", {"name": "py-mcp", "server": {"runtime": "python"}})
+    (mcp / "requirements.txt").write_text("mcp\n")
+    (mcp / "venv" / "lib").mkdir(parents=True)
+    os.mkfifo(mcp / "venv" / "pyvenv.cfg")
+    os.mkfifo(mcp / "venv" / "lib" / "pyvenv.cfg")
+    (mcps / ".uv-python" / "cpython-3.13").mkdir(parents=True)
+    t = threading.Thread(target=lambda: asyncio.run(mis.reconcile_mcp_runtimes(mcps, None, compute=None)), daemon=True)
+    t.start()
+    t.join(5)
+    held = t.is_alive()
+    if held:
+        for cfg in (mcp / "venv" / "pyvenv.cfg", mcp / "venv" / "lib" / "pyvenv.cfg"):
+            with contextlib.suppress(OSError):
+                os.close(os.open(cfg, os.O_WRONLY | os.O_NONBLOCK))
+        t.join(5)
+    assert not held

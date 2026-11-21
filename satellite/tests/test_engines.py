@@ -37,7 +37,10 @@ def test_the_frozen_rows():
     assert (codex.config_dir, codex.credential_kind, codex.credential_filename) == (
         ".codex", "codex", "auth.json")
     assert (codex.conf_section, codex.conf_key) == ("codex", "codex_bin")
-    assert codex.turn_replay is False and codex.revives_dead_process is True
+    assert codex.turn_replay is True and codex.revives_dead_process is True
+    assert (claude.credential_payload_key, codex.credential_payload_key) == ("credentials_json", "auth_json")
+    assert (claude.replayed_by_default, codex.replayed_by_default) == (True, False)
+    assert engines.DEFAULT_REPLAYS == {"claude-code-cli"}
 
 
 def test_the_lookup_tables_cover_exactly_the_rows():

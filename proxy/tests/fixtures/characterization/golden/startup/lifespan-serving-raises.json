@@ -1,0 +1,19 @@
+{
+ "order": [
+  "_boot_process",
+  "_boot_database",
+  "_boot_registrations",
+  "_boot_mcps",
+  "_boot_subscriptions",
+  "_boot_services",
+  {
+   "args": [
+    "app",
+    "executor"
+   ],
+   "step": "_boot_arm"
+  },
+  "serving"
+ ],
+ "raised": "while serving"
+}

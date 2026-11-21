@@ -13,6 +13,14 @@ import config as app_config
 from core.layers.direct import builtins as B, session as session_mod, tool_catalog as tc
 from core.layers.direct.tool_catalog import ToolCatalog
 from core.sandbox.sandbox import SandboxConfig
+from tests.execution import direct_program
+
+
+@pytest.fixture(autouse=True)
+def _file_program(monkeypatch):
+    """The file program runs in this process, on the test's own tree."""
+    direct_program.install(monkeypatch)
+
 
 
 def _tool(name, desc="", props=None):
@@ -193,10 +201,11 @@ async def test_tool_search_builtin_loads_and_reports(monkeypatch, tmp_path):
 
     # With the guide materialized in the session's skills dir, the result
     # points at it (pointer only — never the body).
-    claude_dir = tmp_path / ".claude"
+    # The store sits in the agent's folder, where the skills are read beneath it.
+    monkeypatch.setattr(app_config, "AGENTS_DIR", tmp_path / "agents")
+    claude_dir = tmp_path / "agents" / "pa" / ".claude"
     (claude_dir / "skills" / "task-scheduling-guide").mkdir(parents=True)
     (claude_dir / "skills" / "task-scheduling-guide" / "SKILL.md").write_text("---\nname: x\n---\nBODY")
-    (tmp_path / "agents").mkdir()
     (tmp_path / "mcps").mkdir()
     s.sandbox_cfg = SandboxConfig(
         role="manager", username="", agent_name="pa", is_admin_agent=False,
@@ -216,13 +225,13 @@ async def test_skill_loads_the_deferred_tools_its_guide_names(monkeypatch, tmp_p
     to call them (the live failure: a local model read `write_xlsx` in the
     guide, had no such tool, and substituted the ones it had)."""
     s = _session(monkeypatch, [MEM, SCHED, LIST, NOTIF])
-    claude_dir = tmp_path / ".claude"
+    monkeypatch.setattr(app_config, "AGENTS_DIR", tmp_path / "agents")
+    claude_dir = tmp_path / "agents" / "pa" / ".claude"
     (claude_dir / "skills" / "task-scheduling-guide").mkdir(parents=True)
     (claude_dir / "skills" / "task-scheduling-guide" / "SKILL.md").write_text(
         "---\nname: task-scheduling-guide\n---\n"
         "Use `create_scheduled_task` for cron and `list_tasks` to read back.\n"
     )
-    (tmp_path / "agents").mkdir()
     (tmp_path / "mcps").mkdir()
     s.sandbox_cfg = SandboxConfig(
         role="manager", username="", agent_name="pa", is_admin_agent=False,
@@ -321,6 +330,24 @@ def test_a_resumed_worker_rebuilds_every_round_and_skips_this_rounds_prompt(monk
         {"role": "assistant", "content": "plan v2"},
         {"role": "user", "content": "a person's note"},
     ]
+
+
+def test_a_healed_call_rebuilds_its_own_chat_less_this_turn(monkeypatch):
+    """A call has no task run: the skip falls back to the chat it names."""
+    from core.layers.direct.layer import _rebuild_history_from_db
+    from core.layers.direct.session import DirectSession
+    s = DirectSession.__new__(DirectSession)
+    s.model, s.messages, s.catalog = "m", [], None
+    rows = [{"id": 1, "role": "user", "content": "my name is Maria"},
+            {"id": 2, "role": "assistant", "content": "hello Maria"},
+            {"id": 3, "role": "user", "content": "still there?"}]
+    monkeypatch.setattr("storage.database.round_chats_of_session", lambda sid: [])
+    monkeypatch.setattr("storage.database.get_chat", lambda cid: {"id": cid, "last_turn_aborted": False})
+    monkeypatch.setattr("storage.database.get_chat_messages", lambda cid: rows)
+    monkeypatch.setattr("core.layers.direct.layer.app_config.get_model_context_window", lambda m: 100_000)
+    _rebuild_history_from_db(s, "s-call", chat_id="phone-1", skip_row=3)
+    assert s.messages == [{"role": "user", "content": "my name is Maria"},
+                          {"role": "assistant", "content": "hello Maria"}]
 
 
 def test_the_rounds_of_a_session_are_its_runs_chats_in_start_order(temp_db):

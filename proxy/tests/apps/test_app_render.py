@@ -268,3 +268,70 @@ def test_working_tree_renders_take_live_data_only_when_its_code_would_go_live_un
     assert asyncio.run(app_render.render_live(row, approved=True)).seeded is True
     (src / "app.json").write_text(json.dumps({"title": "Board"}))
     assert asyncio.run(app_render.render_working_tree(row, src, approved=True)).seeded is True
+
+
+def test_a_working_tree_that_adds_a_server_renders_on_empty_data_with_no_site(renderer, _tree, monkeypatch):
+    """check_app and screenshot_app on a working tree whose server the live
+    release has not: code a person has not approved, so empty data and
+    none of the approved sites for its check instance."""
+    from types import SimpleNamespace
+    row, src = _static_app(_tree)
+    out = asyncio.run(app_deploy.deploy_folder(AGENT, "", None, "board", src, "workspace/apps/board"))
+    assert out["status"] == "ok", out
+    row = task_store.get_app(row["id"])
+    _live_db(row)
+    assert asyncio.run(app_render.render_working_tree(row, src, approved=True)).seeded is True
+    hosts: list = []
+
+    async def start(row, name=app_supervisor.LIVE, *, release_dir=None, data_dir=None, allow_hosts=None):
+        hosts.append(allow_hosts)
+        return SimpleNamespace(state="up")
+
+    async def stop(*a, **kw):
+        return None
+
+    monkeypatch.setattr(app_supervisor, "start", start)
+    monkeypatch.setattr(app_supervisor, "stop", stop)
+    (src / "server").mkdir()
+    (src / "server" / "index.ts").write_text("Bun.serve({ fetch: () => new Response('ok') });\n")
+    report = asyncio.run(app_render.render_working_tree(row, src, approved=True))
+    assert report.seeded is False and report.egress is False and hosts == [[]], (report, hosts)
+
+
+def test_a_working_tree_is_judged_on_the_row_as_it_stands_under_the_lock(renderer, _tree, monkeypatch):
+    """check_app is handed a row read before a person's Roll back took the
+    live server away: the render reads the row again under the lock, so the
+    working tree's server counts as arriving, with no seed and no site."""
+    from types import SimpleNamespace
+    hosts: list = []
+
+    async def start(row, name=app_supervisor.LIVE, *, release_dir=None, data_dir=None, allow_hosts=None):
+        if name == app_supervisor.CHECK:
+            hosts.append(allow_hosts)
+        return SimpleNamespace(state="up")
+
+    async def stop(*a, **kw):
+        return None
+
+    monkeypatch.setattr(app_supervisor, "start", start)
+    monkeypatch.setattr(app_supervisor, "stop", stop)
+    row, src = _static_app(_tree)
+
+    async def releases_one_and_two() -> dict:
+        one = await app_deploy.deploy_folder(AGENT, "", None, "board", src, "workspace/apps/board")
+        assert one["status"] == "ok", one
+        (src / "server").mkdir()
+        (src / "server" / "index.ts").write_text("Bun.serve({ fetch: () => new Response('ok') });\n")
+        two = await app_deploy.deploy_folder(AGENT, "", None, "board", src, "workspace/apps/board")
+        assert two["status"] == "pending approval", two
+        await app_deploy.approve_pending(task_store.get_app(row["id"]), "alice-sub")
+        stale = task_store.get_app(row["id"])
+        await app_deploy.rollback_folder(stale, by_person=True)
+        return stale
+
+    stale = asyncio.run(releases_one_and_two())
+    assert releases.current_number(task_store.get_app(row["id"])) == 1
+    _live_db(task_store.get_app(row["id"]))
+    hosts.clear()
+    report = asyncio.run(app_render.render_working_tree(stale, src, approved=True))
+    assert report.seeded is False and report.egress is False and hosts == [[]], (report, hosts)

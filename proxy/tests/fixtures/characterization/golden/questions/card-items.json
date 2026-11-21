@@ -1,0 +1,100 @@
+{
+ "journaled": {
+  "queued": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "options": [
+        "a",
+        "b"
+       ],
+       "question": "Pick one"
+      }
+     ]
+    },
+    "tool_name": "AskUserQuestion"
+   }
+  ],
+  "rows": [],
+  "viewer": []
+ },
+ "no_chat_other_queue": {
+  "own_queue": [],
+  "pings": [],
+  "route_queue": [
+   {
+    "event_type": "question",
+    "tool_input": {
+     "questions": [
+      {
+       "options": [
+        "a",
+        "b"
+       ],
+       "question": "Pick one"
+      }
+     ]
+    },
+    "tool_name": "request_user_input_async"
+   }
+  ],
+  "viewer": []
+ },
+ "shown_between_turns": {
+  "pings": [
+   {
+    "body": "Waiting for your answer",
+    "chat_id": "chat-q-card",
+    "title": "questions-agent needs your input",
+    "user_sub": "user-admin"
+   }
+  ],
+  "queued": [],
+  "rows": [
+   {
+    "content": "",
+    "event_data": {
+     "tool_input": {
+      "questions": [
+       {
+        "options": [
+         "a",
+         "b"
+        ],
+        "question": "Pick one"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    "event_type": "question",
+    "role": "event"
+   }
+  ],
+  "viewer": [
+   {
+    "chat_id": "chat-q-card",
+    "frame": {
+     "chat_id": "chat-q-card",
+     "tool_input": {
+      "questions": [
+       {
+        "options": [
+         "a",
+         "b"
+        ],
+        "question": "Pick one"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    "type": "chat_ui_frame"
+   }
+  ]
+ }
+}

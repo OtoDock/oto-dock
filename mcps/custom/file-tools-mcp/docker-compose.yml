@@ -94,6 +94,7 @@ services:
         target: /etc/coolwsd/proof_key
         read_only: true
         volume:
+          nocopy: true
           subpath: proof_key
       # Collabora's free edition shows an "Explore the new" welcome once per
       # browser, and no setting turns it off short of its home mode, which

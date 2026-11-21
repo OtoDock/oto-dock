@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.1/mcps/manifest.schema.json",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v2.0.0/mcps/manifest.schema.json",
   "title": "OtoDock MCP package manifest",
   "description": "The catalog contract for the manifest.json of an OtoDock MCP package (OtoDock is a fair source project). It accepts every manifest the platform's parser (services/mcp/mcp_manifest_parse.py) and install gate (services/community/community_installer.py) accept, refuses what they refuse where JSON Schema can say it, and adds the community catalog's own rules: a git+ source pins a full commit, a remote source names its endpoint and a non-stdio transport. Unknown keys are allowed at the top level and in every block the parser leaves open: a catalog is additive.",
   "$comment": "Custom annotation keywords. x-otodock-since: the platform release that first reads the field; an entry that gives the field a value (not null, empty or false) needs platform_min_version at least that release. x-otodock-floors (on server.source): a list of {pattern, since}; a value matching the pattern needs that release. Validators ignore both keywords.",
@@ -102,6 +102,10 @@
       "type": "boolean",
       "description": "Default state of the _network_access toggle (true)."
     },
+    "network_exit": {
+      "type": "boolean",
+      "description": "A Docker MCP whose container closes its own local network when the platform asks (OTODOCK_LOCAL_NETWORK=closed); the _network_access toggle is its switch (false)."
+    },
     "data_dirs": {
       "type": "object",
       "additionalProperties": { "type": "string" }
@@ -149,7 +153,7 @@
     },
     "placement": {
       "enum": ["any", "satellite_only"],
-      "description": "Device-local MCP class. Not for community packages."
+      "description": "Device-local MCP class: satellite_only keeps the MCP on paired computers. A community app connector sets it."
     },
     "remote_policy": {
       "enum": ["any", "admin_paired_only"]
@@ -159,7 +163,7 @@
     },
     "device_capability": {
       "enum": ["computer", "browser", "app", null],
-      "description": "Marks a device-control MCP. Not for community packages."
+      "description": "Marks a device-control MCP: it loads only where the machine's owner granted this capability. A community app connector sets app."
     },
     "companion_app": {
       "$ref": "#/$defs/companionApp"
@@ -539,6 +543,11 @@
         "health_endpoint": {
           "type": "string"
         },
+        "busy_endpoint": {
+          "type": "string",
+          "pattern": "^/[A-Za-z0-9_\\-/.]{0,199}$",
+          "description": "A Docker tool's path that answers GET with {\"busy\": true} while it works on a job. The platform keeps the tool awake while it says so, for at most its tool_timeout_sec (30 minutes when none), then puts it to sleep as usual. A platform that does not read the key ignores it."
+        },
         "url_template": {
           "type": "string",
           "description": "A container's base URL (http://${docker_mcp_host}:${port}) or a remote MCP's endpoint (https://mcp.vendor.com/mcp), whose host is its identity."
@@ -571,7 +580,11 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 3600,
-          "description": "Seconds Codex gives one tool call of this server before it fails the call (Codex's own default is 60). For a server whose tools run for minutes: a media generation, a document conversion, an install. Claude Code keeps its own limit; a platform that does not read the key ignores it."
+          "description": "Seconds one tool call of this server may take before the engine fails the call. Without it Codex allows 60 seconds and Claude Code 5 minutes of silence over HTTP. For a server whose tools run for minutes: a media generation, a document conversion, an install. A platform that does not read the key ignores it."
+        },
+        "starts": {
+          "enum": ["first_call", "with_chat", "with_platform"],
+          "description": "When a session starts the server's program. first_call (the default): the platform answers the engine's questions about its tools from the answers it saved and starts the program when the agent first calls one of them; a Docker tool's container stops after a quiet spell and starts again at its next call. with_chat: the program starts with the chat, for a server whose tool list reads live data (the platform's state, a vendor) that a saved answer could not repeat. with_platform: a Docker tool's container runs while the platform runs. A platform that does not read the key starts every program with the chat."
         }
       },
       "allOf": [
@@ -647,6 +660,10 @@
         "api_key_header": {
           "x-otodock-since": "1.7.1",
           "$ref": "#/$defs/apiKeyHeader"
+        },
+        "exit": {
+          "x-otodock-since": "2.0.0",
+          "$ref": "#/$defs/exit"
         }
       }
     },
@@ -964,6 +981,52 @@
           "type": "array",
           "minItems": 1,
           "items": { "$ref": "#/$defs/hostPattern" }
+        }
+      }
+    },
+    "exit": {
+      "type": ["array", "null"],
+      "description": "The secrets the tool sends in a header of its own toward declared hosts (mcp_manifest_blocks._validate_exit). The credential exit may hand the tool a placeholder for each key and write prefix + the value in the header on the way out; the hosts join the MCP's allowlist rows under the manifest's name by the provenance rule (a catalog or first-party literal host applies by itself, a wildcard or a ZIP's waits for the admin's Allow). Never beside credentials.oauth.bearer_required. A platform before 2.0.0 loads the MCP with the value in its environment as before.",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/exitEntry" }
+    },
+    "exitEntry": {
+      "type": "object",
+      "required": ["key", "header", "hosts"],
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/envVarName",
+          "description": "A secret the platform delivers: an env-delivered instances.fields key with secret true, a credentials.fields key with input_type password (credentials.type per_user or infra), a credentials.oauth.mcp_env_injection name, or OTODOCK_RELAY_TOKEN when hosted.api_key_relay is declared. No two entries share a key."
+        },
+        "header": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,63}$",
+          "not": {
+            "pattern": "^(?:[Cc][Oo][Oo][Kk][Ii][Ee]|[Hh][Oo][Ss][Tt]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-.*|[Aa][Cc][Cc][Ee][Pp][Tt].*|[Mm][Cc][Pp]-.*|[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-.*|[Xx]-[Rr][Ee][Aa][Ll]-[Ii][Pp]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-.*)$"
+          },
+          "description": "The HTTP header the tool sends the secret in; never one the platform owns or strips. Authorization is allowed (vendors read keys from it)."
+        },
+        "prefix": {
+          "type": "string",
+          "maxLength": 32,
+          "pattern": "^[ -~]*$",
+          "description": "What the tool writes before the value in that header (\"Bearer \", \"Key \"); empty by default. Printable ASCII, never CR or LF."
+        },
+        "streams": {
+          "x-otodock-since": "2.0.0",
+          "type": "boolean",
+          "description": "True when the tool sends a request body past the exit's 16 MiB cap in a request that carries this secret (a picture or a file sent inline): the body then passes as it arrives. False by default."
+        },
+        "hosts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(?:\\*\\.)?[A-Za-z0-9](?:[-A-Za-z0-9.])*$",
+            "description": "A literal hostname, or *. before a domain of at least two labels (*.fal.run, not *.com); never an address, localhost or a .localhost name."
+          }
         }
       }
     },
@@ -1391,7 +1454,7 @@
     },
     "pathEnvEntry": {
       "type": "object",
-      "description": "Either {role, subpath} (one path) or {values: [{role, subpath}], join} (joined paths). Roles: workspace, user_root, shared_workspace, config, knowledge_dir, credentials_dir (subpath required). Invalid entries are skipped at parse, not refused.",
+      "description": "Either {role, subpath} (one path) or {values: [{role, subpath}], join} (joined paths). Roles: workspace, user_root, shared_workspace, config, knowledge_dir. Invalid entries are skipped at parse, not refused.",
       "properties": {
         "role": { "type": "string" },
         "subpath": { "type": "string" },
@@ -1713,7 +1776,7 @@
     },
     "companionApp": {
       "type": ["object", "null"],
-      "description": "App-connector block (a running local program). Not for community packages.",
+      "description": "App-connector block: the local program the server reaches. The platform checks its shape and never starts the program.",
       "properties": {
         "program": { "type": "string" },
         "connect": {

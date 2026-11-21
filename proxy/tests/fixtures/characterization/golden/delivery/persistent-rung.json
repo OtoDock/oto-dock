@@ -1,0 +1,77 @@
+{
+ "a pipe that breaks closes it": {
+  "answer": null,
+  "layer": [
+   [
+    "is_session_alive",
+    "s-rung"
+   ],
+   [
+    "send_message",
+    "s-rung",
+    "WAKE"
+   ],
+   [
+    "close_session",
+    "s-rung"
+   ]
+  ]
+ },
+ "alive with no chat, the text comes back": {
+  "answer": "ECHO TEXT",
+  "layer": [
+   [
+    "is_session_alive",
+    "s-rung"
+   ],
+   [
+    "send_message",
+    "s-rung",
+    "WAKE"
+   ]
+  ]
+ },
+ "alive, an echo through the pump": {
+  "answer": "",
+  "layer": [
+   [
+    "is_session_alive",
+    "s-rung"
+   ],
+   [
+    "send_message",
+    "s-rung",
+    "WAKE"
+   ]
+  ]
+ },
+ "its last-active moves": {
+  "answer": "ECHO TEXT",
+  "layer": [
+   [
+    "is_session_alive",
+    "s-tracked"
+   ],
+   [
+    "send_message",
+    "s-tracked",
+    "WAKE"
+   ]
+  ]
+ },
+ "last_active": "<stamp>",
+ "layers_asked_when_locked": [],
+ "locked on a colleague's computer: no layer asked": {
+  "answer": null,
+  "layer": []
+ },
+ "the session is dead": {
+  "answer": null,
+  "layer": [
+   [
+    "is_session_alive",
+    "s-rung"
+   ]
+  ]
+ }
+}

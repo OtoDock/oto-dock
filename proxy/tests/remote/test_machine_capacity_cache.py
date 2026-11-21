@@ -79,3 +79,23 @@ async def test_fail_open_when_row_missing(stores):
     assert cm.machine_at_capacity("m1") is False   # no override, no recommendation
     await cm.deregister("m1", expected=conn)
     assert await cm.drain_persists()
+
+
+@pytest.mark.asyncio
+async def test_the_session_count_is_the_sign_ins_until_a_heartbeat_and_unknown_without_one(stores):
+    """The first heartbeat comes about 20 s after a sign-in. The sign-in's own
+    count holds until then, and a machine that sent none has no known count:
+    never 0, which the update confirm would read as nothing to stop."""
+    cm = SatelliteConnectionManager()
+    conn = await cm.register("m1", _FakeWS(), {"active_sessions": 3})
+    (row,) = cm.concurrency_stats()
+    assert row["active_sessions"] == 3
+    await cm.deregister("m1", expected=conn)
+    conn = await cm.register("m1", _FakeWS(), {"os": "linux"})
+    (row,) = cm.concurrency_stats()
+    assert row["active_sessions"] is None
+    await cm.handle_message("m1", {"type": "heartbeat", "active_sessions": 0})
+    (row,) = cm.concurrency_stats()
+    assert row["active_sessions"] == 0
+    await cm.deregister("m1", expected=conn)
+    assert await cm.drain_persists()

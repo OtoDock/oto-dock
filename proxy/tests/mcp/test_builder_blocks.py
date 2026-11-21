@@ -13,6 +13,7 @@ Three layers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import json
 import time
@@ -20,7 +21,12 @@ import uuid
 
 import pytest
 
-from services.mcp import builder_executor, dynamic_context, mcp_registry
+from services.mcp import (
+    builder_executor,
+    dynamic_context,
+    mcp_manifest_store,
+    mcp_registry,
+)
 from services.mcp.mcp_registry import (
     AgentContextBlock,
     AgentContextBuilder,
@@ -131,9 +137,9 @@ def _make_manifest(name, *, transport="stdio", agent_context=()):
 
 @pytest.fixture
 def reset_manifests():
-    saved = dict(mcp_registry._manifests)
+    saved = dict(mcp_manifest_store._manifests)
     yield
-    mcp_registry._manifests = saved
+    mcp_manifest_store._manifests = saved
 
 
 class TestBuilderTransportValidation:
@@ -143,10 +149,10 @@ class TestBuilderTransportValidation:
             builder=AgentContextBuilder(tool="mcp__nonexistent__foo", args={}),
         )
         owner = _make_manifest("owner", agent_context=[block])
-        mcp_registry._manifests = {"owner": owner}
+        mcp_manifest_store._manifests = {"owner": owner}
         mcp_registry._validate_builder_block_transports()
         # Block dropped — manifest stays.
-        assert mcp_registry._manifests["owner"].agent_context == []
+        assert mcp_manifest_store._manifests["owner"].agent_context == []
 
     def test_drops_block_when_target_mcp_is_stdio(self, reset_manifests):
         # Stdio target — rejected at post-load.
@@ -156,9 +162,9 @@ class TestBuilderTransportValidation:
         )
         owner = _make_manifest("owner", agent_context=[block])
         target = _make_manifest("stdio-mcp", transport="stdio")
-        mcp_registry._manifests = {"owner": owner, "stdio-mcp": target}
+        mcp_manifest_store._manifests = {"owner": owner, "stdio-mcp": target}
         mcp_registry._validate_builder_block_transports()
-        assert mcp_registry._manifests["owner"].agent_context == []
+        assert mcp_manifest_store._manifests["owner"].agent_context == []
 
     def test_keeps_block_when_target_is_http(self, reset_manifests):
         block = AgentContextBlock(
@@ -167,17 +173,17 @@ class TestBuilderTransportValidation:
         )
         owner = _make_manifest("owner", agent_context=[block])
         target = _make_manifest("http-mcp", transport="http")
-        mcp_registry._manifests = {"owner": owner, "http-mcp": target}
+        mcp_manifest_store._manifests = {"owner": owner, "http-mcp": target}
         mcp_registry._validate_builder_block_transports()
-        assert len(mcp_registry._manifests["owner"].agent_context) == 1
+        assert len(mcp_manifest_store._manifests["owner"].agent_context) == 1
 
     def test_template_only_blocks_pass_through(self, reset_manifests):
         # No builder → no transport check applies.
         block = AgentContextBlock(template="hi", builder=None)
         owner = _make_manifest("owner", agent_context=[block])
-        mcp_registry._manifests = {"owner": owner}
+        mcp_manifest_store._manifests = {"owner": owner}
         mcp_registry._validate_builder_block_transports()
-        assert len(mcp_registry._manifests["owner"].agent_context) == 1
+        assert len(mcp_manifest_store._manifests["owner"].agent_context) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +225,7 @@ def _register_mock_as_mcp(handle, slug):
         skills=[],
         agent_context=[],
     )
-    mcp_registry._manifests[slug] = manifest
+    mcp_manifest_store._manifests[slug] = manifest
 
 
 @pytest.mark.asyncio
@@ -247,6 +253,76 @@ class TestBuilderExecutor:
             mcp_name="caller-mcp", agent_name="some-agent",
         )
         assert rendered == "Hi ALICE (pro)"
+
+    async def test_a_docker_tool_is_in_use_before_its_wake_and_until_the_call_ends(
+        self, mock_mcp, reset_manifests, monkeypatch,
+    ):
+        """No sweep can put the tool to sleep between its wake and the
+        builder's call: it is held from before ``ready`` to the call's end."""
+        from urllib.parse import urlsplit
+
+        from core.credentials.mcp_gateway import CONTAINER, GatewayCredential
+        from services.containers import door, state
+        from services.mcp import mcp_registry
+        slug = f"mock-{uuid.uuid4().hex[:6]}"
+        _register_mock_as_mcp(mock_mcp, slug)
+        parts = urlsplit(mock_mcp.mcp_url)
+        cred = GatewayCredential(upstream=f"{parts.scheme}://{parts.netloc}", path=parts.path,
+                                 allowlist_key="", proxy_local=True, manifest=slug, kind=CONTAINER)
+        monkeypatch.setattr(mcp_registry, "gateway_entry", lambda *a, **k: (cred, None))
+        state.reset_for_tests()
+        seen: list[bool] = []
+
+        async def ready(manifest, **_kw):
+            seen.append(state.in_use(manifest.name))
+            return ""
+        monkeypatch.setattr(door, "ready", ready)
+
+        async def lookup(name: str) -> str:
+            seen.append(state.in_use(slug))
+            return json.dumps({"name": name.upper()})
+        mock_mcp.register("lookup", lookup, schema={
+            "type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]})
+        rendered = await builder_executor.execute_builder(
+            block=_block("Hi ${result.name}", args={"name": "ada"}, tool=f"mcp__{slug}__lookup"),
+            tokens={}, trigger_payload=None, mcp_name="caller-mcp", agent_name="some-agent",
+        )
+        assert rendered == "Hi ADA"
+        assert seen == [True, True]
+        assert not state.in_use(slug)
+
+    async def test_a_docker_tool_whose_sign_in_is_refused_is_never_woken(
+        self, mock_mcp, reset_manifests, monkeypatch,
+    ):
+        """The gateway's order: the sign-in first; a refused one holds and
+        wakes nothing."""
+        from urllib.parse import urlsplit
+
+        from core.credentials import mcp_gateway
+        from core.credentials.mcp_gateway import CONTAINER, GatewayCredential
+        from services.containers import door, state
+        from services.mcp import mcp_registry
+        slug = f"mock-{uuid.uuid4().hex[:6]}"
+        _register_mock_as_mcp(mock_mcp, slug)
+        parts = urlsplit(mock_mcp.mcp_url)
+        cred = GatewayCredential(upstream=f"{parts.scheme}://{parts.netloc}", path=parts.path,
+                                 allowlist_key="x", value="tok", proxy_local=True, manifest=slug, kind=CONTAINER)
+        monkeypatch.setattr(mcp_registry, "gateway_entry", lambda *a, **k: (cred, None))
+        monkeypatch.setattr(mcp_gateway, "resolve_credential",
+                            lambda c: mcp_gateway.Refusal("needs_reconnect", "Reconnect the account."))
+        state.reset_for_tests()
+        touched: list[str] = []
+
+        async def ready(manifest, **_kw):
+            touched.append("ready")
+            return ""
+        monkeypatch.setattr(door, "ready", ready)
+        monkeypatch.setattr(door, "hold", lambda m: touched.append("hold") or contextlib.nullcontext())
+        rendered = await builder_executor.execute_builder(
+            block=_block("Hi ${result.name}", args={"name": "ada"}, tool=f"mcp__{slug}__lookup"),
+            tokens={}, trigger_payload=None, mcp_name="caller-mcp", agent_name="some-agent",
+        )
+        assert rendered is None and touched == []
 
     async def test_substitutes_trigger_tokens_in_args(
         self, mock_mcp, reset_manifests,
@@ -409,7 +485,7 @@ class TestBuilderExecutor:
             env={}, agent_env={}, exclude_from=[], skills=[],
             agent_context=[],
         )
-        mcp_registry._manifests["stdio-target"] = stdio
+        mcp_manifest_store._manifests["stdio-target"] = stdio
         block = _block(
             "x ${result.name}", args={},
             tool="mcp__stdio-target__foo",
@@ -482,7 +558,7 @@ class TestBuilderParallelEvaluation:
             config=[], env={}, agent_env={}, exclude_from=[], skills=[],
             agent_context=[block_a, block_b],
         )
-        mcp_registry._manifests[owner_slug] = owner
+        mcp_manifest_store._manifests[owner_slug] = owner
 
         # Stub out the token-map builder so it doesn't try to load
         # nonexistent agent / service-account rows from the DB.
@@ -554,7 +630,7 @@ async def test_a_header_style_key_builder_runs_with_the_resolved_key(
 
     slug = f"mock-{uuid.uuid4().hex[:6]}"
     _register_mock_as_mcp(mock_mcp, slug)
-    m = mcp_registry._manifests[slug]
+    m = mcp_manifest_store._manifests[slug]
     m.credentials = CredentialConfig(type="per_user", api_key_header={
         "name": "X-Test-Key", "value_from": "TEST_KEY", "proposed_hosts": ["127.0.0.1"],
     })
@@ -577,6 +653,9 @@ async def test_a_header_style_key_builder_runs_with_the_resolved_key(
     monkeypatch.setattr(deployment, "is_proxy_local_mcp_host", lambda host, manifest: False)
     monkeypatch.setattr(bearer_allowlist, "is_host_allowed", lambda key, host: True)
     monkeypatch.setattr(mcp_gateway, "_egress_refusal", lambda upstream: None)
+    # The mock "vendor" listens on loopback, which the dial's own check
+    # refuses as the gateway's would (``test_the_builders_dial_policy``).
+    monkeypatch.setattr(builder_executor, "_dial_policy", lambda *a: None)
     mcp_gateway.forget_memos()
 
     rendered = await builder_executor.execute_builder(
@@ -605,7 +684,7 @@ async def test_a_header_style_key_builder_reads_an_env_delivered_instance_field(
 
     slug = f"mock-{uuid.uuid4().hex[:6]}"
     _register_mock_as_mcp(mock_mcp, slug)
-    m = mcp_registry._manifests[slug]
+    m = mcp_manifest_store._manifests[slug]
     m.credentials = CredentialConfig(type="none", api_key_header={
         "name": "X-Test-Key", "value_from": "INST_KEY", "proposed_hosts": ["127.0.0.1"],
     })
@@ -625,6 +704,9 @@ async def test_a_header_style_key_builder_reads_an_env_delivered_instance_field(
     monkeypatch.setattr(deployment, "is_proxy_local_mcp_host", lambda host, manifest: False)
     monkeypatch.setattr(bearer_allowlist, "is_host_allowed", lambda key, host: True)
     monkeypatch.setattr(mcp_gateway, "_egress_refusal", lambda upstream: None)
+    # The mock "vendor" listens on loopback, which the dial's own check
+    # refuses as the gateway's would (``test_the_builders_dial_policy``).
+    monkeypatch.setattr(builder_executor, "_dial_policy", lambda *a: None)
     mcp_gateway.forget_memos()
 
     rendered = await builder_executor.execute_builder(
@@ -647,10 +729,27 @@ async def test_a_builder_cancelled_on_its_own_renders_nothing(reset_manifests, m
     monkeypatch.setattr(builder_executor, "execute_builder", _execute)
     monkeypatch.setattr(dynamic_context, "_build_token_map", lambda *a, **kw: {})
     owner = f"owner-{uuid.uuid4().hex[:6]}"
-    mcp_registry._manifests[owner] = _make_manifest(owner, agent_context=[
+    mcp_manifest_store._manifests[owner] = _make_manifest(owner, agent_context=[
         _block("x", tool="mcp__other__gone"), _block("y", tool="mcp__other__kept"),
     ])
     rendered = await dynamic_context._resolve_manifest_blocks(
         owner, "test", user_sub="", user_role="", session_ctx={},
     )
     assert rendered == ["kept"]
+
+
+def test_the_builders_dial_policy(monkeypatch):
+    """A sidecar keeps the SDK's client; a credentialed vendor is dialled on
+    the gateway's rule; any other remote MCP on ``admin_host``."""
+    from core.config import deployment
+    from services.infra import pinned_http
+    monkeypatch.setattr(deployment, "is_proxy_local_mcp_host",
+                        lambda host, manifest: host == "file-tools")
+    assert builder_executor._dial_policy("http://file-tools:8932/mcp", None, None) is None
+    assert builder_executor._dial_policy("https://crm.example/mcp", None, None) is pinned_http.admin_host
+    assert builder_executor._dial_policy("https://crm.example/mcp", None, False) is pinned_http.control_plane
+    assert builder_executor._dial_policy("http://file-tools:8932/mcp", None, True) is None
+    import config
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
+    assert builder_executor._dial_policy("http://file-tools:8932/mcp", None, None) is pinned_http.docker_tool
+    assert builder_executor._dial_policy("http://file-tools:8932/mcp", None, True) is pinned_http.docker_tool

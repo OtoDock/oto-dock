@@ -244,6 +244,35 @@ class TestSwitchEngineGates:
                 assert "platform pool" in frame["message"]
         run_ws_scenario(scenario)
 
+    def test_an_editor_never_switches_a_run_that_writes_knowledge(self, temp_db, monkeypatch):
+        # The rule every door asks: an editor opens an agent-scope task chat,
+        # and a run whose session writes the agent's knowledge is a
+        # manager's to continue, so it is a manager's to switch too.
+        from core.config import task_config_builder
+        from storage import database as task_store
+        stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+        monkeypatch.setattr(task_config_builder, "run_holds_knowledge_write", lambda run: True)
+        slug = make_test_agent()
+        _enable_codex(slug)
+        _grant("codex-cli")
+        task_store.set_user_agents("user-viewer", [slug], "user-admin",
+                                   agent_roles={slug: "editor"})
+        cid = _make_chat(slug, chat_id=f"task-{uuid.uuid4()}", user_sub=f"task::{slug}")
+        self._make_task_run(cid, status="completed", scope="agent",
+                            created_by="user-admin", agent=slug)
+
+        async def scenario():
+            cookie = session_cookie(sub="user-viewer", email="viewer@test.com",
+                                    name="Viewer User", role="member")
+            async with dashboard_connection(cookie) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                await _drain_until(ws, "chat_history")
+                _switch(ws)
+                frame = await _drain_until(ws, "switch_engine_denied")
+                assert "manager when the run can change the agent's knowledge" in frame["message"]
+        run_ws_scenario(scenario)
+
     def test_continuation_target_chat_denied(self, temp_db, monkeypatch):
         # A chat wired as an ACTIVE continuation target keeps its row
         # coherent with the continuation's delivery ladder (a rebind NULLs

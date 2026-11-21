@@ -1,0 +1,198 @@
+{
+  "win32": {
+    "satellite/_vendored/app_server_client.py::AppServerClient._kill_proc": [
+      "os.getpgid",
+      "signal.SIGKILL"
+    ],
+    "satellite/_vendored/loop_watchdog.py::_sample_fds": [
+      "resource.RLIMIT_NOFILE",
+      "resource.getrlimit"
+    ],
+    "satellite/_vendored/mcp_installer.py::_drain_group": [
+      "os.WNOHANG",
+      "os.killpg"
+    ],
+    "satellite/_vendored/mcp_installer.py::_kill_tree": [
+      "os.killpg",
+      "signal.SIGKILL"
+    ],
+    "satellite/_vendored/mcp_installer.py::_reap_group": [
+      "os.WNOHANG"
+    ],
+    "satellite/_vendored/sandbox_render.py::_sign_in_mount_point": [
+      "os.O_NOFOLLOW"
+    ],
+    "satellite/_vendored/session_home.py::_FdOps.__init__": [
+      "os.O_DIRECTORY",
+      "os.O_NOFOLLOW"
+    ],
+    "satellite/_vendored/session_home.py::_FdOps._mkdir_open": [
+      "os.fchmod"
+    ],
+    "satellite/_vendored/session_home.py::_FdOps._seed": [
+      "os.O_NOFOLLOW",
+      "os.O_NONBLOCK"
+    ],
+    "satellite/config.py::relaunch_self": [
+      "os.getuid"
+    ],
+    "satellite/config.py::write_if_changed": [
+      "os.fchmod"
+    ],
+    "satellite/host/host_probe.py::_detect_os_user_and_home": [
+      "os.getuid",
+      "pwd.getpwuid"
+    ],
+    "satellite/host/host_probe.py::sleep_clock": [
+      "time.clock_gettime"
+    ],
+    "satellite/host/safe_fs.py::_dir_flags": [
+      "os.O_DIRECTORY",
+      "os.O_NOFOLLOW"
+    ],
+    "satellite/host/safe_fs.py::_listing_fd": [
+      "os.O_DIRECTORY"
+    ],
+    "satellite/host/safe_fs.py::_open_leaf_posix": [
+      "os.O_NOFOLLOW",
+      "os.O_NONBLOCK",
+      "os.set_blocking"
+    ],
+    "satellite/host/safe_fs.py::_parent_posix": [
+      "os.O_NOFOLLOW"
+    ],
+    "satellite/host/safe_fs.py::atomic_write_beneath": [
+      "os.O_NOFOLLOW"
+    ],
+    "satellite/host/safe_fs.py::open_root": [
+      "os.O_NOFOLLOW"
+    ],
+    "satellite/host/safe_fs.py::sweep_temps_beneath": [
+      "os.O_DIRECTORY"
+    ],
+    "satellite/host/service_unit.py::systemctl_env": [
+      "os.getuid"
+    ],
+    "satellite/sessions/app_server.py::AppServers._end": [
+      "signal.SIGKILL"
+    ],
+    "satellite/sessions/app_server.py::AppServers._kill_group": [
+      "os.killpg"
+    ],
+    "satellite/sessions/app_server.py::AppServers._watch": [
+      "signal.SIGKILL"
+    ],
+    "satellite/sessions/app_server.py::AppServers.kill_all": [
+      "signal.SIGKILL"
+    ],
+    "satellite/sessions/mcp_install_support.py::_rewrite_through_fresh_name": [
+      "os.fchmod"
+    ],
+    "satellite/sessions/memory_guard.py::Guard._descriptor": [
+      "os.pidfd_open"
+    ],
+    "satellite/sessions/memory_guard.py::Guard._folders": [
+      "os.statvfs"
+    ],
+    "satellite/sessions/memory_guard.py::Guard._freeze": [
+      "signal.SIGSTOP"
+    ],
+    "satellite/sessions/memory_guard.py::Guard.stop": [
+      "signal.SIGKILL"
+    ],
+    "satellite/sessions/memory_guard.py::_age_s": [
+      "time.CLOCK_BOOTTIME",
+      "time.clock_gettime"
+    ],
+    "satellite/sessions/sandbox_host.py::_write_private": [
+      "os.O_NOFOLLOW",
+      "os.fchmod"
+    ],
+    "satellite/sessions/sandbox_host.py::build_host": [
+      "os.getgid",
+      "os.getuid"
+    ],
+    "satellite/sessions/sandbox_host.py::render_host": [
+      "os.getgid",
+      "os.getuid"
+    ],
+    "satellite/sessions/ssh_agent.py::_AgentServer.__init__": [
+      "socket.AF_UNIX"
+    ],
+    "satellite/sessions/step_runner.py::_execute": [
+      "signal.SIGKILL"
+    ],
+    "satellite/sessions/step_runner.py::_execute._kill_group": [
+      "os.killpg",
+      "signal.SIGKILL"
+    ],
+    "satellite/sessions/step_runner.py::_kill_later._kill": [
+      "os.killpg",
+      "signal.SIGKILL"
+    ],
+    "satellite/sessions/step_runner.py::_signal_step": [
+      "os.killpg"
+    ],
+    "satellite/terminal/local_socket.py::LocalControlServer._check_peer": [
+      "os.getuid",
+      "socket.SO_PEERCRED"
+    ],
+    "satellite/terminal/local_socket.py::LocalControlServer._probe_live": [
+      "asyncio.open_unix_connection"
+    ],
+    "satellite/terminal/local_socket.py::LocalControlServer.start": [
+      "asyncio.start_unix_server"
+    ],
+    "satellite/terminal/otodock_cli.py::_PosixTerminal._restore": [
+      "self._termios.TCIFLUSH",
+      "self._termios.TCSADRAIN",
+      "self._termios.tcflush",
+      "self._termios.tcsetattr"
+    ],
+    "satellite/terminal/otodock_cli.py::_PosixTerminal.setup": [
+      "signal.SIGWINCH",
+      "tty.setraw"
+    ],
+    "satellite/terminal/otodock_cli.py::_PosixTerminal.teardown": [
+      "signal.SIGWINCH"
+    ],
+    "satellite/terminal/pty_relay.py::PtyProcess._attach": [
+      "os.set_blocking"
+    ],
+    "satellite/terminal/pty_relay.py::PtyProcess._signal_group": [
+      "os.killpg"
+    ],
+    "satellite/terminal/pty_relay.py::PtyProcess._wait_child": [
+      "signal.SIGKILL"
+    ],
+    "satellite/terminal/pty_relay.py::_set_winsize": [
+      "fcntl.ioctl",
+      "termios.TIOCSWINSZ"
+    ],
+    "satellite/terminal/pty_relay.py::spawn_pty": [
+      "pty.openpty"
+    ],
+    "satellite/terminal/pty_relay.py::spawn_pty._preexec": [
+      "fcntl.ioctl",
+      "os.setsid",
+      "termios.TIOCSCTTY"
+    ],
+    "satellite/transport/file_sync.py::_hash_file": [
+      "os.set_blocking"
+    ],
+    "satellite/transport/lifecycle_update.py::_self_uninstall_and_exit": [
+      "os.getuid"
+    ]
+  },
+  "darwin": {
+    "satellite/sessions/memory_guard.py::Guard._descriptor": [
+      "os.pidfd_open"
+    ],
+    "satellite/sessions/memory_guard.py::_age_s": [
+      "time.CLOCK_BOOTTIME"
+    ],
+    "satellite/terminal/local_socket.py::LocalControlServer._check_peer": [
+      "socket.SO_PEERCRED"
+    ]
+  }
+}

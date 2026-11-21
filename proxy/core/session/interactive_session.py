@@ -1,20 +1,20 @@
-"""Interactive CLI session registry, single-process lease, idle reaper, drainer.
+"""Interactive CLI session: the class, its registration and its drainer.
 
-An *interactive* session is a PTY-backed CLI (``pty_relay.PtyProcess``) that the
-proxy registers but does **not** drive turns for — there is no pump and no
+An *interactive* session is a PTY-backed CLI on a machine (its handle here is
+``remote_pty.RemotePtyProcess``) that the proxy registers but does **not**
+drive turns for — there is no pump and no
 ``CommonEvent`` stream, because a PTY emits raw bytes, not events. This module
-owns their lifecycle:
+owns their lifecycle, and re-exports what importers take from the parts beside it:
+``interactive_registry`` (the live table and the idle reaper), ``interactive_common``
+(the timing constants and callback types), and the mixins under the class
+(``interactive_input``, ``interactive_queue``, ``interactive_turn``,
+``interactive_output``):
 
-  * a per-session registry keyed by ``session_id``;
   * the **single-live-process lease** — registering a ``session_id``
     first kills any process already bound to it (mode toggle / cross-surface
     takeover), so shared session files never get two writers;
   * chat-slot acquisition + a hook into the 120s reconciler (``concurrency.py``)
     so an interactive slot is never mis-reaped or leaked;
-  * an **idle reaper** that will NOT reap a session a viewer is watching, and
-    treats input, turn signals and PTY output inside an open turn as activity
-    (so a long unviewed agent turn isn't killed mid-flight, and a TUI's redraw
-    between turns doesn't keep an abandoned terminal alive);
   * the **drainer** — a task that forwards the session's permission queue
     (permission prompts + display/file-tools artifacts pushed by ``api/hooks``)
     to a viewer callback, since there is no pump to drain it.
@@ -27,245 +27,97 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
-import re
 import time
-import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import psycopg
 
-import config
-from core import host_os, placement
+from core import placement
 from core.background import spawn
-from core.sandbox import pty_relay
-from core.sandbox.pty_relay import PtyProcess
+from core.drain import PLATFORM_STOPPING
 from core.session import session_kind
-from core.session.transcript_tailer import leaves_turn_open
-from core.session.transcript_tool_events import drop_sent_prompts, note_sent_prompt
-from core.terminal_queries import (
-    MOUSE_RE as _MOUSE_RE,
-    strip_clipboard_writes as _strip_clipboard_writes,
-    strip_queries as _strip_terminal_queries,
-    strip_replies as _strip_terminal_replies,
+from core.session.interactive_common import (  # noqa: F401
+    _BREADCRUMB_MIN_CHARS,
+    _COLD_RETRY_MAX,
+    _COLD_RETRY_S,
+    _COMPOSER_DIRTY_TTL_S,
+    _DIALOG_KEYS_RE,
+    _INJECT_BACKSTOP_S,
+    _INJECT_QUIET_S,
+    _MIDTURN_TAIL_S,
+    _POST_OUTPUT_TAIL_S,
+    _RESUME_TAIL_S,
+    _SATELLITE_INJECT_TIMEOUT_S,
+    _SESSION_TOKEN_LIFE_S,
+    _SUBMIT_ENTER_DELAY_S,
+    _SUBMIT_MAX_S,
+    _SUBMIT_SETTLE_S,
+    _SUBMIT_WIN_BACKSTOP_S,
+    _TITLE_EARLY_TIMER_S,
+    _TOOLS_RECHECK_S,
+    DEFAULT_COLS,
+    DEFAULT_ROWS,
+    DEFAULT_SCROLLBACK_BYTES,
+    MIN_TURN_S,
+    READY_MAX_S,
+    READY_MIN_S,
+    READY_SETTLE_S,
+    CloseCb,
+    OutputListener,
+    PermEventCb,
+    StatusCb,
+    TurnCompleteCb,
+    _batch_listeners,
+    _breadcrumb_text,
+    _load_chat_row,
+    _token_expires_at,
+    add_batch_listener,
 )
+from core.session.interactive_input import (
+    InteractiveInputMixin,
+)
+from core.session.interactive_output import (  # noqa: F401
+    InteractiveOutputMixin,
+)
+from core.session.interactive_queue import (  # noqa: F401
+    InteractiveQueueMixin,
+)
+from core.session.interactive_registry import (  # noqa: F401
+    _reaper_loop,
+    _sessions,
+    close_all,
+    close_for_chat,
+    close_session,
+    find_live_for_chat,
+    get,
+    held_on_machine,
+    live_session_ids,
+    live_sessions,
+    note_background_report,
+    reap_idle,
+    reap_spare_reason,
+    start_idle_reaper,
+    tail_live_sessions,
+)
+from core.session.interactive_turn import (  # noqa: F401
+    InteractiveTurnMixin,
+    LimitMark,
+)
+from core.session.transcript_tailer import leaves_turn_open
+from core.session.transcript_tool_events import drop_sent_prompts
 from storage.agents.schema import DEFAULT_EXECUTION_PATH
-from ws import chat_phase, wire_events as wire
+from ws import wire_events as wire
+
+if TYPE_CHECKING:
+    from core.events.turn_ending import TurnEnding
+    from core.remote.remote_pty import RemotePtyProcess
 
 logger = logging.getLogger("otodock.interactive")
-
-# Terminal auto-RESPONSE sequences the mirror xterm emits but that are NOT user
-# input (DA/DSR/CPR replies, focus reports, DECRPM/kitty/XTWINOPS/OSC/DCS
-# responses). xterm.js auto-answers an application's terminal queries and emits
-# focus reports; the dashboard forwards them over `pty_input`. They must never
-# reach the real PTY — the controlling terminal answers the app's queries
-# itself — and, critically, must not be mistaken for "the user started typing",
-# which would CANCEL the cold first-prompt Enter retry (the Windows-remote
-# first-prompt-never-submits bug: ConPTY emits an outer DA query whose mirror
-# reply rode `pty_input` mid-cold-submit). Vocabulary + rationale live in
-# ``core.terminal_queries`` (shared with the output-side strips; imported at
-# the top as ``_strip_terminal_replies`` / ``_strip_terminal_queries``).
-
-# Mouse-tracking reports the xterm forwards when the TUI has mouse mode on: SGR
-# (`\x1b[<b;x;yM` / `…m`) + legacy X10 (`\x1b[M` + 3 bytes). These ARE
-# user-generated, but they're pointer movement/clicks, not message input — they
-# must still reach the PTY (the TUI may use them) yet must NOT pre-empt the
-# pending cold first-prompt submit. A stray mouse-MOVE over the terminal during
-# warmup otherwise cancelled the cold-submit retry before the Enter landed
-# (observed live: `\x1b[<35;70;68M`).
-
-# Minimum recovered-text length for an undelivered-input breadcrumb. A cold
-# flush that dies unconfirmed is persisted into the chat so the user can copy
-# their prompt back (2026-08-18 field loss: a 1143-byte prompt typed into
-# Claude's resume-from-summary picker vanished with no DB trace). Short
-# residues (arrow keys, a stray Enter, tiny edits) are noise, not prompts.
-_BREADCRUMB_MIN_CHARS = 40
-
-
-def _breadcrumb_text(raw: bytes) -> str:
-    """Human-readable text of a buffered PTY input chunk, for the
-    undelivered-input breadcrumb. Strips bracketed-paste framing, CSI/OSC
-    escape sequences, and control chars (except newline/tab); collapses the
-    trailing submit CR. Pure — unit-tested directly."""
-    text = raw.decode("utf-8", errors="replace")
-    text = text.replace("\x1b[200~", "").replace("\x1b[201~", "")
-    text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", text)  # OSC
-    text = re.sub(r"\x1b\[[0-9;?<>=]*[A-Za-z~]", "", text)         # CSI
-    text = re.sub(r"\x1b.", "", text)                              # bare ESC+x
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = "".join(c for c in text if c in ("\n", "\t") or ord(c) >= 0x20)
-    return text.strip()
-
-# Idle reaping is unified across all session kinds via config.get_idle_timeout()
-# (the admin `session_idle_timeout` setting); reap_idle() reads it per-sweep. A
-# viewer attached keeps an interactive session alive regardless of the timeout;
-# its idle age moves on input, prompts, interrupts, turn signals and PTY output
-# inside an open turn (see _fanout_output and reap_idle).
-_REAPER_PERIOD_S = 60
-# A turn parked on a question waits on a person, so the reaper spares it like
-# a held prompt: until the session's token ends less _TOKEN_MARGIN_S (an answer
-# after that lets the turn go on and every later hook is refused), at most
-# session_state.PROMPT_WAIT_S idle. Past it the answer path revives the session
-# (single-flight). Under memory pressure and at the per-person cap the capacity
-# evictor (core/concurrency._turn_live) spares a parked question up to the
-# background-work ceiling and reclaims it past that.
-_TOKEN_MARGIN_S = 60
-# A session token's life (auth/session_token.create_session_token): the
-# stand-in from the terminal's start when its own token cannot be read.
-_SESSION_TOKEN_LIFE_S = 24 * 3600
-
-
-def _token_expires_at(env: dict | None) -> float | None:
-    """The wall-clock expiry of the session token in a spawn env
-    (``PROXY_API_KEY``), or None when there is none or it cannot be read."""
-    token = str((env or {}).get("PROXY_API_KEY") or "")
-    if not token:
-        return None
-    from auth.session_token import validate_session_token
-    exp = (validate_session_token(token) or {}).get("exp")
-    return float(exp) if isinstance(exp, (int, float)) else None
-
-# Readiness gate: buffer input until the TUI has rendered + gone quiet, so the
-# first prompt (a human's, or an autonomous task's injected prompt) is never sent
-# before the CLI's input handler is attached (the "message sent before the CLI
-# started" race). Ready = the TUI has STARTED RENDERING (first ESC/control
-# sequence) AND output then quiet for READY_SETTLE_S, or READY_MAX_S since spawn
-# as a fallback. The render gate skips pre-TUI plain-text noise (e.g. Codex's
-# "Can't run AVX2 build…" native warning emitted before its Ratatui renders).
-# Layer-agnostic → Claude (Ink emits ESC from frame 1) AND Codex.
-READY_SETTLE_S = getattr(config, "INTERACTIVE_READY_SETTLE_S", 0.8)
-READY_MAX_S = getattr(config, "INTERACTIVE_READY_MAX_S", 20.0)
-# A line-submit ("text\r" in one write) often lands in the TUI input box WITHOUT
-# submitting (Ink/readline). Send the text, then the Enter separately after this
-# gap so the TUI registers the text first, then submits. Bare Enter keystrokes
-# (live typing) are written as-is.
-_SUBMIT_ENTER_DELAY_S = getattr(config, "INTERACTIVE_SUBMIT_ENTER_DELAY_S", 0.12)
-# The COLD first prompt: write the text, then fire ONE Enter once the composer has
-# settled — output quiet for _SUBMIT_SETTLE_S (re-armed on each output, so a
-# still-rendering / warming TUI keeps it from firing early), or _SUBMIT_MAX_S as a
-# backstop. We do NOT blind-retry — a stray Enter selects a native question/menu
-# (AskUserQuestion) option once the first one submits. This single Enter is
-# reliable LOCAL + on a Linux-remote satellite (the text is written first, then the
-# Enter only after the echo settles). The ONE exception is WINDOWS-remote Claude,
-# where the ConPTY render race can swallow it; THERE ONLY we fire one more Enter
-# _SUBMIT_WIN_BACKSTOP_S later as a backstop — see _fire_submit.
-_SUBMIT_SETTLE_S = getattr(config, "INTERACTIVE_SUBMIT_SETTLE_S", 0.8)
-_SUBMIT_MAX_S = getattr(config, "INTERACTIVE_SUBMIT_MAX_S", 12.0)
-# Windows-remote Claude ONLY: one extra Enter this long after the first (the TUI is
-# idle by then). 2 Enters total. Codex / Linux-remote / local: single Enter.
-_SUBMIT_WIN_BACKSTOP_S = getattr(config, "INTERACTIVE_SUBMIT_WIN_BACKSTOP_S", 7.0)
-# Cold-flush CONFIRMATION: the readiness settle is a heuristic — on a cold
-# boot the welcome frame renders, output goes quiet ≥READY_SETTLE_S while the
-# MCPs are still warming, and the flush lands in a TUI whose composer isn't
-# live yet: body + Enter swallowed, first prompt lost (live repro 2026-07-21,
-# first message to a brand-new interactive chat). After the cold-submit Enter
-# fires, if the transcript hasn't confirmed the turn (_turn_open via the
-# journaled user line) within _COLD_RETRY_S, the flushed bytes are re-emitted,
-# up to _COLD_RETRY_MAX times. The window sits past the +4s submit tail so a
-# prompt that DID land is seen as confirmed before the watcher acts.
-_COLD_RETRY_S = getattr(config, "INTERACTIVE_COLD_RETRY_S", 5.0)
-_COLD_RETRY_MAX = getattr(config, "INTERACTIVE_COLD_RETRY_MAX", 2)
-# Floor on the readiness settle for fresh (non prompt-in-argv) TUIs: never
-# mark ready before this much time since spawn — the first post-render quiet
-# is usually the MCP warm, not a live composer (same precedent as MIN_TURN_S
-# guarding turn-complete false-fires). READY_MAX_S stays the hard backstop.
-READY_MIN_S = getattr(config, "INTERACTIVE_READY_MIN_S", 2.5)
-# After PTY output goes quiet for this long (a turn / long pause likely ended),
-# tail the transcript → chat_messages + the title backfill. The native TUI does
-# NOT reliably fire the Stop hook, so without this the DB (and the interactive
-# chat's title) only caught up on the 60s reaper sweep — the title appeared up to
-# a minute late. This makes both land within a few seconds of the turn.
-_POST_OUTPUT_TAIL_S = getattr(config, "INTERACTIVE_POST_OUTPUT_TAIL_S", 3.0)
-# Short fuse for the resume-check tail: output arriving while the turn is
-# CLOSED (promptless self-resume / in-TUI question answer) triggers a
-# transcript read this soon, so the reopened turn shows live instead of
-# waiting out the starved post-output debounce.
-_RESUME_TAIL_S = getattr(config, "INTERACTIVE_RESUME_TAIL_S", 1.5)
-# Mid-turn tail cadence (LOCAL only): while a turn is open the TUI spinner
-# redraws continuously, so the post-output debounce never fires and a local
-# turn's rows historically landed only at turn end (+3s). Remote sessions
-# already persist rows mid-turn (the satellite polls its transcript every
-# 0.8s); this periodic tail gives local sessions the same incremental
-# persistence — live rich view and voice mode read rows as they land.
-_MIDTURN_TAIL_S = getattr(config, "INTERACTIVE_MIDTURN_TAIL_S", 1.0)
-
-# LLM chat-title latency cap: if the FIRST turn is still running this long
-# after it opened and no tail batch has crossed the char/tool thresholds
-# (the LOCAL TUI's spinner starves the post-output debounce, so long local
-# turns produce no mid-turn batches), force one tail and fire the title
-# upgrade with whatever partial first turn is persisted — a prompt-only
-# title beats waiting minutes for turn end. One-shot per session.
-_TITLE_EARLY_TIMER_S = getattr(config, "INTERACTIVE_TITLE_EARLY_TIMER_S", 30.0)
-
-# Interactive TASK completion: the turn-end signal
-# (Claude end_turn / Codex task_complete, surfaced by the tailer) fires the
-# task's ``on_turn_complete`` callback — but only after the session is at least
-# this old, so MCP-warm / first-render quiet can't false-trigger before a real
-# turn. Belt-and-braces: a turn-end signal only exists AFTER a real turn anyway.
-# Chats never set the callback, so this whole path is a no-op for them.
-MIN_TURN_S = getattr(config, "INTERACTIVE_TASK_MIN_TURN_S", 5.0)
-
-# Server-prompt injection (delegate results …): the PTY must have been quiet
-# this long before a queued prompt is injected — covers the gap between a user
-# submit and the first transcript line (the turn-open flag is transcript-derived
-# and can lag by one tail poll).
-_INJECT_QUIET_S = getattr(config, "INTERACTIVE_INJECT_QUIET_S", 2.0)
-# Re-check period while prompts are queued but a gate blocks (mid-turn, dirty
-# composer, young session…). A one-shot timer would starve after the first
-# blocked attempt; this one re-arms until the queue drains or the session dies.
-_INJECT_BACKSTOP_S = getattr(config, "INTERACTIVE_INJECT_BACKSTOP_S", 5.0)
-
-# TTL on the composer-dirty injection gate. Dirty means "printable bytes with
-# no submit yet" — but a mirror viewer's wheel scroll arrives as arrow keys on
-# a TUI alternate screen and reads as typing with no Enter ever coming, which
-# wedged queued delegate results behind a phantom draft. A real draft keeps
-# refreshing the timestamp on every keystroke; three quiet minutes means the
-# "draft" is scroll residue and injection may proceed.
-_COMPOSER_DIRTY_TTL_S = getattr(config, "INTERACTIVE_COMPOSER_DIRTY_TTL_S", 180.0)
-# The keys a TUI dialog takes (a picker's arrows, Home, End and pages, Tab
-# and Shift+Tab, space, digits, Esc, Ctrl+C): typed while one shows they
-# answer it and leave the TUI's input box as it was.
-_DIALOG_KEYS_RE = re.compile(rb"(?:\x1b\[[ABCDHFZ]|\x1bO[ABCDHF]|\x1b\[[56]~|[\x1b\t\x03 0-9])+")
-# otodock-attached injection: how long to await the satellite's
-# pty_inject_result before treating it as lost and re-sending the SAME
-# inject_id (the satellite dedupes recent ids and re-ACKs, so a lost result
-# frame can never double-inject).
-_SATELLITE_INJECT_TIMEOUT_S = getattr(
-    config, "INTERACTIVE_SATELLITE_INJECT_TIMEOUT_S", 20.0,
-)
-
-# Callbacks supplied by the WS layer. Either may be sync or return a coroutine.
-OutputListener = Callable[[bytes], "Awaitable[None] | None"]
-PermEventCb = Callable[[dict], "Awaitable[None] | None"]
-CloseCb = Callable[["InteractiveSession", str], "Awaitable[None] | None"]
-# Fired once when an autonomous interactive TASK's run completes (turn-end +
-# bg-empty). The arg is the final assistant/agent message text. Set by the
-# scheduler's interactive-task watcher; left None for human-driven chats.
-TurnCompleteCb = Callable[[str], "Awaitable[None] | None"]
-# A remote PTY's transport is reconnecting/reconnected (a satellite WS blip).
-# Fired to the viewer so it can show a "reconnecting" banner + pause input.
-StatusCb = Callable[[str], "Awaitable[None] | None"]
-
-# ---------------------------------------------------------------------------
-# Module state
-# ---------------------------------------------------------------------------
-
-_sessions: dict[str, InteractiveSession] = {}
-# Told after every persisted batch and turn transition of a tailed session,
-# ``fn(chat_id, *, persisted, turn_open)``: the socket package registers its
-# duplex feed (``ws/duplex_attach.py``) when it is imported, before any
-# duplex session can attach.
-_batch_listeners: list[Callable[..., None]] = []
 _lock: asyncio.Lock | None = None
-_reaper_task: asyncio.Task | None = None
-
-
-def add_batch_listener(fn: Callable[..., None]) -> None:
-    """Register a batch listener (``_batch_listeners``); idempotent."""
-    if fn not in _batch_listeners:
-        _batch_listeners.append(fn)
 
 
 def _get_lock() -> asyncio.Lock:
@@ -279,11 +131,11 @@ class CapacityError(RuntimeError):
     """Raised when no chat slot is available for a new interactive session."""
 
 
-class InteractiveSession:
+class InteractiveSession(InteractiveInputMixin):
     """A registered, PTY-backed interactive CLI session.
 
-    Construct via :func:`register` (which enforces the lease + slot). Holds the
-    ``PtyProcess`` and the per-session viewer/permission plumbing.
+    Construct via :func:`register_remote` (which enforces the lease + slot).
+    Holds the PTY's handle and the per-session viewer/permission plumbing.
     """
 
     # Class-level defaults for the cold-flush retry state: hand-built partial
@@ -293,6 +145,13 @@ class InteractiveSession:
     _cold_flush_seed = ""
     _cold_flush_attempts = 0
     _cold_flush_watcher: asyncio.TimerHandle | None = None
+    _ready_deadline = 0.0
+    _tools_recheck: asyncio.TimerHandle | None = None
+    _tools_held_at = 0.0
+    # A turn an Escape may have dropped (``_check_dropped_turn``).
+    _escape_at = 0.0
+    _dropped_turn_check: asyncio.TimerHandle | None = None
+    _dropped_turn_looks = 0
     # Monotonic stamp of the latest cold Enter (see _check_cold_flush).
     _cold_flush_enter_at = 0.0
     # The hook-driven park already pinged the open dialog (see
@@ -330,13 +189,14 @@ class InteractiveSession:
         username: str = "",
         target: str = placement.LOCAL,
         remote_os: str = "",
-        rows: int = pty_relay.DEFAULT_ROWS,
-        cols: int = pty_relay.DEFAULT_COLS,
+        rows: int = DEFAULT_ROWS,
+        cols: int = DEFAULT_COLS,
         execution_path: str = DEFAULT_EXECUTION_PATH,
         prompt_in_argv: bool = False,
         tui_theme: str = "dark",
         chat_row: dict | None = None,
         token_expires_at: float | None = None,
+        payer: str | None = None,
     ) -> None:
         self.session_id = session_id
         self.chat_id = chat_id
@@ -369,15 +229,21 @@ class InteractiveSession:
         # white-on-white. Sent to viewers in the pty_status "attached" frame.
         self.tui_theme = "light" if str(tui_theme).lower().startswith("light") else "dark"
 
-        # Set by the spawn; what runs on a live session casts its reads.
-        self.pty: PtyProcess | None = None
+        # Set by the registration, a machine's PTY; what runs on a live
+        # session casts its reads.
+        self.pty: RemotePtyProcess | None = None
         self.created_at = time.monotonic()
         self.last_activity = self.created_at
         # When the session token in the CLI's env ends (wall clock): a parked
-        # question is spared no longer (_reap_spare_reason).
+        # question is spared no longer (reap_spare_reason).
         self.token_expires_at = (
             token_expires_at if token_expires_at is not None
             else time.time() + _SESSION_TOKEN_LIFE_S)
+        # Whose account the start's config was built to pay with ("" the
+        # shared subscriptions), None for a session taken back after a
+        # restart: a stored wake of a lane's chat asks it before the seat is
+        # bound (``spender.serves_lane``).
+        self.payer = payer
 
         # otodock-CLI: True while a local `otodock` terminal is attached to
         # this session over the satellite's local control socket. The local
@@ -419,6 +285,8 @@ class InteractiveSession:
         # "exited") — the dashboard surfaces a non-zero code ("process exited
         # (code 1)") instead of a blank/ambiguous "session ended".
         self.exit_code: int | None = None
+        # The machine's memory guard ended the engine (a remote PTY's exit says so).
+        self.ended_for_memory = False
         # Viewer hook fired when the REMOTE PTY transport is
         # reconnecting/reconnected (satellite WS blip). Single-slot (last viewer
         # wins), like on_close/on_perm_event. Stays None for local sessions.
@@ -427,11 +295,25 @@ class InteractiveSession:
         # watcher; fired ONCE when a turn-end signal lands with the bg
         # SubagentRegistry empty + min-turn-time elapsed.
         self.on_turn_complete: TurnCompleteCb | None = None
+        # A chat's terminal a wake or a continue warmed: it has the callback
+        # as a task's terminal does, and its turns still need the open-turn row.
+        self.chat_terminal_rewarmed = False
         self._turn_complete_fired = False
         # One-shot turn-end waiters (a borrowed-terminal delegate round waits
         # for the first turn end after ITS prompt was injected): fired and
         # cleared at the same point as the task callback.
         self._turn_end_waiters: list[TurnCompleteCb] = []
+        # The typed ending of the last turn that ended short (a limit, an API
+        # error: its tailer's row), cleared when a turn opens; and the mark
+        # of a limit its server prompts wait behind (``LimitMark``).
+        self.last_ending: TurnEnding | None = None
+        self.limit_mark: LimitMark | None = None
+        # The engine's own limit menu may be open (its answer is typed keys):
+        # one Escape goes before the limit's continuation is typed.
+        self._limit_menu = False
+        # When the engine last answered a turn of this terminal: an account's
+        # rest that began before it holds nothing here (``limit_ending``).
+        self._served_at = 0.0
         # LLM chat-title generation (services/title_generator.py): armed for
         # chats not yet LLM-titled (mirrors the pump's _title_armed — resumed
         # already-titled chats arm False and skip everything, timer included).
@@ -458,9 +340,15 @@ class InteractiveSession:
             armed = not chat_row.get("title_generated")
         self._title_armed = armed
         # Pre-seed the chat owner from the same row so ``_chat_owner()`` (the
-        # turn-end broadcast identity) never has to read the DB lazily on the
-        # loop. Consumed below where the attribute is initialised.
-        self._chat_owner_seed = (chat_row or {}).get("user_sub") or ""
+        # turn-end broadcast identity) never reads the store on the loop. A
+        # row that failed to load answers with the person, so a shared-only
+        # chat then broadcasts to that one person; the chat's row exists
+        # before every spawn. Consumed below where the attribute is initialised.
+        self._chat_owner_seed = (None if chat_row is None
+                                 else chat_row.get("user_sub") or self.user_sub or "")
+        # A delegated lane's chat (a chat-surface worker's has a plain id):
+        # steered by role, never read as a session for nobody.
+        self.chat_is_lane = (chat_row or {}).get("origin") == "delegated"
         self._title_chars = 0   # accumulated tail-batch counters (first turn)
         self._title_tools = 0
         self._title_timer: asyncio.TimerHandle | None = None
@@ -494,6 +382,10 @@ class InteractiveSession:
         self._render_started = False
         self._input_buffer: list[bytes] = []
         self._settle_handle: asyncio.TimerHandle | None = None
+        # The tools gate (``_tools_pending``): when the readiness bound
+        # passes, and the pending look-again.
+        self._ready_deadline = 0.0
+        self._tools_recheck: asyncio.TimerHandle | None = None
         self._ready_max_handle: asyncio.TimerHandle | None = None
         # Deferred submit (cold first-prompt Enter — see _SUBMIT_SETTLE_S). ONE
         # Enter once the composer settles (or _SUBMIT_MAX_S backstop), then an
@@ -568,6 +460,8 @@ class InteractiveSession:
         # broadcast the sidebar chat_status (streaming/ready) — interactive has
         # no pump, so these ARE the chat's live-dot signals.
         self._turn_open = False
+        # The open turn's token on the chat's open-turn row (``_note_turn_row``).
+        self._turn_token = ""
         # Parked on an unanswered AskUserQuestion: the turn is CLOSED (question
         # fold) but the TUI is showing the dialog — server-prompt injection is
         # gated off (the paste would land in the dialog). Cleared on any
@@ -577,12 +471,11 @@ class InteractiveSession:
         # ``hook_sent_at``): a tail batch whose reopening line was journaled
         # before the park is a read that raced the park, not a new turn.
         self._parked_at = None
-        # The chat ROW's owner (lazy) — for shared-only agents it is the
-        # synthetic agent::<slug>, which the status broadcast fans out to
-        # every user of the agent; self.user_sub would reach only one.
-        # Seeded from the spawn-time chat row (loaded off-loop) so the lazy
-        # DB fallback in ``_chat_owner`` never fires on the loop in production.
-        self._chat_owner_sub: str | None = self._chat_owner_seed or None
+        # The chat ROW's owner — for shared-only agents it is the synthetic
+        # agent::<slug>, which the status broadcast fans out to every user of
+        # the agent; self.user_sub would reach only one. Seeded from the
+        # spawn-time chat row (loaded off-loop).
+        self._chat_owner_sub: str | None = self._chat_owner_seed
         # Composer-dirty heuristic for the injection gates: printable viewer
         # input (terminal replies + mouse reports excluded) not yet submitted.
         # Never inject into a non-empty composer — the paste + CR would submit
@@ -597,9 +490,12 @@ class InteractiveSession:
         # logging in the drain — the block reason is the whole diagnosis when
         # a delegate result sits queued on a live session).
         self._last_held_reason: str | None = None
-        # Last reap-spare reason logged for this session (change-only DEBUG in
+        # Last reap-spare reason logged for this session (change-only INFO in
         # reap_idle — the spare re-fires every sweep for hours-long parks).
         self._last_reap_spare: str | None = None
+        # Whether this terminal's last Stop listed background work the agent
+        # started (note_background_report; the background-pending spare).
+        self._background_reported = False
         # Serialize persistence of transcript lines FORWARDED from a remote
         # satellite (the satellite tails its JSONL + sends new lines; we persist
         # them in arrival order). Local sessions never use this (they read the
@@ -644,12 +540,47 @@ class InteractiveSession:
     # -- readiness gate -------------------------------------------------------
     def _arm_readiness(self) -> None:
         """Start the force-ready fallback timer (output may never settle)."""
+        self._ready_deadline = time.monotonic() + READY_MAX_S
         self._ready_max_handle = self._loop.call_later(READY_MAX_S, self._mark_ready)
 
+    def _tools_pending(self) -> bool:
+        """The engine still lacks a stand-in's tool list (a Claude Code
+        terminal sends its first message without the servers still
+        connecting) and the readiness bound has not passed: hold the
+        buffered input, look again shortly. At the bound the input goes in
+        and one line names what never reported."""
+        from services.mcp import tool_listing
+        pending = tool_listing.pending_listed(self.session_id)
+        if not pending:
+            if self._tools_held_at:
+                logger.info("interactive %s: the tools are listed, input goes in after %.1f s",
+                            self.session_id[:8], time.monotonic() - self._tools_held_at)
+            return False
+        if time.monotonic() < self._ready_deadline:
+            if not self._tools_held_at:
+                self._tools_held_at = time.monotonic()
+                logger.info("interactive %s: ready, input waits for %d tool list(s)",
+                            self.session_id[:8], len(pending))
+            if self._tools_recheck is None:
+                self._tools_recheck = self._loop.call_later(_TOOLS_RECHECK_S, self._recheck_tools)
+            return True
+        logger.info("interactive %s: tools not listed by the bound, input goes in: %s",
+                    self.session_id[:8], ", ".join(sorted(pending)))
+        return False
+
+    def _recheck_tools(self) -> None:
+        self._tools_recheck = None
+        self._mark_ready()
+
     def _mark_ready(self) -> None:
-        """The TUI is ready — flush any input buffered before now."""
-        if self._ready:
+        """The TUI is ready — flush any input buffered before now (once the
+        engine has its stand-ins' tool lists, ``_tools_pending``)."""
+        if self._ready or self._closed:
             return
+        if self._tools_pending():
+            return
+        from services.mcp import tool_listing
+        tool_listing.drop_listed(self.session_id)
         self._ready = True
         for h in (self._settle_handle, self._ready_max_handle):
             if h is not None:
@@ -675,17 +606,6 @@ class InteractiveSession:
             )
 
     @property
-    def has_viewer(self) -> bool:
-        return bool(self._output_listeners)
-
-    @property
-    def is_remote(self) -> bool:
-        """Where this PTY runs: a satellite the proxy drives over the WS, or
-        the sandbox on this host (``core.placement``; ``target`` is the
-        stored value)."""
-        return not placement.is_local(self.target)
-
-    @property
     def idle_seconds(self) -> float:
         """The age the idle reaper and the evictor read (``last_activity``)."""
         return time.monotonic() - self.last_activity
@@ -707,1692 +627,6 @@ class InteractiveSession:
         but what is queued for it now is never delivered to its viewer."""
         return self._closing or self._closed
 
-    def may_drive(self, sender_sub: str) -> bool:
-        """Whether ``sender_sub`` may DRIVE this session (type, paste, answer a
-        permission prompt, abort a turn).
-
-        The session runs the CLI under the identity of whoever warmed it — its
-        JWT, ``OTO_*`` env, platform role and subscription. On a Shared-only
-        agent every assigned user can open the same chat, so a second user's
-        keystrokes would otherwise act as the warmer: spending their
-        subscription and inheriting their platform role (which
-        ``agent-creator-mcp``'s endpoint gates on). Input from anyone else is
-        refused; changing hands is an explicit take-over, never implicit.
-
-        Exemptions, in order:
-
-        * no owner recorded (phone/legacy sessions) — nothing to compare against
-        * no sender (server-injected prompts: scheduler wakes, cold submits)
-        * a task chat (``session_kind.is_task_chat_id``) — governed by its OWN
-          authorization model (``_task_continue_allowed`` is role-based on
-          purpose, so
-          delegate lanes stay steerable by whoever holds the role); an ownership
-          gate on top would break live lane steering.
-
-        Fails OPEN on an unprovable owner, unlike the ``-p`` recycle in
-        ``ws/dashboard_chat.py`` which fails closed: there a wrong guess costs
-        one respawn, here it would silently swallow a keystroke.
-        """
-        driver = self.sole_driver
-        return not sender_sub or not driver or sender_sub == driver
-
-    @property
-    def sole_driver(self) -> str:
-        """The one person who may drive this session (``may_drive``), ``""``
-        when anyone may (no owner recorded, a task chat). Only their socket
-        can hold the session's prompt slot, so what the drainer forwards
-        reaches them alone: a pushed document's token is minted for them
-        (``api/hooks/preview.py``)."""
-        if not self.user_sub or session_kind.is_task_chat_id(self.chat_id):
-            return ""
-        return self.user_sub
-
-    # -- viewers (output fan-out) --------------------------------------------
-    def add_output_listener(
-        self, cb: OutputListener,
-        on_evict: Callable[[str], Awaitable[None] | None] | None = None,
-        on_close: CloseCb | None = None,
-    ) -> bytes:
-        """Attach a viewer. Returns the scrollback to replay so the viewer sees
-        the current screen (reconnect / late-attach).
-
-        Single controller: when ``on_evict`` is given, this is the driving
-        dashboard viewer. It EVICTS the previous controller first (drops that
-        one listener and fires its evict callback with reason "superseded")
-        so two devices or tabs never drive the same PTY at different sizes,
-        which garbles both. A read-only mirror passes no ``on_evict`` and
-        survives a controller change; ``on_close`` lets it learn the session
-        ended (the controller's notice is the single-slot ``self.on_close``).
-        Internal and test listeners pass neither."""
-        prev_evict, prev_cb = self._viewer_evict, self._viewer_listener
-        supersede = on_evict is not None and prev_evict is not None and prev_cb is not cb
-        if supersede:
-            self._output_listeners.discard(prev_cb)
-            self._listener_close.pop(cast("OutputListener", prev_cb), None)
-        self._output_listeners.add(cb)
-        if on_close is not None:
-            self._listener_close[cb] = on_close
-        if on_evict is not None:
-            self._viewer_evict = on_evict
-            self._viewer_listener = cb
-            self.had_viewer = True
-        self._note_activity()
-        if supersede:
-            try:
-                res = cast("Callable[[str], Awaitable[None] | None]", prev_evict)("superseded")
-                if asyncio.iscoroutine(res):
-                    spawn(res,
-                          name="evict_superseded_viewer", owner="interactive_session")
-            except Exception:
-                logger.exception("interactive %s: viewer evict failed", self.session_id[:8])
-        if self.pty is None:
-            return b""
-        sb = self.pty.scrollback()
-        # Mirror boundary (replay): strip the app's terminal queries so the
-        # attaching viewer has nothing stale to auto-answer — a raw replay makes
-        # the mirror re-answer every buffered query on each (re)attach (see
-        # core.terminal_queries). Remote rings are pre-stripped at feed
-        # (remote_pty._feed_output); a local PTY ring is raw, so strip here.
-        # Clipboard writes (OSC 52 set) are replay-stripped for BOTH targets:
-        # they pass live (the TUI's copy feature) but a replayed one would
-        # overwrite the viewer's clipboard on page open.
-        if not self.is_remote:
-            sb = _strip_terminal_queries(sb)
-        return _strip_clipboard_writes(sb)
-
-    def remove_output_listener(self, cb: OutputListener) -> None:
-        self._output_listeners.discard(cb)
-        self._listener_close.pop(cb, None)
-        if cb is self._viewer_listener:
-            self._viewer_evict = None
-            self._viewer_listener = None
-
-    def evict_viewer(self, reason: str = "superseded") -> None:
-        """dual-control: detach the current dashboard viewer (if any) WITHOUT
-        killing the PTY — used when the local `otodock` terminal takes over a live
-        session. Fires the viewer's evict callback (which sends it a ``pty_exit
-        {reason}`` so it shows the take-over banner and stops driving), then drops
-        the listener + the single-slot callbacks so output/perm/status stop
-        fanning out to the now-detached socket. Fully SYNCHRONOUS (it only
-        SCHEDULES the evict's WS send as a task), so it is safe to call under the
-        registry lock without racing ``close()``'s ``on_close`` read."""
-        ev, cb = self._viewer_evict, self._viewer_listener
-        self._output_listeners.discard(cb)
-        self._listener_close.pop(cb, None)  # type: ignore[arg-type]  # no viewer: a None key; typeshed types dict.pop's key as the key type, the call accepts any hashable (library typing gap)
-        self._viewer_evict = None
-        self._viewer_listener = None
-        self.on_perm_event = None
-        self.on_close = None
-        self.on_status = None
-        if ev is not None:
-            try:
-                res = ev(reason)
-                if asyncio.iscoroutine(res):
-                    spawn(res, name="evict_viewer", owner="interactive_session")
-            except Exception:
-                logger.exception("interactive %s: evict_viewer failed", self.session_id[:8])
-
-    def notify_status(self, state: str) -> None:
-        """Tell the current viewer the REMOTE PTY transport state changed —
-        "reconnecting" on a satellite WS drop, "reconnected" on re-adopt.
-        Fire-and-forget; no-op when no viewer wired ``on_status`` (e.g. a
-        background interactive task, or a local session)."""
-        if self.on_status is None:
-            return
-        try:
-            res = self.on_status(state)
-            if asyncio.iscoroutine(res):
-                spawn(res, name="status", owner="interactive_session")
-        except Exception:
-            logger.exception("interactive %s: on_status failed", self.session_id[:8])
-
-    def _fanout_output(self, data: bytes) -> None:
-        # PtyProcess.on_output → here. Output inside an open turn is the agent
-        # working, so an unviewed long turn isn't reaped. Between turns a TUI
-        # redraws on its own (a warmup in the same scope rewrites its hook
-        # files, a status line), which must not reset the age the reaper and
-        # the evictor read; it still breaks the injection gate's quiet. A
-        # local otodock terminal types on the satellite, never through
-        # write_input, so its echo is the only trace of that input here.
-        if self._turn_open or self.otodock_attached:
-            self._note_activity()
-        else:
-            self._last_io_at = time.monotonic()
-        # Readiness: output is flowing → (re)arm the settle timer. Ready fires
-        # when output goes quiet for READY_SETTLE_S (the TUI finished rendering).
-        if not self._ready:
-            # Only count output as "the TUI is rendering" once a terminal control
-            # sequence (ESC) appears — skips Codex's pre-TUI plain-text warnings so
-            # the settle timer measures quiet AFTER the render, not during the warm
-            # gap. Claude's Ink TUI emits ESC from its first frame, so this is
-            # layer-agnostic; READY_MAX_S remains the hard backstop.
-            if not self._render_started and b"\x1b" in data:
-                self._render_started = True
-            if self._render_started:
-                if self._settle_handle is not None:
-                    self._settle_handle.cancel()
-                # Floor the settle so ready can't fire before READY_MIN_S since
-                # spawn: the first post-render quiet is usually the MCP warm,
-                # not a live composer.
-                delay = max(READY_SETTLE_S,
-                            READY_MIN_S - (time.monotonic() - self._spawn_ts))
-                self._settle_handle = self._loop.call_later(delay, self._mark_ready)
-        # A deferred cold-start submit is waiting for the echo to settle — push
-        # its Enter out while the text is still echoing (the max-fallback caps it).
-        if self._submit_settle_handle is not None:
-            self._submit_settle_handle.cancel()
-            self._submit_settle_handle = self._loop.call_later(_SUBMIT_SETTLE_S, self._fire_submit)
-        # Post-turn tail: once the TUI is ready, debounce a transcript tail on
-        # output quiet so chat_messages + the title land within seconds of a turn
-        # (the Stop hook is unreliable; the 60s reaper sweep is just the backstop).
-        if self._ready and self.chat_id:
-            if self._tail_handle is not None:
-                self._tail_handle.cancel()
-            self._tail_handle = self._loop.call_later(_POST_OUTPUT_TAIL_S, self._run_post_output_tail)
-            # Self-resume detection: output while the turn is CLOSED → check the
-            # transcript promptly (the debounce above is starved while output
-            # flows). NOT re-armed per chunk — one probe per fuse window, and
-            # only while the turn stays closed. Local only: remote turn state
-            # rides the forwarded transcript lines.
-            if (not self._turn_open and not self.is_remote
-                    and self._resume_tail_handle is None):
-                self._resume_tail_handle = self._loop.call_later(
-                    _RESUME_TAIL_S, self._run_resume_tail)
-        # Mirror boundary (live): listeners are dashboard mirrors — strip the
-        # app's terminal queries so xterm.js never auto-answers one (the answers
-        # would ride pty_input back as phantom keystrokes; see
-        # core.terminal_queries). Remote sessions arrive pre-stripped
-        # (remote_pty._feed_output); local PTY bytes are stripped here. The
-        # readiness/settle/tail logic above intentionally saw the RAW bytes.
-        mirror_data = _strip_terminal_queries(data) if not self.is_remote else data
-        if not mirror_data:
-            return
-        for cb in list(self._output_listeners):
-            try:
-                res = cb(mirror_data)
-                if asyncio.iscoroutine(res):
-                    spawn(res, name="mirror_output", owner="interactive_session")
-            except Exception:
-                logger.exception("interactive %s: output listener failed", self.session_id[:8])
-
-    # -- input / resize (proxy → PTY) ----------------------------------------
-    def deliver_dashboard_input(self, data: bytes, composer: bool = False,
-                                sender_sub: str = "") -> bool:
-        """Dashboard input router. ``composer=True`` marks a discrete chat-box
-        send (the FE flags it; raw terminal keystrokes are never flagged):
-        while the turn is question-parked, typing it through would land the
-        paste in the open picker's notes field and the trailing CR would
-        submit the recommended option — so the text is HELD in the server
-        prompt queue instead, as a steer carrying the page's own bytes: the
-        answer unparks the turn and the drain types it into the running turn
-        as the page sent it (a dismissed question: as the next prompt).
-        Everything else funnels straight to :meth:`write_input` (answering
-        in the TUI keeps working).
-
-        ``sender_sub`` is the user whose socket this input arrived on. Input
-        from anyone but the session's controller is DROPPED (:meth:`may_drive`)
-        — the identity gate for Shared-only chats. Returns False when the input
-        was refused for that reason, so the caller can tell the sender why;
-        every other outcome (delivered, queued, buffered) returns True.
-
-        This is the right chokepoint precisely because it is the HUMAN dashboard
-        funnel (``pty_input`` + ``pty_attachments``). The gate must not sink to
-        ``write_input``, which also carries ``submit_prompt`` — scheduler wakes
-        and cold submits legitimately have no human sender.
-        """
-        if not self.may_drive(sender_sub):
-            logger.info(
-                "interactive %s: dropped %d input byte(s) from a non-controller",
-                self.session_id[:8], len(data),
-            )
-            return False
-        if composer and self._question_parked:
-            text = data.decode("utf-8", errors="replace")
-            if text.startswith("\x1b[200~") and text.endswith("\x1b[201~\r"):
-                text = text[6:-7]
-            text = text.rstrip("\r\n")
-            if text and self.queue_prompt(text, source="dashboard", steer=True, raw=data):
-                return True
-        self.write_input(data)
-        return True
-
-    def write_input(self, data: bytes) -> bool:
-        """Write ``data`` to the PTY (or its readiness buffer). False when
-        nothing was written: a dead PTY, a local ``otodock`` terminal holding
-        the input, or bytes that were all terminal auto-responses."""
-        if not self.alive:
-            return False
-        # dual-control: while a local `otodock` terminal is the active
-        # controller (otodock_attached), the dashboard is a DETACHED (evicted)
-        # viewer — DROP its input so the two never fight over the one PTY. This is
-        # the authoritative server-side gate covering every dashboard write path
-        # (pty_input, pty_attachments, and submit_prompt all funnel here). The
-        # otodock terminal drives the PTY satellite-side (session.write), never
-        # through this proxy method, so it is unaffected.
-        if self.otodock_attached:
-            return False
-        # Drop the mirror xterm's terminal auto-responses FIRST (see
-        # core.terminal_queries.TERMINAL_REPLY_RE): they aren't user input,
-        # must not reach the PTY, and must not cancel the pending cold-submit
-        # Enter (the Windows-remote first-prompt-never-submits bug).
-        data = _strip_terminal_replies(data)
-        if not data:
-            return False
-        self._note_activity()
-        # Composer-dirty tracking (injection gate): only the residue that would
-        # also cancel the cold submit counts as typing — mouse reports are
-        # pointer, not text. A write ENDING with CR/NL is a submit (interior
-        # paste newlines don't submit); Ctrl-C empties the composer.
-        _typed = _MOUSE_RE.sub(b"", data)
-        if _typed and self._question_parked:
-            # While a dialog shows the keys go to it, not to the TUI's input
-            # box: its Enter puts the flag back as the park found it (what was
-            # typed since went to the dialog) and still tails at once so the
-            # answer reopens the turn live; the keys a picker takes leave the
-            # flag; other text may be a new draft (the park lags the dialog's
-            # close by a tail) and marks it.
-            if _typed.endswith((b"\r", b"\n")):
-                self._composer_dirty, self._composer_dirty_at = self._dirty_at_park
-                self._schedule_submit_tails()
-            elif not _DIALOG_KEYS_RE.fullmatch(_typed):
-                self._composer_dirty = True
-                self._composer_dirty_at = time.monotonic()
-        elif _typed:
-            if _typed.endswith((b"\r", b"\n")):
-                self._composer_dirty = False
-                # A terminal-side SUBMIT (Enter in the dashboard xterm): if it
-                # starts a turn, the transcript journals the user line within
-                # a beat — tail promptly so the turn OPENS live.
-                self._schedule_submit_tails()
-            elif b"\x03" in _typed:
-                self._composer_dirty = False
-            else:
-                self._composer_dirty = True
-                self._composer_dirty_at = time.monotonic()
-        if not self._ready:
-            # TUI not ready yet — buffer; _mark_ready flushes it. Prevents the
-            # first prompt from being sent before the CLI can accept input.
-            self._input_buffer.append(data)
-            return True
-        # Real user input after the cold start → cancel the pending cold-submit
-        # Enter (the user is driving now). But mouse-tracking reports (pointer
-        # move/click the xterm forwards) are NOT message input — they must reach
-        # the TUI yet must not pre-empt the first prompt, so cancel only when
-        # something OTHER than mouse bytes remains.
-        if (self._submit_settle_handle or self._submit_max_handle
-                or self._submit_recheck_handle) and _MOUSE_RE.sub(b"", data):
-            # Log the event only — never the input bytes (they can carry message
-            # content or pasted secrets).
-            logger.info(
-                "interactive %s: user input cancels pending cold-submit (%d bytes)",
-                self.session_id[:8], len(data),
-            )
-            self._cancel_deferred_submit()
-            # The user is driving — no replay. But the flushed text is not yet
-            # a confirmed turn: usually it sits in the composer (their next
-            # Enter sends it), yet a TUI dialog can have swallowed it (the
-            # resume-from-summary picker field loss) — so breadcrumb it
-            # before dropping. Redundancy in the happy case is the accepted
-            # cost of never losing a prompt.
-            if self._cold_flush_pending:
-                self._persist_undelivered_input(self._cold_flush_pending)
-            self._clear_cold_flush()
-        self._emit_to_pty(data)
-        return True
-
-    def interrupt_turn(self) -> bool:
-        """Dashboard Stop on an interactive chat: press ESC in the TUI — the
-        native stop-generation key in both CLIs. Gated on an OPEN turn (a
-        stray ESC on an idle TUI clears the composer / opens codex's
-        backtrack picker) and on dashboard control (an attached otodock
-        terminal owns its own keys — its viewer is evicted anyway). Returns
-        True when the ESC was actually sent; the turn state then closes via
-        the transcript interrupt markers, never from this call."""
-        if not self.alive or self.otodock_attached or not self._turn_open:
-            return False
-        self._note_activity()
-        self._emit_to_pty(b"\x1b")
-        logger.info("interactive %s: dashboard abort sent ESC", self.session_id[:8])
-        return True
-
-    def submit_prompt(self, text: str, *, settle: bool = False) -> bool:
-        """Deliver a COMPLETE prompt to the TUI and submit it. False when the
-        bytes went nowhere (the PTY gone, a local terminal holding the input):
-        the caller's note of the typed text comes back then.
-
-        Single-line text is a plain line-submit (text + CR). MULTI-LINE text (a
-        multi-line task prompt) is sent as a **bracketed paste** (``ESC[200~ …
-        ESC[201~``) so the TUI inserts it verbatim instead of submitting at the
-        first newline, then a trailing CR submits (mirrors the frontend's
-        multi-line interactive send). The CR rides the readiness gate + the single
-        deferred Enter like any cold prompt, so it lands even before the TUI is
-        ready.
-
-        ``settle=True`` (server-injected prompts — delegate wakes, queued
-        follow-ups): a large bracketed paste can still be ingesting when the
-        warm fixed-gap Enter lands — the TUI swallows it and the text sits in
-        the composer unsent. Route the trailing Enter through the cold-submit
-        settle machinery instead (echo-quiet + max backstop). Guards mirror
-        ``write_input`` (dual-control drop, readiness buffering) minus the
-        composer-dirty tracking — this is not user typing, and it must not
-        cancel its own pending Enter the way real user input would."""
-        raw = text.encode("utf-8")
-        if b"\n" in raw or b"\r" in raw:
-            data = b"\x1b[200~" + raw.replace(b"\r\n", b"\n") + b"\x1b[201~\r"
-        else:
-            data = raw + b"\r"
-        if not settle:
-            return self.write_input(data)
-        if not self.alive or self.otodock_attached:
-            return False
-        self._note_activity()
-        if not self._ready:
-            self._input_buffer.append(data)
-            return True
-        self._emit_to_pty(data, deferred_submit=True)
-        return True
-
-    def _emit_to_pty(self, data: bytes, deferred_submit: bool = False) -> None:
-        """Write to the PTY, ensuring a line-submit actually submits.
-
-        A line-submit (text + a trailing newline, e.g. ChatInput's "text\\r" or
-        the flushed first prompt) is written as the text, then Enter SEPARATELY —
-        one combined write often lands in the TUI's input box without submitting.
-        A bare Enter / single keystroke (live typing) is written as-is.
-
-        ``deferred_submit`` (the cold first-prompt flush): ALWAYS arm the Enter
-        (settle path) regardless of the buffer's trailing byte. A viewer's
-        just-attached xterm can append terminal-response bytes AFTER the prompt's
-        ``\\r``, so for a WATCHED chat the trailing byte is no longer ``\\r`` and the
-        generic newline test below would miss it — the prompt then sits unsent. The
-        freshly-rendered TUI may not have ingested the text yet, so the single armed
-        Enter waits for the echo to settle (_SUBMIT_SETTLE_S) before firing."""
-        if not self.alive:
-            return
-        is_submit = deferred_submit or (len(data) > 1 and data[-1:] in (b"\r", b"\n"))
-        # DB-fallback resume: prepend the restored-history digest right before
-        # the FIRST submission, as its own bracketed paste, so it lands as composer
-        # content (NOT N separate submits) ahead of the user's prompt → one combined
-        # turn. Independent of how the prompt was delivered (a pty_input paste for
-        # Claude, submit_prompt for Codex). The tailers strip the digest from the
-        # persisted user message.
-        if is_submit and not self._submitted_once and self._pending_seed_digest:
-            digest = self._pending_seed_digest
-            self._pending_seed_digest = ""
-            cast("PtyProcess", self.pty).write(
-                b"\x1b[200~"
-                + digest.encode("utf-8").replace(b"\r\n", b"\n")
-                + b"\n\n\x1b[201~"
-            )
-        if deferred_submit:
-            body = data.rstrip(b"\r\n")
-            if body:
-                cast("PtyProcess", self.pty).write(body)
-            self._submitted_once = True
-            self._arm_deferred_submit()
-            return
-        if len(data) > 1 and data[-1:] in (b"\r", b"\n"):
-            body = data.rstrip(b"\r\n")
-            if body:
-                cast("PtyProcess", self.pty).write(body)
-            # FIRST live line-submit uses the settle path (the TUI may not have
-            # ingested the text yet); warm submits after use the fast fixed gap.
-            if not self._submitted_once:
-                self._arm_deferred_submit()
-            else:
-                self._loop.call_later(_SUBMIT_ENTER_DELAY_S, self._warm_enter, self._park_seq)
-                self._schedule_submit_tails()
-            self._submitted_once = True
-        else:
-            cast("PtyProcess", self.pty).write(data)
-
-    def _warm_enter(self, park_seq: int) -> None:
-        """The warm line-submit's Enter, a fixed gap after its text."""
-        if self.alive and not self._enter_lands_in_a_dialog(park_seq):
-            cast("PtyProcess", self.pty).write(b"\r")
-
-    def _enter_lands_in_a_dialog(self, park_seq: int) -> bool:
-        """Whether a park began after the text this Enter submits (the park
-        count moved since ``park_seq``): the Enter would answer the new
-        dialog. It is held: the text stays in the TUI's input box, the
-        composer is marked dirty (so no prompt lands on it) and the unpark
-        presses the Enter when nothing was typed since."""
-        if not (self._question_parked and self._park_seq != park_seq):
-            return False
-        now = time.monotonic()
-        self._held_enter_at = now
-        self._composer_dirty, self._composer_dirty_at = True, now
-        self._dirty_at_park = (True, now)
-        logger.info("interactive %s: Enter held: a dialog opened after its text",
-                    self.session_id[:8])
-        return True
-
-    def _schedule_submit_tails(self) -> None:
-        """A prompt was just SUBMITTED to the TUI (terminal Enter, dashboard
-        line-submit, injected prompt, or the deferred cold Enter): tail the
-        transcript shortly after, so the turn OPENS (sidebar pulsing dot +
-        stop button) the moment the CLI journals the user line. The
-        post-output debounce can never do this — the TUI spinner redraws
-        continuously during generation, starving it until the turn ends.
-        Two one-shots tolerate a slow first journal write; the tailer's line
-        cursor makes re-runs idempotent."""
-        if self._closed or not self._ready or not self.chat_id:
-            return
-        for h in self._submit_tail_handles:
-            with contextlib.suppress(Exception):
-                h.cancel()
-        self._submit_tail_handles = [
-            self._loop.call_later(delay, self._run_post_output_tail)
-            for delay in (1.5, 4.0)
-        ]
-
-    def _arm_deferred_submit(self) -> None:
-        """Arm the cold-first-prompt Enter.
-
-        Fires the FIRST Enter when the echo goes quiet for _SUBMIT_SETTLE_S (re-armed
-        on each output by _fanout_output, so a still-rendering / MCP-warming TUI
-        keeps it from firing early), or at _SUBMIT_MAX_S as a backstop. After that,
-        :meth:`_fire_submit` then schedules ONE backstop Enter for Windows-remote
-        Claude only."""
-        self._cancel_deferred_submit()
-        self._submit_refires = 0
-        self._submit_park_seq = self._park_seq
-        self._submit_settle_handle = self._loop.call_later(_SUBMIT_SETTLE_S, self._fire_submit)
-        self._submit_max_handle = self._loop.call_later(_SUBMIT_MAX_S, self._fire_submit)
-
-    def _fire_submit(self) -> None:
-        self._cancel_deferred_submit()
-        if not self.alive or self._enter_lands_in_a_dialog(self._submit_park_seq):
-            return
-        cast("PtyProcess", self.pty).write(b"\r")
-        self._schedule_submit_tails()  # the turn starts NOW — open it live
-        logger.info(
-            "interactive %s: cold-submit Enter fired (try %d)",
-            self.session_id[:8], self._submit_refires + 1,
-        )
-        # A COLD flush (readiness-buffered first prompt) gets a confirmation
-        # watcher: if the transcript never journals the user line, this Enter
-        # was swallowed and the flush must be replayed.
-        if self._cold_flush_pending:
-            self._arm_cold_flush_watch()
-        # WINDOWS-remote, and only a TUI that declares it (Claude's Ink): the
-        # ConPTY render race can swallow this single post-settle Enter (it lands
-        # first-try local + Linux-remote). Fire ONE more Enter
-        # _SUBMIT_WIN_BACKSTOP_S later — by then the TUI is idle. 2 Enters
-        # total: an extra Enter on an already-submitted/empty composer is a no-op;
-        # the narrow accepted risk is a native menu shown within the gap (it'd select
-        # an option). Codex / Linux-remote / local: no backstop (single Enter works).
-        _row = host_os.of(self.remote_os)
-        if (self._submit_refires == 0
-                and self._engine_caps.runtime.interactive_submit_backstop
-                and _row is not None and _row.conpty):
-            self._submit_refires = 1
-            self._submit_recheck_handle = self._loop.call_later(
-                _SUBMIT_WIN_BACKSTOP_S, self._fire_submit,
-            )
-
-    def _cancel_deferred_submit(self) -> None:
-        for h in (self._submit_settle_handle, self._submit_max_handle,
-                  self._submit_recheck_handle):
-            if h is not None:
-                h.cancel()
-        self._submit_settle_handle = self._submit_max_handle = None
-        self._submit_recheck_handle = None
-
-    # -- cold-flush confirm-and-retry ------------------------------------------
-    def _arm_cold_flush_watch(self) -> None:
-        if self._cold_flush_watcher is not None:
-            self._cold_flush_watcher.cancel()
-        # The reference is the FIRST Enter of this flush: a retry or the
-        # Windows backstop Enter must not move it past a hook stamp that
-        # already proved the first Enter was accepted.
-        if self._cold_flush_enter_at <= 0:
-            self._cold_flush_enter_at = time.monotonic()
-        self._cold_flush_watcher = self._loop.call_later(
-            _COLD_RETRY_S, self._check_cold_flush,
-        )
-
-    def _cold_flush_confirmed_by_hooks(self) -> bool:
-        """True when a hook of THIS session fired after the cold Enter — the
-        CLI is running a turn, so the prompt was accepted even if the
-        transcript has not shown the user line (yet, or at all)."""
-        if self._cold_flush_enter_at <= 0:
-            return False
-        from core.session.session_state import get_hook_activity
-        return get_hook_activity(self.session_id) >= self._cold_flush_enter_at
-
-    def _check_cold_flush(self) -> None:
-        """The cold Enter fired _COLD_RETRY_S ago. If the transcript never
-        confirmed the turn (journaled user line → ``_turn_open``), the flush was
-        swallowed by a still-booting composer — replay it. Bounded; stands down
-        the moment the turn opens (:meth:`_set_turn_open`) or the user starts
-        driving (``write_input`` clears the pending flush on real input).
-
-        A second confirmation source: hook activity. A PreToolUse / Stop /
-        SubagentStop hook stamped after the Enter proves the turn is running,
-        so the flush is done even when no transcript line has arrived — a
-        late satellite forward, or no transcript at all (a CLI that inherited
-        ``CLAUDE_CODE_CHILD_SESSION`` journals nothing). Re-emitting there
-        pasted the prompt into the open question dialog and answered it with
-        the Enter, then left a false undelivered-input breadcrumb (T1,
-        2026-09-10)."""
-        self._cold_flush_watcher = None
-        if (not self._cold_flush_pending or self._turn_open
-                or not self.alive or self._closing or self._closed):
-            return
-        if self._cold_flush_confirmed_by_hooks():
-            logger.info(
-                "interactive %s: cold first prompt confirmed by hook activity "
-                "— retry stands down", self.session_id[:8],
-            )
-            self._clear_cold_flush()
-            return
-        if self._cold_flush_attempts >= _COLD_RETRY_MAX:
-            logger.warning(
-                "interactive %s: cold first prompt unconfirmed after %d "
-                "attempt(s) — giving up (the user must resend)",
-                self.session_id[:8], self._cold_flush_attempts + 1,
-            )
-            # Definitive loss (no turn ever opened with this text) — leave
-            # the recovery breadcrumb before dropping the bytes.
-            self._persist_undelivered_input(self._cold_flush_pending)
-            self._cold_flush_pending = b""
-            self._cold_flush_seed = ""
-            return
-        self._cold_flush_attempts += 1
-        logger.info(
-            "interactive %s: cold first prompt unconfirmed — re-emitting "
-            "(retry %d/%d)",
-            self.session_id[:8], self._cold_flush_attempts, _COLD_RETRY_MAX,
-        )
-        # Replay the ORIGINAL flush shape: restore the seed digest and the
-        # first-submission flag so _emit_to_pty pastes seed + body + arms the
-        # deferred Enter exactly like the swallowed attempt did. Synchronous
-        # within this callback — nothing can interleave before the emit.
-        if self._cold_flush_seed:
-            self._pending_seed_digest = self._cold_flush_seed
-        self._submitted_once = False
-        self._emit_to_pty(self._cold_flush_pending, deferred_submit=True)
-
-    def _clear_cold_flush(self) -> None:
-        self._cold_flush_pending = b""
-        self._cold_flush_seed = ""
-        self._cold_flush_enter_at = 0.0
-        if self._cold_flush_watcher is not None:
-            self._cold_flush_watcher.cancel()
-            self._cold_flush_watcher = None
-
-    def _persist_undelivered_input(self, raw: bytes) -> None:
-        """Persist an abandoned cold flush into the chat as a recovery
-        breadcrumb (system event ``undelivered_input``).
-
-        A cold flush that never became a confirmed turn is otherwise GONE —
-        interactive persistence is transcript-derived, so text swallowed by a
-        TUI dialog (the CLI's resume-from-summary picker ate a 1143-byte
-        prompt in the field, 2026-08-18) leaves no DB trace. Called from the
-        two places the flush is abandoned: the confirm-and-retry watcher's
-        give-up branch, and the user-input cancel (there the text USUALLY
-        sits safely in the composer — the breadcrumb may then be redundant,
-        which is the acceptable side of the trade). Length-gated so key
-        residue never becomes a row; best-effort, off-loop."""
-        if not self.chat_id:
-            return
-        text = _breadcrumb_text(raw)
-        if len(text) < _BREADCRUMB_MIN_CHARS:
-            return
-        from core.session.transcript_tool_events import persist_event
-        from storage import database as task_store
-        block = {
-            "type": wire.SYSTEM,
-            "subtype": wire.SUBTYPE_UNDELIVERED_INPUT,
-            "message": text,
-        }
-        async def _write() -> None:
-            try:
-                await asyncio.to_thread(
-                    persist_event, task_store, self.chat_id, block,
-                )
-                logger.warning(
-                    "interactive %s: cold flush abandoned — %d char(s) "
-                    "persisted as undelivered-input breadcrumb",
-                    self.session_id[:8], len(text),
-                )
-            except Exception:
-                logger.exception(
-                    "interactive %s: undelivered-input breadcrumb persist "
-                    "failed", self.session_id[:8],
-                )
-        spawn(_write(), name="write", owner="interactive_session")
-
-    def set_pending_seed(self, digest: str) -> None:
-        """Stash a restored-history digest (DB-fallback) to prepend to the cold
-        first prompt. Set by the spawn path right after the session is created and
-        BEFORE the readiness flush, so :meth:`_emit_to_pty` pastes it ahead of the
-        user's first prompt. No-op for an empty digest."""
-        if digest:
-            self._pending_seed_digest = digest
-
-    # -- server-prompt injection (delegate results …) --------------------------
-    def queue_prompt(self, text: str, source: str, **context) -> dict | None:
-        """Queue a server-originated prompt for injection at CLI quiescence.
-
-        ``steer=True`` in the context marks the item steer-eligible: with an
-        OPEN turn it injects mid-turn instead of waiting for quiescence (see
-        ``_prompt_gates_blocked``), on this proxy's PTY and a paired
-        machine's alike; with the turn closed, or a local ``otodock``
-        terminal attached (the satellite injects at the turn end), the flag
-        is inert. ``raw`` (a person's held composer send) is typed as given
-        instead of submitted as ``text``. ``on_injected`` in the context is called once the prompt is in
-        the terminal (the local paste, or the satellite's ACK). Returns the
-        queued item — the handle ``cancel_prompt`` takes — or None when the
-        session can't take it (dead/closing) so the delivery ladder falls
-        through to its headless rungs. ``context`` is the re-delivery payload
-        (chat_id/agent/user_sub/role/hops + the ladder's rung callables) that
-        close() hands back if the PTY dies first. Deliberately does NOT count
-        as activity — a starved queue must not immortalize an unviewed session
-        against the idle reaper (reap → close → handback is the designed
-        escape for a composer that never clears)."""
-        if not self.alive or self._closing or self._closed:
-            return None
-        item = {"text": text, "source": source, **context}
-        self._prompt_queue.append(item)
-        logger.info(
-            "interactive %s: queued server prompt [%s] (depth=%d)",
-            self.session_id[:8], source, len(self._prompt_queue),
-        )
-        spawn(self._try_drain_prompt_queue(),
-              name="try_drain_prompt_queue", owner="interactive_session")
-        return item
-
-    def cancel_prompt(self, item: dict) -> bool:
-        """Drop a queued prompt that has not been injected yet (a cancelled
-        borrowed-terminal round); False when it already left the queue, or
-        when it is the satellite's in-flight injection, which may land anyway
-        (dropped all the same: a decline or a lost result never re-sends it)."""
-        try:
-            self._prompt_queue.remove(item)
-        except ValueError:
-            return False
-        inflight = self._satellite_inject
-        return inflight is None or inflight.get("item") is not item
-
-    def add_turn_end_waiter(self, cb: TurnCompleteCb) -> None:
-        """Fire ``cb`` once at the next turn end that passes the completion
-        gates (min turn time, no background subagent, not a question)."""
-        cast("list[TurnCompleteCb]", self._turn_end_waiters).append(cb)
-
-    def remove_turn_end_waiter(self, cb: TurnCompleteCb) -> None:
-        if cb in self._turn_end_waiters:
-            cast("list[TurnCompleteCb]", self._turn_end_waiters).remove(cb)
-
-    def _note_injected(self, item: dict, *, cancelled: bool = False) -> None:
-        """The prompt is in the terminal: note it for the tailer when its row
-        exists (``note``: the item's row is its queuer's, the owner this
-        session), then tell whoever queued it. An item cancelled while the
-        satellite typed it (``cancelled``) gets no hook, its round is gone;
-        one whose row that hook would have written gets no note either, so
-        the tailer's plain row stays the one record of what the agent was
-        told."""
-        cb = item.get("on_injected")
-        if cancelled and cb is not None:
-            return
-        if item.get("note") and self.chat_id:
-            note_sent_prompt(self.chat_id, item["text"], owner=self.session_id)
-        if cancelled or cb is None:
-            return
-        try:
-            cb()
-        except Exception:
-            logger.exception("interactive: on_injected hook failed [%s]", item.get("source", "?"))
-
-    def _apply_turn_signal(self, last_signal: str | None,
-                           question_pending: bool = False,
-                           signal_at: float | None = None) -> None:
-        """Fold a tailer batch's ``last_signal`` into the turn-open state.
-        ``question_pending`` tracks the question-parked flag alongside: set on
-        a question fold, cleared by the next turn-relevant signal (reopen or
-        real end_turn); signal-less batches leave it untouched. A batch with
-        a signal is activity: the CLI journaled turn work, which covers a turn
-        it opened with no input (a background subagent's result, a self-wake).
-
-        ``signal_at`` is the journal time of the line behind the signal: while
-        a hook park holds the turn, a reopen journaled before the park (an
-        earlier call's lines, read before the park and folded after it) is
-        dropped, so the composer hold stays on and a send cannot land in the
-        dialog. A line from after the park (the answer) folds as always."""
-        if (signal_at is not None and not question_pending
-                and leaves_turn_open(last_signal) and self._question_parked
-                and self._parked_at is not None and signal_at < self._parked_at):
-            return
-        if last_signal is not None or question_pending:
-            self._note_activity(io=False)
-        if question_pending:
-            self._set_parked(True)
-        elif last_signal is not None:
-            self._set_parked(False)
-            self._parked_at = None
-        if leaves_turn_open(last_signal):
-            self._set_turn_open(True)
-        elif last_signal == "end_turn":
-            if self._turn_open:
-                self._set_turn_open(False)
-            else:
-                # A quick turn can fit in ONE tailer batch (fresh sessions
-                # surface their transcript late): the fold then sees only the
-                # closing signal and the open transition never happens. The
-                # close-side effects must still run, or a short background
-                # turn never stamps last_response_at / lights the unread dot.
-                self._turn_end_effects()
-
-    def _set_parked(self, parked: bool) -> None:
-        """The question park, on and off, for every site. A park counts
-        itself (an Enter armed before it is held, ``_enter_lands_in_a_dialog``)
-        and keeps the composer flag it found (the dialog's own Enter puts it
-        back, ``write_input``). The unpark presses an Enter held for its text
-        when nothing was typed since, and drains a message held for the
-        dialog at once instead of at the backstop."""
-        if parked == self._question_parked:
-            return
-        self._question_parked = parked
-        if parked:
-            self._park_seq += 1
-            self._dirty_at_park = (self._composer_dirty, self._composer_dirty_at)
-            return
-        held, self._held_enter_at = self._held_enter_at, None
-        if (held is not None and self.alive and not self.otodock_attached
-                and self._composer_dirty and self._composer_dirty_at == held):
-            cast("PtyProcess", self.pty).write(b"\r")
-            self._composer_dirty = False
-            self._schedule_submit_tails()
-            logger.info("interactive %s: pressed the Enter held for a dialog",
-                        self.session_id[:8])
-        if self._prompt_queue and not (self._closing or self._closed):
-            spawn(self._try_drain_prompt_queue(),
-                  name="try_drain_prompt_queue", owner="interactive_session")
-
-    def park_on_native_dialog(self, tool_name: str, *, sent_at: float | None = None) -> None:
-        """The permission hook saw the CLI open a dialog that blocks the turn
-        on the human — the AskUserQuestion cards (hook ``allow``), the
-        ExitPlanMode approval (hook ``defer``) or Codex's request_user_input
-        picker. Park the turn NOW: close it (live dot / Stop button clear,
-        ``last_response_at`` stamped), hold composer sends and injections
-        (``_question_parked``) and fire the "needs your input" ping. The
-        transcript fold (``question_pending``) does the same once the CLI
-        journals the ``tool_use`` line — but Claude writes that line late in
-        some runs (T1, 2.1.263, 2026-09-10: two of three plan approvals
-        journaled while the dialog was open, one only with the answer; the
-        operator's live question journaled NOTHING of the reply until the
-        answer), and then the chat sat live for the whole dialog. The hook
-        call is deterministic and precedes the dialog, so it is the primary
-        trigger; the fold stays as the fallback and ``_native_park_pinged``
-        keeps it from pinging the same dialog twice. The chat rows stay the
-        tailers' job: while the CLI holds its reply the history shows the
-        prompt only, and the whole turn lands in order with the answer (a
-        hook-written card was tried and dropped — it could not be answered
-        from the history and the late-arriving text rendered below it).
-        ``sent_at`` is the gate's ``hook_sent_at`` (the clock of the host the
-        CLI runs on), kept so a tail batch read before the park cannot reopen
-        the turn (``_apply_turn_signal``). Loop thread (called from the hook
-        handler)."""
-        if self._closed or not self.chat_id:
-            return
-        logger.info("interactive %s: parked on the native %s dialog",
-                    self.session_id[:8], tool_name)
-        self._note_activity(io=False)
-        self._set_parked(True)
-        self._parked_at = sent_at
-        if self._turn_open:
-            self._set_turn_open(False)
-        else:
-            # The transcript never opened this turn (late user line): the
-            # close-side effects must still run so the dot clears.
-            self._turn_end_effects()
-        # The flag dedupes the transcript fold, never a hook park: a dialog
-        # chained on the previous one (a follow-up question, a plan approval
-        # after a question) parks before any tail consumed the flag, and
-        # each of them is a fresh wait on the human.
-        self._native_park_pinged = False
-        self._maybe_fire_turn_complete("", persisted=1, question=True)
-        self._native_park_pinged = True
-
-    def _chat_owner(self) -> str:
-        """The chat ROW's owner sub (synthetic ``agent::<slug>`` for shared-only
-        agents) — the identity the chat_status fan-out keys on. Lazy, cached."""
-        if self._chat_owner_sub is None:
-            try:
-                from storage import database as task_store
-                row = task_store.get_chat(self.chat_id) or {}
-                self._chat_owner_sub = row.get("user_sub") or self.user_sub or ""
-            except (ImportError, psycopg.Error):
-                self._chat_owner_sub = self.user_sub or ""
-        return self._chat_owner_sub
-
-    def _set_turn_open(self, is_open: bool) -> None:
-        """Set the turn-open flag; on a TRANSITION, broadcast the sidebar
-        live-dot signal (streaming/ready) — interactive sessions have no pump,
-        so without this a background interactive turn never lights the dot and
-        a crash mid-turn never clears it. The close transition also stamps
-        ``chats.last_response_at`` for the unread indicator. Meeting chats are
-        skipped (per-speaker turns are not chat-level activity)."""
-        was = self._turn_open
-        self._turn_open = is_open
-        if is_open != was:
-            self._note_activity(io=False)
-        if is_open:
-            self._set_parked(False)  # any open unparks (answer/inject)
-            self._native_park_pinged = False
-            self._clear_cold_flush()  # prompt confirmed — retry stands down
-        if is_open == was or not self.chat_id:
-            return
-        if is_open:
-            try:
-                from services.notifications import notification_manager
-                notification_manager.broadcast_chat_status(
-                    self._chat_owner(), self.chat_id, chat_phase.STREAMING,
-                    agent=self.agent_name,
-                )
-            except Exception:
-                logger.exception(
-                    "interactive %s: turn-status broadcast failed", self.session_id[:8]
-                )
-            # Early-title latency cap: one-shot timer armed at the FIRST open
-            # transition of an untitled chat (see _TITLE_EARLY_TIMER_S).
-            if self._title_armed and not self._title_timer_spent:
-                self._title_timer_spent = True
-                self._title_timer = self._loop.call_later(
-                    _TITLE_EARLY_TIMER_S, self._fire_title_timer)
-            # Mid-turn tail cycle (local): rows land as the turn produces them.
-            if not self.is_remote and self._midturn_tail_handle is None:
-                self._midturn_tail_handle = self._loop.call_later(
-                    _MIDTURN_TAIL_S, self._run_midturn_tail)
-        else:
-            if self._midturn_tail_handle is not None:
-                self._midturn_tail_handle.cancel()
-                self._midturn_tail_handle = None
-            self._turn_end_effects()
-
-    def _turn_end_effects(self) -> None:
-        """A turn genuinely ended on this chat: stamp ``last_response_at`` and
-        broadcast the ``ready`` live-dot signal. Runs on the open→closed
-        transition AND on an end_turn signal with no prior open (whole turn in
-        one tailer batch) — both are real turn ends. Idempotent."""
-        self._kick_prompt_queue_post_turn()
-        # The platform's turn_end, as an OBSERVATION: on a terminal the CLI
-        # drives the turn and the Stop hook is the one point that can hold it
-        # open, so the verdict is computed there (HOOKS.md); this call only
-        # records the end for the session's bookkeeping.
-        try:
-            from core.session import session_events
-            spawn(session_events.turn_end(
-                self.session_id, source="transcript",
-                engine=self.transcript_kind, driven_by="cli",
-            ), name="turn_end", owner="interactive_session")
-        except ImportError:
-            logger.debug("interactive %s: turn_end observation failed",
-                         self.session_id[:8], exc_info=True)
-        if not self.chat_id:
-            return
-        try:
-            from datetime import datetime, timezone
-
-            from services.notifications import notification_manager
-            from storage.pg import db_executor
-
-            _chat_id = self.chat_id
-            _owner = self._chat_owner()
-            _mark_read = bool(self.otodock_attached)
-            _now_iso = datetime.now(timezone.utc).isoformat()
-            _sid = self.session_id[:8]
-
-            def _stamp_job() -> None:
-                # ONE ordered executor job: ``last_response_at`` first, then
-                # the read mark — two separate jobs could land reversed and
-                # leave an otodock-attached chat showing unread. Per-turn DB
-                # writes never run on the loop thread (storage/pg.py rule).
-                from storage import database as task_store
-                task_store.update_chat(_chat_id, last_response_at=_now_iso)
-                if _mark_read:
-                    # The response just rendered on a live otodock terminal —
-                    # that IS the read (the dashboard's visible-tab rule,
-                    # terminal edition). Without this the fixed unread dot
-                    # lingers until someone opens the chat in the dashboard.
-                    # Detached-at-turn-end chats keep the dot: nobody saw it.
-                    task_store.mark_chat_read(_chat_id, _owner)
-
-            def _stamp_done(fut) -> None:
-                try:
-                    fut.result()
-                except psycopg.Error:
-                    logger.debug("interactive %s: turn-end stamp failed", _sid,
-                                 exc_info=True)
-
-            # Loop closing → the stamp is best-effort.
-            with contextlib.suppress(RuntimeError):
-                self._loop.run_in_executor(db_executor(), _stamp_job).add_done_callback(
-                    _stamp_done,
-                )
-            notification_manager.broadcast_chat_status(
-                _owner, _chat_id, chat_phase.READY, agent=self.agent_name,
-            )
-            if _mark_read:
-                with contextlib.suppress(Exception):
-                    notification_manager.broadcast_chat_read(
-                        _owner, _chat_id, agent=self.agent_name,
-                    )
-        except Exception:
-            logger.exception(
-                "interactive %s: turn-status broadcast failed", self.session_id[:8]
-            )
-
-    def _kick_prompt_queue_post_turn(self) -> None:
-        """A turn just closed with prompts queued: schedule a drain right after
-        the quiet window instead of leaving delivery to the 5s backstop cadence
-        — a queued delegate result should land AT the turn boundary. The drain
-        re-checks every gate itself, so a late fire on a closed/busy session is
-        a no-op."""
-        if not self._prompt_queue or self._closing or self._closed:
-            return
-        self._loop.call_later(
-            _INJECT_QUIET_S + 0.1,
-            lambda: self._loop.create_task(self._try_drain_prompt_queue()),
-        )
-
-    def _arm_inject_backstop(self) -> None:
-        if (self._inject_backstop_handle is None and self._prompt_queue
-                and not self._closing and not self._closed):
-            self._inject_backstop_handle = self._loop.call_later(
-                _INJECT_BACKSTOP_S, self._fire_inject_backstop,
-            )
-
-    def _fire_inject_backstop(self) -> None:
-        self._inject_backstop_handle = None
-        if self._prompt_queue and not self._closing and not self._closed:
-            spawn(self._try_drain_prompt_queue(),
-                  name="try_drain_prompt_queue", owner="interactive_session")
-
-    def _prompt_gates_blocked(
-        self, *, for_satellite: bool = False, steering: bool = False,
-    ) -> str | None:
-        """The first injection gate that blocks right now, or None when clear.
-        Cheap, synchronous — callable before AND after the freshness tail.
-        ``for_satellite`` skips the composer gate: while otodock-attached the
-        dashboard input path is dropped (so ``_composer_dirty`` is stale) and
-        the LOCAL terminal's line state is the satellite's to judge.
-
-        ``steering`` + an OPEN turn drops the ``turn_open``/``not_quiet``/
-        ``bg_pending`` gates: both TUIs treat mid-turn typed input as a steer
-        (consumed between tool calls), and a streaming turn's output resets
-        the quiet clock forever, so those gates would starve a steer. All
-        SAFETY gates stay — a dialog, a dirty composer, or an in-flight
-        cold submit blocks steers too. A steer item with the turn CLOSED is
-        an ordinary inject (full gate run)."""
-        steer_live = steering and self._turn_open
-        if not self.alive or self._closing or self._closed:
-            return "dead"
-        if not self._ready:
-            return "not_ready"
-        # A pending cold-submit Enter means the user's first prompt is still in
-        # flight — injecting now would cancel that Enter and merge the prompts.
-        if (self._submit_settle_handle is not None
-                or self._submit_max_handle is not None
-                or self._submit_recheck_handle is not None):
-            return "cold_submit_pending"
-        if self._turn_open and not steer_live:
-            return "turn_open"
-        # An unstamped dirty flag (no timestamp yet) holds unconditionally —
-        # only a KNOWN-stale draft may expire.
-        if (not for_satellite and self._composer_dirty
-                and (not self._composer_dirty_at
-                     or time.monotonic() - self._composer_dirty_at
-                     < _COMPOSER_DIRTY_TTL_S)):
-            return "composer_dirty"
-        if not steer_live and self.quiet_seconds < _INJECT_QUIET_S:
-            return "not_quiet"
-        # Shared completion gates (mirror _maybe_fire_turn_complete): a young
-        # session may still be warming; a pending bg subagent means a follow-up
-        # turn is coming (irrelevant mid-steer: the target turn is open NOW).
-        if (time.monotonic() - self.created_at) < MIN_TURN_S:
-            return "too_young"
-        if not steer_live:
-            try:
-                from core.session.session_state import get_subagent_registry
-                if get_subagent_registry(self.session_id).has_pending:
-                    return "bg_pending"
-            except ImportError:
-                pass
-        # A pending hook permission prompt: the TUI is waiting on a dialog —
-        # an injected CR would answer it.
-        try:
-            from core.session.session_state import _session_permission_requests
-            if _session_permission_requests.get(self.session_id):
-                return "permission_pending"
-        except ImportError:
-            pass
-        # Parked on an AskUserQuestion dialog (turn folded closed): the paste +
-        # CR would land in the question picker instead of the composer.
-        if self._question_parked:
-            return "question_parked"
-        return None
-
-    def _log_held(self, reason: str) -> None:
-        """Held-gate reason, logged at INFO on CHANGE only (the backstop
-        retries every few seconds — repeat reasons stay at debug). A delegate
-        result sitting queued on a live session was undiagnosable in the
-        field: the block reason never reached the logs."""
-        if reason != self._last_held_reason:
-            self._last_held_reason = reason
-            logger.info(
-                "interactive %s: prompt injection held (%s, depth=%d)",
-                self.session_id[:8], reason, len(self._prompt_queue),
-            )
-        else:
-            logger.debug(
-                "interactive %s: prompt injection held (%s)",
-                self.session_id[:8], reason,
-            )
-
-    async def _try_drain_prompt_queue(self) -> None:
-        """Inject the next queued server prompt iff the CLI is quiescent.
-
-        ONE item per attempt — the injected prompt opens a turn, so the next
-        item waits for that turn's ``end_turn``. Re-arms the backstop timer
-        whenever the queue stays non-empty (gate blocked / more items)."""
-        if self._draining_prompts:
-            return
-        self._draining_prompts = True
-        try:
-            if not self._prompt_queue:
-                return
-            if self.otodock_attached:
-                # The local otodock terminal owns this PTY's input; the proxy
-                # must not write. The satellite injection path (versioned)
-                # takes these items instead; until it does, they wait here —
-                # a detach flips the flag and this proxy path takes over.
-                # Satellite injection is turn-end by design — the steer flag
-                # is deliberately inert on this path (recorded follow-up).
-                await self._try_satellite_inject()
-                return
-            # Steer eligibility is the HEAD item's — FIFO order is never
-            # reordered, so a steer item behind a normal one waits with it.
-            steering = bool(self._prompt_queue[0].get("steer"))
-            blocked = self._prompt_gates_blocked(steering=steering)
-            if blocked:
-                self._log_held(blocked)
-                return
-            # Freshness: the local debounce tail can be up to 3s stale — force
-            # a tail so _turn_open reflects the transcript NOW (a quiet mid-turn
-            # lull, e.g. a native permission dialog waiting for input, must not
-            # read as idle). Remote sessions are fresh via the satellite's 0.8s
-            # forwarded-lines poll, and have no local file to read.
-            if not self.is_remote and self.chat_id:
-                tailer = self._tailer()
-                try:
-                    result = await asyncio.to_thread(
-                        tailer.resolve_and_tail, self.session_id, self.chat_id,
-                    )
-                except Exception:
-                    logger.exception(
-                        "interactive %s: pre-inject tail failed", self.session_id[:8]
-                    )
-                    return
-                # The whole fold: the cursor moved past this batch, so a turn
-                # end in it is reported here or never.
-                self._fold_tail_result(result)
-                if not self._prompt_queue:
-                    return
-                # Re-check everything after the await — state may have moved
-                # (the tail can flip _turn_open; output during the await resets
-                # the quiet clock; a cancel can change the head, and with it
-                # the steer eligibility).
-                steering = bool(self._prompt_queue[0].get("steer"))
-                blocked = self._prompt_gates_blocked(steering=steering)
-                if blocked:
-                    self._log_held(f"{blocked} post-tail")
-                    return
-            if not self._prompt_queue:
-                return
-            item = self._prompt_queue.popleft()
-            self._last_held_reason = None
-            steered_live = self._turn_open
-            raw = item.get("raw")
-            if raw:
-                # A person's composer send held for a dialog: typed as the
-                # page sent it (its bracketed paste, then the warm Enter, in a
-                # session whose earlier prompts were only typed keys too).
-                self._submitted_once = True
-                written = self.write_input(raw)
-            else:
-                # settle=True: the trailing Enter waits for the paste echo to
-                # settle (large delegate results were landing in the composer
-                # with the fixed-gap Enter swallowed mid-ingest → never sent).
-                written = self.submit_prompt(item["text"], settle=True)
-            if not written:
-                # The PTY went away, or a local terminal took the input,
-                # between the gate and the write: the item waits at the head
-                # (the close hands the queue back, the satellite path takes
-                # it) and the turn stays as it was.
-                self._prompt_queue.appendleft(item)
-                return
-            # The injected prompt opens a turn NOW (no-op transition for a
-            # mid-turn steer — the turn is already open) — the tailer confirms
-            # within a poll, but the flag must flip synchronously so a second
-            # queued item can't ride the stale-idle window.
-            self._set_turn_open(True)
-            logger.info(
-                "interactive %s: %s server prompt [%s] (%d left)",
-                self.session_id[:8],
-                "steered into open turn" if steered_live else "injected",
-                item.get("source", "?"), len(self._prompt_queue),
-            )
-            self._note_injected(item)
-        finally:
-            self._draining_prompts = False
-            self._arm_inject_backstop()
-
-    async def _try_satellite_inject(self) -> None:
-        """otodock-attached: hand the head item to the satellite's stdin-inject
-        path — the satellite owns the local terminal's input-line state; the
-        proxy owns the turn-state decision (its gates below run on the same
-        forwarded-transcript signals as the proxy path, minus the composer).
-        The head item stays queued until the satellite ACKs; a local-terminal
-        detach or an old satellite leaves it queued for the proxy path /
-        close-handback."""
-        if not self._prompt_queue or not self.is_remote:
-            return
-        blocked = self._prompt_gates_blocked(for_satellite=True)
-        if blocked:
-            logger.debug(
-                "interactive %s: satellite injection held (%s)",
-                self.session_id[:8], blocked,
-            )
-            return
-        from core.remote.satellite_connection import get_connection_manager
-        mgr = get_connection_manager()
-        if not mgr.satellite_supports_pty_inject(self.target):
-            logger.debug(
-                "interactive %s: satellite %s predates pty_inject — prompt held",
-                self.session_id[:8], self.target[:8],
-            )
-            return
-        now = time.monotonic()
-        inflight = self._satellite_inject
-        if inflight is not None:
-            if now - inflight["sent_at"] < _SATELLITE_INJECT_TIMEOUT_S:
-                return  # awaiting the result frame
-            if any(q is inflight["item"] for q in self._prompt_queue):
-                # Result lost (WS blip) — re-send the SAME id; the
-                # satellite's recent-id dedupe re-ACKs without re-injecting.
-                inflight["sent_at"] = now
-            else:
-                inflight = None  # cancelled in flight — never re-sent
-        if inflight is None:
-            inflight = {"inject_id": uuid.uuid4().hex[:12], "sent_at": now,
-                        "item": self._prompt_queue[0]}
-            self._satellite_inject = inflight
-        inject_id, item = inflight["inject_id"], inflight["item"]
-        await mgr.send_fire_and_forget(self.target, {
-            "type": "pty_inject",
-            "session_id": self.session_id,
-            "inject_id": inject_id,
-            "text": item["text"],
-            "source": item.get("source", ""),
-        })
-        logger.info(
-            "interactive %s: pty_inject sent to satellite %s [%s]",
-            self.session_id[:8], self.target[:8], item.get("source", "?"),
-        )
-
-    def handle_inject_result(self, inject_id: str, ok: bool, reason: str = "") -> None:
-        """satellite ``pty_inject_result``: resolve the in-flight injection.
-        ACK removes exactly the item that was sent (the prompt is in the
-        user's terminal) and opens the turn; an item cancelled in flight is
-        already gone and nothing else leaves the queue. NACK leaves it queued
-        for the backstop / the proxy path (after a detach) / the
-        close-handback (session gone)."""
-        inflight = self._satellite_inject
-        if not inflight or inflight.get("inject_id") != inject_id:
-            return  # stale or unknown — a newer attempt owns the slot
-        self._satellite_inject = None
-        if ok:
-            item = inflight["item"]
-            queued = False
-            for i, q in enumerate(self._prompt_queue):
-                if q is item:
-                    del self._prompt_queue[i]
-                    queued = True
-                    break
-            self._set_turn_open(True)  # the injected prompt opened a turn
-            logger.info(
-                "interactive %s: satellite injected server prompt [%s]%s (%d left)",
-                self.session_id[:8], item.get("source", "?"),
-                "" if queued else " cancelled in flight", len(self._prompt_queue),
-            )
-            # The satellite typed it either way; a cancelled item's round is
-            # gone, and with it the row its hook would have written.
-            self._note_injected(item, cancelled=not queued)
-        else:
-            logger.info(
-                "interactive %s: satellite injection declined (%s)",
-                self.session_id[:8], reason or "?",
-            )
-            if reason == "not_attached" and not self.otodock_attached:
-                # The local terminal detached while the frame was in flight —
-                # the proxy path owns the queue again.
-                spawn(self._try_drain_prompt_queue(),
-                      name="try_drain_prompt_queue", owner="interactive_session")
-        self._arm_inject_backstop()
-
-    def _tailer(self):
-        """The transcript-persistence module for this session's engine
-        (``ExecutionLayer.transcript_tailer``). Both engines' modules expose
-        the same ``resolve_and_tail(session_id, chat_id)`` + ``forget``
-        surface, so the call sites are engine-agnostic."""
-        from core.session.session_manager import get_layer_by_path
-        return get_layer_by_path(self.execution_path).transcript_tailer()
-
-    def _run_post_output_tail(self) -> None:
-        """Output settled (turn / long pause likely ended) → tail the transcript
-        into chat_messages + backfill the title, off the event loop. Idempotent
-        (the tailer's line cursor skips already-seen lines). Also fires the
-        interactive-task completion callback when the tailer reports turn-end."""
-        self._tail_handle = None
-        if self._closed or not self.chat_id:
-            return
-        spawn(self._tail_and_maybe_complete(),
-              name="tail_and_maybe_complete", owner="interactive_session")
-
-    def _run_resume_tail(self) -> None:
-        """Resume-check fired: read the transcript now. If the CLI resumed on
-        its own, the batch's ``user``/``tool_use`` signal reopens the turn
-        (live dot + Stop button back). Further output while STILL closed
-        re-arms via ``_fanout_output``; an open turn stops the cycle."""
-        self._resume_tail_handle = None
-        if self._closed or not self.chat_id or self._turn_open:
-            return
-        spawn(self._tail_and_maybe_complete(),
-              name="tail_and_maybe_complete", owner="interactive_session")
-
-    def _run_midturn_tail(self) -> None:
-        """Periodic mid-turn tail (local): persist the open turn's rows as they
-        land instead of at turn end. Re-arms itself while the turn stays open;
-        the close transition (or ``close()``) cancels the cycle. A beat is
-        skipped while the previous tail is still off-thread — the tailer's
-        line cursor plus row claim-keys make overlapping reads harmless, but
-        there is no point stacking them."""
-        self._midturn_tail_handle = None
-        if self._closed or not self.chat_id or not self._turn_open:
-            return
-        if self._midturn_tail_task is None or self._midturn_tail_task.done():
-            self._midturn_tail_task = self._loop.create_task(
-                self._tail_and_maybe_complete())
-        self._midturn_tail_handle = self._loop.call_later(
-            _MIDTURN_TAIL_S, self._run_midturn_tail)
-
-    async def _tail_and_maybe_complete(self) -> None:
-        """Tail off the loop, then — if the tailer reports a turn-end signal —
-        fire the interactive-task completion callback (gated in
-        :meth:`_maybe_fire_turn_complete`). The whole branch is a no-op for chats
-        (they never set ``on_turn_complete``)."""
-        tailer = self._tailer()
-        try:
-            result = await asyncio.to_thread(
-                tailer.resolve_and_tail, self.session_id, self.chat_id
-            )
-        except Exception:
-            logger.exception(
-                "interactive %s: post-output tail failed", self.session_id[:8]
-            )
-            return
-        self._fold_tail_result(result)
-
-    def _fold_tail_result(self, result: dict) -> None:
-        """One tail batch into the session: the turn-signal fold, the
-        per-batch effects, then a turn end's completion (gated in
-        :meth:`_maybe_fire_turn_complete`)."""
-        last_signal = result.get("last_signal")
-        self._apply_turn_signal(last_signal,
-                                question_pending=bool(result.get("question_pending")),
-                                signal_at=result.get("last_signal_at"))
-        self._post_batch_effects(result)
-        if result.get("turn_complete") or result.get("question_pending"):
-            self._maybe_fire_turn_complete(
-                result.get("last_message", "") or "", result.get("persisted", 0),
-                question=bool(result.get("question_pending")),
-                compacted=bool(result.get("compacted")),
-                reopened=leaves_turn_open(last_signal),
-            )
-
-    def _post_batch_effects(self, result: dict) -> None:
-        """Shared per-batch effects after the turn-signal fold (local tail and
-        forwarded satellite lines alike):
-
-        * ``chat_rows`` nudge — new rows persisted → tell the user's dashboard
-          connections so an OPEN rich-history view (the terminal ⇄ transcript
-          toggle) refetches live instead of waiting for a re-toggle.
-        * compaction turn-end — a compact boundary landed while the session is
-          IDLE (manual ``/compact``): run the normal turn-end effects + a
-          reworded finished ping, otherwise the compact ends silently and the
-          chat never stamps ready/unread. A MANUAL boundary additionally
-          CLOSES a still-open turn: manual compaction only completes with the
-          CLI idle at the prompt, so an open turn here is stale state (the
-          command record + reseed lines are all signal-filtered — nothing
-          else ever closes it and the chat shows "active" forever). Guarded
-          on the batch carrying no NEWER open signal (a prompt landing right
-          after the boundary in the same batch wins). A mid-turn auto-compact
-          is NOT a turn end — the open turn continues and closes normally.
-          Codex needs no close twin — its manual /compact journals
-          task_complete after the compacted item, which folds to end_turn
-          already — but that same task_complete makes ``turn_complete`` true
-          in the SAME batch, so the ping is deferred to
-          :meth:`_maybe_fire_turn_complete` (compacted-worded there) instead
-          of firing twice ("compacted" + "finished").
-
-        Both best-effort; the boundary line is read once (tail cursors), so
-        the compaction ping can't double-fire."""
-        self._maybe_fire_title_early(result)
-        # The batch listeners: the duplex feed (an attached full-duplex session
-        # speaks new assistant rows as they persist, interactive chats having
-        # no pump to tap) needs the turn-close edge even when the batch
-        # persisted nothing.
-        for listener in _batch_listeners:
-            listener(
-                self.chat_id or "",
-                persisted=int(result.get("persisted", 0) or 0),
-                turn_open=self._turn_open,
-            )
-        try:
-            if result.get("persisted", 0) > 0 and self.chat_id:
-                from services.notifications import notification_manager
-                notification_manager.broadcast_chat_rows(
-                    self._chat_owner(), self.chat_id, agent=self.agent_name,
-                )
-        except Exception:
-            logger.exception(
-                "interactive %s: chat_rows broadcast failed", self.session_id[:8]
-            )
-        if result.get("compacted"):
-            if result.get("turn_complete"):
-                # Codex manual /compact: the end_turn fold already ran the
-                # turn-end effects; _maybe_fire_turn_complete owns the (one,
-                # compacted-worded) ping.
-                pass
-            elif not self._turn_open:
-                self._turn_end_effects()
-                self._fire_turn_notification(compacted=True)
-            elif (result.get("compact_trigger") == "manual"
-                    and not leaves_turn_open(result.get("last_signal"))):
-                self._set_turn_open(False)  # runs the turn-end effects
-                self._fire_turn_notification(compacted=True)
-
-    # -- early LLM chat-title (interactive twin of the pump's triggers) ------
-    def _maybe_fire_title_early(self, result: dict) -> None:
-        """Accumulate a tail batch's first-turn counters and fire the title
-        upgrade once either threshold is crossed. Remote sessions cross them
-        naturally (the satellite forwards lines all through the turn); long
-        LOCAL turns are covered by the one-shot timer instead (the starved
-        debounce yields no mid-turn batches). Counters only ever grow while
-        armed, so a resumed/titled chat costs nothing here."""
-        if not self._title_armed or not self.chat_id:
-            return
-        self._title_chars += int(result.get("assistant_chars") or 0)
-        self._title_tools += int(result.get("tool_rows") or 0)
-        from services.title_generator import TITLE_CHAR_THRESHOLD, TITLE_TOOL_THRESHOLD
-        if (self._title_chars >= TITLE_CHAR_THRESHOLD
-                or self._title_tools >= TITLE_TOOL_THRESHOLD):
-            self._fire_title()
-
-    def _fire_title(self, assistant_excerpt: str = "") -> None:
-        """Disarm + schedule the one-time LLM title upgrade. The local flag
-        only stops wasted calls; exactly-once across sessions and fire points
-        is the DB claim's job (services/title_generator.py). No excerpt is
-        needed from the batch paths — the tailer has already persisted the
-        partial first turn, so the service's DB read sees it."""
-        if not self._title_armed:
-            return
-        self._title_armed = False
-        if self._title_timer is not None:
-            self._title_timer.cancel()
-            self._title_timer = None
-        try:
-            from services import title_generator
-            spawn(title_generator.request_chat_title(
-                self.chat_id, assistant_excerpt=assistant_excerpt,
-            ), name="request_chat_title", owner="interactive_session")
-        except Exception:
-            logger.exception(
-                "interactive %s: title request failed to schedule",
-                self.session_id[:8],
-            )
-
-    def _fire_title_timer(self) -> None:
-        """The early-title latency cap fired (loop-affine callback)."""
-        self._title_timer = None
-        if self._closing or self._closed or not self._title_armed:
-            return
-        spawn(self._title_timer_task(),
-              name="title_timer_task", owner="interactive_session")
-
-    async def _title_timer_task(self) -> None:
-        """Force one full tail pass (so the locally-starved transcript catches
-        up AND its turn signals apply — a raw tail here would advance the
-        cursor past turn-relevant lines the normal tails then never see), then
-        fire with whatever partial first turn is persisted. A batch-threshold
-        fire during that tail wins harmlessly (_fire_title no-ops disarmed)."""
-        if self._closing or self._closed or not self._title_armed or not self.chat_id:
-            return
-        await self._tail_and_maybe_complete()
-        if not self._closing and not self._closed:
-            self._fire_title()
-
-    # -- remote transcript forwarding ----------------------------------------
-    def feed_transcript_lines(self, lines: list[str]) -> None:
-        """Persist transcript JSONL lines FORWARDED from a remote satellite.
-
-        The satellite tails this session's transcript file (it controls the
-        config dir, so it finds the JSONL by session id regardless of cwd) and
-        forwards new lines over the WS (``transcript_lines`` frame); the proxy's
-        ``satellite_connection`` routes them here. We hand them to the SAME tailer
-        parser used for local sessions (``tail_lines``) so persistence +
-        turn-complete are identical — no on-disk mirror needed. Persisting hits
-        the DB, so it runs off the loop; the per-session lock keeps arrival
-        order."""
-        if self._closed or not self.chat_id or not lines:
-            return
-        spawn(self._persist_forwarded_lines(list(lines)),
-              name="persist_forwarded_lines", owner="interactive_session")
-
-    async def _persist_forwarded_lines(self, lines: list[str]) -> None:
-        tailer = self._tailer()
-        try:
-            async with self._transcript_lock:
-                result = await asyncio.to_thread(
-                    tailer.tail_lines, self.session_id, self.chat_id, lines
-                )
-        except Exception:
-            logger.exception(
-                "interactive %s: forwarded transcript persist failed", self.session_id[:8]
-            )
-            return
-        self._fold_tail_result(result)
-
-    def _maybe_fire_turn_complete(self, last_message: str, persisted: int = 0,
-                                  question: bool = False,
-                                  compacted: bool = False,
-                                  reopened: bool = False) -> None:
-        """A tailer saw a turn-end signal. Three independent reactions, in order:
-
-        1. **LLM chat-title generation** — the FALLBACK fire for first turns
-           the early triggers (tail-batch thresholds / the one-shot timer)
-           never reached; disarms ``_title_armed``. Task chats title like any
-           chat — the service skips no id shape (a meeting pump is disarmed
-           by its driver kind) and atomically claims, so exactly once across
-           every fire point.
-        2. **End-of-turn USER notification + audio** — fired once PER TURN (chats
-           only — an autonomous task run's completion alert is its
-           ``notification_mode`` contract), local AND remote, giving interactive
-           the same "<agent> finished" ping the ``-p`` pump fires (interactive has
-           no pump, so a turn would otherwise end silently). See
-           :meth:`_fire_turn_notification`.
-        3. **Interactive-TASK completion callback** — fired ONCE per session (only
-           autonomous TASKS set ``on_turn_complete``).
-
-        ``persisted`` is the tailer's count of NEW transcript lines this call — the
-        per-TURN dedup for (2): a turn-end's ``end_turn`` line is tailed exactly
-        once (cursor-advanced), so ``persisted > 0`` is true only on the call that
-        first saw THIS turn-end. (1)/(3) carry their own fire-once flags. The tailer
-        fires on debounce + forwarded-lines + close + the 60 s sweep, hence the
-        dedup matters.
-
-        (2) + (3) share two gates (mirroring the pump): min-turn-time since spawn
-        (no warm/first-render false-trigger) and the bg ``SubagentRegistry`` being
-        empty — a still-running bg subagent means a follow-up turn is coming, so
-        hold both until the FINAL turn.
-
-        ``question=True``: the "turn end" is really the CLI parked on an
-        unanswered AskUserQuestion / ExitPlanMode — (2) words the ping as
-        needs-input and (3) is skipped (a question is not a task completion;
-        hooks deny the tool for autonomous tasks anyway, this is defense in
-        depth). A transcript fold for a dialog the hook-driven park
-        (:meth:`park_on_native_dialog`) already pinged is a no-op."""
-        if question and self._native_park_pinged:
-            self._native_park_pinged = False
-            return
-        # (1) one-time chat-title upgrade — the fallback fire for first turns
-        # the early triggers (batch thresholds / timer) never reached.
-        if self._title_armed and self.chat_id:
-            self._fire_title(assistant_excerpt=last_message)
-
-        # Shared gates for the notification (2) + the task callback (3).
-        if (time.monotonic() - self.created_at) < MIN_TURN_S:
-            return
-        bg_pending = False
-        try:
-            from core.session.session_state import get_subagent_registry
-            bg_pending = get_subagent_registry(self.session_id).has_pending
-        except ImportError:
-            pass
-        if bg_pending:
-            return  # a bg subagent is still running → a follow-up turn is coming
-
-        # (2) per-turn end-of-turn user notification (parity with the -p pump).
-        # ``compacted``: the "turn" was a codex manual /compact (task_complete
-        # rides the same batch as the compacted item) — compacted wording,
-        # not "finished".
-        if persisted > 0:
-            self._fire_turn_notification(question=question, compacted=compacted)
-
-        # (2a) shared-library turn-end reconcile (parity with the -p pump): an
-        # interactive turn that deleted/wrote inside a library in its sandbox
-        # propagates now, not at the next 5-min sweep. Loop-thread hop — this
-        # runs on the tailer thread. Best-effort, never blocks the tailer.
-        try:
-            from services.knowledge import library_projector
-            self._loop.call_soon_threadsafe(
-                library_projector.schedule_reconcile_for_agent, self.agent_name)
-        except (ImportError, RuntimeError):
-            pass
-
-        # (2b) a turn just closed with the shared gates clear — drain any queued
-        # server prompts (delegate results waiting for quiescence). Never during
-        # close(): its final tail also lands here, but the PTY is already dead —
-        # write_input would silently drop the item (close hands the queue back
-        # to the delivery ladder instead). Skipped while parked on a question:
-        # an injected prompt would land in (and fight) the question dialog.
-        if self._prompt_queue and not self._closing and not question:
-            spawn(self._try_drain_prompt_queue(),
-                  name="try_drain_prompt_queue", owner="interactive_session")
-
-        # (3) one-time interactive-TASK completion callback, and the one-shot
-        # turn-end waiters (a borrowed-terminal round's) — the same gates.
-        if question:
-            return
-        # ``reopened``: the batch ends with the next turn already open. A
-        # prompt steered in as this turn closed runs as that next turn, so a
-        # waiter armed at its injection waits for that turn's end.
-        if self._turn_end_waiters and not reopened:
-            waiters, self._turn_end_waiters = self._turn_end_waiters, []
-            for waiter in waiters:
-                try:
-                    waiter(last_message)
-                except Exception:
-                    logger.exception(
-                        "interactive %s: turn-end waiter failed", self.session_id[:8],
-                    )
-        if self._turn_complete_fired or self.on_turn_complete is None:
-            return
-        self._turn_complete_fired = True
-        cb = self.on_turn_complete
-        logger.info(
-            "interactive %s: turn-complete → firing task completion", self.session_id[:8]
-        )
-        try:
-            res = cb(last_message)
-            if asyncio.iscoroutine(res):
-                spawn(res, name="turn_complete", owner="interactive_session")
-        except Exception:
-            logger.exception(
-                "interactive %s: on_turn_complete failed", self.session_id[:8]
-            )
-
-    def _fire_turn_notification(self, question: bool = False,
-                                compacted: bool = False) -> None:
-        """Fire the end-of-turn user notification + audio for an interactive turn —
-        the same signal the ``-p`` pump fires at turn end (``question=True``
-        rewords it: the CLI is waiting on an AskUserQuestion, not finished):
-        ``broadcast_chat_status`` "ready" clears the sidebar live-dot on every
-        device (a no-op for the dot when interactive never lit "streaming"), and
-        ``fire_ephemeral`` routes the alert: to the viewing browser via the
-        recorded origin (the FE drops it only when that chat is the visible tab),
-        to every active dashboard connection when the origin can't take it
-        (``interactive=True`` presence overlay), or FCM to the phone when no
-        dashboard is present. An ``otodock``-CLI attachment is NOT dashboard
-        presence (``cli_attached``): the FCM still fires while the terminal is
-        open, and a stale viewer origin never swallows it. ``user_sub`` +
-        ``agent_name`` are on the session; both calls are non-blocking — the
-        first enqueues to in-memory conn queues, the second (with the agent's
-        display name, read off the loop) is scheduled as a task. Skipped for
-        autonomous task runs (the scheduler set ``on_turn_complete``) — a
-        task's completion alert is its
-        ``notification_mode`` contract; a re-warmed task chat has no callback and
-        keeps the per-turn signal. A meeting never runs an interactive session.
-        Best-effort."""
-        if not self.user_sub or not self.chat_id:
-            return
-        try:
-            from services.notifications import notification_manager
-            notification_manager.broadcast_chat_status(
-                self._chat_owner(), self.chat_id, chat_phase.READY, agent=self.agent_name,
-            )
-            if self.on_turn_complete is not None:
-                return
-            # Read now: the alert routes by the attachment at the turn's end.
-            cli_attached = self.otodock_attached
-
-            async def _notify() -> None:
-                # Display name, not slug — the title is what the phone shows.
-                # A cold agents cache reads the table: off the loop.
-                from storage.pg import run_db
-                label = await run_db(notification_manager.agent_label, self.agent_name)
-                if compacted:
-                    title = f"{label} compacted the conversation"
-                    body = "Context compacted. The session is ready."
-                else:
-                    title, body = notification_manager.turn_end_words(label, asked=question)
-                await notification_manager.fire_ephemeral(
-                    self.user_sub,
-                    title=title,
-                    body=body,
-                    chat_id=self.chat_id,
-                    interactive=True,
-                    cli_attached=cli_attached,
-                )
-
-            spawn(_notify(), name="fire_ephemeral", owner="interactive_session")
-        except Exception:
-            logger.exception(
-                "interactive %s: turn notification failed", self.session_id[:8]
-            )
-
     def resize(self, rows: int, cols: int) -> None:
         # dual-control: drop dashboard resizes while the otodock terminal is
         # the active controller (it owns the PTY size; a dashboard resize would
@@ -2402,7 +636,7 @@ class InteractiveSession:
             return
         self.rows, self.cols = rows, cols
         if self.alive:
-            cast("PtyProcess", self.pty).resize(rows, cols)
+            cast("RemotePtyProcess", self.pty).resize(rows, cols)
 
     # -- drainer (permission queue → viewer) ---------------------------------
     def _start_drainer(self) -> None:
@@ -2468,11 +702,14 @@ class InteractiveSession:
     # -- lifecycle ------------------------------------------------------------
     def _on_pty_exit(self, code: int | None) -> None:
         # The CLI process died (normal exit / crash / killed). Tear the session
-        # down. Scheduled because PtyProcess fires this from its reaper task.
+        # down. Scheduled because the PTY's handle fires this from its own task.
         if self._closed or self._closing:
             return
         logger.info("interactive %s: pty exited code=%r", self.session_id[:8], code)
         self.exit_code = code
+        # A remote machine's memory guard ended the engine: the chat hears it
+        # as a headless chat does (``close`` writes the card).
+        self.ended_for_memory = getattr(self.pty, "exit_reason", "") == "memory"
         spawn(self.close(reason="exited", _signal_child=False),
               name="close", owner="interactive_session")
 
@@ -2486,7 +723,8 @@ class InteractiveSession:
 
         for h in (self._settle_handle, self._ready_max_handle, self._tail_handle,
                   self._inject_backstop_handle, self._resume_tail_handle,
-                  self._midturn_tail_handle, self._title_timer):
+                  self._midturn_tail_handle, self._title_timer, self._tools_recheck,
+                  self._dropped_turn_check):
             if h is not None:
                 h.cancel()
         self._settle_handle = self._ready_max_handle = self._tail_handle = None
@@ -2534,6 +772,10 @@ class InteractiveSession:
             logger.exception(
                 "interactive %s: final transcript tail failed", self.session_id[:8]
             )
+        # After the conversation's last rows and before the viewer hears of
+        # the exit: its page reloads the chat's history, which holds the card.
+        if self.ended_for_memory and self.chat_id and not deleted:
+            await _note_memory_end(self.chat_id)
         # The notes this session made for prompts it typed and the journal
         # never gave back: the final tail above was the last chance (a
         # forwarded batch still in flight finishes first).
@@ -2553,26 +795,40 @@ class InteractiveSession:
         # interactive PTY is torn down here (idle reap, toggle-off, task end,
         # shutdown) — so without this active_sessions drifts up until restart.
         # Safe to call unconditionally: release pops the binding (idempotent,
-        # no-op when the session never bound one).
-        from services.engines.subscription_pool import release_subscription
-        release_subscription(self.session_id)
-        cleanup_session_permission_state(self.session_id)
-        tailer.forget(self.session_id)
-
-        # Drop from the registry. No lock needed — the get/pop pair is atomic
-        # under single-threaded asyncio, and close() runs while register() holds
-        # the registry lock during a supersede (taking it here would deadlock).
+        # no-op when the session never bound one). The home a terminal on a
+        # compute machine ran from goes first, while the binding names it.
+        from core import file_commit
+        from core.sandbox.session_config_dir import close_session_home
+        await file_commit.run_in("session-homes", close_session_home, self.session_id)
+        # Drop from the registry before the seat goes: a wake its release
+        # replays must find no live terminal here, or it is stored again
+        # with nothing left to fire it. No lock needed — the get/pop pair is
+        # atomic under single-threaded asyncio, and close() runs while a
+        # registration holds the registry lock during a supersede (taking it
+        # here would deadlock).
         if _sessions.get(self.session_id) is self:
             _sessions.pop(self.session_id, None)
             from core.session.session_state import mark_closing
             mark_closing(self.session_id)
+        from services.engines.subscription_pool import release_subscription
+        release_subscription(self.session_id)
+        placed = cleanup_session_permission_state(self.session_id)
+        tailer.forget(self.session_id)
+        # A Codex terminal's own profile and text (a no-op for any other),
+        # and the stand-ins a first message was waiting for.
+        from core.layers.codex import session_text
+        from services.mcp import tool_listing
+        session_text.forget(self.session_id)
+        tool_listing.drop_listed(self.session_id)
 
         # A session dying mid-turn can never emit its end_turn signal — clear
         # the sidebar dot (and stamp the partial response) via the transition
         # broadcast. No-op when the turn already closed. A chat being deleted
         # gets no ready frame and no unread stamp: its row goes next, and the
         # frame would leave a finished row for an id no list carries.
-        if deleted:
+        if deleted or reason == PLATFORM_STOPPING:
+            # (the platform's stop: the turn's open-turn row stays for the
+            # boot, and nobody is told the turn ended)
             self._turn_open = False
         else:
             self._set_turn_open(False)
@@ -2607,6 +863,22 @@ class InteractiveSession:
                     await res
             except Exception:
                 logger.exception("interactive %s: on_close failed", self.session_id[:8])
+        # The context's removal is on disk before the close returns (a
+        # terminal on a machine is taken back after a restart by its context).
+        # Not for a supersede: it runs under the registry's lock, and the
+        # same id registers again at once.
+        if placed and reason != "superseded":
+            from core.session.session_state import security_index_written
+            await security_index_written()
+
+
+async def _note_memory_end(chat_id: str) -> None:
+    """The headless chat's card for a turn whose engine the machine's memory
+    guard ended (``TurnEnding(EXITED, MEMORY)``)."""
+    from core.events import turn_ending
+    from core.session.interactive_turn import write_turn_ended_card
+    await write_turn_ended_card(chat_id, turn_ending.TurnEnding(reason=turn_ending.EXITED,
+                                                                detail=turn_ending.MEMORY), label="memory_end")
 
 
 async def _redeliver_pending(sess: InteractiveSession, items: list[dict]) -> None:
@@ -2653,21 +925,6 @@ async def _redeliver_pending(sess: InteractiveSession, items: list[dict]) -> Non
             logger.exception(
                 "interactive %s: server-prompt handback failed", sess.session_id[:8]
             )
-
-
-async def _load_chat_row(chat_id: str) -> dict:
-    """Spawn-time chat row read on the DB executor (title-arm + owner seed
-    for the constructor). Best-effort: ``{}`` on any failure."""
-    if not chat_id:
-        return {}
-    from storage import database as task_store
-    from storage.pg import run_db
-    try:
-        return (await run_db(task_store.get_chat, chat_id)) or {}
-    except psycopg.Error:
-        logger.debug("interactive: chat row load failed for %s", chat_id[:8],
-                     exc_info=True)
-        return {}
 
 
 def settings_card_from_perm_item(item: dict) -> dict:
@@ -2738,81 +995,17 @@ def persist_drained_artifact(chat_id: str, item: dict) -> int | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Registry API
-# ---------------------------------------------------------------------------
-
-def get(session_id: str) -> InteractiveSession | None:
-    return _sessions.get(session_id)
-
-
-def find_live_for_chat(
-    chat_id: str, *, target: str | None = None
-) -> InteractiveSession | None:
-    """dual-control: the NEWEST live session for ``chat_id`` (optionally pinned
-    to the ``target`` machine). Used by ``otodock --resume`` to ATTACH to a running
-    PTY instead of killing + re-spawning it (the in-flight turn survives). Returns
-    the NEWEST-alive, not first-found: the spawn lease is per-session_id (not
-    per-chat), so a brief fresh-respawn race can transiently leave two live
-    sessions for one chat_id."""
-    if not chat_id:
-        return None
-    matches = [
-        s for s in _sessions.values()
-        if s.chat_id == chat_id and s.alive and (target is None or s.target == target)
-    ]
-    if not matches:
-        return None
-    return max(matches, key=lambda s: s.created_at)
-
-
-async def close_for_chat(chat_id: str, *, reason: str = "superseded") -> int:
-    """otodock-CLI take-over: close any LIVE session(s) for ``chat_id`` so a new
-    spawn/resume of the same chat is the single writer. The close fires each
-    session's ``_on_exit`` → for an otodock session that feeds an EXIT to the old
-    local terminal (it restores its tty + exits); a dashboard viewer sees the PTY
-    close. Returns how many were closed."""
-    if not chat_id:
-        return 0
-    victims = [s for s in list(_sessions.values()) if s.chat_id == chat_id and s.alive]
-    for s in victims:
-        try:
-            await s.close(reason=reason)
-        except Exception:
-            logger.exception("close_for_chat: failed to close %s", s.session_id[:8])
-    return len(victims)
-
-
-def live_session_ids(local_only: bool = False) -> set[str]:
-    """Session ids with a live PTY — consumed by concurrency.reconcile_chat_slots
-    so interactive slots aren't released as orphans. With ``local_only``,
-    excludes remote (satellite) sessions: those belong to a satellite budget, not
-    the local ceiling G, so they must not appear in the local reconciler's live set."""
-    return {sid for sid, s in _sessions.items()
-            if s.alive and (not local_only or not s.is_remote)}
-
-
-def streaming_chat_ids() -> set[str]:
-    """Chat ids of live interactive sessions currently INSIDE a turn — the
-    interactive half of the dashboard connect-time ``chat_status_snapshot``
-    (the pump half is ``session_state.streaming_chat_ids``). A meeting never
-    runs an interactive session, so nothing is excluded here."""
-    return {s.chat_id for s in _sessions.values()
-            if s.chat_id and s.alive and s._turn_open}
-
-
 async def _register_session(
     session: InteractiveSession,
     *,
     pty_factory,
 ) -> InteractiveSession:
-    """Shared registration spine for local + remote interactive sessions.
+    """The registration spine of an interactive session.
 
     Enforces the lease (one live process per ``session_id``), acquires a chat
-    slot, creates ``session.pty`` via ``pty_factory`` (a local
-    ``pty_relay.spawn_pty`` or a remote ``remote_pty.spawn_remote_pty``), stores
-    the session, and starts the drainer + readiness gate. Everything except the
-    pty creation is identical for both targets.
+    slot, creates ``session.pty`` via ``pty_factory`` (a machine's
+    ``remote_pty.spawn_remote_pty``, or the handle a reconnect adopts), stores
+    the session, and starts the drainer + readiness gate.
     """
     from core import concurrency
 
@@ -2876,10 +1069,15 @@ async def _register_session(
     # Outside the lock — a DB hop must not serialize other spawns.
     if session.chat_id:
         try:
+            from core.config import spender
             from storage import database as task_store
+            # A lane's wake is never typed into a terminal that serves
+            # another person: it stays stored for one that serves the lane.
+            serves = await asyncio.to_thread(functools.partial(
+                spender.serves_lane, session.chat_id, session.session_id, built_for=session.payer))
             wakes = await asyncio.to_thread(
                 task_store.claim_pending_delegate_wake, session.chat_id,
-            )
+            ) if serves else []
             for wake in wakes:
                 session.queue_prompt(wake, "delegate_result_replay",
                                      chat_id=session.chat_id, note=True)
@@ -2897,66 +1095,6 @@ async def _register_session(
     return session
 
 
-async def register(
-    *,
-    session_id: str,
-    chat_id: str,
-    agent_name: str,
-    argv: list[str],
-    env: dict,
-    cwd: str | None = None,
-    rows: int = pty_relay.DEFAULT_ROWS,
-    cols: int = pty_relay.DEFAULT_COLS,
-    user_sub: str = "",
-    role: str = "",
-    username: str = "",
-    target: str = placement.LOCAL,
-    scrollback_limit: int = pty_relay.DEFAULT_SCROLLBACK_BYTES,
-    execution_path: str = DEFAULT_EXECUTION_PATH,
-    prompt_in_argv: bool = False,
-    tui_theme: str = "dark",
-) -> InteractiveSession:
-    """Spawn ``argv`` on a PTY and register it under ``session_id``.
-
-    Enforces the lease (kills any existing process for the same ``session_id``)
-    and acquires a chat slot. ``argv``/``env`` are pre-assembled by the caller
-    (the interactive CLI argv mirrors the ``-p`` spawn minus ``-p``/stream-json,
-    plus ``TERM``); ``execution_path`` names the engine whose TUI it is. The
-    PROXY-side identity (``set_session_security`` etc.) is set by the caller
-    BEFORE this call so hooks resolve the moment the CLI starts.
-
-    Raises :class:`CapacityError` if no chat slot is free.
-    """
-    session = InteractiveSession(
-        session_id=session_id, chat_id=chat_id, agent_name=agent_name,
-        user_sub=user_sub, role=role, username=username, target=target,
-        rows=rows, cols=cols,
-        execution_path=execution_path, prompt_in_argv=prompt_in_argv,
-        tui_theme=tui_theme,
-        chat_row=await _load_chat_row(chat_id),
-        token_expires_at=_token_expires_at(env),
-    )
-
-    async def _make_local_pty(s: InteractiveSession):
-        return pty_relay.spawn_pty(
-            argv, env=env, cwd=cwd, rows=rows, cols=cols,
-            on_output=s._fanout_output,
-            on_exit=s._on_pty_exit,
-            scrollback_limit=scrollback_limit,
-        )
-
-    # One spawn slot around the local PTY start, taken OUTSIDE
-    # _register_session: its registry lock would otherwise queue every
-    # registration, remote ones included, behind a spawn waiting for a slot.
-    async with pty_relay.spawn_slot():
-        sess = await _register_session(session, pty_factory=_make_local_pty)
-    logger.info(
-        "interactive %s registered (chat=%s agent=%s pid=%s)",
-        session_id[:8], chat_id, agent_name, cast("PtyProcess", sess.pty).pid,
-    )
-    return sess
-
-
 async def register_remote(
     *,
     session_id: str,
@@ -2965,24 +1103,25 @@ async def register_remote(
     machine_id: str,
     execution_path: str,
     config_payload: dict,
-    rows: int = pty_relay.DEFAULT_ROWS,
-    cols: int = pty_relay.DEFAULT_COLS,
+    rows: int = DEFAULT_ROWS,
+    cols: int = DEFAULT_COLS,
     user_sub: str = "",
     role: str = "",
     username: str = "",
-    scrollback_limit: int = pty_relay.DEFAULT_SCROLLBACK_BYTES,
+    scrollback_limit: int = DEFAULT_SCROLLBACK_BYTES,
     prompt_in_argv: bool = False,
     tui_theme: str = "dark",
+    payer: str | None = None,
 ) -> InteractiveSession:
     """Register an interactive session whose PTY runs on a REMOTE satellite.
 
-    Mirrors :func:`register`, but ``session.pty`` is a
+    ``session.pty`` is a
     :class:`core.remote.remote_pty.RemotePtyProcess` driven over the satellite WS — the
     satellite assembles the interactive argv from ``config_payload`` (the SAME
     payload the ``-p`` path uses, ``RemoteExecutionLayer._build_start_payload``)
     and spawns it under a PTY. ``target`` is the ``machine_id``. The PROXY-side
     identity (``set_session_security`` etc.) is set by the caller BEFORE this
-    call, same as :func:`register`.
+    call.
     """
     from core.remote import remote_pty
     from core.remote.satellite_connection import get_connection_manager
@@ -3002,6 +1141,7 @@ async def register_remote(
         # The payload's token, minted at the payload build, which can run
         # minutes before this session exists (a satellite MCP install).
         token_expires_at=_token_expires_at(config_payload.get("env")),
+        payer=payer,
     )
 
     async def _make_remote_pty(s: InteractiveSession):
@@ -3016,162 +1156,89 @@ async def register_remote(
     sess = await _register_session(session, pty_factory=_make_remote_pty)
     logger.info(
         "interactive %s registered REMOTE (machine=%s chat=%s agent=%s pid=%s)",
-        session_id[:8], machine_id[:8], chat_id, agent_name, cast("PtyProcess", sess.pty).pid,
+        session_id[:8], machine_id[:8], chat_id, agent_name, cast("RemotePtyProcess", sess.pty).pid,
     )
     return sess
 
 
-async def close_session(session_id: str, *, reason: str = "closed",
-                        drop_queued: bool = False) -> bool:
-    """Close a registered interactive session by id. Returns True if it existed.
-
-    ``drop_queued`` discards the session's queued server prompts instead of
-    handing them back to the delivery ladder (a closer acting on a person who
-    lost access must not re-deliver what was queued under their role)."""
-    session = _sessions.get(session_id)
-    if session is None:
-        return False
-    if drop_queued:
-        session._prompt_queue.clear()
-    await session.close(reason=reason)
-    return True
-
-
-async def close_all(reason: str = "shutdown") -> None:
-    for session in list(_sessions.values()):
-        try:
-            await session.close(reason=reason)
-        except Exception:
-            logger.exception("interactive %s: close_all failed", session.session_id[:8])
-
-
-# ---------------------------------------------------------------------------
-# Idle reaper
-# ---------------------------------------------------------------------------
-
-def _reap_spare_reason(session: InteractiveSession, timeout_s: float) -> str:
-    """Why an over-timeout session must NOT be reaped, or "".
-
-    * ``question-parked`` — the turn is parked on an unanswered
-      AskUserQuestion: idle by every byte measure, but waiting on a person.
-      Spared like a held prompt: until the session's token ends less
-      ``_TOKEN_MARGIN_S``, at most ``session_state.PROMPT_WAIT_S`` idle (see
-      the constant).
-    * ``prompt-pending``: a prompt the platform holds for this session
-      waits on a person (``session_state.has_pending_prompt``), as the
-      headless reapers spare it; the prompt's own wait bounds it.
-    * ``turn-open`` — mid-turn work with no viewer: a byte-quiet stretch of a
-      long tool call can outlast the idle window. Capped at the per-TURN
-      ceiling (``config.get_session_timeout()``): a turn cannot legitimately
-      outlive it, so past that the flag is stuck and must not confer immortality.
-    * ``hook-activity`` — tool hooks are still firing for this session id even
-      though the PTY output stalled (satellite WS-down frames are dropped
-      silently), so the CLI is demonstrably working. Session-id-keyed, same
-      signal the headless reapers consult. Self-limiting: it needs hooks to keep
-      firing inside the window.
-    """
+def adopt_remote(
+    *, session_id: str, chat_id: str, agent_name: str, machine_id: str, execution_path: str,
+    user_sub: str, role: str, username: str, mode: str, token_floor: int,
+    turn_token: str, chat_row: dict,
+) -> InteractiveSession:
+    """A terminal the machine still runs, taken back as its chat's: the
+    session and its handle are built and registered with no await and no
+    lock (the claim runs in the machine's read loop), the TUI reads as ready,
+    the mode and floor are restored, and the chat's open-turn token, when
+    the row is this session's, is this session's. The slot, the stored wakes
+    and the credentials follow in a task of their own."""
+    from core.remote import remote_pty
+    from core.remote.satellite_connection import get_connection_manager
     from core.session import session_state
-    if (session.question_parked
-            and session.idle_seconds < session_state.PROMPT_WAIT_S
-            and time.time() < session.token_expires_at - _TOKEN_MARGIN_S):
-        return "question-parked"
-    if session_state.has_pending_prompt(session.session_id):
-        return "prompt-pending"
-    if session.turn_open and session.idle_seconds < config.get_session_timeout():
-        return "turn-open"
-    last_hook = session_state.get_hook_activity(session.session_id)
-    if last_hook and time.monotonic() - last_hook < timeout_s:
-        return "hook-activity"
-    return ""
+    sess = InteractiveSession(
+        session_id=session_id, chat_id=chat_id, agent_name=agent_name,
+        user_sub=user_sub, role=role, username=username, target=machine_id,
+        remote_os=get_connection_manager().satellite_os(machine_id),
+        execution_path=execution_path, chat_row=chat_row,
+    )
+    sess.pty = remote_pty.adopt_remote_pty(
+        machine_id=machine_id, session_id=session_id, rows=sess.rows, cols=sess.cols,
+        on_output=sess._fanout_output, on_exit=sess._on_pty_exit,
+    )
+    session_state.restore_session_state(session_id, mode, token_floor)
+    session_state._record_session_use(session_id, client_type=session_kind.DASHBOARD.name,
+                                      agent=agent_name)
+    if turn_token:
+        sess.adopt_turn_token(turn_token)
+    _sessions[session_id] = sess
+    sess._start_drainer()
+    sess._mark_ready()
+    # Its binding comes last in the tail: on its way until then, so the
+    # machine's kept sessions are not all back yet (``reported_since_boot``).
+    from core.remote import satellite_link
+    satellite_link.adoption_begins(machine_id, session_id)
+    spawn(_finish_adoption(sess), name="adopt_remote", owner="interactive_session")
+    logger.info("interactive %s adopted REMOTE (machine=%s chat=%s agent=%s turn=%s)",
+                session_id[:8], machine_id[:8], chat_id[:8], agent_name, "open" if turn_token else "idle")
+    return sess
 
 
-async def reap_idle(timeout_s: float | None = None) -> int:
-    """Close sessions with no viewer and no activity for ``timeout_s``.
-
-    ``timeout_s`` defaults to the platform-wide admin idle timeout (the
-    cached off-loop read): ONE knob shared with the headless reapers.
-    A viewer attached keeps a session alive; input, prompts, turn signals
-    and output inside an open turn reset its age, so a long unviewed agent
-    turn is never killed mid-flight while a redraw between turns is no
-    activity. An on-screen or reconnect-grace terminal is also spared below
-    (don't kill visible state — that is NOT a longer timeout). A parked question / open turn / recent hook
-    activity also spares (``_reap_spare_reason``). Returns the count reaped.
-    """
-    if timeout_s is None:
-        from core.session import session_state as _state
-        timeout_s = await _state.cached_idle_timeout()
-    reaped = 0
-    for session in list(_sessions.values()):
-        if session.has_viewer or session.otodock_attached or not session.alive:
-            continue
-        # A remote session whose satellite is mid-reconnect is held in
-        # PTY-grace — still `alive` but transiently unviewable. Don't reap it; the
-        # grace timer (or its reconcile on reconnect) decides its fate.
-        if session.is_remote:
-            from core.remote.satellite_connection import get_connection_manager
-            if get_connection_manager().is_pty_in_grace(session.target):
-                continue
-        if session.idle_seconds > timeout_s:
-            spare = _reap_spare_reason(session, timeout_s)
-            if spare:
-                if spare != session._last_reap_spare:
-                    session._last_reap_spare = spare
-                    logger.debug(
-                        "interactive %s: sparing idle session (%s, %.0fs idle)",
-                        session.session_id[:8], spare, session.idle_seconds,
-                    )
-                continue
-            logger.info(
-                "interactive %s: reaping idle (%.0fs, no viewer)",
-                session.session_id[:8], session.idle_seconds,
-            )
-            await session.close(reason="idle")
-            reaped += 1
-    return reaped
-
-
-async def tail_live_sessions() -> None:
-    """Persist each live session's transcript incrementally (idempotent via the
-    tailer's line cursor) so a proxy crash between turns can't lose history. The
-    close()-time tail covers normal teardown; this covers the crash gap."""
-    for session in list(_sessions.values()):
-        if not session.alive:
-            continue
-        try:
-            tailer = session._tailer()
-            _r = await asyncio.to_thread(
-                tailer.resolve_and_tail, session.session_id, session.chat_id
-            )
-            session._apply_turn_signal(
-                _r.get("last_signal"),
-                question_pending=bool(_r.get("question_pending")),
-                signal_at=_r.get("last_signal_at"))
-            # Crash backstop for interactive tasks: if the post-output debounce
-            # missed a turn-end (busy loop), the 60s sweep still completes it.
-            if _r.get("turn_complete") or _r.get("question_pending"):
-                session._maybe_fire_turn_complete(
-                    _r.get("last_message", "") or "", _r.get("persisted", 0),
-                    question=bool(_r.get("question_pending")),
-                    reopened=leaves_turn_open(_r.get("last_signal")),
-                )
-        except Exception:
-            logger.exception(
-                "interactive %s: periodic transcript tail failed", session.session_id[:8]
-            )
-
-
-async def _reaper_loop() -> None:
-    while True:
-        await asyncio.sleep(_REAPER_PERIOD_S)
-        try:
-            await tail_live_sessions()
-            await reap_idle()
-        except Exception:
-            logger.exception("interactive idle reaper error")
-
-
-def start_idle_reaper() -> None:
-    """Start the idle-reaper background task (call once at app startup)."""
-    global _reaper_task
-    if _reaper_task is None or _reaper_task.done():
-        _reaper_task = asyncio.get_event_loop().create_task(_reaper_loop())
+async def _finish_adoption(sess: InteractiveSession) -> None:
+    """What a start does after its registration, for an adopted terminal: the
+    connected accounts refilled from the session's descriptor (the same call
+    as a headless take-back's; first, so a failure below cannot skip it), the
+    chat slot (a paired machine's counts as none here; a compute machine's
+    is the reconciler's, ``concurrency._adopt_compute_sessions``, as for a
+    headless take-back), the stored wakes, the seat and the credential
+    fan-out (on a compute machine the platform's own file, by the session's
+    own placement)."""
+    from core import concurrency
+    from core.session import session_state
+    from core.session.session_manager import _get_remote_layer
+    from storage import database as task_store
+    try:
+        remote = _get_remote_layer()
+        if remote is not None and sess.alive:
+            await remote._reprovision_gateway(sess.session_id, sess.target)
+        ctx = session_state.get_session_security(sess.session_id)
+        compute_pl = placement.compute_of(getattr(ctx, "placement", None))
+        on_compute = compute_pl is not None
+        if not on_compute:
+            await concurrency.acquire_chat_slot(sess.session_id, target=sess.target,
+                                                user_sub=sess.user_sub or None, per_user_cap=False)
+        from core.config import spender
+        serves = await asyncio.to_thread(functools.partial(
+            spender.serves_lane, sess.chat_id, sess.session_id, built_for=sess.payer))
+        wakes = (await asyncio.to_thread(task_store.claim_pending_delegate_wake, sess.chat_id)
+                 if serves else [])
+        for wake in wakes:
+            sess.queue_prompt(wake, "delegate_result_replay", chat_id=sess.chat_id, note=True)
+        if remote is not None:
+            await asyncio.to_thread(remote._restore_adopted_credentials, sess.session_id,
+                                    sess.target, sess.agent_name, sess.execution_path,
+                                    local_file=compute_pl is not None and not compute_pl.own_copy)
+    except Exception:
+        logger.exception("interactive %s: the adoption's tail failed", sess.session_id[:8])
+    finally:
+        from core.remote import satellite_link
+        satellite_link.adoption_ends(sess.target, sess.session_id)

@@ -72,6 +72,11 @@ def test_a_set_keeps_its_library_schedules_and_bindings():
     assert dset.bindings == [sets.SetBinding(from_member="yacht-manager", app="owner-report",
                                              to_member="yacht-finance", to_app="finance-board")]
     assert dset.platform_min_version == "1.9.1"
+    # A short text for the store's card and the install dialog: the template's bounds.
+    assert sets.load_set_from_dict({**YACHT, "summary": "Runs the office of a yacht as one team."}).slug == "yacht-office"
+    # The work it does, as a template's highlights (an icon this release lacks passes: the catalog's lint holds it).
+    rows = [{"icon": "document", "text": "Owner reports, written for you"}, {"icon": "hologram_2", "text": "Later work"}]
+    assert sets.load_set_from_dict({**YACHT, "highlights": rows}).slug == "yacht-office"
 
 
 @pytest.mark.parametrize("over, sentence", [
@@ -84,6 +89,15 @@ def test_a_set_keeps_its_library_schedules_and_bindings():
     ({"members": []}, "department.json: members must name 1 to 24 members"),
     ({"members": [{"template": "yacht-manager"}]}, "department.json: members[0]: missing required field 'level'"),
     ({"library": {"source": "yacht-manager", "subdir": "../x"}}, "department.json: library.subdir: invalid folder"),
+    ({"summary": "x" * 201},
+     "department.json: summary: the summary is one or two short sentences on one line, at most 200 characters"),
+    ({"summary": "One.\nTwo."}, "department.json: summary: the summary is one or two short sentences"),
+    ({"highlights": [{"icon": "app", "text": "A"}] * 7}, "department.json: highlights: a department has at most 6 highlights"),
+    ({"highlights": [{"icon": "app"}]}, "department.json: highlights[0]: missing required field 'text'"),
+    ({"highlights": [{"icon": "app", "text": "y" * 61}]},
+     "department.json: highlights[0].text: a highlight's text is a few words on one line, at most 60 characters"),
+    ({"highlights": [{"icon": "<svg>", "text": "A"}]},
+     "department.json: highlights[0].icon: a highlight's icon is a name from the dashboard's icon set"),
 ])
 def test_a_schema_finding_is_a_sentence(over, sentence):
     with pytest.raises(sets.SetValidationError) as exc:
@@ -209,3 +223,14 @@ def test_every_set_a_catalog_serves_loads_and_names_served_templates(catalog):
         assert sets.missing_members(dset, registry) == []
         for member in dset.members:
             assert (catalog / member.template / "agent.json").is_file()
+
+
+def test_a_set_s_highlights_are_a_template_s_highlights():
+    """One definition in two files: a set's highlights take the template's
+    bounds, only the words about whose highlights they are differ."""
+    root = REPO_ROOT / "mcps"
+    template = json.loads((root / "agent-template.schema.json").read_text())["$defs"]["agentJson"]["properties"]["highlights"]
+    dept = json.loads((root / "department.schema.json").read_text())["properties"]["highlights"]
+    own = ("description", "x-otodock-hint")
+    assert {k: v for k, v in dept.items() if k not in own} == {k: v for k, v in template.items() if k not in own}
+    assert dept["items"] == template["items"]

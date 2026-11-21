@@ -1,0 +1,52 @@
+{
+ "agent template update sweep": [
+  "maybe_notify_updates"
+ ],
+ "catalog_install_registry sweep": [
+  "sweep_stale"
+ ],
+ "docker tools idle sweep": [
+  "sweep_once"
+ ],
+ "idle fingerprint sweep": [
+  "remote_layer.run_idle_fingerprint_sweep"
+ ],
+ "idle fingerprint sweep, no remote layer": [],
+ "install_registry sweep": [
+  "install.sweep_stale"
+ ],
+ "mcp auto-update sweep": [
+  "maybe_run_weekly"
+ ],
+ "media cache sweep": [
+  "sweep_host_media_cache",
+  "sweep_expired_media_tokens"
+ ],
+ "preview snapshot sweep": [
+  "sweep_orphans"
+ ],
+ "quota monitor sweep": [
+  "check_quotas"
+ ],
+ "recover-bin reap": [
+  "recover_bin_store.delete_expired"
+ ],
+ "retention sweep": [
+  "maybe_run_daily"
+ ],
+ "subscription health sweep": [
+  "check_subscription_health"
+ ],
+ "subscription window alert sweep": [
+  "check_window_alerts"
+ ],
+ "tombstone reap": [
+  "tombstones.delete_expired"
+ ],
+ "transfer_registry sweep": [
+  "transfer.sweep_stale"
+ ],
+ "warmup_registry sweep": [
+  "warmup.sweep_stale"
+ ]
+}

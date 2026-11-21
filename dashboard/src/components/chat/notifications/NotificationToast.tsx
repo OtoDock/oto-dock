@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { ToastItem } from '../../../hooks/useNotifications'
 import type { AgentSummary } from '../../../api/agents'
+import { deliveryOpens } from '../../../api/notifications'
 import NotificationBody from './NotificationBody'
 import NotificationAgentHeader from './NotificationAgentHeader'
 import { ToastPortal } from '../../ui/Toast'
@@ -43,7 +44,7 @@ const SEVERITY_TITLE_COLOR: Record<string, string> = {
 function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toast: ToastItem; agents?: AgentSummary[]; onDismiss: (id: string) => void; onStopAlarm?: () => void; onNavigate?: (agentSlug: string, chatId: string, href?: string) => void }) {
   const [visible, setVisible] = useState(false)
   const { delivery } = toast
-  const hasLink = !!delivery.href || !!(delivery.agent_slug && delivery.chat_id)
+  const hasLink = deliveryOpens(delivery)
 
   // Slide-in animation
   useEffect(() => {

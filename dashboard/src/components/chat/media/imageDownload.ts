@@ -3,7 +3,10 @@
 // download (an external image fetched as a blob first, since a cross-origin
 // <a download> is ignored).
 
+import { emitAppToast } from '../../../lib/appToasts'
 import { saveNativeFile } from '../../../lib/nativeBridge'
+import { safeHref } from '../../../lib/safeUrl'
+import { NOTIFICATION_SEVERITY } from '../../../lib/status/notificationSeverity'
 import type { LightboxImage } from './ImageLightbox'
 
 // Map mime → file extension. A naive `mime.split('/')[1]` mangles compound
@@ -64,7 +67,11 @@ export async function triggerDownload(img: LightboxImage, index: number) {
     link.click()
     setTimeout(() => URL.revokeObjectURL(blobUrl), 5000)
   } catch {
-    // Fallback: open in new tab — user can right-click → save.
-    window.open(fetchUrl, '_blank', 'noopener')
+    // Fallback: open in new tab — user can right-click → save. The address
+    // is a session's: only one the link check passes is opened, and a
+    // refused one says so rather than nothing.
+    const href = safeHref(fetchUrl)
+    if (href) window.open(href, '_blank', 'noopener')
+    else emitAppToast({ title: 'The picture could not be downloaded.', body: '', severity: NOTIFICATION_SEVERITY.WARNING })
   }
 }

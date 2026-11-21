@@ -27,6 +27,23 @@ logger = logging.getLogger("proxy_client")
 TOOL_USE_SIGNAL = object()
 
 
+# What the caller hears when a turn ends in an error the platform gave no
+# words for, and the longest line of the platform's that is spoken.
+_ERROR_APOLOGY = "Sorry, I encountered an error."
+_SAY_MAX = 200
+
+
+def spoken_error(data, apology: str = _ERROR_APOLOGY) -> str:
+    """The line a person hears for an ``error`` frame: the platform's own
+    (``data.say``, one short line it wrote to be spoken) when it sent one,
+    else ``apology``. This service has no words of its own for an ending.
+    Read by a call's turn and by a spoken conversation's."""
+    say = data.get("say") if isinstance(data, dict) else None
+    if isinstance(say, str) and say.strip() and len(say) <= _SAY_MAX:
+        return say.strip()
+    return apology
+
+
 class ProxyClient:
     """Client for the Claude Code Proxy, using WebSocket transport.
 
@@ -412,7 +429,7 @@ class ProxyClient:
                 error_msg = msg.get("data", {}).get("message", "Unknown error")
                 logger.error("WS chat error: %s", error_msg)
                 self.turn_in_flight = False
-                yield "Sorry, I encountered an error."
+                yield spoken_error(msg.get("data"))
                 break
             # Silently ignore: tool_input, thinking, metadata
 

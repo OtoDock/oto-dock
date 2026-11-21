@@ -1,0 +1,95 @@
+{
+ "chats": [
+  {
+   "agent": "warm-pinned",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "m-office",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "<id2>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  {
+   "agent": "warm-pinned",
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "m-office",
+   "new_chat": false,
+   "type": "warmup_started"
+  },
+  {
+   "chat_id": "<id1>",
+   "execution_path": "claude-code-cli",
+   "execution_target": "m-office",
+   "fallback_reason": null,
+   "interactive": false,
+   "mode": "ask",
+   "model": "test-model",
+   "offline_machine_name": "",
+   "pinned_label": "Office-PC",
+   "pinned_target": "m-office",
+   "resolved_label": "the OtoDock platform",
+   "resolved_target": "local",
+   "session_id": "<id2>",
+   "type": "warmup_ready"
+  },
+  {
+   "count": 0,
+   "type": "notification_count"
+  }
+ ],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [
+   "<id2>"
+  ],
+  "started": [
+   {
+    "agent": "warm-pinned",
+    "chat_id": "<id1>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "m-office",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "ask",
+    "model": "test-model",
+    "resume": true,
+    "resume_handle": null,
+    "role": "admin",
+    "session_id": "<id2>",
+    "user_sub": "user-admin",
+    "username": ""
+   }
+  ]
+ },
+ "slots": {
+  "acquired": [
+   [
+    "<id2>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "m-office",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": []
+ }
+}

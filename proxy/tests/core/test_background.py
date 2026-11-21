@@ -164,10 +164,11 @@ def test_spawn_off_the_loop_raises():
 
 def test_the_shutdown_tail_cancels_the_spawned_tasks(monkeypatch):
     import startup
+    import startup_shutdown
     from storage import pg as pg_pool
 
     order: list[str] = []
-    monkeypatch.setattr(startup, "_ARM_EXIT_FAILSAFE", False)
+    monkeypatch.setattr(startup_shutdown, "_ARM_EXIT_FAILSAFE", False)
 
     async def _fake_flush(logger):
         order.append("flush")
@@ -176,7 +177,7 @@ def test_the_shutdown_tail_cancels_the_spawned_tasks(monkeypatch):
         order.append("background")
         return 0
 
-    monkeypatch.setattr(startup, "_flush_active_pumps", _fake_flush)
+    monkeypatch.setattr(startup_shutdown, "_flush_active_pumps", _fake_flush)
     monkeypatch.setattr(startup.task_store, "list_orphaned_runs", lambda: [])
     monkeypatch.setattr(startup.task_store, "mark_orphaned_runs_failed", lambda exclude_ids=None: 0)
     monkeypatch.setattr(startup.task_store, "mark_orphaned_meetings_failed", lambda: 0)

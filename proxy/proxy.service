@@ -1,6 +1,12 @@
 # Template unit for a bare-metal (host-process) install. `scripts/dev-setup.sh
 # --service` generates and enables this automatically with your checkout's
 # paths and user — edit by hand only if you manage the unit yourself.
+#
+# The server starts no chat, task, call or tool itself: a bare-metal install
+# needs the compute unit beside this one (proxy/compute.service, which
+# dev-setup.sh --service writes too). Without it nothing runs and the server
+# says so at its start and on /health. A unit you keep by hand follows both
+# files: compare yours with them after every update.
 [Unit]
 Description=OtoDock — multi-agent AI orchestration platform
 # PostgreSQL runs in Docker (docker-compose.t1.yml) → wait for the daemon.
@@ -21,6 +27,14 @@ WorkingDirectory=/opt/otodock/proxy
 # environment. The proxy also parses config.env itself; process env wins.
 EnvironmentFile=/opt/otodock/config.env
 ExecStart=/opt/otodock/proxy/venv/bin/python app.py
+# The folder it writes the compute machine's credential into (otodock-compute).
+Environment="OTODOCK_COMPUTE_LINK_DIR=/opt/otodock/compute-link"
+# The stop reaches the server alone first, so it can wait for open work
+# (ExecStop, up to OTODOCK_DRAIN_BOUND_S seconds, 600 unless config.env says
+# otherwise, then the server's own stop). Its engines are ended last.
+KillMode=mixed
+ExecStop=-/opt/otodock/proxy/venv/bin/python /opt/otodock/proxy/admin_cli.py drain --quiet
+TimeoutStopSec=780
 # -----------------------------------------
 Restart=on-failure
 RestartSec=10

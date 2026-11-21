@@ -686,9 +686,25 @@ async def _relay(reader, writer, *, cli: str = "", agent: str = "",
     return exit_code["v"]
 
 
+def _api_main():
+    """The verbs that use a personal API key (``otodock_api.py``): a file of
+    its own, since it also runs by itself on a machine with no satellite."""
+    try:  # package import (the normal case)
+        from . import otodock_api
+    except ImportError:  # pragma: no cover - standalone fallback
+        import otodock_api  # type: ignore
+    return otodock_api
+
+
 def main(argv: list[str] | None = None) -> int:
+    words = sys.argv[1:] if argv is None else argv
+    api = _api_main()
+    if words and words[0] in api.VERBS:
+        return api.main(words)
     parser = argparse.ArgumentParser(
         prog="otodock",
+        epilog="Also: otodock login | logout | agents | chat | tasks | files | notify "
+               "(use your OtoDock with a personal API key).",
         description="Run an interactive Claude/Codex session as your otodock agent "
                     "in the current folder.",
     )

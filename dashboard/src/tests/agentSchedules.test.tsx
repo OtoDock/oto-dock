@@ -133,6 +133,16 @@ describe('AgentSchedules', () => {
     expect(within(chip).getByText('claude-sonnet-5').className).toContain('truncate')
   })
 
+  it('never calls a one-shot that will not run active, on the table and the card', () => {
+    h.tasks = [{ ...TASKS[0], will_not_fire: true }, TASKS[1]]
+    mount()
+    // The desktop row and the phone card of the dead row; the paused one keeps its word.
+    expect(screen.getAllByText('Will not run')).toHaveLength(2)
+    expect(screen.queryAllByText('Active')).toHaveLength(0)
+    expect(screen.getAllByText('Paused')).toHaveLength(2)
+    expect(within(screen.getAllByTestId('task-card-status')[0]).getByText('Will not run')).toBeInTheDocument()
+  })
+
   it('names who a moved task was transferred from, on the table and the card', () => {
     mount()
     const lines = screen.getAllByTestId('transferred-from')

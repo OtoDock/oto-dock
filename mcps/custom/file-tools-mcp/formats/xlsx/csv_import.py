@@ -5,7 +5,6 @@ import csv
 import io
 import os
 import re
-import stat
 from copy import copy
 
 from catalog import KeySpec, OpSpec
@@ -75,19 +74,16 @@ def _number(text: str, decimal: str):
 
 
 def _read_bounded(path: str) -> bytes:
-    """At most MAX_BYTES of a regular file. Opened without blocking, so a
-    pipe or a device is refused instead of waited on."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    """At most MAX_BYTES of a regular file, read beneath the mount with no
+    link followed (``shared.safe_open_read``): a pipe, a device or a link is
+    refused at once, never waited on or followed."""
+    import shared
+
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OpError(Code.BAD_VALUE, f"{os.path.basename(path)} is not a regular file",
-                          hint="Import a CSV file saved on disk.")
-        with os.fdopen(fd, "rb") as fh:
-            fd = -1
+        with shared.safe_open_read(path) as fh:
             data = fh.read(MAX_BYTES + 1)
-    finally:
-        if fd >= 0:
-            os.close(fd)
+    except PermissionError as exc:
+        raise OpError(Code.BAD_VALUE, str(exc), hint="Import a CSV file saved on disk.") from None
     if len(data) > MAX_BYTES:
         raise OpError(Code.BAD_VALUE, f"the file is over the {MAX_BYTES // (1024 * 1024)} MB one import takes",
                       hint="Split the file and import each part.")

@@ -353,8 +353,8 @@ export function SubscribeToEventsModal({
             {fixedAgent && (
               <p className="text-xs text-tertiary mt-1">
                 For agent <span className="font-medium">{fixedAgent}</span>, with
-                the account set as its service account. The agent&apos;s shared
-                triggers and apps fire on these events.
+                this account. The agent&apos;s shared triggers and apps fire on
+                these events.
               </p>
             )}
             {registrationMode === 'relay' && !installationTarget && (

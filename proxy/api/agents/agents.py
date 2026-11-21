@@ -26,12 +26,10 @@ from auth.providers import (
     require_admin,
     require_auth,
     require_creator,
-    require_write,
     session_bound_to,
 )
 from core import layout, placement
 from core.background import spawn
-from core.session import session_kind
 from services.infra.path_confinement import PathOutsideRoot
 from storage import database as task_store
 from storage.agents import agent_store
@@ -59,9 +57,13 @@ from api.agents import (
 
 # isort: split
 # (the sections above register their routes first)
-from api.agents import (
+from api.agents import (  # noqa: F401  # each module registers its routes on the shared router at import
     activity as _activity,
+    conversations as _conversations,
     knowledge_libraries as _knowledge_libraries,
+    outside as _outside,
+    session_reload as _session_reload,
+    tool_limits as _tool_limits,
 )
 from storage.agents.schema import DEFAULT_EXECUTION_PATH
 
@@ -82,7 +84,7 @@ discard_recover_bin = _files.discard_recover_bin
 # the agent config's Shared Knowledge card). tests/api/test_route_registry.py
 # pins the route set against exactly that.
 _SECTION_MODULES = (_discovery, _files, _user_context, _activity,
-                    _knowledge_libraries)
+                    _knowledge_libraries, _session_reload, _outside, _conversations)
 
 
 class CreateAgentRequest(BaseModel):
@@ -128,6 +130,15 @@ class UpdateAgentRequest(BaseModel):
     # update_agent — assigning wires delegation edges into other teams).
     department_id: str | None = None
     department_level_id: str | None = None
+    # Days the agent keeps its history (services/infra/history_retention.py),
+    # 0 is off. An admin's: a per-user chat can be deleted only by its owner
+    # or an admin, and a window deletes every member's.
+    history_retention_days: int | None = None
+    # The team account (services/mcp/account_context.py): people's chats on
+    # a collaborative agent run on the agent's own accounts, from the floor
+    # role up. A manager's, from the settings page.
+    team_account: bool | None = None
+    team_account_floor: str | None = None
 
 
 class DeleteAgentRequest(BaseModel):
@@ -330,6 +341,14 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
 
     fields = req.model_dump(exclude_none=True)
     fields.pop("confirm_removals", None)
+    # Whose accounts people's chats run on, and the floor, before the write:
+    # a change tells the chats (``_after_update``).
+    from services.mcp import account_context
+    lent_before = await asyncio.to_thread(account_context.people_use_agents_accounts, name)
+    floor_before = (await asyncio.to_thread(account_context.team_account, name))[1]
+    if fields.get("collaborative") is False:
+        # A mode without both spaces has no team account: off in the same write.
+        fields["team_account"] = False
     if "department_id" in fields or "department_level_id" in fields:
         # The pair is cleared together: one empty value empties the other.
         fields["department_id"] = (fields.get("department_id") or "").strip()
@@ -339,7 +358,7 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
         fields["default_for_new_users_role"] = ""
     # Keep the PRIMARY execution layer consistent with the default model whenever
     # EITHER is updated. A no-picker session/task uses (primary layer + default
-    # model), and a model only runs on its OWN layer (e.g. gpt-6-astra is codex-cli-
+    # model), and a model only runs on its OWN layer (e.g. gpt-6.2-astra is codex-cli-
     # only), so a mismatch makes delegated/no-picker runs hard-reject the model
     # (the personal-assistant delegate bug). resolve_execution_path reads the
     # scalar `execution_path`, so reconciling it here is what fixes those runs.
@@ -369,7 +388,7 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
     result = await asyncio.to_thread(agent_store.update_agent, name, **fields)
     if not result:
         raise HTTPException(404, "Agent not found")
-    await _after_update(name, fields, result)
+    await _after_update(name, fields, result, lent_before=lent_before, floor_before=floor_before)
     if switch is not None:
         result = dict(result)
         result["shared_only_switch"] = await _finish_shared_only_switch(name, u, switch)
@@ -500,6 +519,8 @@ async def _check_execution_target(name: str, req: UpdateAgentRequest, u: UserCon
         machine = remote_store.get_remote_machine(req.execution_target)
         if not machine:
             raise HTTPException(400, "Remote machine not found")
+        if placement.machine_is_compute(machine):
+            raise HTTPException(400, remote_store.COMPUTE_PLACE_REFUSED)
         if not placement.machine_is_admin_paired(machine):
             raise HTTPException(
                 403,
@@ -548,7 +569,47 @@ async def _check_department(name: str, req: UpdateAgentRequest, u: UserContext) 
 
 # update_agent's field checks in the order they run; each raises on its
 # first refusal, so the first check that fails answers the request.
+async def _check_history_window(name: str, req: UpdateAgentRequest, u: UserContext) -> None:
+    """The history window: an admin sets it, never a session token (an agent
+    must not shorten the window that deletes its own history)."""
+    days = req.history_retention_days
+    if days is None:
+        return
+    if u.is_session or not u.is_admin:
+        raise HTTPException(403, "Only an admin can change how long this agent's history is kept.")
+    from services.infra import history_retention
+    if days != 0 and not history_retention.MIN_DAYS <= days <= history_retention.MAX_DAYS:
+        raise HTTPException(400, "Enter 0 to keep everything, or a number of days from "
+                                 f"{history_retention.MIN_DAYS} to {history_retention.MAX_DAYS}.")
+
+
+TEAM_ACCOUNT_WHO = ("Only a manager, from Agent Settings, can change whose accounts this "
+                    "agent's chats use.")
+TEAM_ACCOUNT_MODE = "This setting is for an agent with both a shared and a personal space."
+
+
+async def _check_team_account(name: str, req: UpdateAgentRequest, u: UserContext) -> None:
+    """The team account: a manager sets it from the settings page, never a
+    session token or an API key (an agent must not put every chat on its own
+    accounts); on with the request's or the stored mode collaborative; the
+    floor one of the agent roles."""
+    if req.team_account is None and req.team_account_floor is None:
+        return
+    if u.is_session or u.is_api_key:
+        raise HTTPException(403, TEAM_ACCOUNT_WHO)
+    if req.team_account_floor is not None and req.team_account_floor not in roles.AGENT_ROLES:
+        raise HTTPException(400, "The floor is one of: " + ", ".join(roles.AGENT_ROLES) + ".")
+    if req.team_account:
+        collaborative = req.collaborative
+        if collaborative is None:
+            collaborative = bool((agent_store.get_agent(name) or {}).get("collaborative", True))
+        if not collaborative:
+            raise HTTPException(409, TEAM_ACCOUNT_MODE)
+
+
 _UPDATE_CHECKS = (
+    _check_history_window,
+    _check_team_account,
     _check_engines,
     _check_scope_and_effort,
     _check_execution_mode,
@@ -596,21 +657,42 @@ async def _move_execution_target(name: str, fields: dict, u: UserContext) -> Non
             await asyncio.to_thread(
                 remote_store.set_agent_remote_target, name, _target, u.sub,
             )
+            from services.remote import tools_ahead
+            tools_ahead.after_assignment(_target)
 
 
-async def _after_update(name: str, fields: dict, result: dict) -> None:
+async def _after_update(name: str, fields: dict, result: dict, *,
+                        lent_before: bool = False, floor_before: str = "") -> None:
     """What the written fields set off: the department edges recompiled, a
-    Shared-only agent's personal-machine overrides dropped."""
+    Shared-only agent's personal-machine overrides dropped, a Personal-only
+    agent's own accounts taken out, and the chats told when whose accounts
+    they run on changed (``lent_before``, ``floor_before``: read before the
+    write; a mode change that keeps the answer tells nothing)."""
     # Membership changed → the department edge set changed with it.
     if "department_id" in fields or "department_level_id" in fields:
         from services.departments import edge_compiler
         await asyncio.to_thread(edge_compiler.recompile)
+    from services.mcp import account_context
+    lends = await asyncio.to_thread(account_context.people_use_agents_accounts, name)
+    floor = str(result.get("team_account_floor") or roles.EDITOR)
+    if lends != lent_before or (bool(result.get("team_account")) and floor != floor_before):
+        # The closes wait for open turns and for machines: off the request.
+        from services.remote import chat_reload
+        spawn(chat_reload.team_account_changed(name, lends=lends if lends != lent_before else None),
+              name=f"team-account:{name}", owner="agents")
     # If this update put the agent into Shared-only mode (one shared chat history
     # across all users), drop any user→personal-machine overrides for it: a
     # shared-only agent may not run on a personal machine. Admin defaults (admin
     # machines) are untouched; reverting to any other mode re-allows personal
     # overrides. Computed from the returned row (no stale cache).
     if "default_scope" in fields or "collaborative" in fields:
+        from core.session.visibility import MODE_PERSONAL_ONLY, mode_for
+        if mode_for(bool(result.get("collaborative", True)),
+                    result.get("default_scope") or "user") == MODE_PERSONAL_ONLY:
+            # A Personal-only agent has no accounts of its own: they go
+            # through the one remover, with their subscriptions and sessions.
+            from services.agents import offboarding_bindings
+            await offboarding_bindings.clear_personal_only(name)
         now_shared_only = (
             not result.get("collaborative", True)
             and (result.get("default_scope") or "user") == "agent"
@@ -790,6 +872,14 @@ async def delete_agent(name: str, req: DeleteAgentRequest, user: UserContext = D
     deleted = await asyncio.to_thread(agent_store.delete_agent, name)
     if not deleted:
         raise HTTPException(404, "Agent not found")
+    # An open document of the agent is judged again at its next request.
+    from api.media import wopi
+    wopi.forget_agent(name)
+    # The apps' event index was marked stale before the row went (the apps'
+    # stop above): an index built in between still counts this agent as a
+    # department's member.
+    from services.apps import app_handlers
+    app_handlers.mark_dirty()
 
     if _lib_consumers:
         from services.knowledge import library_projector
@@ -814,43 +904,6 @@ async def delete_agent(name: str, req: DeleteAgentRequest, user: UserContext = D
         logger.warning("Failed to remove recover-bin files for %s: %s", name, e)
 
     return {"status": "deleted", "slug": name}
-
-
-@router.get("/v1/agents/{name}/conversations")
-async def list_agent_conversations(
-    name: str,
-    source_type: str = "",
-    offset: int = 0,
-    limit: int = 50,
-    user: UserContext = Depends(get_current_user),
-):
-    """List all conversations for an agent. Managers + admins only."""
-    u = require_auth(user)
-    limit = max(1, min(limit, config.MAX_PAGE_SIZE))  # cap page size
-    # A person's tab: an agent-scope session (a task run, a trigger, a call)
-    # reads no caller's transcript, whatever role its agent row carries.
-    if u.is_no_user_session:
-        raise HTTPException(status_code=403, detail="The conversations list is for people")
-    # Operators only (manager + admin). Phone transcripts are agent-scope and
-    # shared across the agent's managers/admins BY DESIGN (phone is not per-user),
-    # so there is no per-user filter — but viewers + editors must not see them.
-    # Matches the frontend tab gate (canManage, AgentLayout.tsx).
-    require_write(u, name)
-
-    # The Conversations tab is for EXTERNAL conversations — the kinds an
-    # out-of-band driver owns (phone today; a new one declares itself in
-    # core/session/session_kind). Dashboard chats and task runs live in the
-    # sidebar, so the tab works for every agent.
-    conversations = await asyncio.to_thread(
-        task_store.get_agent_conversations, name,
-        source_type=source_type, source_types=session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES,
-        offset=offset, limit=limit,
-    )
-    total = await asyncio.to_thread(
-        task_store.count_agent_conversations, name,
-        source_type=source_type, source_types=session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES,
-    )
-    return {"conversations": conversations, "total": total}
 
 
 @router.get("/v1/chats/{chat_id}/detail")

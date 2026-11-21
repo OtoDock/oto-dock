@@ -22,10 +22,7 @@ import hashlib
 import ipaddress
 import json
 import logging
-import os
 import re
-import shutil
-import sqlite3
 import stat
 import time
 from dataclasses import dataclass
@@ -37,8 +34,9 @@ import psycopg
 import config
 from auth import roles
 from auth.request_path import has_traversal
-from core import layout
+from core import agent_folder, layout
 from services.apps import (
+    app_db,
     app_folders,
     app_sandbox,
     app_supervisor,
@@ -68,9 +66,16 @@ RESULT_REJECTED = "rejected"
 # Why a release that turns the per-app switch off parks (APPS.md "The
 # contract"): a deploy raises the switch, only a person lowers it.
 LOWERS_APPROVAL = "turns off approval for every deploy"
+ROLLBACK_ADDS_SERVER = ("The release before this one has a server and the live one has none. "
+                        "A person rolls it back from the app's menu.")
+# An agent's folder the install's operator made a link (core/agent_folder.py):
+# a new release opens beneath the agents folder (releases.agents_rel), so it
+# is refused there.
+LINKED_AGENT_FOLDER = ("this agent's folder is a link, so a new release cannot be made here. "
+                       "The release that is live keeps serving.")
 RESULTS: frozenset[str] = frozenset({RESULT_OK, RESULT_REFUSED, RESULT_PENDING_APPROVAL, RESULT_REJECTED})
 
-APP_JSON_MAX_BYTES = 32 * 1024
+APP_JSON_MAX_BYTES = 96 * 1024   # the actions (manifest.MAX_MANIFEST_BYTES) and the other blocks
 MAX_EGRESS_HOSTS = 16
 MAX_FILE_PREFIXES = 8
 PULL_MAX_FILES = 200
@@ -374,9 +379,12 @@ def validate_exports(block) -> dict:
             if floor is not None:
                 if kind == "events":
                     raise DeployError(f"exports.events.{name}: events carry no min_role")
-                if floor not in _mf.ACTION_ROLES:
+                if floor == _mf.OUTSIDE_FLOOR and kind != "methods":
+                    raise DeployError(f"exports.{kind}.{name}: min_role external opens a method to "
+                                      "outside people, and only a method can be one")
+                if floor not in _mf.ACTION_ROLES and floor != _mf.OUTSIDE_FLOOR:
                     raise DeployError(f"exports.{kind}.{name}: min_role is viewer, contributor, "
-                                      "editor or manager")
+                                      "editor, manager or external")
                 # The default floor is every caller and is never stored, as
                 # an action's.
                 if floor != roles.VIEWER:
@@ -736,11 +744,13 @@ def validate_requires(block) -> dict:
 
 
 def validate_app_json(doc: dict, agent: str, shared: bool,
-                      source_dir: Path | None = None) -> Manifest:
+                      source_dir: Path | None = None, *,
+                      blueprint_tasks: frozenset[str] | None = None) -> Manifest:
     """The whole manifest, or ``DeployError``. ``source_dir`` is the folder
     the manifest describes: with it the steps' scripts are hashed into the
     block (every stored block comes from a call with it); a shape check
-    before the folder exists passes None."""
+    before the folder exists passes None. ``blueprint_tasks``: a template's
+    folder check, its buttons named by the blueprint's slugs."""
     unknown = sorted(k for k in doc if k not in ALLOWED_KEYS)
     if unknown:
         raise DeployError(f"app.json: unknown keys {unknown}")
@@ -750,7 +760,8 @@ def validate_app_json(doc: dict, agent: str, shared: bool,
     if doc.get("catalog"):
         raise DeployError("app.json: declare feeds and methods as actions "
                           "(type data_feed / platform), not under catalog")
-    actions_json, err = _mf.validate_actions(doc.get("actions") or [], agent, shared)
+    actions_json, err = _mf.validate_actions(doc.get("actions") or [], agent, shared,
+                                             blueprint_tasks=blueprint_tasks)
     if actions_json is None:
         raise DeployError(f"app.json: {err}")
     # A folder app's server owns its data directory, where the per-viewer
@@ -880,12 +891,10 @@ async def pull_folder(session_id: str, rel_dir: str) -> int:
             raise DeployError(f"could not read {rel} from your machine")
         pulled += 1
         with contextlib.suppress(OSError):
-            total += path.stat().st_size
+            total += path.lstat().st_size
         if total > PULL_MAX_BYTES:
             raise DeployError(f"the folder is larger than {PULL_MAX_BYTES // (1024 * 1024)} MB")
-    # A satellite whose listing may leave out files it has (the Windows hash
-    # bug) says nothing about absence: the pulls land, nothing is removed.
-    if agent_dir is not None and remote_file_flow.absence_is_reliable(session_id):
+    if agent_dir is not None:
         try:
             root = path_confinement.join_under(agent_dir, rel_dir)
         except path_confinement.PathOutsideRoot as exc:
@@ -914,66 +923,6 @@ async def pull_folder(session_id: str, rel_dir: str) -> int:
             session_id, info.agent_name if info else "", f"{rel_dir}/{p}")]
         await asyncio.to_thread(_drop, removable)
     return pulled
-
-
-# ── the database ────────────────────────────────────────────────────────────
-
-
-def _plain_file_or_absent(path: Path) -> bool:
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return True
-    return stat.S_ISREG(st.st_mode)
-
-
-def snapshot_db(src: Path, dst: Path) -> bool:
-    """A consistent copy through the SQLite backup API (a WAL database
-    another process holds open is fine); False when there is nothing.
-
-    The data directory is the app's own server's to write, so the database
-    and its WAL and shm siblings are checked to be plain files right before
-    the open: SQLite opens by name and would follow a link the app planted
-    into another app's or another person's database."""
-    for cand in (src, Path(str(src) + "-wal"), Path(str(src) + "-shm")):
-        if not _plain_file_or_absent(cand):
-            raise DeployError("the app's database is not a plain file, so the deploy "
-                              "stops here and nothing is read through it")
-    if not src.is_file():
-        return False
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(dst.name + ".tmp")
-    try:
-        source = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-        try:
-            target = sqlite3.connect(tmp)
-            try:
-                with target:
-                    source.backup(target)
-            finally:
-                target.close()
-        finally:
-            source.close()
-    except sqlite3.Error as e:
-        tmp.unlink(missing_ok=True)
-        raise DeployError(f"the app's database could not be copied ({e}) — the deploy "
-                          "stops here so nothing is lost") from e
-    tmp.replace(dst)
-    return True
-
-
-def restore_db(snapshot: Path, target: Path) -> None:
-    """Put a snapshot in the database's place and drop the stale WAL and
-    shm files (a replaced main file under an old WAL is corrupt). The copy
-    lands beneath the agents root with no link followed and replaces the
-    name atomically: the data directory is the app's own to write, so a
-    link planted at the database's name is replaced, never written through."""
-    root = config.AGENTS_DIR
-    target_rel = safe_fs.rel_under(target, root)
-    for suffix in ("-wal", "-shm"):
-        safe_fs.unlink_beneath(root, target_rel + suffix, missing_ok=True)
-    safe_fs.copy_file_beneath(root, safe_fs.rel_under(snapshot, root), root, target_rel,
-                              mkdirs=True)
 
 
 def changed_files(old_dir: Path | None, new_dir: Path) -> dict:
@@ -1009,8 +958,11 @@ def quota_preflight(row: dict, source_dir: Path, release_bytes: int | None = Non
     used, _ = usage
     if release_bytes is None:
         release_bytes = releases.tree_bytes(source_dir)
-    db = releases.app_data_dir(row) / "app.db"
-    db_bytes = db.stat().st_size if db.is_file() else 0
+    db = releases.app_data_dir(row) / app_db.DB_NAME
+    db_bytes = 0
+    with contextlib.suppress(OSError):
+        name = safe_fs.kind_beneath(*releases.agents_rel(db))
+        db_bytes = name.st.st_size if name.is_file and name.st else 0
     if used + release_bytes + db_bytes > limit * QUOTA_HEADROOM:
         need = (used + release_bytes + db_bytes) // (1024 * 1024)
         have = int(limit * QUOTA_HEADROOM) // (1024 * 1024)
@@ -1021,15 +973,17 @@ def quota_preflight(row: dict, source_dir: Path, release_bytes: int | None = Non
 
 def _prune_rollback_snapshots(row: dict) -> None:
     base = releases.app_release_dir(row)
-    snaps = sorted(base.glob("rollback-*.sqlite"), key=lambda p: p.name)
+    snaps = sorted(n for n in releases.entries(base)[1] if n.startswith("rollback-") and n.endswith(".sqlite"))
     for old in snaps[:-KEEP_ROLLBACK_SNAPSHOTS] if len(snaps) > KEEP_ROLLBACK_SNAPSHOTS else []:
-        old.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            safe_fs.unlink_beneath(*agent_folder.beneath_agent(base / old, row["agent"]), missing_ok=True)
 
 
 # ── the pipeline ────────────────────────────────────────────────────────────
 
 
-async def _notify_pending(row: dict, n: int, waiting: str = "", *, lowers: bool = False) -> None:
+async def _notify_pending(row: dict, n: int, waiting: str = "", *, lowers: bool = False,
+                          adds_server: bool = False) -> None:
     from services.notifications.notification_manager import fire_notification
     from storage.identity import db_users
     if row.get("username"):
@@ -1039,6 +993,8 @@ async def _notify_pending(row: dict, n: int, waiting: str = "", *, lowers: bool 
                    if roles.can_edit(u.get("agent_role"))]
     title = f"Release {n} of {row.get('title') or row.get('slug')} is waiting for approval"
     body = "Open the app to see what changed and approve or reject the release."
+    if adds_server:
+        body = "This release of the app runs its own program on your OtoDock. Open the app to approve or reject it."
     if lowers:
         body = ("This release turns off approval for every deploy: approving it lets later "
                 "deploys of the app go live without asking.")
@@ -1059,7 +1015,7 @@ async def go_live(row: dict, n: int, *, start: bool = True) -> dict:
     templates"): the row is pointed and the server starts on the first
     open (``app_supervisor.ensure_up``), never at the seed."""
     new_dir = releases.app_release_dir(row) / str(n)
-    if not (new_dir / releases.MANIFEST_NAME).is_file():
+    if not releases.is_plain_file(new_dir, releases.MANIFEST_NAME):
         raise DeployError(f"release {n} is not on disk")
     # APPS.md "Secrets": a release never goes live while a required secret
     # has no value (the approve route refuses with the same words).
@@ -1071,13 +1027,12 @@ async def go_live(row: dict, n: int, *, start: bool = True) -> dict:
     # starts.
     folders = (await asyncio.to_thread(app_folders.ensure_created_dirs, row)
                if app_folders.declares_folders(row) else None)
-    db = releases.app_data_dir(row) / "app.db"
-    await asyncio.to_thread(snapshot_db, db, releases.db_before_path(row, n))
+    await asyncio.to_thread(app_db.snapshot_db, row, releases.db_before_path(row, n))
     if start and app_sandbox.server_entry(new_dir) and task_store.app_actions_approved(row):
         try:
             await app_supervisor.start(row, app_supervisor.LIVE, release_dir=new_dir)
         except (app_sandbox.AppStartError, app_supervisor.AppUnavailable) as e:
-            await asyncio.to_thread(shutil.rmtree, new_dir, True)
+            await asyncio.to_thread(releases.remove_tree, new_dir)
             await run_db(task_store.set_deploy_state, row["id"], deploy_state=task_store.DEPLOY_IDLE,
                          pending_release=0)
             raise DeployError(f"the new release did not start, the previous one keeps "
@@ -1105,7 +1060,7 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
                         cold: bool = False, approve_as: str = "",
                         template_ref: str | None = None,
                         origin: tuple[str, str] | None = None,
-                        hold: bool = False) -> dict:
+                        hold: bool = False, consent_tree: str = "", consent_server: bool = False) -> dict:
     """The whole pipeline for one working folder; raises ``DeployError``
     with the reason for the agent. ``hold`` parks the release for a person
     whatever the manifest says (a release another agent's app sent,
@@ -1119,7 +1074,10 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
     failing one leaves the release pending with the reason in
     ``consent_refused``); ``template_ref`` stamps the row, ``origin`` (a
     template's slug and version) where the app's code came from
-    (app_blueprints.py)."""
+    (app_blueprints.py). ``consent_tree`` is the tree the consent names
+    (``template_app_seeder.consent_reach``): it covers a server only on a
+    cut of that tree (``releases.code_sha``), and on a row with a release
+    live only with ``consent_server`` (its dialog showed the server)."""
     confine_to_scope(agent, username, source_dir)
     if session_id:
         from core.remote import remote_file_flow
@@ -1187,10 +1145,17 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
         approver = await asyncio.to_thread(user_context_for_sub, approve_as)
         consent_refused = (await asyncio.to_thread(_manifest_target_error, row, approver)
                            if approver else "the person who consented is gone")
+        # The consent approves like a person's click: an app open to
+        # external identities never approves a folder they may not read,
+        # and a change in what it opens to them tells the managers.
+        from services.mcp import outside_picks
+        if not consent_refused:
+            consent_refused = await run_db(outside_picks.approval_refusal, row)
         if not consent_refused:
             await run_db(task_store.approve_app_actions, row["id"],
                          task_store.manifest_sig(row), approve_as)
             row = await run_db(task_store.get_app, row["id"]) or row
+            await run_db(outside_picks.app_released, row)
     async with _deploy_lock(row["id"]):
         # The row as it stands now: an approval that held the lock while
         # this deploy waited took the waiting copy live, and a live release
@@ -1201,7 +1166,7 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
         if m.requires_approval and not row.get("deploy_requires_approval"):
             row = await run_db(task_store.set_deploy_state, row["id"], requires_approval=True) or row
         if superseded and int(row.get("pending_release") or 0) == superseded:
-            await asyncio.to_thread(shutil.rmtree, releases.app_release_dir(row) / str(superseded), True)
+            await asyncio.to_thread(releases.remove_tree, releases.app_release_dir(row) / str(superseded))
             row = await run_db(task_store.set_deploy_state, row["id"], deploy_state=task_store.DEPLOY_IDLE,
                                pending_release=0) or row
         else:
@@ -1210,22 +1175,44 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
         if why:
             await _restore_live_manifest(row)
             raise DeployError(why)
+        # A release that brings a server where the live one has none waits
+        # for a person (``releases.adds_server``). Read before the cut, which
+        # takes the number of a live copy that is gone.
+        live_serves = await asyncio.to_thread(releases.live_runs_server, row)
         try:
             rel, sha, n = await asyncio.to_thread(releases.cut_folder_release, row, source_dir,
                                                   after=superseded)
         except releases.ReleaseInvalid as e:
             await _restore_live_manifest(row)
             raise DeployError(str(e)) from e
+        except safe_fs.SafeFsError as e:
+            await _restore_live_manifest(row)
+            raise DeployError(LINKED_AGENT_FOLDER) from e
         approved = task_store.app_actions_approved(row)
+        gains = await asyncio.to_thread(releases.adds_server, row, releases.app_release_dir(row) / str(n),
+                                        live_serves)
+        # No server goes live before a person said yes: on the card, or by a
+        # template consent whose tree this cut is, on a copy that runs a
+        # release only when its dialog showed the server. A refused consent
+        # leaves the manifest waiting anyway.
+        covered = bool(approve_as and consent_tree) and await asyncio.to_thread(
+            releases.code_sha, releases.app_release_dir(row) / str(n)) == consent_tree
+        judged = not covered or (bool(row.get("release_path")) and not consent_server)
+        # The server is the answer's reason only where it decides.
+        adds = judged and gains
+        if gains and not adds:
+            logger.info("App %s: release %d brings a server, the template consent of %s covers it",
+                        slug, n, approve_as)
         if not cold:
             # The rendered check of the copy that ships (APPS.md "Deploy
             # pipeline"): a page that fails when loaded never goes live and
             # never parks for approval either; the release copy goes with it.
             from services.apps import app_render
             report = await app_render.render_tree(row, releases.app_release_dir(row) / str(n),
-                                                  approved=approved, seed=app_render.seeds_live_data(row, m))
+                                                  approved=approved and not gains,
+                                                  seed=app_render.seeds_live_data(row, m, gains))
             if report.status == "hard":
-                await asyncio.to_thread(shutil.rmtree, releases.app_release_dir(row) / str(n), True)
+                await asyncio.to_thread(releases.remove_tree, releases.app_release_dir(row) / str(n))
                 await _restore_live_manifest(row)
                 return {"status": RESULT_REFUSED, "slug": slug, "app_id": row["id"],
                         "render": report.as_dict(), **lint}
@@ -1237,7 +1224,7 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
         from services.apps import app_secrets
         waiting = await asyncio.to_thread(app_secrets.waiting_reason, row)
         lowers = m.requires_approval is False and bool(row.get("deploy_requires_approval"))
-        if bool(row.get("deploy_requires_approval")) or not approved or waiting or hold:
+        if bool(row.get("deploy_requires_approval")) or not approved or waiting or hold or adds:
             row = await run_db(task_store.set_deploy_state, row["id"], deploy_state=task_store.DEPLOY_PENDING,
                                pending_release=n) or row
             # One notification per waiting episode: a deploy that replaces a
@@ -1245,11 +1232,13 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
             # deploys in a row rang three times on the internal install).
             if not superseded:
                 try:
-                    await _notify_pending(row, n, waiting, lowers=lowers)
+                    await _notify_pending(row, n, waiting, lowers=lowers, adds_server=adds)
                 except Exception:
                     logger.exception("App %s: pending-release notification failed", slug)
             if lowers:
                 lint = {**lint, "lowers_approval": True, "reason": LOWERS_APPROVAL}
+            if adds:
+                lint = {**lint, "adds_server": True}
             return {"status": RESULT_PENDING_APPROVAL, "app_id": row["id"], "release": n,
                     "manifest_changed": not approved, "live_release": releases.current_number(row),
                     "superseded": superseded, "waiting": waiting, **lint}
@@ -1257,13 +1246,16 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
 
 
 async def approve_pending(row: dict, approver_sub: str, expect_sig: str | None = None,
-                          expect_release: int | None = None) -> dict:
+                          expect_release: int | None = None, expect_sha: str | None = None) -> dict:
     """Approve the pending release (the human route): the manifest it
     carries becomes the approved one in the same step, then it goes live.
     ``expect_sig`` / ``expect_release`` name what the person was shown (the
     card's body; by default the row the caller judged). The row is read
     again under the deploy lock: a deploy that replaced the waiting copy or
-    its manifest meanwhile refuses the click instead of riding it."""
+    its manifest meanwhile refuses the click instead of riding it.
+    ``expect_sha`` is the waiting copy's tree hash the card showed: a number
+    is handed out again after a reject, so the pair alone may name another
+    copy. A click without it (an older tab) is judged as before."""
     if expect_sig is None:
         expect_sig = task_store.manifest_sig(row)
     if expect_release is None:
@@ -1277,6 +1269,9 @@ async def approve_pending(row: dict, approver_sub: str, expect_sig: str | None =
             raise DeployError("no release is waiting for approval")
         if n != expect_release or task_store.manifest_sig(row) != expect_sig:
             raise DeployError("the release changed — review it again")
+        if expect_sha is not None and await asyncio.to_thread(
+                releases.tree_sha, releases.app_release_dir(row) / str(n)) != expect_sha:
+            raise DeployError("the release changed — review it again")
         # A required secret without a value: the click sets nothing live
         # and approves nothing — the card says what to set first.
         from services.apps import app_secrets
@@ -1288,11 +1283,19 @@ async def approve_pending(row: dict, approver_sub: str, expect_sig: str | None =
         # leaves the switch on for the next deploy.
         lowers = bool(row.get("deploy_requires_approval")) and await asyncio.to_thread(
             release_lowers_approval, row, n)
+        gains = await asyncio.to_thread(releases.adds_server, row, releases.app_release_dir(row) / str(n))
+        from services.mcp import outside_picks
         if not task_store.app_actions_approved(row):
+            refused = await run_db(outside_picks.approval_refusal, row)
+            if refused:
+                raise DeployError(refused)
             if not await run_db(task_store.approve_app_actions, row["id"], expect_sig, approver_sub):
                 raise DeployError("the release changed — review it again")
             row = await run_db(task_store.get_app, row["id"]) or row
         out = await go_live(row, n)
+        if gains:
+            logger.info("App %s: release %d brings a server, approved by %s", row.get("slug"), n, approver_sub)
+        await run_db(outside_picks.app_released, row)
         if lowers:
             await run_db(task_store.set_deploy_state, row["id"], requires_approval=False)
             logger.info("App %s: approval turned off by the approval of release %d", row.get("slug"), n)
@@ -1349,7 +1352,7 @@ async def reject_pending(row: dict) -> dict:
         raise DeployError("no release is waiting for approval")
     async with _deploy_lock(row["id"]):
         tree = await asyncio.to_thread(releases.tree_sha, releases.app_release_dir(row) / str(n))
-        await asyncio.to_thread(shutil.rmtree, releases.app_release_dir(row) / str(n), True)
+        await asyncio.to_thread(releases.remove_tree, releases.app_release_dir(row) / str(n))
         row = await run_db(task_store.set_deploy_state, row["id"], deploy_state=task_store.DEPLOY_IDLE,
                            pending_release=0) or row
         row = await _restore_live_manifest(row)
@@ -1361,25 +1364,30 @@ async def reject_pending(row: dict) -> dict:
                 **({"warning": warning} if warning else {})}
 
 
-async def rollback_folder(row: dict) -> dict:
+async def rollback_folder(row: dict, *, by_person: bool) -> dict:
     """Serve the previous release again with the database as it was before
     the current one went live (the caller holds the deploy lock); the
-    current database is snapshotted first so nothing is lost for good."""
+    current database is snapshotted first so nothing is lost for good.
+    ``by_person`` is the menu's Roll back: the agent's ``rollback_app``
+    never brings back a server the live release has not."""
+    row = await run_db(task_store.get_app, row["id"]) or row
     if int(row.get("pending_release") or 0):
         raise DeployError("a release is waiting for approval — approve or reject it first")
     cur = releases.current_number(row)
     prev = releases.previous_number(row)
     if prev is None:
         raise DeployError("no previous release")
+    if not by_person and await asyncio.to_thread(releases.rollback_adds_server, row):
+        raise DeployError(ROLLBACK_ADDS_SERVER)
     await app_supervisor.stop(row["id"], app_supervisor.LIVE)
     db = releases.app_data_dir(row) / "app.db"
     stamp = time.strftime("%Y%m%dT%H%M%S")
-    snapshotted = await asyncio.to_thread(snapshot_db, db, releases.rollback_snapshot_path(row, stamp))
+    snapshotted = await asyncio.to_thread(app_db.snapshot_db, row, releases.rollback_snapshot_path(row, stamp))
     await asyncio.to_thread(_prune_rollback_snapshots, row)
     before = releases.db_before_path(row, cur)
     restored = False
-    if before.is_file():
-        await asyncio.to_thread(restore_db, before, db)
+    if releases.is_plain_file(before.parent, before.name):
+        await asyncio.to_thread(app_db.restore_db, before, db)
         restored = True
     rel, sha = await asyncio.to_thread(releases.point_to, row, prev)
     fresh = await run_db(task_store.set_app_release, row["id"], rel, sha) or row
@@ -1427,9 +1435,8 @@ async def cut_preview(row: dict, source_dir: Path) -> str:
 
     def _copy() -> str:
         releases.copy_tree(source_dir, pd, replace=True)
-        live_db = releases.app_data_dir(row) / "app.db"
-        if app_render.seeds_live_data(row, working_manifest(row, pd)) and live_db.is_file():
-            snapshot_db(live_db, pd / "data" / "app.db")
+        if app_render.seeds_live_data(row, working_manifest(row, pd), releases.adds_server(row, pd)):
+            app_db.snapshot_db(row, pd / "data" / app_db.DB_NAME)
         return releases.tree_sha(pd)
 
     try:
@@ -1476,6 +1483,9 @@ def status(row: dict) -> dict:
         except releases.ReleaseDamaged:
             live = None
         out["changes"] = changed_files(live, releases.app_release_dir(row) / str(pending))
+        out["pending_sha"] = releases.tree_sha(releases.app_release_dir(row) / str(pending))
+        if releases.pending_adds_server(row):
+            out["adds_server"] = True
         if row.get("deploy_requires_approval") and release_lowers_approval(row, pending):
             out["lowers_approval"] = True
     return out

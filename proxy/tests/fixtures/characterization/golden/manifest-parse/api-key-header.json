@@ -1,0 +1,105 @@
+{
+ "bad host": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — proposed_hosts[0]='https://x' is not a valid hostname"
+ },
+ "bad name": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — name must be an HTTP header name"
+ },
+ "bad value_from": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — value_from must name a credential key"
+ },
+ "beside a bearer": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — cannot be declared beside credentials.oauth.bearer_required"
+ },
+ "beside an empty relay": {
+  "parsed": {
+   "api_key_header": {
+    "name": "X-Char-Key",
+    "proposed_hosts": [
+     "api.example.test"
+    ],
+    "value_from": "CHAR_KEY"
+   },
+   "fields": [
+    {
+     "input_type": "password",
+     "key": "CHAR_KEY",
+     "label": "Key"
+    }
+   ],
+   "type": "infra"
+  }
+ },
+ "beside the relay": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — cannot be declared beside hosted.api_key_relay"
+ },
+ "good": {
+  "parsed": {
+   "api_key_header": {
+    "name": "X-Char-Key",
+    "proposed_hosts": [
+     "*.example.test"
+    ],
+    "value_from": "CHAR_KEY"
+   },
+   "fields": [
+    {
+     "input_type": "password",
+     "key": "CHAR_KEY",
+     "label": "Key"
+    }
+   ],
+   "type": "infra"
+  }
+ },
+ "hosts empty": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — proposed_hosts must be a non-empty list"
+ },
+ "instance field": {
+  "parsed": {
+   "api_key_header": {
+    "name": "X-Char-Key",
+    "proposed_hosts": [
+     "api.example.test"
+    ],
+    "value_from": "CHAR_KEY"
+   }
+  }
+ },
+ "missing hosts": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — proposed_hosts is required"
+ },
+ "missing name": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — name is required"
+ },
+ "no scheme": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — server.url_template must be an http(s) URL with a host"
+ },
+ "not an object": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — must be an object when declared"
+ },
+ "other host": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — server.url_template host 'other.test' is not among proposed_hosts"
+ },
+ "owned family": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — name 'X-Forwarded-For' is a header the platform owns"
+ },
+ "owned name": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — name 'Authorization' is a header the platform owns"
+ },
+ "stdio": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — requires a streamable-HTTP server.transport; got 'stdio'"
+ },
+ "template": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — server.url_template must be a literal URL"
+ },
+ "text field": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — value_from 'CHAR_KEY' must be a credentials.fields key with input_type password or an env-delivered instances field"
+ },
+ "undeclared key": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — value_from 'OTHER' must be a credentials.fields key with input_type password or an env-delivered instances field"
+ },
+ "unknown key": {
+  "refused": "char-mcp: invalid credentials.api_key_header block — unknown keys: ['extra']"
+ }
+}

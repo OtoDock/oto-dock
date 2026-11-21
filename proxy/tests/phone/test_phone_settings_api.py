@@ -59,6 +59,17 @@ def test_known_keys_are_stored_as_the_daemon_reads_them(client):
     assert got["debug_outgoing_audio"] == "on" and got["log_level"] == "DEBUG"
 
 
+@pytest.mark.parametrize("key", ["vad_context", "voice_vad_context"])
+def test_the_detectors_feed_cannot_be_stored(client, key):
+    """No setting chooses the feed of the speech detector, for calls or for
+    voice conversations: each key an earlier build stored answers as any
+    unknown key, and nothing is written."""
+    for sent in ("on", "off"):
+        r = client.put("/v1/admin/phone/settings", json={key: sent})
+        assert r.status_code == 400 and key in r.json()["detail"]
+    assert _stored(key) is None
+
+
 def test_an_unknown_key_answers_400_with_the_key_named(client):
     r = client.put("/v1/admin/phone/settings", json={"tts_buffer_chars": "30", "vad_threshold": "0.5"})
     assert r.status_code == 400 and "vad_threshold" in r.json()["detail"]
@@ -93,6 +104,33 @@ def test_a_bad_value_leaves_the_good_ones_unwritten(client):
     r = client.put("/v1/admin/phone/settings", json={"tts_buffer_chars": "30", "breath_gain": "7"})
     assert r.status_code == 400 and r.json()["detail"].startswith("breath_gain:")
     assert _stored("tts_buffer_chars") is None
+
+
+def test_every_phone_switch_word_names_a_setting_the_server_stores():
+    """A switch word for a phone key the allowlist refuses is a row left
+    behind by a setting that is gone."""
+    from configuration import setting_switches
+
+    stale = sorted(key for key in setting_switches.SWITCH_WORDS
+                   if key.startswith("phone_") and key.removeprefix("phone_") not in phone_settings.PHONE_SETTINGS)
+    assert stale == []
+
+
+def test_the_dashboards_restore_defaults_sends_only_keys_the_server_stores():
+    """Restore Defaults writes the Advanced card's phone defaults in one
+    request, and one unknown key refuses them all. Read from the dashboard's
+    source: a default for a setting that is gone must go with it."""
+    import re
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[3] / "dashboard" / "src" / "components" / "audio" / "AdvancedTuning.tsx"
+    if not source.is_file():
+        pytest.skip("no dashboard sources in this tree")
+    block = re.search(r"const PHONE_ADV_DEFAULTS: Record<string, string> = \{(.*?)\n\}", source.read_text(encoding="utf-8"), re.S)
+    assert block, "PHONE_ADV_DEFAULTS not found"
+    defaults = dict(re.findall(r"(\w+): '([^']*)'", block.group(1)))
+    assert len(defaults) >= 15
+    assert phone_settings.check_phone_settings(defaults) == defaults
 
 
 def test_the_dashboard_payloads_pass():

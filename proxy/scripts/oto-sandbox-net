@@ -9,9 +9,17 @@ existing bwrap argv; see core/sandbox/sandbox.py::SandboxBuilder.build_command_p
 
 Usage:
     oto-sandbox-net [--beneath ROOT]... [--forward PORT]... [--allow-host ADDR]... \
-                    [--dns-forward ADDR] [--block-private] \
+                    [--dns-forward ADDR] [--block-private] [--hosted] \
                     [--inbound HOSTPORT:PORT] [--egress-deny] \
                     -- <inner argv (bwrap ... -- agent ...)>
+
+``--hosted`` (a hosted install, ``OTODOCK_CLOUD``): with ``--block-private``
+the blackholes also take the shared address space and the benchmarking
+range (100.64.0.0/10, 198.18.0.0/15, fail-closed like the others) and the
+IPv6 unique-local range (fc00::/7, tolerated like the other IPv6 routes),
+the IPv6 default gateway carved on-link first. Link-local IPv6 stays: the
+namespace's own ``fe80::/64`` route is more specific than any blackhole and
+carries the IPv6 gateway, so the hosted VM's firewall refuses it instead.
 
 ``--beneath ROOT`` (an agent session's resolved agent folder): the shim opens
 every ``--bind`` / ``--ro-bind`` source below ROOT as a descriptor, walking
@@ -142,6 +150,27 @@ _BLOCK_V4 = (
 _BLOCK_V6 = (
     "fd00:ec2::254/128",   # AWS IMDSv2 over IPv6 (explicit)
 )
+# --hosted adds these: on a hosted install no address beside the public
+# internet belongs to the customer (a cloud provider's carrier-grade NAT and
+# its internal services sit in 100.64/10).
+_HOSTED_V4 = (
+    "100.64.0.0/10",       # shared address space (RFC 6598)
+    "198.18.0.0/15",       # benchmarking (RFC 2544)
+)
+_HOSTED_V6 = (
+    "fc00::/7",            # unique-local (RFC 4193)
+)
+
+
+def _take_flag(argv: list[str], flag: str) -> tuple[bool, list[str]]:
+    """Whether ``flag`` appears before the ``--`` separator, and the argv
+    without it (the inner argv after ``--`` is never touched)."""
+    if "--" in argv:
+        cut = argv.index("--")
+        head, tail = argv[:cut], argv[cut:]
+    else:
+        head, tail = argv, []
+    return flag in head, [a for a in head if a != flag] + tail
 
 
 def _die(msg: str) -> None:
@@ -320,7 +349,8 @@ def _held_binds(argv):
 #      targets + every --allow-host) as more-specific /32 · /128 via the gateway
 #      — pasta re-originates host-side, so via-gw reaches on-link AND routed;
 #   5. blackholes _BLOCK_V4 + the on-link subnet(s) (fail-CLOSED, os._exit(41))
-#      and _BLOCK_V6 (tolerated — v6 may be off);
+#      and _BLOCK_V6 (tolerated — v6 may be off), the IPv6 gateway carved
+#      on-link first when the hosted ranges are in;
 #   6. with --beneath, swaps each bind source below a root for a held
 #      descriptor (_HELD_BINDS) in the mount namespace bwrap starts from
 #      (fail-CLOSED, os._exit(42));
@@ -332,6 +362,7 @@ _BLOCK_V6 = {block_v6!r}
 _CARVE = {carve!r}
 _BLOCK = {block!r}
 _EGRESS_DENY = {egress_deny!r}
+_HOSTED = {hosted!r}
 _BENEATH = {beneath!r}
 {held_binds}
 
@@ -351,6 +382,12 @@ def _gw6():
     out = _ip(["-o", "route", "show", "default"], v6=True).stdout.split()
     for i, t in enumerate(out):
         if t == "via" and i + 1 < len(out): return out[i + 1]
+    return ""
+
+def _dev6():
+    out = _ip(["-o", "route", "show", "default"], v6=True).stdout.split()
+    for i, t in enumerate(out):
+        if t == "dev" and i + 1 < len(out): return out[i + 1]
     return ""
 
 def _resolvers():
@@ -432,6 +469,10 @@ if _BLOCK:
         if _ip(["route", "replace", "unreachable", net]).returncode != 0:
             sys.stderr.write("oto-sandbox-net-shim: failed to blackhole " + net + "\\n")
             os._exit(41)
+    if _HOSTED and gw6 and _dev6():
+        # A unique-local IPv6 gateway (a Docker network with IPv6) stays
+        # reachable under the fc00::/7 blackhole.
+        _ip(["route", "replace", gw6 + "/128", "dev", _dev6()], v6=True)
     for net in _BLOCK_V6:
         _ip(["route", "replace", "unreachable", net], v6=True)
 
@@ -478,7 +519,7 @@ os.execvp(inner[0], inner)
 def _build_pyshim(
     forwards: list[str], allow_hosts: list[str],
     dns_forward: str, block_private: bool, egress_deny: bool = False,
-    beneath: "list[str] | tuple[str, ...]" = (),
+    beneath: "list[str] | tuple[str, ...]" = (), hosted: bool = False,
 ) -> str:
     """The in-netns python3 program (config baked in). See _PYSHIM."""
     # Non-loopback forward targets (`addr/port` specs) carve back out; loopback
@@ -487,14 +528,16 @@ def _build_pyshim(
                  if "/" in f and not f.split("/", 1)[0].startswith("127.")]
     carve = ([dns_forward] if dns_forward else []) + fwd_addrs + list(allow_hosts)
     return _PYSHIM.format(
-        block_v4=_BLOCK_V4, block_v6=_BLOCK_V6,
-        carve=carve, block=block_private, egress_deny=egress_deny,
+        block_v4=_BLOCK_V4 + (_HOSTED_V4 if hosted else ()),
+        block_v6=_BLOCK_V6 + (_HOSTED_V6 if hosted else ()),
+        carve=carve, block=block_private, egress_deny=egress_deny, hosted=hosted,
         beneath=list(beneath), held_binds=_HELD_BINDS,
     )
 
 
 def main() -> None:
     beneath, argv = _take_beneath(sys.argv[1:])
+    hosted, argv = _take_flag(argv, "--hosted")
     (forwards, allow_hosts, dns_forward, block_private,
      inbound, egress_deny, inner) = _parse_argv(argv)
     if not inner:
@@ -531,7 +574,7 @@ def main() -> None:
         cmd.extend(["--dns-forward", dns_forward])
 
     pyshim = _build_pyshim(forwards, allow_hosts, dns_forward, block_private, egress_deny,
-                           beneath)
+                           beneath, hosted)
     # Ubuntu 26.04 confines pasta with its own AppArmor profile (usr.bin.pasta,
     # new in that passt package), whose exec rule is `/{usr/,}bin/** Ux` on the
     # RESOLVED path: pasta may start a program whose file lives under /bin or

@@ -15,10 +15,11 @@ route reads the row, awaits, and the orchestrator re-reads it): a caller
 may REQUEST an end on ``active`` or ``concluding`` and a leave on
 ``active``; the machine ENDS from ``paused`` too (the moderator's
 ``end_meeting`` landing after a ``propose_conclude``) and LEAVES from
-``paused`` too. ``LIVE`` is what counts toward the creator's cap, what
-"one meeting per chat" reads and what the restart sweep fails — ``paused``
-is outside it (a paused meeting survives a restart neither failed nor
-live; documented, unchanged).
+``paused`` too. ``LIVE`` is what counts toward the creator's cap and what
+"one meeting per chat" reads; ``paused`` is outside it. The restart sweep
+fails every meeting that has not ended (``RESTART_FAILS``), a paused one
+included: no meeting's loop survives a restart, and nothing resumes or
+ends a paused meeting without its loop.
 
 Stdlib only — a leaf, used module-qualified (``from storage.chat import
 meeting_status``).
@@ -36,11 +37,14 @@ FAILED = "failed"
 STATUSES: frozenset[str] = frozenset({PENDING, ACTIVE, PAUSED, CONCLUDING, CONCLUDED, FAILED})
 
 #: Counts toward the creator's participant cap, is "the meeting on this
-#: chat", is failed by the restart sweep.
+#: chat".
 LIVE: frozenset[str] = frozenset({PENDING, ACTIVE, CONCLUDING})
 
 #: The ends.
 TERMINAL: frozenset[str] = frozenset({CONCLUDED, FAILED})
+
+#: What the restart sweep fails: every meeting that has not ended.
+RESTART_FAILS: frozenset[str] = STATUSES - TERMINAL
 
 #: The round loop stops queueing turns.
 ROUND_STOPS: frozenset[str] = frozenset({CONCLUDING, FAILED})
@@ -59,7 +63,7 @@ PROPOSABLE: frozenset[str] = frozenset({ACTIVE})
 TRANSITIONS: dict[str, frozenset[str]] = {
     PENDING: frozenset({ACTIVE, FAILED}),
     ACTIVE: frozenset({PAUSED, CONCLUDING, CONCLUDED, FAILED}),
-    PAUSED: frozenset({ACTIVE, CONCLUDING, CONCLUDED}),
+    PAUSED: frozenset({ACTIVE, CONCLUDING, CONCLUDED, FAILED}),
     CONCLUDING: frozenset({CONCLUDED, FAILED}),
     CONCLUDED: frozenset(),
     FAILED: frozenset(),

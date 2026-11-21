@@ -169,7 +169,7 @@ install_linux_tier_1() {
     # (pnpm + the claude/codex CLI installs) falls over with "npm not
     # present" — first hit on a fresh dev-VM satellite pairing. Same keyring
     # pattern as the gh repo above; idempotent.
-    local node_ver="${NODE_VERSION:-26.13.0}"
+    local node_ver="${NODE_VERSION:-26.13.1}"
     local node_major="${node_ver%%.*}"
     if ! command -v npm &>/dev/null; then
         info "Adding NodeSource apt repo (node ${node_major}.x)..."
@@ -330,9 +330,9 @@ install_netns_tools() {
     # REQUIRED — sandbox network isolation is always on. `passt` provides
     # `pasta`, which wraps every local agent sandbox in an isolated network
     # namespace; `iproute2` provides `ip` for the in-netns route blackholes.
-    # The proxy's startup preflight (core/sandbox/sandbox.py::netns_preflight)
-    # hard-fails if either is missing and warns on a pasta older than
-    # PASST_MIN_VERSION, so install it now. See VERSIONS.md (PASST_VERSION).
+    # The machine that runs the sessions checks at its start (sandbox_render.py,
+    # preflight): it runs none when either is missing and notes a pasta older
+    # than PASST_MIN_VERSION, so install it now. See VERSIONS.md (PASST_VERSION).
     # A pasta at or above the floor stays; else the distro's passt when its
     # candidate is at or above it (Ubuntu 24.04, Debian 13); else the pinned
     # release is BUILT from its git tag (Debian 12, Ubuntu 22.04, the image):
@@ -558,8 +558,8 @@ install_sympy() {
 # runs this script before VERSIONS.md is copied in; a pairing or a bare-metal
 # run may override them by the env vars), and
 # proxy/tests/execution/test_engine_descriptor.py holds them equal to the rows.
-CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.312}"
-CODEX_VERSION="${CODEX_VERSION:-0.166.0}"
+CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.325}"
+CODEX_VERSION="${CODEX_VERSION:-0.170.0}"
 
 # The bare x.y.z of a CLI's --version ("2.1.177 (Claude Code)", "codex-cli
 # 0.139.0"). Never fails under set -e, never waits on stdin (a corepack shim).

@@ -133,7 +133,8 @@ def test_write_load_index_and_hand_edit(tree):
     assert row["updated_by"] == "alice-sub" and row["doc_sha256"] == it.doc_sha256
     assert row["script_sha256"] == it.script_sha256
     # The config repo tracks it.
-    assert (tree / "config" / ".git").is_dir()
+    from services.infra import git_writer
+    assert any(row["subject"].startswith("checks:") for row in git_writer.log(tree / "config"))
     # A hand edit: the index follows the file and says so.
     doc = json.loads((folder / "check.json").read_text())
     doc["description"] = "edited by hand"
@@ -243,3 +244,292 @@ def test_a_judge_model_the_agent_does_not_offer_is_refused(tree, monkeypatch):
     assert d.judge_envelope_problem(AGENT, {"model": "m-enabled"}) is None
     assert "not available" in d.judge_envelope_problem(AGENT, {"model": "m-off"})
     assert "not available" in d.judge_envelope_problem(AGENT, {"model": "any-model"})
+
+
+# ── links a session plants in a check's tree (safe_fs) ──────────────────────
+
+
+def test_a_link_at_a_checks_file_is_replaced_never_written_through(tree):
+    d.write_check(AGENT, "", _doc(script={"run": "lint.sh"}), "echo one\n", updated_by="alice-sub")
+    folder = tree / "config" / "checks" / "coding"
+    victims = {}
+    for name in ("check.json", "lint.sh"):
+        victim = tree / "workspace" / f"victim-{name}"
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_text("keep")
+        (folder / name).unlink()
+        (folder / name).symlink_to(victim)
+        victims[name] = victim
+    it = d.write_check(AGENT, "", _doc(script={"run": "lint.sh"}, description="again"), "echo two\n",
+                       updated_by="alice-sub")
+    assert it.doc["description"] == "again" and not it.problems
+    for name, victim in victims.items():
+        assert victim.read_text() == "keep"
+        assert not (folder / name).is_symlink()
+    # A person's own check, the same.
+    d.write_check(AGENT, "alice", _doc(name="tone"), None, updated_by="alice-sub")
+    mine = tree / "users" / "alice" / "checks" / "tone" / "check.json"
+    mine.unlink()
+    mine.symlink_to(victims["check.json"])
+    d.write_check(AGENT, "alice", _doc(name="tone", description="mine"), None, updated_by="alice-sub")
+    assert victims["check.json"].read_text() == "keep" and not mine.is_symlink()
+
+
+def test_a_dangling_link_at_a_checks_file_creates_nothing_elsewhere(tree):
+    folder = tree / "config" / "checks" / "coding"
+    folder.mkdir(parents=True)
+    away = tree / "workspace" / "made-here.json"
+    (folder / "check.json").symlink_to(away)
+    d.write_check(AGENT, "", _doc(), None, updated_by="alice-sub")
+    assert not away.exists() and (folder / "check.json").is_file()
+
+
+def test_a_linked_checks_tree_is_neither_written_nor_removed_through(tree):
+    elsewhere = tree / "workspace" / "elsewhere"
+    (elsewhere / "coding").mkdir(parents=True)
+    (elsewhere / "coding" / "check.json").write_text(json.dumps(_doc()))
+    (tree / "config").mkdir(exist_ok=True)
+    (tree / "config" / "checks").symlink_to(elsewhere)
+    with pytest.raises(d.CheckError) as e:
+        d.write_check(AGENT, "", _doc(name="tone"), None, updated_by="alice-sub")
+    assert "link" in str(e.value)
+    assert not (elsewhere / "tone").exists()
+    db_checks.upsert_index(AGENT, "", "coding", _doc(), doc_sha256="x", script_sha256="", updated_by="alice-sub")
+    with pytest.raises(d.CheckError):
+        d.delete_check(AGENT, "", "coding")
+    assert (elsewhere / "coding" / "check.json").is_file()
+    assert db_checks.get_index(AGENT, "", "coding") is None
+    # A person's own tree, the same.
+    (tree / "users" / "alice" / "checks").symlink_to(elsewhere)
+    with pytest.raises(d.CheckError):
+        d.delete_check(AGENT, "alice", "coding")
+    assert (elsewhere / "coding" / "check.json").is_file()
+
+
+def test_a_link_at_a_checks_name_is_removed_and_its_target_kept(tree):
+    elsewhere = tree / "workspace" / "elsewhere"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "check.json").write_text(json.dumps(_doc()))
+    (tree / "config" / "checks").mkdir(parents=True)
+    (tree / "config" / "checks" / "coding").symlink_to(elsewhere)
+    assert d.delete_check(AGENT, "", "coding")
+    assert not (tree / "config" / "checks" / "coding").is_symlink()
+    assert (elsewhere / "check.json").is_file()
+
+
+def test_a_linked_document_or_script_is_never_read(tree):
+    d.write_check(AGENT, "", _doc(script={"run": "lint.sh"}), "echo one\n", updated_by="alice-sub")
+    folder = tree / "config" / "checks" / "coding"
+    other = tree / "workspace" / "other.sh"
+    other.parent.mkdir(parents=True, exist_ok=True)
+    other.write_text("echo other\n")
+    (folder / "lint.sh").unlink()
+    (folder / "lint.sh").symlink_to(other)
+    [it] = d.load_checks(AGENT, "")
+    assert it.script_sha256 == "" and "missing" in it.problems[0]
+    doc = tree / "workspace" / "doc.json"
+    doc.write_text(json.dumps(_doc(description="from elsewhere")))
+    (folder / "check.json").unlink()
+    (folder / "check.json").symlink_to(doc)
+    assert d.load_check(AGENT, "", "coding") is None
+
+
+def test_a_pipe_at_a_checks_files_is_never_waited_on(tree):
+    import os
+    folder = tree / "config" / "checks" / "coding"
+    folder.mkdir(parents=True)
+    os.mkfifo(folder / "check.json")
+    assert d.load_check(AGENT, "", "coding") is None
+    (folder / "check.json").unlink()
+    (folder / "check.json").write_text(json.dumps(_doc(script={"run": "lint.sh"})))
+    os.mkfifo(folder / "lint.sh")
+    [it] = d.load_checks(AGENT, "")
+    assert it.problems and it.script_sha256 == ""
+
+
+def test_the_fan_out_pushes_the_checks_own_files_only(tree, monkeypatch):
+    import asyncio
+
+    from services.infra import file_bookkeeping
+    d.write_check(AGENT, "", _doc(), None, updated_by="alice-sub")
+    folder = tree / "config" / "checks" / "coding"
+    other = tree / "workspace" / "notes.md"
+    other.parent.mkdir(parents=True, exist_ok=True)
+    other.write_text("notes")
+    (folder / "extra.md").symlink_to(other)
+    pushed = []
+
+    async def _push(agent, rel, path, writer=None):
+        pushed.append(rel)
+    monkeypatch.setattr(file_bookkeeping, "push_file_write", _push)
+    asyncio.run(d.fan_out(AGENT, "", "coding"))
+    assert pushed == ["config/checks/coding/check.json"]
+
+
+def test_a_document_whose_file_is_large_but_whose_text_is_in_the_rule_loads(tree):
+    # The rule measures the document, not the file's spacing: one saved
+    # indented, or hand-edited with room, still loads.
+    d.write_check(AGENT, "", _doc(), None, updated_by="alice-sub")
+    path = tree / "config" / "checks" / "coding" / "check.json"
+    path.write_text(json.dumps(_doc(description="spaced"), indent=20000))
+    assert path.stat().st_size > d.MAX_DOC_BYTES
+    [it] = d.load_checks(AGENT, "")
+    assert not it.problems and it.doc["description"] == "spaced"
+
+
+# An agent's folder may itself be a link the install's operator made
+# (core/agent_folder.py): a check's files are reached through that one link
+# and through none below it.
+
+
+@pytest.fixture
+def linked_tree(tree, tmp_path):
+    """The agent's folder moved outside the stand-in agents folder, a link
+    at its name: answers the agent's folder as named."""
+    real = tmp_path / "disk2" / AGENT
+    real.parent.mkdir()
+    tree.rename(real)
+    tree.symlink_to(real)
+    return tree
+
+
+def test_a_linked_agents_check_is_written_loaded_and_run(linked_tree):
+    from services.checks.kinds import script_kind
+    d.write_check(AGENT, "", _doc(script={"run": "lint.sh"}), "echo one\n", updated_by="alice-sub")
+    assert (linked_tree.resolve() / "config" / "checks" / "coding" / "check.json").is_file()
+    [it] = d.load_checks(AGENT, "")
+    assert it.name == "coding" and not it.problems and it.script_sha256
+    assert script_kind._read_script(d.load_check(AGENT, "", "coding"))[0] == b"echo one\n"
+
+
+def test_a_linked_agents_check_is_fanned_out_and_deleted(linked_tree, monkeypatch):
+    import asyncio
+
+    from services.infra import file_bookkeeping
+    d.write_check(AGENT, "", _doc(), None, updated_by="alice-sub")
+    pushed = []
+
+    async def _push(agent, rel, path, writer=None):
+        pushed.append(rel)
+    monkeypatch.setattr(file_bookkeeping, "push_file_write", _push)
+    asyncio.run(d.fan_out(AGENT, "", "coding"))
+    assert pushed == ["config/checks/coding/check.json"]
+    assert d.delete_check(AGENT, "", "coding")
+    assert not (linked_tree.resolve() / "config" / "checks" / "coding").exists()
+
+
+def test_a_link_below_a_linked_agents_folder_is_still_refused(linked_tree, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "coding").mkdir(parents=True)
+    (elsewhere / "coding" / "check.json").write_text(json.dumps(_doc()))
+    (linked_tree / "config").mkdir(exist_ok=True)
+    (linked_tree / "config" / "checks").symlink_to(elsewhere)
+    with pytest.raises(d.CheckError) as e:
+        d.write_check(AGENT, "", _doc(name="tone"), None, updated_by="alice-sub")
+    assert "link" in str(e.value)
+    assert d.load_checks(AGENT, "") == [] and d.load_check(AGENT, "", "coding") is None
+    with pytest.raises(d.CheckError):
+        d.delete_check(AGENT, "", "coding")
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["coding"]
+    assert (elsewhere / "coding" / "check.json").is_file()
+
+
+# A mandatory check is never switched off by taking its whole checks folder
+# away (CHECKS.md): gone, a file in its place or a link in its place, it comes
+# back as a held item, as when only its own folder goes.
+
+
+def _write_mandatory():
+    it = d.write_check(AGENT, "", _doc(mandatory=True), None, updated_by="alice-sub")
+    assert it.mandatory and (db_checks.get_index(AGENT, "", "coding") or {}).get("mandatory")
+
+
+def _held_after_two_loads():
+    d.load_checks(AGENT, "")
+    return [it.name for it in d.load_checks(AGENT, "") if it.held]
+
+
+@pytest.mark.parametrize("what", ["own-folder-gone", "checks-folder-gone", "a-file", "a-link"])
+def test_a_mandatory_check_is_held_when_its_folder_or_the_checks_folder_goes(tree, tmp_path, what):
+    _write_mandatory()
+    checks = tree / "config" / "checks"
+    if what == "own-folder-gone":
+        (checks / "coding").rename(tree / "config" / "aside")
+    else:
+        checks.rename(tree / "config" / "checks-aside")
+        if what == "a-file":
+            checks.write_text("x")
+        elif what == "a-link":
+            (tmp_path / "empty").mkdir()
+            checks.symlink_to(tmp_path / "empty")
+    assert _held_after_two_loads() == ["coding"]
+
+
+def test_checks_load_when_the_agents_folder_and_the_agents_own_folder_are_links(temp_db, tmp_path, monkeypatch):
+    agent = "checks-linked-agents"
+    real_agents = tmp_path / "vol" / "agents"
+    real_agents.mkdir(parents=True)
+    agents = tmp_path / "agents"
+    agents.symlink_to(real_agents)
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    from storage.agents import agent_store
+    agent_store.create_agent(agent, "Checks Linked Agents", created_by="alice-sub")
+    (agents / agent / "config").mkdir(parents=True, exist_ok=True)
+    d.write_check(agent, "", _doc(), None, updated_by="alice-sub")
+    assert [it.name for it in d.load_checks(agent, "")] == ["coding"]
+    real = tmp_path / "disk2" / agent
+    real.parent.mkdir()
+    (real_agents / agent).rename(real)
+    (real_agents / agent).symlink_to(real)
+    assert [it.name for it in d.load_checks(agent, "")] == ["coding"]
+    d.write_check(agent, "", _doc(name="tone"), None, updated_by="alice-sub")
+    assert sorted(it.name for it in d.load_checks(agent, "")) == ["coding", "tone"]
+
+
+# The agent's folder away (a linked agent whose disk is not there) or the
+# checks folder that cannot be read is not "every check removed": the rows
+# stay, and a mandatory check is held from the first such load.
+
+
+def test_the_rows_stay_while_the_agents_folder_is_away(linked_tree):
+    d.write_check(AGENT, "", _doc(name="tone"), None, updated_by="alice-sub")
+    _write_mandatory()
+    real = linked_tree.resolve()
+    real.rename(real.with_name("away"))
+    try:
+        first = d.load_checks(AGENT, "")
+        assert [it.name for it in first if it.held] == ["coding"]
+        d.load_checks(AGENT, "")
+        d.load_checks(AGENT, "")
+        assert db_checks.get_index(AGENT, "", "tone")["updated_by"] == "alice-sub"
+        assert db_checks.get_index(AGENT, "", "coding")
+    finally:
+        real.with_name("away").rename(real)
+    assert sorted(it.name for it in d.load_checks(AGENT, "")) == ["coding", "tone"]
+
+
+def test_the_rows_stay_while_the_checks_folder_cannot_be_read(tree):
+    import os
+    d.write_check(AGENT, "", _doc(name="tone"), None, updated_by="alice-sub")
+    checks = tree / "config" / "checks"
+    os.chmod(checks, 0)
+    try:
+        d.load_checks(AGENT, "")
+        d.load_checks(AGENT, "")
+        assert db_checks.get_index(AGENT, "", "tone")["updated_by"] == "alice-sub"
+    finally:
+        os.chmod(checks, 0o755)
+
+
+def test_a_document_that_cannot_be_read_keeps_its_row(tree):
+    import os
+    d.write_check(AGENT, "", _doc(name="tone"), None, updated_by="alice-sub")
+    doc = tree / "config" / "checks" / "tone" / "check.json"
+    os.chmod(doc, 0)
+    try:
+        items = d.load_checks(AGENT, "")
+        d.load_checks(AGENT, "")
+        assert [it.name for it in items] == ["tone"] and items[0].problems
+        assert db_checks.get_index(AGENT, "", "tone")["updated_by"] == "alice-sub"
+    finally:
+        os.chmod(doc, 0o644)

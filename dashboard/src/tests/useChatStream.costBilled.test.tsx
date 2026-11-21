@@ -171,3 +171,112 @@ describe('costBilled in useChatStream', () => {
     expect(result.current.billedCost).toBeCloseTo(0.3)
   })
 })
+
+// A long turn's newest page holds its own tool steps and no cost row: the
+// newest turn's flag and the fee rows are outside the window. The server's
+// word over the whole chat (`restore.cost`) decides the gauge.
+function toolSteps(n: number) {
+  return Array.from({ length: n }, (_, i) =>
+    row('event', '', 'tool', { type: 'tool', name: 'Bash', tool_input: { command: `step ${i}` } }))
+}
+
+describe('the cost gauge takes the server word over the whole chat', () => {
+  it('a window with no cost row keeps a subscription chat hidden', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({
+      chat_id: 'chat-1', total_cost: 93.65, has_more: true,
+      messages: toolSteps(50), restore: { cost: { billed: false, fees: 0 } },
+    }))
+    expect(result.current.costBilled).toBe(false)
+    expect(result.current.billedCost).toBe(0)
+    expect(result.current.totalCost).toBeCloseTo(93.65)  // still counted
+  })
+
+  it('a fee outside the window still shows, alone', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({
+      chat_id: 'chat-1', total_cost: 93.77, has_more: true,
+      messages: toolSteps(50), restore: { cost: { billed: false, fees: 0.12 } },
+    }))
+    expect(result.current.billedCost).toBeCloseTo(0.12)
+    expect(result.current.toolCost).toBeCloseTo(0.12)
+  })
+
+  it('a metered chat shows its whole total and its fees from the word', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({
+      chat_id: 'chat-1', total_cost: 4.2, has_more: true,
+      messages: toolSteps(50), restore: { cost: { billed: true, fees: 0.05 } },
+    }))
+    expect(result.current.costBilled).toBe(true)
+    expect(result.current.billedCost).toBeCloseTo(4.2)
+    expect(result.current.toolCost).toBeCloseTo(0.05)
+  })
+
+  it('the word beats the loaded rows', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({
+      chat_id: 'chat-1', total_cost: 2,
+      messages: [row('event', '', 'metadata', { type: 'metadata', cost_usd: 2, cost_billed: true })],
+      restore: { cost: { billed: false, fees: 0 } },
+    }))
+    expect(result.current.costBilled).toBe(false)
+    expect(result.current.billedCost).toBe(0)
+  })
+
+  it('a word without fees reads as none', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({
+      chat_id: 'chat-1', total_cost: 7, messages: toolSteps(2), restore: { cost: { billed: false } },
+    }))
+    expect(result.current.billedCost).toBe(0)
+    expect(result.current.toolCost).toBe(0)
+  })
+
+  it('a delta takes the word too', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({
+      chat_id: 'chat-1', total_cost: 50, messages: toolSteps(3), restore: { cost: { billed: false, fees: 0 } },
+    }))
+    act(() => captured.cb.onChatHistoryDelta({
+      chat_id: 'chat-1', since_id: 0, total_cost: 60, messages: toolSteps(2),
+      restore: { cost: { billed: false, fees: 0.3 } },
+    }))
+    expect(result.current.costBilled).toBe(false)
+    expect(result.current.billedCost).toBeCloseTo(0.3)
+    expect(result.current.toolCost).toBeCloseTo(0.3)
+    // The next turn ran on an API key: the whole total shows.
+    act(() => captured.cb.onChatHistoryDelta({
+      chat_id: 'chat-1', since_id: 0, total_cost: 61, messages: toolSteps(1),
+      restore: { cost: { billed: true, fees: 0.3 } },
+    }))
+    expect(result.current.costBilled).toBe(true)
+    expect(result.current.billedCost).toBeCloseTo(61)
+  })
+
+  it('a seed after the word leaves the gauge as the word set it', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({
+      chat_id: 'chat-1', total_cost: 93.77, has_more: true,
+      messages: toolSteps(50), restore: { cost: { billed: false, fees: 0.12 } },
+    }))
+    act(() => result.current.seedDbHistory(toolSteps(50), true))
+    expect(result.current.costBilled).toBe(false)
+    expect(result.current.billedCost).toBeCloseTo(0.12)
+    expect(result.current.toolCost).toBeCloseTo(0.12)
+  })
+
+  it('an older server without the word keeps the rule on the loaded rows', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onChatHistory({
+      chat_id: 'chat-1', total_cost: 1.5,
+      messages: [row('event', '', 'metadata', { type: 'metadata', cost_usd: 1.5, cost_billed: false })],
+      restore: { todos: [] },
+    }))
+    expect(result.current.costBilled).toBe(false)
+    expect(result.current.billedCost).toBe(0)
+    // A seed then re-derives from its own rows, as before.
+    act(() => result.current.seedDbHistory([row('user', 'a')], false))
+    expect(result.current.costBilled).toBe(true)
+  })
+})

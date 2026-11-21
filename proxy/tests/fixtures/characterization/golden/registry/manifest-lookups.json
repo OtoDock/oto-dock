@@ -1,0 +1,106 @@
+{
+ "authorization_server_conflict": {
+  "none": "",
+  "other": "provider_id 'char-oauth' is used by the installed MCP 'char-bearer', which uses an admin's OAuth app; one provider id issues its tokens one way",
+  "same_way": "",
+  "self": ""
+ },
+ "by_config_key": {
+  "char-nobody": null,
+  "char-tools": "char-tools",
+  "local": "char-browser"
+ },
+ "by_provider": {
+  "": [],
+  "char-git": [
+   "char-gitish"
+  ],
+  "char-oauth": [
+   "char-bearer",
+   "char-bearer-sidecar"
+  ],
+  "nobody": []
+ },
+ "constants": {
+  "BROWSER_SERVER_KEY": "local",
+  "BROWSER_TOKEN_ENV": "PLAYWRIGHT_MCP_EXTENSION_TOKEN",
+  "DEVICE_CAPABILITIES": [
+   "app",
+   "browser",
+   "computer"
+  ],
+  "EXTERNAL_CONTEXT": "external",
+  "EXTERNAL_CONTEXT_REASON": "Excluded in external mode",
+  "EXTERNAL_DENIED_MCPS": [
+   "agent-config-mcp",
+   "agent-creator-mcp",
+   "conversations-mcp",
+   "delegation-mcp",
+   "mcps-mcp",
+   "meetings-mcp",
+   "memory-mcp",
+   "notifications-mcp",
+   "phone-mcp",
+   "schedules-mcp",
+   "ssh-hosts",
+   "triggers-mcp"
+  ],
+  "EXTERNAL_DENIED_REASON": "Not available on external routes",
+  "SHARED_CHAT_CONTEXT": "shared_chat"
+ },
+ "core": [
+  "char-core"
+ ],
+ "device_capability": {
+  "": null,
+  "char-nobody": null,
+  "char-tools": null,
+  "local": "browser"
+ },
+ "effective_config": {
+  "none": {},
+  "peruser": {
+   "USER_SMTP": "smtp.example.test"
+  },
+  "saved_given": {
+   "CHAR_LIMIT": "5",
+   "CHAR_MODE": "",
+   "CHAR_OFF": "false",
+   "CHAR_ON": "true"
+  },
+  "tools": {
+   "CHAR_LIMIT": "9",
+   "CHAR_MODE": "fast",
+   "CHAR_OFF": "false",
+   "CHAR_ON": "true",
+   "CHAR_SAVED": "saved"
+  }
+ },
+ "oauth_scopes": {
+  "no_oauth": [],
+  "services": [
+   "base",
+   "mail.read",
+   "cal.read",
+   "mail.send"
+  ]
+ },
+ "protected_subpaths": [
+  "google-analytics-tokens",
+  "google-tokens"
+ ],
+ "skill_provider": {
+  "char-guide": "char-tools",
+  "delegation-guide": "delegation-mcp",
+  "nobody": null
+ },
+ "tool_filter": {
+  "char-nobody": null,
+  "char-sse": null,
+  "char-tools": [
+   "--enabled-tools",
+   "^safe_"
+  ]
+ },
+ "unknown": null
+}

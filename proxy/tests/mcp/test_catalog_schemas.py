@@ -292,6 +292,19 @@ def test_unknown_keys_and_files_pass(tmp_path):
                               "hooks": {"x": 1}, "metadata": {"version": "2"}}, SKILL, "x") == []
 
 
+def test_a_summary_and_highlights_pass_with_an_icon_this_release_lacks(tmp_path):
+    """The two fields a store card and the install dialog draw. An icon name
+    is not checked against this release's set: a newer catalog may name one
+    it lacks, and the template must still install (the dashboard draws a
+    neutral mark)."""
+    agent = {**AGENT, "summary": "Runs your company's whole content workflow.",
+             "highlights": [{"icon": "video", "text": "Full videos"}, {"icon": "hologram_2", "text": "Later work"},
+                            {"icon": "mic", "text": "AI voice", "note": "a later key"}]}
+    root = _write(tmp_path / "t", {**BASE, "agent.json": agent})
+    assert _template_problems(root) == []
+    store.load_template_from_dir(root)
+
+
 # --- refusals, each a sentence -------------------------------------------------------
 
 TASK = {"slug": "daily-task", "scope": "agent", "prompt": "p", "schedule": {"type": "cron", "cron": "0 8 * * *"}}
@@ -321,6 +334,17 @@ REFUSED = {
     "slug with a newline": ({"agent.json": {**AGENT, "slug": "good-one\n"}}, "invalid slug 'good-one\\n'"),
     "empty name": ({"agent.json": {**AGENT, "display_name": " "}}, "agent.json: display_name must not be empty"),
     "bad color": ({"agent.json": {**AGENT, "color": "red"}}, "invalid color 'red' (must be #RRGGBB)"),
+    "long summary": ({"agent.json": {**AGENT, "summary": "x" * 201}},
+                     "agent.json: summary: the summary is one or two short sentences on one line, at most 200 characters"),
+    "summary on two lines": ({"agent.json": {**AGENT, "summary": "One.\nTwo."}}, "summary: the summary is one or two"),
+    "seven highlights": ({"agent.json": {**AGENT, "highlights": [{"icon": "app", "text": "A"}] * 7}},
+                         "agent.json: highlights: a template has at most 6 highlights"),
+    "highlight without text": ({"agent.json": {**AGENT, "highlights": [{"icon": "app"}]}},
+                               "agent.json: highlights[0]: missing required field 'text'"),
+    "long highlight": ({"agent.json": {**AGENT, "highlights": [{"icon": "app", "text": "y" * 61}]}},
+                       "highlights[0].text: a highlight's text is a few words on one line, at most 60 characters"),
+    "highlight icon not a name": ({"agent.json": {**AGENT, "highlights": [{"icon": "<svg>", "text": "A"}]}},
+                                  "a highlight's icon is a name from the dashboard's icon set, like video (got '<svg>')"),
     "bad scope": ({"agent.json": {**AGENT, "default_scope": "team"}},
                   "agent.json: default_scope must be one of 'user', 'agent', null (got 'team')"),
     "bad core_mcps": ({"agent.json": {**AGENT, "core_mcps": "some"}}, "agent.json: core_mcps must be one of"),

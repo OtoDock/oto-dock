@@ -126,3 +126,52 @@ def test_own_only_holds_with_a_cursor():
     wide = task_store.list_task_chats(AGENT, OWNER, limit=10, before=(_at(3), mine[3]))
     assert "task-agentrun" in [r["id"] for r in wide]
     assert "task-otherrun" not in [r["id"] for r in wide]
+
+
+def _pin(sub: str, *ids: str) -> None:
+    from storage.chat import chat_pins
+    for cid in ids:
+        assert chat_pins.pin(sub, cid)
+
+
+PINNER = "user-viewer"
+
+
+def test_the_pinned_view_pages_the_person_s_pins_in_the_history_s_order():
+    ids = [_chat(f"c{i:03d}", _at(i)) for i in range(12)]
+    pinned = ids[1::2]
+    _pin(PINNER, *pinned)
+    _pin("user-viewer2", ids[0])
+    seen = _walk(lambda n, b: task_store.list_chats(OWNER, agent=AGENT, limit=n, before=b,
+                                                    pinned_by=PINNER), 2)
+    assert seen == list(reversed(pinned))
+
+
+def test_the_pinned_view_keeps_every_condition_of_the_history():
+    own = _chat("c-own", _at(1))
+    another = _chat("c-another", _at(2), owner="user-elsewhere")
+    task_row = _task_chat("r-pinned", _at(3))
+    _pin(PINNER, own, another, task_row)
+    rows = task_store.list_chats(OWNER, agent=AGENT, pinned_by=PINNER)
+    assert [r["id"] for r in rows] == [own]
+    assert task_store.list_chats(OWNER, agent="agent-other", pinned_by=PINNER) == []
+
+
+def test_hide_agent_runs_holds_in_the_pinned_view():
+    worker = _chat(str(uuid.uuid4()), _at(1))
+    task_store.create_run("r-worker-pin", "t-w", AGENT, "delegate", None, "p", scope="agent")
+    task_store.update_run("r-worker-pin", chat_id=worker)
+    plain = _chat("c-plain", _at(2))
+    _pin(PINNER, worker, plain)
+    rows = task_store.list_chats(OWNER, agent=AGENT, hide_agent_runs=True, pinned_by=PINNER)
+    assert [r["id"] for r in rows] == [plain]
+
+
+def test_search_keeps_to_the_pins_in_the_pinned_view():
+    a, b = _chat("c-search-a", _at(1)), _chat("c-search-b", _at(2))
+    for cid in (a, b):
+        task_store.add_chat_message(cid, "user", "a shared word: lighthouse")
+    _pin(PINNER, a)
+    assert {r["id"] for r in task_store.search_chats(OWNER, AGENT, "lighthouse")} == {a, b}
+    assert [r["id"] for r in task_store.search_chats(OWNER, AGENT, "lighthouse",
+                                                     pinned_by=PINNER)] == [a]

@@ -1,0 +1,25 @@
+{
+ "marks": {},
+ "notifications": [
+  {
+   "agent_slug": "flow-agent",
+   "body": "Your version of “refused-own-save.txt” was replaced by a newer version. It is in the Recover bin.",
+   "scope": "user",
+   "severity": "info",
+   "source": "file_conflict",
+   "target": "user-admin",
+   "title": "Recover your file"
+  }
+ ],
+ "platform": {
+  "workspace/refused-own-save.txt": "alice's change"
+ },
+ "recover_bin": [
+  {
+   "file_hash": "sha256:bed8c8d0d4f0a811fffeea11717da08d5bae32cab6bbc43c574a3b3065c1b88e",
+   "reason": "conflict",
+   "rel_path": "workspace/refused-own-save.txt",
+   "size": 12
+  }
+ ]
+}

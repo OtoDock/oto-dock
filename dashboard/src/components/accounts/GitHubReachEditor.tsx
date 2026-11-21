@@ -5,9 +5,9 @@
  * narrowed by GitHub as well.
  *
  * `GitHubReachView` is the one view of it, fed its listing and its save:
- * under the service-account select (Agent Settings, MCPs) through
- * `GitHubReachEditor` here, and under each agent of a person's own account
- * card (User Settings, Integrations) through `AgentOverrideList`.
+ * under each of the agent's own GitHub accounts (Agent Settings, MCPs)
+ * through `GitHubReachEditor` here, and under each agent of a person's own
+ * account card (User Settings, Integrations) through `AgentOverrideList`.
  *
  * A GitHub-App account offers its repositories as a checklist with a
  * search; a token or OAuth account has no list, so only Read only.
@@ -18,7 +18,7 @@ import { useSaveState } from '../../hooks/useSaveState'
 import {
   useAgentServiceRepositories,
   useReachCopied,
-  useSetAgentServiceBinding,
+  useSetAgentServiceReach,
   type ReachRepositoriesResponse,
 } from '../../api/serviceAccounts'
 import Button from '../ui/Button'
@@ -45,7 +45,7 @@ interface ViewProps {
   readOnly: boolean
   /** The account is a GitHub-App one: it has repositories to pick from. */
   pickable: boolean
-  /** Shown, not changed (a co-manager's binding). */
+  /** Shown, not changed (another manager's account of the agent). */
   viewOnly: boolean
   listing: ReachListing
   /** The picker opened or closed: the listing is asked for while it is open. */
@@ -261,11 +261,17 @@ interface Props {
   readOnly: boolean
   /** The account is a GitHub-App one: it has repositories to pick from. */
   pickable: boolean
-  /** A co-manager's binding: shown, not changed. */
+  /** Another manager's account: shown, not changed. */
   viewOnly: boolean
+  /** How the page names the account: several sit on one page. */
+  accountName: string
+  /** A refusal, also told to the card: the list is read again after one,
+   * and this editor may go with its row. A later save that works clears it
+   * (``null``). */
+  onRefused?: (text: string | null) => void
 }
 
-/** The agent's reach under its service-account select. */
+/** The agent's reach on one of its own GitHub accounts. */
 export function GitHubReachEditor({
   agentName,
   mcpName,
@@ -275,14 +281,22 @@ export function GitHubReachEditor({
   readOnly,
   pickable,
   viewOnly,
+  accountName,
+  onRefused,
 }: Props) {
-  const setBinding = useSetAgentServiceBinding()
+  const setReach = useSetAgentServiceReach()
   const [picking, setPicking] = useState(false)
   const listing = useAgentServiceRepositories(agentName, mcpName, accountLabel, installationId, picking)
-  const copied = useReachCopied(agentName, mcpName)
+  const copied = useReachCopied(agentName, mcpName, accountLabel)
   // The view shows a refusal or a warning under the controls.
   const save = (change: ReachChange) =>
-    setBinding.mutateAsync({ agentName, mcpName, accountLabel, installationId, ...change })
+    setReach.mutateAsync({ agentName, mcpName, accountLabel, installationId, ...change }).then((answer) => {
+      onRefused?.(null)
+      return answer
+    }, (e: unknown) => {
+      onRefused?.(e instanceof Error ? e.message : 'The change was refused.')
+      throw e
+    })
 
   return (
     <GitHubReachView
@@ -293,8 +307,9 @@ export function GitHubReachEditor({
       listing={listing}
       onPickerChange={setPicking}
       save={save}
-      pending={setBinding.isPending}
+      pending={setReach.isPending}
       title="GitHub reach"
+      label={accountName}
       notice={
         copied
           ? 'Starts from the repositories you chose for your own chats with this agent. Change it here.'

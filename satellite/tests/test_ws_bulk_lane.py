@@ -284,3 +284,65 @@ async def test_a_pull_cancelled_while_its_file_opens_closes_the_descriptor(tmp_p
 
 async def test_paced_transfers_is_a_capability(tmp_path):
     assert _sm(tmp_path).detect_capabilities()["paced_transfers"] is True
+
+
+class _ClosingWS:
+    """websockets 16 as the writer meets it at a close: a send on a socket
+    that is no longer OPEN writes nothing and waits until the connection is
+    lost (``send_context``), and only then raises."""
+
+    def __init__(self, state):
+        self.state = state
+        self.sent: list[dict] = []
+        self.lost = asyncio.Event()
+
+    async def send(self, s):
+        from websockets.exceptions import ConnectionClosed
+        from websockets.protocol import State
+        if self.state is not State.OPEN:
+            await self.lost.wait()
+            raise ConnectionClosed(None, None)
+        self.sent.append(json.loads(s))
+
+
+async def test_a_closing_socket_takes_no_frame_off_its_lane():
+    """At the wake of a frozen machine the heartbeat's late tick starts the
+    close and the transcript poll queues the turn in the same pass. A writer
+    that took the frame then sat in ``send`` until the connect loop cancelled
+    it, and the frame was gone: a terminal's whole first turn. The writer
+    takes none once the socket is closing: the lane keeps it, and the next
+    link's writer sends it."""
+    from websockets.protocol import State
+    c = _client()
+    c._ws = _ClosingWS(State.CLOSING)
+    line = {"type": "transcript_lines", "session_id": "s", "lines": ["{}"], "offset": 3}
+    await c.enqueue_send(line)
+    writer = asyncio.create_task(c._writer_loop())
+    await asyncio.sleep(0.05)
+    writer.cancel()                  # what connect_forever's finally does
+    await asyncio.gather(writer, return_exceptions=True)
+    assert c._send_queue.qsize() == 1
+    c._ws = _ClosingWS(State.OPEN)   # the next link
+    writer = asyncio.create_task(c._writer_loop())
+    while not c._lanes_empty():  # noqa: ASYNC110  # the client's lanes drain without an event to await
+        await asyncio.sleep(0.01)
+    writer.cancel()
+    assert c._ws.sent == [line]
+
+
+async def test_a_drop_takes_the_requests_that_never_left_off_the_lane():
+    """A tunneled request still on the control lane at a drop was answered
+    "never sent" (``fail_all_streams``): its frames go, so the next link
+    never carries a hook call its caller already gave up on or sent again.
+    A chunk of a request that left, and every other frame, stays."""
+    c = _client(connected=False)
+    for frame in ({"type": "http_request", "stream_id": "s1", "body_eof": False},
+                  {"type": "http_request_chunk", "stream_id": "s1", "body_eof": True},
+                  {"type": "heartbeat"},
+                  {"type": "http_request_chunk", "stream_id": "s0", "body_eof": True},
+                  {"type": "http_request", "stream_id": "s2", "body_eof": True}):
+        await c.enqueue_send(frame)
+    assert c.drop_unsent_requests() == {"s1", "s2"}
+    kept = [c._send_queue.get_nowait() for _ in range(c._send_queue.qsize())]
+    assert kept == [{"type": "heartbeat"},
+                    {"type": "http_request_chunk", "stream_id": "s0", "body_eof": True}]

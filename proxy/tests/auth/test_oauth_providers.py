@@ -249,7 +249,7 @@ class TestGenericProvider:
         mock_client.__aexit__ = AsyncMock(return_value=None)
         mock_client.post = AsyncMock(return_value=mock_response)
         with patch(
-            "auth.oauth_providers.generic.httpx.AsyncClient",
+            "auth.oauth_providers.generic._client",
             return_value=mock_client,
         ):
             ts = await provider.exchange_code(
@@ -275,7 +275,7 @@ class TestGenericProvider:
         mock_client.__aexit__ = AsyncMock(return_value=None)
         mock_client.get = AsyncMock(return_value=mock_response)
         with patch(
-            "auth.oauth_providers.generic.httpx.AsyncClient",
+            "auth.oauth_providers.generic._client",
             return_value=mock_client,
         ):
             ui = await provider.fetch_userinfo(access_token="at")
@@ -431,7 +431,7 @@ class TestPatOnlyProvider:
         mock_client.__aexit__ = AsyncMock(return_value=None)
         mock_client.get = AsyncMock(return_value=mock_response)
         with patch(
-            "auth.oauth_providers.generic.httpx.AsyncClient",
+            "auth.oauth_providers.generic._client",
             return_value=mock_client,
         ):
             ts, ui = await p.exchange_personal_access_token(
@@ -461,7 +461,7 @@ class TestPatOnlyProvider:
         mock_client.__aexit__ = AsyncMock(return_value=None)
         mock_client.get = AsyncMock(return_value=mock_response)
         with patch(
-            "auth.oauth_providers.generic.httpx.AsyncClient",
+            "auth.oauth_providers.generic._client",
             return_value=mock_client,
         ):
             ui = await p.fetch_userinfo(access_token="at")

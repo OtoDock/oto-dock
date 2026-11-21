@@ -55,10 +55,35 @@ def check_rate(chat_id: str, token: str) -> bool:
         return False
     stamps.append(now)
     _rate[key] = stamps
-    if len(_rate) > 512:  # drop dead chats' keys, keep the dict bounded
+    _prune(now)
+    return True
+
+
+def _prune(now: float) -> None:
+    """Drop the windows of chats gone quiet: the table stays bounded."""
+    if len(_rate) > 512:
         for k in [k for k, v in _rate.items() if not v or now - v[-1] > WINDOW_S]:
             _rate.pop(k, None)
-    return True
+
+
+def check_app_press(chat_id: str, user_sub: str, app_id: str) -> bool:
+    """Admit one press of an app's prompt button: the window of its chat,
+    and the same window for the person ACROSS chats. A button that starts a
+    new chat at every press never meets the per-chat window, so the second
+    one is what bounds the agent turns it can cost (no chat id starts with
+    ``viewer:``). A refused press is recorded in neither window."""
+    now = time.monotonic()
+    token = f"app:{app_id}"
+    keys = ((chat_id, token), (f"viewer:{user_sub}", token))
+    recent = [[t for t in _rate.get(key, []) if now - t < WINDOW_S] for key in keys]
+    admitted = not any(stamps and (now - stamps[-1] < MIN_INTERVAL_S or len(stamps) >= WINDOW_LIMIT)
+                       for stamps in recent)
+    for key, stamps in zip(keys, recent, strict=True):
+        if admitted:
+            stamps.append(now)
+        _rate[key] = stamps
+    _prune(now)
+    return admitted
 
 
 def validate_interaction(

@@ -70,7 +70,7 @@ class TestFallbacks:
     def test_no_route_is_shared_default_role(self, temp_db):
         agent = _agent()
         ident = _resolve(None, agent)
-        assert ident.mode == "shared" and ident.role == pi.EXTERNAL_ROUTE_ROLE == "viewer"
+        assert ident.mode == "shared" and ident.role == pi.EXTERNAL_ROUTE_ROLE == "external"
         assert ident.external is not None and not ident.external.has_tree
         assert ident.label == "shared" and ident.fallback_reason == "no route"
 
@@ -88,7 +88,7 @@ class TestCallerMode:
         agent = _agent()
         route = _route(agent)
         ident = _resolve(route, agent)
-        assert ident.mode == "caller" and ident.role == "viewer"
+        assert ident.mode == "caller" and ident.role == "external"
         assert ident.external.slug == "302101234567" and not ident.external.ephemeral
         assert ident.label == "caller:+302101234567"
 
@@ -118,8 +118,8 @@ class TestCallerMode:
         """The per-route role selector was removed (2026-09-08): a legacy
         editor/manager column value never reaches the session."""
         agent = _agent()
-        assert _resolve(_route(agent, role="manager"), agent).role == "viewer"
-        assert _resolve(_route(agent, role="editor"), agent).role == "viewer"
+        assert _resolve(_route(agent, role="manager"), agent).role == "external"
+        assert _resolve(_route(agent, role="editor"), agent).role == "external"
 
 
 class TestLegacySharedValue:
@@ -129,7 +129,7 @@ class TestLegacySharedValue:
         shared space (id kept, no tree)."""
         shared_only = _agent(collaborative=False, default_scope="agent")
         ident = _resolve(_route(shared_only, identity_mode="shared", role="editor"), shared_only)
-        assert ident.mode == "caller" and ident.role == "viewer"
+        assert ident.mode == "caller" and ident.role == "external"
         assert ident.external.id == "+302101234567" and not ident.external.has_tree
         collaborative = _agent()
         ident = _resolve(_route(collaborative, identity_mode="shared"), collaborative)

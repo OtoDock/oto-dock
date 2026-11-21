@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: forwards a brief tool result summary to the proxy
-so it can be rendered inline in the chat UI.
+"""PostToolUse and PostToolUseFailure hook: forwards a brief tool result
+summary to the proxy so it can be rendered inline in the chat UI. Claude
+Code runs the second for a call that failed, with the text the model reads
+under ``error`` and no ``tool_response``; Codex runs only the first.
 
 Same pattern as permission_gate.py: reads JSON from stdin, uses only
 urllib.request (no dependencies), POSTs to the proxy, exits quickly.
@@ -62,6 +64,7 @@ TOOL_ROLES = {
     "AskUserQuestion": "question",
     "request_user_input": "question",
     "request_user_input_async": "question",
+    "send_message_to_user_async": "message",
     "CodexEscalation": "escalation",
     "CodexTerminalInput": "escalation",
     "view_image": "read",
@@ -81,7 +84,8 @@ TOOL_ROLES = {
 # spawn block.
 _SKIP_ROLES = {"question", "plan_enter", "plan_exit", "task_read", "task_write"}
 
-# MCP tools to skip (display-mcp tools — the image/link itself just appeared)
+# MCP tools to skip when they succeed (display-mcp tools — the image/link
+# itself just appeared); a failed one is forwarded, the person reads why.
 _SKIP_MCP_TOOLS = {
     "mcp__display__display_image",
     "mcp__display__send_url",
@@ -290,6 +294,36 @@ def _is_error_result(tool_result, summary: str) -> bool:
     return summary.lower().startswith("error")
 
 
+# Claude Code's event for a call that failed (a non-zero exit it reads as an
+# error, a stopped command, a missing file, an MCP error).
+FAILURE_EVENT = "PostToolUseFailure"
+
+
+def _is_failure(inp: dict) -> bool:
+    """Did the CLI report this call as failed (its own event, whatever the
+    text says)?"""
+    return inp.get("hook_event_name") == FAILURE_EVENT
+
+
+def _failure_text(inp: dict) -> str:
+    """The failed call's text, as the model read it."""
+    error = inp.get("error")
+    if isinstance(error, str):
+        return error
+    if error is None:
+        return ""
+    try:
+        return json.dumps(error)
+    except (TypeError, ValueError):
+        return str(error)
+
+
+def _failure_summary(result_text: str) -> str:
+    """A failed call's one line: its first line, whatever the tool."""
+    first_line = result_text.strip().splitlines()[0] if result_text.strip() else ""
+    return f"error: {first_line[:80]}" if first_line else "error"
+
+
 def main():
     raw = sys.stdin.read()
     # Codex app-server sessions (OTO_HOOK_NO_FORWARD set by the spawn): the
@@ -309,6 +343,7 @@ def main():
 
     if not proxy_url or not api_key or not session_id:
         return
+    failed = _is_failure(inp)
 
     # Interactive TUI (OTO_INTERACTIVE set by the spawn): rendering is
     # redundant — the terminal shows tool results itself, and forwarding was
@@ -317,10 +352,11 @@ def main():
     # is the only evidence the user clicked Allow in the native prompt, and
     # without it every call of the same tool re-prompts. Send a MEMORY-ONLY
     # ping for mcp__ tools (the proxy skips rendering for it); no-op for
-    # everything else. Headless -p still forwards everything.
+    # everything else, a failed call included. Headless -p still forwards
+    # everything.
     if os.environ.get("OTO_INTERACTIVE"):
         tool_name = inp.get("tool_name", "")
-        if not tool_name.startswith("mcp__"):
+        if failed or not tool_name.startswith("mcp__"):
             return
         tool_result = inp.get("tool_response") or inp.get("tool_result") or {}
         payload = json.dumps({
@@ -348,17 +384,22 @@ def main():
     # The CLI's PostToolUse input carries the result under ``tool_response``
     # (verified live, CLI 2.1.201); the old ``tool_result`` read matched
     # nothing, so every headless Claude pill shipped an EMPTY body ("ok"
-    # summaries, no Output section). Keep the legacy key as a fallback.
-    tool_result = inp.get("tool_response") or inp.get("tool_result") or {}
+    # summaries, no Output section). Keep the legacy key as a fallback. A
+    # failed call's input has no response: its result is the ``error`` text.
+    tool_result = (_failure_text(inp) if failed
+                   else inp.get("tool_response") or inp.get("tool_result") or {})
 
     # Skip tools with dedicated rendering
-    if TOOL_ROLES.get(tool_name, "") in _SKIP_ROLES or tool_name in _SKIP_MCP_TOOLS:
+    if (TOOL_ROLES.get(tool_name, "") in _SKIP_ROLES
+            or (tool_name in _SKIP_MCP_TOOLS and not failed)):
         return
 
     result_text = _extract_result_text(tool_result)
-    summary = _extract_summary(tool_name, tool_input, result_text)
+    summary = (_failure_summary(result_text) if failed
+               else _extract_summary(tool_name, tool_input, result_text))
     if not summary:
         return
+    is_error = failed or _is_error_result(tool_result, summary)
 
     # Cap result content to avoid huge payloads (500 lines or 50KB)
     result_content = result_text
@@ -377,7 +418,7 @@ def main():
         "tool_use_id": inp.get("tool_use_id", "") or "",
         "summary": summary,
         "result_content": result_content,
-        "is_error": _is_error_result(tool_result, summary),
+        "is_error": is_error,
         # The paths the call named — the turn's record on the proxy
         # (session_events.post_tool); never the whole input (a Write's
         # content would ride along).
@@ -395,7 +436,7 @@ def main():
     # the proxy's answer says so): its pictures and file blobs go in a
     # second request, and the line naming where they were saved reaches the
     # agent as this hook's additionalContext.
-    if not answer.get("result_files") or _is_error_result(tool_result, summary):
+    if not answer.get("result_files") or is_error:
         return
     blocks = _binary_blocks(tool_result)
     if not blocks:

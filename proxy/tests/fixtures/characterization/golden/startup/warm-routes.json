@@ -1,0 +1,95 @@
+{
+ "real_app": null,
+ "seen": [
+  [
+   "a",
+   {
+    "client": [
+     "127.0.0.1",
+     0
+    ],
+    "headers": [],
+    "http_version": "1.1",
+    "method": "GET",
+    "path": "/__otodock_route_warmup__/x",
+    "query_string": "b''",
+    "raw_path": "b'/__otodock_route_warmup__/x'",
+    "root_path": "",
+    "scheme": "http",
+    "server": [
+     "127.0.0.1",
+     80
+    ],
+    "type": "http"
+   },
+   true
+  ],
+  [
+   "a",
+   {
+    "client": [
+     "127.0.0.1",
+     0
+    ],
+    "headers": [],
+    "path": "/__otodock_route_warmup__/x",
+    "query_string": "b''",
+    "raw_path": "b'/__otodock_route_warmup__/x'",
+    "root_path": "",
+    "scheme": "ws",
+    "server": [
+     "127.0.0.1",
+     80
+    ],
+    "subprotocols": [],
+    "type": "websocket"
+   },
+   true
+  ],
+  [
+   "b",
+   {
+    "client": [
+     "127.0.0.1",
+     0
+    ],
+    "headers": [],
+    "http_version": "1.1",
+    "method": "GET",
+    "path": "/__otodock_route_warmup__/x",
+    "query_string": "b''",
+    "raw_path": "b'/__otodock_route_warmup__/x'",
+    "root_path": "",
+    "scheme": "http",
+    "server": [
+     "127.0.0.1",
+     80
+    ],
+    "type": "http"
+   },
+   true
+  ],
+  [
+   "b",
+   {
+    "client": [
+     "127.0.0.1",
+     0
+    ],
+    "headers": [],
+    "path": "/__otodock_route_warmup__/x",
+    "query_string": "b''",
+    "raw_path": "b'/__otodock_route_warmup__/x'",
+    "root_path": "",
+    "scheme": "ws",
+    "server": [
+     "127.0.0.1",
+     80
+    ],
+    "subprotocols": [],
+    "type": "websocket"
+   },
+   true
+  ]
+ ]
+}

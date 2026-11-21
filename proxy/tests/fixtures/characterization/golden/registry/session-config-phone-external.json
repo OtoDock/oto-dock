@@ -1,0 +1,127 @@
+{
+ "bash_env_keys": [
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_KEY_0",
+  "GIT_CONFIG_KEY_1",
+  "GIT_CONFIG_VALUE_0",
+  "GIT_CONFIG_VALUE_1"
+ ],
+ "bundles": {
+  "char-http": {
+   "gateway": {
+    "allowlist_key": "",
+    "callbacks": true,
+    "header": "",
+    "kind": "container",
+    "manifest": "char-http",
+    "path": "/mcp/",
+    "prefix": "",
+    "proxy_local": true,
+    "upstream": "http://localhost:8932"
+   }
+  }
+ },
+ "excluded": {
+  "char-admin-only": "Not picked for outside people",
+  "char-bearer": "Not picked for outside people",
+  "char-bearer-sidecar": "Not picked for outside people",
+  "char-browser": "Requires a remote machine (satellite)",
+  "char-cfg-inst": "Not picked for outside people",
+  "char-cli-token": "Not picked for outside people",
+  "char-context": "Not picked for outside people",
+  "char-core": "Not picked for outside people",
+  "char-default-off": "Not picked for outside people",
+  "char-editors": "Not picked for outside people",
+  "char-env-inst": "Not picked for outside people",
+  "char-gitish": "Not picked for outside people",
+  "char-homelab": "Not picked for outside people",
+  "char-hosted": "Not picked for outside people",
+  "char-hostself": "Not picked for outside people",
+  "char-infra-missing": "Not picked for outside people",
+  "char-keyed": "Not picked for outside people",
+  "char-lookalike": "Not picked for outside people",
+  "char-loopback": "Not picked for outside people",
+  "char-no-external": "Excluded in external mode",
+  "char-no-many": "Excluded in phone mode",
+  "char-no-meeting": "Not picked for outside people",
+  "char-no-phone": "Excluded in phone mode",
+  "char-no-shared-chat": "Excluded in shared_chat mode",
+  "char-no-task": "Not picked for outside people",
+  "char-no-terminal": "Not picked for outside people",
+  "char-peruser": "Not picked for outside people",
+  "char-satellite": "Requires a remote machine (satellite)",
+  "char-shared-docker": "Not picked for outside people",
+  "char-sse": "Not picked for outside people",
+  "char-toggle-off": "Not picked for outside people",
+  "char-toggle-on": "Not picked for outside people",
+  "char-unapproved": "Not picked for outside people",
+  "delegation-mcp": "Not available on external routes"
+ },
+ "file": {
+  "mcpServers": {
+   "char-http": {
+    "headers": {
+     "Authorization": "Bearer OTO_SESSION_JWT"
+    },
+    "type": "http",
+    "url": "http://127.0.0.1:<port>/v1/mcp-gateway/char-http/mcp/"
+   },
+   "char-platform": {
+    "args": [
+     "<tmp>/mcps/custom/char-platform/server.py"
+    ],
+    "command": "<tmp>/mcps/custom/char-platform/venv/bin/python",
+    "env": {
+     "OTO_CLI_TOKEN": ""
+    },
+    "type": "stdio"
+   },
+   "char-tools": {
+    "args": [
+     "<tmp>/mcps/custom/char-tools/server.py",
+     "--mode",
+     "fast",
+     "char-reg",
+     "quote\"and\\back",
+     "line\nbreak"
+    ],
+    "command": "<tmp>/mcps/custom/char-tools/venv/bin/python",
+    "env": {
+     "CHAR_AGENT": "char-reg",
+     "CHAR_ASK": "1",
+     "CHAR_CHAT": "",
+     "CHAR_DIR": "<tmp>/mcps/custom/char-tools/data",
+     "CHAR_LIMIT": "9",
+     "CHAR_MASTER": "${proxy_api_key}",
+     "CHAR_MODE": "fast",
+     "CHAR_OFF": "false",
+     "CHAR_ON": "true",
+     "CHAR_OWNER": "",
+     "CHAR_PROXY": "http://localhost:<port>",
+     "CHAR_REF": "http://192.168.77.10:9100/metrics",
+     "CHAR_ROOT": "<platform-root>/x",
+     "CHAR_SAVED": "saved",
+     "CHAR_SCOPE": "",
+     "CHAR_STATIC": "1",
+     "CHAR_USER": "",
+     "OTO_CLI_TOKEN": ""
+    },
+    "type": "stdio"
+   }
+  }
+ },
+ "flat_env": {
+  "GIT_CONFIG_COUNT": "2",
+  "GIT_CONFIG_KEY_0": "credential.https://git.example.test.helper",
+  "GIT_CONFIG_KEY_1": "credential.https://git.example.test.helper",
+  "GIT_CONFIG_VALUE_0": "",
+  "GIT_CONFIG_VALUE_1": "!\"$OTO_HOOK_PY\" -I \"$OTO_HOOKS_DIR/credential_helper.py\" git"
+ },
+ "instance_files": {},
+ "path": "<tmp>/sessions/user-mcp-configs/char-reg-d4f0bc5a29de.json",
+ "server_order": [
+  "char-http",
+  "char-tools",
+  "char-platform"
+ ]
+}

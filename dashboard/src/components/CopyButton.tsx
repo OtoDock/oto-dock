@@ -1,6 +1,7 @@
 /** Tiny copy-to-clipboard button. Swaps to a green check + "Copied" for ~2s. */
 
 import { useState } from 'react'
+import { copyOrSay } from '../lib/copyText'
 import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT } from './ui/classes'
 
 export function CopyButton({ text, className = '' }: { text: string; className?: string }) {
@@ -9,10 +10,9 @@ export function CopyButton({ text, className = '' }: { text: string; className?:
     <button
       type="button"
       onClick={() => {
-        navigator.clipboard.writeText(text).then(
-          () => { setCopied(true); setTimeout(() => setCopied(false), 2000) },
-          () => {},
-        )
+        void copyOrSay(text).then((ok) => {
+          if (ok) { setCopied(true); setTimeout(() => setCopied(false), 2000) }
+        })
       }}
       className={`${BUTTON_BASE} ${BUTTON_VARIANT.secondary} ${BUTTON_SIZE.xs} ${className}`}
     >

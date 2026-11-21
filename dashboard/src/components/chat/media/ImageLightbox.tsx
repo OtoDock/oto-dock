@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { safeHref } from '../../../lib/safeUrl'
 import { pushEscHandler } from '../../../lib/escStack'
 import { blockedByModal } from '../../../lib/ui/modalLayers'
+import { holdBack } from '../../../lib/ui/backLayer'
 import { useReturnFocus, wrapTab } from '../../ui/focusReturn'
 import { usePortalRoot } from '../../ui/portalRoot'
 import { useSwipeGesture } from '../../../hooks/useSwipeGesture'
@@ -216,46 +217,12 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
     return () => cont.removeEventListener('wheel', onWheel)
   }, [applyView, focal])
 
-  // Browser back-button → close the lightbox via the history-stack pattern.
-  // Works on desktop and on the in-browser mobile site. (For the Capacitor
-  // Android app, `MainActivity.OnBackPressedCallback` intercepts the back
-  // gesture BEFORE it reaches popstate — see the global-flag effect below
-  // for the Android-specific path.)
-  useEffect(() => {
-    const HISTORY_KEY = 'otoLightbox'
-    window.history.pushState({ [HISTORY_KEY]: true }, '', window.location.href)
-    const onPop = () => onCloseRef.current()
-    window.addEventListener('popstate', onPop)
-    return () => {
-      window.removeEventListener('popstate', onPop)
-      const s = window.history.state
-      if (s && typeof s === 'object' && (s as Record<string, unknown>)[HISTORY_KEY]) {
-        window.history.back()
-      }
-    }
-    // Mount-once by design (see onCloseRef above): one history entry per
-    // lightbox lifetime — re-arming on onClose identity is the self-close bug.
-  }, [])
-
-  // Android back-gesture / back-button integration — same pattern as
-  // WorkspaceOverlay's selection mode. MainActivity.handleBackAction's
-  // injected JS checks these globals BEFORE deciding to minimize the app
-  // (the chat-page default), and if it sees the lightbox active it calls
-  // our close function and returns 'handled' so the app stays put.
-  // Requires the matching MainActivity.java case (see
-  // `MainActivity.handleBackAction` — the `__otodockLightboxActive` branch).
-  useEffect(() => {
-    const w = window as unknown as {
-      __otodockLightboxActive?: boolean
-      __otodockLightboxClose?: () => void
-    }
-    w.__otodockLightboxActive = true
-    w.__otodockLightboxClose = () => onCloseRef.current()
-    return () => {
-      w.__otodockLightboxActive = false
-      delete w.__otodockLightboxClose
-    }
-  }, [])
+  // Back closes the lightbox: the browser's (a history entry) and the
+  // Android and iOS apps' (the window members their back script reads),
+  // through the one owner of a layer Back closes (lib/ui/backLayer).
+  // Mount-once by design (see onCloseRef above): one history entry per
+  // lightbox lifetime. Re-arming on onClose identity is the self-close bug.
+  useEffect(() => holdBack(() => onCloseRef.current()), [])
 
   useEffect(() => {
     const pop = pushEscHandler(() => onCloseRef.current(), () => outerRef.current)

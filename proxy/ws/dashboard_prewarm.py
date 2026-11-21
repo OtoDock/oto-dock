@@ -58,6 +58,13 @@ async def _pre_warmup_rollback(sid: str, build, agent_cfg, started: bool, layer)
         release_config_seat(sid, agent_cfg)
 
 
+def _built_placement(cfg):
+    """The compute placement a config was built with (its security
+    context's), None when the platform's own sandbox serves it."""
+    ctx = getattr(cfg, "security_context", None)
+    return placement.compute_of(getattr(ctx, "placement", None) if ctx is not None else None)
+
+
 def _schedule_pre_warmup_rollback(sid: str, build, agent_cfg, started: bool, layer) -> None:
     task = asyncio.create_task(_pre_warmup_rollback(sid, build, agent_cfg, started, layer))
     _ROLLBACK_TASKS.add(task)
@@ -84,11 +91,12 @@ async def spawn_detached_prewarm(
     agent_cfg = None
     layer = None
     try:
-        def _path_and_check() -> tuple[str, bool]:
+        def _path_and_check() -> tuple[str, bool, bool]:
+            from services.remote import remote_status
             path = resolve_execution_path(agent, "")
-            return path, _model_foreign_to_engine(requested_model, path)
+            return path, _model_foreign_to_engine(requested_model, path), remote_status.keeps_beside(agent)
 
-        exec_path, foreign_model = await run_db(_path_and_check)
+        exec_path, foreign_model, beside = await run_db(_path_and_check)
         if foreign_model:
             logger.info(
                 "detached pre-warm: skipped (model %s is not a "
@@ -98,7 +106,7 @@ async def spawn_detached_prewarm(
         # Room for this session and one more, nobody waiting, the person
         # below their cap; otherwise skipped without a word.
         from core import concurrency
-        if not concurrency.prewarm_allowed(exec_path, user_sub=user_sub):
+        if not concurrency.prewarm_allowed(exec_path, user_sub=user_sub, shared_folder=beside):
             logger.info("detached pre-warm: skipped (no room for two) agent=%s", agent)
             return None
         agent_cfg = await build_agent_config(
@@ -122,8 +130,11 @@ async def spawn_detached_prewarm(
             release_config_seat(new_sid, agent_cfg)
             return None
         from core.concurrency import acquire_chat_slot
+        built = _built_placement(agent_cfg)
         adm = await acquire_chat_slot(new_sid, execution_path=agent_cfg.execution_path,
-                                      user_sub=user_sub, speculative=True)
+                                      user_sub=user_sub, speculative=True,
+                                      mcp_config_path=agent_cfg.mcp_config_path or "",
+                                      **({"target": built.machine_id} if built else {}))
         if not adm:
             logger.info("detached pre-warm: no slot (%s)", adm.reason)
             release_config_seat(new_sid, agent_cfg)
@@ -134,6 +145,7 @@ async def spawn_detached_prewarm(
         layer = get_execution_layer(
             agent, execution_path=exec_path, user_sub=user_sub, role=role,
             execution_target=agent_cfg.execution_target,
+            **({"placement_built": built} if built else {}),
         )
         await layer.start_session(new_sid, agent_cfg)
         _tz = get_user_tz(user_sub)

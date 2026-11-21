@@ -8,16 +8,29 @@ rebinds ``config.AGENTS_DIR``.
 """
 
 import contextlib
+import dataclasses
+import fnmatch
 import logging
+import os
 from pathlib import Path
 
 from auth import roles
 from core import layout
 from core.placement import LOCAL_PLACEMENT, PlacementCapabilities
 
+_prompt_log = logging.getLogger("otodock.prompts")
+
 _DOC_EXTENSIONS = {".md", ".txt", ".markdown"}
 _MAX_DOC_BYTES = 1 * 1024 * 1024       # 1 MB per file
 _MAX_TOTAL_DOC_BYTES = 5 * 1024 * 1024  # 5 MB total per agent
+
+
+def _read_persona(agent_fd: int, name: str) -> str:
+    """``config/<name>`` beneath the agent's handle: a regular file reached
+    with no link, at most ``_MAX_TOTAL_DOC_BYTES``, decoded as UTF-8."""
+    from services.infra import safe_fs
+    return safe_fs.read_bytes_beneath(
+        agent_fd, f"{layout.CONFIG}/{name}", max_size=_MAX_TOTAL_DOC_BYTES).decode("utf-8")
 
 
 def persona_is_unconfigured(agent_name: str) -> bool:
@@ -34,22 +47,24 @@ def persona_is_unconfigured(agent_name: str) -> bool:
     cannot tell (a template-installed agent always has real content).
     """
     import config
+    from core.agent_folder import agent_root
+    from services.infra import safe_fs
     if not config.is_safe_agent_name(agent_name):
         return False
     try:
-        config_dir = config.get_agent_dir(agent_name) / layout.CONFIG
-    except ValueError:
+        with safe_fs.open_root(agent_root(agent_name)) as agent_fd:
+            for name in ("agent.md", "prompt.md"):
+                try:
+                    text = _read_persona(agent_fd, name)
+                except OSError:
+                    continue
+                # Drop a single leading H1 (the seeded title) and see what remains.
+                body = text.strip()
+                if body.startswith("#"):
+                    body = body.split("\n", 1)[1] if "\n" in body else ""
+                return not body.strip()
+    except (OSError, ValueError):
         return False
-    for candidate in (config_dir / "agent.md", config_dir / "prompt.md"):
-        try:
-            text = candidate.read_text()
-        except OSError:
-            continue
-        # Drop a single leading H1 (the seeded title) and see what remains.
-        body = text.strip()
-        if body.startswith("#"):
-            body = body.split("\n", 1)[1] if "\n" in body else ""
-        return not body.strip()
     return False
 
 
@@ -67,24 +82,47 @@ def _read_agent_files(model: str) -> list[tuple[str, str]]:
     skipped files are listed in a synthesized `_auto_context_skipped.md` so the
     agent knows what didn't make it in.
 
+    Every file is read beneath a handle on the agent's real folder
+    (``core.agent_folder.agent_root``) with no link at any part below it: a
+    manager's session writes ``config/``, so a link there
+    is never followed into the prompt. A link in the context folder is listed
+    as skipped; a persona that is a link, or past 5 MB, is refused and the
+    agent has no prompt (logged), as with no persona at all.
+
     Returns list of (relative_path, content) tuples.
     """
     import config
+    from core.agent_folder import agent_root
+    from services.infra import safe_fs
     if not config.is_safe_agent_name(model):
         return []
     try:
-        agent_dir = config.get_agent_dir(model)
-    except ValueError:
+        with safe_fs.open_root(agent_root(model)) as agent_fd:
+            return _agent_files(agent_fd, model)
+    except (FileNotFoundError, ValueError):
         return []
-    config_dir = agent_dir / layout.CONFIG
+    except OSError as exc:
+        _prompt_log.warning("prompt of %s: its folder was not read (%s)", model, type(exc).__name__)
+        return []
+
+
+def _agent_files(agent_fd: int, model: str) -> list[tuple[str, str]]:
+    """``_read_agent_files`` beneath the agent's handle."""
+    from services.infra import safe_fs
     persona_text: str | None = None
     # Two passes: a concurrent rename/restore can remove the probed file
-    # between exists() and read_text() — re-probe both names before giving up.
+    # between the listing and the read — re-probe both names before giving up.
     for _attempt in range(2):
-        for candidate in (config_dir / "agent.md", config_dir / "prompt.md"):
+        for name in ("agent.md", "prompt.md"):
             try:
-                persona_text = candidate.read_text()
+                persona_text = _read_persona(agent_fd, name)
                 break
+            except FileNotFoundError:
+                continue
+            except (safe_fs.SafeFsError, UnicodeDecodeError) as exc:
+                _prompt_log.warning("prompt of %s: config/%s was not read (%s)",
+                                    model, name, type(exc).__name__)
+                continue
             except OSError:
                 continue
         if persona_text is not None:
@@ -94,28 +132,53 @@ def _read_agent_files(model: str) -> list[tuple[str, str]]:
 
     files: list[tuple[str, str]] = [("agent.md", persona_text)]
 
-    context_dir = agent_dir / layout.CONFIG / layout.CONTEXT
-    if not context_dir.is_dir():
-        return files
+    context_rel = f"{layout.CONFIG}/{layout.CONTEXT}"
+    found: list[tuple[str, int]] = []
+    links: list[str] = []
 
-    candidates = sorted(
-        p for p in context_dir.rglob("*")
-        if p.is_file() and p.suffix.lower() in _DOC_EXTENSIONS
-    )
+    def _unread(exc: OSError) -> None:
+        _prompt_log.warning("prompt of %s: a folder of %s was not read (%s)",
+                            model, context_rel, type(exc).__name__)
+
+    try:
+        for step in safe_fs.walk_beneath(agent_fd, context_rel, onerror=_unread):
+            for name in step.files:
+                if Path(name).suffix.lower() not in _DOC_EXTENSIONS:
+                    continue
+                try:
+                    size = os.stat(name, dir_fd=step.dirfd, follow_symlinks=False).st_size
+                except OSError:
+                    continue
+                found.append((step.path(name), size))
+            links.extend(step.path(name) for name in step.symlinks
+                         if Path(name).suffix.lower() in _DOC_EXTENSIONS)
+    except (FileNotFoundError, NotADirectoryError):
+        return files
+    except OSError as exc:
+        _unread(exc)
+        return files
+    # The order of the sorted paths before: by path part.
+    found.sort(key=lambda item: item[0].split("/"))
 
     total_bytes = 0
     skipped: list[str] = []
-    for p in candidates:
-        size = p.stat().st_size
-        rel = str(p.relative_to(agent_dir))
+    for rel, size in found:
         if size > _MAX_DOC_BYTES:
             skipped.append(f"{rel} ({size} bytes — over 1 MB per-file limit)")
             continue
         if total_bytes + size > _MAX_TOTAL_DOC_BYTES:
             skipped.append(f"{rel} (5 MB total cap reached)")
             break
-        files.append((rel, p.read_text(encoding="utf-8", errors="replace")))
+        try:
+            data = safe_fs.read_bytes_beneath(agent_fd, rel, max_size=_MAX_DOC_BYTES)
+        except safe_fs.FileTooLarge:
+            skipped.append(f"{rel} (over 1 MB per-file limit)")
+            continue
+        except OSError:
+            continue
+        files.append((rel, data.decode("utf-8", errors="replace")))
         total_bytes += size
+    skipped.extend(f"{rel} (a link, not loaded)" for rel in sorted(links, key=lambda r: r.split("/")))
 
     if skipped:
         files.append((
@@ -125,6 +188,56 @@ def _read_agent_files(model: str) -> list[tuple[str, str]]:
         ))
 
     return files
+
+
+def _person_context_docs(agent_name: str, ctx_dir: Path,
+                         cap: int) -> tuple[list[tuple[str, int, bytes | None]], list[str]]:
+    """``(name, size, bytes)`` of each regular ``*.md`` file directly in a
+    person's (or a caller's) context folder, a hidden name included, sorted
+    by name, listed and read beneath the agent's real folder
+    (``core.agent_folder``) with no link at any part below it; ``bytes`` is
+    None for a file past ``cap`` (it is named as skipped). Beside them, the
+    ``*.md`` names that are links: named as skipped, never loaded. A folder
+    that is missing, outside the agent's folder or reached through a link
+    lists nothing."""
+    from core.agent_folder import beneath_agent
+    from services.infra import safe_fs
+    docs: list[tuple[str, int, bytes | None]] = []
+    links: list[str] = []
+    try:
+        root, rel = beneath_agent(ctx_dir, agent_name)
+        with safe_fs.open_root(root) as agent_fd:
+            names: list[tuple[str, int]] = []
+            for step in safe_fs.walk_beneath(agent_fd, rel):
+                for name in step.files:
+                    if not fnmatch.fnmatchcase(name, "*.md"):
+                        continue
+                    try:
+                        names.append((name, os.stat(name, dir_fd=step.dirfd, follow_symlinks=False).st_size))
+                    except OSError:
+                        continue
+                links.extend(sorted(name for name in step.symlinks if fnmatch.fnmatchcase(name, "*.md")))
+                break
+            for name, size in sorted(names):
+                if size > cap:
+                    docs.append((name, size, None))
+                    continue
+                try:
+                    data: bytes | None = safe_fs.read_bytes_beneath(agent_fd, f"{rel}/{name}", max_size=cap)
+                except safe_fs.FileTooLarge:
+                    data = None
+                except OSError:
+                    continue
+                docs.append((name, size, data))
+    except FileNotFoundError:
+        return docs, links
+    except OSError as exc:
+        _prompt_log.warning("prompt of %s: a person's context folder was not read (%s)",
+                            agent_name, type(exc).__name__)
+        return docs, links
+    except ValueError:
+        return docs, links
+    return docs, links
 
 
 # Directories to skip when scanning the workspace tree. The session-state
@@ -146,8 +259,14 @@ def _scan_workspace(agent_dir: Path, agent_name: str, *,
                     role: str = "manager",
                     sandboxed: bool = True,
                     mount_shared: bool = True,
-                    external_home: str = "") -> str | None:
+                    external_home: str = "",
+                    external: bool = False,
+                    outside_knowledge: tuple[str, ...] = ()) -> str | None:
     """Scan an agent's directories and return a formatted tree.
+
+    An outside session (``external``) sees its own home and the knowledge
+    folders a manager picked (``outside_knowledge``), never the shared
+    workspace or the knowledge tree whole: the tree shows what is mounted.
 
     Returns ``None`` if no folder is visible to this session. Otherwise
     returns a multi-line string with directories AND files, sorted
@@ -164,7 +283,27 @@ def _scan_workspace(agent_dir: Path, agent_name: str, *,
 
     When ``sandboxed=True``, root paths use sandbox-relative prefixes
     (``/workspace/`` etc.) — what the CLI sees inside bwrap.
+
+    Every folder is listed beneath a handle on the agent's real folder
+    (``core.agent_folder.agent_root``) and entered from its parent's handle
+    with no link followed.
     """
+    from core.agent_folder import agent_root
+    from services.infra import safe_fs
+    try:
+        with safe_fs.open_root(agent_root(agent_name)) as agent_fd:
+            return _scan_tree(agent_fd, agent_dir, username=username, role=role,
+                              mount_shared=mount_shared, external_home=external_home,
+                              external=external, outside_knowledge=outside_knowledge)
+    except (OSError, ValueError):
+        return None
+
+
+def _scan_tree(agent_fd: int, agent_dir: Path, *, username: str | None, role: str,
+               mount_shared: bool, external_home: str, external: bool,
+               outside_knowledge: tuple[str, ...]) -> str | None:
+    """``_scan_workspace`` beneath the agent's handle."""
+    from services.infra import safe_fs
     lines: list[str] = []
     rendered_bytes = 0
     truncated_count = 0  # entries past the cap we couldn't fit
@@ -174,70 +313,108 @@ def _scan_workspace(agent_dir: Path, agent_name: str, *,
             return name
         return name[:_TREE_MAX_NAME_LEN - 1] + "…"
 
-    def _walk(current: Path, depth: int, indent: int) -> None:
+    def _walk(dir_fd: int, depth: int, indent: int) -> None:
         nonlocal rendered_bytes, truncated_count
         if depth > _TREE_MAX_DEPTH:
             return
         try:
-            entries = list(current.iterdir())
-        except (PermissionError, OSError):
+            with os.scandir(dir_fd) as it:
+                entries = list(it)
+        except OSError:
             return
-        # Filter: skip hidden + denylisted dirs; keep everything else.
-        visible = [
-            e for e in entries
-            if not e.name.startswith(".") and e.name not in _TREE_SKIP_DIRS
-        ]
+        # Filter: skip hidden + denylisted dirs; keep everything else. A
+        # folder is entered from its parent's handle with no link followed;
+        # a link is listed by its name with ``@`` and never entered, and an
+        # outside session lists no link at all.
+        dirs: list[str] = []
+        files: list[tuple[str, str]] = []
+        for e in entries:
+            if e.name.startswith(".") or e.name in _TREE_SKIP_DIRS:
+                continue
+            try:
+                if e.is_symlink():
+                    if not external:
+                        files.append((e.name, f"{_trim_name(e.name)}@"))
+                elif e.is_dir(follow_symlinks=False):
+                    dirs.append(e.name)
+                elif e.is_file(follow_symlinks=False):
+                    files.append((e.name, _trim_name(e.name)))
+            except OSError:
+                continue
         # Sort: directories first, then files; both alphabetical.
-        dirs = sorted([e for e in visible if e.is_dir()], key=lambda p: p.name)
-        files = sorted([e for e in visible if e.is_file()], key=lambda p: p.name)
-        for d in dirs:
-            line = f"{'  ' * indent}{_trim_name(d.name)}/"
+        for d in sorted(dirs):
+            line = f"{'  ' * indent}{_trim_name(d)}/"
             if rendered_bytes + len(line) + 1 > _TREE_MAX_BYTES:
                 truncated_count += 1
                 continue
             lines.append(line)
             rendered_bytes += len(line) + 1
-            _walk(d, depth + 1, indent + 1)
-        for f in files:
-            line = f"{'  ' * indent}{_trim_name(f.name)}"
+            try:
+                child = safe_fs.open_dir_beneath(dir_fd, d)
+            except OSError:
+                continue
+            try:
+                _walk(child, depth + 1, indent + 1)
+            finally:
+                os.close(child)
+        for _name, shown in sorted(files):
+            line = f"{'  ' * indent}{shown}"
             if rendered_bytes + len(line) + 1 > _TREE_MAX_BYTES:
                 truncated_count += 1
                 continue
             lines.append(line)
             rendered_bytes += len(line) + 1
 
-    def _emit_root(rel_label: str, root: Path) -> None:
+    def _emit_root(rel_label: str, rel: str) -> None:
         nonlocal rendered_bytes
-        if not root.is_dir():
+        try:
+            fd = safe_fs.open_dir_beneath(agent_fd, rel)
+        except OSError:
             return
-        line = rel_label
-        if rendered_bytes + len(line) + 1 > _TREE_MAX_BYTES:
-            return
-        lines.append(line)
-        rendered_bytes += len(line) + 1
-        _walk(root, 1, 1)
+        try:
+            line = rel_label
+            if rendered_bytes + len(line) + 1 > _TREE_MAX_BYTES:
+                return
+            lines.append(line)
+            rendered_bytes += len(line) + 1
+            _walk(fd, 1, 1)
+        finally:
+            os.close(fd)
 
     # An external caller's own tree (mounted at /caller) comes first.
     if external_home:
-        for sub in layout.USER_SUBDIRS:
-            _emit_root(f"/caller/{sub}/", Path(external_home) / sub)
+        try:
+            home_rel = safe_fs.rel_under(external_home, agent_dir)
+        except safe_fs.SafeFsError:
+            home_rel = ""
+        if home_rel:
+            for sub in layout.USER_SUBDIRS:
+                _emit_root(f"/caller/{sub}/", f"{home_rel}/{sub}")
+    if external:
+        from services.mcp.outside_picks import knowledge_parts
+        for pick in outside_knowledge:
+            parts_ = knowledge_parts(pick)
+            if parts_ is None:
+                continue
+            # A picked folder reached through a link shows nothing, as the
+            # mounts bind nothing for it.
+            _emit_root(f"{layout.V_KNOWLEDGE}/{pick}/", "/".join((layout.KNOWLEDGE, *parts_)))
     # Agent-scope (no username): /workspace/ + /knowledge/
-    if not username:
-        _emit_root(f"{layout.V_WORKSPACE}/", agent_dir / layout.WORKSPACE)
-        _emit_root(f"{layout.V_KNOWLEDGE}/", agent_dir / layout.KNOWLEDGE)
+    elif not username:
+        _emit_root(f"{layout.V_WORKSPACE}/", layout.WORKSPACE)
+        _emit_root(f"{layout.V_KNOWLEDGE}/", layout.KNOWLEDGE)
     else:
         # User-scope: own user dir + shared spaces + (manager+) config
-        user_dir = layout.user_dir(agent_dir, username)
-        if user_dir.is_dir():
-            for sub in layout.USER_SUBDIRS:
-                _emit_root(f"{layout.virtual_user_root(username)}/{sub}/", user_dir / sub)
+        user_rel = safe_fs.rel_under(layout.user_dir(agent_dir, username), agent_dir)
+        for sub in layout.USER_SUBDIRS:
+            _emit_root(f"{layout.virtual_user_root(username)}/{sub}/", f"{user_rel}/{sub}")
         # Shared workspace + knowledge only when the agent's mode has them
         # (Personal-only omits both — they aren't mounted in that mode).
         if mount_shared:
-            _emit_root(f"{layout.V_WORKSPACE}/", agent_dir / layout.WORKSPACE)
-            _emit_root(f"{layout.V_KNOWLEDGE}/", agent_dir / layout.KNOWLEDGE)
+            _emit_root(f"{layout.V_WORKSPACE}/", layout.WORKSPACE)
+            _emit_root(f"{layout.V_KNOWLEDGE}/", layout.KNOWLEDGE)
         if roles.can_manage(role):
-            _emit_root(f"{layout.V_CONFIG}/", agent_dir / layout.CONFIG)
+            _emit_root(f"{layout.V_CONFIG}/", layout.CONFIG)
 
     if truncated_count:
         lines.append(
@@ -258,11 +435,15 @@ def _scan_workspace(agent_dir: Path, agent_name: str, *,
 _memory_log = logging.getLogger("otodock.prompts")
 
 
-def _render_memory_scope(root, *, virtual: str, budget: int,
+def _render_memory_scope(root, *, agent: str, virtual: str, budget: int,
                          writable: bool = True, label: str = "") -> str:
     """One scope's body: the inlined topics, the listed ones, or empty-state
-    priming. ``label`` names the agent and the scope in the one warning a
-    failed index rewrite logs."""
+    priming. Each inlined topic is read beneath ``agent``'s real folder
+    (``core.agent_folder``) with no link at any part below it, under the
+    topic's hard cap. ``label`` names the agent and the scope in the one
+    warning a failed index rewrite logs."""
+    from core.agent_folder import beneath_agent
+    from services.infra import safe_fs
     from services.memory import memory_file, memory_index
 
     facts = memory_index.scope_facts(root, today=memory_index.today_utc())
@@ -297,12 +478,15 @@ def _render_memory_scope(root, *, virtual: str, budget: int,
             listed.append(f)
             continue
         try:
-            content = (root / f.rel).read_text(encoding="utf-8", errors="replace").rstrip()
-        except OSError:
-            # Unreadable now (a permission, a file swapped mid-build): keep it
-            # visible with its index entry, so `view` can still be tried.
+            data = safe_fs.read_bytes_beneath(*beneath_agent(root / f.rel, agent),
+                                             max_size=memory_file.TOPIC_HARD_CAP_BYTES)
+        except (OSError, ValueError):
+            # Unreadable now (a permission, a file swapped mid-build, a link
+            # in its place): keep it visible with its index entry, so `view`
+            # can still be tried.
             listed.append(f)
             continue
+        content = data.decode("utf-8", errors="replace").rstrip()
         out.append(f"### `{f.rel}`\n\n{content}")
         used += f.size
     if listed:
@@ -315,23 +499,87 @@ def _render_memory_scope(root, *, virtual: str, budget: int,
     return "\n\n".join(out)
 
 
+def _has_folders(*, external: bool, external_home: str, outside_knowledge: tuple[str, ...]) -> bool:
+    """Whether the session can see any folder: an outside person with no
+    tree of their own and no folder picked sees none, whatever the files."""
+    return not external or bool(external_home or outside_knowledge)
+
+
 def _kb(n: int) -> str:
     return f"{n // 1024} KB" if n % 1024 == 0 else f"{n:,} bytes"
 
 
-def _render_memory_sections(model: str, agent_dir: Path, *,
-                            username: str | None, role: str,
-                            external: bool = False,
-                            external_home: str = "") -> str | None:
-    """The `# Memory` prompt section: capture directive + per-scope content.
+def _where_files_go(*, username: str | None, role: str, external: bool, wrapup: bool,
+                    home: str, files_write: bool) -> str:
+    """The workspace listing's last line: where this session writes, in
+    sandbox paths."""
+    if wrapup:
+        return ("\nFiles for this person go to `/caller/workspace/`. Nothing else is written."
+                if home else "\nNothing is written after this conversation.")
+    if external:
+        return ("\nFiles for this person go to `/caller/workspace/`."
+                if home and files_write else "\nNothing is written during this conversation.")
+    if username:
+        line = f"\nUser files go to `{layout.virtual_workspace(username)}/`."
+        if roles.can_write_workspace(role):
+            line += " Agent-scoped output goes to `/workspace/`."
+        return line
+    return "\nAgent-scoped output goes to `/workspace/`."
+
+
+def _notes_apply(model: str) -> bool:
+    """Whether the agent's sessions read the notes from conversations: a
+    manager may turn them off, and the kept lines then stay for the switch
+    to bring back, read by no prompt."""
+    from storage.agents import outside_store
+    return bool(outside_store.get_wrapup(model)["shared_notes"])
+
+
+def _render_outside_notes(model: str) -> str:
+    """The `# Notes from conversations` section's instructions: what the
+    notes are. The notes ride (``_start_notes``)."""
+    from services.infra.external_data import NOTE
+    if not _notes_apply(model):
+        return ""
+    return ("\n\n---\n\n# Notes from conversations\n\n"
+            "Notes the agent kept after conversations with people outside the "
+            f"team, oldest first, come with the context at this start. {NOTE}\n")
+
+
+def _start_notes(model: str) -> str:
+    """The notes from conversations, each fenced as data."""
+    from services.infra.external_data import fence
+    from storage.chat import conversation_store
+    notes = conversation_store.notes_for(model)
+    if not notes:
+        return "_No notes yet._"
+    return "\n".join(f"- {n['day']}: {fence(n['text'])}" for n in notes)
+
+
+def _memory_sections(model: str, agent_dir: Path, *,
+                     username: str | None, role: str,
+                     external: bool = False,
+                     external_home: str = "",
+                     wrapup: bool = False,
+                     content: bool = True) -> tuple[str, str] | None:
+    """The `# Memory` prompt section's two halves: the capture directive
+    (the stable text) and the per-scope content (the riding part, which
+    ``_start_memory`` renders; ``core/session/start_context.py``).
 
     Scope loading matrix: user-scoped sessions get agent + user memory;
     agent-scoped sessions (no username) get agent memory only. A viewer's
-    agent scope is read-only. An EXTERNAL session (a phone caller who is not
-    a platform user) never gets the agent memory; with a caller tree
-    (``external_home``) the caller's own memory is its user scope — same
-    toggles and mode clamp as a user's. Returns None when memory is fully
-    disabled.
+    agent scope is read-only. An EXTERNAL session (an outside person who is
+    not a platform user) never gets the agent memory; with a home
+    (``external_home``) the person's own memory is read to the agent and
+    never written during the conversation (the memory tool is not in the
+    session: the wrap-up after it records what matters). The WRAP-UP after
+    a conversation (``wrapup``) writes that one person's memory
+    (``external_home`` their tree) and reads no other. Returns None when
+    memory is fully disabled.
+
+    Only the content half reads the topic files (and heals their index),
+    and only with ``content``: a directive rendered twice with the same
+    settings is the same bytes.
     """
     from services.memory import memory_file
     from storage.agents import agent_store, memory_store
@@ -352,9 +600,10 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
         and toggles.get("agent_memory_enabled")
         and _mode_agent_ok
         and not external
+        and not wrapup
     )
     user_enabled = bool(
-        (external_home if external else username)
+        (external_home if external or wrapup else username)
         and settings.get("user_memory_enabled")
         and toggles.get("user_memory_enabled")
         and _mode_user_ok
@@ -366,6 +615,7 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
     caps = memory_file.Caps.from_settings(settings)
 
     parts: list[str] = ["\n\n---\n\n# Memory\n"]
+    data: list[str] = []
 
     default_scope = agent_row.get("default_scope") or (
         "user" if user_enabled else "agent"
@@ -386,12 +636,7 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
         scope_lines.append(
             "- `/memories/agent/` is shared with every user of this agent."
         )
-    if user_enabled and external:
-        scope_lines.append(
-            "- `/memories/user/` is private to this caller. Nothing else "
-            "on this line is remembered."
-        )
-    elif user_enabled:
+    if user_enabled:
         scope_lines.append(f"- `/memories/user/` is private to {username}.")
     # The one scope rule, for a session that can write both scopes; a
     # viewer or a contributor reads the shared memory and saves user-scope
@@ -412,6 +657,45 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
         )
     else:
         scope_rule = ""
+    if wrapup:
+        parts.append(
+            "\nYou keep this person's memory with the `memory` tool at "
+            "`/memories/user/`: what they told you and what concerns them, a "
+            "fact or a decision per entry, dated (YYYY-MM-DD), one to three "
+            "lines. Update the existing entry instead of adding one. Never "
+            "anything about another person, and never what you read in your "
+            "own files or tools about anyone. Nothing to keep is a valid "
+            "answer. This person's memory comes with the context at this start.\n"
+        )
+        root = Path(external_home) / layout.CONTEXT / "memory"
+        if content:
+            data.append(
+                "## This person's memory\n\n"
+                + _render_memory_scope(
+                    root, agent=model, virtual="/memories/user", budget=budget,
+                    writable=True, label=f"{model} (caller scope)",
+                )
+            )
+        return "".join(parts), "\n\n".join(data)
+    if external:
+        directive = (
+            "\nWhat you remember of this person comes with the context at "
+            "this start. Nothing you learn "
+            "in this conversation is saved while it runs: what matters is "
+            "recorded for this person after it ends, so do not promise to "
+            "remember anything beyond that.\n"
+        )
+        parts.append(directive)
+        root = Path(external_home) / layout.CONTEXT / "memory"
+        if content:
+            data.append(
+                "## This person's memory\n\n"
+                + _render_memory_scope(
+                    root, agent=model, virtual="/memories/user", budget=budget,
+                    writable=False, label=f"{model} (caller scope)",
+                )
+            )
+        return "".join(parts), "\n\n".join(data)
     directive = (
         "\nYou have persistent memory: markdown topic files you manage with "
         "the `memory` tool.\n"
@@ -429,41 +713,31 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
         f"past {_kb(caps.grow_cap)} and an edit that adds over "
         f"{_kb(caps.entry_cap)}. Delete what no longer governs. `MEMORY.md` "
         "is generated, never edit it. Never store secrets. This is the only "
-        "memory in play: the engine's own memory is off.\n"
+        "memory in play: the engine's own memory is off. The topics come "
+        "with the context at this start. If no such context reached you, list "
+        "them with the `memory` tool before you answer from memory.\n"
     )
     parts.append(directive)
 
-    if agent_enabled:
+    if agent_enabled and content:
         root = memory_file.scope_root(agent_dir, "agent")
-        parts.append(
-            "\n## Agent memory (shared)\n\n"
+        data.append(
+            "## Agent memory (shared)\n\n"
             + _render_memory_scope(
-                root, virtual="/memories/agent", budget=budget,
+                root, agent=model, virtual="/memories/agent", budget=budget,
                 writable=agent_writable, label=f"{model} (agent scope)",
             )
-            + "\n"
         )
-    if user_enabled and external:
-        root = Path(external_home) / layout.CONTEXT / "memory"
-        parts.append(
-            "\n## Caller memory (private to this caller)\n\n"
-            + _render_memory_scope(
-                root, virtual="/memories/user", budget=budget,
-                label=f"{model} (caller scope)",
-            )
-            + "\n"
-        )
-    elif user_enabled:
+    if user_enabled and content:
         root = memory_file.scope_root(agent_dir, "user", username)
-        parts.append(
-            f"\n## User memory ({username})\n\n"
+        data.append(
+            f"## User memory ({username})\n\n"
             + _render_memory_scope(
-                root, virtual="/memories/user", budget=budget,
+                root, agent=model, virtual="/memories/user", budget=budget,
                 label=f"{model} (user scope, {username})",
             )
-            + "\n"
         )
-    return "".join(parts)
+    return "".join(parts), "\n\n".join(data)
 
 
 def _has_delegation_tools(model: str, placement: PlacementCapabilities) -> bool:
@@ -476,8 +750,26 @@ def _has_delegation_tools(model: str, placement: PlacementCapabilities) -> bool:
     return False
 
 
+def _notebook_functions(model: str, placement: PlacementCapabilities,
+                        tool_limits=None) -> tuple[bool, bool]:
+    """Whether the session holds ``notebook_read`` and ``notebook_post``:
+    the delegation MCP assigned (``_has_delegation_tools``), each function
+    within the session's tool limits (``tool_limits.allows``)."""
+    if not _has_delegation_tools(model, placement):
+        return False, False
+    with contextlib.suppress(Exception):
+        from services.mcp import mcp_registry, tool_limits as _tool_limits
+        from services.mcp.outside_picks import server_key
+        manifest = mcp_registry.get_all_manifests().get("delegation-mcp")
+        key = server_key(manifest) if manifest is not None else "delegation-mcp"
+        return (_tool_limits.allows(tool_limits, key, "notebook_read"),
+                _tool_limits.allows(tool_limits, key, "notebook_post"))
+    return False, False
+
+
 def _render_notebook(model: str, *, role: str, external: bool, read_only: bool,
-                     client_type: str, placement: PlacementCapabilities) -> str | None:
+                     client_type: str, placement: PlacementCapabilities,
+                     tool_limits=None) -> str | None:
     """The ``# Notebook`` section (``services/notebook/notebook_prompt.py``):
     the latest entries of the agent's read set and when to post. Never for
     an external caller. Whether the session may post is
@@ -488,9 +780,25 @@ def _render_notebook(model: str, *, role: str, external: bool, read_only: bool,
     refusal = posting.posting_refusal(
         model, role=role, read_only=read_only, client_type=client_type,
     )
-    return notebook_prompt.render(
-        model, refusal=refusal, has_tools=_has_delegation_tools(model, placement),
-    )
+    reads, posts = _notebook_functions(model, placement, tool_limits)
+    return notebook_prompt.render(model, refusal=refusal, reads=reads, posts=posts)
+
+
+def _notebook_applies(model: str, *, role: str, external: bool, read_only: bool,
+                      client_type: str, placement: PlacementCapabilities,
+                      tool_limits=None) -> bool:
+    """Whether the session's text has the ``# Notebook`` section, so its
+    entries ride."""
+    if external:
+        return False
+    with contextlib.suppress(Exception):
+        from services.notebook import notebook_prompt, posting
+        refusal = posting.posting_refusal(
+            model, role=role, read_only=read_only, client_type=client_type,
+        )
+        return notebook_prompt.applies(
+            model, refusal=refusal, posts=_notebook_functions(model, placement, tool_limits)[1])
+    return False
 
 
 def build_agent_prompt(model: str, *,
@@ -503,13 +811,34 @@ def build_agent_prompt(model: str, *,
                        placement: PlacementCapabilities = LOCAL_PLACEMENT,
                        mount_shared: bool = True,
                        execution_path: str = "",
-                       skip_http_mcps: bool = False,
                        external: bool = False,
                        external_home: str = "",
                        user_role: str | None = None,
                        shared_chat: bool = False,
-                       read_only: bool = False) -> str | None:
+                       read_only: bool = False,
+                       outside_picks=None,
+                       kind_rule=None,
+                       wrapup: bool = False,
+                       wrapup_home: str = "",
+                       tool_limits=None,
+                       session_id: str = "") -> str | None:
     """Build the full system prompt for an agent.
+
+    The text is built only from inputs that change rarely, so two builds
+    with the same inputs are the same bytes and a session that starts again
+    inside the engine's cache lifetime reads it from the cache. The data
+    that changes (memory topics, notes from conversations, Notebook
+    entries, the folder tree, the parallel sessions) rides on the start's
+    first turn instead (``core/session/start_context.py``), rendered by
+    ``start_sections`` from the arguments recorded here for ``session_id``.
+
+    ``tool_limits`` (``services/mcp/tool_limits``, the session's pairs of
+    server key and names): the section "Tools you may use in part", so the
+    agent knows what it may use of a limited tool and what to say.
+
+    ``outside_picks`` (an external session's, ``services/mcp/outside_picks``)
+    reaches the three readers of the one tool rule, so the catalog and the
+    skills agree with the config about what an outside person gets.
 
     ``user_role`` is the person's effective role on the agent when the
     caller knows it: the inline skills and the skill catalog drop a skill
@@ -527,6 +856,13 @@ def build_agent_prompt(model: str, *,
 
     ``read_only`` = a check's judge: its Notebook section says it
     cannot post, as the posting route refuses it.
+
+    ``kind_rule`` (``mcp_session_filter.KindRule``): a session kind's own
+    hard set, which the catalog and the skills read with the config.
+    ``wrapup`` is the wrap-up after a conversation: the person's memory
+    (``wrapup_home`` their tree, "" for none) is the one memory it writes,
+    and it reads neither the shared memory, the notes from conversations
+    nor the Notebook.
 
     Section order:
 
@@ -575,10 +911,6 @@ def build_agent_prompt(model: str, *,
             ``"direct-llm"`` / ``""``. Only ``"direct-llm"`` changes the
             output: it appends the ``# Skills`` catalog (the CLI engines index
             their materialized skills dir themselves).
-        skip_http_mcps: leave sidecar (HTTP-transport) MCPs out of the MCP
-            catalog, the inline skills and the skill catalog — a phone
-            Direct-LLM session never connects them, so the prompt must not
-            describe tools it cannot reach.
     """
     import config
     if not config.is_safe_agent_name(model):
@@ -648,8 +980,9 @@ def build_agent_prompt(model: str, *,
             model, context=client_type or "",
             shared_chat=shared_chat,
             placement=placement,
-            skip_http_mcps=skip_http_mcps,
             external=external,
+            outside_picks=outside_picks,
+            kind_rule=kind_rule,
             # The person's role: an MCP whose audience is above it is not
             # listed, as the session config leaves it out.
             user_role=user_role,
@@ -668,9 +1001,10 @@ def build_agent_prompt(model: str, *,
             model, context=client_type or "",
             shared_chat=shared_chat,
             placement=placement,
-            skip_http_mcps=skip_http_mcps,
             external=external,
             user_role=user_role,
+            outside_picks=outside_picks,
+            kind_rule=kind_rule,
         )
         # Only "always" skills inline; "on_demand" skills reach CLI sessions
         # as materialized skill folders (core/sandbox/skills_materializer)
@@ -698,9 +1032,10 @@ def build_agent_prompt(model: str, *,
                 model, context=client_type or "",
                 shared_chat=shared_chat,
                 placement=placement,
-                skip_http_mcps=skip_http_mcps,
                 external=external,
                 user_role=user_role,
+                outside_picks=outside_picks,
+                kind_rule=kind_rule,
             )
             if skill_catalog:
                 parts.append(
@@ -735,96 +1070,96 @@ def build_agent_prompt(model: str, *,
     elif username:
         user_ctx_dir = layout.context_dir(agent_dir, username)
     if user_ctx_dir is not None:
-        if user_ctx_dir.is_dir():
-            ctx_files = sorted(user_ctx_dir.glob("*.md"))
-            if ctx_files:
-                parts.append(
-                    "\n\n---\n\n"
-                    + ("# Caller Context\n\n"
-                       "These notes about the current caller are loaded for "
-                       "this caller only.\n"
-                       if external_home else
-                       "# User Context (Personal)\n\n"
-                       "These personal documents are loaded for the current user only.\n")
-                )
-                running_bytes = 0
-                skipped: list[tuple[str, int, str]] = []  # (name, size, reason)
-                for md_file in ctx_files:
-                    try:
-                        size = md_file.stat().st_size
-                    except OSError:
-                        continue
-                    if size > _USER_CTX_MAX_FILE_BYTES:
-                        skipped.append((md_file.name, size, "exceeds per-file cap"))
-                        continue
-                    if running_bytes + size > _USER_CTX_MAX_TOTAL_BYTES:
-                        skipped.append((md_file.name, size, "exceeds total cap"))
-                        continue
-                    with contextlib.suppress(Exception):
-                        parts.append(
-                            f"\n## `{md_file.name}`\n\n{md_file.read_text()}"
-                        )
-                        running_bytes += size
-                if skipped:
-                    skipped_md = "\n".join(
-                        f"- `{n}` ({sz:,} bytes): {reason}"
-                        for n, sz, reason in skipped
-                    )
+        ctx_docs, ctx_links = _person_context_docs(model, user_ctx_dir, _USER_CTX_MAX_FILE_BYTES)
+        if ctx_docs or ctx_links:
+            parts.append(
+                "\n\n---\n\n"
+                + ("# Caller Context\n\n"
+                   "These notes about the current caller are loaded for "
+                   "this caller only.\n"
+                   if external_home else
+                   "# User Context (Personal)\n\n"
+                   "These personal documents are loaded for the current user only.\n")
+            )
+            running_bytes = 0
+            skipped: list[tuple[str, int | None, str]] = []  # (name, size, reason)
+            for name, size, data in ctx_docs:
+                if size > _USER_CTX_MAX_FILE_BYTES or data is None:
+                    skipped.append((name, size, "exceeds per-file cap"))
+                    continue
+                if running_bytes + size > _USER_CTX_MAX_TOTAL_BYTES:
+                    skipped.append((name, size, "exceeds total cap"))
+                    continue
+                with contextlib.suppress(Exception):
                     parts.append(
-                        "\n## `_user_context_skipped.md`\n\n"
-                        "The following user-context files were skipped due to "
-                        "size limits.\n\n"
-                        + skipped_md
+                        f"\n## `{name}`\n\n{data.decode('utf-8')}"
                     )
+                    running_bytes += size
+            skipped.extend((name, None, "a link, not loaded") for name in ctx_links)
+            if skipped:
+                skipped_md = "\n".join(
+                    f"- `{n}`: {reason}" if sz is None else f"- `{n}` ({sz:,} bytes): {reason}"
+                    for n, sz, reason in skipped
+                )
+                parts.append(
+                    "\n## `_user_context_skipped.md`\n\n"
+                    "The following user-context files were skipped.\n\n"
+                    + skipped_md
+                )
 
     # Memory — agent-maintained topic files (knowledge/memory/ shared,
     # users/{u}/context/memory/ per-user) with the capture directive. The
     # generic context loaders above never see these dirs (user-context glob
     # is flat; knowledge/ isn't auto-loaded) — this is their ONLY injection
     # point. Best-effort: a memory failure never breaks prompt build.
+    # The agent's own line: anyone who dials hears what the prompt carries,
+    # so it carries none of the agent's records. The memory is shut to the
+    # line in its mounts, its path policy and the memory API too.
+    open_line = bool(getattr(kind_rule, "open_line", False))
     with contextlib.suppress(Exception):
-        memory_section = _render_memory_sections(
+        memory_section = None if open_line else _memory_sections(
             model, agent_dir, username=username, role=role,
-            external=external, external_home=external_home,
+            external=external, external_home=wrapup_home if wrapup else external_home,
+            wrapup=wrapup, content=False,
         )
         if memory_section:
-            parts.append(memory_section)
+            parts.append(memory_section[0])
+
+    # The notes from conversations (a wrap-up's one line for the team, when
+    # the agent's switch is on): data from outside, in members' and the
+    # agent's own sessions, never in a call of any line nor in a wrap-up.
+    from core.session.session_kind import PHONE as PHONE_KIND
+    if not (external or wrapup or client_type == PHONE_KIND.name):
+        with contextlib.suppress(Exception):
+            notes_section = _render_outside_notes(model)
+            if notes_section:
+                parts.append(notes_section)
 
     # The Notebook — the latest entries of the agents one delegation edge
     # away (and the agent's own), read server-side so every kind of session
     # gets them. Best-effort like memory.
     with contextlib.suppress(Exception):
         notebook_section = _render_notebook(
-            model, role=role, external=external, read_only=read_only,
-            client_type=client_type, placement=placement,
+            model, role=role, external=external or wrapup or open_line, read_only=read_only,
+            client_type=client_type, placement=placement, tool_limits=tool_limits,
         )
         if notebook_section:
             parts.append(notebook_section)
 
-    # Workspace and user directory listing
-    ws_listing = _scan_workspace(agent_dir, model, username=username, role=role,
-                                 sandboxed=sandboxed, mount_shared=mount_shared,
-                                 external_home=external_home)
-    if ws_listing:
+    # Workspace: where files go. The folder tree rides (``start_sections``).
+    outside_knowledge = tuple(getattr(outside_picks, "knowledge", ()) or ())
+    if _has_folders(external=external, external_home=external_home,
+                    outside_knowledge=outside_knowledge):
         parts.append(
             "\n\n---\n\n"
             "# Workspace\n\n"
-            "Available directories:\n\n"
-            f"```\n{ws_listing}\n```\n"
+            "The tree of the folders this session reaches comes with the context "
+            "at this start.\n"
         )
-        # Path guidance uses sandbox-relative paths
-        if external_home:
-            parts.append("\nFiles for this caller go to `/caller/workspace/`.")
-            if roles.can_write_workspace(role):
-                parts.append(" Shared output goes to `/workspace/`.")
-        elif external and not roles.can_write_workspace(role):
-            parts.append("\nThis session has no writable folder.")
-        elif username:
-            parts.append(f"\nUser files go to `{layout.virtual_workspace(username)}/`.")
-            if roles.can_write_workspace(role):
-                parts.append(" Agent-scoped output goes to `/workspace/`.")
-        else:
-            parts.append("\nAgent-scoped output goes to `/workspace/`.")
+        parts.append(_where_files_go(
+            username=username, role=role, external=external, wrapup=wrapup,
+            home=wrapup_home if wrapup else external_home,
+            files_write=bool(getattr(outside_picks, "files_write", False))))
 
     # Excluded MCPs section (tools unavailable in this session). On an
     # external session the entries that ARE the external rules are left
@@ -833,19 +1168,21 @@ def build_agent_prompt(model: str, *,
     listed_exclusions = dict(excluded_mcps or {})
     if external and listed_exclusions:
         with contextlib.suppress(Exception):
-            from services.mcp.mcp_registry import (
-                EXTERNAL_CONTEXT_REASON,
-                EXTERNAL_DENIED_REASON,
-            )
+            from services.mcp.mcp_session_filter import EXTERNAL_REASONS
             listed_exclusions = {
-                k: v for k, v in listed_exclusions.items()
-                if v not in (EXTERNAL_DENIED_REASON, EXTERNAL_CONTEXT_REASON)
+                k: v for k, v in listed_exclusions.items() if v not in EXTERNAL_REASONS
             }
     if listed_exclusions:
         parts.append(_UNAVAILABLE_HEAD)
         for mcp_name, reason in sorted(listed_exclusions.items()):
             parts.append(_unavailable_row(mcp_name, reason))
         parts.append(_UNAVAILABLE_TAIL)
+    if tool_limits:
+        with contextlib.suppress(Exception):
+            from services.mcp import tool_limits as _tool_limits
+            section = _tool_limits.prompt_section(tool_limits)
+            if section:
+                parts.append("\n\n---\n\n" + section)
 
     # The instruction files of the repositories in the person's own
     # workspace, for an engine that does not load a nested repository's
@@ -865,7 +1202,109 @@ def build_agent_prompt(model: str, *,
             if section:
                 parts.append("\n\n---\n\n" + section)
 
+    if session_id:
+        from core.session import start_context
+        start_context.record(session_id, StartArgs(
+            agent=model, username=username or "", role=role, sandboxed=sandboxed,
+            client_type=client_type, mount_shared=mount_shared, external=external,
+            external_home=external_home,
+            outside_knowledge=outside_knowledge,
+            wrapup=wrapup, wrapup_home=wrapup_home, open_line=open_line,
+            notes=not (external or wrapup or client_type == PHONE_KIND.name),
+            notebook=_notebook_applies(model, role=role, external=external or wrapup or open_line,
+                                       read_only=read_only, client_type=client_type,
+                                       placement=placement, tool_limits=tool_limits),
+            notebook_tools=_notebook_functions(model, placement, tool_limits)[0],
+        ))
     return "\n".join(parts)
+
+
+@dataclasses.dataclass(frozen=True)
+class StartArgs:
+    """The builder's own arguments a session's riding part is rendered from
+    (``build_agent_prompt`` records them for its session), never derived
+    from the session's security context: an agent-scope run mounts no
+    person's folders, whoever created it."""
+    agent: str
+    username: str = ""
+    role: str = "manager"
+    sandboxed: bool = True
+    client_type: str = ""
+    mount_shared: bool = True
+    external: bool = False
+    external_home: str = ""
+    outside_knowledge: tuple[str, ...] = ()
+    wrapup: bool = False
+    wrapup_home: str = ""
+    open_line: bool = False
+    notes: bool = True
+    notebook: bool = False
+    notebook_tools: bool = False
+
+    def to_dict(self) -> dict:
+        return {**dataclasses.asdict(self), "outside_knowledge": list(self.outside_knowledge)}
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "StartArgs | None":
+        """The arguments a persisted record holds; None for one that does
+        not name an agent (an index from another build)."""
+        if not isinstance(raw, dict) or not isinstance(raw.get("agent"), str):
+            return None
+        names = {f.name for f in dataclasses.fields(cls)}
+        kept = {k: v for k, v in raw.items() if k in names}
+        kept["outside_knowledge"] = tuple(str(x) for x in kept.get("outside_knowledge") or ())
+        try:
+            return cls(**kept)
+        except TypeError:
+            return None
+
+
+def start_sections(args: StartArgs) -> list[tuple[str, str, str]]:
+    """The riding sections of a session's start, as ``(key, title, body)``:
+    its memory, the notes from conversations, the Notebook's entries and its
+    folder tree, rendered by the helpers the text's sections use, for the
+    same kind of session (``build_agent_prompt`` says which apply). A
+    section that applies is always rendered, empty or not, so a newer one
+    replaces an older one whole. A section that fails to render is left
+    out; the others still ride."""
+    import config
+    from core.session.start_context import TITLES
+    if not config.is_safe_agent_name(args.agent):
+        return []
+    agent_dir = config.get_agent_dir(args.agent)
+    out: list[tuple[str, str, str]] = []
+    if not args.open_line:
+        with contextlib.suppress(Exception):
+            memory = _memory_sections(
+                args.agent, agent_dir, username=args.username or None, role=args.role,
+                external=args.external,
+                external_home=args.wrapup_home if args.wrapup else args.external_home,
+                wrapup=args.wrapup,
+            )
+            if memory:
+                out.append(("memory", TITLES["memory"], memory[1] or "_No memory topics._"))
+    if args.notes:
+        with contextlib.suppress(Exception):
+            if _notes_apply(args.agent):
+                out.append(("notes", TITLES["notes"], _start_notes(args.agent)))
+    if args.notebook:
+        with contextlib.suppress(Exception):
+            from services.notebook import notebook_prompt
+            entries = notebook_prompt.render_entries(args.agent, reads=args.notebook_tools)
+            if entries:
+                out.append(("notebook", TITLES["notebook"], entries))
+    if not _has_folders(external=args.external, external_home=args.external_home,
+                        outside_knowledge=args.outside_knowledge):
+        return out
+    with contextlib.suppress(Exception):
+        tree = _scan_workspace(
+            agent_dir, args.agent, username=args.username or None, role=args.role,
+            sandboxed=args.sandboxed, mount_shared=args.mount_shared,
+            external_home=args.external_home, external=args.external,
+            outside_knowledge=args.outside_knowledge)
+        out.append(("workspace", TITLES["workspace"],
+                    f"```\n{tree}\n```" if tree else "_No folder is visible to this session._"))
+    return out
 
 
 _UNAVAILABLE_HEADING = "# Unavailable Tools"
@@ -900,9 +1339,9 @@ def _always_skill_bodies(mcp_name: str) -> list[str]:
         for skill_def in manifest.skills:
             if skill_def.loading != "always":
                 continue
-            path = mcp_manifest_parse.resolve_skill_file(manifest.mcp_dir, skill_def.file)
-            if path is not None:
-                out.append(strip_frontmatter(path.read_text()))
+            text = mcp_manifest_parse.read_skill_file(manifest.mcp_dir, skill_def.file)
+            if text is not None:
+                out.append(strip_frontmatter(text))
         return out
     except (ImportError, OSError, ValueError):
         return []

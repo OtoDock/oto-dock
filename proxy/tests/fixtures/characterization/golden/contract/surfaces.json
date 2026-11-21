@@ -1,0 +1,440 @@
+{
+ "Engine": {
+  "can_resume_session": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str, *, agent_name: str = '', username: str = '', external_home: str = '') -> ResumeVerdict"
+  },
+  "canonical_tool_name": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str, native: str) -> str"
+  },
+  "capabilities": {
+   "abstract": true,
+   "kind": "property",
+   "signature": "(self) -> LayerCapabilities"
+  },
+  "chat_session_files": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, home: Path, session_id: str, resume_handle: str) -> list[Path]"
+  },
+  "credential_file_from_env": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, env: dict) -> dict | None"
+  },
+  "credential_file_payload": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, access_token: str, expires_at_ms: int, stored: dict) -> dict | None"
+  },
+  "engine_name": {
+   "abstract": false,
+   "kind": "property",
+   "signature": "(self) -> str"
+  },
+  "engine_reviews": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str, live_mode: str) -> bool"
+  },
+  "hook_can_ask": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self) -> bool"
+  },
+  "iter_session_files": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, home: Path) -> collections.abc.Iterator[tuple[Path, str]]"
+  },
+  "on_subscriptions_changed": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self) -> None"
+  },
+  "parse_usage": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, payload) -> Windows | None"
+  },
+  "parse_usage_report": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, payload) -> Windows | None"
+  },
+  "pinned_cli_version": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self) -> str"
+  },
+  "prepare_config_dir": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, agent_name: str, *, username: str = '', scope: str = 'user', external_home=None, no_shell: bool = False, read_only: bool = False, outside_picks=None, kind_rule=None) -> Path"
+  },
+  "prepare_spawn": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str, config: AgentConfig) -> SpawnPlan"
+  },
+  "record_usage_event": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str, payload) -> None"
+  },
+  "refresh_oauth": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, refresh_token: str, stored: dict) -> OAuthRefresh"
+  },
+  "remote_adapter": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self) -> 'RemoteEngineAdapter | None'"
+  },
+  "resumes_interactive": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, config: AgentConfig) -> bool"
+  },
+  "session_file_companions": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, path: Path) -> list[Path]"
+  },
+  "subscription_env": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, handle: SubscriptionHandle) -> dict[str, str]"
+  },
+  "supports_permissions": {
+   "abstract": false,
+   "kind": "property",
+   "signature": "(self) -> bool"
+  },
+  "supports_plan_mode": {
+   "abstract": false,
+   "kind": "property",
+   "signature": "(self) -> bool"
+  },
+  "supports_resume": {
+   "abstract": false,
+   "kind": "property",
+   "signature": "(self) -> bool"
+  },
+  "terminal_reports_mode": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self) -> bool"
+  },
+  "transcript_tailer": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self)"
+  },
+  "usage_request": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, stored: dict) -> tuple[str, dict] | None"
+  },
+  "usage_scope_key": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, model: str) -> str"
+  }
+ },
+ "ExecutionLayer": {
+  "_send_turn": {
+   "abstract": true,
+   "kind": "sync",
+   "signature": "(self, session_id: str, message: str, **kwargs) -> collections.abc.AsyncIterator[CommonEvent]"
+  },
+  "abort": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> bool"
+  },
+  "answer_engine_prompt": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str, request_id: str, approved: bool, tool_input: dict) -> None"
+  },
+  "capabilities_for": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str) -> LayerCapabilities"
+  },
+  "change_mode": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str, mode: str) -> None"
+  },
+  "change_model": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str, model: str) -> None"
+  },
+  "close_session": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> None"
+  },
+  "compact": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> dict | None"
+  },
+  "drain_bg_commands": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str, *, budget: float = 2.0) -> bool"
+  },
+  "engine_for": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str) -> str"
+  },
+  "forget_resume_probe": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str, *, agent_name: str = '', username: str = '') -> None"
+  },
+  "get_session": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str)"
+  },
+  "interrupt_for_queued": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> bool"
+  },
+  "is_session_alive": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> bool"
+  },
+  "is_session_grace_held": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str) -> bool"
+  },
+  "is_session_process_dead": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> bool"
+  },
+  "local_session_ids": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self) -> list[str]"
+  },
+  "owns_session": {
+   "abstract": true,
+   "kind": "sync",
+   "signature": "(self, session_id: str) -> bool"
+  },
+  "prepare_resume": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> None"
+  },
+  "probe_session_process_dead": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> bool"
+  },
+  "record_waiting_turns": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> None"
+  },
+  "reenter_review": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> bool"
+  },
+  "remote_stream_severed": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str) -> bool"
+  },
+  "respond_permission": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str, request_id: str, approved: bool) -> None"
+  },
+  "resume_machine_reach": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str, *, agent_name: str = '', username: str = '') -> MachineReach"
+  },
+  "resume_probe_future": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str, *, agent_name: str = '', username: str = '') -> 'asyncio.Future | None'"
+  },
+  "send_control_request": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str, subtype: str, **kwargs) -> dict"
+  },
+  "send_message": {
+   "abstract": false,
+   "kind": "async generator",
+   "signature": "(self, session_id: str, message: str, **kwargs) -> collections.abc.AsyncIterator[CommonEvent]"
+  },
+  "session_idle_seconds": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, session_id: str) -> float | None"
+  },
+  "session_lock": {
+   "abstract": true,
+   "kind": "async context manager",
+   "signature": "(self, session_id: str)"
+  },
+  "session_self_wakes": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str) -> bool"
+  },
+  "start_session": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, session_id: str, config: AgentConfig) -> None"
+  },
+  "steer": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str, text: str) -> bool"
+  },
+  "wait_for_bg_subagents": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str, *, timeout: float = 120.0) -> int"
+  },
+  "wait_session_reconnect": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, session_id: str, *, timeout: float = 10.0) -> bool"
+  }
+ },
+ "RemoteEngineAdapter": {
+  "adopt_state": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, info, cm) -> None"
+  },
+  "begin_turn": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, info, settle_after_result: int) -> None"
+  },
+  "can_resume": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, cm, *, machine_id: str, session_id: str, agent_name: str, username: str, resume_handle: str, external_home: str = '') -> ResumeVerdict"
+  },
+  "close_state": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, info) -> None"
+  },
+  "compact": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, info, cm) -> dict | None"
+  },
+  "control_request": {
+   "abstract": true,
+   "kind": "async",
+   "signature": "(self, info, cm, subtype: str, **kwargs) -> bool"
+  },
+  "drain_bg_commands": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, info, cm, *, budget: float) -> bool"
+  },
+  "forget_probe": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, cm, *, machine_id: str, session_id: str) -> None"
+  },
+  "init_session": {
+   "abstract": true,
+   "kind": "sync",
+   "signature": "(self, info, config: AgentConfig, cm) -> None"
+  },
+  "mcp_names": {
+   "abstract": true,
+   "kind": "sync",
+   "signature": "(self, payload: dict) -> set[str]"
+  },
+  "note_interrupt": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, info) -> None"
+  },
+  "owns_event_queue": {
+   "kind": "attribute",
+   "value": "False"
+  },
+  "private_env_keys": {
+   "kind": "attribute",
+   "value": "frozenset()"
+  },
+  "probe_future": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, cm, *, machine_id: str, session_id: str) -> 'asyncio.Future | None'"
+  },
+  "prompt_payload_keys": {
+   "kind": "attribute",
+   "value": "('system_prompt',)"
+  },
+  "reenter_review": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, info, cm) -> bool"
+  },
+  "soft_interrupt_frame": {
+   "abstract": true,
+   "kind": "sync",
+   "signature": "(self) -> str"
+  },
+  "start_payload": {
+   "abstract": true,
+   "kind": "sync",
+   "signature": "(self, base: dict, ctx: RemoteStartContext) -> RemoteStartPlan"
+  },
+  "steer": {
+   "abstract": false,
+   "kind": "async",
+   "signature": "(self, info, cm, text: str) -> bool"
+  },
+  "stream_turn": {
+   "abstract": true,
+   "kind": "sync",
+   "signature": "(self, info, cm) -> collections.abc.AsyncIterator[CommonEvent]"
+  },
+  "turn_settled": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, info) -> bool"
+  },
+  "with_unavailable_mcps": {
+   "abstract": false,
+   "kind": "sync",
+   "signature": "(self, payload: dict, reasons: dict[str, str]) -> dict"
+  },
+  "without_mcps": {
+   "abstract": true,
+   "kind": "sync",
+   "signature": "(self, payload: dict, excluded: set[str]) -> dict"
+  }
+ }
+}

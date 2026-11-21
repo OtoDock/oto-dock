@@ -1,0 +1,106 @@
+{
+ "Admission": {
+  "defaults": {
+   "ok": true,
+   "reason": null,
+   "user_message": null
+  },
+  "falsy": false,
+  "fields": [
+   "ok",
+   "reason",
+   "user_message"
+  ],
+  "truthy": true
+ },
+ "large box, three percent floor": {
+  "active": 0,
+  "available_mb": 1920,
+  "budget_mb": 40000,
+  "fit_heavy": 0,
+  "fit_light": 0,
+  "reserved_mb": 0,
+  "total_mb": 64000
+ },
+ "no reading gets no credit": {
+  "active": 0,
+  "available_mb": 0,
+  "budget_mb": 5000,
+  "fit_heavy": 0,
+  "fit_light": 0,
+  "reserved_mb": 0,
+  "total_mb": 8000
+ },
+ "other fractions": {
+  "active": 0,
+  "available_mb": 100000,
+  "budget_mb": 7200,
+  "fit_heavy": 7,
+  "fit_light": 36,
+  "reserved_mb": 0,
+  "total_mb": 8000
+ },
+ "small box": {
+  "active": 0,
+  "available_mb": 100000,
+  "budget_mb": 1250,
+  "fit_heavy": 1,
+  "fit_light": 6,
+  "reserved_mb": 0,
+  "total_mb": 2000
+ },
+ "swap credit off": {
+  "active": 0,
+  "available_mb": 1000,
+  "budget_mb": 5000,
+  "fit_heavy": 0,
+  "fit_light": 3,
+  "reserved_mb": 0,
+  "total_mb": 8000
+ },
+ "swap credit, capped": {
+  "active": 0,
+  "available_mb": 1512,
+  "budget_mb": 5000,
+  "fit_heavy": 1,
+  "fit_light": 5,
+  "reserved_mb": 0,
+  "total_mb": 8000
+ },
+ "swap credit, half the free swap": {
+  "active": 0,
+  "available_mb": 1200,
+  "budget_mb": 5000,
+  "fit_heavy": 0,
+  "fit_light": 4,
+  "reserved_mb": 0,
+  "total_mb": 8000
+ },
+ "the box": {
+  "active": 0,
+  "available_mb": 100000,
+  "budget_mb": 5000,
+  "fit_heavy": 5,
+  "fit_light": 25,
+  "reserved_mb": 0,
+  "total_mb": 8000
+ },
+ "unknown limit": {
+  "active": 0,
+  "available_mb": 100000,
+  "budget_mb": 0,
+  "fit_heavy": 0,
+  "fit_light": 0,
+  "reserved_mb": 0,
+  "total_mb": 1
+ },
+ "unreadable reads as zero": {
+  "active": 0,
+  "available_mb": 0,
+  "budget_mb": 7200,
+  "fit_heavy": 0,
+  "fit_light": 0,
+  "reserved_mb": 0,
+  "total_mb": 8000
+ }
+}

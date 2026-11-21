@@ -34,6 +34,9 @@ from auth.request_path import has_traversal
 _ALLOWLIST: list[tuple[re.Pattern, frozenset[str]]] = [
     (re.compile(r"^/v1/internal/fire-task$"), frozenset({"POST"})),
     (re.compile(r"^/v1/internal/fire-notification$"), frozenset({"POST"})),
+    (re.compile(r"^/v1/internal/work$"), frozenset({"GET"})),  # the admin command's status
+    (re.compile(r"^/v1/internal/drain$"), frozenset({"POST"})),  # the admin command's drain and resume
+    (re.compile(r"^/metrics$"), frozenset({"GET"})),  # a controller inside the install, from this machine
     (re.compile(r"^/v1/sessions/[^/]+$"), frozenset({"DELETE"})),  # close session
     (re.compile(r"^/v1/phone/usage/turn-classifier$"), frozenset({"POST"})),
     (re.compile(r"^/v1/phone/usage/relisten$"), frozenset({"POST"})),  # a call's second-listen seconds

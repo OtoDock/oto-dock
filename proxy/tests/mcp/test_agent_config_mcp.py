@@ -17,6 +17,8 @@ import asyncio
 import json
 import os
 
+import pytest
+
 from tests._paths import CUSTOM_MCPS, load_mcp_server
 
 _MCP_DIR = CUSTOM_MCPS / "agent-config-mcp"
@@ -47,6 +49,99 @@ def _load_server(env: dict[str, str]):
                 os.environ[k] = v
 
 
+class TestSessionReload:
+    """The two tools of the chat's own session post the reload route of the
+    session's own agent and tell the agent to end its turn."""
+
+    answer: dict = {}
+
+    def _mod(self, role="viewer"):
+        mod = _load_server({"OTO_AGENT_NAME": "pa", "OTO_ROLE": role, "OTO_SCOPE": "user"})
+        calls: list = []
+
+        async def _request(method, path, **kw):
+            calls.append((method, path, kw.get("json"), kw.get("attempts")))
+            return {"scheduled": True, **self.answer}
+
+        mod._request = _request
+        return mod, calls
+
+    def test_reload_posts_the_reason_once(self):
+        import asyncio
+        mod, calls = self._mod()
+        out = asyncio.run(mod._TOOL_HANDLERS["reload_session"]({"reason": "Notion was enabled"}))
+        assert calls == [("POST", "/v1/agents/pa/reload-session",
+                          {"reason": "Notion was enabled"}, 1)]
+        assert out.endswith("End your turn now.")
+
+    def test_switch_account_posts_the_choice_for_one_tool(self):
+        import asyncio
+        mod, calls = self._mod("manager")
+        out = asyncio.run(mod._TOOL_HANDLERS["switch_account"](
+            {"tool": "mail-x", "account": "home", "reason": "the person asked"}))
+        assert calls == [("POST", "/v1/agents/pa/reload-session",
+                          {"reason": "the person asked", "accounts": {"mail-x": "home"}}, 1)]
+        assert "home" in out and out.endswith("End your turn now.")
+
+    def test_the_switchs_answer_names_what_the_platform_recorded(self, monkeypatch):
+        """The route answers the label it recorded, or none for the agent's
+        default account: the word ``default`` may be an account's own label."""
+        import asyncio
+        mod, _calls = self._mod("manager")
+        switch = mod._TOOL_HANDLERS["switch_account"]
+        args = {"tool": "mail-x", "account": "default", "reason": "the person asked"}
+        monkeypatch.setattr(self, "answer", {"accounts": {"mail-x": ""}}, raising=False)
+        assert asyncio.run(switch(args)).startswith(
+            "This chat uses the agent's default account for mail-x from the reload on.")
+        monkeypatch.setattr(self, "answer", {"accounts": {"mail-x": "default"}}, raising=False)
+        assert asyncio.run(switch(args)).startswith(
+            "This chat uses default for mail-x from the reload on.")
+
+    def test_a_refusal_is_the_platforms_sentence_alone(self):
+        """The reload route refuses with a sentence written for the person:
+        the tool answers it without the request's method, path and status."""
+        import asyncio
+        mod, _calls = self._mod("manager")
+        sentence = ("This chat runs on Office-PC. A chat there uses the agent's "
+                    "default account for Mail.")
+
+        async def _refuse(method, path, **kw):
+            err = mod._ApiError(f"{method} {path} → 409: {sentence}")
+            err.status, err.detail = 409, sentence
+            raise err
+
+        mod._request = _refuse
+        [out] = asyncio.run(mod.call_tool(
+            "switch_account", {"tool": "mail-x", "account": "home", "reason": "asked"}))
+        assert out.text == f"Not done. {sentence} Tell the person this in these words."
+        [out] = asyncio.run(mod.call_tool("reload_session", {"reason": "a tool was enabled"}))
+        assert out.text.startswith("Not done. This chat runs on Office-PC.")
+
+        async def _down(method, path, **kw):
+            raise mod._ApiError(f"{method} {path}: connection refused")
+
+        mod._request = _down
+        [out] = asyncio.run(mod.call_tool("reload_session", {"reason": "a tool was enabled"}))
+        assert out.text.startswith("❌ Error: POST /v1/agents/pa/reload-session")
+
+    def test_the_skill_stays_off_a_call(self):
+        import json
+        manifest = json.loads((_MCP_DIR / "manifest.json").read_text())
+        [skill] = manifest["skills"]
+        assert skill["default_exclude_from"] == ["phone", "task"]
+        text = (_MCP_DIR / skill["file"]).read_text()
+        assert "Background commands" in text and "Ask no question" in text
+        assert "viewers see zero tools" not in manifest["description"]
+
+    def test_the_switch_asks_where_the_reload_does_not(self):
+        import json
+        manifest = json.loads((_MCP_DIR / "manifest.json").read_text())
+        tiers = {r["tool"]: r["tier"] for r in manifest["permissions"]["rules"]}
+        assert tiers["reload_session"] == "standard" and tiers["switch_account"] == "sensitive"
+        [skill] = manifest["skills"]
+        assert skill["loading"] == "always" and (_MCP_DIR / skill["file"]).is_file()
+
+
 class TestPermissionMatrix:
     def test_viewer_user_scope_has_only_complete_setup(self):
         # Viewers get exactly complete_setup: per-user onboarding
@@ -57,7 +152,7 @@ class TestPermissionMatrix:
             "OTO_ROLE": "viewer",
             "OTO_SCOPE": "user",
         })
-        assert mod.ENABLED_TOOLS == {"complete_setup"}
+        assert mod.ENABLED_TOOLS == {"complete_setup"} | mod._SESSION_TOOLS
 
     def test_manager_user_scope_has_all_tools(self):
         mod = _load_server({
@@ -89,7 +184,7 @@ class TestPermissionMatrix:
             "OTO_CAN_EDIT_AGENT": "false",
             "OTO_CAN_WRITE_WORKSPACE": "true",
         })
-        assert mod.ENABLED_TOOLS == {"complete_setup"}
+        assert mod.ENABLED_TOOLS == {"complete_setup"} | mod._SESSION_TOOLS
 
     def test_viewer_agent_scope_has_only_complete_setup(self):
         """A Shared-only agent mounts agent-scope for HUMAN chats too, so the
@@ -99,7 +194,7 @@ class TestPermissionMatrix:
             "OTO_ROLE": "viewer",
             "OTO_SCOPE": "agent",
         })
-        assert mod.ENABLED_TOOLS == {"complete_setup"}
+        assert mod.ENABLED_TOOLS == {"complete_setup"} | mod._SESSION_TOOLS
 
     def test_agent_scope_session_has_all_tools(self):
         """Agent-scope (task / phone / trigger / Shared-only agent) can
@@ -109,21 +204,23 @@ class TestPermissionMatrix:
             "OTO_ROLE": "",
             "OTO_SCOPE": "agent",
         })
-        # 22 tools = 5 read + 17 write
+        # 24 tools = 6 read + 18 write
         # Read: get_agent_config, list_available_models, list_context_files,
-        #       get_memory_settings, list_knowledge_libraries
+        #       get_memory_settings, list_knowledge_libraries, get_outside_people
         # Write: update_persona, update_display_name, update_description,
         #        update_color, update_default_model,
         #        update_execution_layers, update_default_layer, update_default_scope,
         #        update_default_execution_mode, set_visibility_mode,
         #        update_user_memory_enabled, update_agent_memory_enabled, complete_setup,
         #        share_knowledge_folder, attach_knowledge_library,
-        #        detach_knowledge_library, set_department (platform-role,
-        #        CRITICAL tier — proxy enforces admin/creator server-side)
+        #        detach_knowledge_library, set_department, set_outside_people
+        #        (platform-role, CRITICAL tier — proxy enforces the role server-side)
         # update_persona is ADVERTISED here but refuses at call time on any
         # session without a user — see TestUpdatePersona.
-        assert len(mod.ENABLED_TOOLS) == len(mod._READ_TOOLS | mod._WRITE_TOOLS)
-        assert len(mod.ENABLED_TOOLS) == 22
+        # and the two tools of the chat's own session (reload_session,
+        # switch_account), open to every role.
+        assert mod.ENABLED_TOOLS == mod._READ_TOOLS | mod._WRITE_TOOLS | mod._SESSION_TOOLS
+        assert len(mod.ENABLED_TOOLS) == 28
 
 
 class TestManifestSanity:
@@ -133,13 +230,23 @@ class TestManifestSanity:
         assert manifest["category"] == "core"
         assert manifest["server"]["runtime"] == "python"
         assert manifest["server"]["transport"] == "stdio"
-        # Only where a HUMAN is present and asking (chat, terminal, phone):
-        # excluded from scheduled tasks (an agent silently reconfiguring
-        # itself with nobody watching) and meetings (self-reconfiguration
-        # mid-discussion, possibly on another participant's suggestion —
-        # and meetings multiply tool-schema cost per turn).
-        # "external" (2026-09): never on a phone caller's session either.
-        assert manifest["exclude_from"] == ["task", "meeting", "external"]
+        # Excluded from meetings (self-reconfiguration mid-discussion,
+        # possibly on another participant's suggestion, and meetings
+        # multiply tool-schema cost per turn) and from a phone caller's
+        # session. A run loads it for the two session tools alone (the
+        # server's tool set and the hook's limit agree).
+        assert manifest["exclude_from"] == ["meeting", "external"]
+
+    @pytest.mark.parametrize("role, scope", [("", "agent"), ("manager", "user"), ("viewer", "agent")])
+    def test_a_run_is_handed_the_two_session_tools_alone(self, role, scope):
+        """A task's or a worker's session, whatever the role behind it:
+        reload_session and switch_account, nothing that configures the agent."""
+        mod = _load_server({
+            "OTO_AGENT_NAME": "pa", "OTO_ROLE": role, "OTO_SCOPE": scope, "OTO_TASK_TYPE": "scheduled",
+            "OTO_CAN_MANAGE_AGENT": "true" if role == "manager" else "false",
+            "OTO_CAN_EDIT_AGENT": "true" if role == "manager" else "false",
+        })
+        assert mod.ENABLED_TOOLS == {"reload_session", "switch_account"}
 
     def test_schema_handler_coherence(self):
         mod = _load_server({
@@ -573,3 +680,166 @@ class TestEngineCatalog:
         assert "## Acme Coder (`acme-cli`)" in out
         assert "Auto (no `default_model`) currently runs `acme-1` (Acme 1) on this engine." in out
         assert "Auto (no `default_model`) currently runs `z-1` (Z 1) on this engine." in out
+
+
+class TestExternalIdentities:
+    """The agent's own tools for the External identities card: a change sends
+    only what it names, and the read shows every choice of the card."""
+
+    PAGE = {
+        "tools": [
+            {"mcp": "crm", "label": "CRM", "access": "read_only", "functions": [], "changed": False,
+             "known_functions": [{"name": "find", "reads_only": True}, {"name": "update", "reads_only": False}]},
+            {"mcp": "mail", "label": "Mail", "access": "custom", "functions": ["list", "read"], "changed": True,
+             "known_functions": None},
+            {"mcp": "files", "label": "Files", "access": "", "functions": [], "changed": False,
+             "known_functions": None},
+        ],
+        "files": "read_write", "web": True, "knowledge": ["faq", "projects/alpha"],
+        "knowledge_choices": ["faq", "projects", "shared/brand"],
+        "wrapup_enabled": True, "shared_notes": False, "wrapup_model": "",
+        "apps": [{"id": "app-1", "slug": "booking", "title": "Booking", "methods": ["book"], "changed": False,
+                  "problem": ""}],
+        "app_choices": [{"id": "app-1", "slug": "booking", "title": "Booking", "methods": ["book"]},
+                        {"id": "app-2", "slug": "board", "title": "Board", "methods": []}],
+    }
+
+    def _mod(self):
+        mod = _load_server({"OTO_AGENT_NAME": "pa", "OTO_ROLE": "manager", "OTO_SCOPE": "user",
+                            "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true"})
+        calls: list = []
+
+        async def _request(method, path, **kw):
+            calls.append((method, path, kw.get("json")))
+            return dict(self.PAGE)
+
+        mod._request = _request
+        return mod, calls
+
+    def test_a_change_sends_only_what_it_names(self):
+        mod, calls = self._mod()
+        out = asyncio.run(mod._TOOL_HANDLERS["set_outside_people"](
+            {"wrapup": False, "tools": [{"mcp": "mail", "access": "custom", "functions": ["read", 3]}]}))
+        assert calls == [("PUT", "/v1/agents/pa/outside",
+                          {"wrapup_enabled": False,
+                           "tools": [{"mcp": "mail", "access": "custom", "functions": ["read", "3"]}]})]
+        assert out.startswith("✅")
+        calls.clear()
+        asyncio.run(mod._TOOL_HANDLERS["set_outside_people"](
+            {"remove_tools": ["crm"], "files": "read_only", "web": False, "add_folders": ["projects/beta"],
+             "remove_folders": ["faq"], "notes_for_team": True, "wrapup_model": "m-small"}))
+        assert calls[0][2] == {"remove_tools": ["crm"], "files": "read_only", "web": False,
+                               "add_knowledge": ["projects/beta"], "remove_knowledge": ["faq"],
+                               "shared_notes": True, "wrapup_model": "m-small"}
+
+    def test_a_change_that_names_nothing_sends_nothing(self):
+        mod, calls = self._mod()
+        out = asyncio.run(mod._TOOL_HANDLERS["set_outside_people"]({}))
+        assert calls == [] and out.startswith("❌")
+        out = asyncio.run(mod._TOOL_HANDLERS["set_outside_people"]({"tools": [{"access": "read_only"}]}))
+        assert calls == [] and out.startswith("❌")
+
+    def test_the_read_shows_every_choice_of_the_card(self):
+        mod, calls = self._mod()
+        out = asyncio.run(mod._TOOL_HANDLERS["get_outside_people"]({}))
+        assert calls == [("GET", "/v1/agents/pa/outside", None)]
+        assert "**crm** (CRM): read only: find" in out
+        assert "**mail** (Mail): custom: list, read" in out and "maker changed" in out
+        assert "**files** (Files): not added" in out
+        assert "**This person's files**: read and write" in out
+        assert "**Web search**: on" in out
+        assert "**Remember each conversation**: on" in out and "notes for the team off" in out
+        assert "**Knowledge folders**: faq, projects/alpha" in out
+        assert "faq, projects, shared/brand, and any folder inside them" in out
+        assert "`booking` (Booking): opens book" in out
+        assert "Apps on offer: `board` (opens nothing to them yet)" in out
+
+    def test_apps_are_named_by_their_short_name_and_sent_by_id(self):
+        mod, calls = self._mod()
+        out = asyncio.run(mod._TOOL_HANDLERS["set_outside_people"]({"add_apps": ["board"], "remove_apps": ["booking"]}))
+        assert out.startswith("✅")
+        assert calls[-1] == ("PUT", "/v1/agents/pa/outside", {"add_apps": ["app-2"], "remove_apps": ["app-1"]})
+        calls.clear()
+        out = asyncio.run(mod._TOOL_HANDLERS["set_outside_people"]({"add_apps": ["nope"]}))
+        assert out.startswith("❌") and "nope" in out and not any(c[0] == "PUT" for c in calls)
+
+    def test_the_schema_names_the_cards_words(self):
+        mod, _ = self._mod()
+        spec = mod._TOOL_SCHEMAS["set_outside_people"]["inputSchema"]
+        assert set(spec["properties"]) == {"tools", "remove_tools", "files", "web", "add_folders",
+                                           "remove_folders", "wrapup", "notes_for_team", "wrapup_model",
+                                           "add_apps", "remove_apps"}
+        assert "required" not in spec
+
+
+class TestToolLimitsTools:
+    """The two limits tools: the read as the card shows it, the write as the
+    route takes it, each column alone, a refusal read as written."""
+
+    def _mod(self, answer=None):
+        mod = _load_server({"OTO_AGENT_NAME": "pa", "OTO_ROLE": "manager", "OTO_SCOPE": "user",
+                            "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true"})
+        calls: list = []
+        page = answer or {"tools": [
+            {"mcp": "mail", "label": "Mail", "known_functions": [{"name": "read", "reads_only": True},
+                                                                   {"name": "send", "reads_only": False}],
+             "outside": None, "runs": {"access": "read_only", "functions": [], "changed": True},
+             "chats": {"access": "custom", "functions": ["read"], "changed": False}},
+            {"mcp": "crm", "label": "CRM", "known_functions": None, "outside": {"access": "read_write", "functions": [], "changed": False},
+             "runs": None, "chats": None},
+        ]}
+
+        async def _request(method, path, **kw):
+            calls.append((method, path, kw.get("json")))
+            return page
+        mod._request = _request
+        return mod, calls
+
+    def test_the_tools_are_listed_for_a_manager_and_the_setter_is_critical(self):
+        mod, _ = self._mod()
+        assert {"get_tool_limits", "set_tool_limits"} <= mod.ENABLED_TOOLS
+        import json
+        manifest = json.loads((_MCP_DIR / "manifest.json").read_text())
+        tiers = {r["tool"]: r["tier"] for r in manifest["permissions"]["rules"]}
+        assert tiers["set_tool_limits"] == "critical"
+        viewer = _load_server({"OTO_AGENT_NAME": "pa", "OTO_ROLE": "viewer", "OTO_SCOPE": "user"})
+        assert "set_tool_limits" not in viewer.ENABLED_TOOLS
+
+    def test_the_read_shows_each_column(self):
+        mod, calls = self._mod()
+        out = asyncio.run(mod._TOOL_HANDLERS["get_tool_limits"]({}))
+        assert calls == [("GET", "/v1/agents/pa/tool-limits", None)]
+        assert "- **mail** (Mail): functions read (reads), send" in out
+        assert "External identities: not added" in out
+        assert "The agent's own runs: only the tools that read (the maker changed" in out
+        assert "People's chats: only read" in out
+        assert "- **crm** (CRM): functions not listed yet" in out
+        assert "External identities: read and write" in out and "The agent's own runs: all tools" in out
+
+    def test_the_write_takes_each_column_alone_and_a_removal(self):
+        mod, calls = self._mod()
+        out = asyncio.run(mod._TOOL_HANDLERS["set_tool_limits"](
+            {"tools": [{"mcp": "mail", "runs": "read_only", "chats": ["read", "list"]}],
+             "remove": [{"mcp": "crm", "column": "chats"}]}))
+        assert calls == [("PUT", "/v1/agents/pa/tool-limits", {
+            "tools": [{"mcp": "mail", "runs": {"access": "read_only", "functions": []},
+                       "chats": {"access": "custom", "functions": ["read", "list"]}}],
+            "remove": [{"mcp": "crm", "governs": "chats"}]})]
+        assert out.startswith("✅ Saved.")
+        for bad in ({}, {"tools": [{"mcp": "mail"}]}, {"tools": [{"mcp": "mail", "runs": "all"}]},
+                    {"remove": [{"mcp": "mail", "column": "outside"}]}):
+            calls.clear()
+            assert asyncio.run(mod._TOOL_HANDLERS["set_tool_limits"](bad)).startswith("❌")
+            assert calls == []
+
+    def test_a_refusal_is_read_as_written(self):
+        mod, _ = self._mod()
+
+        async def refused(method, path, **kw):
+            err = mod._ApiError("refused")
+            err.status, err.detail = 403, "Only a manager, from Agent Settings, can widen what the agent may use."
+            raise err
+        mod._request = refused
+        out = asyncio.run(mod.call_tool("set_tool_limits", {"remove": [{"mcp": "mail", "column": "runs"}]}))
+        assert out[0].text == ("Not done. Only a manager, from Agent Settings, can widen what the agent may use. "
+                               "Tell the person this in these words.")

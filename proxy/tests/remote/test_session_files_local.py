@@ -191,8 +191,8 @@ class _Remote:
                 progress(f.size, f.size)
             return dest
 
-        async def remote_push(machine_id, scope, move_id, rel, src, digest, *, progress=None):
-            self.staged[rel] = _read(src)
+        async def remote_push(machine_id, scope, move_id, rel, digest, *, progress=None):
+            self.staged[rel] = _read(sf.staged_path(scope, move_id, rel))
             if progress is not None:
                 progress(len(self.staged[rel]), len(self.staged[rel]))
 
@@ -326,3 +326,31 @@ def test_the_proof_on_a_machine_asks_for_sizes_only(monkeypatch):
     monkeypatch.setattr(sf._cm(), "send_command", send_command)
     assert asyncio.run(sf.main_size("m-1", s, rel)) == 42
     assert asked == [sf.OP_STAT]
+
+
+def test_a_staged_file_is_pushed_from_its_own_descriptor_never_through_a_link(monkeypatch, tmp_path):
+    """The push of a moved session reads the staged copy beneath the agents
+    root with no link followed: a link put at its name since the staging is
+    refused before any byte leaves."""
+    s = _scope()
+    move_id = str(uuid.uuid4())
+    rel_ok = f".claude/projects/-users-alice/{s.session_id}.jsonl"
+    rel_linked = f".claude/projects/-users-alice/{s.session_id}/subagents/agent-a.jsonl"
+    for rel in (rel_ok, rel_linked):
+        sf.staged_path(s, move_id, rel).parent.mkdir(parents=True, exist_ok=True)
+    sf.staged_path(s, move_id, rel_ok).write_bytes(b"staged")
+    (tmp_path / "stand-in.txt").write_bytes(b"stand-in")
+    sf.staged_path(s, move_id, rel_linked).symlink_to(tmp_path / "stand-in.txt")
+    pushed: list = []
+
+    class _Cm:
+        async def push_file(self, machine_id, ref, source, **kw):
+            pushed.append((ref.value, str(source), Path(source).read_bytes()))  # noqa: ASYNC240  # a test's own temporary files
+            return True
+    monkeypatch.setattr(sf, "_cm", _Cm)
+    asyncio.run(sf.remote_push("m-1", s, move_id, rel_ok, "sha256:x"))
+    assert [(r, src.startswith(("/proc/self/fd/", "/dev/fd/")), data) for r, src, data in pushed] == [
+        (rel_ok, True, b"staged")]
+    with pytest.raises(sf.TransferError):
+        asyncio.run(sf.remote_push("m-1", s, move_id, rel_linked, "sha256:x"))
+    assert len(pushed) == 1

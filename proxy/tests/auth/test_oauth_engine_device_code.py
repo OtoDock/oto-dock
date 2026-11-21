@@ -47,7 +47,7 @@ async def test_start_device_code_returns_vendor_payload():
         "expires_in": 900,
         "interval": 5,
     }
-    with patch("auth.oauth_providers.generic.httpx.AsyncClient",
+    with patch("auth.oauth_providers.generic._client",
                return_value=_mock_post_response(200, payload)):
         result = await _provider().start_device_code(
             scopes=["https://graph.microsoft.com/Mail.Read"],
@@ -60,7 +60,7 @@ async def test_start_device_code_returns_vendor_payload():
 async def test_poll_device_code_pending_returns_none():
     """authorization_pending → None (caller waits + retries)."""
     payload = {"error": "authorization_pending"}
-    with patch("auth.oauth_providers.generic.httpx.AsyncClient",
+    with patch("auth.oauth_providers.generic._client",
                return_value=_mock_post_response(400, payload)):
         result = await _provider().poll_device_code(
             device_code="DC-123",
@@ -80,7 +80,7 @@ async def test_poll_device_code_success_returns_token_set():
         "token_type": "Bearer",
         "scope": "https://graph.microsoft.com/Mail.Read",
     }
-    with patch("auth.oauth_providers.generic.httpx.AsyncClient",
+    with patch("auth.oauth_providers.generic._client",
                return_value=_mock_post_response(200, payload)):
         ts = await _provider().poll_device_code(
             device_code="DC-123",
@@ -98,7 +98,7 @@ async def test_poll_device_code_terminal_failure_raises():
     """expired_token, access_denied, invalid_grant → RuntimeError (caller
     surfaces to user)."""
     payload = {"error": "expired_token", "error_description": "Code expired"}
-    with patch("auth.oauth_providers.generic.httpx.AsyncClient",
+    with patch("auth.oauth_providers.generic._client",
                return_value=_mock_post_response(400, payload)):
         with pytest.raises(RuntimeError, match="expired"):
             await _provider().poll_device_code(

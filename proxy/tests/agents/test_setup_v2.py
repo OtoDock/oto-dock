@@ -115,6 +115,92 @@ class TestSeedUserSetupFile:
         (agent_dir / "config" / "user-setup.md").write_text("x")
         assert cai.seed_user_setup_file(AGENT, "sub-without-username") == 0
 
+    def test_a_dangling_link_at_the_copy_creates_nothing_elsewhere(self, temp_db):
+        # The person's sessions write their context/: a link there is never
+        # written through, and a dangling one reads as a copy, not as absent.
+        from services.community import community_agent_installer as cai
+        agent_dir = _mk_agent()
+        _set_username("user-viewer", "viewer")
+        (agent_dir / "config" / "user-setup.md").write_text("welcome!")
+        away = agent_dir / "workspace" / "made-here.md"
+        dest = agent_dir / "users" / "viewer" / "context" / "user-setup.md"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.symlink_to(away)
+        assert cai.seed_user_setup_file(AGENT, "user-viewer") == 0
+        assert not away.exists()
+
+    def test_a_linked_context_is_never_written_through(self, temp_db):
+        from services.community import community_agent_installer as cai
+        agent_dir = _mk_agent()
+        _set_username("user-viewer", "viewer")
+        (agent_dir / "config" / "user-setup.md").write_text("welcome!")
+        elsewhere = agent_dir / "workspace" / "elsewhere"
+        elsewhere.mkdir(parents=True, exist_ok=True)
+        (agent_dir / "users" / "viewer").mkdir(parents=True, exist_ok=True)
+        (agent_dir / "users" / "viewer" / "context").symlink_to(elsewhere)
+        assert cai.seed_user_setup_file(AGENT, "user-viewer") == 0
+        assert list(elsewhere.iterdir()) == []
+
+    def test_a_linked_source_is_never_read(self, temp_db):
+        from services.community import community_agent_installer as cai
+        agent_dir = _mk_agent()
+        _set_username("user-viewer", "viewer")
+        secret = agent_dir / "workspace" / "not-a-setup.md"
+        secret.parent.mkdir(parents=True, exist_ok=True)
+        secret.write_text("not for the person")
+        (agent_dir / "config" / "user-setup.md").symlink_to(secret)
+        assert cai.seed_user_setup_file(AGENT, "user-viewer") == 0
+        assert not (agent_dir / "users" / "viewer" / "context" / "user-setup.md").exists()
+
+
+@pytest.fixture
+def linked_agent(temp_db, tmp_path):
+    """The agent's folder moved outside the stand-in agents folder, a link
+    at its name (an operator's layout, ``core/agent_folder.py``). The link
+    goes at the end: the next test's agents folder holds none."""
+    agent_dir = _mk_agent()
+    real = tmp_path / "disk2" / AGENT
+    real.parent.mkdir()
+    agent_dir.rename(real)
+    agent_dir.symlink_to(real)
+    yield agent_dir
+    agent_dir.unlink(missing_ok=True)
+
+
+class TestALinkedAgentsFolder:
+    def test_the_setup_file_is_seeded(self, linked_agent):
+        from services.community import community_agent_installer as cai
+        _set_username("user-viewer", "viewer")
+        (linked_agent / "config" / "user-setup.md").write_text("welcome!")
+        assert cai.seed_user_setup_file(AGENT, "user-viewer") == 1
+        copy = linked_agent.resolve() / "users" / "viewer" / "context" / "user-setup.md"
+        assert copy.read_text() == "welcome!"
+
+    def test_the_late_joiners_dashboard_is_seeded(self, linked_agent):
+        from types import SimpleNamespace
+
+        from services.community import community_agent_installer as cai
+        _set_username("user-viewer", "viewer")
+        src = linked_agent / "config" / "community" / "dashboards"
+        src.mkdir(parents=True)
+        (src / "board.html").write_text("<h1>Board</h1>")
+        template = SimpleNamespace(dashboards=[SimpleNamespace(
+            slug="board", title="Board", visibility="user", auto_pin_for_new_users=True)])
+        assert cai._seed_dashboards_for_user(AGENT, template, "user-viewer") == 1
+        page = linked_agent.resolve() / "users" / "viewer" / "workspace" / "apps" / "board.html"
+        assert page.read_text() == "<h1>Board</h1>"
+
+    def test_a_link_below_the_agents_folder_is_still_refused(self, linked_agent, tmp_path):
+        from services.community import community_agent_installer as cai
+        _set_username("user-viewer", "viewer")
+        (linked_agent / "config" / "user-setup.md").write_text("welcome!")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (linked_agent / "users" / "viewer").mkdir(parents=True, exist_ok=True)
+        (linked_agent / "users" / "viewer" / "context").symlink_to(elsewhere)
+        assert cai.seed_user_setup_file(AGENT, "user-viewer") == 0
+        assert list(elsewhere.iterdir()) == []
+
 
 # ---------------------------------------------------------------------------
 # on_user_added_to_agent ordering + opt-out
@@ -160,6 +246,35 @@ def _call(user_ctx, scope=None, summary=""):
         return asyncio.run(complete_agent_setup(
             AGENT, CompleteSetupBody(summary=summary, scope=scope), user_ctx,
         ))
+
+
+class TestCompleteSetupFollowsNoLink:
+    def test_a_context_folder_swapped_for_a_link_keeps_the_files_it_points_at(self, temp_db, tmp_path):
+        agent_dir = _mk_agent()
+        _set_username("user-viewer", "viewer")
+        stand_in = tmp_path / "stand-in"
+        stand_in.mkdir()
+        (stand_in / "user-setup.md").write_text("kept")
+        context = agent_dir / "users" / "viewer" / "context"
+        context.parent.mkdir(parents=True, exist_ok=True)
+        context.symlink_to(stand_in)
+        res = _call(_viewer(), scope="user")
+        assert res["user_setup_removed"] is False
+        assert (stand_in / "user-setup.md").read_text() == "kept"
+
+    def test_a_dangling_link_at_the_guides_name_is_removed(self, temp_db, tmp_path):
+        """A link at the guide's own name is removed with the guide's
+        bookkeeping (it is the guide as far as the person's folder goes);
+        what it points at is never touched."""
+        agent_dir = _mk_agent()
+        _set_username("user-viewer", "viewer")
+        context = agent_dir / "users" / "viewer" / "context"
+        context.mkdir(parents=True, exist_ok=True)
+        (context / "user-setup.md").symlink_to(tmp_path / "nowhere.md")
+        res = _call(_viewer(), scope="user")
+        assert res["user_setup_removed"] is True
+        assert not (context / "user-setup.md").is_symlink()
+        assert not (tmp_path / "nowhere.md").exists()
 
 
 class TestCompleteSetupScopes:

@@ -6,6 +6,7 @@ import type { MenuAction } from './FileContextMenu'
 import type { WorkspaceSection } from './sections'
 import { Icon } from './workspaceIcons'
 import type { useWorkspaceState } from '../../hooks/useWorkspaceState'
+import { copyOrSay } from '../../lib/copyText'
 
 type WSState = ReturnType<typeof useWorkspaceState>['state']
 type WSActions = Omit<ReturnType<typeof useWorkspaceState>, 'state'>
@@ -94,7 +95,7 @@ export function buildActions(
     icon: <Icon name="link" />,
     onClick: () => {
       const virtual = toSandboxVirtualPath(node.path)
-      navigator.clipboard?.writeText(virtual).catch(() => {})
+      void copyOrSay(virtual)
     },
   })
 

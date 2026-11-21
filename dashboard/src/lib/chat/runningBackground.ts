@@ -1,34 +1,49 @@
 /**
- * The background work of a chat that still runs after its turn (background
- * sub-agents and commands, by spawn id). A view rebuilt from rows reads
- * every stored spawn as finished: the history frame's `running` field says
- * which ones are not, and every rebuild marks them running again.
+ * The work of a chat that still runs after its turn: background sub-agents
+ * and commands, by spawn id, and delegations, by task id. A view rebuilt
+ * from rows reads every stored spawn as finished, and holds no delegate
+ * block for a delegation started before its page: the history frame's
+ * `running` field says what still runs, every rebuild marks the spawns
+ * running again, and the status bar shows what no loaded block carries.
  */
 import type { DisplayMessage, MessageBlock } from '../../components/chat/types'
-import { BG_COMMAND_BLOCK } from '../kinds/block'
+import { BG_COMMAND_BLOCK, DELEGATE_BLOCK } from '../kinds/block'
+import { RUN_STATUS } from '../status/run'
 import type { RunningBackgroundEntry, RunningBackgroundWire } from '../../api/wireEvents'
 
-/** The background work of the chat that still runs, by spawn id: what a view
- *  rebuilt from rows cannot know, since every stored spawn reads finished. */
+/** The lists of `RunningBackground`, one per kind of work. */
+export type RunningKind = 'agents' | 'commands' | 'delegates'
+const KINDS: readonly RunningKind[] = ['agents', 'commands', 'delegates']
+
+/** The work of the chat that still runs: what a view rebuilt from rows
+ *  cannot know, since every stored spawn reads finished and a delegation's
+ *  spawn may be older than the page. */
 export interface RunningBackground {
   agents: RunningBackgroundEntry[]
   commands: RunningBackgroundEntry[]
+  /** Delegations whose report comes to this chat, by task id. */
+  delegates: RunningBackgroundEntry[]
   /** The chat the list belongs to: another chat (a new one, the next one
    *  picked before its history arrives) reads nothing from it. */
   chatId?: string | null
 }
 
-export const NO_RUNNING_BACKGROUND: RunningBackground = { agents: [], commands: [] }
+export const NO_RUNNING_BACKGROUND: RunningBackground = { agents: [], commands: [], delegates: [] }
 
-/** A background spawn's block (a background sub-agent's or a command's) as its
- *  running list, spawn id and whether it shows running, else null. A
- *  sub-agent's block is the one that carries `_background`. */
-export function backgroundSpawnOf(b: MessageBlock): { list: 'agents' | 'commands'; id: string; active: boolean; description: string } | null {
+/** A block of work that outlives its turn (a background sub-agent's, a
+ *  command's, a delegation's) as its running list, id and whether it shows
+ *  running, else null. A sub-agent's block is the one that carries
+ *  `_background`; a delegate block without a task id (an old row, the live
+ *  state's by-name fallback) is no list's. */
+export function backgroundSpawnOf(b: MessageBlock): { list: RunningKind; id: string; active: boolean; description: string; agent?: string } | null {
   if ('_background' in b && b._background && b._toolId) {
     return { list: 'agents', id: b._toolId, active: !!b.isActive, description: b.description || '' }
   }
   if (b.type === BG_COMMAND_BLOCK && b._toolId) {
     return { list: 'commands', id: b._toolId, active: !!b.isActive, description: b.description || b.command || '' }
+  }
+  if (b.type === DELEGATE_BLOCK && b._taskId) {
+    return { list: 'delegates', id: b._taskId, active: b.status === RUN_STATUS.RUNNING, description: b.taskName || '', agent: b.agent || '' }
   }
   return null
 }
@@ -40,11 +55,12 @@ export function runningAgain(b: MessageBlock): MessageBlock {
   return '_background' in b || b.type === BG_COMMAND_BLOCK ? { ...b, isActive: true } : b
 }
 
-/** A history frame's `running` field (absent: nothing runs). */
+/** A history frame's `running` field (absent: nothing runs; a list a proxy
+ *  before delegations never sends reads empty). */
 export function runningBackgroundOf(wire: RunningBackgroundWire | null | undefined): RunningBackground {
-  const agents = Array.isArray(wire?.agents) ? wire.agents.filter((e) => e && e.id) : []
-  const commands = Array.isArray(wire?.commands) ? wire.commands.filter((e) => e && e.id) : []
-  return agents.length || commands.length ? { agents, commands } : NO_RUNNING_BACKGROUND
+  const read = (list: RunningBackgroundEntry[] | undefined) => (Array.isArray(list) ? list.filter((e) => e && e.id) : [])
+  const out = { agents: read(wire?.agents), commands: read(wire?.commands), delegates: read(wire?.delegates) }
+  return KINDS.some((k) => out[k].length) ? out : NO_RUNNING_BACKGROUND
 }
 
 /** The list when it belongs to `chatId`, else nothing. */
@@ -53,14 +69,15 @@ export function runningFor(running: RunningBackground, chatId: string | null | u
 }
 
 /** The rebuilt view with the listed background sub-agents and commands
- *  running again (their stored spawn blocks read finished). The list is
- *  returned as it was when nothing is listed or nothing matched. */
+ *  running again (their stored spawn blocks read finished). A delegate
+ *  block is left as its rows say: they carry its end. The list is returned
+ *  as it was when nothing is listed or nothing matched. */
 export function markRunningBackground(messages: DisplayMessage[], running: RunningBackground): DisplayMessage[] {
   if (!running.agents.length && !running.commands.length) return messages
   const ids = { agents: new Set(running.agents.map((e) => e.id)), commands: new Set(running.commands.map((e) => e.id)) }
   const listed = (b: MessageBlock): boolean => {
     const spawn = backgroundSpawnOf(b)
-    return !!spawn && !spawn.active && ids[spawn.list].has(spawn.id)
+    return !!spawn && spawn.list !== 'delegates' && !spawn.active && ids[spawn.list].has(spawn.id)
   }
   let changed = false
   const next = messages.map((msg) => {
@@ -74,18 +91,33 @@ export function markRunningBackground(messages: DisplayMessage[], running: Runni
 /** What a view shows running now, added to `running`: a rebuild from REST rows
  *  (they carry no `running` list: a refetch after new rows, a scroll up) keeps
  *  the badges the live frames lit, the status bar's too when the spawn's row
- *  is older than the page. A history frame's own list replaces it. */
-export function withRunningInView(running: RunningBackground, messages: DisplayMessage[]): RunningBackground {
-  const seen = { agents: new Set(running.agents.map((e) => e.id)), commands: new Set(running.commands.map((e) => e.id)) }
-  const out = { agents: [...running.agents], commands: [...running.commands] }
+ *  is older than the page. `ended` names the delegations whose result is
+ *  among the rows being rebuilt: their entries go, since the rows carry a
+ *  delegation's end. A history frame's own list replaces it. The list is
+ *  returned as it was when nothing changed. */
+export function withRunningInView(
+  running: RunningBackground, messages: DisplayMessage[], ended: ReadonlySet<string> = new Set(),
+): RunningBackground {
+  const seen = {
+    agents: new Set(running.agents.map((e) => e.id)),
+    commands: new Set(running.commands.map((e) => e.id)),
+    delegates: new Set(running.delegates.map((e) => e.id)),
+  }
+  const out = { agents: [...running.agents], commands: [...running.commands], delegates: [...running.delegates] }
+  let changed = false
   for (const msg of messages) {
     for (const b of msg.blocks) {
       const spawn = backgroundSpawnOf(b)
       if (spawn?.active && !seen[spawn.list].has(spawn.id)) {
         seen[spawn.list].add(spawn.id)
-        out[spawn.list].push({ id: spawn.id, description: spawn.description })
+        out[spawn.list].push({ id: spawn.id, description: spawn.description, ...(spawn.agent !== undefined ? { agent: spawn.agent } : {}) })
+        changed = true
       }
     }
   }
-  return out.agents.length === running.agents.length && out.commands.length === running.commands.length ? running : out
+  if (ended.size && out.delegates.some((e) => ended.has(e.id))) {
+    out.delegates = out.delegates.filter((e) => !ended.has(e.id))
+    changed = true
+  }
+  return changed ? { ...running, ...out } : running
 }

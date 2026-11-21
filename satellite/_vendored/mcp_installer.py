@@ -1,4 +1,4 @@
-"""Shared MCP installer — runs on platform AND is vendored into satellite.
+"""Shared MCP installer, vendored into the satellite: run where a tool is built and by ``mcp_venv_bootstrap``.
 
 Single source of truth for:
 - Parsing `server.source` fields — pinned (`npm:pkg@ver`, `pypi:pkg@ver`,
@@ -9,7 +9,8 @@ Single source of truth for:
   the caller can pin it into the local manifest.
 - Applying the patches a Node MCP ships (``patches/*.patch``) with git.
 - Checking and optionally installing system-level dependencies (libmagic,
-  libreoffice, etc.) declared in the manifest's `system_requirements`.
+  libreoffice, etc.) declared in the manifest's `system_requirements`
+  (``mcp_system_deps``, vendored beside it and re-exported here).
 - Computing a stable `version_hash` over install-relevant inputs so the
   satellite and proxy can agree on which version of an MCP is installed.
 
@@ -25,20 +26,28 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
 import os
-import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
+
+from .mcp_system_deps import (  # noqa: F401  # re-exported for the installer's importers
+    MissingDep,
+    SystemRequirementsInput,
+    check_system_requirements,
+    install_system_requirements,
+)
 
 logger = logging.getLogger("mcp-installer")
 
@@ -65,11 +74,11 @@ _PY_FLOOR_RE = re.compile(
     r"Python\s*(>=\s*\d+(?:\.\d+)*(?:\s*,\s*<=?\s*\d+(?:\.\d+)*)?)"
 )
 
-# A distro package name (dpkg, rpm, pacman and brew all fit).
-_SYSTEM_PKG_RE = re.compile(r"[a-z0-9][a-z0-9+.@_-]*")
-
 # A distribution name as it appears in a resolver's message.
 _DIST_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+#: ``mask_sign_ins(text)``: every address's sign-in masked (``scheme://user:password@host``, a token alone
+#: too, reads ``scheme://***@host``). What a build said, before it leaves the machine or is shown.
+mask_sign_ins = functools.partial(re.compile(r"(?<=://)[^/\s@]+(?=@)").sub, "***")
 
 
 def _pep503(name: str) -> str:
@@ -153,6 +162,61 @@ async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
     # must never take the child from it.
     if not windows and proc.returncode is not None:
         await _reap_group(proc.pid)
+        await _drain_group(proc.pid)
+
+
+#: How long a killed step's group may take to empty. In a build's sandbox the
+#: pid namespace's first process is a member, and it is reaped only once every
+#: process of the namespace is gone, so an empty group means the build is over.
+_GROUP_DRAIN_S = 10.0
+
+
+async def _drain_group(pgid: int) -> None:
+    """Wait, bounded, until no process of the group is left, zombies included
+    (a zombie still answers ``killpg``), reaping the ones that became this
+    process's own."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _GROUP_DRAIN_S
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        if loop.time() >= deadline:
+            logger.warning("process group %s still has members after %.0f s", pgid, _GROUP_DRAIN_S)
+            return
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(-pgid, os.WNOHANG)  # noqa: ASYNC222  # WNOHANG: the wait never blocks
+        await asyncio.sleep(0.05)
+
+
+#: What a step's output keeps: its first and its last bytes, and every line the
+#: installer's readers look for in what was cut (a Python floor).
+_OUT_HEAD = 64 * 1024
+_OUT_TAIL = 192 * 1024
+
+
+async def _read_bounded(stream: asyncio.StreamReader) -> str:
+    """The stream to its end, its head and tail kept and the cut named."""
+    head, tail, seen = bytearray(), bytearray(), 0
+    kept: list[str] = []
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        seen += len(chunk)
+        room = _OUT_HEAD - len(head)
+        head += chunk[:room]
+        tail += chunk[room:] if room > 0 else chunk
+        if len(tail) > _OUT_TAIL:
+            cut = bytes(tail[:-_OUT_TAIL])
+            kept.extend(m.group(0) for m in _PY_FLOOR_RE.finditer(cut.decode(errors="replace")))
+            del tail[:-_OUT_TAIL]
+    text = head.decode(errors="replace")
+    if seen > len(head) + len(tail):
+        text += (f"\n[... {seen - len(head) - len(tail)} bytes cut ...]\n"
+                 + "".join(f"{k}\n" for k in kept[:5]))
+    return text + tail.decode(errors="replace")
 
 
 async def _run_bounded(
@@ -171,8 +235,13 @@ async def _run_bounded(
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         **kwargs,
     )
+    async def _whole() -> str:
+        text = await _read_bounded(cast("asyncio.StreamReader", proc.stdout))
+        await proc.wait()
+        return text
+
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        out = await asyncio.wait_for(_whole(), timeout)
     except asyncio.TimeoutError:
         await _kill_tree(proc)
         raise asyncio.TimeoutError(
@@ -180,8 +249,27 @@ async def _run_bounded(
     except asyncio.CancelledError:
         await _kill_tree(proc)
         raise
-    # communicate() waits for the exit, so the code is set.
-    return cast("int", proc.returncode), (out or b"").decode(errors="replace")
+    # _whole waits for the exit, so the code is set.
+    return cast("int", proc.returncode), out
+
+
+#: A step's kind, named to the ``run`` that starts it: ``venv`` makes a venv and
+#: may fetch an interpreter (no package code runs), ``pip`` installs into a venv
+#: (a package's build may run), ``npm`` installs ``node_modules`` and writes the
+#: lock, ``patch`` applies a shipped patch, ``rebuild`` rebuilds Node addons.
+STEPS = frozenset({"venv", "pip", "npm", "patch", "rebuild"})
+
+#: ``run(cmd, cwd=, env=, timeout=, step=, mcp_dir=)``: starts one step and
+#: answers its exit code and output (``_run_bounded``'s contract). The platform
+#: and a compute machine pass one that runs the step in a sandbox.
+Runner = Callable[..., Awaitable[tuple[int, str]]]
+
+
+async def run_unconfined(cmd: list[str], *, cwd: str | None, env: dict[str, str], timeout: float,
+                         step: str, mcp_dir: Path) -> tuple[int, str]:
+    """The ``run`` of a step as this process's own child: a paired computer,
+    which has no sandbox, and the image build's stage."""
+    return await _run_bounded(cmd, cwd=cwd, env=env, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +323,7 @@ def _install_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 
 async def _apply_patches(
-    mcp_dir: Path, patches: list[Path], env: dict[str, str], timeout: int,
+    mcp_dir: Path, patches: list[Path], env: dict[str, str], timeout: int, *, run: Runner,
 ) -> tuple[bool, str]:
     """Apply ``patches`` (git-format diffs rooted at ``mcp_dir``) with the
     platform's own git; never an executable the package or a registry
@@ -251,8 +339,9 @@ async def _apply_patches(
     log: list[str] = []
 
     async def _git(*args: str) -> tuple[int, str]:
-        return await _run_bounded(
+        return await run(
             [git, "apply", *args], cwd=str(mcp_dir), env=git_env, timeout=timeout,
+            step="patch", mcp_dir=mcp_dir,
         )
 
     for patch in patches:
@@ -295,31 +384,6 @@ class ParsedSource:
 
 
 @dataclass
-class SystemRequirementsInput:
-    """Subset of an MCP's system_requirements declaration needed by the
-    installer. Decoupled from the dataclass in services.mcp.mcp_registry so the
-    installer can be used standalone (satellite doesn't import mcp_registry).
-    """
-    debian: list[str] = field(default_factory=list)
-    ubuntu: list[str] = field(default_factory=list)
-    rhel: list[str] = field(default_factory=list)
-    arch: list[str] = field(default_factory=list)
-    macos_brew: list[str] = field(default_factory=list)
-    node_min: str = ""
-    notes: str = ""
-
-
-@dataclass
-class MissingDep:
-    """A required system package or interpreter that isn't available."""
-    kind: str        # "package" | "interpreter"
-    name: str        # package name or "python" / "node"
-    required: str    # e.g. "libmagic1" or "3.10"
-    actual: str = ""  # interpreter version found (or "")
-    install_cmd: str = ""  # suggested install command
-
-
-@dataclass
 class InstallResult:
     """Outcome of an MCP install/update."""
     ok: bool
@@ -329,7 +393,7 @@ class InstallResult:
     # venv). Set for npm/pypi installs; empty for docker/git+/no-op or when the
     # readback couldn't determine it. The caller pins this into the LOCAL
     # manifest (version + source) so detection, display, and satellite reinstall
-    # stay deterministic. See pin_local_manifest in services/mcp/mcp_updater.py.
+    # stay deterministic. See mcp_pin.settle_built.
     resolved_version: str = ""
     missing_deps: list[MissingDep] = field(default_factory=list)
     # The ``--python`` spec of the venv this install created: the caller's
@@ -457,209 +521,6 @@ def parse_source(source: str) -> ParsedSource | None:
 
 
 # ---------------------------------------------------------------------------
-# System-level checks
-# ---------------------------------------------------------------------------
-
-
-def _detect_os_keys() -> list[str]:
-    """Return manifest-key(s) applicable to this host, most-specific first.
-
-    E.g. on Ubuntu 22.04 returns `["ubuntu", "debian"]` so `ubuntu:` entries
-    override `debian:` ones. On macOS returns `["macos_brew"]`.
-    """
-    system = platform.system().lower()
-    if system == "darwin":
-        return ["macos_brew"]
-    if system == "windows":
-        # Windows MCPs can declare `windows:` entries in
-        # `system_requirements`. We don't probe winget/choco from here
-        # (no reliable cross-version registry path), so install_system_
-        # requirements is a no-op on Windows — users install deps via
-        # winget/Chocolatey at install.ps1 time or out of band.
-        return ["windows"]
-    if system == "linux":
-        # Read /etc/os-release (modern distros)
-        try:
-            data = Path("/etc/os-release").read_text(errors="replace")
-        except OSError:
-            return ["debian"]
-        fields = {}
-        for line in data.splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                fields[k.strip()] = v.strip().strip('"')
-        like = (fields.get("ID_LIKE", "") + " " + fields.get("ID", "")).lower().split()
-        out: list[str] = []
-        if "ubuntu" in like:
-            out.append("ubuntu")
-        if "debian" in like:
-            out.append("debian")
-        if "rhel" in like or "fedora" in like or "centos" in like:
-            out.append("rhel")
-        if "arch" in like:
-            out.append("arch")
-        return out or ["debian"]
-    return []
-
-
-def _packages_for_host(req: SystemRequirementsInput) -> tuple[str, list[str]]:
-    """Return (os_family, package_list) applicable to this host."""
-    for key in _detect_os_keys():
-        pkgs = getattr(req, key, [])
-        if pkgs:
-            return key, list(pkgs)
-    return ("", [])
-
-
-def _is_package_installed(family: str, pkg: str) -> bool:
-    """Best-effort check via the host's package DB."""
-    if family == "windows":
-        # Windows has no standardized cross-tool package DB (winget/choco/
-        # MSI installers each have their own state). Assume installed
-        # and let the MCP runtime fail loudly if a dep is actually
-        # missing — baseline-tools.ps1 already covered the common cases.
-        return True
-    try:
-        if family in ("debian", "ubuntu"):
-            r = subprocess.run(
-                ["dpkg-query", "-W", "-f=${Status}", pkg],
-                capture_output=True, text=True, timeout=5,
-            )
-            return r.returncode == 0 and "install ok installed" in r.stdout
-        if family == "rhel":
-            r = subprocess.run(
-                ["rpm", "-q", pkg],
-                capture_output=True, text=True, timeout=5,
-            )
-            return r.returncode == 0
-        if family == "arch":
-            r = subprocess.run(
-                ["pacman", "-Q", pkg],
-                capture_output=True, text=True, timeout=5,
-            )
-            return r.returncode == 0
-        if family == "macos_brew":
-            r = subprocess.run(
-                ["brew", "list", "--formula", pkg],
-                capture_output=True, text=True, timeout=5,
-            )
-            return r.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return False
-
-
-def _install_suggest(family: str, pkg: str) -> str:
-    if family in ("debian", "ubuntu"):
-        return f"sudo apt install -y {pkg}"
-    if family == "rhel":
-        return f"sudo dnf install -y {pkg}"
-    if family == "arch":
-        return f"sudo pacman -S --noconfirm {pkg}"
-    if family == "macos_brew":
-        return f"brew install {pkg}"
-    if family == "windows":
-        return f"winget install -e --id {pkg}  (or 'choco install {pkg}')"
-    return ""
-
-
-def _version_tuple(s: str) -> tuple[int, ...]:
-    parts: list[int] = []
-    for p in s.split("."):
-        try:
-            parts.append(int(p))
-        except ValueError:
-            break
-    return tuple(parts)
-
-
-def _node_version() -> str:
-    try:
-        r = subprocess.run(
-            ["node", "--version"], capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0:
-            return r.stdout.strip().lstrip("v")
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return ""
-
-
-def check_system_requirements(req: SystemRequirementsInput) -> list[MissingDep]:
-    """Return the list of missing system deps + interpreter mismatches.
-
-    Empty list → all requirements satisfied.
-    """
-    missing: list[MissingDep] = []
-
-    # Interpreter floor. Only Node has one: a Python MCP's interpreter floor lives
-    # in its upstream `requires-python`, which uv reads + auto-fetches at install
-    # (mcp_installer recreates the venv on the right Python), so the platform never
-    # gates on a separate `python_min`.
-    if req.node_min:
-        actual = _node_version()
-        if not actual or _version_tuple(actual) < _version_tuple(req.node_min):
-            missing.append(MissingDep(
-                kind="interpreter", name="node",
-                required=req.node_min, actual=actual or "not installed",
-            ))
-
-    # System packages (most-specific OS first)
-    family, pkgs = _packages_for_host(req)
-    if family:
-        for pkg in pkgs:
-            if not _is_package_installed(family, pkg):
-                missing.append(MissingDep(
-                    kind="package", name=pkg, required=pkg,
-                    install_cmd=_install_suggest(family, pkg),
-                ))
-    return missing
-
-
-def install_system_requirements(
-    req: SystemRequirementsInput, *, dry_run: bool = False,
-) -> tuple[bool, str]:
-    """Run the host package manager to install missing system packages.
-
-    Only called when the caller has explicitly opted in (e.g.
-    MCP_AUTO_INSTALL_SYSTEM_DEPS=true on the proxy). Requires sudo;
-    returns (False, error_msg) if sudo is unavailable or install fails.
-    """
-    family, pkgs = _packages_for_host(req)
-    if not family or not pkgs:
-        return True, ""
-    # Manifest content reaches a privileged package manager here: a name is a
-    # name, never an option or a list.
-    bad = [p for p in pkgs if not isinstance(p, str) or not _SYSTEM_PKG_RE.fullmatch(p)]
-    if bad:
-        return False, f"Invalid system package name(s): {bad}"
-    missing = [p for p in pkgs if not _is_package_installed(family, p)]
-    if not missing:
-        return True, "All system requirements satisfied."
-
-    if dry_run:
-        return True, f"Would install {family}: {', '.join(missing)}"
-
-    cmd: list[str]
-    if family in ("debian", "ubuntu"):
-        cmd = ["sudo", "apt", "install", "-y", "--", *missing]
-    elif family == "rhel":
-        cmd = ["sudo", "dnf", "install", "-y", "--", *missing]
-    elif family == "arch":
-        cmd = ["sudo", "pacman", "-S", "--noconfirm", "--", *missing]
-    elif family == "macos_brew":
-        cmd = ["brew", "install", *missing]
-    else:
-        return False, f"Unknown package manager for family={family}"
-
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        return r.returncode == 0, (r.stdout + r.stderr)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        return False, f"{type(e).__name__}: {e}"
-
-
-# ---------------------------------------------------------------------------
 # Installing an npm or PyPI package
 # ---------------------------------------------------------------------------
 
@@ -708,9 +569,94 @@ def _node_installed_version(mcp_dir: Path, pkg_name: str) -> str:
     """
     try:
         pj = mcp_dir / "node_modules" / pkg_name / "package.json"
-        return str(json.loads(pj.read_text()).get("version", "")) if pj.is_file() else ""
-    except (OSError, ValueError):
+        raw = read_built(pj, _PACKAGE_JSON_LIMIT) if _stays_in(pj, mcp_dir) else None
+        return plain_version(json.loads(raw).get("version", "")) if raw is not None else ""
+    except (ValueError, AttributeError, RecursionError):
         return ""
+
+
+#: A top package's ``package.json`` is read to here (the largest seen is a
+#: few KB; a long description must not fail an install).
+_PACKAGE_JSON_LIMIT = 1 << 20
+
+
+#: The most of a file a build wrote that the platform reads: a venv's
+#: config, a package's metadata, an entry point's text.
+BUILT_READ_LIMIT = 1 << 16
+
+_PLAIN_VERSION_RE = re.compile(r"[0-9][0-9A-Za-z.+!_-]{0,63}")
+
+
+def read_built(path: Path, limit: int = BUILT_READ_LIMIT) -> bytes | None:
+    """At most ``limit`` bytes of a regular file a build may have written, or
+    None for anything else (a link, a pipe, a device, a folder, nothing). It
+    never follows a link at the file itself, never waits on a pipe and never
+    reads past ``limit``: every reader of a file in a build's outputs goes
+    through it, so nothing a build leaves holds the platform."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow and os.path.islink(path):  # a host with no O_NOFOLLOW
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks: list[bytes] = []
+        left = limit
+        while left > 0:
+            chunk = os.read(fd, min(left, 1 << 16))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def plain_version(value: object) -> str:
+    """``value`` when it reads as a package version (digits first, then
+    letters, digits and ``.+!_-``, 64 characters at most), else "": a version
+    a build wrote is pinned into the manifest only when it is one."""
+    text = str(value or "").strip()
+    return text if _PLAIN_VERSION_RE.fullmatch(text) else ""
+
+
+def _metadata_version(raw: bytes) -> str:
+    """The ``Version`` header of a distribution's METADATA."""
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            break
+        key, _, val = line.partition(":")
+        if key.strip().lower() == "version":
+            return val.strip()
+    return ""
+
+
+def venv_python_minor(venv_dir: Path) -> tuple[int, int] | None:
+    """``(major, minor)`` of the interpreter a venv's ``pyvenv.cfg`` records,
+    or None when the file is missing, garbled or not a regular file."""
+    raw = read_built(Path(venv_dir) / "pyvenv.cfg")
+    for line in (raw or b"").decode("utf-8", errors="replace").splitlines():
+        key, _, val = line.partition("=")
+        if key.strip().lower() in ("version", "version_info"):
+            parts = val.strip().split(".")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                return int(parts[0]), int(parts[1])
+    return None
+
+
+def _stays_in(path: Path, folder: Path) -> bool:
+    """Whether ``path``, its links followed, lies in ``folder``: what a build
+    wrote is read only when no link of it leads out of the tool's folder."""
+    try:
+        return Path(path).resolve().is_relative_to(Path(folder).resolve())
+    except (OSError, RuntimeError):
+        return False
 
 
 def _python_installed_version(venv_dir: Path, dist: str) -> str:
@@ -720,19 +666,26 @@ def _python_installed_version(venv_dir: Path, dist: str) -> str:
     own interpreter is never started by the installer (its site hooks would
     be third-party code running outside any sandbox). Both venv layouts are
     searched (``lib/pythonX.Y/site-packages``, Windows ``Lib/site-packages``);
-    ``importlib.metadata`` normalizes dash, underscore and case. Returns
-    ``""`` on any miss (never raises); the caller logs + skips pinning.
+    ``importlib.metadata`` normalizes dash, underscore and case and finds
+    the folders; each METADATA is read through ``read_built``. Returns ``""``
+    on any miss or a version that is not plain (never raises); the caller
+    logs + skips pinning.
     """
     import importlib.metadata as metadata
     paths = [
         str(p) for pattern in ("lib/python*/site-packages", "Lib/site-packages")
-        for p in venv_dir.glob(pattern) if p.is_dir()
+        for p in venv_dir.glob(pattern) if p.is_dir() and _stays_in(p, venv_dir)
     ]
     if not paths:
         return ""
     try:
         for found in metadata.Distribution.discover(name=dist, path=paths):
-            return str(found.version or "")
+            meta = getattr(found, "_path", None)
+            if meta is None or not _stays_in(Path(str(meta)), venv_dir):
+                return ""
+            raw = read_built(Path(str(meta)) / "METADATA")
+            if raw is not None:
+                return plain_version(_metadata_version(raw))
     except (OSError, ValueError):
         return ""
     return ""
@@ -751,8 +704,12 @@ _managed_failed_at: float | None = None
 
 def _pyvenv_home(venv_dir: Path) -> str:
     """The ``home`` a venv's ``pyvenv.cfg`` names ("" when it names none).
-    Raises ``OSError`` when the file cannot be read."""
-    for line in (venv_dir / "pyvenv.cfg").read_text(errors="replace").splitlines():
+    Raises ``OSError`` when the file is missing or not a regular file."""
+    cfg = venv_dir / "pyvenv.cfg"
+    raw = read_built(cfg)
+    if raw is None:
+        raise OSError(f"{cfg} is not a regular file")
+    for line in raw.decode("utf-8", errors="replace").splitlines():
         key, _, val = line.partition("=")
         if key.strip().lower() == "home":
             return val.strip()
@@ -767,10 +724,12 @@ def venv_interpreter_paths(venv_dir: Path) -> list[Path]:
     venv_dir = Path(venv_dir)
     out: list[Path] = []
     python = venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"
-    with contextlib.suppress(OSError, RuntimeError):
+    # A build wrote the config: a ``home`` it names may be anything, a NUL
+    # included (``ValueError``), and reads as no path.
+    with contextlib.suppress(OSError, RuntimeError, ValueError):
         if os.path.lexists(python):
             out.append(python.resolve())
-    with contextlib.suppress(OSError, RuntimeError):
+    with contextlib.suppress(OSError, RuntimeError, ValueError):
         home = _pyvenv_home(venv_dir)
         if home:
             out.append(Path(home).resolve())
@@ -779,10 +738,11 @@ def venv_interpreter_paths(venv_dir: Path) -> list[Path]:
 
 def venv_outside(venv_dir: Path, roots: list[Path]) -> bool:
     """Whether an interpreter path of the venv lies under none of ``roots``
-    (resolved paths both sides). A venv with no readable interpreter path is
-    not judged (``False``)."""
+    (resolved paths both sides), or does not exist (a recreate lost it). A
+    venv with no readable interpreter path is not judged (``False``)."""
     paths = venv_interpreter_paths(venv_dir)
-    return any(not any(p == r or p.is_relative_to(r) for r in roots) for p in paths)
+    return any(not p.exists() or not any(p == r or p.is_relative_to(r) for r in roots)
+               for p in paths)
 
 
 async def _create_venv(
@@ -796,6 +756,7 @@ async def _create_venv(
     env: dict[str, str],
     cwd: str,
     timeout: int,
+    run: Runner,
 ) -> tuple[bool, str, str]:
     """Create ``venv_dir``; returns ``(ok, log, spec)`` with ``spec`` the
     ``--python`` the venv was made with ("" for uv's default).
@@ -812,8 +773,9 @@ async def _create_venv(
     if uv is None:
         if floor:
             return False, f"python {floor} required but uv not available", ""
-        rc, out = await _run_bounded(
+        rc, out = await run(
             [python_bin, "-m", "venv", str(venv_dir)], cwd=cwd, env=env, timeout=timeout,
+            step="venv", mcp_dir=venv_dir.parent,
         )
         return rc == 0, out, ""
 
@@ -824,9 +786,13 @@ async def _create_venv(
         if managed:
             cmd.append("--managed-python")
         cmd.append(str(venv_dir))
-        return await _run_bounded(cmd, cwd=cwd, env=env, timeout=bound)
+        return await run(cmd, cwd=cwd, env=env, timeout=bound, step="venv", mcp_dir=venv_dir.parent)
 
     spec = floor or pin or ""
+    try:
+        await asyncio.to_thread(seed_interpreter, venv_dir.parent, spec)
+    except OSError as exc:
+        logger.warning("venv %s: the bundled interpreter was not copied (%s); uv fetches one", venv_dir, exc)
     rc, log = await _uv_venv(spec, False, timeout)
     if rc != 0 and spec and not floor:
         await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
@@ -857,17 +823,127 @@ async def _create_venv(
     return True, log, spec
 
 
+def remove_tree(path: Path) -> None:
+    """Remove ``path`` even when a build left folders with no permission
+    bits in it: each folder gets its owner's bits back and the removal runs
+    again. Follows no link. Raises the last ``OSError``; a missing path is
+    not one."""
+    try:
+        shutil.rmtree(path)
+        return
+    except FileNotFoundError:
+        return
+    except OSError:
+        pass
+    stack = [str(path)]
+    while stack:
+        folder = stack.pop()
+        try:
+            if os.path.islink(folder) or not os.path.isdir(folder):
+                continue
+            os.chmod(folder, stat.S_IRWXU)
+            stack.extend(e.path for e in os.scandir(folder) if e.is_dir(follow_symlinks=False))
+        except OSError:
+            continue
+    shutil.rmtree(path)
+
+
+def sweep_folders(root: Path) -> int:
+    """Remove every folder in ``root`` (what a stopped build left: its
+    scratch), links left alone. Answers how many went; one that will not go
+    is logged and left for the next sweep."""
+    if not Path(root).is_dir():
+        return 0
+    gone = 0
+    for path in Path(root).iterdir():
+        if not path.is_dir() or path.is_symlink():
+            continue
+        try:
+            remove_tree(path)
+            gone += 1
+        except OSError as exc:
+            logger.warning("could not remove %s: %s", path, exc)
+    return gone
+
+
+#: The category folder of the community MCPs under the MCPs root.
+COMMUNITY = "community"
+
+
+def is_community(mcp_dir: Path) -> bool:
+    """True for an MCP of the community category."""
+    return Path(mcp_dir).parent.name == COMMUNITY
+
+
+def uv_python_dir_for(mcp_dir: Path) -> Path:
+    """Where uv puts an interpreter it fetches for this MCP: a community MCP's
+    in its category's own folder, which travels with the community MCPs (a
+    volume of their own in a container), every other MCP's beside the
+    categories. ``interpreter_dirs`` names both; nothing else spells them."""
+    mcp_dir = Path(mcp_dir)
+    if is_community(mcp_dir):
+        return mcp_dir.parent / ".uv-python"
+    return mcp_dir.parent.parent / ".uv-python"
+
+
+def _managed_of(folder: Path, minor: str) -> list[Path]:
+    """The uv-managed CPython folders of ``minor`` in ``folder``, newest
+    last; links (uv's minor-version name) left out."""
+    if not folder.is_dir():
+        return []
+    found = [p for p in folder.glob(f"cpython-{minor}.*") if p.is_dir() and not p.is_symlink()]
+
+    def _patch(p: Path) -> int:
+        part = p.name.split("-")[1].split(".")
+        return int(part[2]) if len(part) > 2 and part[2].isdigit() else -1
+    return sorted(found, key=_patch)
+
+
+def seed_interpreter(mcp_dir: Path, minor: str) -> bool:
+    """Copy (never link) the newest managed interpreter of ``minor`` (``3.13``)
+    the bundled tools hold into a community tool's interpreter folder when
+    that holds none, so the tool's venv step downloads nothing: a bare-metal
+    install's community tools use the interpreter they always did, and an
+    install whose only index is private still gets the pinned Python. The
+    community folder travels on its own (a volume of its own), hence a copy.
+    Answers whether one was copied. Blocking (a copy of about 100 MB)."""
+    mcp_dir = Path(mcp_dir)
+    if not is_community(mcp_dir) or not re.fullmatch(r"\d+\.\d+", minor or ""):
+        return False
+    own = uv_python_dir_for(mcp_dir)
+    if _managed_of(own, minor):
+        return False
+    found = _managed_of(mcp_dir.parent.parent / ".uv-python", minor)
+    if not found:
+        return False
+    src = found[-1]
+    own.mkdir(exist_ok=True)
+    staged = own / f".seed-{src.name}"
+    shutil.rmtree(staged, ignore_errors=True)
+    shutil.copytree(src, staged, symlinks=True)
+    os.replace(staged, own / src.name)
+    logger.info("seeded %s with %s from the bundled tools' interpreters", own, src.name)
+    return True
+
+
+def interpreter_dirs(mcps_root: Path) -> list[Path]:
+    """Every folder uv-managed interpreters live in under ``mcps_root``."""
+    root = Path(mcps_root)
+    return [root / ".uv-python", root / COMMUNITY / ".uv-python"]
+
+
 def _pyvenv_cfgs(mcps_root: Path, max_depth: int = 4) -> list[Path]:
     """Every ``pyvenv.cfg`` under ``mcps_root`` (install backups and swap
     folders included), not descending into a venv, ``node_modules`` or
-    ``.uv-python``. A walk error raises."""
+    ``.uv-python``. Only a regular file is a venv's config: a pipe or a link
+    a build left under that name is none. A walk error raises."""
     def _raise(exc: OSError) -> None:
         raise exc
 
     found: list[Path] = []
     base = len(Path(mcps_root).parts)
     for root, dirs, files in os.walk(mcps_root, onerror=_raise):
-        if "pyvenv.cfg" in files:
+        if "pyvenv.cfg" in files and stat.S_ISREG(os.lstat(Path(root) / "pyvenv.cfg").st_mode):
             found.append(Path(root) / "pyvenv.cfg")
             dirs[:] = []
             continue
@@ -880,7 +956,7 @@ def _pyvenv_cfgs(mcps_root: Path, max_depth: int = 4) -> list[Path]:
 
 
 def prune_uv_pythons(mcps_root: Path) -> list[str]:
-    """Remove the interpreters under ``<mcps_root>/.uv-python`` that no MCP
+    """Remove the interpreters in each folder of ``interpreter_dirs`` that no MCP
     venv uses (about 50 MB each, left by an uninstall or a platform that
     moved to a newer Python). Returns the names removed.
 
@@ -893,13 +969,18 @@ def prune_uv_pythons(mcps_root: Path) -> list[str]:
     prune does not follow, so it removes nothing there."""
     if sys.platform == "win32":
         return []
-    uv_dir = Path(mcps_root) / ".uv-python"
-    if not uv_dir.is_dir():
-        return []
+    removed: list[str] = []
+    for uv_dir in interpreter_dirs(mcps_root):
+        if uv_dir.is_dir():
+            removed += _prune_one(Path(mcps_root), uv_dir)
+    return removed
+
+
+def _prune_one(mcps_root: Path, uv_dir: Path) -> list[str]:
     try:
         uv_real = uv_dir.resolve()
         used: set[str] = set()
-        for cfg in _pyvenv_cfgs(Path(mcps_root)):
+        for cfg in _pyvenv_cfgs(mcps_root):
             _pyvenv_home(cfg.parent)
             for path in venv_interpreter_paths(cfg.parent):
                 if path.is_relative_to(uv_real) and path != uv_real:
@@ -936,6 +1017,7 @@ async def install_mcp(
     source_build: list[str] | None = None,
     python_spec: str | None = None,
     sandbox_roots: list[Path] | None = None,
+    run: Runner,
 ) -> InstallResult:
     """Install or update an MCP's Node/Python dependencies in-place.
 
@@ -969,13 +1051,19 @@ async def install_mcp(
     ``sandbox_roots``, a created venv whose interpreter lies outside them is
     made again on a uv-managed interpreter (see ``_create_venv``). A caller
     passing neither gets uv's default interpreter, as before.
+
+    ``run`` starts each step (``STEPS``) and has no default, so a caller
+    that forgets it cannot build at all: the platform and a compute machine
+    pass one that runs the step in a sandbox (``tool_build``, the satellite's
+    ``mcp_install_support.build_runner``), a paired computer and the image
+    build ``run_unconfined``.
     """
     mcp_dir = Path(mcp_dir)
     name = mcp_dir.name
 
-    # Pythons that uv fetches land here — under mcps/, which the session
-    # sandbox already RO-binds. Derived from mcp_dir (mcps/{custom,community}/<slug>/).
-    uv_python_dir = mcp_dir.parent.parent / ".uv-python"
+    # Pythons that uv fetches land in a folder the session sandbox binds
+    # read-only (``uv_python_dir_for``).
+    uv_python_dir = uv_python_dir_for(mcp_dir)
     # UV_LINK_MODE=copy forces uv to copy files into the venv instead of
     # hardlinking/symlinking the python.exe. On Windows, creating those
     # links requires either Developer Mode enabled OR admin rights —
@@ -1017,9 +1105,9 @@ async def install_mcp(
         # classic npm supply-chain RCE. We refuse to run them. (An MCP that
         # genuinely needs a native build step should ship prebuilt artifacts or
         # run as a Docker MCP, which is isolated.)
-        rc, log = await _run_bounded(
+        rc, log = await run(
             _shell_argv(["npm", "install", "--omit=dev", "--ignore-scripts"]),
-            cwd=str(mcp_dir), env=env, timeout=timeout,
+            cwd=str(mcp_dir), env=env, timeout=timeout, step="npm", mcp_dir=mcp_dir,
         )
         if rc != 0:
             await _emit(progress_cb, {"mcp": name, "phase": "failed", "pct": 100, "message": "npm install failed", "error": log})
@@ -1031,7 +1119,7 @@ async def install_mcp(
         patches = sorted(patches_dir.glob("*.patch")) if patches_dir.is_dir() else []
         if patches:
             await _emit(progress_cb, {"mcp": name, "phase": "npm", "pct": 80, "message": "patches"})
-            patched, patch_log = await _apply_patches(mcp_dir, patches, env, timeout)
+            patched, patch_log = await _apply_patches(mcp_dir, patches, env, timeout, run=run)
             log += "\n" + patch_log
             if not patched:
                 await _emit(progress_cb, {"mcp": name, "phase": "failed", "pct": 100, "message": "patches failed", "error": log})
@@ -1097,7 +1185,7 @@ async def install_mcp(
             return await _create_venv(
                 venv_dir, uv_bin=uv_bin, python_bin=python_bin, floor=floor,
                 pin=python_spec, roots=sandbox_roots, env=env, cwd=str(mcp_dir),
-                timeout=timeout,
+                timeout=timeout, run=run,
             )
 
         async def _pip_install(no_binary: list[str]) -> tuple[bool, str]:
@@ -1110,13 +1198,13 @@ async def install_mcp(
             for pkg in no_binary:
                 binary_flags.extend(["--no-binary", pkg])
             if uv_bin and os.path.isfile(uv_bin):  # noqa: ASYNC240  # one stat of the uv binary before a minutes-long install
-                cmd = [uv_bin, "pip", "install",
+                cmd = [uv_bin, "pip", "install", "--compile-bytecode",
                        "--python", str(venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"),
                        *binary_flags, *upgrade_flag, pip_pkg]
             else:
                 cmd = [str(venv_dir / _VENV_BIN_DIR / f"pip{_EXE_SUFFIX}"),
                        "install", "--isolated", *binary_flags, *upgrade_flag, pip_pkg]
-            rc, out = await _run_bounded(cmd, cwd=str(mcp_dir), env=env, timeout=timeout)
+            rc, out = await run(cmd, cwd=str(mcp_dir), env=env, timeout=timeout, step="pip", mcp_dir=mcp_dir)
             return rc == 0, out
 
         async def _install_package() -> tuple[bool, str]:
@@ -1222,7 +1310,7 @@ async def install_mcp(
             ok, out, venv_spec = await _create_venv(
                 venv_dir, uv_bin=uv_bin, python_bin=python_bin, floor=None,
                 pin=python_spec, roots=sandbox_roots, env=env, cwd=str(mcp_dir),
-                timeout=timeout,
+                timeout=timeout, run=run,
             )
             if not ok:
                 log = "venv creation failed:\n" + out
@@ -1233,13 +1321,13 @@ async def install_mcp(
         async def _req_install() -> tuple[bool, str]:
             # Prefer uv when available (much faster).
             if uv_bin and os.path.isfile(uv_bin):  # noqa: ASYNC240  # one stat of the uv binary before a minutes-long install
-                cmd = [uv_bin, "pip", "install",
+                cmd = [uv_bin, "pip", "install", "--compile-bytecode",
                        "--python", str(venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"),
                        "-r", str(req_file)]
             else:
                 cmd = [str(venv_dir / _VENV_BIN_DIR / f"pip{_EXE_SUFFIX}"),
                        "install", "--isolated", "-r", str(req_file)]
-            rc, out = await _run_bounded(cmd, cwd=str(mcp_dir), env=env, timeout=timeout)
+            rc, out = await run(cmd, cwd=str(mcp_dir), env=env, timeout=timeout, step="pip", mcp_dir=mcp_dir)
             return rc == 0, out
 
         await _emit(progress_cb, {"mcp": name, "phase": "pip", "pct": 50,
@@ -1262,7 +1350,7 @@ async def install_mcp(
                 created, out, venv_spec = await _create_venv(
                     venv_dir, uv_bin=uv_bin, python_bin=python_bin, floor=floor,
                     pin=python_spec, roots=sandbox_roots, env=env, cwd=str(mcp_dir),
-                    timeout=timeout,
+                    timeout=timeout, run=run,
                 )
                 if created:
                     ok, log = await _req_install()

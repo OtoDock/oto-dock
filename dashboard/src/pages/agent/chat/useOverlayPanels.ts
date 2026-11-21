@@ -4,8 +4,9 @@
  * order is unchanged):
  *
  * - useOverlayPanels: the workspace overlay state (useWorkspaceState, the
- *   viewer's manage/edit rights, the ?recover=1 deep link), the pinned
- *   apps overlay (appsOpen / appsActive, toggleApps, useAppsAutoOpen),
+ *   viewer's manage/edit rights, the ?recover=1 deep link), the rule that
+ *   one panel shows at a time, the pinned apps overlay (appsActive,
+ *   toggleApps, useAppsAutoOpen),
  *   the agent-home live-sessions strip, the render-time ?wake=1 arm of
  *   keepAppsOnChatEntryRef (the phone-mode keep-open, created by
  *   useAgentChatStream), the Dock (projects) overlay state + the chat-pins
@@ -17,7 +18,7 @@
  * - usePendingAppAction: delivers the action a full-screen app page handed
  *   over in router state, once the page's socket is open.
  */
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
 import type { RefObject } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import type { useChatStream } from '../../../hooks/useChatStream'
@@ -29,8 +30,8 @@ import { useWorkspaceState } from '../../../hooks/useWorkspaceState'
 import { canManageAgent, canWriteWorkspace } from '../../../lib/permissions'
 import { useActiveChats } from '../../../hooks/useActiveChats'
 import { useAppsAutoOpen } from '../../../hooks/useAppsAutoOpen'
-import { useApps, useChatPins, type PinnedApp } from '../../../api/apps'
-import type { useChats, useTaskChats } from '../../../api/chats'
+import { useApps, useChatPins, type AppPromptAction, type PinnedApp } from '../../../api/apps'
+import type { useChats, usePinnedChatList, useTaskChats } from '../../../api/chats'
 import { apiFetch } from '../../../api/auth'
 import { onFileUpdate } from '../../../lib/fileUpdates'
 import { onOpenApp } from '../../../lib/appLive'
@@ -45,7 +46,8 @@ type Stream = ReturnType<typeof useChatStream>
 type Overlays = ReturnType<typeof useOverlayPanels>
 
 export function useOverlayPanels({
-  messages, agentName, user, chatId, searchParams, setSearchParams, urlChatId, chats, taskChats, keepAppsOnChatEntryRef,
+  messages, agentName, user, chatId, searchParams, setSearchParams, urlChatId, chats, taskChats, pinnedChats,
+  keepAppsOnChatEntryRef,
 }: {
   messages: Stream['messages']
   agentName: string | undefined
@@ -56,6 +58,9 @@ export function useOverlayPanels({
   urlChatId: string | undefined
   chats: ReturnType<typeof useChats>['data']
   taskChats: ReturnType<typeof useTaskChats>['data']
+  /** The pinned view's rows: an old pinned chat may sit past the loaded
+      pages of the history. */
+  pinnedChats?: ReturnType<typeof usePinnedChatList>['data']
   /** Created by useAgentChatStream (the stream callbacks clear it); armed
    *  here at RENDER time from ?wake=1 and consumed by useAppsAutoOpen. */
   keepAppsOnChatEntryRef: RefObject<boolean>
@@ -77,11 +82,36 @@ export function useOverlayPanels({
   const canWriteThisWorkspace =
     !!user && !!agentName && canWriteWorkspace(user, agentName)
 
+  // ---- One panel at a time ----
+  // The workspace, the apps and the Dock share the message slot. The apps
+  // and the Dock are one value, so they exclude each other; the workspace's
+  // opening (its button, Ctrl+E, a link, Back, a pasted address) closes the
+  // one below it. So a panel turned off shows the chat, never a panel it
+  // covered. The rule keys on the opening, not on "both open": the address
+  // changes in a transition, so a switch from the workspace renders once
+  // with the new panel set and the workspace not yet closed.
+  const [under, setUnder] = useState<'apps' | 'dock' | null>(null)
+  const [wsSeen, setWsSeen] = useState(workspace.state.open)
+  if (wsSeen !== workspace.state.open) {
+    setWsSeen(workspace.state.open)
+    if (workspace.state.open) setUnder(null)
+  }
+  const wsOpenRef = useRef(workspace.state.open)
+  useLayoutEffect(() => { wsOpenRef.current = workspace.state.open })
+
   // ---- Pinned apps overlay ----
   // Permanent agent-level surface (standing dashboards), toggled from the
-  // composer button right of the workspace toggle. Slot precedence:
-  // workspace > apps > projects.
-  const [appsOpen, setAppsOpen] = useState(false)
+  // composer button right of the workspace toggle.
+  const appsOpen = under === 'apps'
+  const setAppsOpen = useCallback((open: boolean) => {
+    setUnder((u) => (open ? 'apps' : u === 'apps' ? null : u))
+  }, [])
+  // An arrival or a phone-mode entry never opens the apps under a workspace
+  // that shows.
+  const autoOpenApps = useCallback((open: boolean) => {
+    if (open && wsOpenRef.current) return
+    setAppsOpen(open)
+  }, [setAppsOpen])
   const { data: pinnedApps } = useApps(agentName ?? '')
   const appsActive = appsOpen && !workspace.state.open && !!agentName
   // The active tab lives here, not in the overlay, so an agent's open
@@ -113,35 +143,37 @@ export function useOverlayPanels({
   // entry; a deep-link wake arms the keep inside the hook's own effect,
   // before its close reads it). Extracted for direct unit coverage; the
   // rules live in the hook's header comment.
-  useAppsAutoOpen(agentName, urlChatId, pinnedApps, setAppsOpen, keepAppsOnChatEntryRef,
+  useAppsAutoOpen(agentName, urlChatId, pinnedApps, autoOpenApps, keepAppsOnChatEntryRef,
     searchParams.get('wake') === '1')
   useEffect(() => {
     if (!appsActive) return
     return pushEscHandler(() => setAppsOpen(false))
-  }, [appsActive])
+  }, [appsActive, setAppsOpen])
+  // Each button toggles what shows: its panel off when it shows, else the
+  // panel on in place of the one that shows.
   const toggleApps = useCallback(() => {
-    // Reveal-intent toggle: the flag can be stale-true UNDER an open
-    // workspace (opening the workspace hides apps without clearing appsOpen,
-    // so closing it restores them). Toggling the raw flag from that state
-    // made the first click an invisible no-op — key on VISIBILITY instead.
     if (appsActive) {
       setAppsOpen(false)
       return
     }
     if (workspace.state.open) workspace.closeWorkspace()
     setAppsOpen(true)
-  }, [appsActive, workspace])
+  }, [appsActive, workspace, setAppsOpen])
 
   // The active chat's row — task chats resolve through the task list (they
   // never appear in the chat-mode list).
   const activeChatRow = chats?.find((c) => c.id === chatId)
     ?? taskChats?.find((c) => c.id === chatId)
+    ?? pinnedChats?.find((c) => c.id === chatId)
 
   // Dock overlay (staged feature — this block + the entry button strip from
   // the public cut). Offered when the active chat participates in a
   // delegation project OR carries a chat-scoped pinned dashboard; closes on
   // chat switch like the find bar.
-  const [projectsOpen, setProjectsOpen] = useState(false)
+  const projectsOpen = under === 'dock'
+  const setProjectsOpen = useCallback((open: boolean) => {
+    setUnder((u) => (open ? 'dock' : u === 'dock' ? null : u))
+  }, [])
   // Every delegation participant gets the dock: orchestrators (stamped even
   // without a project slug) and workers (chat- or task-surface — the lane
   // graph falls back to lineage server-side when project_id is empty).
@@ -159,7 +191,15 @@ export function useOverlayPanels({
     setProjectsFor(chatId)
     setProjectsOpen(false)
   }
-  const projectsActive = projectsOpen && dockAvailable && !workspace.state.open && !appsOpen
+  const projectsActive = projectsOpen && dockAvailable && !workspace.state.open
+  const toggleDock = useCallback(() => {
+    if (projectsActive) {
+      setProjectsOpen(false)
+      return
+    }
+    if (workspace.state.open) workspace.closeWorkspace()
+    setProjectsOpen(true)
+  }, [projectsActive, workspace, setProjectsOpen])
   // An agent pin/re-pin broadcasts file_updated for its apps/*.html — that's
   // the signal a Dock pin appeared/changed (the toggle may need to show up
   // while the overlay is closed, so this lives here, not in the overlay).
@@ -184,7 +224,7 @@ export function useOverlayPanels({
     if (plan === 'ignore') return
     f.handled = true
     if (plan === 'dock') {
-      setAppsOpen(false)
+      if (workspace.state.open) workspace.closeWorkspace()
       queryClient.invalidateQueries({ queryKey: ['chat-pins'] })
       setProjectsOpen(true)
       return
@@ -195,7 +235,7 @@ export function useOverlayPanels({
     if (!pinnedApps?.some((a) => a.id === f.app_id)) {
       queryClient.invalidateQueries({ queryKey: ['apps', agentName] })
     }
-  }), [agentName, chatId, workspace, pinnedApps, queryClient, selectApp])
+  }), [agentName, chatId, workspace, pinnedApps, queryClient, selectApp, setAppsOpen, setProjectsOpen])
 
   // Ctrl/Cmd+E toggles the workspace overlay.
   useEffect(() => {
@@ -216,7 +256,7 @@ export function useOverlayPanels({
   }, [workspace])
 
   // Deep-link from a file-conflict notification: ?recover=1 opens the workspace
-  // overlay + the Recover bin modal, then clears the param.
+  // overlay + the Recover bin modal, and the param goes in the same write.
   const [recoverRequested, setRecoverRequested] = useState(false)
   const recoverParam = searchParams.get('recover') === '1'
   const [recoverSeen, setRecoverSeen] = useState(false)
@@ -225,22 +265,20 @@ export function useOverlayPanels({
     if (recoverParam) setRecoverRequested(true)
   }
   useEffect(() => {
-    if (searchParams.get('recover') === '1') {
-      if (!workspace.state.open) workspace.toggleWorkspace()
-      setSearchParams(prev => { prev.delete('recover'); return prev }, { replace: true })
-    }
-  }, [searchParams, setSearchParams, workspace])
+    if (searchParams.get('recover') === '1') workspace.openFromLink('recover')
+  }, [searchParams, workspace])
 
   return {
     workspace, canManageThisAgent, canWriteThisWorkspace, recoverRequested, setRecoverRequested,
     appsActive, setAppsOpen, showHomeActive, toggleApps, appsActiveId, selectApp,
-    setProjectsOpen, isProjectChat, chatPins, dockAvailable, projectsActive,
+    setProjectsOpen, toggleDock, isProjectChat, chatPins, dockAvailable, projectsActive,
   }
 }
 
 export function useAppSendPrompt({
   interactive, chatId, ws, sessionId, warmingUp, mode, model, chatActiveLayer, selectedLayer,
   setAppsOpen, setWarmingUp, serverKickPendingRef, sendAppAction, agentName, keepAppsOnChatEntryRef, handleSelectChat,
+  handleNewChat,
 }: {
   interactive: ReturnType<typeof useInteractiveChat>
   chatId: Stream['chatId']
@@ -258,6 +296,7 @@ export function useAppSendPrompt({
   agentName: string | undefined
   keepAppsOnChatEntryRef: RefObject<boolean>
   handleSelectChat: (selectedChatId: string, searchQuery?: string) => void
+  handleNewChat: () => void
 }) {
   // App send_prompt router — the host page decides the delivery rail:
   // interactive chat → typed into the terminal (composer rail, same as the
@@ -265,17 +304,33 @@ export function useAppSendPrompt({
   // since PTY input is the user's own channel); open headless chat → the
   // app_action WS frame (server-gated); front page → create a chat, view it,
   // then deliver (retrying past the resume race). fire_task never comes here
-  // (AppFrame routes it over REST).
+  // (AppFrame routes it over REST). A button declared with `new_chat`
+  // never uses the open chat: it takes the front page's path whatever is
+  // on screen (the frame asked for a real click before it came here).
   // The members the router calls (the bundle is rebuilt every render).
   const { sessionInteractive, interactiveMode, routeSend, setShowRichView } = interactive
+  const navigate = useNavigate()
   const handleAppSendPrompt = useCallback(
     async (
       app: PinnedApp,
-      action: { id: string; label: string; prompt: string },
+      action: AppPromptAction,
       args: unknown,
     ): Promise<{ status: string; reason?: string }> => {
       const substituted = substituteArgs(action.prompt, args)
-      if (sessionInteractive && chatId) {
+      const fresh = !!action.new_chat
+      if (fresh && interactiveMode && agentName && (chatId || sessionId || warmingUp)) {
+        // A terminal belongs to the chat it runs in: the press goes to the
+        // agent's home, where a new terminal opens with it (the path a
+        // press on the full-screen app page takes). The page is the same
+        // component there, so the open chat is left first: the home
+        // delivers only with no chat open.
+        handleNewChat()
+        navigate(`/chat/${agentName}`, {
+          state: { pendingAppAction: { app, action, args, key: `${Date.now()}` } },
+        })
+        return { status: 'sent' }
+      }
+      if (!fresh && sessionInteractive && chatId) {
         const built = buildAppActionText(app.title || app.slug, action.label, substituted)
         if ('error' in built) return { status: 'denied', reason: built.error }
         ws.sendPtyInput(chatId, ptyPasteB64(withInteractiveTime(built.framed)), true)
@@ -305,7 +360,7 @@ export function useAppSendPrompt({
           return { status: 'sent' }
         }
       }
-      if (chatId) {
+      if (chatId && !fresh) {
         return sendAppAction(app, action.id, action.label, substituted, args)
       }
       try {
@@ -329,8 +384,8 @@ export function useAppSendPrompt({
       }
     },
     [sessionInteractive, interactiveMode, routeSend, setShowRichView, chatId, sessionId, warmingUp, mode, model,
-     chatActiveLayer, selectedLayer, ws, sendAppAction, agentName, handleSelectChat,
-     keepAppsOnChatEntryRef, serverKickPendingRef, setAppsOpen, setWarmingUp],
+     chatActiveLayer, selectedLayer, ws, sendAppAction, agentName, handleSelectChat, handleNewChat,
+     keepAppsOnChatEntryRef, serverKickPendingRef, setAppsOpen, setWarmingUp, navigate],
   )
 
   return { handleAppSendPrompt }
@@ -350,11 +405,14 @@ export function usePendingAppAction({ chatId, agentName, connected, handleAppSen
 }) {
   const location = useLocation()
   const navigate = useNavigate()
-  const doneRef = useRef(false)
+  // One delivery per press: the page is not remounted between a chat and
+  // home, so the guard is the press's own key, never "once per page".
+  const doneRef = useRef<string | null>(null)
   useEffect(() => {
-    const pending = (location.state as { pendingAppAction?: { app: PinnedApp; action: { id: string; label: string; prompt: string }; args: unknown } } | null)?.pendingAppAction
-    if (!pending || chatId || !agentName || !connected || doneRef.current) return
-    doneRef.current = true
+    const pending = (location.state as { pendingAppAction?: { app: PinnedApp; action: AppPromptAction; args: unknown; key?: string } } | null)?.pendingAppAction
+    const key = pending?.key || 'first'
+    if (!pending || chatId || !agentName || !connected || doneRef.current === key) return
+    doneRef.current = key
     navigate(location.pathname + location.search, { replace: true, state: null })
     void handleAppSendPrompt(pending.app, pending.action, pending.args)
   }, [location.state, location.pathname, location.search, chatId, agentName, connected, handleAppSendPrompt, navigate])

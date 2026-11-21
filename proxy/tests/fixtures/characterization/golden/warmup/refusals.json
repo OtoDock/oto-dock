@@ -1,0 +1,110 @@
+{
+ "chats": [
+  {
+   "agent": "warm-refused-other",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "sid-rebound",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [
+  [
+   {
+    "message": "Agent name required",
+    "type": "error"
+   },
+   {
+    "message": "Access denied for agent 'warm-refused-other'",
+    "type": "error"
+   },
+   {
+    "message": "Access denied for agent 'no-such-agent'",
+    "type": "error"
+   },
+   {
+    "error": "This agent is set to Shared only, so its chats and tasks run as the agent itself, which takes the editor role or above (this one would run as viewer). Ask a manager of the agent for the editor role, or to turn on personal chats.",
+    "reason": "below_editor",
+    "type": "warmup_failed"
+   },
+   {
+    "message": "Access denied for agent 'warm-refused-denied'",
+    "type": "error"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   }
+  ],
+  [
+   {
+    "message": "Agent 'no-such-agent' no longer exists",
+    "type": "error"
+   },
+   {
+    "chat_id": "<id1>",
+    "execution_path": "claude-code-cli",
+    "interactive": false,
+    "mode": "plan",
+    "model": "test-model",
+    "session_id": "sid-rebound",
+    "type": "warmup_ready"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   },
+   {
+    "count": 0,
+    "type": "notification_count"
+   }
+  ]
+ ],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [],
+  "reconnect_waits": [],
+  "started": []
+ },
+ "slots": {
+  "acquired": [
+   [
+    "sid-rebound",
+    {
+     "execution_path": "claude-code-cli",
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": []
+ }
+}

@@ -1,0 +1,1629 @@
+{
+ "body_without_frontmatter": "# char-always\n\nBody.\n",
+ "lists": {
+  "dashboard": {
+   "catalog": [
+    [
+     "char-core-guide",
+     "About char-core-guide."
+    ],
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-meeting-guide",
+     "About char-no-meeting-guide."
+    ],
+    [
+     "char-no-phone-guide",
+     "About char-no-phone-guide."
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "About char-no-shared-chat-guide."
+    ],
+    [
+     "char-no-task-guide",
+     "About char-no-task-guide."
+    ],
+    [
+     "char-no-terminal-guide",
+     "About char-no-terminal-guide."
+    ],
+    [
+     "char-owner",
+     "About char-owner."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-core-guide",
+     "on_demand"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-meeting-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-phone-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-task-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-terminal-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-phone-off",
+     "always"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ],
+    [
+     "char-owner",
+     "on_demand"
+    ],
+    [
+     "char-editor",
+     "always"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  },
+  "editor": {
+   "catalog": [
+    [
+     "char-core-guide",
+     "About char-core-guide."
+    ],
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-meeting-guide",
+     "About char-no-meeting-guide."
+    ],
+    [
+     "char-no-phone-guide",
+     "About char-no-phone-guide."
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "About char-no-shared-chat-guide."
+    ],
+    [
+     "char-no-task-guide",
+     "About char-no-task-guide."
+    ],
+    [
+     "char-no-terminal-guide",
+     "About char-no-terminal-guide."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-core-guide",
+     "on_demand"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-meeting-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-phone-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-task-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-terminal-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-phone-off",
+     "always"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ],
+    [
+     "char-editor",
+     "always"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  },
+  "external": {
+   "catalog": [
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ]
+   ],
+   "inline": [
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ]
+   ]
+  },
+  "external-unpicked": {
+   "catalog": [],
+   "inline": []
+  },
+  "machine": {
+   "catalog": [
+    [
+     "char-browser-guide",
+     "About char-browser-guide."
+    ],
+    [
+     "char-core-guide",
+     "About char-core-guide."
+    ],
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-meeting-guide",
+     "About char-no-meeting-guide."
+    ],
+    [
+     "char-no-phone-guide",
+     "About char-no-phone-guide."
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "About char-no-shared-chat-guide."
+    ],
+    [
+     "char-no-task-guide",
+     "About char-no-task-guide."
+    ],
+    [
+     "char-no-terminal-guide",
+     "About char-no-terminal-guide."
+    ],
+    [
+     "char-owner",
+     "About char-owner."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-browser-guide",
+     "on_demand"
+    ],
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-core-guide",
+     "on_demand"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-meeting-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-phone-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-task-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-terminal-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-phone-off",
+     "always"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ],
+    [
+     "char-owner",
+     "on_demand"
+    ],
+    [
+     "char-editor",
+     "always"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  },
+  "manager": {
+   "catalog": [
+    [
+     "char-core-guide",
+     "About char-core-guide."
+    ],
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-meeting-guide",
+     "About char-no-meeting-guide."
+    ],
+    [
+     "char-no-phone-guide",
+     "About char-no-phone-guide."
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "About char-no-shared-chat-guide."
+    ],
+    [
+     "char-no-task-guide",
+     "About char-no-task-guide."
+    ],
+    [
+     "char-no-terminal-guide",
+     "About char-no-terminal-guide."
+    ],
+    [
+     "char-owner",
+     "About char-owner."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-core-guide",
+     "on_demand"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-meeting-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-phone-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-task-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-terminal-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-phone-off",
+     "always"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ],
+    [
+     "char-owner",
+     "on_demand"
+    ],
+    [
+     "char-editor",
+     "always"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  },
+  "meeting": {
+   "catalog": [
+    [
+     "char-core-guide",
+     "About char-core-guide."
+    ],
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-phone-guide",
+     "About char-no-phone-guide."
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "About char-no-shared-chat-guide."
+    ],
+    [
+     "char-no-task-guide",
+     "About char-no-task-guide."
+    ],
+    [
+     "char-no-terminal-guide",
+     "About char-no-terminal-guide."
+    ],
+    [
+     "char-owner",
+     "About char-owner."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-core-guide",
+     "on_demand"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-phone-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-task-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-terminal-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-phone-off",
+     "always"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ],
+    [
+     "char-owner",
+     "on_demand"
+    ],
+    [
+     "char-editor",
+     "always"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  },
+  "no-context": {
+   "catalog": [
+    [
+     "char-core-guide",
+     "About char-core-guide."
+    ],
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-meeting-guide",
+     "About char-no-meeting-guide."
+    ],
+    [
+     "char-no-phone-guide",
+     "About char-no-phone-guide."
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "About char-no-shared-chat-guide."
+    ],
+    [
+     "char-no-task-guide",
+     "About char-no-task-guide."
+    ],
+    [
+     "char-no-terminal-guide",
+     "About char-no-terminal-guide."
+    ],
+    [
+     "char-owner",
+     "About char-owner."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-core-guide",
+     "on_demand"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-meeting-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-phone-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-task-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-terminal-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-phone-off",
+     "always"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ],
+    [
+     "char-owner",
+     "on_demand"
+    ],
+    [
+     "char-editor",
+     "always"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  },
+  "phone": {
+   "catalog": [
+    [
+     "char-core-guide",
+     "About char-core-guide."
+    ],
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-meeting-guide",
+     "About char-no-meeting-guide."
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "About char-no-shared-chat-guide."
+    ],
+    [
+     "char-no-task-guide",
+     "About char-no-task-guide."
+    ],
+    [
+     "char-no-terminal-guide",
+     "About char-no-terminal-guide."
+    ],
+    [
+     "char-owner",
+     "About char-owner."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-core-guide",
+     "on_demand"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-meeting-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-task-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-terminal-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ],
+    [
+     "char-owner",
+     "on_demand"
+    ],
+    [
+     "char-editor",
+     "always"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  },
+  "shared": {
+   "catalog": [
+    [
+     "char-core-guide",
+     "About char-core-guide."
+    ],
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-meeting-guide",
+     "About char-no-meeting-guide."
+    ],
+    [
+     "char-no-phone-guide",
+     "About char-no-phone-guide."
+    ],
+    [
+     "char-no-task-guide",
+     "About char-no-task-guide."
+    ],
+    [
+     "char-no-terminal-guide",
+     "About char-no-terminal-guide."
+    ],
+    [
+     "char-owner",
+     "About char-owner."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-core-guide",
+     "on_demand"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-meeting-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-phone-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-task-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-terminal-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-phone-off",
+     "always"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-owner",
+     "on_demand"
+    ],
+    [
+     "char-editor",
+     "always"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  },
+  "task": {
+   "catalog": [
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-meeting-guide",
+     "About char-no-meeting-guide."
+    ],
+    [
+     "char-no-phone-guide",
+     "About char-no-phone-guide."
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "About char-no-shared-chat-guide."
+    ],
+    [
+     "char-no-terminal-guide",
+     "About char-no-terminal-guide."
+    ],
+    [
+     "char-owner",
+     "About char-owner."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-meeting-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-phone-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-terminal-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-phone-off",
+     "always"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ],
+    [
+     "char-owner",
+     "on_demand"
+    ],
+    [
+     "char-editor",
+     "always"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  },
+  "terminal": {
+   "catalog": [
+    [
+     "char-core-guide",
+     "About char-core-guide."
+    ],
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-meeting-guide",
+     "About char-no-meeting-guide."
+    ],
+    [
+     "char-no-phone-guide",
+     "About char-no-phone-guide."
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "About char-no-shared-chat-guide."
+    ],
+    [
+     "char-no-task-guide",
+     "About char-no-task-guide."
+    ],
+    [
+     "char-owner",
+     "About char-owner."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-core-guide",
+     "on_demand"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-meeting-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-phone-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-task-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-phone-off",
+     "always"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ],
+    [
+     "char-owner",
+     "on_demand"
+    ],
+    [
+     "char-editor",
+     "always"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  },
+  "viewer": {
+   "catalog": [
+    [
+     "char-core-guide",
+     "About char-core-guide."
+    ],
+    [
+     "char-external-off",
+     "About char-external-off."
+    ],
+    [
+     "char-guide",
+     "About char-guide."
+    ],
+    [
+     "char-http-guide",
+     "About char-http-guide."
+    ],
+    [
+     "char-no-external-guide",
+     "About char-no-external-guide."
+    ],
+    [
+     "char-no-meeting-guide",
+     "About char-no-meeting-guide."
+    ],
+    [
+     "char-no-phone-guide",
+     "About char-no-phone-guide."
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "About char-no-shared-chat-guide."
+    ],
+    [
+     "char-no-task-guide",
+     "About char-no-task-guide."
+    ],
+    [
+     "char-no-terminal-guide",
+     "About char-no-terminal-guide."
+    ],
+    [
+     "char-row-adds",
+     "About char-row-adds."
+    ],
+    [
+     "char-row-clears",
+     "About char-row-clears."
+    ],
+    [
+     "char-shared-off",
+     "About char-shared-off."
+    ],
+    [
+     "char-zeta",
+     "About char-zeta."
+    ],
+    [
+     "delegation-guide",
+     "About delegation-guide."
+    ]
+   ],
+   "inline": [
+    [
+     "char-context-guide",
+     "always"
+    ],
+    [
+     "char-core-guide",
+     "on_demand"
+    ],
+    [
+     "char-http-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-external-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-meeting-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-phone-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-shared-chat-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-task-guide",
+     "on_demand"
+    ],
+    [
+     "char-no-terminal-guide",
+     "on_demand"
+    ],
+    [
+     "char-always",
+     "always"
+    ],
+    [
+     "char-guide",
+     "on_demand"
+    ],
+    [
+     "char-zeta",
+     "on_demand"
+    ],
+    [
+     "char-phone-off",
+     "always"
+    ],
+    [
+     "char-row-clears",
+     "on_demand"
+    ],
+    [
+     "char-row-adds",
+     "on_demand"
+    ],
+    [
+     "char-external-off",
+     "on_demand"
+    ],
+    [
+     "char-shared-off",
+     "on_demand"
+    ],
+    [
+     "delegation-guide",
+     "on_demand"
+    ]
+   ]
+  }
+ }
+}

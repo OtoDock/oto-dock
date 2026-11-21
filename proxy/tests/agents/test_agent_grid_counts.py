@@ -135,7 +135,7 @@ def _member(*slugs: str) -> UserContext:
 
 class TestListingOffLoop:
     def _seed_mcps(self, monkeypatch, *, tts_available: bool):
-        from services.mcp import mcp_registry
+        from services.mcp import mcp_manifest_store
         from services.media import audio_service
         from storage.mcp import mcp_store
         manifests = {
@@ -147,7 +147,7 @@ class TestListingOffLoop:
             # Attached by the platform: a stray enabled row never counts.
             "plat-f": _manifest("plat-f", assignment_mode="platform"),
         }
-        monkeypatch.setattr(mcp_registry, "_manifests", manifests)
+        monkeypatch.setattr(mcp_manifest_store, "_manifests", manifests)
         monkeypatch.setattr(audio_service, "tts_capability_available", lambda: tts_available)
         for name in manifests:
             mcp_store.set_mcp_enabled(name, name != "off-e")
@@ -234,7 +234,7 @@ class TestListingOffLoop:
     def test_the_layer_default_model_is_resolved_once_per_engine(self, temp_db, monkeypatch):
         import config
         from api.agents import discovery
-        for slug, model in (("un1", ""), ("un2", ""), ("pin", "claude-fable-5-1")):
+        for slug, model in (("un1", ""), ("un2", ""), ("pin", "claude-fable-5-2")):
             agent_store.create_agent(slug, slug, created_by=A, default_model=model)
         agent_store.create_agent("other", "other", created_by=A, execution_path="codex-cli")
         calls: list[str] = []
@@ -250,5 +250,5 @@ class TestListingOffLoop:
         rows = {a["name"]: a["default_model"]
                 for a in json.loads(asyncio.run(discovery.list_agents(all=False, user=u)).body)["agents"]}
         assert rows == {"un1": "m-default", "un2": "m-default",
-                        "pin": "claude-fable-5-1", "other": ""}
+                        "pin": "claude-fable-5-2", "other": ""}
         assert sorted(calls) == ["claude-code-cli", "codex-cli"]

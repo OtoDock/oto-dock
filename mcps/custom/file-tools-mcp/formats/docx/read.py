@@ -700,8 +700,11 @@ def _start(doc: Any, start_at: Any) -> tuple[int, int]:
 
 def read_docx(path: str, *, start_at: Any = None, end_at: Any = None, outline_only: bool = False,
               budget: int = TOKEN_BUDGET) -> str:
-    preflight(path)
-    doc = open_document(path)
+    import shared
+
+    with shared.safe_open_read(path) as fh:
+        preflight(fh)
+        doc = open_document(fh)
     names, default_style = _style_names(doc)
     reader = _Reader(doc, HeadingLevels(doc), ListMarkers(doc), names, default_style,
                      _Render(doc, doc.part, note_numbers=_note_numbers(doc)))

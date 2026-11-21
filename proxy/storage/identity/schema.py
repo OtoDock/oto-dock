@@ -51,13 +51,7 @@ def init_identity(conn) -> None:
             token_epoch_at TEXT,
             -- The TOTP time step the account accepted last: a code is good
             -- only for a later step (auth/totp.py, RFC 6238 replay).
-            totp_last_step BIGINT NOT NULL DEFAULT 0,
-            -- A preferred engine stored before the engines followed use:
-            -- read only, first while the person has no chat in the window
-            -- on an engine the agent allows them
-            -- (services/engines/engine_resolution.py); never written now,
-            -- dropped at the next minor.
-            preferred_execution_path TEXT NOT NULL DEFAULT ''
+            totp_last_step BIGINT NOT NULL DEFAULT 0
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
@@ -232,9 +226,11 @@ def init_identity(conn) -> None:
         WHERE is_default = TRUE
     """)
 
-    # Per-agent explicit override: which account to use for a specific
-    # agent (catch-all default applies otherwise). UNIQUE on
-    # (user, mcp, agent) so one agent binds to at most one account.
+    # Per agent, the set of a person's accounts the agent may use (the
+    # catch-all default applies to an empty set), one row per account. The
+    # key is named here and in ``migrate_identity`` alike, so a fresh table
+    # and a migrated one are the same; the one-default index lives in
+    # ``migrate_identity``, where ``is_default`` exists on both.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS agent_account_bindings (
             id SERIAL PRIMARY KEY,
@@ -248,7 +244,10 @@ def init_identity(conn) -> None:
             -- repository the account reaches) and whether it may only read.
             repositories TEXT NOT NULL DEFAULT '[]',
             read_only BOOLEAN NOT NULL DEFAULT FALSE,
-            UNIQUE(user_sub, mcp_name, agent_name),
+            -- The set's account when a chat chose none: one per set.
+            is_default BOOLEAN NOT NULL DEFAULT FALSE,
+            CONSTRAINT agent_account_bindings_set_key
+                UNIQUE (user_sub, mcp_name, agent_name, account_label),
             FOREIGN KEY (user_sub) REFERENCES users(sub) ON DELETE CASCADE
         )
     """)
@@ -317,11 +316,13 @@ def init_identity(conn) -> None:
         )
     """)
 
-    # Per-agent service binding (user-owned accounts ONLY). A manager/admin
-    # connects an account in their OWN user and designates it as the agent's
-    # service identity; the agent-scope (service) session reads that user's
-    # tokens directly. ``account_owner_sub`` is always the owning user's sub —
-    # there is no platform "service account" tier (removed before the public release).
+    # Per-agent service accounts (user-owned accounts ONLY). A manager/admin
+    # connects an account in their OWN user and lends it to the agent as one
+    # of its own; the agent-scope (service) session reads that user's tokens
+    # directly. ``account_owner_sub`` is always the owning user's sub — there
+    # is no platform "service account" tier (removed before the public
+    # release). The key is named here and in ``migrate_identity`` alike; the
+    # one-default index lives in ``_migrate_service_sets``.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS service_agent_bindings (
             id SERIAL PRIMARY KEY,
@@ -340,7 +341,12 @@ def init_identity(conn) -> None:
             -- whether it may only read.
             repositories TEXT NOT NULL DEFAULT '[]',
             read_only BOOLEAN NOT NULL DEFAULT FALSE,
-            UNIQUE(mcp_name, agent_name)
+            -- The set's account when a chat chose none: one per set.
+            is_default BOOLEAN NOT NULL DEFAULT FALSE,
+            -- An agent's own accounts of a tool are a set, one account per
+            -- label (the name a chat's choice and the prompt carry).
+            CONSTRAINT service_agent_bindings_set_key
+                UNIQUE (mcp_name, agent_name, account_label)
         )
     """)
 
@@ -376,6 +382,25 @@ def init_identity(conn) -> None:
         ON oauth_client_registrations(issuer, redirect_uri)
         WHERE revoked_at = ''
     """)
+    # The outside people an agent has spoken with, one row per channel and
+    # id (storage/identity/external_identity_store.py): a caller on the
+    # agent's phone line today, a link visitor or a channel's member later.
+    # Never a member's row: an outside person is not a platform user. The
+    # row goes with the person's tree (the caller-data sweep, Forget all).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS external_identities (
+            id TEXT PRIMARY KEY,
+            agent TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            verified_at TEXT NOT NULL DEFAULT '',
+            conversations INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (agent, channel, slug)
+        )
+    """)
 
 
 def migrate_identity(conn) -> None:
@@ -384,9 +409,200 @@ def migrate_identity(conn) -> None:
     # 1.9.1: the bearer allowlist's rows carry their source.
     from storage.identity import bearer_allowlist
     bearer_allowlist.migrate(conn)
-    # 1.9.1: a preferred engine ('' on every pre-existing row). Read only,
-    # as the seed of the engine order by use; dropped at the next minor.
+    # 2.0: the preferred engine of 1.9.0, read by 1.9.1 only as the seed of
+    # the engine order, is gone with its column.
+    conn.execute("ALTER TABLE users DROP COLUMN IF EXISTS preferred_execution_path")
+    _migrate_account_sets(conn)
+    _migrate_service_sets(conn)
+
+
+# The four-column key of an agent's set (``init_identity`` names the same).
+_SET_KEY = "agent_account_bindings_set_key"
+# The three-column key of an agent's own accounts (``init_identity`` names the same).
+_SERVICE_SET_KEY = "service_agent_bindings_set_key"
+
+
+def _unique_keys_on(conn, table: str, columns: list[str]) -> list[str]:
+    """The names of every UNIQUE constraint on ``table`` over exactly
+    ``columns`` (a 1.9.1 key was never named, so it is found by them)."""
+    rows = conn.execute(
+        "SELECT c.conname FROM pg_constraint c "
+        "JOIN pg_class t ON t.oid = c.conrelid "
+        "JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "WHERE t.relname = %s AND n.nspname = current_schema() "
+        "AND c.contype = 'u' AND ("
+        "  SELECT array_agg(a.attname::text ORDER BY a.attname) FROM pg_attribute a "
+        "  WHERE a.attrelid = t.oid AND a.attnum = ANY(c.conkey)"
+        ") = %s::text[]",
+        (table, sorted(columns)),
+    ).fetchall()
+    return [r["conname"] for r in rows]
+
+
+def _one_account_keys(conn) -> list[str]:
+    """The names of the 1.9.1 UNIQUE (user_sub, mcp_name, agent_name) on
+    ``agent_account_bindings``."""
+    return _unique_keys_on(conn, "agent_account_bindings", ["user_sub", "mcp_name", "agent_name"])
+
+
+def _constraint_exists(conn, table: str, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM pg_constraint c "
+        "JOIN pg_class t ON t.oid = c.conrelid "
+        "JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "WHERE t.relname = %s AND n.nspname = current_schema() "
+        "AND c.conname = %s",
+        (table, name),
+    ).fetchone() is not None
+
+
+def _set_key_exists(conn) -> bool:
+    return _constraint_exists(conn, "agent_account_bindings", _SET_KEY)
+
+
+def _migrate_service_sets(conn) -> None:
+    """An agent's own account of a tool becomes a set of accounts with one
+    default, the shape of a person's set (``_migrate_account_sets``). A 1.9.1
+    row becomes the default of a set of one, so every reader resolves what it
+    did until a manager adds a second account. Guarded by the catalog, so a
+    migrated or fresh table gets no DDL but the ``IF NOT EXISTS`` steps. A
+    step that fails stops the boot: every chat's start reads the choice table
+    this ends with."""
     conn.execute(
-        "ALTER TABLE users "
-        "ADD COLUMN IF NOT EXISTS preferred_execution_path TEXT NOT NULL DEFAULT ''"
+        "ALTER TABLE service_agent_bindings "
+        "ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT FALSE"
+    )
+    old = _unique_keys_on(conn, "service_agent_bindings", ["mcp_name", "agent_name"])
+    if old:
+        conn.execute("UPDATE service_agent_bindings SET is_default = TRUE")
+    for name in old:
+        quoted = '"' + name.replace('"', '""') + '"'
+        conn.execute(f"ALTER TABLE service_agent_bindings DROP CONSTRAINT IF EXISTS {quoted}")
+    if not _constraint_exists(conn, "service_agent_bindings", _SERVICE_SET_KEY):
+        conn.execute(
+            f"ALTER TABLE service_agent_bindings ADD CONSTRAINT {_SERVICE_SET_KEY} "
+            "UNIQUE (mcp_name, agent_name, account_label)"
+        )
+    if old:
+        logger.info("service_agent_bindings: each agent's account is the default of its set")
+    # A set with rows and none marked: its oldest row is the default; a set
+    # with several marked keeps the oldest marked one. Every boot, before the
+    # index that allows one default a set, so no data stops the boot.
+    conn.execute(
+        "UPDATE service_agent_bindings b SET is_default = TRUE "
+        "WHERE b.id = (SELECT o.id FROM service_agent_bindings o "
+        "              WHERE o.mcp_name = b.mcp_name AND o.agent_name = b.agent_name "
+        "              ORDER BY o.set_at, o.id LIMIT 1) "
+        "  AND NOT EXISTS (SELECT 1 FROM service_agent_bindings d "
+        "                  WHERE d.mcp_name = b.mcp_name AND d.agent_name = b.agent_name "
+        "                    AND d.is_default)"
+    )
+    conn.execute(
+        "UPDATE service_agent_bindings b SET is_default = FALSE "
+        "WHERE b.is_default "
+        "  AND b.id <> (SELECT o.id FROM service_agent_bindings o "
+        "               WHERE o.mcp_name = b.mcp_name AND o.agent_name = b.agent_name "
+        "                 AND o.is_default ORDER BY o.set_at, o.id LIMIT 1)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sab_default "
+        "ON service_agent_bindings(mcp_name, agent_name) WHERE is_default"
+    )
+    # A Shared-only chat's own choice among the agent's accounts per tool,
+    # whoever made it: it goes with its set row on every delete path (a label
+    # used again never revives it) and with its chat.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_service_account_choices (
+            chat_id TEXT NOT NULL,
+            agent_name TEXT NOT NULL,
+            mcp_name TEXT NOT NULL,
+            account_label TEXT NOT NULL,
+            set_by TEXT NOT NULL DEFAULT '',
+            set_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, mcp_name),
+            FOREIGN KEY (mcp_name, agent_name, account_label)
+                REFERENCES service_agent_bindings(mcp_name, agent_name, account_label)
+                ON DELETE CASCADE,
+            FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_csac_binding "
+        "ON chat_service_account_choices(mcp_name, agent_name, account_label)"
+    )
+
+
+def _migrate_account_sets(conn) -> None:
+    """An agent's choice of a person's account becomes a set of
+    accounts with one default. A 1.9.1 row becomes the default of a set of
+    one. Guarded by the catalog, so a migrated or fresh table gets no DDL
+    but the ``IF NOT EXISTS`` steps. A step that fails stops the boot: every
+    chat's start reads the table this ends with. The default index and the
+    chat's choice come after the column and the key, which they need."""
+    conn.execute(
+        "ALTER TABLE agent_account_bindings "
+        "ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT FALSE"
+    )
+    old = _one_account_keys(conn)
+    if old:
+        conn.execute("UPDATE agent_account_bindings SET is_default = TRUE")
+    for name in old:
+        quoted = '"' + name.replace('"', '""') + '"'
+        conn.execute(f"ALTER TABLE agent_account_bindings DROP CONSTRAINT IF EXISTS {quoted}")
+    if not _set_key_exists(conn):
+        conn.execute(
+            f"ALTER TABLE agent_account_bindings ADD CONSTRAINT {_SET_KEY} "
+            "UNIQUE (user_sub, mcp_name, agent_name, account_label)"
+        )
+    if old:
+        logger.info("agent_account_bindings: each agent's account is the default of its set")
+    # A set with rows and none marked (a row written past the store, a
+    # restore of a half-written state): its oldest row is the default, on
+    # every boot, before the index that allows one default a set.
+    conn.execute(
+        "UPDATE agent_account_bindings b SET is_default = TRUE "
+        "WHERE b.id = (SELECT o.id FROM agent_account_bindings o "
+        "              WHERE o.user_sub = b.user_sub AND o.mcp_name = b.mcp_name "
+        "                AND o.agent_name = b.agent_name ORDER BY o.set_at, o.id LIMIT 1) "
+        "  AND NOT EXISTS (SELECT 1 FROM agent_account_bindings d "
+        "                  WHERE d.user_sub = b.user_sub AND d.mcp_name = b.mcp_name "
+        "                    AND d.agent_name = b.agent_name AND d.is_default)"
+    )
+    # A set with more than one marked (rows written past the store before the
+    # index was there): the oldest marked row stays the default, so the index
+    # below can always be built and no data stops the boot.
+    conn.execute(
+        "UPDATE agent_account_bindings b SET is_default = FALSE "
+        "WHERE b.is_default "
+        "  AND b.id <> (SELECT o.id FROM agent_account_bindings o "
+        "               WHERE o.user_sub = b.user_sub AND o.mcp_name = b.mcp_name "
+        "                 AND o.agent_name = b.agent_name AND o.is_default "
+        "               ORDER BY o.set_at, o.id LIMIT 1)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_aab_default "
+        "ON agent_account_bindings(user_sub, mcp_name, agent_name) WHERE is_default"
+    )
+    # A chat's own choice of account per tool, for the person who made it,
+    # among the agent's set: it goes with its set row on every delete path
+    # (a label used again never revives it) and with its chat.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_account_choices (
+            chat_id TEXT NOT NULL,
+            user_sub TEXT NOT NULL,
+            agent_name TEXT NOT NULL,
+            mcp_name TEXT NOT NULL,
+            account_label TEXT NOT NULL,
+            set_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, user_sub, mcp_name),
+            FOREIGN KEY (user_sub, mcp_name, agent_name, account_label)
+                REFERENCES agent_account_bindings(user_sub, mcp_name, agent_name, account_label)
+                ON DELETE CASCADE,
+            FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+        )
+    """)
+    # A set row's delete finds its choices by the foreign key's columns.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cac_binding "
+        "ON chat_account_choices(user_sub, mcp_name, agent_name, account_label)"
     )

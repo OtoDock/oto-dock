@@ -1,10 +1,11 @@
 """Persist an interactive CLI session's transcript JSONL into chat_messages.
 
 Interactive sessions don't flow through the pump, so nothing writes their turns
-to the DB. On the ``Stop`` hook the proxy reads the
-Claude transcript JSONL (``transcript_path`` forwarded by ``hooks/stop_tracker.py``)
-and appends new **user/assistant text, thinking and tool events** to
-``chat_messages`` for dashboard visibility. (Resume itself uses the CLI's own
+to the DB. The terminal's own tails (the output debounce, the reaper's sweep,
+the close) find the Claude transcript JSONL in the session's engine folder and
+append new **user/assistant text, thinking and tool events** to
+``chat_messages`` for dashboard visibility; the ``Stop`` hook's
+``transcript_path`` is never opened. (Resume itself uses the CLI's own
 ``--resume`` off the same JSONL, so it does not depend on this.)
 
 An assistant text written right before a tool call (its message stopped on
@@ -55,7 +56,9 @@ import base64
 import json
 import logging
 import os
+import posixpath
 import re
+import stat
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -79,6 +82,7 @@ from storage.chat.chat_titles import (
     COMMAND_TAGS,
     remove_tag_blocks,
     title_from_prompt,
+    without_start_context,
 )
 from ws import wire_events as wire
 
@@ -133,8 +137,17 @@ _ATTACH_TS_SKEW_S = 1.0
 # In-memory like the cursor: the local path always seeks before it tails, and the
 # satellite path owns once-only delivery, so neither re-reads persisted lines.
 _tool_events: dict[str, ToolEventBuffer] = {}
+# session_id → how far a person's ``/model`` has come: ``_PICKED`` from its
+# command record, ``_TURNED`` from the next prompt on. The first answer of that
+# turn names the model picked (the batch's ``model_chosen``). An answer before
+# the next prompt is a request still in flight, and Claude Code's own fallback
+# (Fable to Opus on a refusal) writes no command record, so neither is a pick.
+_model_picks: dict[str, str] = {}
+_PICKED, _TURNED = "picked", "turned"
+_MODEL_COMMAND = "<command-name>/model</command-name>"
+_SYNTHETIC_MODEL = "<synthetic>"
 # Serializes cursor+read+persist per session — overlapping tail triggers (debounce
-# / sweep / close / Stop hook) run in separate threads and would otherwise both
+# / sweep / close / the queue's fresh tail) run in separate threads and would otherwise both
 # read the cursor before either advances it, persisting the same slice twice.
 _tail_locks = TailLocks()
 
@@ -146,6 +159,7 @@ def forget(session_id: str) -> None:
     _offsets.pop(session_id, None)
     _tool_events.pop(session_id, None)
     _attach_ts.pop(session_id, None)
+    _model_picks.pop(session_id, None)
     _tail_locks.forget(session_id)
 
 
@@ -165,10 +179,12 @@ def seek_past_existing(session_id: str, chat_id: str = "") -> int:
     """
     path = resolve_transcript_path(session_id)
     n = 0
-    if path and os.path.isfile(path):
+    if path:
         try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                n = sum(1 for _ in fh)
+            opened = _open_transcript(path)
+            if opened is not None:
+                with os.fdopen(opened[0], "rb") as fh:
+                    n = sum(1 for _ in _records(fh))
         except Exception:
             logger.exception("seek_past_existing failed for %s", session_id[:8])
             n = 0
@@ -185,29 +201,118 @@ def seek_past_existing(session_id: str, chat_id: str = "") -> int:
     return n
 
 
-def resolve_transcript_path(session_id: str) -> str | None:
-    """Find the Claude session JSONL on disk WITHOUT the Stop hook.
+# How many entries the ``projects`` folder may list before a search raises.
+_PROJECTS_MAX_ENTRIES = 10_000
 
-    The CLI writes ``<claude_dir>/projects/<project-hash>/<session_id>.jsonl``;
-    the project hash derives from the (sandbox) CWD, so search every project dir
-    under the session's host ``.claude``. This is the robust path — the native
-    TUI does not reliably fire the ``Stop`` hook, so we discover + tail the
-    transcript ourselves on close + periodically rather than depend on it."""
+
+def transcript_files(claude_dir: str, session_id: str, agent: str = "") -> list[str]:
+    """Every ``<claude_dir>/projects/<project>/<session_id>.jsonl``: the
+    CLI names the project folder after the working folder it sees, so each
+    one is looked in. Only a regular file in a real folder, reached beneath
+    the agent's real folder (``core.agent_folder``) with no link at any part
+    below it, is answered; the path is ``claude_dir`` as given, joined. An
+    engine folder in no agent's folder, a link at ``projects`` or above it
+    up to the agent's folder, and a missing folder answer
+    ``[]``; a ``projects`` folder past ``_PROJECTS_MAX_ENTRIES`` entries
+    and any other failure to read the folder raise, so a caller can tell
+    "none" from "could not tell". Blocking: off the event loop."""
+    from core.agent_folder import beneath_agent
+    from services.infra import safe_fs
+    if not claude_dir or not session_id:
+        return []
+    try:
+        root, rel = beneath_agent(claude_dir, agent)
+    except (safe_fs.SafeFsError, ValueError):
+        return []
+    name = f"{session_id}.jsonl"
+    found: list[str] = []
+    try:
+        for step in safe_fs.walk_beneath(root, posixpath.join(rel, "projects"),
+                                         max_entries=_PROJECTS_MAX_ENTRIES):
+            for project in step.dirs:
+                try:
+                    st = safe_fs.lstat_beneath(step.dirfd, f"{project}/{name}")
+                except (FileNotFoundError, NotADirectoryError, safe_fs.SafeFsError):
+                    continue
+                if stat.S_ISREG(st.st_mode):
+                    found.append(os.path.join(claude_dir, "projects", project, name))
+            break
+    except safe_fs.TooManyEntries:
+        raise
+    except (FileNotFoundError, NotADirectoryError, safe_fs.SafeFsError):
+        return []
+    return found
+
+
+def find_transcript(claude_dir: str, session_id: str, agent: str = "") -> str | None:
+    """The first of :func:`transcript_files`, or None."""
+    files = transcript_files(claude_dir, session_id, agent)
+    return files[0] if files else None
+
+
+def resolve_transcript_path(session_id: str) -> str | None:
+    """Find the Claude session JSONL on disk WITHOUT the Stop hook, in the
+    session's host ``.claude`` (:func:`find_transcript`). This is the robust
+    path — the native TUI does not reliably fire the ``Stop`` hook, so we
+    discover + tail the transcript ourselves on close + periodically rather
+    than depend on it."""
     from core.session.session_state import get_session_claude_dir
     claude_dir = get_session_claude_dir(session_id)
     if not claude_dir:
         return None
-    projects = os.path.join(claude_dir, "projects")
-    if not os.path.isdir(projects):
+    try:
+        return find_transcript(claude_dir, session_id)
+    except OSError:
+        logger.warning("transcript of %s: its engine folder could not be read",
+                       session_id[:8], exc_info=True)
+        return None
+
+
+# One transcript record is one JSON line the CLI writes. A longer one is read
+# past and never held, so a tail holds one record at a time while it reads.
+_RECORD_MAX_BYTES = 64 * 1024 * 1024
+_SKIP_CHUNK = 1024 * 1024
+
+
+def _open_transcript(path: str, agent: str = "") -> tuple[int, os.stat_result] | None:
+    """``(fd, stat)`` of the transcript at ``path``: a regular file reached
+    beneath the agent's real folder (``core.agent_folder``) with no link at
+    any part below it, a pipe or a device refused at once, never waited on.
+    None when it is missing, in no agent's folder or refused; any other
+    failure raises. The caller closes the descriptor."""
+    from core.agent_folder import beneath_agent
+    from services.infra import safe_fs
+    if not path:
         return None
     try:
-        for proj in os.listdir(projects):
-            candidate = os.path.join(projects, proj, f"{session_id}.jsonl")
-            if os.path.isfile(candidate):
-                return candidate
-    except OSError:
+        return safe_fs.open_regular_for_read(*beneath_agent(path, agent))
+    except FileNotFoundError:
         return None
-    return None
+    except safe_fs.SafeFsError as exc:
+        logger.warning("transcript %s not read: %s", path, type(exc).__name__)
+        return None
+
+
+def _records(fh):
+    """Each newline-ended record of a binary file, in order: its bytes, or
+    None for one longer than ``_RECORD_MAX_BYTES`` (read past, never held).
+    A last record with no newline yet is the CLI's write in progress: it is
+    not yielded, so the next tail reads it whole."""
+    cap = _RECORD_MAX_BYTES
+    while True:
+        rec = fh.readline(cap + 1)
+        if rec.endswith(b"\n"):
+            yield rec
+            continue
+        if len(rec) <= cap:
+            return
+        while True:
+            more = fh.readline(_SKIP_CHUNK)
+            if not more:
+                return
+            if more.endswith(b"\n"):
+                break
+        yield None
 
 
 def resolve_and_tail(session_id: str, chat_id: str) -> dict:
@@ -496,29 +601,57 @@ def _on_tool_use(buf: ToolEventBuffer, reg, task_store, chat_id: str,
     return 0
 
 
+def holds_a_prompt(path: str, agent: str = "") -> bool:
+    """Whether the transcript at ``path`` holds a user record (a session
+    that can resume), read record by record beneath the agent's real folder
+    and stopping at the first. False when it is missing, in no agent's folder
+    or refused (a link, a pipe); a disk fault raises. Blocking: off the
+    event loop."""
+    opened = _open_transcript(path, agent)
+    if opened is None:
+        return False
+    with os.fdopen(opened[0], "rb") as fh:
+        for rec in _records(fh):
+            if rec is not None and (b'"type":"user"' in rec or b'"type": "user"' in rec):
+                return True
+    return False
+
+
 def tail_transcript(session_id: str, chat_id: str, transcript_path: str) -> dict:
     """Process transcript lines added since the last tail (LOCAL file path).
 
-    Reads the on-disk JSONL from the per-session line cursor and hands the new
-    lines to :func:`_process_lines`. Idempotent across calls via the cursor.
+    Opens the transcript beneath the agent's real folder (:func:`_open_transcript`),
+    reads its records from the per-session record cursor and hands the new
+    ones to :func:`_process_lines`. Idempotent across calls via the cursor.
     """
-    if not transcript_path or not os.path.isfile(transcript_path):
+    try:
+        opened = _open_transcript(transcript_path)
+    except OSError:
+        logger.exception("tail_transcript read failed for session %s", session_id[:8])
+        return {"persisted": 0, "reason": "read_error"}
+    if opened is None:
         return {"persisted": 0, "reason": "no_file"}
 
-    with _tail_locks.acquire(session_id):
+    with os.fdopen(opened[0], "rb") as fh, _tail_locks.acquire(session_id):
         start = _offsets.get(session_id, 0)
         processed = start
         new_lines: list[str] = []
+        over = 0
         try:
-            with open(transcript_path, encoding="utf-8", errors="replace") as fh:
-                for idx, raw in enumerate(fh):
-                    if idx < start:
-                        continue
-                    processed = idx + 1
-                    new_lines.append(raw)
+            for idx, rec in enumerate(_records(fh)):
+                if idx < start:
+                    continue
+                processed = idx + 1
+                if rec is None:
+                    over += 1
+                    continue
+                new_lines.append(rec.decode("utf-8", errors="replace"))
         except Exception:
             logger.exception("tail_transcript read failed for session %s", session_id[:8])
             return {"persisted": 0, "reason": "read_error"}
+        if over:
+            logger.warning("transcript of %s: %d record(s) over %d bytes not read",
+                           session_id[:8], over, _RECORD_MAX_BYTES)
 
         _offsets[session_id] = processed
         result = _process_lines(session_id, chat_id, new_lines,
@@ -578,6 +711,12 @@ class _LineBatch:
     # "tool_use" (mid-turn), "end_turn" (turn closed), None (nothing
     # turn-relevant in the batch — tool_result-only lines don't count).
     last_signal: str | None = None
+    # The model a person picked in this batch (``_model_picks``), or "".
+    model_chosen: str = ""
+    # The typed ending of an API-error row (a limit, an error), and whether
+    # the engine opened its own limit menu on it (``_api_error_line``).
+    ending: Any = None
+    limit_menu: bool = False
     # The journal time of the line that set ``last_signal`` (the CLI host's
     # clock): a terminal parked on a dialog ignores a reopen from before it.
     last_signal_at: float | None = None
@@ -659,25 +798,36 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
         msg = obj.get("message") or {}
         content = msg.get("content")
 
-        if obj.get("isApiErrorMessage"):
-            # A CLI-synthesized API-error row (its own marker — never model
-            # prose, which routinely discusses rate limits): if it names a
-            # provider limit, rest the account and fail the scope over now.
-            # Placed after the replay guard so a re-attach replay of an old
-            # error can't re-mark. The row still persists as assistant text
-            # below — the user should see the error in the chat.
-            try:
-                from services.engines.subscription_pool import throttle_from_cli_error
-                throttle_from_cli_error(session_id, _extract_text(content))
-            except Exception:
-                logger.exception(
-                    "tailer limit-detection failed for %s", session_id[:8])
-
         if kind == "user":
             _user_line(b, obj, content)
         elif kind == "assistant" and isinstance(content, list):
             _assistant_line(b, obj, msg, content)
+        if obj.get("isApiErrorMessage"):
+            _api_error_line(b, obj, content)
     return _finish_batch(b)
+
+
+def _api_error_line(b: _LineBatch, obj: dict, content) -> None:
+    """A CLI-synthesized API-error row (its own marker, never model prose,
+    which routinely discusses rate limits; after the replay guard, so a
+    re-attach replay of an old error acts on nothing): the engine's turn ended
+    on it, so the row's signal is the turn's end, never a ``tool_use`` (its
+    ``stop_sequence``), and the batch carries its typed ending
+    (``translator.api_error_ending``), which the session folds. An error that
+    is no limit keeps the overload's brief nudge here. The row still persists
+    as assistant text above: the person sees the engine's words."""
+    from core.events import turn_ending
+    from core.layers.cli.translator import api_error_ending, limit_menu_opens
+    b.ending = api_error_ending(obj)
+    b.limit_menu = b.ending.reason == turn_ending.LIMIT and limit_menu_opens(obj)
+    b.last_signal = "end_turn"
+    b.last_signal_at = line_time(obj)
+    if b.ending.reason != turn_ending.LIMIT:
+        try:
+            from services.engines.subscription_pool import nudge_from_cli_error
+            nudge_from_cli_error(b.session_id, _extract_text(content))
+        except Exception:
+            logger.exception("tailer overload nudge failed for %s", b.session_id[:8])
 
 
 def _compact_boundary_line(b: _LineBatch, obj: dict) -> None:
@@ -771,9 +921,11 @@ def _user_line(b: _LineBatch, obj: dict, content) -> None:
         return
     if obj.get("isMeta"):
         return  # local-command caveat / CLI meta — never user text
-    # Drop any restored-history digest the reseed prepended to the
-    # cold prompt — only the real prompt belongs in chat_messages.
-    text = strip_seed_prefix(_extract_text(content))
+    # Only the real prompt belongs in chat_messages: the platform's start
+    # block (a first message carries one where no other door did) and any
+    # restored-history digest the reseed prepended to the cold prompt go,
+    # before the title and the row read it.
+    text = strip_seed_prefix(without_start_context(_extract_text(content)))
     if _is_harness_injected_user_line(obj, text):
         return  # bg task-notification — harness, not the user
     if text.strip().startswith("[Request interrupted by user"):
@@ -796,6 +948,8 @@ def _user_line(b: _LineBatch, obj: dict, content) -> None:
     if text.strip():
         cleaned = _strip_command_noise(text)
         if cleaned is None:
+            if _MODEL_COMMAND in text:
+                _model_picks[b.session_id] = _PICKED
             return  # slash-command record — local output, not a prompt
         # Claimed by line uuid like assistant text: the CLI inserts
         # its file-history-snapshot line BEFORE the prompt it just
@@ -818,6 +972,8 @@ def _user_line(b: _LineBatch, obj: dict, content) -> None:
         _drop_dialogs(b)
         b.last_signal = "user"
         b.last_signal_at = line_time(obj)
+        if _model_picks.get(b.session_id) == _PICKED:
+            _model_picks[b.session_id] = _TURNED
         # The batch's first user row that titles anything: a photo alone
         # (marks and the attachments block) leaves the title to the next.
         if b.first_user_text is None and _title_from_prompt(cleaned):
@@ -853,6 +1009,11 @@ def _assistant_line(b: _LineBatch, obj: dict, msg: dict, content: list) -> None:
     # and are skipped.
     usage = msg.get("usage")
     msg_id = msg.get("id")
+    model = msg.get("model") or ""
+    if (msg_id and model and model != _SYNTHETIC_MODEL
+            and _model_picks.get(b.session_id) == _TURNED):
+        _model_picks.pop(b.session_id, None)
+        b.model_chosen = str(model)
     if (isinstance(usage, dict) and msg_id
             and b.buf.claim(f"usage:{msg_id}")):
         acc = b.usage_by_model.setdefault(msg.get("model") or "", {
@@ -927,6 +1088,11 @@ def _assistant_line(b: _LineBatch, obj: dict, msg: dict, content: list) -> None:
         b.last_assistant_text = "".join(msg_text_parts)
         b.last_signal = "end_turn" if sr == "end_turn" else "tool_use"
         b.last_signal_at = line_time(obj)
+        if sr == "end_turn" and not obj.get("isApiErrorMessage"):
+            # The batch's last turn end decides: a turn that ended clean
+            # after an API error's row in the same batch clears its ending.
+            b.ending = None
+            b.limit_menu = False
 
 
 def _finish_batch(b: _LineBatch) -> dict:
@@ -993,7 +1159,8 @@ def _finish_batch(b: _LineBatch) -> dict:
         "persisted": b.persisted,
         "title_set": title_set,
         # Interactive completion signal (consumed by interactive_session).
-        "turn_complete": b.last_stop_reason == "end_turn",
+        # A turn that ended short is no completion: its ending acts instead.
+        "turn_complete": b.last_stop_reason == "end_turn" and b.ending is None,
         "last_message": b.last_assistant_text,
         "last_signal": b.last_signal,
         "last_signal_at": b.last_signal_at,
@@ -1010,6 +1177,11 @@ def _finish_batch(b: _LineBatch) -> dict:
         # Early-title counters (see the init comment above).
         "assistant_chars": b.assistant_chars,
         "tool_rows": b.tool_rows,
+        # The model a person picked inside the terminal, only when one was.
+        **({"model_chosen": b.model_chosen} if b.model_chosen else {}),
+        # A turn that ended short: its typed ending, and whether the engine
+        # opened its own limit menu.
+        **({"ending": b.ending.as_dict(), "limit_menu": b.limit_menu} if b.ending is not None else {}),
     }
 
 

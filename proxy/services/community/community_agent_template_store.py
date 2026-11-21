@@ -26,8 +26,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.permission_modes import stored_mode
 from services.apps.slugs import APP_SLUG_RE
 from services.community import template_sig
+from services.mcp import outside_picks
+from services.scheduler import task_fields
 from storage import catalog_schema
 
 # ---------------------------------------------------------------------------
@@ -69,6 +72,11 @@ class TaskItem:
     # template names none (seeded as the platform's new-task default), None
     # on an installed record written before 1.9.1 (no audience key at all).
     audience: str | None = ""
+    # The task's column words: "" for Don't Ask, the Auto word for Auto
+    # (permission_modes.stored_mode). An engine that cannot run Auto drops
+    # it at install (resolve_task_pins).
+    permission_mode: str = ""
+    timeout_seconds: int = 600
 
 
 @dataclass
@@ -180,6 +188,17 @@ class McpRequirement:
 
 
 @dataclass
+class ToolLimit:
+    """A limit of ``mcps.json`` ``limits``: what the agent may use of one
+    MCP in one kind of session (``governs``: ``runs`` or ``chats``):
+    ``read_only`` with no names, or ``custom`` with the function names."""
+    mcp: str
+    governs: str
+    access: str
+    functions: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SkillPackageRequirement:
     """One standalone community skill package the template needs
     (``skills.json`` → ``required[]``). ``skills`` selects ids within the
@@ -222,6 +241,13 @@ class CommunityAgentTemplate:
     # Standalone skill packages (skills.json) — installed from the skills
     # catalog and assigned to the agent at install time.
     skill_packages: list[SkillPackageRequirement] = field(default_factory=list)
+    # The agent's tool limits (mcps.json ``limits``), written at install
+    # whether or not the tool is enabled yet.
+    tool_limits: list[ToolLimit] = field(default_factory=list)
+    # The team account (agent.json): people's sessions use the agent's own
+    # accounts from the floor role up.
+    team_account: bool = False
+    team_account_floor: str = "editor"
     # Template-shipped app dashboards (dashboards.json + dashboards/).
     dashboards: list[DashboardItem] = field(default_factory=list)
     # Template-shipped folder apps (apps/<slug>/ shared, user-apps/<slug>/
@@ -274,6 +300,7 @@ def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
     prompt_md = (template_dir / persona).read_text(encoding="utf-8")
     readme_md = (template_dir / "README.md").read_text(encoding="utf-8")
     mcps = _parse_mcps_json(document["mcps.json"])
+    tool_limits = _parse_tool_limits(document["mcps.json"])
     tasks = _parse_tasks_json(document.get("tasks.json") or {})
     triggers = _parse_triggers_json(document.get("triggers.json") or {})
     skill_packages = _parse_skills_json(document.get("skills.json") or {})
@@ -302,6 +329,11 @@ def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
 
     raw_default_scope = agent_json.get("default_scope") or "user"
     collaborative = bool(agent_json.get("collaborative", True))
+    team_account = bool(agent_json.get("team_account") or False)
+    team_account_floor = str(agent_json.get("team_account_floor") or "editor")
+    if team_account and not collaborative:
+        raise TemplateValidationError(
+            "agent.json: team_account: the team account is for an agent with both a shared and a personal space")
     dashboards = (
         _parse_dashboards_json(
             document["dashboards.json"], template_dir,
@@ -350,6 +382,9 @@ def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
         collaborative=collaborative,
         default_for_new_users=default_for_new_users,
         core_mcps=raw_core_mcps,
+        tool_limits=tool_limits,
+        team_account=team_account,
+        team_account_floor=team_account_floor,
     )
 
 
@@ -428,6 +463,8 @@ def template_to_persistable_dict(template: CommunityAgentTemplate, *,
         "mcps": [{"name": m.name, "min_version": m.min_version, "skills": list(m.skills)}
                  for m in template.mcps],
         "skill_packages": [{"name": p.name, "skills": list(p.skills)} for p in template.skill_packages],
+        "tool_limits": [{"mcp": lim.mcp, "governs": lim.governs, "access": lim.access,
+                         "functions": list(lim.functions)} for lim in template.tool_limits],
     }
     if agent_slug:
         out["baseline"] = template_baseline(template, agent_slug)
@@ -792,6 +829,7 @@ def _task_to_dict(t: TaskItem) -> dict[str, Any]:
         "roles": t.roles,
         "override_model": t.override_model, "layer": t.layer,
         "notification_mode": t.notification_mode, "audience": t.audience,
+        "permission_mode": t.permission_mode, "timeout_seconds": t.timeout_seconds,
     }
 
 
@@ -816,6 +854,8 @@ def _task_from_dict(raw: dict[str, Any]) -> TaskItem:
         # A record written before 1.9.1 has no audience key (None): its rows
         # took the migration's value, not a seed's.
         audience=None if "audience" not in raw else str(raw.get("audience") or ""),
+        permission_mode=str(raw.get("permission_mode") or ""),
+        timeout_seconds=int(raw.get("timeout_seconds") or task_fields.DEFAULT_TIMEOUT_S),
     )
 
 
@@ -883,6 +923,23 @@ def _parse_default_for_new_users(raw: Any) -> dict[str, Any]:
 # The documents, past the schema
 # ---------------------------------------------------------------------------
 
+def _parse_tool_limits(data: dict[str, Any]) -> list[ToolLimit]:
+    """``mcps.json`` ``limits``: ``{mcp: {runs: read_only | [names], chats: ...}}``
+    as rows; the schema refused every other shape."""
+    out: list[ToolLimit] = []
+    for mcp, columns in (data.get("limits") or {}).items():
+        for governs in ("runs", "chats"):
+            value = (columns or {}).get(governs)
+            if value is None:
+                continue
+            if value == outside_picks.READ_ONLY:
+                out.append(ToolLimit(mcp=str(mcp), governs=governs, access=outside_picks.READ_ONLY))
+            else:
+                out.append(ToolLimit(mcp=str(mcp), governs=governs, access=outside_picks.CUSTOM,
+                                     functions=sorted({str(f) for f in value})))
+    return out
+
+
 def _parse_mcps_json(data: dict[str, Any]) -> list[McpRequirement]:
     return [
         McpRequirement(name=raw["name"], min_version=raw.get("min_version"),
@@ -930,6 +987,8 @@ def _parse_tasks_json(data: dict[str, Any]) -> list[TaskItem]:
             layer=raw.get("layer") or None,
             notification_mode=raw.get("notification_mode") or DEFAULT_NOTIFICATION_MODE,
             audience=raw.get("audience") or "",
+            permission_mode=stored_mode(raw.get("permission_mode")) or "",
+            timeout_seconds=task_fields.clean_timeout(raw.get("timeout_seconds")) or task_fields.DEFAULT_TIMEOUT_S,
         ))
     return out
 

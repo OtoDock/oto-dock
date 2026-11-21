@@ -54,6 +54,14 @@ def test_bootstrap_missing_token_returns_401(monkeypatch):
     assert "X-Pairing-Token" in resp.json()["detail"]
 
 
+def _pairing_row(fake_conn):
+    """The token's row as the store answers it (``remote_store.pairing_row``),
+    from the test's fake row: a paired machine's, unexpired, or none."""
+    row = fake_conn.execute.return_value.fetchone.return_value
+    return patch("storage.remote_store.pairing_row",
+                 return_value=None if row is None else {"id": row["id"], "pairing_scope": "admin", "expired": False})
+
+
 def test_bootstrap_invalid_token_returns_401(monkeypatch):
     """Token not found in DB → 401."""
     app = _make_app()
@@ -61,11 +69,7 @@ def test_bootstrap_invalid_token_returns_401(monkeypatch):
     # Make the DB lookup return no row
     fake_conn = MagicMock()
     fake_conn.execute.return_value.fetchone.return_value = None
-    from contextlib import contextmanager
-    @contextmanager
-    def fake_get_conn():
-        yield fake_conn
-    with patch("storage.pg.get_conn", fake_get_conn):
+    with _pairing_row(fake_conn):
         resp = client.get(
             "/v1/satellite/bootstrap",
             headers={"X-Pairing-Token": "bogus"},
@@ -85,12 +89,8 @@ def test_bootstrap_returns_self_extracting_script(monkeypatch):
 
     fake_conn = MagicMock()
     fake_conn.execute.return_value.fetchone.return_value = {"id": "machine-1"}
-    from contextlib import contextmanager
-    @contextmanager
-    def fake_get_conn():
-        yield fake_conn
 
-    with patch("storage.pg.get_conn", fake_get_conn), \
+    with _pairing_row(fake_conn), \
          patch.object(_rs, "exchange_pairing_token",
                       return_value="machine-secret-xyz") as mock_exchange, \
          patch.object(_cfg, "get_platform_public_url",
@@ -121,6 +121,24 @@ def test_bootstrap_returns_self_extracting_script(monkeypatch):
     )
 
 
+def test_bootstrap_on_a_private_plain_http_address_embeds_the_plain_socket(monkeypatch):
+    """The address the script dials follows the rule the command follows: a LAN
+    install served over HTTP has no TLS to answer ``wss://``."""
+    import config as _cfg
+    from storage import remote_store as _rs
+
+    client = TestClient(_make_app())
+    fake_conn = MagicMock()
+    fake_conn.execute.return_value.fetchone.return_value = {"id": "machine-1"}
+
+    monkeypatch.setattr(_cfg, "DASHBOARD_PUBLIC_URL", "http://192.168.1.10:8400")
+    with _pairing_row(fake_conn), \
+         patch.object(_rs, "exchange_pairing_token", return_value="s"):
+        resp = client.get("/v1/satellite/bootstrap", headers={"X-Pairing-Token": "t"})
+    assert resp.status_code == 200
+    assert 'PLATFORM_URL="ws://192.168.1.10:8400/v1/satellite"' in resp.text
+
+
 def test_bootstrap_windows_returns_powershell(monkeypatch):
     """``?os=windows`` returns a PowerShell-flavored bootstrap (install.ps1
     template body + $env: variable assignments instead of bash export)."""
@@ -132,12 +150,8 @@ def test_bootstrap_windows_returns_powershell(monkeypatch):
 
     fake_conn = MagicMock()
     fake_conn.execute.return_value.fetchone.return_value = {"id": "machine-1"}
-    from contextlib import contextmanager
-    @contextmanager
-    def fake_get_conn():
-        yield fake_conn
 
-    with patch("storage.pg.get_conn", fake_get_conn), \
+    with _pairing_row(fake_conn), \
          patch.object(_rs, "exchange_pairing_token", return_value="secret-xyz"), \
          patch.object(_cfg, "get_platform_public_url", return_value="platform.test"):
         resp = client.get(
@@ -192,12 +206,8 @@ def test_bootstrap_windows_hardens_python_store_stub(monkeypatch):
 
     fake_conn = MagicMock()
     fake_conn.execute.return_value.fetchone.return_value = {"id": "machine-1"}
-    from contextlib import contextmanager
-    @contextmanager
-    def fake_get_conn():
-        yield fake_conn
 
-    with patch("storage.pg.get_conn", fake_get_conn), \
+    with _pairing_row(fake_conn), \
          patch.object(_rs, "exchange_pairing_token", return_value="secret-xyz"), \
          patch.object(_cfg, "get_platform_public_url", return_value="platform.test"):
         resp = client.get(
@@ -250,12 +260,8 @@ def test_bootstrap_no_public_url_returns_400(monkeypatch):
 
     fake_conn = MagicMock()
     fake_conn.execute.return_value.fetchone.return_value = {"id": "machine-1"}
-    from contextlib import contextmanager
-    @contextmanager
-    def fake_get_conn():
-        yield fake_conn
 
-    with patch("storage.pg.get_conn", fake_get_conn), \
+    with _pairing_row(fake_conn), \
          patch.object(_rs, "exchange_pairing_token",
                       return_value="secret"), \
          patch.object(_cfg, "get_platform_public_url", return_value=""):
@@ -281,12 +287,8 @@ def test_bootstrap_embeds_valid_tarball():
 
     fake_conn = MagicMock()
     fake_conn.execute.return_value.fetchone.return_value = {"id": "m1"}
-    from contextlib import contextmanager
-    @contextmanager
-    def fake_get_conn():
-        yield fake_conn
 
-    with patch("storage.pg.get_conn", fake_get_conn), \
+    with _pairing_row(fake_conn), \
          patch.object(_rs, "exchange_pairing_token", return_value="s"), \
          patch.object(_cfg, "get_platform_public_url", return_value="t.test"):
         resp = client.get(
@@ -519,13 +521,7 @@ def test_bootstrap_os_words_pick_the_script(monkeypatch, word, media, head):
     client = TestClient(app)
     fake_conn = MagicMock()
     fake_conn.execute.return_value.fetchone.return_value = {"id": "machine-1"}
-    from contextlib import contextmanager
-
-    @contextmanager
-    def fake_get_conn():
-        yield fake_conn
-
-    with patch("storage.pg.get_conn", fake_get_conn), \
+    with _pairing_row(fake_conn), \
          patch.object(_rs, "exchange_pairing_token", return_value="secret-xyz"), \
          patch.object(_cfg, "get_platform_public_url", return_value="platform.test"):
         resp = client.get(f"/v1/satellite/bootstrap?os={word}", headers={"X-Pairing-Token": "tok"})

@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from services.mcp import mcp_registry
+from services.mcp import mcp_manifest_store, mcp_registry
 
 # ---------------------------------------------------------------------------
 # Manifest validator
@@ -124,7 +124,7 @@ class TestGetToolFilter:
         manifest = MagicMock()
         manifest.tool_filter = None
         with patch.dict(
-            mcp_registry._manifests, {"some-mcp": manifest}, clear=False,
+            mcp_manifest_store._manifests, {"some-mcp": manifest}, clear=False,
         ), patch(
             "storage.mcp.mcp_store.get_tool_filter_regex", return_value="^x_.*",
         ):
@@ -136,7 +136,7 @@ class TestGetToolFilter:
             arg_name="--enabled-tools",
         )
         with patch.dict(
-            mcp_registry._manifests, {"some-mcp": manifest}, clear=False,
+            mcp_manifest_store._manifests, {"some-mcp": manifest}, clear=False,
         ), patch(
             "storage.mcp.mcp_store.get_tool_filter_regex", return_value="",
         ):
@@ -148,7 +148,7 @@ class TestGetToolFilter:
             arg_name="--enabled-tools",
         )
         with patch.dict(
-            mcp_registry._manifests, {"some-mcp": manifest}, clear=False,
+            mcp_manifest_store._manifests, {"some-mcp": manifest}, clear=False,
         ), patch(
             "storage.mcp.mcp_store.get_tool_filter_regex",
             return_value="^(mail|calendar)_.*",

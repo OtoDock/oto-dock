@@ -947,6 +947,18 @@ def test_responses_web_search_tool_rides_only_with_client_tools_on_server_tool_m
     assert [t["type"] for t in kw["tools"]] == ["function"]
 
 
+def test_gpt_6_2_sol_on_direct_llm_reads_its_registry_row(monkeypatch):
+    """GPT-6.2 Sol, the Direct LLM Sol since it replaced 6.1 Sol: the
+    registry row's server tools, the encrypted reasoning, and "max" folded
+    to the top of OpenAI's scale (OpenAI's page: the API refuses only
+    "none"). A live call with a real key is not proven here."""
+    _, kw = _responses_run(monkeypatch, _TEXT_STREAM, model="gpt-6.2-sol", effort="max")
+    assert kw["model"] == "gpt-6.2-sol"
+    assert kw["tools"][-1] == {"type": "web_search"}
+    assert kw["reasoning"]["effort"] == "xhigh"
+    assert "reasoning.encrypted_content" in kw["include"]
+
+
 def test_responses_web_search_events_map_to_a_server_tool_row(monkeypatch):
     monkeypatch.setattr(_oa_mod.app_config, "model_supports_server_tools", lambda m: True)
     events_in = [

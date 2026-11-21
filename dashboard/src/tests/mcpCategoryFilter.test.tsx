@@ -9,8 +9,8 @@ vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: { sub: 'u1', role: 'admin', agent_roles: {} } }),
 }))
 vi.mock('@/components/CommunityMcpsBrowser', () => ({ default: () => null }))
-vi.mock('@/components/ServiceAccountBindingDropdown', () => ({
-  ServiceAccountBindingDropdown: () => null,
+vi.mock('@/components/accounts/AgentAccounts', () => ({
+  AgentAccounts: () => null,
 }))
 
 import * as authApi from '@/api/auth'

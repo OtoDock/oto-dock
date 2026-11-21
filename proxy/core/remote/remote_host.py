@@ -18,7 +18,12 @@ import asyncio
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from core.execution_layer import AgentConfig, LayerCapabilities, RemoteStartPlan
+    from core.execution_layer import (
+        AgentConfig,
+        LayerCapabilities,
+        RemoteStartPlan,
+        SpawnPlan,
+    )
     from core.remote.remote_session_info import RemoteSessionInfo
     from core.remote.satellite_connection import SatelliteConnectionManager
 
@@ -33,6 +38,7 @@ class RemoteLayerHost(Protocol):
     def _adapter(info: RemoteSessionInfo): ...
     async def _build_start_payload(
         self, session_id: str, config: AgentConfig, execution_path: str,
+        spawn: SpawnPlan | None = None,
     ) -> RemoteStartPlan: ...
     async def _hard_abort(self, session_id: str) -> bool: ...
     async def _initial_workspace_sync(
@@ -43,7 +49,8 @@ class RemoteLayerHost(Protocol):
         session_knowledge_rw: bool = False,
         progress_cb=None,
         background: bool = False,
-    ) -> None: ...
+        shared_by_many: bool = False,
+    ) -> bool: ...
     async def _insert_session(self, info: RemoteSessionInfo) -> None: ...
     def capabilities_for(self, session_id: str) -> LayerCapabilities: ...
     async def close_session(self, session_id: str) -> None: ...

@@ -10,7 +10,14 @@ from unittest.mock import patch
 
 import pytest
 
-from services.mcp import mcp_installer
+from services.mcp import mcp_installer, mcp_system_deps
+
+
+def _install(*args, **kwargs):
+    """``install_mcp`` with its steps as this process's children, unless the
+    test names its own runner (the runner has no default)."""
+    kwargs.setdefault("run", mcp_installer.run_unconfined)
+    return mcp_installer.install_mcp(*args, **kwargs)
 
 
 class TestParseSource:
@@ -348,14 +355,14 @@ class TestCheckSystemRequirements:
     def test_node_min_reported_when_not_installed(self):
         req = mcp_installer.SystemRequirementsInput(node_min="99.0")
         # Either node isn't installed, or it's < 99 — either way the check must flag it.
-        with patch("services.mcp.mcp_installer._node_version", return_value=""):
+        with patch("services.mcp.mcp_system_deps._node_version", return_value=""):
             missing = mcp_installer.check_system_requirements(req)
             assert any(m.kind == "interpreter" and m.name == "node" for m in missing)
 
     def test_missing_package_reported(self):
         req = mcp_installer.SystemRequirementsInput(debian=["this-package-does-not-exist"])
-        with patch("services.mcp.mcp_installer._detect_os_keys", return_value=["debian"]), \
-             patch("services.mcp.mcp_installer._is_package_installed", return_value=False):
+        with patch("services.mcp.mcp_system_deps._detect_os_keys", return_value=["debian"]), \
+             patch("services.mcp.mcp_system_deps._is_package_installed", return_value=False):
             missing = mcp_installer.check_system_requirements(req)
             assert len(missing) == 1
             assert missing[0].kind == "package"
@@ -364,8 +371,8 @@ class TestCheckSystemRequirements:
 
     def test_installed_package_not_reported(self):
         req = mcp_installer.SystemRequirementsInput(debian=["some-package"])
-        with patch("services.mcp.mcp_installer._detect_os_keys", return_value=["debian"]), \
-             patch("services.mcp.mcp_installer._is_package_installed", return_value=True):
+        with patch("services.mcp.mcp_system_deps._detect_os_keys", return_value=["debian"]), \
+             patch("services.mcp.mcp_system_deps._is_package_installed", return_value=True):
             missing = mcp_installer.check_system_requirements(req)
             assert missing == []
 
@@ -384,9 +391,9 @@ class TestPinLocalManifest:
         return mf
 
     def test_pins_version_and_source_npm_scoped(self, tmp_path: Path):
-        from services.mcp import mcp_updater
+        from services.mcp import mcp_pin
         self._write_unpinned(tmp_path, "npm:@notionhq/notion-mcp-server")
-        mcp_updater.pin_local_manifest(tmp_path, "npm", "@notionhq/notion-mcp-server", "2.4.0")
+        mcp_pin.pin_manifest(tmp_path, "npm", "@notionhq/notion-mcp-server", "2.4.0")
         data = json.loads((tmp_path / "manifest.json").read_text())
         assert data["version"] == "2.4.0"
         assert data["server"]["source"] == "npm:@notionhq/notion-mcp-server@2.4.0"
@@ -395,22 +402,73 @@ class TestPinLocalManifest:
         assert (p.registry, p.package, p.version) == ("npm", "@notionhq/notion-mcp-server", "2.4.0")
 
     def test_pins_pypi(self, tmp_path: Path):
-        from services.mcp import mcp_updater
+        from services.mcp import mcp_pin
         self._write_unpinned(tmp_path, "pypi:workspace-mcp")
-        mcp_updater.pin_local_manifest(tmp_path, "pypi", "workspace-mcp", "1.21.3")
+        mcp_pin.pin_manifest(tmp_path, "pypi", "workspace-mcp", "1.21.3")
         data = json.loads((tmp_path / "manifest.json").read_text())
         assert data["version"] == "1.21.3"
         assert data["server"]["source"] == "pypi:workspace-mcp@1.21.3"
 
     def test_pins_pypi_with_its_extras(self, tmp_path: Path):
-        from services.mcp import mcp_updater
+        from services.mcp import mcp_pin
         self._write_unpinned(tmp_path, "pypi:nextcloud-mcp-server[documents]")
-        mcp_updater.pin_local_manifest(
+        mcp_pin.pin_manifest(
             tmp_path, "pypi", "nextcloud-mcp-server", "0.40.0", extras=("documents",))
         data = json.loads((tmp_path / "manifest.json").read_text())
         assert data["server"]["source"] == "pypi:nextcloud-mcp-server[documents]@0.40.0"
         p = mcp_installer.parse_source(data["server"]["source"])
         assert (p.package, p.version, p.extras) == ("nextcloud-mcp-server", "0.40.0", ("documents",))
+
+    def test_settle_writes_what_a_node_build_leaves(self, tmp_path: Path):
+        """The platform builds nothing: it writes the manifest's pin and the
+        one-dependency package.json itself, byte for byte what the machine
+        that built wrote, so both hash the same folder."""
+        from services.mcp import mcp_pin
+        built, platform = tmp_path / "built", tmp_path / "platform"
+        for folder in (built, platform):
+            folder.mkdir()
+            self._write_unpinned(folder, "npm:@scope/pkg")
+            (folder / "server.js").write_text("// tool\n")
+        # The machine's build wrote the file before it read the version back.
+        (built / "package.json").write_bytes(mcp_installer._node_package_json("@scope/pkg", "latest"))
+        assert mcp_pin.settle_built(built, "npm:@scope/pkg", "3.1.4") == "npm:@scope/pkg@3.1.4"
+        assert mcp_pin.settle_built(platform, "npm:@scope/pkg", "3.1.4") == "npm:@scope/pkg@3.1.4"
+        assert (platform / "package.json").read_bytes() == mcp_installer._node_package_json("@scope/pkg", "3.1.4")
+        assert (platform / "manifest.json").read_bytes() == (built / "manifest.json").read_bytes()
+        assert mcp_installer.compute_version_hash(platform) == mcp_installer.compute_version_hash(built)
+
+    def test_settle_keeps_a_pypi_source_its_extras_and_writes_no_package_file(self, tmp_path: Path):
+        from services.mcp import mcp_pin
+        self._write_unpinned(tmp_path, "pypi:nextcloud-mcp-server[documents]")
+        assert mcp_pin.settle_built(
+            tmp_path, "pypi:nextcloud-mcp-server[documents]", "0.40.0",
+        ) == "pypi:nextcloud-mcp-server[documents]@0.40.0"
+        assert not (tmp_path / "package.json").exists()
+        assert json.loads((tmp_path / "manifest.json").read_text())["version"] == "0.40.0"
+
+    @pytest.mark.parametrize("source,version", [
+        ("git+https://example.com/x.git@" + "a" * 40, "1.0.0"),   # no registry to pin
+        ("npm:pkg", ""),                                           # nothing read back
+        ("npm:pkg", "1.0.0; rm -rf /"),                            # not a plain version
+        ("npm:pkg", "../../etc"),
+        ("", "1.0.0"),
+    ])
+    def test_settle_pins_nothing_it_cannot_name(self, tmp_path: Path, source: str, version: str):
+        from services.mcp import mcp_pin
+        mf = self._write_unpinned(tmp_path, "npm:pkg")
+        before = mf.read_bytes()
+        assert mcp_pin.settle_built(tmp_path, source, version) == ""
+        assert mf.read_bytes() == before and not (tmp_path / "package.json").exists()
+
+    def test_the_pin_writes_the_same_bytes_twice(self, tmp_path: Path):
+        """A manifest already pinned by this function is left byte for byte:
+        a second pin (the platform's, after the machine's) drifts no hash."""
+        from services.mcp import mcp_pin
+        mf = self._write_unpinned(tmp_path, "npm:pkg")
+        mcp_pin.pin_manifest(tmp_path, "npm", "pkg", "2.0.0")
+        once = mf.read_bytes()
+        mcp_pin.pin_manifest(tmp_path, "npm", "pkg", "2.0.0")
+        assert mf.read_bytes() == once and b"\r" not in once
 
 
 class TestSelfHash:
@@ -440,9 +498,23 @@ class _Proc:
     def __init__(self, rc: int, out: bytes = b""):
         self.returncode = rc
         self._out = out
+        self.stdout = _Out(out)
 
     async def communicate(self):
         return self._out, b""
+
+    async def wait(self):
+        return self.returncode
+
+
+class _Out:
+    """A stream answering ``read`` from fixed bytes, as a pipe would."""
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def read(self, n: int = -1) -> bytes:
+        chunk, self._data = (self._data, b"") if n < 0 else (self._data[:n], self._data[n:])
+        return chunk
 
 
 def _fake_uv(tmp_path: Path) -> str:
@@ -505,7 +577,7 @@ class TestInstallEnvironment:
         (mcp_dir / "patches" / "pkg+1.0.0.patch").write_text("x")
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(1), _Proc(0, b"Applied patch")])
         monkeypatch.setattr(mcp_installer.shutil, "which", lambda n: "/usr/bin/git" if n == "git" else None)
-        r = await mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0")
+        r = await _install(mcp_dir, "node", "npm:pkg@1.0.0")
         assert r.ok, r.log
         assert calls, "no subprocess recorded"
         for c in calls:
@@ -522,7 +594,7 @@ class TestInstallEnvironment:
             monkeypatch.setenv(k, v)
         mcp_dir = _python_dir(tmp_path)
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(mcp_dir, "python", "pypi:ha-mcp@6.7.0", uv_bin=_fake_uv(tmp_path))
+        r = await _install(mcp_dir, "python", "pypi:ha-mcp@6.7.0", uv_bin=_fake_uv(tmp_path))
         assert r.ok, r.log
         assert len(calls) == 2  # uv venv, uv pip install: no interpreter readback
         for c in calls:
@@ -536,7 +608,7 @@ class TestBinaryOnlyPython:
     @pytest.mark.asyncio
     async def test_pypi_install_is_binary_only(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        await mcp_installer.install_mcp(
+        await _install(
             _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
             uv_bin=_fake_uv(tmp_path), source_build=["antlr4-python3-runtime"],
         )
@@ -549,14 +621,14 @@ class TestBinaryOnlyPython:
     async def test_pip_fallback_is_binary_only_and_isolated(self, tmp_path, monkeypatch):
         mcp_dir = _python_dir(tmp_path)
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        await mcp_installer.install_mcp(mcp_dir, "python", "pypi:ha-mcp", uv_bin=None)
+        await _install(mcp_dir, "python", "pypi:ha-mcp", uv_bin=None)
         pip = calls[1]["argv"]
         assert "--only-binary=:all:" in pip and "--isolated" in pip
 
     @pytest.mark.asyncio
     async def test_git_and_requirements_installs_are_not_binary_only(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        await mcp_installer.install_mcp(
+        await _install(
             _python_dir(tmp_path), "python", "git+https://host/r.git@v1", uv_bin=_fake_uv(tmp_path),
         )
         assert not any("--only-binary=:all:" in c["argv"] for c in calls)
@@ -564,7 +636,7 @@ class TestBinaryOnlyPython:
         mcp_dir.mkdir(parents=True)
         (mcp_dir / "requirements.txt").write_text("x\n")
         calls[:] = []
-        await mcp_installer.install_mcp(mcp_dir, "python", "", uv_bin=_fake_uv(tmp_path))
+        await _install(mcp_dir, "python", "", uv_bin=_fake_uv(tmp_path))
         assert calls and not any("--only-binary=:all:" in c["argv"] for c in calls)
 
     @pytest.mark.asyncio
@@ -576,7 +648,7 @@ class TestBinaryOnlyPython:
         asked = []
         monkeypatch.setattr(mcp_installer, "_python_installed_version",
                             lambda venv, dist: asked.append(dist) or "0.40.0")
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             mcp_dir, "python", "pypi:nextcloud-mcp-server[documents]@0.40.0",
             uv_bin=_fake_uv(tmp_path),
         )
@@ -590,7 +662,7 @@ class TestBinaryOnlyPython:
     @pytest.mark.asyncio
     async def test_an_unpinned_extras_source_upgrades(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        await mcp_installer.install_mcp(
+        await _install(
             _python_dir(tmp_path), "python", "pypi:x[a,b]", uv_bin=_fake_uv(tmp_path),
         )
         assert calls[1]["argv"][-2:] == ["--upgrade", "x[a,b]"]
@@ -598,7 +670,7 @@ class TestBinaryOnlyPython:
     @pytest.mark.asyncio
     async def test_an_unparseable_pypi_source_runs_nothing(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:x[-e]", uv_bin=_fake_uv(tmp_path),
         )
         assert r.ok is False and "Unparseable" in r.log
@@ -610,7 +682,7 @@ class TestBinaryOnlyPython:
         (mcp_dir / "venv").mkdir()
         (mcp_dir / "venv" / "stale").write_text("x")
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        await mcp_installer.install_mcp(mcp_dir, "python", "pypi:ha-mcp@6.7.0", uv_bin=_fake_uv(tmp_path))
+        await _install(mcp_dir, "python", "pypi:ha-mcp@6.7.0", uv_bin=_fake_uv(tmp_path))
         assert calls[0]["argv"][1] == "venv"
         assert not (mcp_dir / "venv" / "stale").exists()
 
@@ -666,7 +738,7 @@ class TestPatches:
         bin_.write_text(f"#!/bin/sh\ntouch {marker}\n")
         bin_.chmod(0o755)
         calls = _recording_spawn(monkeypatch, [_Proc(0)], passthrough=("git",))
-        r = await mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0")
+        r = await _install(mcp_dir, "node", "npm:pkg@1.0.0")
         assert r.ok, r.log
         assert (mcp_dir / "node_modules" / "pkg" / "index.js").read_text() == "new\n"
         assert not marker.exists()
@@ -674,7 +746,7 @@ class TestPatches:
         # A second install over the same node_modules is a no-op for the patch.
         calls[:] = []
         _recording_spawn(monkeypatch, [_Proc(0)], passthrough=("git",))
-        r = await mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0")
+        r = await _install(mcp_dir, "node", "npm:pkg@1.0.0")
         assert r.ok, r.log
         assert (mcp_dir / "node_modules" / "pkg" / "index.js").read_text() == "new\n"
         assert "already applied" in r.log
@@ -684,7 +756,7 @@ class TestPatches:
         mcp_dir = self._patched_node_dir(tmp_path)
         _recording_spawn(monkeypatch, [_Proc(0), _Proc(1), _Proc(0, b"Skipped patch 'node_modules/pkg/index.js'.")])
         monkeypatch.setattr(mcp_installer.shutil, "which", lambda n: "/usr/bin/git")
-        r = await mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0")
+        r = await _install(mcp_dir, "node", "npm:pkg@1.0.0")
         assert r.ok is False
         assert "Skipped patch" in r.log
 
@@ -693,7 +765,7 @@ class TestPatches:
         mcp_dir = self._patched_node_dir(tmp_path)
         _recording_spawn(monkeypatch, [_Proc(0)])
         monkeypatch.setattr(mcp_installer.shutil, "which", lambda n: None)
-        r = await mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0")
+        r = await _install(mcp_dir, "node", "npm:pkg@1.0.0")
         assert r.ok is False
         assert "git" in r.log
 
@@ -701,9 +773,9 @@ class TestPatches:
 class TestSystemRequirementNames:
     def test_bad_names_are_refused_before_any_command(self, monkeypatch):
         ran = []
-        monkeypatch.setattr(mcp_installer.subprocess, "run", lambda *a, **k: ran.append(a))
-        with patch("services.mcp.mcp_installer._detect_os_keys", return_value=["debian"]), \
-             patch("services.mcp.mcp_installer._is_package_installed", return_value=False):
+        monkeypatch.setattr(mcp_system_deps.subprocess, "run", lambda *a, **k: ran.append(a))
+        with patch("services.mcp.mcp_system_deps._detect_os_keys", return_value=["debian"]), \
+             patch("services.mcp.mcp_system_deps._is_package_installed", return_value=False):
             ok, msg = mcp_installer.install_system_requirements(
                 mcp_installer.SystemRequirementsInput(debian=["libmagic1", "--force-yes", "a b"]))
         assert ok is False and "--force-yes" in msg and ran == []
@@ -715,9 +787,9 @@ class TestSystemRequirementNames:
             returncode = 0
             stdout = stderr = ""
 
-        monkeypatch.setattr(mcp_installer.subprocess, "run", lambda cmd, **k: ran.append(cmd) or _R())
-        with patch("services.mcp.mcp_installer._detect_os_keys", return_value=["debian"]), \
-             patch("services.mcp.mcp_installer._is_package_installed", return_value=False):
+        monkeypatch.setattr(mcp_system_deps.subprocess, "run", lambda cmd, **k: ran.append(cmd) or _R())
+        with patch("services.mcp.mcp_system_deps._detect_os_keys", return_value=["debian"]), \
+             patch("services.mcp.mcp_system_deps._is_package_installed", return_value=False):
             ok, _ = mcp_installer.install_system_requirements(
                 mcp_installer.SystemRequirementsInput(debian=["libmagic1", "poppler-utils"]))
         assert ok is True
@@ -745,7 +817,7 @@ class TestVenvRemovalOffTheLoop:
         mcp_dir = tmp_path / "community" / "pkg"
         mcp_dir.mkdir(parents=True)
         with pytest.raises(self._Stop):
-            await mcp_installer.install_mcp(mcp_dir, "python", source)
+            await _install(mcp_dir, "python", source)
         assert seen == [False]
 
 
@@ -816,10 +888,10 @@ def _hung_site(site: str, tmp_path: Path, monkeypatch):
             (mcp_dir / "patches" / "pkg+1.0.0.patch").write_text(_PATCH)
             git = _tool(bin_dir / "git", hang_on="apply")
             monkeypatch.setattr(mcp_installer.shutil, "which", lambda n: str(git) if n == "git" else None)
-        return mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0", timeout=1)
+        return _install(mcp_dir, "node", "npm:pkg@1.0.0", timeout=1)
     if site in ("pypi venv", "pypi pip install"):
         uv = _tool(bin_dir / "uv", hang_on="venv" if site == "pypi venv" else "pip install", body=_UV_OK)
-        return mcp_installer.install_mcp(
+        return _install(
             _python_dir(tmp_path), "python", "pypi:ha-mcp@6.7.0", uv_bin=str(uv), timeout=1)
     mcp_dir = tmp_path / "mcps" / "custom" / "bundled"
     mcp_dir.mkdir(parents=True)
@@ -830,7 +902,7 @@ def _hung_site(site: str, tmp_path: Path, monkeypatch):
         "python floor retry venv": ("venv --python", _UV_FLOOR),
     }[site]
     uv = _tool(bin_dir / "uv", hang_on=hang_on, body=body)
-    return mcp_installer.install_mcp(mcp_dir, "python", "", uv_bin=str(uv), timeout=1)
+    return _install(mcp_dir, "python", "", uv_bin=str(uv), timeout=1)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
@@ -884,11 +956,16 @@ class TestInstallTimeout:
         dies: they are reaped, not left as zombies."""
         script = _tool(tmp_path / "hang", hang_on="go")
         code = textwrap.dedent(f"""
-            import asyncio, ctypes, importlib.util, os, sys
+            import asyncio, ctypes, importlib.util, os, sys, types
             ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
-            spec = importlib.util.spec_from_file_location("inst", {str(Path(mcp_installer.__file__))!r})
+            # A package of its own, so the installer's sibling import resolves
+            # without the proxy's package.
+            pkg = types.ModuleType("instpkg")
+            pkg.__path__ = [{str(Path(mcp_installer.__file__).parent)!r}]
+            sys.modules["instpkg"] = pkg
+            spec = importlib.util.spec_from_file_location("instpkg.inst", {str(Path(mcp_installer.__file__))!r})
             inst = importlib.util.module_from_spec(spec)
-            sys.modules["inst"] = inst
+            sys.modules["instpkg.inst"] = inst
             spec.loader.exec_module(inst)
 
             def children():
@@ -957,7 +1034,7 @@ class TestSourceBuildFallback:
     @pytest.mark.asyncio
     async def test_a_listed_package_with_a_wheel_installs_from_the_wheel(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
             uv_bin=_fake_uv(tmp_path), source_build=["antlr4-python3-runtime"],
         )
@@ -969,7 +1046,7 @@ class TestSourceBuildFallback:
     @pytest.mark.asyncio
     async def test_a_listed_package_the_wheels_only_resolve_fails_on_is_built(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(1, _NO_WHEEL), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
             uv_bin=_fake_uv(tmp_path), source_build=["Antlr4_Python3.Runtime", "pycairo"],
         )
@@ -984,7 +1061,7 @@ class TestSourceBuildFallback:
     async def test_each_listed_package_is_added_only_when_the_resolve_names_it(self, tmp_path, monkeypatch):
         calls = _recording_spawn(
             monkeypatch, [_Proc(0), _Proc(1, _NO_WHEEL), _Proc(1, _NO_WHEEL_2), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
             uv_bin=_fake_uv(tmp_path), source_build=["antlr4-python3-runtime", "pycairo"],
         )
@@ -995,7 +1072,7 @@ class TestSourceBuildFallback:
     @pytest.mark.asyncio
     async def test_a_failure_that_names_no_listed_package_is_not_retried(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(1, _NO_WHEEL_2)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
             uv_bin=_fake_uv(tmp_path), source_build=["antlr4-python3-runtime"],
         )
@@ -1009,7 +1086,7 @@ class TestSourceBuildFallback:
                  b"and unifi-network-mcp==1.0.0 depends on Python>=3.13, we can conclude that "
                  b"unifi-network-mcp==1.0.0 cannot be used.\n")
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(1, floor), _Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
             uv_bin=_fake_uv(tmp_path), source_build=["unifi-network-mcp"],
         )
@@ -1040,7 +1117,7 @@ class TestInterpreterPin:
     @pytest.mark.asyncio
     async def test_a_pypi_venv_takes_the_pin(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
             python_spec="3.13",
         )
@@ -1054,7 +1131,7 @@ class TestInterpreterPin:
         mcp_dir.mkdir(parents=True)
         (mcp_dir / "requirements.txt").write_text("x\n")
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             mcp_dir, "python", "", uv_bin=_fake_uv(tmp_path), python_spec="3.13",
         )
         assert r.ok and r.venv_python == "3.13"
@@ -1063,7 +1140,7 @@ class TestInterpreterPin:
     @pytest.mark.asyncio
     async def test_a_pin_uv_cannot_meet_falls_back_to_its_default(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(1, b"No interpreter found"), _Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
             python_spec="3.13",
         )
@@ -1075,7 +1152,7 @@ class TestInterpreterPin:
     @pytest.mark.asyncio
     async def test_a_floor_replaces_the_pin(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(1, _FLOOR_0_12), _Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
             python_spec="3.13",
         )
@@ -1086,7 +1163,7 @@ class TestInterpreterPin:
     @pytest.mark.asyncio
     async def test_no_pin_keeps_uv_s_default(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
         )
         assert _venv_argv(calls[0]) == ["venv"] and r.venv_python == ""
@@ -1094,7 +1171,7 @@ class TestInterpreterPin:
     @pytest.mark.asyncio
     async def test_without_uv_the_pin_is_not_asked(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=None, python_spec="3.13",
         )
         assert r.ok and calls[0]["argv"][1:3] == ["-m", "venv"]
@@ -1106,7 +1183,7 @@ class TestInterpreterPin:
         verdicts = iter([True])
         monkeypatch.setattr(mcp_installer, "venv_outside", lambda v, r: next(verdicts, False))
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
             python_spec="3.13", sandbox_roots=[tmp_path],
         )
@@ -1120,7 +1197,7 @@ class TestInterpreterPin:
         monkeypatch.setattr(mcp_installer, "venv_outside", lambda v, r: True)
         calls = _recording_spawn(
             monkeypatch, [_Proc(0), _Proc(1, b"offline"), _Proc(0), _Proc(0), _Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
             python_spec="3.13", sandbox_roots=[tmp_path],
         )
@@ -1129,7 +1206,7 @@ class TestInterpreterPin:
         assert "--managed-python" not in calls[2]["argv"]
         assert "stays outside the platform tree" in caplog.text
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path / "second"), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
             python_spec="3.13", sandbox_roots=[tmp_path],
         )
@@ -1141,7 +1218,7 @@ class TestInterpreterPin:
         monkeypatch.setattr(mcp_installer, "venv_outside",
                             lambda v, r: pytest.fail("judged without roots"))
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
-        r = await mcp_installer.install_mcp(
+        r = await _install(
             _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
         )
         assert r.ok and len(calls) == 2
@@ -1225,3 +1302,342 @@ class TestPruneUvPythons:
 
     def test_no_uv_python_dir(self, tmp_path):
         assert mcp_installer.prune_uv_pythons(tmp_path) == []
+
+
+class TestBoundedOutput:
+    """A step's output is read to its end with its head and tail kept: a
+    build that prints without end cannot fill the process's memory, and a
+    stream that never reaches end-of-file in the usual way still ends."""
+
+    @pytest.mark.asyncio
+    async def test_a_fake_process_whose_stream_answers_no_bytes_fails_its_test(self):
+        """An ``AsyncMock`` process answers every read with a mock, never
+        ``b""``: a reader looping to its end on it grew one test process to
+        13 GB (the kernel ended it four times on 2026-11-11). The conftest
+        guard fails such a fake at its first read."""
+        from unittest.mock import AsyncMock
+        proc = AsyncMock()
+        with pytest.raises(AssertionError, match="real asyncio.StreamReader"):
+            await mcp_installer._read_bounded(proc.stdout)
+
+    @pytest.mark.asyncio
+    async def test_a_long_output_keeps_its_head_tail_and_a_floor_line(self):
+        head = b"start\n" + b"h" * mcp_installer._OUT_HEAD
+        middle = b"x" * 400_000 + b"\nboom requires Python >=3.14\n" + b"y" * 400_000
+        tail = b"z" * mcp_installer._OUT_TAIL + b"\nthe end\n"
+        out = await mcp_installer._read_bounded(_Out(head + middle + tail))
+        assert out.startswith("start\n")
+        assert out.endswith("the end\n")
+        assert "bytes cut" in out
+        assert mcp_installer._PY_FLOOR_RE.search(out).group(1).replace(" ", "") == ">=3.14"
+        assert len(out) < mcp_installer._OUT_HEAD + mcp_installer._OUT_TAIL + 1024
+
+    @pytest.mark.asyncio
+    async def test_a_real_step_that_prints_a_lot_comes_back_bounded(self, tmp_path):
+        script = tmp_path / "loud"
+        script.write_text("#!/bin/sh\nhead -c 3000000 /dev/zero | tr '\\\\0' a\necho done\n")
+        script.chmod(0o755)
+        rc, out = await mcp_installer._run_bounded([str(script)], cwd=str(tmp_path),
+                                                   env=dict(os.environ), timeout=30)
+        assert rc == 0
+        assert out.rstrip().endswith("done")
+        assert len(out) < mcp_installer._OUT_HEAD + mcp_installer._OUT_TAIL + 1024
+
+
+class TestKillWaitsForTheGroup:
+    @pytest.mark.asyncio
+    async def test_a_kill_returns_only_once_the_group_is_empty(self, monkeypatch):
+        """The rollback runs after the kill: the kill waits until no process
+        of the step's group answers, zombies included, so nothing of the
+        build can still write when the backup goes back."""
+        import signal as _signal
+        proc = await asyncio.create_subprocess_exec(
+            "sleep", "20", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True)
+        real = os.killpg
+        polls = {"left": 3, "asked": 0}
+
+        def _killpg(pgid, sig):
+            if sig == 0 and pgid == proc.pid:
+                polls["asked"] += 1
+                if polls["left"]:
+                    polls["left"] -= 1
+                    return None
+                raise ProcessLookupError
+            return real(pgid, sig)
+        monkeypatch.setattr(mcp_installer.os, "killpg", _killpg)
+        await mcp_installer._kill_tree(proc)
+        assert proc.returncode == -_signal.SIGKILL
+        assert polls == {"left": 0, "asked": 4}
+
+
+class TestInterpreterFolders:
+    def test_a_community_tool_fetches_into_its_own_category_folder(self, tmp_path):
+        root = tmp_path / "mcps"
+        assert mcp_installer.uv_python_dir_for(root / "community" / "x") == root / "community" / ".uv-python"
+        assert mcp_installer.uv_python_dir_for(root / "custom" / "x") == root / ".uv-python"
+        assert mcp_installer.interpreter_dirs(root) == [root / ".uv-python", root / "community" / ".uv-python"]
+
+    @pytest.mark.asyncio
+    async def test_the_install_names_the_category_folder_to_uv(self, tmp_path, monkeypatch):
+        mcp_dir = tmp_path / "mcps" / "community" / "demo"
+        mcp_dir.mkdir(parents=True)
+        seen: list[dict] = []
+
+        async def run(cmd, *, cwd, env, timeout, step, mcp_dir):
+            seen.append({"step": step, "dir": env.get("UV_PYTHON_INSTALL_DIR"), "cmd": cmd})
+            return 1, "nope"
+        await _install(mcp_dir, "python", "pypi:demo@1.0", uv_bin=_fake_uv(tmp_path), run=run)
+        assert seen[0]["step"] == "venv"
+        assert seen[0]["dir"] == str(tmp_path / "mcps" / "community" / ".uv-python")
+
+    def test_the_prune_keeps_what_a_venv_uses_in_both_folders(self, tmp_path):
+        root = tmp_path / "mcps"
+        for folder in mcp_installer.interpreter_dirs(root):
+            (folder / "cpython-3.13-used" / "bin").mkdir(parents=True)
+            (folder / "cpython-3.12-unused").mkdir(parents=True)
+        for cat, folder in (("custom", root / ".uv-python"), ("community", root / "community" / ".uv-python")):
+            venv = root / cat / "t" / "venv"
+            venv.mkdir(parents=True)
+            (venv / "pyvenv.cfg").write_text(f"home = {folder / 'cpython-3.13-used' / 'bin'}\n")
+        assert sorted(mcp_installer.prune_uv_pythons(root)) == ["cpython-3.12-unused"] * 2
+        for folder in mcp_installer.interpreter_dirs(root):
+            assert sorted(p.name for p in folder.iterdir()) == ["cpython-3.13-used"]
+
+
+class TestCommunityInterpreterSeed:
+    """A community tool's interpreter folder is seeded from the bundled
+    tools' own: a copy, the newest patch of the pinned minor, once."""
+
+    def _bundled(self, mcps: Path, *versions: str) -> None:
+        for v in versions:
+            real = mcps / ".uv-python" / f"cpython-{v}-linux-x86_64-gnu"
+            (real / "bin").mkdir(parents=True)
+            (real / "bin" / "python3.13").write_text(v)
+            (real / "bin" / "python3").symlink_to("python3.13")
+        (mcps / ".uv-python" / "cpython-3.13-linux-x86_64-gnu").symlink_to(real)
+
+    def test_the_newest_bundled_patch_is_copied_once(self, tmp_path):
+        mcps = tmp_path / "mcps"
+        self._bundled(mcps, "3.13.9", "3.13.14")
+        tool = mcps / "community" / "demo"
+        tool.mkdir(parents=True)
+        assert mcp_installer.seed_interpreter(tool, "3.13") is True
+        own = mcps / "community" / ".uv-python"
+        assert sorted(p.name for p in own.iterdir()) == ["cpython-3.13.14-linux-x86_64-gnu"]
+        copied = own / "cpython-3.13.14-linux-x86_64-gnu"
+        assert not copied.is_symlink() and (copied / "bin" / "python3").is_symlink()
+        assert (copied / "bin" / "python3.13").read_text() == "3.13.14"
+        assert mcp_installer.seed_interpreter(tool, "3.13") is False
+
+    @pytest.mark.parametrize("category, minor", [("custom", "3.13"), ("community", "3.12"),
+                                                 ("community", ""), ("community", "/usr/bin/python3")])
+    def test_nothing_is_copied_for_another_tool_or_minor(self, tmp_path, category, minor):
+        mcps = tmp_path / "mcps"
+        self._bundled(mcps, "3.13.14")
+        tool = mcps / category / "demo"
+        tool.mkdir(parents=True)
+        assert mcp_installer.seed_interpreter(tool, minor) is False
+        assert not (mcps / "community" / ".uv-python").exists()
+
+    @pytest.mark.asyncio
+    async def test_a_community_venv_step_starts_with_the_seed(self, tmp_path):
+        mcps = tmp_path / "mcps"
+        self._bundled(mcps, "3.13.14")
+        tool = mcps / "community" / "demo"
+        tool.mkdir(parents=True)
+        uv = tmp_path / "uv"
+        uv.write_text("#!/bin/sh\n")
+        seen = []
+
+        async def _run(cmd, **kw):
+            seen.append(sorted(p.name for p in (mcps / "community" / ".uv-python").iterdir()))
+            return 0, ""
+        ok, _log, _spec = await mcp_installer._create_venv(
+            tool / "venv", uv_bin=str(uv), python_bin="python3", floor=None, pin="3.13", roots=None,
+            env={}, cwd=str(tmp_path), timeout=60, run=_run)
+        assert ok and seen == [["cpython-3.13.14-linux-x86_64-gnu"]]
+
+
+class TestReadbacksFollowNoLinkOut:
+    def test_a_node_package_json_linked_out_of_the_folder_is_not_read(self, tmp_path):
+        outside = tmp_path / "config.json"
+        outside.write_text('{"version": "a-secret"}')
+        mcp_dir = tmp_path / "tool"
+        (mcp_dir / "node_modules" / "pkg").mkdir(parents=True)
+        (mcp_dir / "node_modules" / "pkg" / "package.json").symlink_to(outside)
+        assert mcp_installer._node_installed_version(mcp_dir, "pkg") == ""
+
+    def test_a_dist_info_linked_out_of_the_venv_is_not_read(self, tmp_path):
+        outside = tmp_path / "elsewhere" / "pkg-1.0.dist-info"
+        outside.mkdir(parents=True)
+        (outside / "METADATA").write_text("Metadata-Version: 2.1\nName: pkg\nVersion: 9.9.9\n")
+        site = tmp_path / "venv" / "lib" / "python3.13" / "site-packages"
+        site.mkdir(parents=True)
+        (site / "pkg-1.0.dist-info").symlink_to(outside)
+        assert mcp_installer._python_installed_version(tmp_path / "venv", "pkg") == ""
+
+    def test_a_linked_pyvenv_cfg_is_refused(self, tmp_path):
+        (tmp_path / "real.cfg").write_text("home = /usr/bin\n")
+        (tmp_path / "venv").mkdir()
+        (tmp_path / "venv" / "pyvenv.cfg").symlink_to(tmp_path / "real.cfg")
+        with pytest.raises(OSError):
+            mcp_installer._pyvenv_home(tmp_path / "venv")
+
+    def test_a_venv_whose_interpreter_is_gone_reads_as_outside(self, tmp_path):
+        venv = tmp_path / "venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "pyvenv.cfg").write_text(f"home = {tmp_path / 'gone' / 'bin'}\n")
+        assert mcp_installer.venv_outside(venv, [tmp_path]) is True
+
+
+def _within(fn, *args, wait: float = 3.0, release: Path | None = None) -> bool:
+    """Whether ``fn(*args)`` returned within ``wait`` seconds; a pipe it
+    waits on is opened for writing afterwards, which lets it go."""
+    import os
+    import threading
+    t = threading.Thread(target=fn, args=args, daemon=True)
+    t.start()
+    t.join(wait)
+    held = t.is_alive()
+    if held and release is not None:
+        os.close(os.open(release, os.O_WRONLY | os.O_NONBLOCK))
+        t.join(wait)
+    return not held
+
+
+class TestBuiltFilesAreReadBounded:
+    """A build may leave a pipe, a device or a huge file where the platform
+    reads its outputs back: no reader waits on it or reads it whole."""
+
+    def test_the_reader_answers_none_for_anything_but_a_regular_file(self, tmp_path):
+        import os
+        os.mkfifo(tmp_path / "pipe")
+        (tmp_path / "real").write_text("x")
+        (tmp_path / "link").symlink_to(tmp_path / "real")
+        (tmp_path / "folder").mkdir()
+        for name in ("pipe", "link", "folder", "missing"):
+            assert mcp_installer.read_built(tmp_path / name) is None, name
+        assert mcp_installer.read_built(Path("/dev/zero")) is None
+        assert mcp_installer.read_built(tmp_path / "real") == b"x"
+
+    def test_a_huge_sparse_file_is_read_to_the_limit_alone(self, tmp_path):
+        big = tmp_path / "METADATA"
+        with open(big, "wb") as fh:
+            fh.write(b"Version: 1.0\n")
+            fh.truncate(100 << 20)
+        assert len(mcp_installer.read_built(big)) == mcp_installer.BUILT_READ_LIMIT
+
+    def test_a_pipe_at_a_dist_metadata_never_holds_the_readback(self, tmp_path):
+        import os
+        info = tmp_path / "venv" / "lib" / "python3.13" / "site-packages" / "demo-99.dist-info"
+        info.mkdir(parents=True)
+        os.mkfifo(info / "METADATA")
+        assert _within(mcp_installer._python_installed_version, tmp_path / "venv", "demo",
+                       release=info / "METADATA")
+
+    def test_a_pipe_at_a_venv_config_never_holds_the_prune(self, tmp_path):
+        import os
+        root = tmp_path / "mcps"
+        venv = root / "community" / "demo" / "venv"
+        (venv / "lib").mkdir(parents=True)
+        (root / "community" / ".uv-python" / "cpython-3.13").mkdir(parents=True)
+        os.mkfifo(venv / "lib" / "pyvenv.cfg")
+        assert _within(mcp_installer.prune_uv_pythons, root, release=venv / "lib" / "pyvenv.cfg")
+        assert mcp_installer.venv_python_minor(venv / "lib") is None
+
+    def test_a_pipe_at_a_node_package_never_holds_the_readback(self, tmp_path):
+        import os
+        pkg = tmp_path / "tool" / "node_modules" / "pkg"
+        pkg.mkdir(parents=True)
+        os.mkfifo(pkg / "package.json")
+        assert _within(mcp_installer._node_installed_version, tmp_path / "tool", "pkg",
+                       release=pkg / "package.json")
+
+    def test_a_package_json_nested_past_the_parser_reads_as_no_version(self, tmp_path):
+        pkg = tmp_path / "tool" / "node_modules" / "pkg"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text("[" * 60000 + "]" * 60000)
+        assert mcp_installer._node_installed_version(tmp_path / "tool", "pkg") == ""
+
+    def test_a_top_package_json_past_the_usual_limit_is_still_read(self, tmp_path):
+        pkg = tmp_path / "tool" / "node_modules" / "pkg"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(json.dumps({"description": "x" * 200_000, "version": "1.2.3"}))
+        assert mcp_installer._node_installed_version(tmp_path / "tool", "pkg") == "1.2.3"
+
+    def test_a_pipe_named_like_a_venv_config_is_no_venv_to_the_prune(self, tmp_path):
+        """The prune reads every venv's config before it removes an unused
+        interpreter: a pipe a build left under that name is not a venv, and
+        stops the prune no more."""
+        import os
+        root = tmp_path / "mcps"
+        uv = root / ".uv-python"
+        (uv / "cpython-3.11.1-linux-x86_64-gnu" / "bin").mkdir(parents=True)
+        (root / "community" / "demo" / "venv" / "lib").mkdir(parents=True)
+        os.mkfifo(root / "community" / "demo" / "venv" / "lib" / "pyvenv.cfg")
+        assert mcp_installer._pyvenv_cfgs(root) == []
+        assert mcp_installer.prune_uv_pythons(root) == ["cpython-3.11.1-linux-x86_64-gnu"]
+
+    @pytest.mark.parametrize("written, pinned", [
+        ("1.2.3", "1.2.3"), ("2!1.0rc1+local.7", "2!1.0rc1+local.7"),
+        ("1.0; rm -rf /", ""), ("$(id)", ""), ("1.0 beta", ""), ("", ""),
+    ])
+    def test_only_a_plain_version_a_build_wrote_is_pinned(self, tmp_path, written, pinned):
+        info = tmp_path / "venv" / "lib" / "python3.13" / "site-packages" / "demo-1.dist-info"
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: demo\nVersion: {written}\n")
+        assert mcp_installer._python_installed_version(tmp_path / "venv", "demo") == pinned
+        pkg = tmp_path / "tool" / "node_modules" / "pkg"
+        pkg.mkdir(parents=True, exist_ok=True)
+        (pkg / "package.json").write_text(json.dumps({"version": written}))
+        assert mcp_installer._node_installed_version(tmp_path / "tool", "pkg") == pinned
+
+
+@pytest.mark.parametrize("fn", [mcp_installer.install_mcp, mcp_installer._create_venv,
+                                mcp_installer._apply_patches])
+def test_the_runner_has_no_default(fn):
+    """A caller that forgets the runner cannot build at all: a default would
+    build as the platform's own child, with no sandbox, silently."""
+    import inspect
+    assert inspect.signature(fn).parameters["run"].default is inspect.Parameter.empty
+
+
+class TestStepsGoThroughRun:
+    @pytest.mark.asyncio
+    async def test_every_step_of_a_python_install_is_named_and_compiles_bytecode(self, tmp_path):
+        mcp_dir = tmp_path / "mcps" / "community" / "demo"
+        mcp_dir.mkdir(parents=True)
+        steps: list[str] = []
+        pip_cmds: list[list[str]] = []
+
+        async def run(cmd, *, cwd, env, timeout, step, mcp_dir):
+            steps.append(step)
+            if step == "pip":
+                pip_cmds.append(cmd)
+                return (1, "x requires Python >=3.14") if len(pip_cmds) == 1 else (0, "ok")
+            return 0, ""
+        result = await _install(
+            mcp_dir, "python", "pypi:demo@1.0", uv_bin=_fake_uv(tmp_path), run=run)
+        assert result.ok
+        # The floor retry makes a new venv in a step of its own, then builds again.
+        assert steps == ["venv", "pip", "venv", "pip"]
+        assert all("--compile-bytecode" in c for c in pip_cmds)
+
+    @pytest.mark.asyncio
+    async def test_an_npm_install_and_its_patches_are_named(self, tmp_path, monkeypatch):
+        mcp_dir = _node_dir(tmp_path)
+        (mcp_dir / "patches").mkdir()
+        (mcp_dir / "patches" / "a.patch").write_text("x")
+        steps: list[str] = []
+        monkeypatch.setattr(mcp_installer.shutil, "which", lambda n: "/usr/bin/git" if n == "git" else None)
+
+        async def run(cmd, *, cwd, env, timeout, step, mcp_dir):
+            steps.append(step)
+            if step == "npm":
+                (mcp_dir / "node_modules" / "pkg").mkdir(parents=True, exist_ok=True)
+                (mcp_dir / "node_modules" / "pkg" / "package.json").write_text('{"version": "1.0.0"}')
+            return (0, "Applied patch") if step == "patch" and "--check" not in cmd else (1 if "--check" in cmd else 0, "")
+        result = await _install(mcp_dir, "node", "npm:pkg@1.0.0", run=run)
+        assert result.ok, result.log
+        assert steps == ["npm", "patch", "patch"]

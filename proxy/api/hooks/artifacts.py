@@ -6,7 +6,6 @@ One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 ``router``; the facade includes it.
 """
 
-import asyncio
 import logging
 import secrets
 from pathlib import Path
@@ -17,9 +16,7 @@ from pydantic import BaseModel
 import config
 from api.hooks import paths, routing
 from api.sessions.sessions import verify_session_match_async
-from auth.path_policy import (
-    check_host_path_access,
-)
+from core import agent_folder, file_commit
 from core.session import session_kind
 from core.session.session_state import (
     get_permission_queue,
@@ -62,7 +59,7 @@ async def hook_images(req: HookImagesRequest, authorization: str | None = Header
     horizontal scroll-snap carousel — that decision lives in the renderer,
     not here.
     """
-    await verify_session_match_async(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id, accept_callback=True)
     if not req.images:
         raise HTTPException(status_code=400, detail="images list cannot be empty")
     for idx, item in enumerate(req.images):
@@ -157,7 +154,7 @@ async def hook_file(req: HookFileRequest, authorization: str | None = Header(Non
     lazily pulled from the satellite into the platform-side cache first so
     the adapter can serve it directly.
     """
-    await verify_session_match_async(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id, accept_callback=True)
 
     file_path, resolution = await paths._classify_and_pull(req.session_id, req.path)
     if file_path is None:
@@ -168,7 +165,7 @@ async def hook_file(req: HookFileRequest, authorization: str | None = Header(Non
         )
         raise HTTPException(status_code=400, detail=detail)
 
-    filename = req.filename or file_path.name
+    filename = req.filename or paths._asked_name(req.path) or file_path.name
 
     # Route through adapter based on session's client_type. Meeting
     # participants carry client_type "meeting" (no adapter of its own) but
@@ -194,6 +191,7 @@ async def hook_file(req: HookFileRequest, authorization: str | None = Header(Non
     if getattr(adapter, "serves_file_downloads", False):
         chat_id = await routing.resolve_hook_chat_id(req.session_id) or None
         sec = get_session_security(req.session_id)
+        origin_path, machine_id = paths.machine_origin(req.session_id, resolution)
         download_token = secrets.token_urlsafe(32)
         await run_db(
             task_store.create_media_token,
@@ -202,10 +200,12 @@ async def hook_file(req: HookFileRequest, authorization: str | None = Header(Non
             media_kind="file",
             chat_id=chat_id,
             session_id=req.session_id,
+            machine_id=machine_id,
             # cache_owned False even for satellite-pulled cache copies: several
             # tokens may share one cached file; the cache has its own lifecycle.
             cache_owned=False,
             expires_at="",  # durable until the chat is deleted
+            origin_path=origin_path,
             agent=sec.agent if sec else "",
         )
         # No fn= here: the dashboard appends it from the file's name
@@ -300,15 +300,8 @@ async def hook_media(req: HookMediaRequest, authorization: str | None = Header(N
     # Satellite-host (Desktop/Downloads) media is re-pullable, not retained:
     # route its derivatives to the TTL'd host cache and record the origin path
     # so serve_media can re-pull from the laptop on replay.
-    origin_path = ""
-    media_dest = None
-    if (
-        resolution is not None
-        and resolution.path_ref is not None
-        and resolution.path_ref.kind == "satellite_host"
-    ):
-        origin_path = resolution.path_ref.value
-        media_dest = media_pipeline.host_cache_dir()
+    origin_path, machine_id = paths.machine_origin(req.session_id, resolution)
+    media_dest = media_pipeline.host_cache_dir() if origin_path else None
     served_path, mime, transcode_cache = await media_pipeline.ensure_playable_async(
         local_path, codecs=codecs, media_kind=kind, dest_dir=media_dest,
     )
@@ -316,8 +309,6 @@ async def hook_media(req: HookMediaRequest, authorization: str | None = Header(N
     resolved_kind = media_pipeline.media_kind_from_mime(mime) or kind
 
     chat_id = await routing.resolve_hook_chat_id(req.session_id) or None
-    info = remote_file_flow._get_remote_session_info(req.session_id)
-    machine_id = getattr(info, "machine_id", None)
     sec = get_session_security(req.session_id)
 
     token = secrets.token_urlsafe(32)
@@ -376,6 +367,53 @@ def _ui_slug(title: str) -> str:
     return s.strip("-")[:40] or "ui"
 
 
+def _as_page(target: Path) -> Path:
+    """``target`` with ``.html`` put on as written (any case kept)."""
+    return target if target.suffix.lower() == ".html" else target.with_suffix(".html")
+
+
+def _save_page(session_id: str, ctx, agent_dir: Path, scope_root: Path,
+               raw: str, title: str, html: str) -> str:
+    """Write the page and answer its rel beneath ``AGENTS_DIR``. Blocking:
+    one file-commit worker. The asked place is judged where it lands
+    (``paths._judge``): the session's own agent, a role that may write
+    there, an ``.html`` page. Anything else goes to the caller's own
+    ``generated-ui/`` as written, the platform's choice as it always was (no
+    role check: an editor on a Shared-only agent who asks for a place the
+    role may not write gets the page in the shared one). The bytes go through ``safe_fs`` beneath the agent's real
+    folder (``core.agent_folder``): a link on the way, put in after the
+    judgement or found on the fallback's path, refuses the write, never
+    carries it elsewhere. A session that writes no files (a check's judge)
+    saves no page."""
+    from services.infra import safe_fs
+    if paths._writes_no_files(session_id, ctx):
+        raise PermissionError(paths._WRITES_NO_FILES)
+    rel = None
+    try:
+        asked = _as_page(Path(paths._sandbox_to_host(raw, ctx, agent_dir))
+                         if raw.startswith("/") else scope_root / raw)
+        answer, _why = paths._judge(session_id, ctx, asked, writing=True)
+        if answer is not None:
+            judged = safe_fs.rel_under(answer, config.AGENTS_DIR)
+            if judged.startswith(ctx.agent + "/") and judged.lower().endswith(".html"):
+                rel = judged
+    except (OSError, ValueError):
+        rel = None
+    if rel is None:
+        name = Path(raw).name
+        if not name.strip("."):
+            name = f"{_ui_slug(title)}-{secrets.token_hex(4)}.html"
+        try:
+            rel = safe_fs.rel_under(_as_page(scope_root / "generated-ui" / name), config.AGENTS_DIR)
+        except (OSError, ValueError):
+            rel = None
+    if rel is None:
+        raise PermissionError("no place to save the page")
+    root, in_agent = agent_folder.beneath_agent(config.AGENTS_DIR / rel, ctx.agent)
+    safe_fs.atomic_write_beneath(root, in_agent, html.encode("utf-8"), mkdirs=True)
+    return rel
+
+
 @router.post("/v1/hooks/ui")
 async def hook_ui(req: HookUiRequest, authorization: str | None = Header(None)):
     """Called by display-mcp's display_ui to render an HTML artifact in the chat.
@@ -416,32 +454,18 @@ async def hook_ui(req: HookUiRequest, authorization: str | None = Header(None)):
     raw = req.save_path.strip()
     if not raw:
         raw = f"generated-ui/{_ui_slug(title)}-{secrets.token_hex(4)}.html"
-    if raw.startswith("/"):
-        # Sandbox-virtual — resolved in the CALLER'S scope (a viewer's
-        # /workspace/x.html lands in THEIR users/{u}/workspace).
-        target = Path(paths._sandbox_to_host(raw, ctx, agent_dir))
-    else:
-        # Documented workspace-relative form.
-        target = scope_root / raw
-    if target.suffix.lower() != ".html":
-        target = target.with_suffix(".html")
-    # Re-gate the resolved host path — paths._sandbox_to_host is purely lexical and
-    # the write below is otherwise un-RBAC-gated. Anything escaping the tree
-    # or denied by the role matrix re-anchors to the caller's generated-ui/.
-    allowed = False
+    # A sandbox-virtual path resolves in the CALLER'S scope (a viewer's
+    # /workspace/x.html lands in THEIR users/{u}/workspace); a relative one
+    # is workspace-relative. Denied or escaping paths re-anchor to the
+    # caller's generated-ui/ (``_save_page``).
     try:
-        if target.resolve().is_relative_to(agent_dir.resolve()):
-            allowed = check_host_path_access(target, ctx, writing=True).allowed
-    except (OSError, ValueError):
-        allowed = False
-    if not allowed:
-        target = scope_root / "generated-ui" / Path(raw).name
-        if target.suffix.lower() != ".html":
-            target = target.with_suffix(".html")
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(target.write_text, req.html, "utf-8")
-    rel = target.relative_to(agent_dir).as_posix()
+        landed = await file_commit.run(
+            _save_page, req.session_id, ctx, agent_dir, scope_root, raw, title, req.html,
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=403, detail="That page could not be saved there.") from exc
+    target = config.AGENTS_DIR / landed
+    rel = landed.split("/", 1)[1]
     sandbox_path = "/" + rel
 
     # Same-turn push so a satellite CLI can immediately Read the file it just

@@ -9,12 +9,12 @@ import {
 import CommunityMcpsBrowser from '../../components/CommunityMcpsBrowser'
 import McpCategoryFilter from '../../components/McpCategoryFilter'
 import McpIcon from '../../components/McpIcon'
-import { ServiceAccountBindingDropdown } from '../../components/ServiceAccountBindingDropdown'
+import { AgentAccounts } from '../../components/accounts/AgentAccounts'
 import { useAuth } from '../../contexts/AuthContext'
 import { useAgentInfo } from '../../api/agents'
 import { ROLE, canManageAgent } from '../../lib/permissions'
 import { toastError } from '../../lib/http/apiJson'
-import { availableScopes, modeOfAgent } from '../../lib/visibility'
+import { availableScopes, isSharedOnly, modeOfAgent } from '../../lib/visibility'
 import { matchesMcpCategory, type McpCategoryFilterValue } from '../../lib/mcp/categories'
 import Button from '../../components/ui/Button'
 import { Input } from '../../components/ui/Field'
@@ -35,9 +35,11 @@ export default function AgentMcps() {
   const { data: info } = useAgentInfo(name!)
   const setMcps = useSetAgentMcps()
   const { stateOf, run } = useSaveState()
-  // A service-scope subscription runs in the agent's agent scope; a
-  // Personal-only agent has none, so its binding row offers no subscriptions.
-  const agentScopeAvailable = !!info && availableScopes(modeOfAgent(info)).includes('agent')
+  // An agent's own accounts live in its own space: a Personal-only agent has
+  // none, and the server refuses to read or write any there.
+  const holdsOwnAccounts = !!info && availableScopes(modeOfAgent(info)).includes('agent')
+  // A Shared-only agent runs every chat in its own space, on these accounts.
+  const chatsUseThem = !!info && isSharedOnly(modeOfAgent(info))
 
   // `selected` mirrors the in-flight enabled set the manager is editing.
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -69,7 +71,7 @@ export default function AgentMcps() {
   if (!canManage) {
     return (
       <div className="bg-status-warning-bg border border-status-warning-border rounded-card px-4 py-3 text-xs text-status-warning-fg">
-        <strong>Read-only.</strong> MCP assignments and service-account bindings
+        <strong>Read-only.</strong> MCP assignments and the agent&apos;s own accounts
         are owner-only.{' '}
         {agentRole === ROLE.EDITOR
           ? 'As an editor you can work on the agent\'s shared workspace. An owner sets how the agent behaves.'
@@ -220,16 +222,15 @@ export default function AgentMcps() {
                   </Link>
                 )}
               </div>
-              {/* Service-account binding dropdown — only for MCPs whose
-                  manifest declares one (probing every row painted a 400 in
-                  the console per non-capable MCP; the dropdown still
-                  self-hides if its options call fails). */}
-              {mcp.has_service_account && selected.has(mcp.name) && user && name && (
-                <ServiceAccountBindingDropdown
+              {/* The agent's own accounts, only for MCPs whose manifest
+                  declares them (probing every row painted a 400 in the
+                  console per non-capable MCP; the list still self-hides if
+                  its options call fails). */}
+              {mcp.has_service_account && holdsOwnAccounts && selected.has(mcp.name) && user && name && (
+                <AgentAccounts
                   agentName={name}
                   mcpName={mcp.name}
-                  callerSub={user.sub}
-                  agentScopeAvailable={agentScopeAvailable}
+                  chatsUseThem={chatsUseThem}
                 />
               )}
             </div>

@@ -1,8 +1,8 @@
 {
   "name": "video-gen-mcp",
   "label": "Video Generation",
-  "description": "AI video generation, transitions, and editing (Gemini Omni Flash, Veo 3.1, Runway Aleph 2.0)",
-  "version": "1.0.0",
+  "description": "AI video generation, transitions, and editing (Gemini Omni Flash, Veo 3.1 through fal.ai, Seedance, Runway Aleph 2.0)",
+  "version": "1.2.1",
   "category": "custom",
   "server": {
     "runtime": "python",
@@ -14,7 +14,12 @@
     "tool_timeout_sec": 600
   },
   "credentials": {
-    "type": "none"
+    "type": "none",
+    "exit": [
+      {"key": "GOOGLE_AI_API_KEY", "header": "x-goog-api-key", "hosts": ["generativelanguage.googleapis.com"], "streams": true},
+      {"key": "RUNWAY_API_KEY", "header": "Authorization", "prefix": "Bearer ", "hosts": ["api.dev.runwayml.com"]},
+      {"key": "FAL_API_KEY", "header": "Authorization", "prefix": "Key ", "hosts": ["rest.fal.ai", "queue.fal.run"]}
+    ]
   },
   "instances": {
     "delivery": "env",
@@ -33,7 +38,7 @@
       },
       {
         "key": "FAL_API_KEY",
-        "label": "fal.ai API Key (optional — premium transitions)",
+        "label": "fal.ai API Key (for Veo and Seedance)",
         "input_type": "password",
         "secret": true
       }
@@ -88,9 +93,27 @@
       {
         "tool": "generate_video",
         "match": {
+          "model": "omni-flash",
+          "resolution": "4k"
+        },
+        "amount": 0.209,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_video",
+        "match": {
+          "model": "omni-flash",
+          "resolution": "1080p"
+        },
+        "amount": 0.104,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_video",
+        "match": {
           "model": "omni-flash"
         },
-        "amount": 0.1,
+        "amount": 0.07,
         "multiply_by": "duration_seconds"
       },
       {
@@ -116,16 +139,7 @@
           "model": "veo-3.1-fast",
           "resolution": "4k"
         },
-        "amount": 0.3,
-        "multiply_by": "duration_seconds"
-      },
-      {
-        "tool": "generate_video",
-        "match": {
-          "model": "veo-3.1-fast",
-          "resolution": "1080p"
-        },
-        "amount": 0.12,
+        "amount": 0.35,
         "multiply_by": "duration_seconds"
       },
       {
@@ -133,7 +147,7 @@
         "match": {
           "model": "veo-3.1-fast"
         },
-        "amount": 0.1,
+        "amount": 0.15,
         "multiply_by": "duration_seconds"
       },
       {
@@ -141,7 +155,7 @@
         "match": {
           "resolution": "4k"
         },
-        "amount": 0.3,
+        "amount": 0.209,
         "multiply_by": "duration_seconds"
       },
       {
@@ -149,12 +163,12 @@
         "match": {
           "resolution": "1080p"
         },
-        "amount": 0.12,
+        "amount": 0.104,
         "multiply_by": "duration_seconds"
       },
       {
         "tool": "generate_video",
-        "amount": 0.1,
+        "amount": 0.07,
         "multiply_by": "duration_seconds"
       },
       {
@@ -179,6 +193,20 @@
           "model": "veo-3.1"
         },
         "amount": 0.4,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_transition",
+        "match": {
+          "model": "omni-flash"
+        },
+        "amount": 0.07,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_transition",
+        "result_has": "transition with Gemini Omni Flash.",
+        "amount": 0.07,
         "multiply_by": "duration_seconds"
       },
       {

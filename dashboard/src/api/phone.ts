@@ -34,6 +34,9 @@ export interface PhoneRouteWriteResult {
   provisioning_instructions?: string
 }
 
+/** The route identity whose caller acts as the agent itself. */
+export const IDENTITY_AGENT = 'agent'
+
 export interface PhoneRoute {
   id: string
   direction: PhoneDirection
@@ -71,11 +74,16 @@ export interface PhoneRoute {
   // Who the caller IS on this route and what the session may touch.
   // 'caller' = every caller gets a private space (external principal; on a
   // shared-only agent that is the shared space with no per-caller memory),
-  // 'user' = the call runs as identity_user_sub's own session. 'shared' is
+  // 'user' = the call runs as identity_user_sub's own session, 'agent' = the
+  // call runs as the agent itself (its shared space and service accounts,
+  // the management tools off but the ones `line_tools` ticks). 'shared' is
   // a legacy value (option removed 2026-09-07) the API no longer accepts.
   // `remember_callers` off makes every caller ephemeral.
-  identity_mode: 'caller' | 'shared' | 'user'
+  identity_mode: 'caller' | 'shared' | 'user' | 'agent'
   identity_user_sub: string | null
+  // The management tools an 'agent' route ticks open (the preview's
+  // `line_tools_offered` names the ones it may tick); [] elsewhere.
+  line_tools: string[]
   // Server echo of a column kept for compatibility: an external caller
   // always runs as viewer (the per-route role selector was removed
   // 2026-09-08); the API ignores whatever a client sends.
@@ -93,7 +101,8 @@ export interface PhoneRoute {
 
 // Request-only fields on a route save: a PIN set with the route (never
 // echoed back) and the acknowledgement a user-mode inbound route needs to
-// save without one (the server refuses the save otherwise).
+// save without one, as an agent-mode inbound route does (the server refuses
+// the save otherwise).
 export type PhoneRouteSaveExtras = { pin?: string; acknowledge_no_pin?: boolean }
 export type PhoneRouteCreate = Omit<PhoneRoute, 'id' | 'created_at' | 'updated_at' | 'pin_configured' | 'warnings' | 'role'> & PhoneRouteSaveExtras
 export type PhoneRouteUpdate = Partial<PhoneRouteCreate>
@@ -247,14 +256,23 @@ export function usePhoneRouteCallLog(routeId: string, open: boolean, offset = 0,
 export interface RouteMcpPreview {
   attached: { name: string; label: string }[]
   excluded: { name: string; label: string; reason: string }[]
+  /** The management tools a route on the agent's own line may tick. */
+  line_tools_offered?: { name: string; label: string }[]
 }
 
-export function useRouteMcpPreview(agent: string, identityMode: PhoneRoute['identity_mode']) {
+const MCP_PREVIEW_KEY = 'phone-route-mcp-preview'
+
+export function useRouteMcpPreview(agent: string, identityMode: PhoneRoute['identity_mode'], lineTools: string[] = []) {
+  const ticks = identityMode === IDENTITY_AGENT ? [...lineTools].sort().join(',') : ''
   return useQuery({
-    queryKey: ['phone-route-mcp-preview', agent, identityMode],
+    queryKey: [MCP_PREVIEW_KEY, agent, identityMode, ticks],
     enabled: !!agent,
+    // A tick re-reads what the line attaches: the list stays on screen meanwhile.
+    placeholderData: (prev, prevQuery) =>
+      prevQuery && prevQuery.queryKey[1] === agent && prevQuery.queryKey[2] === identityMode ? prev : undefined,
     queryFn: async (): Promise<RouteMcpPreview> => {
       const params = new URLSearchParams({ agent, identity_mode: identityMode })
+      if (ticks) params.set('line_tools', ticks)
       return apiJson<RouteMcpPreview>(`/v1/admin/phone/routes/mcp-preview?${params}`)
         .catch(withMessage('Failed to preview the tools on this route'))
     },
@@ -323,15 +341,33 @@ export function useForgetExternalData() {
 // Phone servers
 // ---------------------------------------------------------------------------
 
+interface PhoneServerList {
+  servers: PhoneServer[]
+  /** The server types this install offers for a new server. Absent from a
+   *  server before 2.0, which offers every type. */
+  types?: PhoneServer['adapter_type'][]
+}
+
+async function fetchPhoneServers(): Promise<PhoneServerList> {
+  return apiJson<PhoneServerList>('/v1/admin/phone-servers')
+    .catch(withMessage('Failed to fetch phone servers'))
+}
+
 export function usePhoneServers() {
   return useQuery({
     queryKey: ['phone-servers'],
-    queryFn: async (): Promise<PhoneServer[]> => {
-      const data = await apiJson<{ servers: PhoneServer[] }>('/v1/admin/phone-servers')
-        .catch(withMessage('Failed to fetch phone servers'))
-      return data.servers
-    },
+    queryFn: fetchPhoneServers,
+    select: (data: PhoneServerList) => data.servers,
     refetchInterval: 15000,  // keep health + bootstrap badges fresh
+  })
+}
+
+/** The server types this install offers, null while unknown (every type). */
+export function usePhoneServerTypes() {
+  return useQuery({
+    queryKey: ['phone-servers'],
+    queryFn: fetchPhoneServers,
+    select: (data: PhoneServerList) => data.types ?? null,
   })
 }
 

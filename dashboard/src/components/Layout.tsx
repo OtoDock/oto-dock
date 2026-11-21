@@ -1,7 +1,7 @@
 import { useAuth } from '../contexts/AuthContext'
 import { useFlag } from '../hooks/useFlag'
 import { isAdmin as isPlatformAdmin } from '../lib/permissions'
-import { SetupBanner } from './PlatformSetupGuard'
+import SetupBanner from './SetupBanner'
 import { ForwardingBanner } from './admin/ForwardingBanner'
 import { ReleaseBanner } from './admin/ReleaseBanner'
 import { ReleaseDialog } from './ReleaseDialog'

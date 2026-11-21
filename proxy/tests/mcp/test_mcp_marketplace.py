@@ -439,19 +439,32 @@ class TestApprove:
         # Already running → no restart.
         start_mock.assert_not_called()
 
-    def test_approve_external_pool_never_starts_locally(self, temp_db):
+    def test_approve_on_a_hosted_install_starts_the_container(self, temp_db):
+        """A hosted install keeps its Docker tools inside it: the approval
+        starts the container as on any compose install."""
         _seed_agent()
         row = _create_request()
+        import config
         from core.config import deployment
         from services.community import community_installer
 
-        with patch(
+        with patch.object(config, "OTODOCK_CLOUD", True), patch.object(
+            community_installer, "install_from_catalog",
+            new=AsyncMock(return_value=FAKE_INSTALL_RESULT),
+        ), patch(
             "services.community.community_installer.mcp_registry.get_manifest",
             return_value=_docker_manifest_stub("nextcloud"),
         ), patch(
-            "services.mcp.docker_manager.start_container",
+            "services.mcp.docker_manager._inject_mcp_env", return_value=True,
+        ), patch(
+            "services.mcp.compose_rewrite.ensure_pull_compose",
+        ), patch(
+            "services.mcp.docker_manager.get_container_status",
+            return_value="stopped",
+        ), patch(
+            "services.mcp.docker_manager.start_container", new=_patchable_mock(return_value=True),
         ) as start_mock, patch.object(
-            deployment, "current_mode", return_value=deployment.EXTERNAL_POOL,
+            deployment, "current_mode", return_value=deployment.MANAGED_SOCKPROX,
         ), patch(
             "services.notifications.notification_manager.fire_notification",
             new=AsyncMock(),
@@ -460,7 +473,7 @@ class TestApprove:
                 community_installer.approve_request(row["id"], ADMIN_SUB),
             )
         assert updated["status"] == "installed"
-        start_mock.assert_not_called()
+        start_mock.assert_called_once()
 
     def test_approve_nondocker_runtime_no_container_calls(self, temp_db):
         _seed_agent()
@@ -2019,3 +2032,39 @@ class TestRefusalSentences:
         monkeypatch.setattr(community_installer.httpx, "AsyncClient",
                             lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
         assert _refused(community_installer._fetch_catalog_tarball()) == (502, sentence)
+
+    def test_a_download_past_64_mb_stops_while_it_streams(self, monkeypatch):
+        import httpx
+
+        from services.community import (
+            community_agents_catalog,
+            community_catalog,
+            community_installer,
+        )
+        sent: list[str] = []
+
+        class _Endless(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                for _ in range(100):
+                    yield b"\0" * (1024 * 1024)
+                    sent.append("1 MB")
+
+        def handler(request):
+            return httpx.Response(200, stream=_Endless(), request=request)
+
+        real = httpx.AsyncClient
+        monkeypatch.setattr(community_installer.httpx, "AsyncClient",
+                            lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+        assert _refused(community_installer._fetch_catalog_tarball()) == (
+            502, "The community list's download is larger than 64 MB.")
+        assert len(sent) <= 64
+        # The agents catalog's fetch: a size refusal is not retried at the
+        # fallback address, and the catalog's sentence words it.
+        sent.clear()
+        monkeypatch.setattr(community_catalog, "http_client",
+                            lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+        with pytest.raises(ValueError) as exc:
+            asyncio.run(community_agents_catalog._fetch_tarball())
+        assert len(sent) <= 64
+        assert community_catalog.load_refusal("template", "https://codeload.github.com/x", exc.value) == (
+            "The template could not be read. Try again in a minute.")

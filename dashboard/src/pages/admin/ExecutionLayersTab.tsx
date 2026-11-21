@@ -8,9 +8,11 @@
  * - Models (builtin + custom) with enable/disable toggles
  */
 
-import { Fragment, useState } from 'react'
+import { useState } from 'react'
 import {
+  useAccountsLive,
   useAdminExecutionLayers,
+  useListReading,
   useDiscoverModels,
   type ExecutionLayerInfo,
   type Subscription,
@@ -23,11 +25,12 @@ import { SubscriptionRow, ModelsByProvider } from './ExecutionLayersTab.rows'
 import { SetupBanner } from './ExecutionLayersTab.sections'
 import { BalanceHint } from '../../components/engines/SubscriptionWindows'
 import {
-  acceptsLocalEndpoints, acceptsRelay, codingEngineNames, engineLabel, isCoding, isLocalProvider,
+  acceptsLocalEndpoints, acceptsRelay, accountLabel, codingEngineNames, engineLabel, isCoding, isLocalProvider,
   keyProviders, sortEngineRows, supportsOAuth, vendorBadge,
 } from '../../lib/engines'
 import { ENGINE_SUBSCRIPTION_STATUS } from '../../lib/status/engineSubscription'
 import { CARD } from '../../components/ui/classes'
+import { useSettledOrder } from '../../components/engines/useSettledOrder'
 
 // ---------------------------------------------------------------------------
 // Layer Card
@@ -67,6 +70,16 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
   // bring-your-own credentials (keys / OAuth). Local endpoints live in the
   // shared Local models section (the server lists them once, not per layer).
   const rowSubs = relayCapable ? subs.filter((s) => s.auth_type !== 'relay') : subs
+  // The rows keep their places while the admin looks: a change re-orders the
+  // list after a quiet spell, in the order the pool uses the accounts.
+  const list = useListReading('pool')
+  const pending = list.pending
+  const { shown, changed, removed, itemRef, listRef } = useSettledOrder(rowSubs, {
+    open: expanded,
+    settings: (s) => `${s.status}:${s.use_personal}:${s.contribute_platform}`,
+    pending,
+  })
+  const live = useAccountsLive('pool', expanded, pending).data
   const hasLocalModels = acceptsLocalEndpoints(engine)
   // The providers an admin key on this engine may belong to (its vendor,
   // or the key-taking providers of a multi-provider engine).
@@ -144,7 +157,11 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
       <button
         type="button"
         aria-expanded={expanded}
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => {
+          // An opened list reads the pool's order now.
+          if (!expanded) list.reread()
+          setExpanded(!expanded)
+        }}
         className="w-full flex items-center justify-between px-4 sm:px-5 py-3 sm:py-4 text-left hover:bg-surface-hover transition-colors"
       >
         <div className="flex flex-wrap items-center gap-2 sm:gap-3 min-w-0">
@@ -201,7 +218,7 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
 
             {/* The key form opens under its button, above the rows. */}
             {showAddApiKey && (
-              <AddApiKeyForm layer={layer.name} providers={providers} onDone={() => setShowAddApiKey(false)} />
+              <AddApiKeyForm layer={layer.name} providers={providers} onDone={() => { changed(); setShowAddApiKey(false) }} />
             )}
 
             {rowSubs.length === 0 && !showAddApiKey && !showOAuth && (
@@ -212,24 +229,27 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
               </p>
             )}
 
-            <div className="space-y-0.5">
-              {rowSubs.map((sub) => (
-                <Fragment key={sub.id}>
+            <div ref={listRef} tabIndex={-1} className="space-y-0.5 outline-none">
+              {shown.map((sub) => (
+                <div key={sub.id} ref={itemRef(sub.id)} className="space-y-0.5">
                   <SubscriptionRow
-                    sub={sub}
+                    sub={live?.[sub.id] ? { ...sub, live: live[sub.id].live ?? sub.live, windows: live[sub.id].windows } : sub}
                     layer={layer.name}
                     vendorId={engine.identity.vendor_id}
+                    accountName={accountLabel(engine)}
                     onDiscover={handleDiscover}
+                    onChanged={changed}
+                    onRemoved={removed}
                   />
                   {!isLocalDiscover && discoverState?.sub.id === sub.id && discoverPanel}
-                </Fragment>
+                </div>
               ))}
             </div>
             <BalanceHint oauthCount={rowSubs.filter((s) => s.auth_type === 'oauth' && s.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE).length} />
 
             {/* A connect is several steps: it opens in a dialog. */}
             {showOAuth && (
-              <ConnectOAuth engine={engine} ownerType="platform" onDone={() => setShowOAuth(false)} />
+              <ConnectOAuth engine={engine} ownerType="platform" onDone={() => { changed(); setShowOAuth(false) }} />
             )}
           </div>
 
@@ -294,8 +314,9 @@ export default function ExecutionLayersTab() {
       {!codingReady && <SetupBanner engines={codingEngineNames(layers.map((l) => l.capabilities))} />}
       <p className="text-sm text-tertiary">
         Set up the shared Anthropic and OpenAI subscriptions your agents use for
-        tasks and chats. Add API keys and models for each AI engine. People connect
-        their own subscriptions for their own chats in User Settings, AI Engines.
+        their own tasks. Add API keys and models for each AI engine. People connect
+        their own subscriptions in User Settings, AI Engines. Their chats, and the
+        chats agents start from them, run on those.
         In Admin, Users, the Platform API switch lets a person use these API keys.
       </p>
       {orderedLayers.map((layer) => (

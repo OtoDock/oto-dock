@@ -14,6 +14,7 @@ from fastapi import HTTPException
 
 from api.mcp import mcps as mcps_api
 from auth.providers import UserContext
+from services.mcp import mcp_manifest_store
 from storage.mcp import mcp_store
 
 
@@ -46,12 +47,11 @@ def _make_manifest(name, category="core"):
 
 @pytest.fixture
 def core_manifests(temp_db, monkeypatch):
-    from services.mcp import mcp_registry
     manifests = {
         name: _make_manifest(name)
         for name in ("meetings-mcp", "delegation-mcp", "schedules-mcp", "memory-mcp")
     }
-    monkeypatch.setattr(mcp_registry, "_manifests", manifests)
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", manifests)
     for name in manifests:
         mcp_store.set_mcp_enabled(name, True)
     return manifests
@@ -103,14 +103,14 @@ def test_an_uninstall_deletes_its_subscriptions_first(temp_db, monkeypatch, tmp_
     install used (one nothing used never reaches the relay)."""
     from types import SimpleNamespace
 
-    from services.mcp import mcp_registry
+    from services.mcp import mcp_manifest_store, mcp_registry
     from services.webhooks import relay_events, subscription_manager
     from storage.identity import credential_store
     from storage.mcp import mcp_update_state_store
     manifest = _make_manifest("slack-mcp", category="community")
     manifest.mcp_dir = tmp_path / "slack-mcp"
     manifest.credentials = SimpleNamespace(webhooks={"provider_id": "slack"}, oauth={"provider_id": "slack"})
-    monkeypatch.setattr(mcp_registry, "_manifests", {"slack-mcp": manifest})
+    monkeypatch.setattr(mcp_manifest_store, "_manifests", {"slack-mcp": manifest})
     order: list[str] = []
 
     async def cleanup(name):

@@ -1,0 +1,485 @@
+[
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-gates",
+    "streaming",
+    {
+     "agent": "term-gates"
+    }
+   ]
+  ],
+  "held": {
+   "a_stale_draft_expires_and_it_injects": null,
+   "bg_pending": "bg_pending",
+   "cold_submit_pending": "cold_submit_pending",
+   "composer_dirty": "composer_dirty",
+   "not_quiet": "not_quiet",
+   "not_ready": "not_ready",
+   "permission_pending": "permission_pending",
+   "question_parked": "question_parked",
+   "too_young": "too_young",
+   "turn_open": "turn_open"
+  },
+  "pty": [
+   "not yet"
+  ],
+  "slot_acquired": [
+   [
+    "sid-gates",
+    {
+     "per_user_cap": false,
+     "target": "local",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "spawn": [
+   {
+    "cols": 80,
+    "rows": 24,
+    "scrollback_limit": 262144
+   }
+  ],
+  "state": {
+   "sid-gates": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_submit",
+     "_fire_submit",
+     "_fire_title_timer",
+     "_run_midturn_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "gates",
+  "timers": [
+   [
+    "_mark_ready",
+    null
+   ],
+   [
+    "_fire_inject_backstop",
+    5.0
+   ],
+   [
+    "<lambda>",
+    60
+   ],
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ],
+   [
+    "_fire_title_timer",
+    30.0
+   ],
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "steer this"
+  ],
+  "state": {
+   "sid-gates": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_submit",
+     "_fire_submit",
+     "_fire_title_timer",
+     "_run_midturn_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "a steer goes into the open turn",
+  "timers": [
+   [
+    "_fire_submit",
+    0.8
+   ],
+   [
+    "_fire_submit",
+    12.0
+   ]
+  ]
+ },
+ {
+  "state": {
+   "sid-gates": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": true,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "composer_dirty",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [
+     "typed over"
+    ],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer",
+     "_run_midturn_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "a dirty composer holds a steer too"
+ },
+ {
+  "answered": true,
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-gates",
+    "ready",
+    {
+     "agent": "term-gates"
+    }
+   ]
+  ],
+  "state": {
+   "sid-gates": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": "not_quiet",
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": true,
+    "queue": [
+     "hello\nworld"
+    ],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "a composer send held for the dialog",
+  "turn_end": [
+   [
+    "sid-gates",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-gates",
+    "streaming",
+    {
+     "agent": "term-gates"
+    }
+   ]
+  ],
+  "pty": [
+   "\u001b[200~hello\nworld\u001b[201~"
+  ],
+  "state": {
+   "sid-gates": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer",
+     "_run_midturn_tail",
+     "_run_post_output_tail",
+     "_run_post_output_tail",
+     "_warm_enter"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "the answer reopens the turn and types it",
+  "timers": [
+   [
+    "_run_midturn_tail",
+    1.0
+   ],
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ],
+   [
+    "_warm_enter",
+    0.12
+   ],
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ]
+  ]
+ },
+ {
+  "pty": [
+   "\r"
+  ],
+  "state": {
+   "sid-gates": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer",
+     "_run_midturn_tail",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "its warm Enter"
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-gates",
+    "ready",
+    {
+     "agent": "term-gates"
+    }
+   ]
+  ],
+  "pty": [
+   "text before the dialog"
+  ],
+  "state": {
+   "sid-gates": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": true,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": true,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": false
+   }
+  },
+  "step": "the Enter is held for the dialog",
+  "timers": [
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ],
+   [
+    "_warm_enter",
+    0.12
+   ],
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ]
+  ],
+  "turn_end": [
+   [
+    "sid-gates",
+    {
+     "driven_by": "cli",
+     "engine": "claude",
+     "source": "transcript"
+    }
+   ]
+  ]
+ },
+ {
+  "broadcast_chat_status": [
+   [
+    "user-admin",
+    "chat-gates",
+    "streaming",
+    {
+     "agent": "term-gates"
+    }
+   ]
+  ],
+  "pty": [
+   "\r"
+  ],
+  "state": {
+   "sid-gates": {
+    "alive": true,
+    "closing": false,
+    "cold_flush": {
+     "attempts": 0,
+     "pending": ""
+    },
+    "composer_dirty": false,
+    "exit_code": null,
+    "had_viewer": false,
+    "has_viewer": false,
+    "held": null,
+    "input_buffer": [],
+    "otodock_attached": false,
+    "question_parked": false,
+    "queue": [],
+    "ready": true,
+    "submitted_once": true,
+    "timers": [
+     "_fire_inject_backstop",
+     "_fire_title_timer",
+     "_run_midturn_tail",
+     "_run_post_output_tail",
+     "_run_post_output_tail"
+    ],
+    "title_armed": true,
+    "turn_open": true
+   }
+  },
+  "step": "the unpark presses it",
+  "timers": [
+   [
+    "_run_post_output_tail",
+    1.5
+   ],
+   [
+    "_run_post_output_tail",
+    4.0
+   ],
+   [
+    "_run_midturn_tail",
+    1.0
+   ]
+  ]
+ }
+]

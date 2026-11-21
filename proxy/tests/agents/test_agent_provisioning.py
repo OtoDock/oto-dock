@@ -8,6 +8,7 @@ import logging
 
 import config
 from services.agents import agent_provisioning
+from services.infra import git_writer
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.identity import db_users
@@ -29,7 +30,24 @@ def test_the_app_installs_the_hooks_before_anything_else_at_start():
 
 def test_an_agent_gets_its_config_repo():
     agent_store.create_agent("prov-a", "Prov A")
-    assert (config.get_agent_dir("prov-a") / "config" / ".git").is_dir()
+    assert git_writer.store_path("prov-a/config").is_dir()
+    assert git_writer.store_path("prov-a/knowledge").is_dir()
+    assert not (config.get_agent_dir("prov-a") / "config" / ".git").exists()
+
+
+def test_an_agents_histories_go_with_it_and_a_new_agent_of_the_name_has_none():
+    agent_store.create_agent("prov-life", "Prov Life")
+    folder = config.get_agent_dir("prov-life") / "config"
+    (folder / "agent.md").write_text("the first agent")
+    assert git_writer.commit_file(folder, folder / "agent.md", "the first agent's persona")
+    assert agent_store.delete_agent("prov-life")
+    assert not (git_writer.history_root() / "agents" / "prov-life").exists()
+    # A removal that failed leaves histories under the name: the next agent
+    # of that name never shows them.
+    (git_writer.history_root() / "agents" / "prov-life" / "config.git").mkdir(parents=True)
+    agent_store.create_agent("prov-life", "Prov Life Again")
+    assert [row["subject"] for row in git_writer.log(folder)] == ["init"]
+    assert len(list((git_writer.history_root() / "set-aside" / "prov-life").iterdir())) == 1
 
 
 def test_a_membership_makes_the_folders_and_a_removal_drops_the_memory():
@@ -39,7 +57,8 @@ def test_a_membership_makes_the_folders_and_a_removal_drops_the_memory():
     task_store.set_user_agents(PERSON, ["prov-b"], ADMIN)
     user_dir = config.get_agent_dir("prov-b") / "users" / uname
     assert (user_dir / "workspace").is_dir()
-    assert (user_dir / "context" / ".git").is_dir()
+    assert git_writer.store_path(f"prov-b/users/{uname}/context").is_dir()
+    assert not (user_dir / "context" / ".git").exists()
     (user_dir / "context" / "memory").mkdir()
     (user_dir / "context" / "memory" / "topic.md").write_text("x")
     task_store.set_user_agents(PERSON, [], ADMIN)
@@ -63,7 +82,7 @@ def test_a_store_with_no_hook_installed_says_so(monkeypatch, caplog):
         task_store.set_user_agents(PERSON, ["prov-d"], ADMIN)
     assert "prov-d created with no provisioning hook installed" in caplog.text
     assert "No provisioning hook installed: no folders for" in caplog.text
-    assert not (config.get_agent_dir("prov-d") / "config" / ".git").exists()
+    assert not git_writer.store_path("prov-d/config").exists()
 
 
 def test_install_is_idempotent():
@@ -71,3 +90,20 @@ def test_install_is_idempotent():
     agent_provisioning.install()
     assert agent_store._created_hooks.count(agent_provisioning.provision_agent_tree) == 1
     assert db_users._agent_folder_hooks.count(agent_provisioning._ensure_user_agent_dirs) == 1
+
+
+def test_a_membership_makes_no_folder_through_a_link(tmp_path):
+    """A person's folders are made beneath the agent's real folder with no
+    link followed: a users folder replaced by a link gets nothing made
+    where it points."""
+    agent_store.create_agent("prov-link", "Prov Link")
+    task_store.upsert_user(PERSON, "pp@t.com", "Person", "member")
+    stand_in = tmp_path / "stand-in"
+    stand_in.mkdir()
+    users = config.get_agent_dir("prov-link") / "users"
+    if users.exists():
+        import shutil
+        shutil.rmtree(users)
+    users.symlink_to(stand_in)
+    task_store.set_user_agents(PERSON, ["prov-link"], ADMIN)
+    assert list(stand_in.iterdir()) == []

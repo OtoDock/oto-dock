@@ -69,6 +69,11 @@ APP = SessionKind("app", "")
 
 KINDS: tuple[SessionKind, ...] = (DASHBOARD, PHONE, TASK, MEETING, TRIGGER, INTERNAL, APP)
 
+#: The open-turn kind of a spoken conversation's turn. Its pump is a chat's
+#: and its session a dashboard's, so no ``SessionKind`` tells it apart, and a
+#: restart must not go on talking with nobody there.
+DUPLEX_TURN = "duplex"
+
 _BY_NAME = {k.name: k for k in KINDS}
 _BY_ROW_SOURCE_TYPE = {k.source_type: k for k in KINDS if k.mints_chat}
 

@@ -15,7 +15,7 @@ import type { AppActionCall, AppActionResult, AppState, PinnedApp } from '@/api/
 // one-shot implementation to answer per call.
 type OnResult = (callId: string, r: AppActionResult) => void
 const fireAppActions = vi.hoisted(() => vi.fn(
-  async (_appId: string, calls: AppActionCall[], onResult: OnResult) => {
+  async (_appId: string, calls: AppActionCall[], onResult: OnResult): Promise<number | void> => {
     for (const c of calls) onResult(c.call_id, { status: 'sent' })
   },
 ))
@@ -222,6 +222,92 @@ describe('AppFrame', () => {
     await flush(800)
     expect(fireAppActions).toHaveBeenCalledTimes(2)
     expect(fireAppActions.mock.calls[1][1]).toEqual([{ call_id: 'c2', action_id: 'tool', args: { a: 1 } }])
+  })
+
+  it('sends a tool call the platform paced once more after the wait it names', async () => {
+    const tooFast = { status: 'denied', reason: 'Too fast — try again in a moment', code: 429, retry_after_ms: 300 }
+    fireAppActions
+      .mockImplementationOnce(async (_a, calls, onResult) => { onResult(calls[0].call_id, tooFast) })
+      .mockImplementationOnce(async (_a, calls, onResult) => { onResult(calls[0].call_id, { status: 'done', result: 'look applied' }) })
+    const { container } = renderFrame(<AppFrame app={mkApp()} agent="a1" />)
+    const f = getFrame(container)
+    const spy = ackSpy(f)
+    await act(async () => { appActions(f, [{ call_id: 'c1', id: 'tool', args: { look: 'warm' } }]) })
+    await flush(300)
+    expect(fireAppActions).toHaveBeenCalledTimes(1)              // waiting out the platform's gap
+    expect(spy).not.toHaveBeenCalled()
+    await flush(1000)
+    expect(fireAppActions).toHaveBeenCalledTimes(2)
+    expect(fireAppActions.mock.calls[1][1]).toEqual([{ call_id: 'c1', action_id: 'tool', args: { look: 'warm' } }])
+    const told = spy.mock.calls.map(([m]) => m)
+    expect(told).toEqual([
+      expect.objectContaining({ type: 'action_ack', status: 'done', call_id: 'c1' }),
+      expect.objectContaining({ type: 'action_result', id: 'tool', ok: true, result: 'look applied', call_id: 'c1' }),
+    ])
+  })
+
+  it('sends a paced call twice at most, and a refusal that names no wait never again', async () => {
+    // The platform names a wait for a tool call inside its gap, never for a
+    // task pressed twice inside its own (proxy test_pinned_apps.py).
+    const tooFast = { status: 'denied', reason: 'Too fast — try again in a moment', code: 429 }
+    fireAppActions.mockImplementation(async (_a, calls, onResult) => {
+      for (const c of calls) onResult(c.call_id, c.action_id === 'tool' ? { ...tooFast, retry_after_ms: 200 } : tooFast)
+    })
+    const { container } = renderFrame(<AppFrame app={mkApp()} agent="a1" />)
+    const f = getFrame(container)
+    const spy = ackSpy(f)
+    await act(async () => { appActions(f, [{ call_id: 'c1', id: 'tool' }, { call_id: 'c2', id: 'go' }]) })
+    await flush(5000)
+    const sent = fireAppActions.mock.calls.flatMap(([, calls]) => calls.map((c: AppActionCall) => c.call_id))
+    expect(sent).toEqual(['c1', 'c2', 'c1'])                     // the tool twice, the task once
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'action_result', id: 'tool', ok: false, result: 'Too fast — try again in a moment', call_id: 'c1',
+    }), '*')
+    expect(spy.mock.calls.filter(([m]) => m.type === 'action_ack')).toHaveLength(2)
+    fireAppActions.mockReset()
+    fireAppActions.mockImplementation(async (_a, calls, onResult) => {
+      for (const c of calls) onResult(c.call_id, { status: 'sent' })
+    })
+  })
+
+  it('sends a batch the platform refused whole again as soon as its wait ends', async () => {
+    let first = true
+    fireAppActions.mockImplementation(async (_a, calls, onResult) => {
+      const whole = first
+      first = false
+      for (const c of calls) {
+        onResult(c.call_id, whole
+          ? { status: 'denied', reason: 'Too fast — try again in a moment', code: 429, retry_after_ms: 80 }
+          : { status: 'sent' })
+      }
+      return whole ? 80 : 0
+    })
+    const { container } = renderFrame(<AppFrame app={mkApp()} agent="a1" />)
+    const f = getFrame(container)
+    const spy = ackSpy(f)
+    await act(async () => { appActions(f, [{ call_id: 'c1', id: 'tool' }, { call_id: 'c2', id: 'go' }]) })
+    await flush(150)                                             // the wait, not another second
+    const sent = fireAppActions.mock.calls.map(([, calls]) => calls.map((c: AppActionCall) => c.call_id))
+    expect(sent).toEqual([['c1', 'c2'], ['c1', 'c2']])          // nothing ran: the task goes again too
+    expect(spy.mock.calls.filter(([m]) => m.type === 'action_ack' && m.status === 'sent')).toHaveLength(2)
+    fireAppActions.mockReset()
+    fireAppActions.mockImplementation(async (_a, calls, onResult) => {
+      for (const c of calls) onResult(c.call_id, { status: 'sent' })
+    })
+  })
+
+  it('sends nothing again for a page that is gone', async () => {
+    fireAppActions.mockImplementationOnce(async (_a, calls, onResult) => {
+      onResult(calls[0].call_id, { status: 'denied', reason: 'Too fast — try again in a moment', code: 429, retry_after_ms: 300 })
+    })
+    const { container, unmount } = renderFrame(<AppFrame app={mkApp()} agent="a1" />)
+    const f = getFrame(container)
+    ackSpy(f)
+    await act(async () => { appActions(f, [{ call_id: 'c1', id: 'tool' }]) })
+    await flush()
+    unmount()
+    await flush(2000)
+    expect(fireAppActions).toHaveBeenCalledTimes(1)
   })
 
   it('routes mcp_tool actions with args and bridges the result into the frame', async () => {

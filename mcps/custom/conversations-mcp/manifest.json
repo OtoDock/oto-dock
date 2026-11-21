@@ -1,0 +1,36 @@
+{
+  "name": "conversations-mcp",
+  "server_name": "conversations",
+  "label": "Conversations",
+  "description": "The agent's conversations with outside people and on its own phone line. An editor or a manager asks what people asked and how each conversation ended, and reads one. After a conversation the agent records its outcome and follow-ups here.",
+  "version": "1.0.0",
+  "category": "core",
+  "audience": "editor",
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": [
+      "server.py"
+    ],
+    "starts": "with_chat"
+  },
+  "credentials": {
+    "type": "none"
+  },
+  "config": [],
+  "env": {},
+  "agent_env": {},
+  "exclude_from": ["external", "phone", "meeting", "task"],
+  "permissions": {
+    "default_tier": "open",
+    "rules": [
+      {
+        "tool": "record_outcome",
+        "tier": "open"
+      }
+    ]
+  },
+  "patched": false,
+  "patch_note": null
+}

@@ -560,11 +560,12 @@ FINISH_MIN_S = 120.0
 
 
 def _stat(path: str) -> tuple[int, int, int] | None:
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_ino, st.st_mtime_ns, st.st_size)
+    """What sits at ``path`` (inode, mtime, size), looked at with no link
+    followed (``shared.safe_kind``); None when nothing is reached there."""
+    import shared
+
+    st = shared.safe_kind(path).st
+    return None if st is None else (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
 class _PathLock:

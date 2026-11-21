@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -80,6 +81,205 @@ def _force_remove_or_quarantine(path: Path, quarantine: Path, *, label: str) -> 
             raise rm_err from mv_err
 
 
+# The largest entry point a swap rewrites: a console script is a few hundred
+# bytes, a Windows wrapper a few hundred KB.
+_SCRIPT_LIMIT = 1 << 20
+_WRAPPER_LIMIT = 16 << 20
+
+
+def _rewrite_through_fresh_name(entry: Path, data: bytes, mode: int, suffix: str) -> None:
+    """Replace ``entry`` with ``data`` through a temporary name beside it:
+    anything already under that name (a link a build left) is removed and the
+    file is created anew, exclusively and following no link, so the write
+    never lands outside the folder."""
+    tmp = entry.with_name(entry.name + suffix)
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(tmp, flags, 0o600), "wb") as fh:
+        fh.write(data)
+        if config.HOST.posix:
+            os.fchmod(fh.fileno(), mode)
+    atomic_replace(tmp, entry)
+
+
+#: The folders of an installed tool its updates keep (its keys and its data):
+#: the swap moves them from the old folder into ``<tool>.new`` before it
+#: replaces the folder.
+PRESERVED_SUBDIRS = ("keys", "config", "screenshots")
+
+
+def rescue_preserved(staged: Path) -> list[str]:
+    """Move the preserved folders a stopped swap left in ``staged``
+    (``<tool>.new``) back into ``<tool>``, made when it is gone (with no
+    manifest it is no installed tool, and the next install carries them
+    over), before ``staged`` is dropped: a stop during the swap never costs
+    a tool's keys and data. One ``<tool>`` still holds stays; a link is
+    never moved. Answers the folders moved."""
+    if not staged.name.endswith(".new"):
+        return []
+    target = staged.with_name(staged.name[:-len(".new")])
+    moved: list[str] = []
+    for sub in PRESERVED_SUBDIRS:
+        src = staged / sub
+        if src.is_symlink() or not src.is_dir() or os.path.lexists(target / sub):
+            continue
+        target.mkdir(parents=True, exist_ok=True)
+        os.replace(src, target / sub)
+        moved.append(sub)
+    return moved
+
+
+def sweep_staged(category_dir: Path) -> int:
+    """Remove what a stopped install left in one category folder: a swap's
+    quarantine (``.quarantine-<mcp>-<id>``, the handles that held it are
+    released by the restart), a staged folder (``<mcp>.new``), its keys
+    and data put back first (``rescue_preserved``), and the folder a
+    stopped copy of the update left (``.copying-<mcp>``,
+    ``scripts/copy-tools-to-compute.sh``). One still held is left for the
+    next start. Answers how many went."""
+    swept = 0
+    for d in (list(category_dir.glob(".quarantine-*")) + list(category_dir.glob("*.new"))
+              + list(category_dir.glob(".copying-*"))):
+        try:
+            if rescued := rescue_preserved(d):
+                logger.info("Put %s back into %s from a stopped swap", rescued, d.name[:-4])
+            force_rmtree(d)
+            logger.info("Swept stale MCP install scratch dir: %s", d.name)
+            swept += 1
+        except OSError:
+            pass  # still held: the next start tries again
+    return swept
+
+
+#: The category the install's own compute machine keeps itself (``own_tools``).
+COMMUNITY = "community"
+#: What a spec of another category is answered with there.
+COMMUNITY_ALONE = "This machine keeps the community tools alone."
+
+
+def kept_categories(sat_config) -> tuple[str, ...] | None:
+    """The categories this machine's tool frames may touch: the community
+    one alone on the install's own compute machine, whose other tools
+    folders are the platform's. ``None`` elsewhere: every category."""
+    return (COMMUNITY,) if getattr(sat_config, "own_tools", False) else None
+
+
+def begin_sync(sat_config, msg: dict) -> tuple[str, ...] | None:
+    """What a ``sync_mcps`` frame starts with: the categories it may touch
+    (``kept_categories``) and, on the install's own compute machine, where
+    its builds may go (the frame's ``egress``, held in memory by
+    ``sandbox_host.note_egress`` until ``end_sync``). Blocking."""
+    kept = kept_categories(sat_config)
+    if kept is not None:
+        from . import sandbox_host
+        try:
+            sandbox_host.note_egress(msg.get("egress"))
+        except OSError:
+            # The installs go on: a build that needed the settings fails by
+            # its own output, which names what it could not reach.
+            logger.exception("builds: the platform's trust files could not be written")
+    return kept
+
+
+def end_sync(sat_config) -> None:
+    """What a ``sync_mcps`` frame ends with on the install's own compute
+    machine: the frame's egress is forgotten (``sandbox_host.clear_egress``).
+    The platform owns those values, and this machine uses them for the
+    builds of the frame that carried them and for nothing else. Blocking."""
+    if kept_categories(sat_config) is not None:
+        from . import sandbox_host
+        sandbox_host.clear_egress()
+
+
+def settle_pin(spec: dict, staged: Path, source: str, result) -> str:
+    """The version a build read back, as the ack names it
+    (``resolved_version``), ``""`` when it read none. With ``pin`` in the
+    spec (the platform's own install of the tool) the staged folder is
+    settled to that version first (the vendored ``mcp_pin.settle_built``:
+    the manifest pinned, a Node tool's ``package.json``) and its hash read
+    again, so this machine and the platform hash the same folder. Blocking."""
+    from .._vendored import mcp_installer, mcp_pin
+    resolved = mcp_installer.plain_version(getattr(result, "resolved_version", ""))
+    if resolved and spec.get("pin") is True and mcp_pin.settle_built(staged, source, resolved):
+        result.version_hash = mcp_installer.compute_version_hash(staged)
+    return resolved
+
+
+def environment_missing(mcp_dir: Path, manifest: dict) -> bool:
+    """Whether a tool that installs from a registry or a repository has no
+    environment to run in here. A Python tool (``pypi:`` or ``git+``): its
+    ``venv/bin/python`` resolves to no file (never built, or an interpreter
+    that is gone), or resolves to this host's own Python while the venv was
+    made for another minor (a folder copied from a host with another
+    Python). A Node tool (``npm:``): no ``node_modules``, or none that holds
+    its own package. Any other runtime or source needs none. A folder copied
+    from elsewhere (an upgrade, a restored backup) is judged by this. It
+    starts no process: bounded reads of what the installer's own readbacks
+    read."""
+    from .._vendored import mcp_installer
+    server = manifest.get("server") if isinstance(manifest, dict) else None
+    server = server if isinstance(server, dict) else {}
+    runtime, source = server.get("runtime"), str(server.get("source") or "")
+    if runtime == "python" and source.startswith(("pypi:", "git+")):
+        python = Path(mcp_dir) / "venv" / "bin" / "python"
+        if not python.is_file():
+            return True
+        made_for = mcp_installer.venv_python_minor(Path(mcp_dir) / "venv")
+        return made_for is not None and made_for != sys.version_info[:2] and _is_host_python(python)
+    if runtime == "node" and source.startswith("npm:"):
+        if not (Path(mcp_dir) / "node_modules").is_dir():
+            return True
+        parsed = mcp_installer.parse_source(source)
+        return bool(parsed and parsed.package
+                    and not mcp_installer._node_installed_version(Path(mcp_dir), parsed.package))
+    return False
+
+
+def _is_host_python(python: Path) -> bool:
+    """Whether a venv's interpreter is this host's own Python (the one this
+    process runs on), not an interpreter kept for the tools."""
+    try:
+        resolved = python.resolve()
+        return resolved == Path(sys.executable).resolve() or resolved.is_relative_to(Path(sys.base_prefix).resolve())
+    except (OSError, RuntimeError):
+        return False
+
+
+def verify_installed(mcps_dir: Path, categories: tuple[str, ...] | None) -> dict[str, dict]:
+    """``{name: {version_hash, healthy, category}}`` of every installed MCP
+    (``sync_mcps_verify``'s answer). Unhealthy: an install that never ended
+    (its marker is still there), a folder whose hash cannot be read. With
+    ``categories`` (the install's own compute machine) those folders alone
+    are read, and a tool there is unhealthy too when its manifest does not
+    parse or it has no environment (``environment_missing``). Blocking: it
+    hashes every tool's source."""
+    from .._vendored import mcp_installer
+    out: dict[str, dict] = {}
+    if not mcps_dir.is_dir():
+        return out
+    for cat_dir in mcps_dir.iterdir():
+        if not cat_dir.is_dir() or (categories is not None and cat_dir.name not in categories):
+            continue
+        for mcp_dir in cat_dir.iterdir():
+            if not mcp_dir.is_dir() or not (mcp_dir / "manifest.json").is_file():
+                continue
+            name = mcp_dir.name
+            healthy = not (cat_dir / f".install-in-progress-{name}").exists()
+            try:
+                vh = mcp_installer.compute_version_hash(mcp_dir)
+            except OSError:
+                vh, healthy = "", False
+            if healthy and categories is not None:
+                try:
+                    manifest = json.loads((mcp_dir / "manifest.json").read_text(encoding="utf-8"))
+                    healthy = not environment_missing(mcp_dir, manifest)
+                except (OSError, ValueError):
+                    healthy = False
+            out[name] = {"version_hash": vh, "healthy": healthy, "category": cat_dir.name}
+    return out
+
+
 def _fix_shebangs_after_swap(old_root: Path, new_root: Path) -> None:
     """Rewrite venv entry-point shebangs after an os.replace swap.
 
@@ -92,44 +292,35 @@ def _fix_shebangs_after_swap(old_root: Path, new_root: Path) -> None:
     This walks ``new_root/venv/bin/*`` and replaces any shebang pointing
     at ``old_root`` with the equivalent path under ``new_root``. Safe to
     run on dirs without a venv (returns early) or on already-correct
-    shebangs (no-op).
+    shebangs (no-op). A build wrote that folder: a ``venv`` or ``bin`` that
+    is a link is never entered, an entry that is not a regular file is left
+    alone, each is read through ``read_built`` and written back through a
+    fresh name (``_rewrite_through_fresh_name``).
     """
+    from .._vendored import mcp_installer
     venv_bin = new_root / "venv" / "bin"
-    if not venv_bin.is_dir():
+    if (new_root / "venv").is_symlink() or venv_bin.is_symlink() or not venv_bin.is_dir():
         return
     old_str = str(old_root)
     new_str = str(new_root)
     if old_str == new_str:
         return
-    for entry in venv_bin.iterdir():
-        if not entry.is_file():
-            continue
+    for entry in sorted(venv_bin.iterdir()):
         try:
-            # Read just the first chunk; shebangs are always the first line.
-            with open(entry, "rb") as f:
-                head = f.read(4096)
-            if not head.startswith(b"#!"):
+            mode = entry.lstat().st_mode
+            if not stat.S_ISREG(mode):
                 continue
-            head_text = head.decode("utf-8", errors="replace")
-            if old_str not in head_text:
+            content = mcp_installer.read_built(entry, _SCRIPT_LIMIT + 1)
+            if content is None or len(content) > _SCRIPT_LIMIT or not content.startswith(b"#!"):
                 continue
-            # Read the rest, rewrite first line, write back atomically.
-            with open(entry, "rb") as f:
-                content = f.read()
             text = content.decode("utf-8", errors="replace")
             nl = text.find("\n")
-            if nl == -1:
+            if nl == -1 or old_str not in text[:nl]:
                 continue
-            first_line = text[:nl].replace(old_str, new_str)
-            fixed = first_line + text[nl:]
-            tmp = entry.with_suffix(entry.suffix + ".shebang-tmp")
-            tmp.write_text(fixed)
-            # Mode bits only matter on Unix (entry scripts need +x).
-            if config.HOST.posix:
-                tmp.chmod(entry.stat().st_mode)
-            atomic_replace(tmp, entry)
-        except (OSError, UnicodeDecodeError):
-            # Binary file or read failure — leave it alone.
+            fixed = text[:nl].replace(old_str, new_str) + text[nl:]
+            _rewrite_through_fresh_name(entry, fixed.encode("utf-8"), stat.S_IMODE(mode), ".shebang-tmp")
+        except OSError:
+            # A read or write failure: leave the entry as it is.
             continue
 
 
@@ -160,7 +351,7 @@ def _fix_windows_exe_paths_after_swap(old_root: Path, new_root: Path) -> None:
     if config.HOST.posix:
         return
     venv_scripts = new_root / "venv" / "Scripts"
-    if not venv_scripts.is_dir():
+    if (new_root / "venv").is_symlink() or venv_scripts.is_symlink() or not venv_scripts.is_dir():
         return
     old_python = str(old_root / "venv" / "Scripts" / "python.exe")
     new_python = str(new_root / "venv" / "Scripts" / "python.exe")
@@ -183,11 +374,15 @@ def _fix_windows_exe_paths_after_swap(old_root: Path, new_root: Path) -> None:
         pad = b" " * (len(old_b) - len(new_b))
         variants.append((old_b, new_b + pad))
 
-    for entry in venv_scripts.iterdir():
-        if not entry.is_file() or entry.suffix.lower() != ".exe":
+    from .._vendored import mcp_installer
+    for entry in sorted(venv_scripts.iterdir()):
+        if entry.suffix.lower() != ".exe":
             continue
         try:
-            content = entry.read_bytes()
+            read = mcp_installer.read_built(entry, _WRAPPER_LIMIT + 1)
+            if read is None or len(read) > _WRAPPER_LIMIT:
+                continue
+            content = read
             changed = False
             for old_b, new_b_padded in variants:
                 if old_b in content:
@@ -195,9 +390,7 @@ def _fix_windows_exe_paths_after_swap(old_root: Path, new_root: Path) -> None:
                     changed = True
             if not changed:
                 continue
-            tmp = entry.with_suffix(entry.suffix + ".rewrap-tmp")
-            tmp.write_bytes(content)
-            atomic_replace(tmp, entry)
+            _rewrite_through_fresh_name(entry, content, 0o755, ".rewrap-tmp")
         except OSError as e:
             logger.warning(
                 "Failed to rewrite .exe wrapper %s: %s", entry.name, e,
@@ -474,21 +667,6 @@ async def _warm_one_mcp(
 _RUNTIME_MARKER = ".oto-runtime.json"
 
 
-def _venv_python_minor(venv_dir: Path) -> tuple[int, int] | None:
-    """``(major, minor)`` from ``venv/pyvenv.cfg``, or None if missing/garbled."""
-    try:
-        text = (venv_dir / "pyvenv.cfg").read_text()
-    except OSError:
-        return None
-    for line in text.splitlines():
-        key, _, val = line.partition("=")
-        if key.strip().lower() in ("version", "version_info"):
-            parts = val.strip().split(".")
-            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-                return int(parts[0]), int(parts[1])
-    return None
-
-
 _node_major_cache: int | None = None
 _node_major_probed = False
 
@@ -541,14 +719,15 @@ _CAUSE_WORDS = re.compile(
     r"|is not installed|No space left|RequiredDependencyException"
 )
 _TREE_GLYPHS = " \t×├╰─▶│|"
-# A network, service, disk or file-lock failure's words (the proxy's ``mcp_sync.
-# _TRANSIENT_FAIL_RE``, held equal by a test): such a line leads the cause, so
-# the cut keeps it and the platform never remembers the failure as lasting.
+# A network, service, disk or file-lock failure's words, and the memory guard's
+# stop of a build (the proxy's ``mcp_sync._TRANSIENT_FAIL_RE``, held equal by a
+# test): such a line leads the cause, so the cut keeps it and the platform never
+# remembers the failure as lasting.
 _NETWORK_WORDS = re.compile(
     r"Failed to fetch|Failed to download|resolve host|spurious network error|error sending request"
     r"|dns error|timed out|Connection (?:reset|refused|closed)|Network is unreachable|tls handshake"
     r"|No space left on device|Disk quota exceeded|Text file busy|resource busy"
-    r"|being used by another process|Resource temporarily unavailable",
+    r"|being used by another process|Resource temporarily unavailable|used too much memory and was stopped",
     re.IGNORECASE,
 )
 
@@ -558,7 +737,10 @@ def install_failure_cause(log: str) -> str:
     order (the network ones first), each once, joined by " / " and cut to
     600 characters, else the log's last 500 characters. The platform tells
     the session this, and a cause it reads as lasting skips the install at
-    the next hour's starts."""
+    the next hour's starts. The sign-in of any address in it is masked
+    first (``mcp_installer.mask_sign_ins``): the cause leaves this machine."""
+    from .._vendored import mcp_installer
+    log = mcp_installer.mask_sign_ins(log)
     found: list[str] = []
     for raw in log.splitlines():
         line = " ".join(raw.lstrip(_TREE_GLYPHS).split())
@@ -601,13 +783,34 @@ def _needs_python_reconcile(venv_dir: Path, target: tuple[int, int], mcp_dir: Pa
     floor-kept venv from rebuilding at every boot on both sides."""
     if not venv_dir.is_dir():
         return False
-    vm = _venv_python_minor(venv_dir)
+    from .._vendored import mcp_installer
+    vm = mcp_installer.venv_python_minor(venv_dir)
     if vm is None or vm == target or (vm > target and config.HOST.name != config.DARWIN):
         return False
     return _read_runtime_marker(mcp_dir).get("python") != f"{target[0]}.{target[1]}"
 
 
-async def _uv_venv_pinned(uv_bin: str, venv_dir: Path, target: tuple[int, int], mcp_dir: Path) -> None:
+def build_runner(compute):
+    """How this satellite runs each step of a tool's build, chosen here
+    alone: in this machine's sandbox on a compute machine (``compute``, its
+    configuration), as the satellite's own children on a paired computer,
+    whose owner's account is the boundary (SECURITY-DECISIONS decision 2)."""
+    from .._vendored import mcp_installer
+    if compute is not None:
+        from . import sandbox_host
+        return sandbox_host.build_run(compute)
+    return mcp_installer.run_unconfined
+
+
+async def install(mcp_dir: Path, runtime: str, source: str, *, compute, **kwargs):
+    """The satellite's one caller of ``install_mcp``: every step through
+    ``build_runner(compute)``; the keyword arguments are the installer's."""
+    from .._vendored import mcp_installer
+    return await mcp_installer.install_mcp(mcp_dir, runtime, source, run=build_runner(compute), **kwargs)
+
+
+async def _uv_venv_pinned(uv_bin: str, venv_dir: Path, target: tuple[int, int], mcp_dir: Path,
+                          run) -> None:
     """Pre-create ``venv_dir`` on this host's interpreter so the subsequent
     install pip-installs into a venv that matches the platform. Best-effort."""
     spec = mcp_python_spec() or f"{target[0]}.{target[1]}"
@@ -616,13 +819,14 @@ async def _uv_venv_pinned(uv_bin: str, venv_dir: Path, target: tuple[int, int], 
     # other subprocess of an install gets: no satellite-side variable reaches uv.
     from .._vendored import mcp_installer
     env = mcp_installer._install_env({
-        "UV_PYTHON_INSTALL_DIR": str(mcp_dir.parent.parent / ".uv-python"),
+        "UV_PYTHON_INSTALL_DIR": str(mcp_installer.uv_python_dir_for(mcp_dir)),
         "UV_LINK_MODE": "copy",
     })
     try:
-        rc, out = await mcp_installer._run_bounded(
+        rc, out = await run(
             [uv_bin, "venv", "--python", spec, str(venv_dir)],
             cwd=None, env=env, timeout=mcp_installer.DEFAULT_INSTALL_TIMEOUT,
+            step="venv", mcp_dir=mcp_dir,
         )
         if rc != 0:
             logger.warning(
@@ -632,7 +836,7 @@ async def _uv_venv_pinned(uv_bin: str, venv_dir: Path, target: tuple[int, int], 
         logger.exception("uv venv --python %s for %s errored", spec, mcp_dir.name)
 
 
-async def _reconcile_node_addons(mcp_dir: Path, name: str) -> str | None:
+async def _reconcile_node_addons(mcp_dir: Path, name: str, run) -> str | None:
     """``npm rebuild`` native addons when the system node MAJOR changed since
     ``node_modules`` was built. Advisory; absent marker → record, don't rebuild."""
     current = _node_major()
@@ -649,9 +853,10 @@ async def _reconcile_node_addons(mcp_dir: Path, name: str) -> str | None:
         # The packages' lifecycle scripts run here: the installer's
         # environment and time bound, as for every install subprocess.
         from .._vendored import mcp_installer
-        rc, out = await mcp_installer._run_bounded(
+        rc, out = await run(
             mcp_installer._shell_argv(["npm", "rebuild"]), cwd=str(mcp_dir),
             env=mcp_installer._install_env(), timeout=mcp_installer.DEFAULT_INSTALL_TIMEOUT,
+            step="rebuild", mcp_dir=mcp_dir,
         )
         if rc == 0:
             _write_runtime_marker(mcp_dir, node_major=current)
@@ -685,7 +890,54 @@ def _settle_venv_asides(mcps_dir: Path, target: tuple[int, int]) -> None:
             logger.warning("reconcile: could not settle %s", aside.name)
 
 
-async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str, str]:
+def _interpreter_gone(venv_dir: Path) -> bool:
+    """Whether a venv's interpreter no longer exists (an image changed its
+    Python): its ``bin/python`` resolves to nothing."""
+    python = venv_dir / "bin" / "python"
+    return os.path.lexists(python) and not python.exists()
+
+
+async def _rebuild_community_venv(mcp_dir: Path, manifest: dict, uv_bin: str | None, compute) -> str:
+    """A community MCP's venv built again on this compute machine from its
+    manifest's pinned source, in the sandbox: what an install of it would
+    run, wheels only (the source build list the manifest names aside)."""
+    from . import sandbox_host
+    server = manifest.get("server") or {}
+    source = str(server.get("source") or "")
+    if not source.startswith(("pypi:", "git+")):
+        return "skipped-community-python"
+    logger.info("reconcile: rebuilding %s, its interpreter is gone", manifest.get("name") or mcp_dir.name)
+    try:
+        r = await install(
+            mcp_dir, "python", source, compute=compute, uv_bin=uv_bin,
+            python_spec=f"{sys.version_info[0]}.{sys.version_info[1]}",
+            source_build=list(server.get("source_build") or []),
+            sandbox_roots=sandbox_host.interpreter_roots(compute, mcp_dir))
+    except Exception:
+        logger.exception("reconcile: %s rebuild errored", mcp_dir.name)
+        return "exception"
+    return "ok-py-community-rebuild" if r.ok else "failed"
+
+
+def _prune_categories(mcps_dir: Path, categories: tuple[str, ...]) -> list[str]:
+    """The installer's interpreter prune for the named categories' own
+    interpreter folders alone (``<category>/.uv-python``): every venv under
+    ``mcps_dir`` is read, and nothing outside those folders is removed."""
+    from .._vendored import mcp_installer
+    if not config.HOST.posix:  # the installer's prune follows no Windows junction
+        return []
+    removed: list[str] = []
+    for category in categories:
+        # A category with no interpreter folder of its own (the installer
+        # keeps those beside the categories) has nothing to prune here.
+        uv_dir = mcp_installer.uv_python_dir_for(mcps_dir / category / "tool")
+        if uv_dir.parent == mcps_dir / category and uv_dir.is_dir():
+            removed += mcp_installer._prune_one(mcps_dir, uv_dir)
+    return removed
+
+
+async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None, *, compute,
+                                 categories: tuple[str, ...] | None = None) -> dict[str, str]:
     """Rebuild MCP venvs / native addons that lag this host's interpreter / node.
 
     Best-effort + idempotent; never raises. For a Python MCP whose venv interpreter
@@ -693,17 +945,33 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
     rebuild it pinned to the host interpreter via the vendored ``install_mcp``. For
     a Node MCP after a major bump: ``npm rebuild``. Returns ``name → outcome`` for
     logging. Returns ``{}`` when there's nothing to do (the common case).
+
+    ``compute`` (this compute machine's configuration, None elsewhere): every
+    step runs in the machine's sandbox (``sandbox_host.build_run``), and a
+    community Python MCP whose interpreter is gone (a new image's Python) is
+    built again from its manifest's source, wheels only, as an install does.
+
+    ``categories`` (``kept_categories``: the install's own compute machine)
+    names the category folders this run may touch. No other folder under
+    ``mcps_dir`` is written then: no venv set aside beside the categories is
+    settled, and the prune takes that category's interpreters alone. No
+    community tool is built here either: that machine builds one inside a
+    frame of the platform alone (the frame names the proxy and the index of
+    the build, which the machine keeps nowhere), so a tool whose interpreter
+    is gone waits for the run its sign-in starts.
     """
     from .._vendored import mcp_installer
 
     results: dict[str, str] = {}
     if not mcps_dir.is_dir():  # noqa: ASYNC240  # runs at boot before the link connects (__main__)
         return results
+    run = build_runner(compute)
     target = sys.version_info[:2]
-    await asyncio.to_thread(_settle_venv_asides, mcps_dir, target)
+    if categories is None:
+        await asyncio.to_thread(_settle_venv_asides, mcps_dir, target)
 
     for cat_dir in sorted(mcps_dir.iterdir()):  # noqa: ASYNC240  # runs at boot before the link connects (__main__)
-        if not cat_dir.is_dir():
+        if not cat_dir.is_dir() or (categories is not None and cat_dir.name not in categories):
             continue
         for mcp_dir in sorted(cat_dir.iterdir()):
             mf = mcp_dir / "manifest.json"
@@ -722,7 +990,19 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
                 # the install refuses for catalog content: platform-shipped
                 # folders only, as the proxy's startup reconcile does.
                 if cat_dir.name == "community":
-                    results[name] = "skipped-community-python"
+                    if compute is None or not _interpreter_gone(mcp_dir / "venv"):
+                        results[name] = "skipped-community-python"
+                    elif categories is not None:
+                        # The install's own machine builds a community tool
+                        # inside a frame of the platform alone: the frame
+                        # carries where the build's requests go, which this
+                        # machine keeps nowhere. The verify reads the tool
+                        # as unhealthy and the platform's run builds it.
+                        logger.info("reconcile: %s has no interpreter here. The platform's next sync "
+                                    "builds it again.", name)
+                        results[name] = "left-to-the-platform"
+                    else:
+                        results[name] = await _rebuild_community_venv(mcp_dir, manifest, uv_bin, compute)
                     continue
                 venv_dir = mcp_dir / "venv"
                 if not (mcp_dir / "requirements.txt").is_file():
@@ -742,19 +1022,19 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
                     logger.warning("reconcile: could not set the stale venv of %s aside", name)
                     continue
                 if uv_bin:
-                    await _uv_venv_pinned(uv_bin, venv_dir, target, mcp_dir)
+                    await _uv_venv_pinned(uv_bin, venv_dir, target, mcp_dir, run)
                 logger.info("reconcile: rebuilding %s venv on Python %s.%s", name, *target)
                 rebuilt = False
                 try:
                     # The pin again: the pre-created venv is best effort, and
                     # without it uv takes the first python3 on PATH.
-                    r = await mcp_installer.install_mcp(mcp_dir, "python", "", uv_bin=uv_bin,
-                                                        python_spec=mcp_python_spec())
+                    r = await install(mcp_dir, "python", "", compute=compute, uv_bin=uv_bin,
+                                      python_spec=mcp_python_spec())
                     if r.ok:
                         rebuilt = True
                         # Reconciled only on the pin (or a floor the package
                         # asked for): a venv uv made elsewhere is tried again.
-                        if r.venv_python or _venv_python_minor(venv_dir) == target:
+                        if r.venv_python or mcp_installer.venv_python_minor(venv_dir) == target:
                             _write_runtime_marker(mcp_dir, python=f"{target[0]}.{target[1]}")
                         results[name] = "ok-py-reconcile"
                     else:
@@ -783,13 +1063,16 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
                 if cat_dir.name == "community":
                     results[name] = "skipped-bundled-node"
                     continue
-                outcome = await _reconcile_node_addons(mcp_dir, name)
+                outcome = await _reconcile_node_addons(mcp_dir, name, run)
                 if outcome:
                     results[name] = outcome
 
     # Nothing installs yet (this runs before the satellite connects): the
     # uv-managed interpreters no venv uses go.
-    removed = await asyncio.to_thread(mcp_installer.prune_uv_pythons, mcps_dir)
+    if categories is None:
+        removed = await asyncio.to_thread(mcp_installer.prune_uv_pythons, mcps_dir)
+    else:
+        removed = await asyncio.to_thread(_prune_categories, mcps_dir, categories)
     if removed:
         logger.info("reconcile: removed unused uv interpreters: %s", removed)
     return results

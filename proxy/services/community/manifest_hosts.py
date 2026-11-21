@@ -6,13 +6,19 @@ entry reviewed: its install, update, source switch and approved request) or
 an admin who allowed them on the ZIP install card, in the MCP's row or in
 Admin, Security, where the hosts and the sign-in they receive are shown. A
 catalog entry's host applies by itself only in the narrow shape a review
-can read at a glance: the MCP's own literal https server host, or
-``localhost`` for its container. Anything else it declares (a wildcard,
-another host, an address, a host of a templated URL, a key another kind of
-MCP uses) waits for the admin's Allow like a ZIP's. An update replaces the
+can read at a glance: the MCP's own literal https server host, ``localhost``
+for its container, or a literal host a ``credentials.exit`` entry sends a
+declared secret to (keyed by the manifest's name, as an API-key-header MCP's
+are). Anything else it declares (a wildcard, another host, an address, a
+host of a templated URL, a key another kind of MCP uses) waits for the
+admin's Allow like a ZIP's. An update replaces the
 MCP's rows with the new manifest's (a ZIP update only narrows them), a
 disable takes them down and an enable puts back what was approved, a
 removal forgets them.
+
+The credential exit's hosts are rows like the tool's other hosts: the live
+rows and the ledger are one set, and the boot settles every MCP that
+declares an exit entry, so its literal exit hosts have their rows.
 
 A row going live takes over the admin row of exactly its pair, unless
 another installed MCP still leans on that row. An admin row does not hide a
@@ -47,32 +53,54 @@ _SIDECAR_HOST = "localhost"
 _TLS_SCHEME = "https"
 
 
-def _key_and_block(manifest) -> tuple[str, dict] | None:
-    """The allowlist key the gateway checks this MCP under
-    (``mcp_registry.gateway_entry``: a bearer MCP's provider id, an
-    API-key-header MCP's own name) and the block declaring its hosts."""
+def _key_and_hosts(manifest) -> tuple[str, list] | None:
+    """The allowlist key the gateway and the credential exit check this MCP
+    under (``mcp_server_resolve.gateway_entry``: a bearer MCP's provider id;
+    an API-key-header or exit MCP's own name) and the host lists it
+    declares: the bearer's or the header key's ``proposed_hosts``, each exit
+    entry's ``hosts``."""
+    from services.mcp.mcp_session_config import exit_entry_hosts
     creds = getattr(manifest, "credentials", None)
     if creds is None:
         return None
     oauth = creds.oauth or {}
     if oauth.get("bearer_required"):
-        return str(oauth.get("provider_id") or ""), oauth
+        return str(oauth.get("provider_id") or ""), [oauth.get("proposed_hosts")]
+    exits = [list(exit_entry_hosts(e)) for e in (creds.exit or []) if isinstance(e, dict)]
     if isinstance(creds.api_key_header, dict):
-        return manifest.name, creds.api_key_header
+        return manifest.name, [creds.api_key_header.get("proposed_hosts"), *exits]
+    if exits:
+        return manifest.name, exits
     return None
 
 
+def _norm(host: str) -> str:
+    return host.strip().rstrip(".").lower()
+
+
 def hosts_of(manifest) -> tuple[str, list[str]] | None:
-    """The allowlist key and the declared hosts, as the gateway keys its
-    check."""
-    found = _key_and_block(manifest)
+    """The allowlist key and the declared hosts, the exit's among them, as
+    the gateway keys its check."""
+    found = _key_and_hosts(manifest)
     if found is None:
         return None
-    key, hosts = found[0], found[1].get("proposed_hosts")
-    if not key or not isinstance(hosts, list):
+    key, lists = found[0], [hs for hs in found[1] if isinstance(hs, list)]
+    if not key or not lists:
         return None
-    out = sorted({str(h).strip().rstrip(".").lower() for h in hosts if isinstance(h, str) and h.strip()})
+    out = sorted({_norm(h) for hs in lists for h in hs if isinstance(h, str) and h.strip()})
     return key, out
+
+
+def _exit_hosts(manifest) -> set[str]:
+    """The hosts the credential exit may send a declared secret to
+    (``credentials.exit``, ``mcp_session_config.exit_entry_hosts``), as
+    ``hosts_of`` lists them."""
+    from services.mcp.mcp_session_config import exit_entry_hosts
+    out: set[str] = set()
+    for entry in manifest.credentials.exit or []:
+        if isinstance(entry, dict):
+            out |= {_norm(h) for h in exit_entry_hosts(entry) if h.strip()}
+    return out
 
 
 def _declared(manifest) -> set[tuple[str, str]]:
@@ -81,6 +109,18 @@ def _declared(manifest) -> set[tuple[str, str]]:
         return set()
     key, hosts = found
     return {(key, h) for h in hosts if not _never(h)}
+
+
+def _ledger_pairs(manifest) -> set[tuple[str, str]]:
+    """What the ledger keeps for the MCP: its declared pairs, the exit's
+    among them."""
+    return _declared(manifest)
+
+
+def _live_pairs(manifest, approved) -> set[tuple[str, str]]:
+    """Which approved pairs stand as rows now: every one. The live rows and
+    the ledger are one set; every writer reads it."""
+    return set(approved)
 
 
 def _never(host: str) -> bool:
@@ -96,25 +136,34 @@ def _is_address(host: str) -> bool:
         return False
 
 
+def _keyed_by_name(manifest) -> bool:
+    """An MCP whose allowlist key is its own name: an API-key-header or exit MCP."""
+    creds = manifest.credentials
+    return isinstance(creds.api_key_header, dict) or bool(creds.exit)
+
+
 def _key_clash(manifest, key: str) -> bool:
     """A key the other kind of MCP also uses: a bearer MCP's provider id
-    that is an API-key-header MCP's name, or the reverse."""
+    that is an API-key-header or exit MCP's name, or the reverse."""
     from auth.oauth_providers import hardcoded_provider_ids
     oauth = manifest.credentials.oauth or {}
     others = [m for m in mcp_registry.get_all_manifests().values() if m.name != manifest.name]
     if oauth.get("bearer_required"):
-        return any(m.name == key and isinstance(m.credentials.api_key_header, dict) for m in others)
+        return any(m.name == key and _keyed_by_name(m) for m in others)
     return key in hardcoded_provider_ids() or bool(mcp_registry.get_mcps_by_provider(key))
 
 
 def _applies_by_itself(manifest, pair: tuple[str, str]) -> bool:
     """A catalog host that needs no admin's Allow: the MCP's own literal
-    https server host (an exact name, never an address), or ``localhost``
-    for its container."""
+    https server host (an exact name, never an address), ``localhost`` for
+    its container, or a literal host an exit entry sends a declared secret
+    to (a wildcard waits like any other)."""
     from services.mcp import mcp_manifest_types as _mt
     key, host = pair
     if _key_clash(manifest, key) or "*" in host or _is_address(host):
         return False
+    if host in _exit_hosts(manifest):
+        return True
     if _mt.is_container(manifest.server):
         return host == _SIDECAR_HOST
     url = urlsplit(manifest.server.url_template or "")
@@ -138,7 +187,7 @@ def _relied_on(manifest, pairs: set[tuple[str, str]]) -> set[tuple[str, str]]:
     ``localhost`` for its container; any host of its key when the server
     host is templated, since which one is known only at the session)."""
     from services.mcp import mcp_manifest_types as _mt
-    found = _key_and_block(manifest)
+    found = _key_and_hosts(manifest)
     if found is None or not found[0]:
         return set()
     key = found[0]
@@ -215,21 +264,73 @@ def after_install(name: str, *, from_catalog: bool, by: str = "") -> dict | None
     if manifest is None or name == bearer_allowlist.ADMIN_SOURCE:
         return None
     try:
-        declared = _declared(manifest)
-        approved = dict.fromkeys(bearer_allowlist.approved_hosts(name) & declared, VIA_CONFIRMED)
-        if from_catalog:
-            for p in declared:
-                if _applies_by_itself(manifest, p):
-                    approved.setdefault(p, VIA_CATALOG)
-        live = set(approved) if _enabled(name) else set()
-        removed = bearer_allowlist.set_mcp_hosts(
-            name, approved=approved, live=live, take_over=_take_over(name, live),
-            origin=ORIGIN_CATALOG if from_catalog else ORIGIN_ZIP, by=by or VIA_CATALOG)
-        _told(removed)
+        _settle(manifest, from_catalog=from_catalog, by=by or VIA_CATALOG,
+                origin=ORIGIN_CATALOG if from_catalog else ORIGIN_ZIP)
         return pending(manifest)
     except Exception:  # the install stands; the admin can add the hosts by hand
         logger.exception("allowlist rows of %s not updated after its install", name)
         return None
+
+
+def _settle(manifest, *, from_catalog: bool, by: str, origin: str = "") -> None:
+    """The MCP's ledger from its manifest and its rows from the ledger: what
+    an admin allowed that it still declares stays, a catalog's own-shaped
+    hosts apply by themselves, and the rows are the live pairs of it while
+    the MCP is enabled. ``origin`` is recorded when given."""
+    name = manifest.name
+    declared = _ledger_pairs(manifest)
+    approved = dict.fromkeys(bearer_allowlist.approved_hosts(name) & declared, VIA_CONFIRMED)
+    if from_catalog:
+        for p in declared:
+            if _applies_by_itself(manifest, p):
+                approved.setdefault(p, VIA_CATALOG)
+    live = _live_pairs(manifest, approved) if _enabled(name) else set()
+    _told(bearer_allowlist.set_mcp_hosts(
+        name, approved=approved, live=live, take_over=_take_over(name, live), origin=origin, by=by))
+
+
+def _shipped(manifest) -> bool:
+    """One of the platform's own tools: its manifest arrives with a release."""
+    return getattr(manifest, "category", "") == "custom"
+
+
+def seed_shipped() -> int:
+    """The platform's own tools (category ``custom``) join the allowlist at
+    boot as a catalog install does: their manifests arrive with a release,
+    not through the installer, so a host a release adds (a
+    ``credentials.exit`` entry's, the tool's own server host) gets its row
+    here by the same rule, and rows already right stay as they are. Then
+    every other MCP that declares an exit entry is settled
+    (``settle_exits``). How many shipped manifests were applied."""
+    applied = 0
+    for manifest in list(mcp_registry.get_all_manifests().values()):
+        if not _shipped(manifest) or hosts_of(manifest) is None:
+            continue
+        after_install(manifest.name, from_catalog=True, by="platform")
+        applied += 1
+    settle_exits()
+    return applied
+
+
+def settle_exits() -> int:
+    """At boot, every installed MCP that declares a ``credentials.exit``
+    entry, other than the platform's own, gets the rows its ledger gives. A
+    boot approves nothing: the catalog rule runs where a manifest arrives
+    (the installer, and ``seed_shipped`` for the platform's own tools), so a
+    host the ledger lacks waits for the Allow. Nothing is handed over and no
+    origin is recorded. How many MCPs were settled. Never raises."""
+    settled = 0
+    for manifest in list(mcp_registry.get_all_manifests().values()):
+        if manifest.name == bearer_allowlist.ADMIN_SOURCE or not _exit_hosts(manifest):
+            continue
+        if _shipped(manifest):
+            continue  # seeded above, by the same rule
+        try:
+            _settle(manifest, from_catalog=False, by="")
+            settled += 1
+        except Exception:  # one MCP's rows never stop the boot
+            logger.exception("allowlist rows of %s not settled at boot", manifest.name)
+    return settled
 
 
 class Refused(ValueError):
@@ -249,7 +350,7 @@ def confirm(name: str, *, provider: str, hosts: list[str], shown: str, by: str) 
         raise Refused("This MCP's addresses changed since they were shown. Reload and try again.")
     approved = dict.fromkeys(bearer_allowlist.approved_hosts(name) | {(provider, h) for h in waiting["hosts"]},
                              VIA_CONFIRMED)
-    live = set(approved) if _enabled(name) else set()
+    live = _live_pairs(manifest, approved) if _enabled(name) else set()
     bearer_allowlist.set_mcp_hosts(name, approved=approved, live=live, take_over=_take_over(name, live), by=by)
 
 
@@ -260,11 +361,10 @@ def after_enable(name: str) -> None:
     manifest = mcp_registry.get_manifest(name)
     if manifest is None or name == bearer_allowlist.ADMIN_SOURCE:
         return
-    declared = _declared(manifest)
-    approved = dict.fromkeys(bearer_allowlist.approved_hosts(name) & declared, VIA_CONFIRMED)
-    handover = _bridged(manifest, declared) - set(approved)
+    approved = dict.fromkeys(bearer_allowlist.approved_hosts(name) & _ledger_pairs(manifest), VIA_CONFIRMED)
+    handover = _bridged(manifest, _declared(manifest)) - set(approved)
     approved.update(dict.fromkeys(handover, VIA_ADMIN_ROW))
-    live = set(approved)
+    live = _live_pairs(manifest, approved)
     bearer_allowlist.set_mcp_hosts(name, approved=approved, live=live, take_over=_take_over(name, live),
                                    handover=handover, by="")
 

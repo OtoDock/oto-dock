@@ -1,0 +1,593 @@
+{
+ "admin": [
+  [
+   "char-browser-guide",
+   "<tmp>/mcps/custom/char-browser/skills/char-browser-guide.md",
+   "char-browser",
+   "1.0.0",
+   "About char-browser-guide."
+  ],
+  [
+   "char-core-guide",
+   "<tmp>/mcps/custom/char-core/skills/char-core-guide.md",
+   "char-core",
+   "1.0.0",
+   "About char-core-guide."
+  ],
+  [
+   "char-http-guide",
+   "<tmp>/mcps/custom/char-http/skills/char-http-guide.md",
+   "char-http",
+   "1.0.0",
+   "About char-http-guide."
+  ],
+  [
+   "char-no-external-guide",
+   "<tmp>/mcps/custom/char-no-external/skills/char-no-external-guide.md",
+   "char-no-external",
+   "1.0.0",
+   "About char-no-external-guide."
+  ],
+  [
+   "char-no-meeting-guide",
+   "<tmp>/mcps/custom/char-no-meeting/skills/char-no-meeting-guide.md",
+   "char-no-meeting",
+   "1.0.0",
+   "About char-no-meeting-guide."
+  ],
+  [
+   "char-no-phone-guide",
+   "<tmp>/mcps/custom/char-no-phone/skills/char-no-phone-guide.md",
+   "char-no-phone",
+   "1.0.0",
+   "About char-no-phone-guide."
+  ],
+  [
+   "char-no-shared-chat-guide",
+   "<tmp>/mcps/custom/char-no-shared-chat/skills/char-no-shared-chat-guide.md",
+   "char-no-shared-chat",
+   "1.0.0",
+   "About char-no-shared-chat-guide."
+  ],
+  [
+   "char-no-task-guide",
+   "<tmp>/mcps/custom/char-no-task/skills/char-no-task-guide.md",
+   "char-no-task",
+   "1.0.0",
+   "About char-no-task-guide."
+  ],
+  [
+   "char-no-terminal-guide",
+   "<tmp>/mcps/custom/char-no-terminal/skills/char-no-terminal-guide.md",
+   "char-no-terminal",
+   "1.0.0",
+   "About char-no-terminal-guide."
+  ],
+  [
+   "char-guide",
+   "<tmp>/mcps/custom/char-tools/skills/char-guide.md",
+   "char-tools",
+   "1.0.0",
+   "About char-guide."
+  ],
+  [
+   "char-zeta",
+   "<tmp>/mcps/custom/char-tools/skills/char-zeta.md",
+   "char-tools",
+   "1.0.0",
+   "About char-zeta."
+  ],
+  [
+   "char-row-clears",
+   "<tmp>/mcps/custom/char-tools/skills/char-row-clears.md",
+   "char-tools",
+   "1.0.0",
+   "About char-row-clears."
+  ],
+  [
+   "char-row-adds",
+   "<tmp>/mcps/custom/char-tools/skills/char-row-adds.md",
+   "char-tools",
+   "1.0.0",
+   "About char-row-adds."
+  ],
+  [
+   "char-external-off",
+   "<tmp>/mcps/custom/char-tools/skills/char-external-off.md",
+   "char-tools",
+   "1.0.0",
+   "About char-external-off."
+  ],
+  [
+   "char-shared-off",
+   "<tmp>/mcps/custom/char-tools/skills/char-shared-off.md",
+   "char-tools",
+   "1.0.0",
+   "About char-shared-off."
+  ],
+  [
+   "char-owner",
+   "<tmp>/mcps/custom/char-tools/skills/char-owner.md",
+   "char-tools",
+   "1.0.0",
+   "About char-owner."
+  ],
+  [
+   "delegation-guide",
+   "<tmp>/mcps/custom/delegation-mcp/skills/delegation-guide.md",
+   "delegation-mcp",
+   "1.0.0",
+   "About delegation-guide."
+  ]
+ ],
+ "agent": [
+  [
+   "char-browser-guide",
+   "<tmp>/mcps/custom/char-browser/skills/char-browser-guide.md",
+   "char-browser",
+   "1.0.0",
+   "About char-browser-guide."
+  ],
+  [
+   "char-core-guide",
+   "<tmp>/mcps/custom/char-core/skills/char-core-guide.md",
+   "char-core",
+   "1.0.0",
+   "About char-core-guide."
+  ],
+  [
+   "char-http-guide",
+   "<tmp>/mcps/custom/char-http/skills/char-http-guide.md",
+   "char-http",
+   "1.0.0",
+   "About char-http-guide."
+  ],
+  [
+   "char-no-external-guide",
+   "<tmp>/mcps/custom/char-no-external/skills/char-no-external-guide.md",
+   "char-no-external",
+   "1.0.0",
+   "About char-no-external-guide."
+  ],
+  [
+   "char-no-meeting-guide",
+   "<tmp>/mcps/custom/char-no-meeting/skills/char-no-meeting-guide.md",
+   "char-no-meeting",
+   "1.0.0",
+   "About char-no-meeting-guide."
+  ],
+  [
+   "char-no-phone-guide",
+   "<tmp>/mcps/custom/char-no-phone/skills/char-no-phone-guide.md",
+   "char-no-phone",
+   "1.0.0",
+   "About char-no-phone-guide."
+  ],
+  [
+   "char-no-shared-chat-guide",
+   "<tmp>/mcps/custom/char-no-shared-chat/skills/char-no-shared-chat-guide.md",
+   "char-no-shared-chat",
+   "1.0.0",
+   "About char-no-shared-chat-guide."
+  ],
+  [
+   "char-no-task-guide",
+   "<tmp>/mcps/custom/char-no-task/skills/char-no-task-guide.md",
+   "char-no-task",
+   "1.0.0",
+   "About char-no-task-guide."
+  ],
+  [
+   "char-no-terminal-guide",
+   "<tmp>/mcps/custom/char-no-terminal/skills/char-no-terminal-guide.md",
+   "char-no-terminal",
+   "1.0.0",
+   "About char-no-terminal-guide."
+  ],
+  [
+   "char-guide",
+   "<tmp>/mcps/custom/char-tools/skills/char-guide.md",
+   "char-tools",
+   "1.0.0",
+   "About char-guide."
+  ],
+  [
+   "char-zeta",
+   "<tmp>/mcps/custom/char-tools/skills/char-zeta.md",
+   "char-tools",
+   "1.0.0",
+   "About char-zeta."
+  ],
+  [
+   "char-row-clears",
+   "<tmp>/mcps/custom/char-tools/skills/char-row-clears.md",
+   "char-tools",
+   "1.0.0",
+   "About char-row-clears."
+  ],
+  [
+   "char-row-adds",
+   "<tmp>/mcps/custom/char-tools/skills/char-row-adds.md",
+   "char-tools",
+   "1.0.0",
+   "About char-row-adds."
+  ],
+  [
+   "char-external-off",
+   "<tmp>/mcps/custom/char-tools/skills/char-external-off.md",
+   "char-tools",
+   "1.0.0",
+   "About char-external-off."
+  ],
+  [
+   "char-shared-off",
+   "<tmp>/mcps/custom/char-tools/skills/char-shared-off.md",
+   "char-tools",
+   "1.0.0",
+   "About char-shared-off."
+  ],
+  [
+   "char-owner",
+   "<tmp>/mcps/custom/char-tools/skills/char-owner.md",
+   "char-tools",
+   "1.0.0",
+   "About char-owner."
+  ],
+  [
+   "delegation-guide",
+   "<tmp>/mcps/custom/delegation-mcp/skills/delegation-guide.md",
+   "delegation-mcp",
+   "1.0.0",
+   "About delegation-guide."
+  ]
+ ],
+ "editor": [
+  [
+   "char-browser-guide",
+   "<tmp>/mcps/custom/char-browser/skills/char-browser-guide.md",
+   "char-browser",
+   "1.0.0",
+   "About char-browser-guide."
+  ],
+  [
+   "char-core-guide",
+   "<tmp>/mcps/custom/char-core/skills/char-core-guide.md",
+   "char-core",
+   "1.0.0",
+   "About char-core-guide."
+  ],
+  [
+   "char-http-guide",
+   "<tmp>/mcps/custom/char-http/skills/char-http-guide.md",
+   "char-http",
+   "1.0.0",
+   "About char-http-guide."
+  ],
+  [
+   "char-no-external-guide",
+   "<tmp>/mcps/custom/char-no-external/skills/char-no-external-guide.md",
+   "char-no-external",
+   "1.0.0",
+   "About char-no-external-guide."
+  ],
+  [
+   "char-no-meeting-guide",
+   "<tmp>/mcps/custom/char-no-meeting/skills/char-no-meeting-guide.md",
+   "char-no-meeting",
+   "1.0.0",
+   "About char-no-meeting-guide."
+  ],
+  [
+   "char-no-phone-guide",
+   "<tmp>/mcps/custom/char-no-phone/skills/char-no-phone-guide.md",
+   "char-no-phone",
+   "1.0.0",
+   "About char-no-phone-guide."
+  ],
+  [
+   "char-no-shared-chat-guide",
+   "<tmp>/mcps/custom/char-no-shared-chat/skills/char-no-shared-chat-guide.md",
+   "char-no-shared-chat",
+   "1.0.0",
+   "About char-no-shared-chat-guide."
+  ],
+  [
+   "char-no-task-guide",
+   "<tmp>/mcps/custom/char-no-task/skills/char-no-task-guide.md",
+   "char-no-task",
+   "1.0.0",
+   "About char-no-task-guide."
+  ],
+  [
+   "char-no-terminal-guide",
+   "<tmp>/mcps/custom/char-no-terminal/skills/char-no-terminal-guide.md",
+   "char-no-terminal",
+   "1.0.0",
+   "About char-no-terminal-guide."
+  ],
+  [
+   "char-guide",
+   "<tmp>/mcps/custom/char-tools/skills/char-guide.md",
+   "char-tools",
+   "1.0.0",
+   "About char-guide."
+  ],
+  [
+   "char-zeta",
+   "<tmp>/mcps/custom/char-tools/skills/char-zeta.md",
+   "char-tools",
+   "1.0.0",
+   "About char-zeta."
+  ],
+  [
+   "char-row-clears",
+   "<tmp>/mcps/custom/char-tools/skills/char-row-clears.md",
+   "char-tools",
+   "1.0.0",
+   "About char-row-clears."
+  ],
+  [
+   "char-row-adds",
+   "<tmp>/mcps/custom/char-tools/skills/char-row-adds.md",
+   "char-tools",
+   "1.0.0",
+   "About char-row-adds."
+  ],
+  [
+   "char-external-off",
+   "<tmp>/mcps/custom/char-tools/skills/char-external-off.md",
+   "char-tools",
+   "1.0.0",
+   "About char-external-off."
+  ],
+  [
+   "char-shared-off",
+   "<tmp>/mcps/custom/char-tools/skills/char-shared-off.md",
+   "char-tools",
+   "1.0.0",
+   "About char-shared-off."
+  ],
+  [
+   "delegation-guide",
+   "<tmp>/mcps/custom/delegation-mcp/skills/delegation-guide.md",
+   "delegation-mcp",
+   "1.0.0",
+   "About delegation-guide."
+  ]
+ ],
+ "nobody": [
+  [
+   "char-browser-guide",
+   "<tmp>/mcps/custom/char-browser/skills/char-browser-guide.md",
+   "char-browser",
+   "1.0.0",
+   "About char-browser-guide."
+  ],
+  [
+   "char-core-guide",
+   "<tmp>/mcps/custom/char-core/skills/char-core-guide.md",
+   "char-core",
+   "1.0.0",
+   "About char-core-guide."
+  ],
+  [
+   "char-http-guide",
+   "<tmp>/mcps/custom/char-http/skills/char-http-guide.md",
+   "char-http",
+   "1.0.0",
+   "About char-http-guide."
+  ],
+  [
+   "char-no-external-guide",
+   "<tmp>/mcps/custom/char-no-external/skills/char-no-external-guide.md",
+   "char-no-external",
+   "1.0.0",
+   "About char-no-external-guide."
+  ],
+  [
+   "char-no-meeting-guide",
+   "<tmp>/mcps/custom/char-no-meeting/skills/char-no-meeting-guide.md",
+   "char-no-meeting",
+   "1.0.0",
+   "About char-no-meeting-guide."
+  ],
+  [
+   "char-no-phone-guide",
+   "<tmp>/mcps/custom/char-no-phone/skills/char-no-phone-guide.md",
+   "char-no-phone",
+   "1.0.0",
+   "About char-no-phone-guide."
+  ],
+  [
+   "char-no-shared-chat-guide",
+   "<tmp>/mcps/custom/char-no-shared-chat/skills/char-no-shared-chat-guide.md",
+   "char-no-shared-chat",
+   "1.0.0",
+   "About char-no-shared-chat-guide."
+  ],
+  [
+   "char-no-task-guide",
+   "<tmp>/mcps/custom/char-no-task/skills/char-no-task-guide.md",
+   "char-no-task",
+   "1.0.0",
+   "About char-no-task-guide."
+  ],
+  [
+   "char-no-terminal-guide",
+   "<tmp>/mcps/custom/char-no-terminal/skills/char-no-terminal-guide.md",
+   "char-no-terminal",
+   "1.0.0",
+   "About char-no-terminal-guide."
+  ],
+  [
+   "char-guide",
+   "<tmp>/mcps/custom/char-tools/skills/char-guide.md",
+   "char-tools",
+   "1.0.0",
+   "About char-guide."
+  ],
+  [
+   "char-zeta",
+   "<tmp>/mcps/custom/char-tools/skills/char-zeta.md",
+   "char-tools",
+   "1.0.0",
+   "About char-zeta."
+  ],
+  [
+   "char-row-clears",
+   "<tmp>/mcps/custom/char-tools/skills/char-row-clears.md",
+   "char-tools",
+   "1.0.0",
+   "About char-row-clears."
+  ],
+  [
+   "char-row-adds",
+   "<tmp>/mcps/custom/char-tools/skills/char-row-adds.md",
+   "char-tools",
+   "1.0.0",
+   "About char-row-adds."
+  ],
+  [
+   "char-external-off",
+   "<tmp>/mcps/custom/char-tools/skills/char-external-off.md",
+   "char-tools",
+   "1.0.0",
+   "About char-external-off."
+  ],
+  [
+   "char-shared-off",
+   "<tmp>/mcps/custom/char-tools/skills/char-shared-off.md",
+   "char-tools",
+   "1.0.0",
+   "About char-shared-off."
+  ],
+  [
+   "char-owner",
+   "<tmp>/mcps/custom/char-tools/skills/char-owner.md",
+   "char-tools",
+   "1.0.0",
+   "About char-owner."
+  ],
+  [
+   "delegation-guide",
+   "<tmp>/mcps/custom/delegation-mcp/skills/delegation-guide.md",
+   "delegation-mcp",
+   "1.0.0",
+   "About delegation-guide."
+  ]
+ ],
+ "viewer": [
+  [
+   "char-browser-guide",
+   "<tmp>/mcps/custom/char-browser/skills/char-browser-guide.md",
+   "char-browser",
+   "1.0.0",
+   "About char-browser-guide."
+  ],
+  [
+   "char-core-guide",
+   "<tmp>/mcps/custom/char-core/skills/char-core-guide.md",
+   "char-core",
+   "1.0.0",
+   "About char-core-guide."
+  ],
+  [
+   "char-http-guide",
+   "<tmp>/mcps/custom/char-http/skills/char-http-guide.md",
+   "char-http",
+   "1.0.0",
+   "About char-http-guide."
+  ],
+  [
+   "char-no-external-guide",
+   "<tmp>/mcps/custom/char-no-external/skills/char-no-external-guide.md",
+   "char-no-external",
+   "1.0.0",
+   "About char-no-external-guide."
+  ],
+  [
+   "char-no-meeting-guide",
+   "<tmp>/mcps/custom/char-no-meeting/skills/char-no-meeting-guide.md",
+   "char-no-meeting",
+   "1.0.0",
+   "About char-no-meeting-guide."
+  ],
+  [
+   "char-no-phone-guide",
+   "<tmp>/mcps/custom/char-no-phone/skills/char-no-phone-guide.md",
+   "char-no-phone",
+   "1.0.0",
+   "About char-no-phone-guide."
+  ],
+  [
+   "char-no-shared-chat-guide",
+   "<tmp>/mcps/custom/char-no-shared-chat/skills/char-no-shared-chat-guide.md",
+   "char-no-shared-chat",
+   "1.0.0",
+   "About char-no-shared-chat-guide."
+  ],
+  [
+   "char-no-task-guide",
+   "<tmp>/mcps/custom/char-no-task/skills/char-no-task-guide.md",
+   "char-no-task",
+   "1.0.0",
+   "About char-no-task-guide."
+  ],
+  [
+   "char-no-terminal-guide",
+   "<tmp>/mcps/custom/char-no-terminal/skills/char-no-terminal-guide.md",
+   "char-no-terminal",
+   "1.0.0",
+   "About char-no-terminal-guide."
+  ],
+  [
+   "char-guide",
+   "<tmp>/mcps/custom/char-tools/skills/char-guide.md",
+   "char-tools",
+   "1.0.0",
+   "About char-guide."
+  ],
+  [
+   "char-zeta",
+   "<tmp>/mcps/custom/char-tools/skills/char-zeta.md",
+   "char-tools",
+   "1.0.0",
+   "About char-zeta."
+  ],
+  [
+   "char-row-clears",
+   "<tmp>/mcps/custom/char-tools/skills/char-row-clears.md",
+   "char-tools",
+   "1.0.0",
+   "About char-row-clears."
+  ],
+  [
+   "char-row-adds",
+   "<tmp>/mcps/custom/char-tools/skills/char-row-adds.md",
+   "char-tools",
+   "1.0.0",
+   "About char-row-adds."
+  ],
+  [
+   "char-external-off",
+   "<tmp>/mcps/custom/char-tools/skills/char-external-off.md",
+   "char-tools",
+   "1.0.0",
+   "About char-external-off."
+  ],
+  [
+   "char-shared-off",
+   "<tmp>/mcps/custom/char-tools/skills/char-shared-off.md",
+   "char-tools",
+   "1.0.0",
+   "About char-shared-off."
+  ],
+  [
+   "delegation-guide",
+   "<tmp>/mcps/custom/delegation-mcp/skills/delegation-guide.md",
+   "delegation-mcp",
+   "1.0.0",
+   "About delegation-guide."
+  ]
+ ]
+}

@@ -74,10 +74,16 @@ class AMIClient:
     # -- connection lifecycle ----------------------------------------------
     async def connect(self) -> None:
         """Open the TCP connection and consume the AMI banner line."""
+        from services.infra import pinned_http
         try:
+            # The PBX an admin named, at a checked address: this machine and
+            # the LAN pass, link-local and the cloud metadata addresses never.
+            sock = await asyncio.wait_for(asyncio.to_thread(
+                pinned_http.checked_socket, self.host, self.port, pinned_http.admin_host,
+                _CONNECT_TIMEOUT), timeout=_CONNECT_TIMEOUT + 1)
+            sock.setblocking(False)
             self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port),
-                timeout=_CONNECT_TIMEOUT,
+                asyncio.open_connection(sock=sock), timeout=_CONNECT_TIMEOUT,
             )
         except asyncio.TimeoutError as e:
             raise PhoneAdapterError(

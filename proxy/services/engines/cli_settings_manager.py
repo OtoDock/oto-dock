@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
+import posixpath
 
 logger = logging.getLogger(__name__)
+
+# The CLI's own config file: a few KB. Older builds kept per-project data
+# here, so a long-lived store can grow; past this it is left untouched.
+_SEED_MAX_BYTES = 64 * 1024 * 1024
 
 
 def seed_interactive_cli_config(
@@ -38,12 +42,30 @@ def seed_interactive_cli_config(
       * ``projects[cwd].hasTrustDialogAccepted`` — skip "trust this folder?".
     Idempotent; written BEFORE the spawn so Claude reads it at startup (after
     which Claude owns the file). Local interactive sessions only.
+
+    The folder is written by every session of the scope, so the file is read
+    and written beneath the agent's real folder (``core.agent_folder``) with
+    no link at any part below it: a link, a
+    pipe or a device at the name reads as empty and the write replaces it
+    with a regular file; a file over ``_SEED_MAX_BYTES`` is left as it is and
+    nothing is seeded (an honest file is never cut). Blocking: off the loop.
     """
     if not host_claude_dir:
         return
-    cfg = Path(host_claude_dir) / ".claude.json"
+    from core.agent_folder import beneath_agent
+    from services.infra import safe_fs
     try:
-        data = json.loads(cfg.read_text()) if cfg.exists() else {}
+        root, base = beneath_agent(host_claude_dir)
+    except safe_fs.SafeFsError:
+        logger.warning("seed_interactive_cli_config: %s is in no agent's folder", host_claude_dir)
+        return
+    rel = posixpath.join(base, ".claude.json")
+    try:
+        data = json.loads(safe_fs.read_bytes_beneath(root, rel, max_size=_SEED_MAX_BYTES))
+    except safe_fs.FileTooLarge:
+        logger.warning("seed_interactive_cli_config: %s/.claude.json is over %d bytes; not seeded",
+                       host_claude_dir, _SEED_MAX_BYTES)
+        return
     except (OSError, ValueError):
         data = {}
     if not isinstance(data, dict):
@@ -83,7 +105,8 @@ def seed_interactive_cli_config(
         proj["hasCompletedProjectOnboarding"] = True
         proj.setdefault("projectOnboardingSeenCount", 1)
     try:
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        cfg.write_text(json.dumps(data, indent=2) + "\n")
+        safe_fs.atomic_write_beneath(root, rel, (json.dumps(data, indent=2) + "\n").encode(),
+                                     mkdirs=True, fsync=False)
     except OSError:
-        logger.warning("seed_interactive_cli_config: could not write %s", cfg, exc_info=True)
+        logger.warning("seed_interactive_cli_config: could not write %s/.claude.json", host_claude_dir,
+                       exc_info=True)

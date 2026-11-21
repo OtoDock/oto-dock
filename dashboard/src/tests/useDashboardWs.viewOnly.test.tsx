@@ -10,6 +10,9 @@ import { useDashboardWs } from '@/hooks/useDashboardWs'
 import { FakeWebSocket } from './fakeWebSocket'
 import { connectDashboardWs } from './dashboardWsHarness'
 
+const RECORD = "This is a phone call's conversation. Only the call writes here."
+const WRITING = 'A phone call is writing in this chat. You can write here when it ends.'
+
 function resumes(ws: FakeWebSocket, chatId: string): number {
   return ws.sent
     .map((s) => JSON.parse(s))
@@ -41,10 +44,10 @@ describe('useDashboardWs on a chat a call drives', () => {
     act(() => { hook.result.current.resumeChat('chat-call') })
     expect(resumes(ws, 'chat-call')).toBe(1)
 
-    frame(ws, { type: 'chat_view_only', chat_id: 'chat-call', kind: 'phone' })
+    frame(ws, { type: 'chat_view_only', chat_id: 'chat-call', kind: 'phone', lock: RECORD })
     frame(ws, { type: 'chat_history', chat_id: 'chat-call', messages: [], agent: 'a' })
     expect(onChatViewOnly).toHaveBeenCalledTimes(1)
-    expect(onChatViewOnly.mock.calls[0][0]).toMatchObject({ chat_id: 'chat-call', kind: 'phone' })
+    expect(onChatViewOnly.mock.calls[0][0]).toMatchObject({ chat_id: 'chat-call', kind: 'phone', lock: RECORD })
 
     // The call's turns light the chat: no resume, the refusal would repeat.
     // Each turn's queue_sent leaves this socket's own flag alone (no done
@@ -72,6 +75,23 @@ describe('useDashboardWs on a chat a call drives', () => {
     // A later ready is an ordinary turn's end: no second reload.
     frame(ws, { type: 'chat_status', chat_id: 'chat-call', status: 'ready' })
     expect(resumes(ws, 'chat-call')).toBe(2)
+  })
+
+  it("a person's own chat is locked while the call writes, and theirs at the hang-up", () => {
+    const { hook, ws, onChatViewOnly } = connect('chat-mine')
+    act(() => { hook.result.current.resumeChat('chat-mine') })
+    frame(ws, { type: 'chat_view_only', chat_id: 'chat-mine', kind: 'phone', lock: WRITING })
+    frame(ws, { type: 'chat_history', chat_id: 'chat-mine', messages: [], agent: 'a' })
+    expect(onChatViewOnly).toHaveBeenLastCalledWith({ type: 'chat_view_only', chat_id: 'chat-mine', kind: 'phone', lock: WRITING })
+    // The hang-up: the chat's ready status, one full resume, the lock gone,
+    // and the history that answers it keeps it gone.
+    frame(ws, { type: 'chat_status', chat_id: 'chat-mine', status: 'ready' })
+    expect(resumes(ws, 'chat-mine')).toBe(2)
+    expect(onChatViewOnly).toHaveBeenLastCalledWith(null)
+    frame(ws, { type: 'chat_history', chat_id: 'chat-mine', messages: [], agent: 'a' })
+    frame(ws, { type: 'warmup_ready', chat_id: 'chat-mine', session_id: null, needs_warmup: true })
+    expect(onChatViewOnly).toHaveBeenLastCalledWith(null)
+    expect(onChatViewOnly).toHaveBeenCalledTimes(2)
   })
 
   it('drops the frame for a chat the socket is not viewing', () => {

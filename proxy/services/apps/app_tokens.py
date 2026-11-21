@@ -37,6 +37,10 @@ PRINCIPAL_PLATFORM = "platform"
 # placed app"): a word of its own, so code that takes ``agent`` for the
 # app's own agent never takes a placed agent's session for it.
 PRINCIPAL_PLACEMENT = "placement"
+# An outside person: a visitor of a shared link (a viewer claim with its
+# ``grant``) or the session of a caller an app's agent opened it to (a
+# caller claim with its ``channel``). Never relayed by an app's server.
+PRINCIPAL_EXTERNAL = "external"
 
 VIEWER_TTL_S = 10 * 60
 CALLER_TTL_S = 60

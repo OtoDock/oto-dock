@@ -28,11 +28,14 @@
 # bare-metal dev install). Pick ONE: the T1 file for a host proxy, this
 # file for a fully Dockerised proxy.
 #
-# SECURITY NOTE (proxy service): the proxy runs as the NON-ROOT `oto` user (uid
-# 1000) — like the bare-metal install — so every bwrap'd agent is non-root with
-# ZERO Linux capabilities. Rootless bwrap inside a container needs three Docker
-# relaxations (seccomp / apparmor / systempaths unconfined — see the proxy
-# service) and NO cap_add: a net privilege reduction vs running root+CAP_SYS_ADMIN.
+# SECURITY NOTE: the proxy and the compute service run as the NON-ROOT `oto`
+# user (uid 1000) — like the bare-metal install. The proxy is the control plane
+# and starts no session, no tool and no build: its container gets no relaxed
+# security profile, no device and no capability. Sessions run in the compute
+# service, each bwrap'd agent non-root with ZERO Linux capabilities. Rootless
+# bwrap inside a container needs three Docker relaxations (seccomp / apparmor /
+# systempaths unconfined — see the compute service) and NO cap_add: a net
+# privilege reduction vs running root+CAP_SYS_ADMIN.
 # A one-shot root init sidecar chowns the data volume to uid 1000 at first boot.
 
 name: otodock
@@ -47,10 +50,27 @@ x-logging: &default-logging
     max-size: "10m"
     max-file: "5"
 
+# The folders the proxy and the compute service share, each written once.
+# An override file that moves one of them for otodock-proxy must move it for
+# otodock-compute too: scripts/upgrade.sh compares both services' sources
+# and refuses the update while they differ, and the compute service refuses
+# an agents folder not the proxy's.
+# The community tools are not shared: the proxy keeps their sources in
+# otodock-mcps, the compute service builds and runs them in a volume of its
+# own, otodock-compute-tools, and each mounts its own at the same path.
+x-agents-folder: &agents-folder
+  type: volume
+  source: otodock-agents
+  target: /opt/otodock/agents
+x-skills-folder: &skills-folder
+  type: volume
+  source: otodock-skills
+  target: /opt/otodock/mcps/skills
+
 services:
   # --- PostgreSQL ---
   otodock-postgres:
-    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab}
+    image: ${POSTGRES_IMAGE:-postgres:16.16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e}
     restart: unless-stopped
     logging: *default-logging
     environment:
@@ -129,15 +149,15 @@ services:
 
   # --- The platform proxy (dashboard baked in) ---
   otodock-proxy:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.9.1}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-2.0.0}
     restart: unless-stopped
     logging: *default-logging
     # Graceful-stop budget: uvicorn's connection drain (up to 10s) + the 30s
     # session-close cap must fit before docker escalates to SIGKILL — the
     # default 10s force-killed every stop mid-drain (exit 137).
     stop_grace_period: 60s
-    # Memory cap — DEFAULT 0 = unlimited (the proxy uses all host RAM for max
-    # session concurrency; the live-RAM admission gates self-protect via Gate-2's
+    # Memory cap — DEFAULT 0 = unlimited (of the sessions only Direct LLM chats
+    # live in the proxy; the live-RAM admission gates self-protect via Gate-2's
     # host MemAvailable read + LRU session eviction + swap). Operators sharing the
     # host with other heavy containers can set OTODOCK_PROXY_MEM_LIMIT (e.g. "12g" =
     # host RAM minus ~2GB sibling headroom) for HARD OOM containment — a capped
@@ -156,14 +176,12 @@ services:
       nofile:
         soft: 65536
         hard: 524288
-    # PID floor for the whole proxy container: a fork bomb in one sandbox cannot
-    # exhaust the host PID space. This is a container-wide FLOOR sized well above
-    # the platform's real thread/process count at full session load; per-session
-    # containment (a cgroup pids.max per sandbox) is separate, later work.
+    # PID floor for the whole proxy container, sized well above the platform's
+    # real thread/process count at full load (the sessions' processes count in
+    # the compute service, under its own limit).
     # Override OTODOCK_PROXY_PIDS_LIMIT (0 = unlimited).
     pids_limit: ${OTODOCK_PROXY_PIDS_LIMIT:-32768}
-    # Non-root runtime user (matches the Dockerfile USER + file-tools' uid). The
-    # agent inherits this uid → it runs as uid 1000, capability-less.
+    # Non-root runtime user (matches the Dockerfile USER + file-tools' uid).
     user: "1000:1000"
     environment:
       # T2 deployment seam — resolves Docker-MCP hosts to service-DNS, points
@@ -177,6 +195,9 @@ services:
       # a container is UTC unless TZ is set). Set TZ in config.env to localise.
       TZ: ${TZ:-UTC}
       PROXY_SERVICE_NAME: otodock-proxy
+      # The image this proxy runs, so a compute machine on another server runs
+      # the same one, rc tags included (the build overlay empties it).
+      OTODOCK_PROXY_IMAGE: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-2.0.0}
       DOCKER_SOCKET_PROXY_HOST: docker-socket-proxy
       DOCKER_SOCKET_PROXY_PORT: "2375"
       OTODOCK_NETWORK: otodock
@@ -197,6 +218,10 @@ services:
       COLLABORA_BACKEND_URL: http://collabora:9980
       # Reach Postgres over the compose network (not the host's loopback).
       DATABASE_URL: postgresql://otodock:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@otodock-postgres:5432/otodock
+      # The compute service (below): the one address its link is taken from,
+      # and the folder the proxy writes its credential into at every start.
+      OTODOCK_COMPUTE_LINK_FROM: ${OTODOCK_COMPUTE_ADDRESS:-10.205.0.10}
+      OTODOCK_COMPUTE_LINK_DIR: /opt/otodock/compute-link
     ports:
       # Publish the API/dashboard port. Default 8400; set PROXY_PORT (in the env
       # file / shell) to publish elsewhere, e.g. PROXY_PORT=8410 to run alongside
@@ -220,16 +245,20 @@ services:
       # restarts — exactly like bare-metal. DATABASE_URL above (container env)
       # overrides the file's.
       - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env
-      # Shared with file-tools (file-tools mounts the SAME volume at /agents).
-      - otodock-agents:/opt/otodock/agents
-      # Runtime-installed community MCPs (camoufox, github-mcp, ...) land in
-      # /opt/otodock/mcps/community — a named volume keeps them across a proxy
-      # image rebuild / recreate (the baked dir is empty; core/custom MCPs live
-      # elsewhere in the image and are untouched).
+      # Shared with file-tools (file-tools mounts the SAME volume at /agents)
+      # and with the compute service.
+      - *agents-folder
+      # The community tools an admin installs (camoufox, github-mcp, ...) land
+      # in /opt/otodock/mcps/community: their sources, manifests, skills and
+      # patches. A named volume keeps them across an image rebuild or a
+      # recreate (the baked folder is empty, the core and custom tools live
+      # elsewhere in the image). The proxy builds none of them. The compute
+      # service does, in a volume of its own at this path, which the proxy
+      # never mounts.
       - otodock-mcps:/opt/otodock/mcps/community
       # Runtime-installed skill packages (community-skills catalog) land in
       # /opt/otodock/mcps/skills — same persistence story as community MCPs.
-      - otodock-skills:/opt/otodock/mcps/skills
+      - *skills-folder
       # Admin-uploaded SSH private keys (ssh-hosts MCP). mcps/custom is baked
       # into the image, so runtime-written keys need their own volume or a
       # rebuild wipes them. Never mounted into any agent sandbox.
@@ -243,12 +272,202 @@ services:
       # every person's deleted personal files: proxy-only, never mounted
       # into a sidecar.
       - otodock-recover-bin:/opt/otodock/recover-bin
+      # The compute service's credential, written here by the proxy at every
+      # start (read-only to the compute service).
+      - otodock-compute-link:/opt/otodock/compute-link
+    # No security_opt, no devices, no cap_add: the proxy starts no sandbox. An
+    # override that adds them here widens the server for nothing, and upgrade.sh names it.
+    # The proxy is the ONLY container that bridges every plane: `otodock` (the
+    # shared bridge of community MCPs and the phone, and the only non-internal net, so
+    # it provides the default route / internet egress), `socketproxy` (drive the
+    # daemon), `otodock-data` (Postgres) and `otodock-internal` (file-tools +
+    # Collabora). The other three nets are internal:true (no gateway); egress stays
+    # via `otodock`.
+    # `otodock-compute` (internal) carries the compute service's link alone:
+    # the proxy answers it there by a name no other network knows.
+    networks:
+      otodock: {}
+      socketproxy: {}
+      otodock-data: {}
+      otodock-internal: {}
+      otodock-compute:
+        aliases: [otodock-proxy-compute]
+        ipv4_address: ${OTODOCK_COMPUTE_PROXY_ADDRESS:-10.205.0.2}
+    # Reach services on the Docker host (e.g. a local Ollama / OpenAI-compatible
+    # LLM endpoint, or local STT/TTS) at host.docker.internal. The proxy is the
+    # trusted control plane and only dials admin-configured endpoints — agents
+    # run netns-isolated (see SANDBOX.md). Admins configure local endpoints with
+    # a LAN IP or host.docker.internal (NOT localhost — that's the container).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      otodock-postgres:
+        condition: service_healthy
+      # Named volumes are created root-owned; this one-shot sidecar chowns the
+      # agents volume + config.env to uid 1000 before the (non-root) proxy starts.
+      otodock-agents-init:
+        condition: service_completed_successfully
+      # The community tools' one hand-over to the compute service, before
+      # either service starts.
+      otodock-tools-copy:
+        condition: service_completed_successfully
+      # Demote the app DB role (and, on an existing volume, upgrade it) before
+      # the proxy connects.
+      otodock-db-init:
+        condition: service_completed_successfully
+
+  # --- One-shot init: own the data volume for the non-root proxy ---
+  # Docker creates named volumes root-owned, but the proxy + file-tools + agent
+  # all run as uid 1000 and can't chown them. This runs once as root, chowns the
+  # agents volume + the bind-mounted config.env to 1000, then exits. The walk
+  # handles the upgrade case where the volume already holds root-owned agent
+  # trees, and passes only a file with the wrong owner: a chown to the same
+  # owner moves a file's ctime, and the cleanup of old uploads ages a file by
+  # it, so an unguarded walk would restart every file's age at every up.
+  # Non-fatal (a fresh volume is empty so it's effectively no-op).
+  otodock-agents-init:
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-2.0.0}
+    user: "0:0"
+    # This one-shot only chowns volumes — it needs NO network. Without this,
+    # Compose creates a `<project>_default` bridge just for it, and on a host
+    # whose 172.x pools are exhausted that bridge can grab a 192.168.x range
+    # that overlaps the LAN and black-holes the host's own route. `none` keeps
+    # it off every bridge so no default network is ever created. (Also pin the
+    # daemon's default-address-pools — see DOCKER-DEPLOYMENT.md host prereq.)
+    network_mode: "none"
+    # It also writes Collabora's WOPI proof key, once (an existing key is
+    # kept: removing the otodock-collabora-proof volume makes a new one), for
+    # Collabora's user (1001) alone: Collabora signs every WOPI call with it
+    # and the proxy refuses an unsigned one. Beside it, on every run, the
+    # script that closes Collabora's welcome dialog (collabora's mounts say
+    # why), so a Collabora bump that changes it lands at the next up. Every
+    # shell `$` is written `$$`: compose fills variables in this text.
+    # It owns the compute service's tools volume for uid 1000 too, so the copy
+    # below (otodock-tools-copy) can fill it. It never writes into a volume a
+    # session can write by name: only the ownership pass reaches inside them,
+    # from each folder (-execdir, chown -h), and the mount points are chmod'ed.
+    command:
+      - sh
+      - -lc
+      - |
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin find /opt/otodock/agents /opt/otodock/mcps/community /opt/otodock/compute-tools /opt/otodock/mcps/skills /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/sessions /opt/otodock/recover-bin /opt/otodock/compute /opt/otodock/compute-link \( ! -uid 1000 -o ! -gid 1000 \) -execdir chown -h 1000:1000 {} + 2>/dev/null
+        chown 1000:1000 /opt/otodock/config.env 2>/dev/null
+        chmod 0755 /opt/otodock/agents
+        chmod 0700 /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/recover-bin /opt/otodock/compute /opt/otodock/compute-link 2>/dev/null
+        k=/opt/otodock/collabora-proof/proof_key
+        [ -s $$k ] || { umask 077; openssl genpkey -quiet -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out $$k.new && mv $$k.new $$k; }
+        chown 1001:1001 $$k 2>/dev/null
+        chmod 0400 $$k 2>/dev/null
+        w=/opt/otodock/collabora-proof/welcome.js
+        cat > $$w.new <<'EOF' && chmod 0444 $$w.new && mv -fT $$w.new $$w
+        window.parent.postMessage('{"MessageId":"welcome-translate","strings":{}}', window.origin)
+        window.parent.postMessage('{"MessageId":"welcome-close"}', window.origin)
+        EOF
+        chown 1001:1001 $$w 2>/dev/null
+        true
+    volumes:
+      - otodock-agents:/opt/otodock/agents
+      - otodock-mcps:/opt/otodock/mcps/community
+      - otodock-compute-tools:/opt/otodock/compute-tools
+      - otodock-skills:/opt/otodock/mcps/skills
+      - otodock-ssh-keys:/opt/otodock/mcps/custom/ssh-hosts/keys
+      - otodock-sessions:/opt/otodock/sessions
+      - otodock-recover-bin:/opt/otodock/recover-bin
+      - otodock-collabora-proof:/opt/otodock/collabora-proof
+      - otodock-compute:/opt/otodock/compute
+      - otodock-compute-link:/opt/otodock/compute-link
+      - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env
+    restart: "no"
+
+  # --- One-shot: the community tools' hand-over to the compute service ---
+  # Copies the community tools the proxy's volume holds into the compute
+  # service's own, once (the script's header says what is copied and when).
+  # An install that updates from a release where the proxy built them then
+  # builds none again. It runs as the compute service's own account and sees
+  # only the two tools volumes, the proxy's read-only: whatever the compute
+  # service left in its volume, the copy writes nothing the compute service
+  # could not write itself, and takes from the proxy's volume only the programs
+  # the compute service runs. A copy that fails stops nothing: the line it prints is
+  # in this one-shot's log, and the compute service installs the tools again by
+  # itself.
+  otodock-tools-copy:
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-2.0.0}
+    user: "1000:1000"
+    network_mode: "none"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    command:
+      - sh
+      - -c
+      - sh /opt/otodock/scripts/copy-tools-to-compute.sh /opt/otodock/mcps/community /opt/otodock/compute-tools || true
+    volumes:
+      - otodock-mcps:/opt/otodock/mcps/community:ro
+      - otodock-compute-tools:/opt/otodock/compute-tools
+    depends_on:
+      # Owns the compute tools volume's root for uid 1000 first.
+      otodock-agents-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # --- The compute machine: where Claude Code and Codex sessions run ---
+  # The proxy's own image, started as the platform's compute machine
+  # (proxy/compute_start.py): every session runs here in the platform's
+  # sandbox, so it keeps the sandbox's three relaxations and the tun device,
+  # while the proxy stays the control plane. It holds no secret of the
+  # platform: no config.env, no database address, never the proxy's sessions
+  # folder, the SSH keys or the recover bin; the bundled tools come with the
+  # image, environments included, and the skills are read-only to it; the
+  # community tools it builds itself, in its own volume; and its own state
+  # (its sign-in) is its own volume.
+  # It links to the proxy over `otodock-compute` alone, from the pinned
+  # address the proxy takes its link from (OTODOCK_COMPUTE_ADDRESS).
+  otodock-compute:
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-2.0.0}
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["/opt/otodock/satellite/venv/bin/python", "/opt/otodock/proxy/compute_start.py"]
+    # A stop ends the link first, then each session in turn (the platform
+    # continues their turns at the machine's return).
+    stop_grace_period: 120s
+    # Under memory pressure the kernel takes a tool or a session before the
+    # control plane: the proxy and Postgres stay at the default 0, this
+    # service sits at 250, its sessions and the Docker tools at 500.
+    oom_score_adj: 250
+    # Memory and PID caps of their own, as the proxy's (0 = uncapped: the
+    # admission gates read the host). A cap set here is what admission reads
+    # for the sessions it runs, read again whenever it changes.
+    mem_limit: ${OTODOCK_COMPUTE_MEM_LIMIT:-0}
+    pids_limit: ${OTODOCK_COMPUTE_PIDS_LIMIT:-32768}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+    user: "1000:1000"
+    environment:
+      HOME: /opt/otodock/compute
+      TZ: ${TZ:-UTC}
+      OTODOCK_COMPUTE_LINK_DIR: /opt/otodock/compute-link
+      OTODOCK_COMPUTE_PLATFORM_URL: http://otodock-proxy-compute:8400
+      # The engines' binaries .env names for the proxy, if any (a path inside
+      # the container: an override that mounts one for the proxy mounts it here too).
+      CLAUDE_BIN: ${CLAUDE_BIN:-}
+      CODEX_BIN: ${CODEX_BIN:-}
+    volumes:
+      - *agents-folder
+      # The community tools as this service builds them, with their
+      # environments, keys and data. Never the proxy's volume of that path.
+      - otodock-compute-tools:/opt/otodock/mcps/community
+      - <<: *skills-folder
+        read_only: true
+      - otodock-compute:/opt/otodock/compute
+      - otodock-compute-link:/opt/otodock/compute-link:ro
     # Rootless bwrap inside the container needs these three relaxations — NOT
     # cap_add, NOT --privileged. seccomp → create the agent's user namespace
     # (Docker's default profile blocks clone(CLONE_NEWUSER) without CAP_SYS_ADMIN);
     # apparmor → mount-propagation (MS_SLAVE); systempaths → mount a fresh isolated
     # /proc over Docker's masked /proc. The agent ends up uid 1000, CapEff=0, with
-    # its own clean /proc. Low-risk for a non-root proxy (e.g. /proc/kcore still
+    # its own clean /proc. Low-risk for a non-root service (e.g. /proc/kcore still
     # needs CAP_SYS_RAWIO it doesn't hold). See SANDBOX.md.
     #
     # Ubuntu 24.04+ hosts: the kernel denies unprivileged user-namespace
@@ -265,91 +484,36 @@ services:
       - systempaths=unconfined
     # Sandbox network isolation (always on) wraps every agent in a pasta netns;
     # pasta creates a tap via /dev/net/tun, which Docker does not expose by
-    # default. The host node is world-rw (10:200), so the non-root proxy can use
-    # it once the device is mapped in — no extra capability needed (pasta gets
-    # CAP_NET_ADMIN over its OWN userns/netns). Without this the proxy refuses
-    # to start: its boot check runs the sandbox and names the device. See
-    # docs/architecture/SANDBOX.md.
+    # default. The host node is world-rw (10:200), so the non-root service can
+    # use it once the device is mapped in — no extra capability needed (pasta
+    # gets CAP_NET_ADMIN over its OWN userns/netns). Without this the service
+    # refuses to serve sessions: its start runs the sandbox's check, which
+    # names the device. See docs/architecture/SANDBOX.md.
     devices:
       - /dev/net/tun
-    # The proxy is the ONLY container that bridges every plane: `otodock` (the
-    # shared bridge of community MCPs and the phone, and the only non-internal net, so
-    # it provides the default route / internet egress), `socketproxy` (drive the
-    # daemon), `otodock-data` (Postgres) and `otodock-internal` (file-tools +
-    # Collabora). The other three nets are internal:true (no gateway); egress stays
-    # via `otodock`.
-    networks: [otodock, socketproxy, otodock-data, otodock-internal]
-    # Reach services on the Docker host (e.g. a local Ollama / OpenAI-compatible
-    # LLM endpoint, or local STT/TTS) at host.docker.internal. The proxy is the
-    # trusted control plane and only dials admin-configured endpoints — agents
-    # run netns-isolated (see SANDBOX.md). Admins configure local endpoints with
-    # a LAN IP or host.docker.internal (NOT localhost — that's the container).
+    # `otodock` gives its sessions and its tool builds their way out, and
+    # `otodock-compute` is its link. A Docker tool is reached through the
+    # proxy's door, never dialled. Never socketproxy, otodock-data or
+    # otodock-internal.
+    networks:
+      otodock: {}
+      otodock-compute:
+        ipv4_address: ${OTODOCK_COMPUTE_ADDRESS:-10.205.0.10}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Healthy once it has its sign-in and passed the sandbox's check; the
+    # reason a refused start gives is in its log and in the status file.
+    healthcheck:
+      test: ["CMD", "sh", "-c", "grep -q '^running' /opt/otodock/compute/.oto-dock/compute-status"]
+      interval: 10s
+      timeout: 5s
+      start_period: 600s
+      retries: 6
     depends_on:
-      otodock-postgres:
-        condition: service_healthy
-      # Named volumes are created root-owned; this one-shot sidecar chowns the
-      # agents volume + config.env to uid 1000 before the (non-root) proxy starts.
       otodock-agents-init:
         condition: service_completed_successfully
-      # Demote the app DB role (and, on an existing volume, upgrade it) before
-      # the proxy connects.
-      otodock-db-init:
+      otodock-tools-copy:
         condition: service_completed_successfully
-
-  # --- One-shot init: own the data volume for the non-root proxy ---
-  # Docker creates named volumes root-owned, but the proxy + file-tools + agent
-  # all run as uid 1000 and can't chown them. This runs once as root, chowns the
-  # agents volume + the bind-mounted config.env to 1000, then exits. `-R` handles
-  # the upgrade case where the volume already holds root-owned agent trees;
-  # idempotent + non-fatal (a fresh volume is empty so it's effectively no-op).
-  otodock-agents-init:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.9.1}
-    user: "0:0"
-    # This one-shot only chowns volumes — it needs NO network. Without this,
-    # Compose creates a `<project>_default` bridge just for it, and on a host
-    # whose 172.x pools are exhausted that bridge can grab a 192.168.x range
-    # that overlaps the LAN and black-holes the host's own route. `none` keeps
-    # it off every bridge so no default network is ever created. (Also pin the
-    # daemon's default-address-pools — see DOCKER-DEPLOYMENT.md host prereq.)
-    network_mode: "none"
-    # It also writes Collabora's WOPI proof key, once (an existing key is
-    # kept: removing the otodock-collabora-proof volume makes a new one), for
-    # Collabora's user (1001) alone: Collabora signs every WOPI call with it
-    # and the proxy refuses an unsigned one. Beside it, on every run, the
-    # script that closes Collabora's welcome dialog (collabora's mounts say
-    # why), so a Collabora bump that changes it lands at the next up. Every
-    # shell `$` is written `$$`: compose fills variables in this text.
-    command:
-      - sh
-      - -lc
-      - |
-        chown -R 1000:1000 /opt/otodock/agents /opt/otodock/mcps/community /opt/otodock/mcps/skills /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/sessions /opt/otodock/recover-bin 2>/dev/null
-        chown 1000:1000 /opt/otodock/config.env 2>/dev/null
-        chmod 0755 /opt/otodock/agents
-        chmod 0700 /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/recover-bin 2>/dev/null
-        k=/opt/otodock/collabora-proof/proof_key
-        [ -s $$k ] || { umask 077; openssl genpkey -quiet -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out $$k.new && mv $$k.new $$k; }
-        chown 1001:1001 $$k 2>/dev/null
-        chmod 0400 $$k 2>/dev/null
-        w=/opt/otodock/collabora-proof/welcome.js
-        cat > $$w.new <<'EOF' && chmod 0444 $$w.new && mv -fT $$w.new $$w
-        window.parent.postMessage('{"MessageId":"welcome-translate","strings":{}}', window.origin)
-        window.parent.postMessage('{"MessageId":"welcome-close"}', window.origin)
-        EOF
-        chown 1001:1001 $$w 2>/dev/null
-        true
-    volumes:
-      - otodock-agents:/opt/otodock/agents
-      - otodock-mcps:/opt/otodock/mcps/community
-      - otodock-skills:/opt/otodock/mcps/skills
-      - otodock-ssh-keys:/opt/otodock/mcps/custom/ssh-hosts/keys
-      - otodock-sessions:/opt/otodock/sessions
-      - otodock-recover-bin:/opt/otodock/recover-bin
-      - otodock-collabora-proof:/opt/otodock/collabora-proof
-      - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env
-    restart: "no"
 
   # --- One-shot init: the two database roles ---
   # Makes the runtime role `otodock` a NON-SUPERUSER that OWNS this database and
@@ -364,7 +528,7 @@ services:
   # on the next start. Idempotent, injection-safe. Postgres image (ships psql):
   # no Dockerfile change. Runs before the proxy connects.
   otodock-db-init:
-    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab}
+    image: ${POSTGRES_IMAGE:-postgres:16.16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e}
     restart: "no"
     logging: *default-logging
     # Data-plane only: the TCP gate and the app-role proof reach
@@ -545,7 +709,7 @@ services:
   # The proxy does NOT drive this container's lifecycle in T2 (it's a sibling
   # the operator owns) — startup_docker_mcps skips it. Shares the agents volume.
   file-tools:
-    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.9.1}
+    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-2.0.0}
     restart: unless-stopped
     logging: *default-logging
     # Bound so a runaway document parse OOM-restarts this container instead of
@@ -557,6 +721,8 @@ services:
     # for very heavy documents.
     mem_limit: ${OTODOCK_FILETOOLS_MEM_LIMIT:-4g}
     memswap_limit: ${OTODOCK_FILETOOLS_MEM_LIMIT:-4g}
+    # The kernel takes this before the control plane (see otodock-compute).
+    oom_score_adj: 500
     environment:
       PROXY_URL: http://otodock-proxy:8400
       WOPI_BASE_URL: http://otodock-proxy:8400
@@ -594,6 +760,8 @@ services:
     # Bound so a runaway document degrades (Collabora sheds its LRU doc)
     # instead of pressuring the host; matches the T1 catalog deploy.
     mem_limit: 2g
+    # The kernel takes this before the control plane (see otodock-compute).
+    oom_score_adj: 500
     environment:
       # The image has no shell: its own entrypoint (coolwsd --use-env-vars)
       # reads these. Collabora's public address needs no setting: the proxy
@@ -623,6 +791,9 @@ services:
         target: /etc/coolwsd/proof_key
         read_only: true
         volume:
+          # No copy from the image: Docker 28.1 cannot create a container
+          # that copies onto a subpath naming a file.
+          nocopy: true
           subpath: proof_key
       # Collabora's free edition shows an "Explore the new" welcome once per
       # browser, and no setting turns it off short of its home mode, which
@@ -641,6 +812,7 @@ services:
         target: /usr/share/coolwsd/browser/dist/welcome/welcome.js
         read_only: true
         volume:
+          nocopy: true
           subpath: welcome.js
     cap_add:
       - MKNOD
@@ -691,6 +863,14 @@ networks:
     ipam:
       config:
         - subnet: ${OTODOCK_INTERNAL_SUBNET:-10.204.0.0/24}
+  # The compute service's link to the proxy, and nothing else on it. The
+  # compute service's address on it is pinned: the proxy takes a compute link
+  # from that address alone.
+  otodock-compute:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${OTODOCK_COMPUTE_SUBNET:-10.205.0.0/24}
 
 # Explicit (project-independent) volume names, matching the named network above:
 # predictable for backup/restore tooling (`docker run -v otodock-agents:… tar`)
@@ -718,3 +898,14 @@ volumes:
   # reads from Collabora.
   otodock-collabora-proof:
     name: otodock-collabora-proof
+  # The compute service's own state (its sign-in, its log), and the
+  # credential the proxy writes for it. Not in a backup:
+  # the proxy writes a new credential when a restored one does not verify.
+  otodock-compute:
+    name: otodock-compute
+  otodock-compute-link:
+    name: otodock-compute-link
+  # The community tools as the compute service builds them. Not in a backup:
+  # the compute service installs a tool again from the proxy's copy of it.
+  otodock-compute-tools:
+    name: otodock-compute-tools

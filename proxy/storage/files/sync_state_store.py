@@ -7,7 +7,9 @@ which is what turns "proxy-always-wins" into "newest-version-wins".
 
 A **cache + change-attribution hint, never a delete-authority**:
 it is reconciled from every manifest, so a stale or missing row degrades to
-"first sync", never to data loss. ``base_mtime`` is the PLATFORM file's mtime
+"first sync", never to data loss. (The end-of-turn scan in
+``services/infra/file_bookkeeping.py`` reads the rows to know WHICH paths a
+machine holds; what authorizes a delete is still the tombstone it writes.) ``base_mtime`` is the PLATFORM file's mtime
 (platform clock) — a re-hash-cache hint, NOT a merge input (the merge attributes
 by hash, not time).
 
@@ -97,6 +99,31 @@ def record_synced_many(
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.executemany(_UPSERT, params)
+
+
+def paths_for_agent(agent_slug: str) -> dict[str, str]:
+    """The paths some machine still paired has converged on for this agent:
+    what could come back to the platform from a machine, each with the time
+    of its newest such row. A removed machine's rows stay in the table and
+    count for nothing."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT s.rel_path, MAX(s.updated_at) AS updated_at FROM sync_state s "
+            "JOIN remote_machines m ON m.id = s.machine_id WHERE s.agent_slug=%s "
+            "GROUP BY s.rel_path",
+            (agent_slug,),
+        ).fetchall()
+    return {r["rel_path"]: r["updated_at"] for r in rows}
+
+
+def agents_with_paths() -> set[str]:
+    """Every agent some paired machine holds files of."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT s.agent_slug FROM sync_state s "
+            "JOIN remote_machines m ON m.id = s.machine_id",
+        ).fetchall()
+    return {r["agent_slug"] for r in rows}
 
 
 def agents_for_machine(machine_id: str) -> set[str]:

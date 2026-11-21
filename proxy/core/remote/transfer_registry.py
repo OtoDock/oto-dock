@@ -293,6 +293,16 @@ async def set_state(
         logger.exception("transfer_registry.set_state failed")
 
 
+async def end_row(transfer_id: str, machine_id: str, total: int, *, error: str = "") -> None:
+    """One machine's part of a transfer ended: done at ``total`` bytes, or
+    failed with ``error``."""
+    if error:
+        await set_state(transfer_id, machine_id, "failed", error=error)
+        return
+    await progress(transfer_id, machine_id, total, total)
+    await set_state(transfer_id, machine_id, "done")
+
+
 async def progress(
     transfer_id: str, machine_id: str, bytes_sent: int, bytes_total: int,
 ) -> None:

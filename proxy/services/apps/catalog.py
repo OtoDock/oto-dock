@@ -18,17 +18,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from collections.abc import Iterable
 from datetime import datetime, timezone
+from pathlib import Path
 
 import psycopg
 
-from auth import roles
 from core import layout, placement
 from core.session import session_kind
 from core.session.visibility import is_phone_chat_owner, is_shared_chat_owner
-from services.apps import app_supervisor
+from services.apps import media_links
 from storage import database as task_store
 from storage.automation import notification_severity
 from ws import wire_events as wire
@@ -116,6 +117,14 @@ METHODS: dict[str, dict] = {
         "min_role": "contributor",
         "args": {"path": "string", "content": "string"},
     },
+    # A short-lived address an <img>, a <video> or an <audio> in the page
+    # loads: made on a person's own page alone.
+    "files.media": {
+        "description": "show a video, an audio file or a picture under one of the app's declared "
+                       "read prefixes; the page can read what it shows",
+        "min_role": "viewer",
+        "args": {"path": "string", "paths": "array"},
+    },
     # An app as the setup page (COMMUNITY-AGENTS-REGISTRY.md "Setup guides"):
     # the viewer's own onboarding state and its completion — the same
     # service the complete_setup tool's route runs. A person's own page
@@ -140,6 +149,15 @@ METHODS: dict[str, dict] = {
         "min_role": "editor",
         "args": {},
     },
+    # The older copies of the database a release and a rollback keep, for
+    # an app that deleted rows it must not keep. The app's own server only
+    # (the route's rule; run_method refuses every other caller too).
+    "app.forget_copies": {
+        "description": "remove the older copies of this app's database that the platform keeps "
+                       "for a rollback, so what the app deleted is gone from those too",
+        "min_role": "manager",
+        "args": {},
+    },
     # A single-file app's document per viewer, each viewer's page its own
     # (a folder app keeps per-viewer data in its database).
     "viewer.data.read": {
@@ -156,12 +174,20 @@ METHODS: dict[str, dict] = {
 FILE_METHODS = frozenset({"files.list", "files.read", "files.write"})
 SETUP_METHODS = frozenset({"setup.status", "setup.complete"})
 AUDIENCE_METHOD = "app.audience"
+FORGET_METHOD = "app.forget_copies"
 VIEWER_DATA_METHODS = frozenset({"viewer.data.read", "viewer.data.write"})
 # A person's own page only: the page's claim, direct or forwarded by the
 # server; never a bearer, the app identity, a wake, an inbound event or
 # the render.
 PERSON_METHODS = SETUP_METHODS | VIEWER_DATA_METHODS
+# The page's own call with the dashboard's cookie, and nothing else: never a
+# claim a server forwards (a media link needs no credential, and a server
+# has egress), never a bearer, the app identity, a wake or the render.
+MEDIA_METHOD = "files.media"
+PAGE_METHODS = frozenset({MEDIA_METHOD})
 FILE_MAX_BYTES = 2 * 1024 * 1024
+#: ``files.list`` reads at most this many names of one folder.
+FILE_LIST_SCAN_MAX = 100_000
 FILE_LIST_MAX = 500
 
 # Sequence numbers per (user, agent, feed), in-process: a gap tells the
@@ -196,9 +222,7 @@ def _emit_now(users: Iterable[str], agent: str, feed: str, delta: dict | None,
               snapshot: list | None = None, shared: bool | None = None) -> int:
     """A frame reaches only the connections that subscribed to the feed
     (``catalog_subscribe``); a user with none takes no frame and no
-    sequence step, so a tab without such an app costs nothing. An app
-    server that subscribed (APPS.md) takes the delta when it lies in the
-    agent-scope slice."""
+    sequence step, so a tab without such an app costs nothing."""
     from services.notifications import notification_manager
     n = 0
     for sub in set(users):
@@ -212,7 +236,6 @@ def _emit_now(users: Iterable[str], agent: str, feed: str, delta: dict | None,
             frame["delta"] = delta or {}
         n += notification_manager.push_catalog(sub, agent, feed, frame)
     if delta is not None and snapshot is None:
-        n += _push_app_subs(agent, feed, delta, shared)
         # A handler that wakes on this event (APPS.md "Handlers"): a
         # durable delivery, never a frame.
         from services.apps import app_handlers
@@ -220,68 +243,11 @@ def _emit_now(users: Iterable[str], agent: str, feed: str, delta: dict | None,
     return n
 
 
-# ── App servers as subscribers (APPS.md "Platform methods and feeds") ──────
-# An app's server has no user connection: it opens its own socket to the
-# proxy and subscribes to feeds of its agent; deltas reach it through a
-# live queue of its own, only those in the agent-scope slice (shared
-# chats, agent-scope tasks and triggers, workspace files — never a
-# member's inbox or personal work).
-
-
-class AppSubscription:
-    """One server socket's feeds and queue: the socket holds it from open
-    to close, and only the socket that registered it may take it down."""
-
-    def __init__(self, app_id: str, agent: str, instance: str = app_supervisor.LIVE) -> None:
-        from services.notifications.notification_manager import LiveQueue
-        self.app_id = app_id
-        self.agent = agent
-        self.instance = instance
-        self.seq_key = f"app:{app_id}:{instance}"
-        self.feeds: set[str] = set()
-        self.queue = LiveQueue()
-
-
-# (app id, instance) → the socket serving that process now: the preview
-# copy's server and the live one subscribe side by side, and a reconnect
-# supersedes the same process's older socket without the older one's close
-# taking the newer one down.
-_app_subs: dict[tuple[str, str], AppSubscription] = {}
-APP_FEEDS_MAX = 16
-
-
-def open_app_subscription(app_id: str, agent: str, instance: str = app_supervisor.LIVE) -> AppSubscription:
-    sub = AppSubscription(app_id, agent, instance)
-    _app_subs[(app_id, instance)] = sub
-    return sub
-
-
-def close_app_subscription(sub: AppSubscription) -> None:
-    if _app_subs.get((sub.app_id, sub.instance)) is sub:
-        _app_subs.pop((sub.app_id, sub.instance), None)
-
-
-def app_subscribe(sub: AppSubscription, feed: str, on: bool) -> bool:
-    if feed not in _SERVER_FEEDS:
-        return False
-    if on:
-        if len(sub.feeds) >= APP_FEEDS_MAX and feed not in sub.feeds:
-            return False
-        sub.feeds.add(feed)
-    else:
-        sub.feeds.discard(feed)
-    return True
-
-
-def app_subscription(app_id: str, instance: str = app_supervisor.LIVE) -> AppSubscription | None:
-    return _app_subs.get((app_id, instance))
-
-
 def in_agent_slice(feed: str, delta: dict, shared: bool | None) -> bool:
     """Whether a delta belongs to the agent-scope slice an app identity may
     see. The emit sites say so when they know (``shared``); a session
-    delta that does not carry it is looked up (rare: only with an app
-    subscribed)."""
+    delta that does not carry it is looked up (rare: only with a handler
+    that wakes on it)."""
     if feed in ("notifications",):
         return False
     if shared is not None:
@@ -295,20 +261,6 @@ def in_agent_slice(feed: str, delta: dict, shared: bool | None) -> bool:
     return False
 
 
-def _push_app_subs(agent: str, feed: str, delta: dict, shared: bool | None) -> int:
-    n = 0
-    for sub in list(_app_subs.values()):
-        if sub.agent != agent or feed not in sub.feeds:
-            continue
-        if not in_agent_slice(feed, delta, shared):
-            continue
-        frame = {"type": wire.CATALOG, "agent": agent, "feed": feed,
-                 "seq": _next_seq(sub.seq_key, agent, feed), "delta": delta}
-        if sub.queue.put(frame):
-            n += 1
-    return n
-
-
 def app_principal(row: dict):
     """The app identity as a principal: a session-shaped caller that acts
     on its own agent and owns nothing of any user (APPS.md "Viewer known
@@ -319,19 +271,6 @@ def app_principal(row: dict):
         name=row.get("title") or row.get("slug") or "app", role="agent", agents=[],
         is_api_key=True, session_id=f"app:{row['id']}", agent=row.get("agent") or "",
     )
-
-
-def snapshot_for_app(feed: str, agent: str, row: dict) -> list[dict]:
-    """The agent-scope slice of a feed for an app server with no viewer
-    behind the call: shared chats, agent-scope tasks and triggers; never
-    an inbox."""
-    if feed == "sessions":
-        from core.session.visibility import SHARED_CHAT_OWNER_PREFIX
-        chats = task_store.list_chats(f"{SHARED_CHAT_OWNER_PREFIX}{agent}", agent=agent, limit=100)
-        return [session_row(c) for c in chats]
-    if feed == "notifications":
-        return []
-    return snapshot(feed, agent, app_principal(row))
 
 
 _SERVER_FEEDS = frozenset(FEEDS) - CLIENT_FEEDS
@@ -355,12 +294,13 @@ def handle_subscription(user_sub: str, connection_id: str, msg: dict) -> bool:
 
 def emit(users: Iterable[str], agent: str, feed: str, delta: dict,
          *, shared: bool | None = None) -> None:
-    """Push one delta to every listed user's connections (and to the app
-    servers subscribed to the agent's feed when it is agent-scope data —
-    ``shared``; None lets the slice rule look). Safe from any thread: off
-    the loop it hops onto it (the live queue wakes a future)."""
+    """Push one delta to every listed user's connections, and wake the
+    handlers of the agent's apps that listen for it (``shared`` says the
+    delta is agent-scope data; None lets the slice rule look). Safe from
+    any thread: off the loop it hops onto it (the live queue wakes a
+    future)."""
     users = list(users)
-    if not users and not _app_subs:
+    if not users:
         from services.apps import app_handlers
         if not app_handlers.has_subscribers(agent):
             return
@@ -387,11 +327,11 @@ def _members_and_admins(agent: str) -> list[str]:
 
 def _editors_and_admins(agent: str) -> list[str]:
     """Who sees what the agent does on its own behalf (its runs, trigger
-    fires, verdicts): the editor tier and every admin. A socket subscribes
-    to any (agent, feed) pair without an app (``handle_subscription``), so
-    the floor is on the delta's targets."""
-    from services.notifications.notification_manager import agent_audience
-    return sorted(set(agent_audience(agent, fan_out=True, floor=roles.EDITOR)))
+    fires, verdicts): ``visibility.agent_work_audience``. A socket
+    subscribes to any (agent, feed) pair without an app
+    (``handle_subscription``), so the floor is on the delta's targets."""
+    from core.session.visibility import agent_work_audience
+    return agent_work_audience(agent, fan_out=True)
 
 
 def _chat_targets(chat: dict) -> list[str]:
@@ -766,8 +706,12 @@ def run_method(method: str, agent: str, row: dict, user, args, *,
     disagrees with the floors; without it the per-agent acting role.
     ``path_gate`` is the files API's path resolver
     (``api.agents.files.safe_agent_path``), passed by the route that
-    answers the method; a file method without it is refused."""
+    answers the method; a file method without it is refused. An outside
+    person reaches no platform method: their session passes the member
+    checks of its own agent, so it is refused here first."""
     args = args if isinstance(args, dict) else {}
+    if getattr(user, "is_external", False):
+        raise PermissionError("not available to outside people")
     if method == "viewer.me":
         u = task_store.get_user(user.sub) or {}
         return {
@@ -811,10 +755,16 @@ def run_method(method: str, agent: str, row: dict, user, args, *,
         return {"id": delivery["id"], "delivered": True, "_delivery": delivery}
     if method in FILE_METHODS:
         return _run_file_method(method, agent, row, user, args, path_gate)
+    if method == MEDIA_METHOD:
+        return _run_media(agent, row, user, args, path_gate)
     if method in SETUP_METHODS:
         return _run_setup_method(method, agent, row, user, args)
     if method == AUDIENCE_METHOD:
         return _run_audience(row, user, role)
+    if method == FORGET_METHOD:
+        if not is_app_identity(row, user):
+            raise PermissionError("only the app's own server may do this")
+        return {"_forget": row}
     if method in VIEWER_DATA_METHODS:
         return _run_viewer_data(method, row, user, args)
     raise KeyError(method)
@@ -1021,15 +971,67 @@ def _matches(rel: str, prefixes: list[str]) -> bool:
     return any(rel == p or rel.startswith(p + "/") for p in prefixes)
 
 
-def _run_file_method(method: str, agent: str, row: dict, user, args: dict, path_gate) -> dict:
-    """Resolve the path first (the files API's own gate), match the
-    declared prefixes against the RESOLVED path, refuse the never-
-    declarable segments again, then read, list or write."""
+def _list_app_folder(agent: str, row: dict, rel: str) -> dict:
+    """``files.list`` of the authorized folder ``rel``: opened beneath the
+    agent's real folder with no link followed and listed from that handle
+    (a folder swapped for a link after the check lists nothing of its
+    target), at most ``FILE_LIST_SCAN_MAX`` names read."""
+    import os
+    import stat
+
+    from core import agent_folder
+    from services.apps import app_folders
+    from services.infra import safe_fs
+    root = agent_folder.agent_root(agent)
+    kind = safe_fs.kind_beneath(root, rel)
+    if kind.kind != "dir":
+        # A folder the manifest declares and nobody has made again since
+        # it went (a person removed it, or the last file of a paired
+        # machine's copy): empty until the next approved release.
+        if kind.kind == "missing" and rel in app_folders.declared_folders(row):
+            return {"path": rel, "entries": []}
+        raise ValueError("not a folder")
+    try:
+        fd = safe_fs.open_dir_beneath(root, rel)
+    except OSError as exc:
+        raise PermissionError("that folder cannot be listed") from exc
+    try:
+        names: list[str] = []
+        with os.scandir(fd) as it:
+            for entry in it:
+                if len(names) >= FILE_LIST_SCAN_MAX:
+                    raise ValueError("the folder holds too many entries to list")
+                if not entry.name.startswith("."):
+                    names.append(entry.name)
+        out = []
+        for name in sorted(names)[:FILE_LIST_MAX]:
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            folder = stat.S_ISDIR(st.st_mode)
+            out.append({"name": name, "type": "folder" if folder else "file",
+                        "size": 0 if folder else st.st_size})
+    finally:
+        os.close(fd)
+    return {"path": rel, "entries": out}
+
+
+def resolve_app_file(method: str, agent: str, row: dict, user, args: dict,
+                     path_gate) -> tuple[str, str, Path]:
+    """Every gate the files methods run before they read, list or write:
+    the caller a member of the agent, the declared prefix on the path as
+    written, the files API's own gate (``path_gate``) at the caller's role,
+    the declared prefix again on the RESOLVED path, the never-declarable
+    names. ``(raw, rel, resolved)``; a refusal raises ``PermissionError`` or
+    ``ValueError`` with its sentence. A button's declared file field is
+    judged here too (``api/apps/app_actions.py``)."""
     from fastapi import HTTPException
 
     import config as _config
     from services import path_roles
-    from services.apps import releases
     from services.apps.app_deploy import NEVER_SEGMENTS
     # A share admits to the app, not to the agent (SHARING.md): a viewer
     # with no place on the agent reads none of its files, whatever the app
@@ -1064,32 +1066,27 @@ def _run_file_method(method: str, agent: str, row: dict, user, args: dict, path_
     parts = rel.split("/")
     if any(seg in NEVER_SEGMENTS for seg in parts) or path_roles.is_protected_credentials_path(rel):
         raise PermissionError("that path is never reachable from an app")
+    return raw, rel, resolved
+
+
+def _run_file_method(method: str, agent: str, row: dict, user, args: dict, path_gate) -> dict:
+    """Resolve the path first (the files API's own gate), match the
+    declared prefixes against the RESOLVED path, refuse the never-
+    declarable segments again (``resolve_app_file``), then read, list or
+    write."""
+    from core import agent_folder
+    from services.infra import safe_fs
+    _raw, rel, resolved = resolve_app_file(method, agent, row, user, args, path_gate)
     if method == "files.list":
-        if not resolved.is_dir():
-            # A folder the manifest declares and nobody has made again since
-            # it went (a person removed it, or the last file of a paired
-            # machine's copy): empty until the next approved release.
-            from services.apps import app_folders
-            if not (resolved.exists() or resolved.is_symlink()) and rel in app_folders.declared_folders(row):
-                return {"path": rel, "entries": []}
-            raise ValueError("not a folder")
-        out = []
-        for child in sorted(resolved.iterdir(), key=lambda p: p.name)[:FILE_LIST_MAX]:
-            if child.name.startswith(".") or child.is_symlink():
-                continue
-            try:
-                st = child.stat()
-            except OSError:
-                continue
-            out.append({"name": child.name, "type": "folder" if child.is_dir() else "file",
-                        "size": 0 if child.is_dir() else st.st_size})
-        return {"path": rel, "entries": out}
+        return _list_app_folder(agent, row, rel)
+    # The one root every file method opens beneath: the agent's real folder,
+    # the folder the gates counted ``rel`` from.
+    root = agent_folder.agent_root(agent)
     if method == "files.read":
         # The resolved (and so authorized) path is opened strictly: a link
         # swapped in after the check is refused, never followed.
-        from services.infra import safe_fs
         try:
-            data = safe_fs.read_bytes_beneath(_config.AGENTS_DIR, f"{agent}/{rel}", max_size=FILE_MAX_BYTES)
+            data = safe_fs.read_bytes_beneath(root, rel, max_size=FILE_MAX_BYTES)
         except safe_fs.FileTooLarge as exc:
             raise ValueError("the file is larger than 2 MB") from exc
         except FileNotFoundError as exc:
@@ -1106,11 +1103,101 @@ def _run_file_method(method: str, agent: str, row: dict, user, args: dict, path_
         raise ValueError("content is larger than 2 MB")
     if resolved.is_dir():
         raise ValueError("a folder is at that path")
-    # Joined from the row's agent and the checked rel, never the realpath:
-    # the write lands beneath that agent's folder or nowhere.
+    # Beneath the agent's real folder at the checked rel: the write lands
+    # there or nowhere.
     try:
-        releases.write_atomic(agent_dir / rel, content)
+        safe_fs.atomic_write_beneath(root, rel, content.encode("utf-8"), mkdirs=True)
     except OSError as exc:
         raise PermissionError("that path cannot be written (a link, or not a regular file)") from exc
     return {"path": rel, "size": len(content.encode("utf-8")),
             "_written": (agent, rel, str(resolved))}
+
+
+# ── Media links ────────────────────────────────────────────────────────────
+
+
+def open_media(agent: str, row: dict, user, path, path_gate) -> media_links.MediaFile:
+    """The file a media link names, opened for reading after every gate of
+    a file method (``resolve_app_file``): an inert kind by its RESOLVED
+    name, the resolved place opened beneath the agent's own folder with no
+    link followed below it, a regular file, and the same kind by the bytes
+    read from that descriptor. The root is the one the gate's place is
+    counted from (``agent_folder.agent_root``): an agent folder that an
+    operator moved behind a link is followed once, there. The mint and
+    every request on the link call this one function."""
+    from core import agent_folder
+    from services.infra import safe_fs
+    _raw, rel, _resolved = resolve_app_file(MEDIA_METHOD, agent, row, user, {"path": path}, path_gate)
+    kind = media_links.kind_of(rel)
+    if kind is None:
+        raise ValueError("not a video, an audio file or a picture an app can show")
+    try:
+        fd, st = safe_fs.open_regular_for_read(agent_folder.agent_root(agent), rel)
+    except (FileNotFoundError, safe_fs.NotRegularFile) as exc:
+        raise ValueError("not a file") from exc
+    except OSError as exc:
+        raise PermissionError("that path is not a regular file the app may read") from exc
+    try:
+        if not kind.check(os.pread(fd, media_links.HEAD_BYTES, 0)):
+            raise ValueError("the file is not what its name says")
+    except BaseException:
+        os.close(fd)
+        raise
+    return media_links.MediaFile(fd, st, rel, kind.kind, kind.mime)
+
+
+def call_cost(method: str, args) -> float:
+    """What a platform call takes from its caller's reserve
+    (``call_rate``): one, and one for every four files of a batch of media
+    links."""
+    paths = args.get("paths") if method == MEDIA_METHOD and isinstance(args, dict) else None
+    return float(max(1, -(-len(paths) // 4))) if isinstance(paths, list) else 1.0
+
+
+def _page_only(row: dict, user) -> None:
+    if getattr(user, "is_external", False):
+        raise PermissionError("not available to outside people")
+    if (getattr(user, "is_api_key", False) or getattr(user, "render_app", "")
+            or is_app_identity(row, user)):
+        raise PermissionError("a media link is made on a person's own page")
+
+
+def page_media(agent: str, row: dict, user, path, path_gate) -> media_links.MediaFile:
+    """Everything ``files.media`` asks of the caller and of the file, for
+    the mint and for every request on the link: a person (never an outside
+    one, a bearer, the app identity or the render), then ``open_media``."""
+    _page_only(row, user)
+    return open_media(agent, row, user, path, path_gate)
+
+
+def _media_link(agent: str, row: dict, user, path, path_gate) -> dict:
+    media = page_media(agent, row, user, path, path_gate)
+    os.close(media.fd)
+    try:
+        link, lease = media_links.issue(row["id"], user.sub, str(path), media.rel, media.kind)
+    except media_links.TableFull as exc:
+        raise ValueError("too many files are open at once, try again in a moment") from exc
+    logger.debug("media link: app=%s viewer=%s file=%s", row.get("slug"), user.sub,
+                 media.rel.rsplit("/", 1)[-1])
+    return {"path": media.rel, "url": link.address(media.stat), "expires_in": lease, "kind": media.kind,
+            "mime": media.mime, "size": media.stat.st_size}
+
+
+def _run_media(agent: str, row: dict, user, args: dict, path_gate) -> dict:
+    """``files.media``: one link for ``path``, or one per entry of
+    ``paths`` (each a link or ``{path, error}``). A person's own page
+    only: the address it answers needs no credential."""
+    _page_only(row, user)
+    paths = args.get("paths")
+    if paths is None:
+        return _media_link(agent, row, user, args.get("path"), path_gate)
+    if (not isinstance(paths, list) or not 1 <= len(paths) <= media_links.BATCH_MAX
+            or any(not isinstance(p, str) for p in paths)):
+        raise ValueError(f"paths is a list of 1 to {media_links.BATCH_MAX} paths")
+    links: list[dict] = []
+    for p in paths:
+        try:
+            links.append(_media_link(agent, row, user, p, path_gate))
+        except (ValueError, PermissionError) as e:
+            links.append({"path": p, "error": str(e)})
+    return {"links": links}

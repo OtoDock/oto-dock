@@ -185,6 +185,7 @@ def test_all_keys_always_present():
         # External routes: the caller's channel / id / PIN-verified flag
         # (empty / "false" for every session that is not external).
         "OTO_EXTERNAL_CHANNEL", "OTO_EXTERNAL_ID", "OTO_EXTERNAL_VERIFIED",
+        "OTO_MEMORY_PERSON",
     }
     for username, role in [
         ("alice", "manager"),

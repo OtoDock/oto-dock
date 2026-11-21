@@ -1,0 +1,61 @@
+{
+ "pending": [],
+ "rows": [
+  {
+   "content": "",
+   "event_data": {
+    "agent": "char-peer",
+    "output_text": "for nobody",
+    "status": "completed",
+    "task_id": "t-left",
+    "task_name": "the-worker"
+   },
+   "event_type": "delegate_result",
+   "role": "event"
+  },
+  {
+   "content": "",
+   "event_data": {
+    "agent": "char-peer",
+    "output_text": "by session",
+    "status": "completed",
+    "task_id": "t-left2",
+    "task_name": "w"
+   },
+   "event_type": "delegate_result",
+   "role": "event"
+  }
+ ],
+ "seen": {
+  "admission": [],
+  "frames": [
+   [
+    "c-left",
+    {
+     "agent": "char-peer",
+     "chat_id": "c-left",
+     "output_text": "for nobody",
+     "status": "completed",
+     "task_id": "t-left",
+     "task_name": "the-worker",
+     "type": "delegate_result"
+    }
+   ],
+   [
+    "c-left",
+    {
+     "agent": "char-peer",
+     "output_text": "by session",
+     "status": "completed",
+     "task_id": "t-left2",
+     "task_name": "w",
+     "type": "delegate_result"
+    }
+   ]
+  ],
+  "layer": [],
+  "layers_asked": [],
+  "released": [],
+  "seats": []
+ }
+}

@@ -27,6 +27,22 @@ _TINY_PNG_B64 = (
 _TINY_PNG_DATA_URL = f"data:image/png;base64,{_TINY_PNG_B64}"
 
 
+@pytest.fixture(autouse=True)
+def _agents_root_is_the_tests_folder(tmp_path, monkeypatch):
+    """A photo is written beneath the agents root: the test's own folder."""
+    import config
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+
+
+def _photo_folder(tmp_path: Path) -> dict:
+    """``save_dir`` and ``scope_dir`` in a stand-in agent folder (``ws``): a
+    photo is written beneath the agent's real folder, and an agent's folder
+    always exists."""
+    folder = tmp_path / "ws"
+    folder.mkdir(exist_ok=True)
+    return {"save_dir": folder, "scope_dir": folder}
+
+
 def test_pasted_photos_are_saved_off_the_loop_in_order(tmp_path, monkeypatch):
     """A pasted phone photo is decoded, resized and re-encoded: seconds of
     CPU that must never hold the event loop. Each photo is saved in a thread,
@@ -42,9 +58,9 @@ def test_pasted_photos_are_saved_off_the_loop_in_order(tmp_path, monkeypatch):
     seen: list[tuple[str, bool]] = []
     real = dash._save_base64_image
 
-    def _recording_save(data_url, *, save_dir):
+    def _recording_save(data_url, *, save_dir, scope_dir):
         seen.append((data_url[-8:], threading.get_ident() != main))
-        return real(data_url, save_dir=save_dir)
+        return real(data_url, save_dir=save_dir, scope_dir=scope_dir)
 
     monkeypatch.setattr(dash, "_save_base64_image", _recording_save)
     monkeypatch.setattr(support, "_PHOTO_WAIT_S", 5.0)
@@ -52,7 +68,7 @@ def test_pasted_photos_are_saved_off_the_loop_in_order(tmp_path, monkeypatch):
 
     async def run():
         return [await support._save_photo_off_loop(dash._save_base64_image, u,
-                                                   save_dir=tmp_path) for u in urls]
+                                                   **_photo_folder(tmp_path)) for u in urls]
 
     saved = asyncio.run(run())
     assert [s for _, s in seen] == [True, True, True]      # every save off the loop
@@ -69,8 +85,9 @@ def test_save_base64_image_uses_passed_save_dir(tmp_path):
     """
     from ws.dashboard import _save_base64_image
 
+    (tmp_path / "uploads").mkdir()  # the stand-in agent's folder
     target = tmp_path / "uploads" / "photos"
-    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=target)
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=target, scope_dir=target)
 
     assert saved is not None, "save should succeed for a valid data URL"
     p = Path(saved["path"])
@@ -89,10 +106,11 @@ def test_save_base64_image_creates_missing_parents(tmp_path):
     """
     from ws.dashboard import _save_base64_image
 
+    (tmp_path / "agent").mkdir()  # the stand-in agent's folder
     deep = tmp_path / "agent" / "users" / "alice" / "workspace" / "uploads" / "photos"
     assert not deep.exists()
 
-    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=deep)
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=deep, scope_dir=deep)
 
     assert saved is not None
     assert deep.is_dir()
@@ -105,8 +123,9 @@ def test_save_base64_image_supports_agent_scoped_workspace(tmp_path):
     """
     from ws.dashboard import _save_base64_image
 
+    (tmp_path / "agent").mkdir()  # the stand-in agent's folder
     target = tmp_path / "agent" / "workspace" / "uploads" / "photos"
-    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=target)
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=target, scope_dir=target)
 
     assert saved is not None
     assert Path(saved["path"]).parent == target
@@ -116,7 +135,7 @@ def test_save_base64_image_resize_preserves_format(tmp_path):
     """Tiny image stays PNG (not JPEG-converted); file extension matches."""
     from ws.dashboard import _save_base64_image
 
-    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=tmp_path)
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, **_photo_folder(tmp_path))
     assert saved is not None
     # 1x1 PNG is way under 500KB → stays PNG (not JPEG-converted).
     assert Path(saved["path"]).suffix == ".png"
@@ -128,7 +147,7 @@ def test_save_base64_image_returns_path_base64_media_type(tmp_path):
     recompress), and ``media_type`` is ``image/png`` or ``image/jpeg``."""
     from ws.dashboard import _save_base64_image
 
-    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=tmp_path)
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, **_photo_folder(tmp_path))
     assert saved is not None
     assert set(saved.keys()) == {"path", "base64", "media_type"}
     # base64 round-trips back to the same bytes that landed on disk.
@@ -140,7 +159,7 @@ def test_save_base64_image_png_for_small_input(tmp_path):
     """Small input image keeps PNG format; ``media_type`` matches."""
     from ws.dashboard import _save_base64_image
 
-    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=tmp_path)
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, **_photo_folder(tmp_path))
     assert saved is not None
     assert saved["media_type"] == "image/png"
     assert Path(saved["path"]).suffix == ".png"
@@ -175,7 +194,7 @@ def test_save_base64_image_jpeg_for_large_input(tmp_path):
     )
     data_url = f"data:image/jpeg;base64,{_b64.b64encode(raw).decode('ascii')}"
 
-    saved = _save_base64_image(data_url, save_dir=tmp_path)
+    saved = _save_base64_image(data_url, **_photo_folder(tmp_path))
     assert saved is not None
     assert saved["media_type"] == "image/jpeg"
     assert Path(saved["path"]).suffix == ".jpg"
@@ -210,7 +229,7 @@ def test_a_small_jpeg_stays_a_jpeg_without_metadata(tmp_path):
     url = _data_url(img, "JPEG", quality=85, exif=exif.tobytes(),
                     comment=b"secret note", icc_profile=icc)
 
-    saved = _save_base64_image(url, save_dir=tmp_path)
+    saved = _save_base64_image(url, **_photo_folder(tmp_path))
     assert saved["media_type"] == "image/jpeg"
     assert Path(saved["path"]).suffix == ".jpg"
     out = _saved_image(saved)
@@ -227,7 +246,7 @@ def test_a_cmyk_jpeg_is_saved_as_rgb(tmp_path):
     from ws.dashboard import _save_base64_image
 
     saved = _save_base64_image(
-        _data_url(Image.new("CMYK", (64, 64), (0, 50, 50, 0)), "JPEG"), save_dir=tmp_path)
+        _data_url(Image.new("CMYK", (64, 64), (0, 50, 50, 0)), "JPEG"), **_photo_folder(tmp_path))
     out = _saved_image(saved)
     assert out.format == "JPEG" and out.mode == "RGB"
 
@@ -247,7 +266,7 @@ def test_transparency_palette_and_deep_images_stay_png(tmp_path, make):
         url = _data_url(Image.new("P", (64, 64), 3), "GIF")
     else:
         url = _data_url(Image.new("I;16", (64, 64), 40000), "PNG")
-    saved = _save_base64_image(url, save_dir=tmp_path)
+    saved = _save_base64_image(url, **_photo_folder(tmp_path))
     assert saved["media_type"] == "image/png"
     assert _saved_image(saved).format == "PNG"
 
@@ -260,7 +279,7 @@ def test_a_32_bit_grey_image_is_kept_as_a_16_bit_png(tmp_path):
     from ws.dashboard import _save_base64_image
 
     saved = _save_base64_image(
-        _data_url(Image.new("I", (64, 64), 70000), "TIFF"), save_dir=tmp_path)
+        _data_url(Image.new("I", (64, 64), 70000), "TIFF"), **_photo_folder(tmp_path))
     assert saved["media_type"] == "image/png"
     out = _saved_image(saved)
     assert out.format == "PNG" and out.mode == "I;16"
@@ -273,7 +292,7 @@ def test_an_opaque_rgb_png_becomes_a_jpeg(tmp_path):
     from ws.dashboard import _save_base64_image
 
     saved = _save_base64_image(
-        _data_url(Image.new("RGB", (300, 200), (10, 120, 200)), "PNG"), save_dir=tmp_path)
+        _data_url(Image.new("RGB", (300, 200), (10, 120, 200)), "PNG"), **_photo_folder(tmp_path))
     assert saved["media_type"] == "image/jpeg"
     assert _saved_image(saved).format == "JPEG"
 
@@ -289,7 +308,7 @@ def test_a_huge_non_jpeg_is_refused_with_a_reason(tmp_path):
 
     url = _data_url(Image.new("1", (7200, 7200), 1), "PNG")
     with pytest.raises(AttachmentsRefused, match="megapixels"):
-        _save_base64_image(url, save_dir=tmp_path)
+        _save_base64_image(url, save_dir=tmp_path / "ws", scope_dir=tmp_path / "ws")
     assert list(tmp_path.iterdir()) == []
 
 
@@ -304,7 +323,7 @@ def test_a_converted_jpeg_keeps_no_profile_of_its_old_mode(tmp_path):
     profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
     saved = _save_base64_image(
         _data_url(Image.new("CMYK", (64, 64), (0, 50, 50, 0)), "JPEG", icc_profile=profile),
-        save_dir=tmp_path)
+        **_photo_folder(tmp_path))
     out = _saved_image(saved)
     assert out.mode == "RGB"
     assert "icc_profile" not in out.info
@@ -381,6 +400,7 @@ def test_a_photo_that_waits_too_long_for_a_slot_refuses_the_message(agents_root,
     from ws import dashboard as dash, dashboard_chat_support as support
 
     monkeypatch.setattr(support, "_PHOTO_WAIT_S", 0.05)
+    (agents_root / _AGENT).mkdir()  # an agent's folder always exists
     real = dash._save_base64_image
     held: dict = {}
 
@@ -388,8 +408,8 @@ def test_a_photo_that_waits_too_long_for_a_slot_refuses_the_message(agents_root,
         for _ in range(support._PHOTO_SLOTS):
             held["loop"].create_task(support._photo_slot().acquire())
 
-    def _save_then_fill_the_slots(data_url, *, save_dir):
-        out = real(data_url, save_dir=save_dir)
+    def _save_then_fill_the_slots(data_url, *, save_dir, scope_dir):
+        out = real(data_url, save_dir=save_dir, scope_dir=scope_dir)
         held["loop"].call_soon_threadsafe(_take_both_slots)
         return out
 
@@ -417,11 +437,11 @@ def test_a_send_cancelled_while_a_photo_saves_keeps_no_photo(agents_root, monkey
     real = dash._save_base64_image
     started, go, done = threading.Event(), threading.Event(), threading.Event()
 
-    def _slow_save(data_url, *, save_dir):
+    def _slow_save(data_url, *, save_dir, scope_dir):
         started.set()
         go.wait(5)
         try:
-            return real(data_url, save_dir=save_dir)
+            return real(data_url, save_dir=save_dir, scope_dir=scope_dir)
         finally:
             done.set()
 
@@ -631,3 +651,238 @@ class TestSharedPhotoAuthority:
         with pytest.raises(AttachmentsRefused, match="contributor role or above"):
             asyncio.run(gate(self._handler("user-viewer"), "team-line"))
         asyncio.run(gate(self._handler("user-viewer2"), "team-line"))
+
+
+# ---- a pasted photo lands where its folder was judged (stand-in folders) ----
+
+
+def _scope(tmp_path, user="alice"):
+    ws = tmp_path / "agent-x" / "users" / user / "workspace"
+    ws.mkdir(parents=True, exist_ok=True)
+    return ws
+
+
+def test_a_photo_folder_that_leads_out_of_the_persons_folder_keeps_nothing(tmp_path):
+    from ws.dashboard import _save_base64_image
+    mine, theirs = _scope(tmp_path), _scope(tmp_path, "bob")
+    (mine / "uploads").mkdir()
+    (mine / "uploads" / "photos").symlink_to(theirs)
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=mine / "uploads" / "photos", scope_dir=mine)
+    assert saved is None
+    assert list(theirs.iterdir()) == []
+
+
+def test_a_photo_never_lands_in_the_engines_state(tmp_path):
+    from ws.dashboard import _save_base64_image
+    shared = tmp_path / "agent-x" / "workspace"
+    (shared / ".claude").mkdir(parents=True)
+    (shared / "uploads").mkdir()
+    (shared / "uploads" / "photos").symlink_to(shared / ".claude")
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=shared / "uploads" / "photos",
+                               scope_dir=shared / "uploads" / "photos")
+    assert saved is None
+    assert list((shared / ".claude").iterdir()) == []
+
+
+def test_a_photo_folder_linked_inside_the_persons_own_folder_still_works(tmp_path):
+    from ws.dashboard import _save_base64_image
+    mine = _scope(tmp_path)
+    (mine / "pictures").mkdir()
+    (mine / "uploads").mkdir()
+    (mine / "uploads" / "photos").symlink_to(mine / "pictures")
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=mine / "uploads" / "photos",
+                               scope_dir=mine)
+    assert saved is not None
+    assert Path(saved["path"]).parent == mine / "pictures"
+    assert Path(saved["path"]).is_file()
+
+
+def test_a_photo_never_lands_in_the_engines_state_inside_its_scope(tmp_path):
+    from ws.dashboard import _save_base64_image
+    shared = tmp_path / "agent-x" / "workspace"
+    (shared / ".claude").mkdir(parents=True)
+    (shared / "uploads").mkdir()
+    (shared / "uploads" / "photos").symlink_to(shared / ".claude")
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=shared / "uploads" / "photos",
+                               scope_dir=shared)
+    assert saved is None
+    assert list((shared / ".claude").iterdir()) == []
+
+
+def test_a_photo_with_no_scope_folder_keeps_nothing(tmp_path):
+    """The scope folder is required and is never the agents root itself."""
+    from ws.dashboard import _save_base64_image
+    assert _save_base64_image(_TINY_PNG_DATA_URL, save_dir=tmp_path, scope_dir=tmp_path) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_photo_never_lands_in_a_sign_in_folder_inside_its_scope(tmp_path):
+    """A folder name earlier releases gave a tool's sign-in copies is refused
+    even inside the person's own folder."""
+    from ws.dashboard import _save_base64_image
+    mine = _scope(tmp_path)
+    kept = mine / "google-tokens"
+    kept.mkdir()
+    (mine / "uploads").mkdir()
+    (mine / "uploads" / "photos").symlink_to(kept)
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=mine / "uploads" / "photos", scope_dir=mine)
+    assert saved is None
+    assert list(kept.iterdir()) == []
+
+
+def _data_url_of(fmt: str, mime: str) -> str:
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("L", (8, 8), 128).save(buf, format=fmt)
+    return f"data:{mime};base64," + _b64.b64encode(buf.getvalue()).decode()
+
+
+@pytest.mark.parametrize(("fmt", "mime"), [("PPM", "image/x-portable-pixmap"), ("EPS", "image/png")],
+                         ids=["ppm", "eps-named-as-png"])
+def test_a_picture_in_a_format_the_chat_does_not_keep_is_not_decoded(tmp_path, monkeypatch, fmt, mime):
+    """Only the formats the chat keeps are opened: a still picture in any
+    other format is left out before the server decodes it, whatever its
+    declared type, and nothing is saved. The message goes on, and the chat
+    says the photo did not reach the agent. One of those formats would have
+    the decoder start a program of the host."""
+    from PIL import EpsImagePlugin
+
+    from ws.dashboard import _save_base64_image
+    loads = []
+    monkeypatch.setattr(EpsImagePlugin.EpsImageFile, "load", lambda self, *a, **k: loads.append(self))
+    assert _save_base64_image(_data_url_of(fmt, mime), save_dir=tmp_path / "out", scope_dir=tmp_path / "out") is None
+    assert loads == []
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_picture_that_is_no_picture_at_all_is_left_out_too(tmp_path, caplog):
+    """A person's picture the decoder cannot read is no fault of the server:
+    a warning, never an error."""
+    import logging
+
+    from ws.dashboard import _save_base64_image
+    junk = "data:image/png;base64," + _b64.b64encode(b"not a picture at all").decode()
+    with caplog.at_level(logging.INFO, logger="otodock"):
+        assert _save_base64_image(junk, save_dir=tmp_path / "out", scope_dir=tmp_path / "out") is None
+    assert not (tmp_path / "out").exists()
+    assert [r.levelname for r in caplog.records if "image" in r.getMessage().lower()] == ["WARNING"]
+
+
+def test_a_truncated_picture_is_a_warning_and_a_refused_save_an_error(tmp_path, caplog, monkeypatch):
+    """Pillow raises OSError for a truncated file, as the write does: the
+    level follows where it was raised, the decoder or the platform's save."""
+    import io
+    import logging
+
+    from PIL import Image
+
+    from ws import dashboard
+    buf = io.BytesIO()
+    Image.new("RGB", (40, 40), (10, 20, 30)).save(buf, format="PNG")
+    cut = "data:image/png;base64," + _b64.b64encode(buf.getvalue()[:60]).decode()
+    with caplog.at_level(logging.INFO, logger="otodock"):
+        assert dashboard._save_base64_image(cut, **_photo_folder(tmp_path)) is None
+    assert [r.levelname for r in caplog.records if "image" in r.getMessage().lower()] == ["WARNING"]
+    caplog.clear()
+
+    def _refused(*_a, **_k):
+        raise PermissionError("the photo folder is not the person's to write")
+    monkeypatch.setattr(dashboard, "_land_photo", _refused)
+    with caplog.at_level(logging.INFO, logger="otodock"):
+        assert dashboard._save_base64_image(_data_url_of("PNG", "image/png"), **_photo_folder(tmp_path)) is None
+    assert [r.levelname for r in caplog.records if "image" in r.getMessage().lower()] == ["ERROR"]
+
+
+@pytest.mark.parametrize("fmt", ["JPEG", "PNG", "GIF", "WEBP", "BMP", "TIFF", "AVIF", "ICO"])
+def test_every_format_the_chat_keeps_still_saves(tmp_path, fmt):
+    from ws.dashboard import _save_base64_image
+    saved = _save_base64_image(_data_url_of(fmt, f"image/{fmt.lower()}"), **_photo_folder(tmp_path))
+    assert saved is not None and Path(saved["path"]).is_file()
+
+
+# ---- an agent folder that is the operator's link (stand-in folders) ----
+
+
+@pytest.fixture
+def linked_agent(tmp_path, monkeypatch):
+    """The agent's folder is a link the operator made to a folder elsewhere:
+    the server follows that one link, and nothing beneath it."""
+    import config
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    real = tmp_path / "big-disk" / "pa"
+    (real / "users" / "alice" / "workspace").mkdir(parents=True)
+    (real / "users" / "bob" / "workspace").mkdir(parents=True)
+    (agents / "pa").symlink_to(real)
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    return agents, real
+
+
+def test_a_photo_lands_in_a_linked_agent_folder(linked_agent):
+    from ws.dashboard import _save_base64_image
+    agents, real = linked_agent
+    mine = agents / "pa" / "users" / "alice" / "workspace"
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=mine / "uploads" / "photos", scope_dir=mine)
+    assert saved is not None
+    assert Path(saved["path"]).parent == mine / "uploads" / "photos"
+    assert (real / "users/alice/workspace/uploads/photos" / Path(saved["path"]).name).is_file()
+
+
+def test_a_photo_folder_that_leaves_the_person_is_still_refused_in_a_linked_agent_folder(linked_agent):
+    from ws.dashboard import _save_base64_image
+    agents, real = linked_agent
+    mine = agents / "pa" / "users" / "alice" / "workspace"
+    (real / "users" / "alice" / "workspace" / "uploads").symlink_to(real / "users" / "bob" / "workspace")
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=mine / "uploads" / "photos", scope_dir=mine)
+    assert saved is None
+    assert list((real / "users" / "bob" / "workspace").iterdir()) == []
+
+
+def test_a_linked_data_folder_still_takes_a_photo(tmp_path, monkeypatch):
+    import config
+    from ws.dashboard import _save_base64_image
+    real = tmp_path / "real-agents"
+    (real / "pa" / "users" / "alice" / "workspace").mkdir(parents=True)
+    agents = tmp_path / "data-link"
+    agents.symlink_to(real)
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    mine = agents / "pa" / "users" / "alice" / "workspace"
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=mine / "uploads" / "photos", scope_dir=mine)
+    assert saved is not None
+    assert saved["path"].startswith(str(agents) + "/")
+    assert Path(saved["path"]).is_file()
+
+
+def test_a_photo_folder_beside_the_scope_folder_is_outside_it(tmp_path):
+    """A folder whose name only starts like the person's scope folder is not
+    inside it."""
+    from ws.dashboard import _save_base64_image
+    mine = _scope(tmp_path)
+    beside = mine.parent / "workspace-old"
+    beside.mkdir()
+    (mine / "uploads").symlink_to(beside)
+    saved = _save_base64_image(_TINY_PNG_DATA_URL, save_dir=mine / "uploads" / "photos", scope_dir=mine)
+    assert saved is None
+    assert list(beside.iterdir()) == []
+
+
+def test_a_reattached_photo_past_the_image_cap_is_not_read_whole(agents_root, monkeypatch):
+    """An engine that takes photos inline gets a re-attached photo only
+    under the chat's image cap: a larger file is left out, never read
+    whole into memory."""
+    import config
+    from ws import dashboard_chat_support as support
+    monkeypatch.setattr(config, "TEMP_IMAGE_MAX_BYTES", 64)
+    rel = _SCOPE + "uploads/photos/img_big.png"
+    big = agents_root / _AGENT / rel
+    big.parent.mkdir(parents=True, exist_ok=True)
+    big.write_bytes(b"\x89PNG" + b"x" * 200)
+    assert support._reattach_saved_photo(_AGENT, agents_root / _AGENT, rel, _SCOPE, with_bytes=True) is None
+    small = agents_root / _AGENT / (_SCOPE + "uploads/photos/img_small.png")
+    small.write_bytes(b"\x89PNG small")
+    got = support._reattach_saved_photo(_AGENT, agents_root / _AGENT, _SCOPE + "uploads/photos/img_small.png",
+                                        _SCOPE, with_bytes=True)
+    assert got is not None and got["base64"]
+    assert support._reattach_saved_photo(_AGENT, agents_root / _AGENT, rel, _SCOPE, with_bytes=False) is not None

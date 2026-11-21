@@ -15,6 +15,7 @@ from pathlib import Path
 import config as app_config
 from services.memory import memory_file
 from storage.agents import agent_store, memory_store
+from tests.fixtures.start_text import prompt_at_start
 
 
 def _seed_agent(slug: str, *, default_scope: str = "user") -> Path:
@@ -35,7 +36,8 @@ def _write_topic(agent_dir: Path, scope: str, name: str, text: str,
 
 
 def _prompt(slug: str, **kwargs) -> str:
-    return app_config.build_agent_prompt(slug, **kwargs) or ""
+    # The memory rides on the start: read with the text, as the model reads it.
+    return prompt_at_start(slug, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -269,18 +271,81 @@ def test_a_topic_whose_read_fails_is_listed_not_dropped(temp_db, monkeypatch):
     agent_dir = _seed_agent("acme")
     _write_topic(agent_dir, "agent", "locked.md", "# Locked\n- l (2026-10-03)\n")
     _write_topic(agent_dir, "agent", "open.md", "# Open\n- o (2026-10-02)\n")
-    real_read = Path.read_text
+    from services.infra import safe_fs
+    real_read = safe_fs.read_bytes_beneath
 
-    def read_text(self, *args, **kwargs):
-        if self.name == "locked.md":
-            raise PermissionError(13, "Permission denied", str(self))
-        return real_read(self, *args, **kwargs)
-    monkeypatch.setattr(Path, "read_text", read_text)
+    def read_bytes_beneath(root, rel, **kwargs):
+        if str(rel).endswith("locked.md"):
+            raise PermissionError(13, "Permission denied", str(rel))
+        return real_read(root, rel, **kwargs)
+    monkeypatch.setattr(safe_fs, "read_bytes_beneath", read_bytes_beneath)
     p = _prompt("acme", username="alice", role="manager")
     assert "### `open.md`" in p and "### `locked.md`" not in p
     listed = p.split("### Topics listed, not loaded")[1]
     assert "- locked.md: Locked (" in listed
 
+
+def test_a_topic_swapped_for_a_link_after_the_listing_is_listed_not_read(temp_db, monkeypatch, tmp_path):
+    """The topics are listed first and read after: a topic that became a link
+    in between is never read through it, and stays listed."""
+    from services.memory import memory_index
+    memory_store.update_settings(inline_budget_bytes=200_000)
+    agent_dir = _seed_agent("acme")
+    _write_topic(agent_dir, "agent", "swapped.md", "# Swapped\n- s (2026-10-03)\n")
+    _write_topic(agent_dir, "agent", "open.md", "# Open\n- o (2026-10-02)\n")
+    stand_in = tmp_path / "stand-in.md"
+    stand_in.write_text("# Swapped\n- STAND-IN TEXT (2026-10-03)\n")
+    real_facts = memory_index.scope_facts
+
+    def facts_then_swap(root, **kwargs):
+        out = real_facts(root, **kwargs)
+        topic = root / "swapped.md"
+        if topic.is_file() and not topic.is_symlink():
+            topic.unlink()
+            topic.symlink_to(stand_in)
+        return out
+    monkeypatch.setattr(memory_index, "scope_facts", facts_then_swap)
+    p = _prompt("acme", username="alice", role="manager")
+    assert "### `open.md`" in p and "### `swapped.md`" not in p
+    assert "STAND-IN TEXT" not in p
+    assert "- swapped.md: Swapped (" in p.split("### Topics listed, not loaded")[1]
+
+
+
+def test_a_topic_that_grew_past_its_cap_after_the_listing_is_listed_not_read(temp_db, monkeypatch):
+    """The topics are listed first and read after: a topic that grew past
+    the hard cap in between is not loaded, and stays listed."""
+    from services.memory import memory_index
+    memory_store.update_settings(inline_budget_bytes=200_000)
+    agent_dir = _seed_agent("acme")
+    _write_topic(agent_dir, "agent", "grown.md", "# Grown\n- g (2026-10-03)\n")
+    _write_topic(agent_dir, "agent", "open.md", "# Open\n- o (2026-10-02)\n")
+    real_facts = memory_index.scope_facts
+
+    def facts_then_grow(root, **kwargs):
+        out = real_facts(root, **kwargs)
+        topic = root / "grown.md"
+        if topic.is_file() and topic.stat().st_size <= memory_file.TOPIC_HARD_CAP_BYTES:
+            topic.write_text("# Grown\n" + "x" * (memory_file.TOPIC_HARD_CAP_BYTES + 1))
+        return out
+    monkeypatch.setattr(memory_index, "scope_facts", facts_then_grow)
+    p = _prompt("acme", username="alice", role="manager")
+    assert "### `open.md`" in p and "### `grown.md`" not in p
+    assert "- grown.md: Grown (" in p.split("### Topics listed, not loaded")[1]
+
+
+def test_an_agent_whose_folder_is_a_link_loads_its_memory(temp_db, tmp_path):
+    """The operator may move an agent's folder and leave a link in its place:
+    its topics are read beneath the real folder."""
+    real = tmp_path / "disk2" / "moved"
+    real.mkdir(parents=True)
+    (app_config.AGENTS_DIR / "moved").symlink_to(real)
+    _seed_agent("moved")
+    memory_store.update_settings(inline_budget_bytes=200_000)
+    (real / "knowledge" / "memory").mkdir(parents=True)
+    (real / "knowledge" / "memory" / "infra.md").write_text("# Prod cluster is main-eu\n")
+    p = _prompt("moved", username="alice", role="manager")
+    assert "### `infra.md`" in p and "Prod cluster is main-eu" in p
 
 # ---------------------------------------------------------------------------
 # The index rewrite at a prompt build never drops the section

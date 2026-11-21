@@ -38,7 +38,8 @@ async def _run(role, username, path, action="write"):
         "path": path,
         "action": action,
         "session_id": "sess-1",
-        "hash": "sha256:abc",
+        # An inline write's hash is the hash of the bytes it carries.
+        "hash": "sha256:" + __import__("hashlib").sha256(b"x").hexdigest(),
         "content_b64": base64.b64encode(b"x").decode() if action == "write" else "",
     }
     sec = SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="machine-1"), role=role, username=username, agent="my-agent")

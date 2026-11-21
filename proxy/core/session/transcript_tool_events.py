@@ -113,6 +113,10 @@ class _Note:
     key: str
     noted_at: float
     owner: str
+    # A prompt an earlier process of the platform wrote the row of
+    # (``note_persisted_prompt``): keyed without its preludes, and good for
+    # the first prompt line the journal gives back only.
+    persisted: bool = False
 
 
 _sent_prompts: dict[str, list[_Note]] = {}
@@ -155,8 +159,11 @@ def typed_key(text: str) -> str:
     exactly, preludes included: a note holds what was typed. A message's
     attachments block is left out on both sides, with the TUI's leading
     ``[Image #N]`` marks: the TUI takes a pasted photo path in as an image,
-    so its line holds the marks and not the paths."""
-    plain = _PASTED_CONTENT_TAG_RE.sub("", text or "")
+    so its line holds the marks and not the paths. The platform's text is
+    typed fenced (``start_context.fence_turn``) and noted as given: both
+    sides are fenced."""
+    from core.session.start_context import fence_turn
+    plain = fence_turn(_PASTED_CONTENT_TAG_RE.sub("", text or ""))
     plain = _ATTACHMENTS_BLOCK_RE.sub("", _IMAGE_MARKS_RE.sub("", plain))
     return " ".join(plain.split())
 
@@ -168,7 +175,9 @@ def prompt_key(text: str) -> str:
     run's own text; the transcript keeps them, the caller holds the raw
     prompt), whitespace folded. The lane collection's and the Codex prefix
     merge's compare."""
-    out = _PASTED_CONTENT_TAG_RE.sub("", text or "").strip()
+    from core.session.start_context import fence_turn
+    from storage.chat.chat_titles import without_start_context
+    out = fence_turn(without_start_context(_PASTED_CONTENT_TAG_RE.sub("", text or "").strip()))
     while True:
         stripped = ROW_PRELUDE_RE.sub("", out, count=1)
         if stripped == out:
@@ -204,20 +213,42 @@ def note_sent_prompt(chat_id: str, text: str, *, owner: str = "") -> None:
     logger.debug("sent-prompt note chat=%s len=%d owner=%s", chat_id[:8], len(text), owner[:8])
 
 
+def note_persisted_prompt(chat_id: str, text: str, *, owner: str) -> None:
+    """A terminal taken back after a restart, its turn open: the turn's
+    prompt has its row, written by the earlier process, whose note went with
+    it. The journal may give the prompt's line back once more (the machine
+    held it while the platform was away), with the preludes the typing
+    added, so it is matched without them, and only by the first prompt line
+    that comes: a later line is another prompt. ``owner`` is the terminal's
+    session id."""
+    if not chat_id or not text or not owner:
+        return
+    with _sent_prompts_lock:
+        _prune_locked(time.time())
+        _sent_prompts.setdefault(chat_id, []).append(
+            _Note(prompt_key(text), time.time(), owner, persisted=True))
+
+
 def consume_sent_prompt(chat_id: str, text: str) -> bool:
     """True exactly once per note for a journaled line whose key matches one
     of the chat's notes (the oldest first) — the caller skips persisting that
-    user row. A line that matches no note leaves every note in place."""
+    user row. A line that matches no note leaves every note in place, but a
+    persisted prompt's note (``note_persisted_prompt``), which only the first
+    line may match."""
     key = typed_key(text)
     with _sent_prompts_lock:
         notes = _sent_prompts.get(chat_id) or []
-        for i, note in enumerate(notes):
-            if note.key == key:
-                del notes[i]
-                if not notes:
-                    _sent_prompts.pop(chat_id, None)
-                logger.debug("sent-prompt consumed chat=%s len=%d", chat_id[:8], len(text))
-                return True
+        loose = prompt_key(text) if any(n.persisted for n in notes) else ""
+        hit = next((i for i, n in enumerate(notes) if n.key == (loose if n.persisted else key)), None)
+        if hit is not None:
+            del notes[hit]
+        # The first prompt line has come: a persisted prompt's note is spent.
+        notes[:] = [n for n in notes if not n.persisted]
+        if not notes:
+            _sent_prompts.pop(chat_id, None)
+        if hit is not None:
+            logger.debug("sent-prompt consumed chat=%s len=%d", chat_id[:8], len(text))
+            return True
         pending = len(notes)
     if pending:
         # A line that matches none of the chat's notes while notes wait is

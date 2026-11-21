@@ -29,8 +29,11 @@ such transport.
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import socket
+import subprocess
+from collections.abc import Callable, Iterable
 from urllib.parse import urlsplit
 
 try:  # what httpx and requests encode hostnames with; absent → the stdlib codec
@@ -46,6 +49,11 @@ _SITE_LOCAL_V6 = ipaddress.ip_network("fec0::/10")
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 #: The schemes a fetch may use; ``require_https`` narrows it to the second.
 _SCHEMES = ("http", "https")
+#: The cloud metadata addresses: never dialled from a sandbox's exit,
+#: whatever a carve says.
+METADATA_ADDRESSES = frozenset({
+    ipaddress.ip_address("169.254.169.254"), ipaddress.ip_address("fd00:ec2::254"),
+})
 
 
 def ipv4_inside(ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
@@ -129,3 +137,76 @@ def validate_outbound_url(url: str, *, require_https: bool = False) -> str | Non
         if ip_blocked(addr):  # type: ignore[arg-type]
             return f"the host {host!r} resolves to a private or internal address ({addr})"
     return None
+
+
+def host_owns(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Whether this host can bind ``ip``: one of its own addresses, on any
+    interface, whatever listens on it."""
+    family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.bind((str(ip), 0))
+    except OSError:
+        return False
+    return True
+
+
+def read_onlink() -> tuple[ipaddress.IPv4Network, ...]:
+    """The host's on-link IPv4 routes less link-local, as the sandbox shim's
+    ``_onlink4`` reads them; empty where ``ip`` is missing (a Mac, Windows).
+    Blocking (a subprocess): run it off the loop."""
+    try:
+        out = subprocess.run(["ip", "-o", "route", "show", "scope", "link"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    nets: list[ipaddress.IPv4Network] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and "/" in parts[0] and not parts[0].startswith("169.254."):
+            with contextlib.suppress(ValueError):
+                net = ipaddress.ip_network(parts[0], strict=False)
+                if isinstance(net, ipaddress.IPv4Network):
+                    nets.append(net)
+    return tuple(nets)
+
+
+def sandbox_dial_refused(
+    address: str, *, carves: Iterable[str] = (), onlink: Iterable[ipaddress.IPv4Network] = (),
+    owns: Callable[[ipaddress.IPv4Address | ipaddress.IPv6Address], bool] = host_owns,
+) -> bool:
+    """The sandbox shim's rule for one address a session's exit would dial
+    from outside the namespace (the compute machine's exit, through the
+    vendored copy): every
+    address that is not publicly routable is refused, and so are the host's
+    own addresses (under pasta the host's address is the namespace's own, so
+    a sandbox reaches none of them: ``owns``) and its on-link subnets
+    (``onlink``, ``read_onlink``'s), but the session's own carves pass;
+    loopback, the metadata addresses and the unspecified address never pass,
+    whatever the carves say. An IPv4-mapped or NAT64 form stands for its
+    IPv4 (a name the session controls can answer one, and the namespace
+    sends the connect as IPv4). Unparseable: refused."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return True
+    if ip.is_loopback or ip in METADATA_ADDRESSES or ip.is_unspecified:
+        return True
+    if address in set(carves):
+        return False
+    v4 = ipv4_inside(ip)
+    if ip_blocked(address) or owns(v4):
+        return True
+    return v4.version == 4 and any(v4 in net for net in onlink)
+
+
+#: The name RFC 6761 reserves for this machine, with every name under it.
+LOOPBACK_NAME = "localhost"
+
+
+def names_this_machine(host: str) -> bool:
+    """``localhost`` and every ``*.localhost`` name: they resolve to
+    loopback, whatever a resolver answers, so a check that lets a proxy
+    resolve a name refuses these first (the gateway's and the exit's)."""
+    name = host.lower().rstrip(".")
+    return name == LOOPBACK_NAME or name.endswith("." + LOOPBACK_NAME)

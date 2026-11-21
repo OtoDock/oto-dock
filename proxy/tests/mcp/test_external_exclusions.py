@@ -18,6 +18,8 @@ _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
+from services.mcp import mcp_session_config
+from services.mcp.outside_picks import NOT_PICKED_REASON, OutsidePicks, ToolPick
 from tests.mcp.test_mcp_broker_activation import (
     _FakeManifest,
     _stub_assembly,
@@ -72,13 +74,29 @@ class TestRule:
         assert reg.session_exclusion_reason(m, contexts={"task", "meeting"}, external=False) \
             == "Excluded in meeting mode"
 
+    def test_the_channels_own_tool_is_admitted_whole(self):
+        """A call's call-control tool counts as picked: the channel adds it."""
+        from services.mcp import mcp_registry as reg
+        picks = OutsidePicks(channel=frozenset({"call-control-mcp"}))
+        assert reg.session_exclusion_reason(_manifest("call-control-mcp"), contexts={"phone"},
+                                            external=True, picks=picks) is None
+        assert reg.session_exclusion_reason(_manifest("call-control-mcp"), contexts={"phone"},
+                                            external=True) == NOT_PICKED_REASON
+
     def test_filter_helper(self):
         from services.mcp import mcp_registry as reg
-        kept = reg.filter_manifests_for_session(
-            [_manifest("memory-mcp"), _manifest("delegation-mcp"), _manifest("x", ["external"])],
-            contexts={"phone"}, external=True,
-        )
-        assert [m.name for m in kept] == ["memory-mcp"]
+        manifests = [_manifest("file-tools"), _manifest("delegation-mcp"), _manifest("x", ["external"]),
+                     _manifest("memory-mcp")]
+        picks = OutsidePicks(tools={"file-tools": ToolPick("read_only")})
+        kept = reg.filter_manifests_for_session(manifests, contexts={"phone"}, external=True, picks=picks)
+        assert [m.name for m in kept] == ["file-tools"]
+        # Without the picks an external filter admits nothing: fail closed.
+        assert reg.filter_manifests_for_session(manifests, contexts={"phone"}, external=True) == []
+        assert reg.session_exclusion_reason(manifests[0], contexts={"phone"}, external=True) == NOT_PICKED_REASON
+        # The memory tool is never offered: the person's memory is read into
+        # the prompt and written after the conversation.
+        assert reg.session_exclusion_reason(manifests[3], contexts={"phone"}, external=True, picks=picks) \
+            == reg.EXTERNAL_DENIED_REASON
 
 
 # ---------------------------------------------------------------------------
@@ -88,20 +106,23 @@ class TestRule:
 class TestSessionConfig:
     def test_external_phone_session_drops_the_management_set(self, monkeypatch, tmp_path):
         from services.mcp import mcp_registry as reg
-        excluded = _build(
-            monkeypatch, tmp_path,
-            [
-                _manifest("memory-mcp"), _manifest("file-tools"),
-                _manifest("schedules-mcp"), _manifest("delegation-mcp"),
-                _manifest("helpdesk", ["external"]), _manifest("display-mcp", ["phone"]),
-            ],
-            phone_mode=True, external=True,
-        )
+        manifests = [
+            _manifest("memory-mcp"), _manifest("file-tools"), _manifest("crm"),
+            _manifest("schedules-mcp"), _manifest("delegation-mcp"),
+            _manifest("helpdesk", ["external"]), _manifest("display-mcp", ["phone"]),
+        ]
+        picks = OutsidePicks(tools={"file-tools": ToolPick("read_write"), "helpdesk": ToolPick("read_only")})
+        excluded = _build(monkeypatch, tmp_path, manifests, phone_mode=True, external=True, outside_picks=picks)
         assert excluded["schedules-mcp"] == reg.EXTERNAL_DENIED_REASON
         assert excluded["delegation-mcp"] == reg.EXTERNAL_DENIED_REASON
+        assert excluded["memory-mcp"] == reg.EXTERNAL_DENIED_REASON
         assert excluded["helpdesk"] == reg.EXTERNAL_CONTEXT_REASON
         assert excluded["display-mcp"] == "Excluded in phone mode"
-        assert "memory-mcp" not in excluded and "file-tools" not in excluded
+        assert excluded["crm"] == NOT_PICKED_REASON
+        assert "file-tools" not in excluded
+        # An external build without the picks attaches nothing.
+        excluded = _build(monkeypatch, tmp_path, manifests, phone_mode=True, external=True)
+        assert excluded["file-tools"] == NOT_PICKED_REASON and excluded["crm"] == NOT_PICKED_REASON
 
     def test_user_tied_phone_session_keeps_them(self, monkeypatch, tmp_path):
         excluded = _build(
@@ -119,6 +140,7 @@ class TestSessionConfig:
         _stub_assembly(monkeypatch, [_manifest("memory-mcp")], env_by_mcp={}, tmp_path=tmp_path)
         extra = _manifest("meetings-mcp")
         monkeypatch.setattr(reg, "get_manifest", lambda n: extra if n == "meetings-mcp" else None)
+        monkeypatch.setattr(mcp_session_config, "get_manifest", lambda n: extra if n == "meetings-mcp" else None)
         _path, _env, excluded, _b, _k = reg.build_session_mcp_config(
             "agent", None, phone_mode=True, external=True, extra_mcps=["meetings-mcp"],
         )
@@ -140,7 +162,7 @@ class TestPromptSide:
         from services.mcp import mcp_registry as reg
         from storage.mcp import mcp_store
         manifests = [
-            _manifest("memory-mcp"), _manifest("schedules-mcp"), _manifest("helpdesk", ["external"]),
+            _manifest("crm"), _manifest("schedules-mcp"), _manifest("helpdesk", ["external"]),
         ]
         for m in manifests:
             m.category = "mcp"
@@ -150,33 +172,44 @@ class TestPromptSide:
             m.skills = [_skill(f"{m.name}-card"), _skill(f"{m.name}-guide", "on_demand")]
             for s in m.skills:
                 (m.mcp_dir / s.file).write_text(f"# {s.id}\nbody\n")
+        from services.mcp import mcp_agent_skills
         monkeypatch.setattr(reg, "get_agent_mcps", lambda *a, **k: manifests)
+        monkeypatch.setattr(mcp_agent_skills, "get_agent_mcps", lambda *a, **k: manifests)
         monkeypatch.setattr(mcp_store, "get_agent_skills", lambda a: [])
         return reg
 
     def test_catalog_skills_and_skill_catalog(self, registry):
         reg = registry
-        catalog = reg.build_available_mcps_section("agent", context="phone", external=True)
-        assert "`memory-mcp`" in catalog
+        picks = OutsidePicks(tools={"crm": ToolPick("read_only")})
+        catalog = reg.build_available_mcps_section("agent", context="phone", external=True, outside_picks=picks)
+        assert "`crm`" in catalog
         assert "schedules-mcp" not in catalog and "helpdesk" not in catalog
+        # Without the picks the catalog of an outside session is empty.
+        assert reg.build_available_mcps_section("agent", context="phone", external=True) == ""
         # Non-external phone sessions keep both.
         assert "schedules-mcp" in reg.build_available_mcps_section("agent", context="phone")
 
-        skills = {sid for sid, _b, _l in reg.get_skills_for_agent("agent", "phone", external=True)}
-        assert skills == {"memory-mcp-card", "memory-mcp-guide"}
-        on_demand = [sid for sid, _d in reg.get_skill_catalog_for_agent("agent", "phone", external=True)]
-        assert on_demand == ["memory-mcp-guide"]
+        skills = {sid for sid, _b, _l in reg.get_skills_for_agent("agent", "phone", external=True,
+                                                                  outside_picks=picks)}
+        assert skills == {"crm-card", "crm-guide"}
+        assert reg.get_skills_for_agent("agent", "phone", external=True) == []
+        on_demand = [sid for sid, _d in reg.get_skill_catalog_for_agent("agent", "phone", external=True,
+                                                                         outside_picks=picks)]
+        assert on_demand == ["crm-guide"]
+        assert reg.get_skill_catalog_for_agent("agent", "phone", external=True) == []
 
     def test_skill_level_external_opt_out(self, registry):
         reg = registry
         manifests = reg.get_agent_mcps("agent")
-        extra = _skill("memory-mcp-humans-only", exclude=["external"])
+        extra = _skill("crm-humans-only", exclude=["external"])
         (manifests[0].mcp_dir / extra.file).write_text("# humans only\nbody\n")
         manifests[0].skills.append(extra)
-        skills = {sid for sid, _b, _l in reg.get_skills_for_agent("agent", "phone", external=True)}
-        assert "memory-mcp-humans-only" not in skills
+        picks = OutsidePicks(tools={"crm": ToolPick("read_only")})
+        skills = {sid for sid, _b, _l in reg.get_skills_for_agent("agent", "phone", external=True,
+                                                                  outside_picks=picks)}
+        assert "crm-humans-only" not in skills and "crm-card" in skills
         skills = {sid for sid, _b, _l in reg.get_skills_for_agent("agent", "phone")}
-        assert "memory-mcp-humans-only" in skills
+        assert "crm-humans-only" in skills
 
 
 class TestUnavailableTools:
@@ -192,12 +225,14 @@ class TestUnavailableTools:
         excluded = {
             "schedules-mcp": reg.EXTERNAL_DENIED_REASON,
             "helpdesk": reg.EXTERNAL_CONTEXT_REASON,
+            "crmx": NOT_PICKED_REASON,
             "crm": "Credentials not configured",
         }
         prompt = config.build_agent_prompt("ext-prompt", excluded_mcps=excluded,
                                            client_type="phone", external=True) or ""
         assert "crm" in prompt and "Credentials not configured" in prompt
         assert "schedules-mcp" not in prompt and "helpdesk" not in prompt
+        assert "crmx" not in prompt and NOT_PICKED_REASON not in prompt
         # A non-external session still lists everything it was told about.
         prompt = config.build_agent_prompt("ext-prompt", excluded_mcps=excluded,
                                            client_type="phone") or ""
@@ -205,33 +240,15 @@ class TestUnavailableTools:
 
 
 # ---------------------------------------------------------------------------
-# Direct manager + shipped manifests + the retired HTTP warmup
+# Shipped manifests + the retired HTTP warmup
 # ---------------------------------------------------------------------------
-
-class TestDirectManager:
-    @pytest.mark.asyncio
-    async def test_rebuild_carries_the_flag(self, monkeypatch):
-        from core.layers.direct.mcp import AgentMCPManager
-        from services.mcp import mcp_registry as reg
-        seen = {}
-
-        def _fake_build(agent, user_sub, **kw):
-            seen.update(kw)
-            return None, {}, {}, {}, set()
-
-        monkeypatch.setattr(reg, "build_session_mcp_config", _fake_build)
-        mgr = AgentMCPManager("agent", phone_mode=True, session_id="s", external=True)
-        await mgr._start_impl()
-        assert seen["external"] is True and seen["phone_mode"] is True
-        # Built into the session's own directory, never the identity's
-        # shared file another session of the agent rewrites.
-        assert seen["session_id"] == "s"
 
 
 SHIPPED_EXTERNAL_OPT_OUTS = [
     "delegation-mcp", "schedules-mcp", "triggers-mcp", "notifications-mcp",
     "meetings-mcp", "agent-config-mcp", "agent-creator-mcp", "mcps-mcp",
-    "ssh-hosts", "phone-mcp", "location-mcp", "display-mcp", "computer-mcp",
+    "ssh-hosts", "phone-mcp", "location-mcp", "display-mcp", "computer-mcp", "memory-mcp",
+    "conversations-mcp",
 ]
 
 
@@ -266,6 +283,9 @@ def test_the_http_warmup_route_is_gone(monkeypatch, temp_db):
     tok = live_session_token("00000000-0000-4000-8000-000000000000", "x")
     r = client.post("/v1/sessions/warmup", json={"model": "x"},
                     headers={"Authorization": f"Bearer {tok}"})
-    # No POST route under that path: the DELETE of ``/v1/sessions/{id}``
-    # answers the method refusal.
-    assert r.status_code == 405
+    # A session's token is refused off its route list before any routing.
+    assert r.status_code == 403 and r.json()["detail"] == "A session's token does not reach this route"
+    # No POST route under that path: the DELETE of ``/v1/sessions/{id}`` is
+    # the only route there.
+    assert not any(getattr(route, "path", "") == "/v1/sessions/warmup"
+                   and "POST" in (getattr(route, "methods", None) or ()) for route in app.routes)

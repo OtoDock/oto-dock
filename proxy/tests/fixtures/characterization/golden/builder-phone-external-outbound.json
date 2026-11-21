@@ -7,17 +7,36 @@
    ],
    "call": "build_session_mcp_config",
    "kwargs": {
+    "call": true,
     "call_ask_back": true,
     "external": true,
     "extra_mcps": [
      "call-control-mcp"
     ],
     "mcp_config_format": "json",
+    "outside_picks": {
+     "channel": [
+      "call-control-mcp"
+     ],
+     "knowledge": [
+      "faq"
+     ],
+     "tools": {
+      "char-files": {
+       "access": "read_write"
+      }
+     }
+    },
     "phone_mode": true,
-    "placement": {},
-    "session_id": "s-phone",
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "session_id": "4f1d2c3b-0000-4000-8000-00000000c411",
+    "shared_chat": true,
     "target_browser": {},
-    "user_role": "viewer"
+    "user_role": "external"
    }
   },
   {
@@ -30,8 +49,9 @@
    ],
    "call": "get_dynamic_contexts",
    "kwargs": {
+    "lookup_mcp_names": [],
     "trigger_payload": null,
-    "user_role": "viewer",
+    "user_role": "external",
     "user_sub": ""
    }
   },
@@ -46,12 +66,30 @@
     "excluded_mcps": null,
     "execution_path": "claude-code-cli",
     "external": true,
-    "external_home": "",
-    "placement": {},
-    "role": "viewer",
+    "external_home": "<agents>/char-agent/externals/phone/_ephemeral/4f1d2c3b-0000-4000-8000-00000000c411",
+    "outside_picks": {
+     "channel": [
+      "call-control-mcp"
+     ],
+     "knowledge": [
+      "faq"
+     ],
+     "tools": {
+      "char-files": {
+       "access": "read_write"
+      }
+     }
+    },
+    "placement": {
+     "kind": "compute",
+     "label": "Compute",
+     "machine_id": "compute-0123456789ab"
+    },
+    "role": "external",
     "sandboxed": true,
-    "skip_http_mcps": false,
-    "user_role": "viewer",
+    "session_id": "4f1d2c3b-0000-4000-8000-00000000c411",
+    "shared_chat": true,
+    "user_role": "external",
     "username": null
    }
   },
@@ -62,9 +100,29 @@
      "config_visible": false,
      "external_channel": "phone",
      "external_claim": "phone:",
+     "external_ephemeral": true,
+     "external_home": "<agents>/char-agent/externals/phone/_ephemeral/4f1d2c3b-0000-4000-8000-00000000c411",
      "is_admin_agent": false,
+     "outside_grants": [
+      [
+       "char-files",
+       null
+      ],
+      [
+       "call-control-mcp",
+       null
+      ]
+     ],
+     "outside_knowledge": [
+      "faq"
+     ],
+     "placement": {
+      "kind": "compute",
+      "label": "Compute",
+      "machine_id": "compute-0123456789ab"
+     },
      "principal": "external",
-     "role": "viewer",
+     "role": "external",
      "session_scope": "agent",
      "username": ""
     }
@@ -85,8 +143,21 @@
    "call": "ensure_persistent_agent_dir",
    "kwargs": {
     "execution_path": "claude-code-cli",
-    "external_home": null,
+    "external_home": "<agents>/char-agent/externals/phone/_ephemeral/4f1d2c3b-0000-4000-8000-00000000c411",
     "no_shell": true,
+    "outside_picks": {
+     "channel": [
+      "call-control-mcp"
+     ],
+     "knowledge": [
+      "faq"
+     ],
+     "tools": {
+      "char-files": {
+       "access": "read_write"
+      }
+     }
+    },
     "scope": "agent",
     "username": ""
    }
@@ -119,12 +190,16 @@
      "execution_path": "claude-code-cli",
      "execution_paths": "",
      "execution_target": "local",
+     "history_retention_days": 0,
      "local_only_engines": "",
      "setup_completed_at": null,
      "slug": "char-agent",
+     "team_account": false,
+     "team_account_floor": "editor",
      "updated_at": "<stamp>"
     },
-    "model": "claude-char-1"
+    "model": "claude-char-1",
+    "sticky_scope": "local:/char/.claude"
    }
   }
  ],
@@ -150,9 +225,29 @@
    "config_visible": false,
    "external_channel": "phone",
    "external_claim": "phone:",
+   "external_ephemeral": true,
+   "external_home": "<agents>/char-agent/externals/phone/_ephemeral/4f1d2c3b-0000-4000-8000-00000000c411",
    "is_admin_agent": false,
+   "outside_grants": [
+    [
+     "char-files",
+     null
+    ],
+    [
+     "call-control-mcp",
+     null
+    ]
+   ],
+   "outside_knowledge": [
+    "faq"
+   ],
+   "placement": {
+    "kind": "compute",
+    "label": "Compute",
+    "machine_id": "compute-0123456789ab"
+   },
    "principal": "external",
-   "role": "viewer",
+   "role": "external",
    "session_scope": "agent",
    "username": ""
   },

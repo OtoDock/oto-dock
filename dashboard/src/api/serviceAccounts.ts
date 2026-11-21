@@ -1,11 +1,9 @@
 /**
- * Per-agent service-account binding hooks.
- *
- * Backs the ``ServiceAccountBindingDropdown`` rendered next to each MCP row
- * in Agent Settings. A binding targets the caller's own
- * ``user_credential_accounts`` row — bind your personal account as the
- * agent's service identity for agent-scope sessions. The owner is always the
- * caller (derived server-side); there is no platform service-account tier.
+ * An agent's own accounts of a tool, the hooks of ``AgentAccounts`` on each
+ * MCP row in Agent Settings, MCPs. Each account is one of a manager's own
+ * connected accounts, added by them (the owner is always the caller, derived
+ * server-side); runs with no person use the default. There is no platform
+ * service-account tier.
  */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -24,19 +22,6 @@ export interface ServiceAccountInstallation {
   admin: boolean
 }
 
-/** The bind's answer: a warning when the installation's first token could
- * not be minted (the binding stands; a session tries again). */
-export interface SetBindingResponse {
-  status: string
-  installation_id?: string
-  repositories?: string[]
-  read_only?: boolean
-  warning?: string
-  /** A new binding of the caller's own account started from the reach the
-   * caller chose for their own chats with the agent (a copy, once). */
-  reach_copied?: boolean
-}
-
 export interface AgentServiceAccountOption {
   label: string
   display_email: string
@@ -50,25 +35,45 @@ export interface AgentServiceAccountOption {
 
 export interface AgentServiceAccountOptionsResponse {
   my_accounts: AgentServiceAccountOption[]
-  current_binding: {
-    label: string
-    owner_sub: string
-    owner_name: string
-    owner_email: string
-    set_by: string
-    set_at: string
-    /** A GitHub App installation as the identity ('' = the account itself). */
-    installation_id?: string
-    installation_account?: string
-    /** The agent's GitHub reach: the repositories it may reach ([] = every one)
-     * and whether it may only read. */
-    repositories?: string[]
-    read_only?: boolean
-    /** Why the binding cannot serve as it is, in the server's words. */
-    problem?: string
-  } | null
-  /** The binding may carry a GitHub reach (the MCP is GitHub). */
+  /** Each account may carry a GitHub reach (the MCP is GitHub). */
   reach_supported?: boolean
+  /** The agent's own accounts of the tool, the default first. */
+  accounts?: AgentServiceSetAccount[]
+}
+
+/** One of the agent's own accounts of a tool. */
+export interface AgentServiceSetAccount {
+  label: string
+  display_email: string
+  owner_sub: string
+  owner_name: string
+  is_default: boolean
+  /** Its owner still manages the agent: the account is in use. */
+  stands: boolean
+  /** The caller's own account. */
+  mine: boolean
+  /** A GitHub App installation the account acts as ('' = the account itself). */
+  installation_id: string
+  installation_account?: string
+  /** A GitHub-App account (lib/kinds/oauthApp.ts): it has repositories to pick from. */
+  kind?: string
+  /** The agent's GitHub reach on this account: the repositories it may reach
+   * ([] = every one) and whether it may only read. */
+  repositories?: string[]
+  read_only?: boolean
+  /** Why the account cannot serve as it is, in the server's words. */
+  problem?: string
+}
+
+/** The answer of a write to the agent's own accounts. */
+export interface ServiceSetResponse {
+  status: string
+  accounts: AgentServiceSetAccount[]
+  /** A new GitHub account started from the reach the caller chose for their
+   * own chats with the agent (a copy, once). */
+  reach_copied?: boolean
+  /** The installation's first token could not be minted (the account stands). */
+  warning?: string
 }
 
 /** One installation's repositories, as the reach picker offers them. */
@@ -109,14 +114,14 @@ export const useAgentServiceRepositories = (
     enabled,
   })
 
-/** Whether the agent's binding last started from the binder's own reach:
- * set by each bind's answer, read by the reach editor's notice. */
-const reachCopiedKey = (agentName: string, mcpName: string) =>
-  ['agent-service-reach-copied', agentName, mcpName]
+/** Whether an account of the agent started from the adder's own reach: set
+ * by the add's answer, read by that account's reach editor's notice. */
+const reachCopiedKey = (agentName: string, mcpName: string, accountLabel: string) =>
+  ['agent-service-reach-copied', agentName, mcpName, accountLabel]
 
-export const useReachCopied = (agentName: string, mcpName: string) =>
+export const useReachCopied = (agentName: string, mcpName: string, accountLabel: string) =>
   useQuery({
-    queryKey: reachCopiedKey(agentName, mcpName),
+    queryKey: reachCopiedKey(agentName, mcpName, accountLabel),
     queryFn: async () => false,
     enabled: false,
   }).data === true
@@ -138,74 +143,110 @@ export const useAgentServiceAccountOptions = (
     enabled: !!agentName && !!mcpName,
   })
 
-interface SetBindingVars {
+interface ServiceSetVars {
   agentName: string
   mcpName: string
   accountLabel: string
-  /** An installation of the account as the identity; '' the account itself;
-   * absent keeps what the binding holds. */
+}
+
+interface AddServiceVars extends ServiceSetVars {
+  /** One of the account's GitHub App installations as the way it acts; '' or
+   * absent the account itself. */
   installationId?: string
-  /** The agent's GitHub reach; absent keeps what the binding holds. */
+}
+
+interface ServiceReachVars extends ServiceSetVars {
+  /** The way the account acts, as the page shows it: the reach is written
+   * only while it still acts so. */
+  installationId: string
+  /** Absent keeps what the account holds. */
   repositories?: string[]
   readOnly?: boolean
 }
 
-export const useSetAgentServiceBinding = () => {
+const serviceSetPath = (vars: ServiceSetVars) =>
+  `/v1/agents/${encodeURIComponent(vars.agentName)}` +
+  `/mcps/${encodeURIComponent(vars.mcpName)}/service-accounts`
+
+function useServiceSetWrite<V extends ServiceSetVars>(
+  request: (vars: V) => Promise<ServiceSetResponse>,
+) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (vars: SetBindingVars): Promise<SetBindingResponse> => {
-      return apiJson<SetBindingResponse>(
-        `/v1/agents/${encodeURIComponent(vars.agentName)}` +
-          `/mcps/${encodeURIComponent(vars.mcpName)}/service-binding`,
-        {
-          method: 'PUT',
-          json: {
-            account_label: vars.accountLabel,
-            ...(vars.installationId !== undefined ? { installation_id: vars.installationId } : {}),
-            ...(vars.repositories !== undefined ? { repositories: vars.repositories } : {}),
-            ...(vars.readOnly !== undefined ? { read_only: vars.readOnly } : {}),
-          },
-        },
-        'Could not set the account',
-      )
-    },
-    onSuccess: (data, vars) => {
-      qc.setQueryData(reachCopiedKey(vars.agentName, vars.mcpName), data.reach_copied === true)
-      return Promise.all([
-        qc.invalidateQueries({
-          queryKey: ['agent-service-account-options', vars.agentName, vars.mcpName],
-        }),
-        // The agent's picker lists what the binding covers.
-        qc.invalidateQueries({ queryKey: eventCatalogKey(vars.mcpName) }),
-      ])
-    },
+    mutationFn: request,
+    onSuccess: (_data, vars: V) => Promise.all([
+      qc.invalidateQueries({
+        queryKey: ['agent-service-account-options', vars.agentName, vars.mcpName],
+      }),
+      qc.invalidateQueries({ queryKey: eventCatalogKey(vars.mcpName) }),
+      // A removal takes the account's event subscriptions with it.
+      qc.invalidateQueries({ queryKey: ['subscriptions'] }),
+    ]),
+    // A refusal often means the list changed under the page (an account
+    // removed or changed meanwhile): show the list as it is now.
+    onError: (_e, vars: V) =>
+      qc.invalidateQueries({ queryKey: ['agent-service-account-options', vars.agentName, vars.mcpName] }),
   })
 }
 
-interface ClearBindingVars {
-  agentName: string
-  mcpName: string
+/** Add one of the caller's own accounts to the agent's own set. */
+export const useAddAgentServiceAccount = () => {
+  const qc = useQueryClient()
+  return useServiceSetWrite((vars: AddServiceVars) => apiJson<ServiceSetResponse>(
+    serviceSetPath(vars),
+    {
+      method: 'PUT',
+      json: {
+        account_label: vars.accountLabel,
+        ...(vars.installationId ? { installation_id: vars.installationId } : {}),
+      },
+    },
+    'Could not add the account',
+  ).then((answer) => {
+    qc.setQueryData(reachCopiedKey(vars.agentName, vars.mcpName, vars.accountLabel), answer.reach_copied === true)
+    return answer
+  }))
 }
 
-export const useClearAgentServiceBinding = () => {
+/** Change the agent's GitHub reach on one of the caller's own accounts. */
+export const useSetAgentServiceReach = () => {
   const qc = useQueryClient()
-  return useMutation({
-    mutationFn: async (vars: ClearBindingVars) => {
-      return apiJson(
-        `/v1/agents/${encodeURIComponent(vars.agentName)}` +
-          `/mcps/${encodeURIComponent(vars.mcpName)}/service-binding`,
-        { method: 'DELETE' },
-        'Could not remove the account',
-      )
+  return useServiceSetWrite((vars: ServiceReachVars) => apiJson<ServiceSetResponse>(
+    `${serviceSetPath(vars)}/reach`,
+    {
+      method: 'PUT',
+      json: {
+        account_label: vars.accountLabel,
+        installation_id: vars.installationId,
+        ...(vars.repositories !== undefined ? { repositories: vars.repositories } : {}),
+        ...(vars.readOnly !== undefined ? { read_only: vars.readOnly } : {}),
+      },
     },
-    onSuccess: (_data, vars) => {
-      qc.setQueryData(reachCopiedKey(vars.agentName, vars.mcpName), false)
-      return Promise.all([
-        qc.invalidateQueries({
-          queryKey: ['agent-service-account-options', vars.agentName, vars.mcpName],
-        }),
-        qc.invalidateQueries({ queryKey: eventCatalogKey(vars.mcpName) }),
-      ])
-    },
-  })
+    'Could not change the repositories',
+  ).then((answer) => {
+    // The reach is the manager's own now: the copy's notice goes.
+    qc.setQueryData(reachCopiedKey(vars.agentName, vars.mcpName, vars.accountLabel), false)
+    return answer
+  }))
+}
+
+/** Make one of the agent's own accounts its default. */
+export const useSetAgentServiceDefault = () =>
+  useServiceSetWrite((vars: ServiceSetVars) => apiJson<ServiceSetResponse>(
+    `${serviceSetPath(vars)}/default`,
+    { method: 'PUT', json: { account_label: vars.accountLabel } },
+    'Could not change the default account',
+  ))
+
+/** Take one account out of the agent's own set. */
+export const useRemoveAgentServiceAccount = () => {
+  const qc = useQueryClient()
+  return useServiceSetWrite((vars: ServiceSetVars) => apiJson<ServiceSetResponse>(
+    `${serviceSetPath(vars)}?${new URLSearchParams({ account_label: vars.accountLabel }).toString()}`,
+    { method: 'DELETE' },
+    'Could not remove the account',
+  ).then((answer) => {
+    qc.setQueryData(reachCopiedKey(vars.agentName, vars.mcpName, vars.accountLabel), false)
+    return answer
+  }))
 }

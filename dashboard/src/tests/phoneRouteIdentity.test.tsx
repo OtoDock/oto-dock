@@ -1,6 +1,7 @@
 /**
- * Route identity UI (RouteModal + routes table): the two identity modes,
- * the tied-user picker with its PIN advisory, the remember-callers toggle
+ * Route identity UI (RouteModal + routes table): the identity modes (the
+ * agent's own line has its own file, phoneRouteAgentLine.test.tsx), the
+ * tied-user picker with its PIN advisory, the remember-callers toggle
  * (callers are always viewers — no role control), the MCP preview, the
  * server-computed warnings surfaced on save and in the table, and the
  * acknowledgement a user-mode inbound route needs to save without a PIN.
@@ -39,6 +40,7 @@ const ADMIN_NOTE = 'Alice is a platform admin on an admin-only agent; calls run 
 
 function mockApi(routes: unknown[], opts: {
   engine?: string; saveResponse?: Record<string, unknown>; pinDeleteResponse?: Record<string, unknown>
+  sharedOnly?: boolean
 } = {}) {
   fetchSpy.mockImplementation(async (path: string, init?: RequestInit) => {
     const ok = (body: unknown) => ({ ok: true, json: async () => body }) as Response
@@ -55,7 +57,8 @@ function mockApi(routes: unknown[], opts: {
       return ok({ users: [{ sub: 'u-alice', name: 'Alice', email: 'alice@x', role: 'editor' }] })
     }
     if (path.startsWith('/v1/agents')) {
-      return ok({ agents: [{ name: 'assistant', execution_path: opts.engine ?? 'claude-code-cli' }] })
+      return ok({ agents: [{ name: 'assistant', execution_path: opts.engine ?? 'claude-code-cli',
+        ...(opts.sharedOnly ? { collaborative: false, default_scope: 'agent' } : {}) }] })
     }
     if (path.startsWith('/v1/triggers')) return ok({ triggers: [] })
     return ok({})
@@ -110,11 +113,13 @@ describe('route identity', () => {
     await openEdit()
     const group = screen.getByRole('radiogroup', { name: 'Caller identity' })
     expect((within(group).getByRole('radio', { name: /Per caller/ }) as HTMLInputElement).checked).toBe(true)
-    // Callers are always viewers: no role control anywhere in the form.
+    // Callers are always external identities: no role control anywhere in the form.
     expect(screen.queryByLabelText('Role on the agent')).not.toBeInTheDocument()
     expect(screen.queryByText(/Editor|Manager —/)).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'About Per caller, recommended' }), { detail: 0 })
-    expect(screen.getByRole('tooltip')).toHaveTextContent(/Callers read the agent's shared files as viewers/)
+    expect(screen.getByRole('tooltip')).toHaveTextContent(
+      "Each phone number gets its own private notes and files. Each caller is an external identity and gets only the tools a manager picks in the agent's settings.")
+    expect(screen.getByRole('tooltip')).not.toHaveTextContent(/viewer|shared space/)
     expect(screen.getByText('Remember callers')).toBeInTheDocument()
     expect(screen.queryByLabelText('Platform user')).not.toBeInTheDocument()
     // The preview names what reaches the line and what never does.
@@ -123,6 +128,17 @@ describe('route identity', () => {
     expect(preview).toHaveTextContent('Not on calls: Schedules')
     expect(fetchSpy.mock.calls.some(([p]) =>
       String(p).startsWith('/v1/admin/phone/routes/mcp-preview?') && String(p).includes('identity_mode=caller'))).toBe(true)
+  })
+
+  it('drops the private folder sentence for a Shared-only agent, from the list the tab loads', async () => {
+    mockApi([makeRoute()], { sharedOnly: true })
+    renderTab()
+    await openEdit()
+    await waitFor(() => expect(fetchSpy.mock.calls.some(([p]) => String(p).startsWith('/v1/agents'))).toBe(true))
+    fireEvent.click(screen.getByRole('button', { name: 'About Per caller, recommended' }), { detail: 0 })
+    await waitFor(() => expect(screen.getByRole('tooltip')).toHaveTextContent(
+      /^Each caller is an external identity and gets only the tools a manager picks in the agent's settings\.$/))
+    expect(screen.getByRole('tooltip')).not.toHaveTextContent(/private notes|shared space/)
   })
 
   it('a user-tied route shows the attached-user picker, the PIN advisory, and hides remember-callers', async () => {
@@ -153,12 +169,13 @@ describe('route identity', () => {
     })
   })
 
-  it('offers exactly two identities — per caller and a platform user', async () => {
+  it('offers exactly three identities: per caller, a platform user, the agent itself', async () => {
     mockApi([makeRoute()])
     renderTab()
     await openEdit()
     const group = screen.getByRole('radiogroup', { name: 'Caller identity' })
-    expect(within(group).getAllByRole('radio')).toHaveLength(2)
+    expect(within(group).getAllByRole('radio')).toHaveLength(3)
+    expect(within(group).getByRole('radio', { name: /The agent itself/ })).toBeInTheDocument()
     expect(within(group).queryByLabelText(/^Shared/)).not.toBeInTheDocument()
   })
 

@@ -9,7 +9,8 @@ per-monitor bounds clamp (:func:`geometry.clamp_to_monitor`).
 
 Coordinates arriving from the model are in the **model image space** of a
 screenshot of some ``display``; the server resolves that display's
-``(monitor, scale)`` (see :func:`screen.resolve_target`) and passes it in, and
+``(monitor, scale)`` (``steps._run_locked``, from the layout read once per
+call) and passes it in, and
 we convert to a global OS coordinate via :func:`geometry.model_to_input_coords`
 before every move/click/drag.
 
@@ -20,12 +21,28 @@ tool, and are mapped to PyAutoGUI's names by :data:`KEY_MAP`.
 
 from __future__ import annotations
 
+import contextlib
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import geometry
+import screen
 from environment import DeviceUnavailable, os_kind
 
 _pyautogui = None
+
+# What this module pressed down and has not released yet, recorded BEFORE the
+# event goes out: a stop or an exception releases exactly these
+# (:func:`release_held`), and nothing when nothing is held.
+_held_keys: list[str] = []
+_held_buttons: list[str] = []
+
+# Key-by-key text goes in chunks of this many characters, with the runner asked
+# between chunks whether to go on: a dialog that takes the keys mid-word gets
+# at most this many of them (the proof on a virtual screen: ten went into a
+# dialog that opened after the first one).
+TYPE_CHUNK = 3
 
 
 def _gui():
@@ -35,6 +52,7 @@ def _gui():
     global _pyautogui
     if _pyautogui is not None:
         return _pyautogui
+    screen.ensure_dpi_aware()  # before pyautogui's import sets an awareness of its own
     try:
         import pyautogui
     except Exception as e:  # display connection / backend import failure
@@ -135,6 +153,57 @@ def _to_input(model_x: float, model_y: float, monitor: geometry.Monitor, scale: 
     return int(round(gx)), int(round(gy))
 
 
+# --- held keys and buttons -------------------------------------------------
+
+def _key_down(g, key: str) -> None:
+    _held_keys.append(key)
+    g.keyDown(key)
+
+
+def _key_up(g, key: str) -> None:
+    g.keyUp(key)
+    if key in _held_keys:
+        _held_keys.remove(key)   # only once it is up: a failed release stays recorded
+
+
+def _release(g, keys: list[str]) -> None:
+    """Release ``keys`` in reverse order, each in its own ``try``."""
+    errors: list[BaseException] = []
+    for k in reversed(keys):
+        try:
+            _key_up(g, k)
+        except Exception as e:  # noqa: BLE001  # every key gets its release attempt
+            errors.append(e)
+    if errors:
+        raise errors[0]
+
+
+def held() -> tuple[list[str], list[str]]:
+    return list(_held_keys), list(_held_buttons)
+
+
+def release_held() -> None:
+    """Release whatever is still recorded as held (an exception mid-step, a
+    signal). Sends nothing when nothing is held. Never raises."""
+    if not (_held_keys or _held_buttons):
+        return
+    g = _pyautogui
+    for k in reversed(list(_held_keys)):
+        try:
+            if g is not None:
+                g.keyUp(k)
+        except Exception:  # noqa: BLE001  # a release must never stop the next one
+            pass
+    for b in reversed(list(_held_buttons)):
+        try:
+            if g is not None:
+                g.mouseUp(button=b)
+        except Exception:  # noqa: BLE001  # a release must never stop the next one
+            pass
+    _held_keys.clear()
+    _held_buttons.clear()
+
+
 # --- actions ---------------------------------------------------------------
 
 def cursor_position() -> tuple[int, int]:
@@ -151,71 +220,67 @@ def move_to(model_x, model_y, monitor, scale, *, duration: float = 0.0):
     return x, y
 
 
+def _click_at(g, x, y, *, button, clicks, modifiers):
+    mods: list[str] = []
+    try:
+        for m in modifiers or []:
+            _key_down(g, m)
+            mods.append(m)
+        # pyautogui sleeps ``interval`` after every click, the last one too:
+        # only a double or triple click needs it.
+        interval = 0.05 if clicks > 1 else 0.0
+        if x is None:
+            g.click(clicks=clicks, button=button, interval=interval)
+        else:
+            g.click(x=x, y=y, clicks=clicks, button=button, interval=interval)
+    finally:
+        _release(g, mods)
+
+
 def click(model_x, model_y, monitor, scale, *, button="left", clicks=1, modifiers=None):
     g = _gui()
     x, y = _to_input(model_x, model_y, monitor, scale)
-    mods = modifiers or []
-    for m in mods:
-        g.keyDown(m)
-    try:
-        g.click(x=x, y=y, clicks=clicks, button=button, interval=0.05)
-    finally:
-        for m in reversed(mods):
-            g.keyUp(m)
+    _click_at(g, x, y, button=button, clicks=clicks, modifiers=modifiers)
     return x, y
 
 
 def click_current(*, button="left", clicks=1, modifiers=None):
     """Click at the CURRENT cursor position (no coordinate supplied)."""
     g = _gui()
-    mods = modifiers or []
-    for m in mods:
-        g.keyDown(m)
-    try:
-        g.click(clicks=clicks, button=button, interval=0.05)
-    finally:
-        for m in reversed(mods):
-            g.keyUp(m)
+    _click_at(g, None, None, button=button, clicks=clicks, modifiers=modifiers)
     p = g.position()
     return int(p[0]), int(p[1])
 
 
 def drag(end_x, end_y, monitor, scale, *, start=None, button="left", duration: float = 0.4):
     """Press at ``start`` (model coords, or current cursor if None), move to the
-    end coordinate with the button held, release."""
+    end coordinate with the button held, release. pyautogui's ``dragTo``
+    releases the button only when it succeeds, so a failure releases it here."""
     g = _gui()
     if start is not None:
         sx, sy = _to_input(start[0], start[1], monitor, scale)
         g.moveTo(sx, sy, duration=0.0)
     ex, ey = _to_input(end_x, end_y, monitor, scale)
-    g.dragTo(ex, ey, duration=max(0.05, duration), button=button)
+    _held_buttons.append(button)
+    try:
+        g.dragTo(ex, ey, duration=max(0.05, duration), button=button)
+    except BaseException:
+        g.mouseUp(button=button)
+        _held_buttons.remove(button)   # only once it is up: a failed release stays recorded
+        raise
+    _held_buttons.remove(button)
     return ex, ey
-
-
-def mouse_down(model_x, model_y, monitor, scale, *, button="left"):
-    g = _gui()
-    if model_x is not None and model_y is not None:
-        x, y = _to_input(model_x, model_y, monitor, scale)
-        g.moveTo(x, y, duration=0.0)
-    g.mouseDown(button=button)
-
-
-def mouse_up(model_x, model_y, monitor, scale, *, button="left"):
-    g = _gui()
-    if model_x is not None and model_y is not None:
-        x, y = _to_input(model_x, model_y, monitor, scale)
-        g.moveTo(x, y, duration=0.0)
-    g.mouseUp(button=button)
 
 
 def scroll(direction: str, amount: int, model_x=None, model_y=None, monitor=None, scale=None):
     """Scroll ``amount`` clicks in ``direction`` (up/down/left/right). Moves to
     the coordinate first when supplied (so the scroll lands over the right
-    pane)."""
+    pane), and returns that point (``None`` when it did not move)."""
     g = _gui()
+    point = None
     if model_x is not None and model_y is not None and monitor is not None and scale is not None:
-        x, y = _to_input(model_x, model_y, monitor, scale)
-        g.moveTo(x, y, duration=0.0)
+        point = _to_input(model_x, model_y, monitor, scale)
+        g.moveTo(point[0], point[1], duration=0.0)
     d = (direction or "down").strip().lower()
     amt = abs(int(amount))
     if d == "up":
@@ -229,109 +294,111 @@ def scroll(direction: str, amount: int, model_x=None, model_y=None, monitor=None
         hscroll(amt if d == "right" else -amt)
     else:
         raise ValueError(f"scroll_direction must be up/down/left/right, got {direction!r}.")
+    return point
 
 
 def press_keys(combo: str):
-    """Press an xdotool key combo (``ctrl+s``, ``Return``) once."""
+    """Press an xdotool key combo (``ctrl+s``, ``Return``) once. The keys go
+    down in order and come up in reverse in ``finally`` (pyautogui's
+    ``hotkey`` releases nothing when a key fails)."""
     g = _gui()
     keys = parse_key_combo(combo)
-    if len(keys) == 1:
-        g.press(keys[0])
-    else:
-        g.hotkey(*keys)
-
-
-def hold_keys(combo: str, duration: float):
-    """Hold an xdotool key combo down for ``duration`` seconds, then release."""
-    g = _gui()
-    keys = parse_key_combo(combo)
-    dur = max(0.0, min(float(duration), 30.0))
-    for k in keys:
-        g.keyDown(k)
+    down: list[str] = []
     try:
-        time.sleep(dur)
+        for k in keys:
+            _key_down(g, k)
+            down.append(k)
     finally:
-        for k in reversed(keys):
-            g.keyUp(k)
+        _release(g, down)
 
 
-def type_text(text: str):
-    """Type literal ``text``. ASCII goes through pyautogui's keystroke path;
-    anything non-ASCII (accents, CJK, emoji — which pyautogui's US-keycode
-    mapping can't produce) is delivered via a clipboard paste, since synthesizing
-    arbitrary Unicode keystrokes is unreliable. IME / dead-key composition is not
-    supported. Returns a short note describing the method used."""
+def hold_keys(combo: str, duration: float, *, wait: Callable[[float], object] = time.sleep):
+    """Hold an xdotool key combo down for ``duration`` seconds, then release.
+    ``wait`` is the runner's sleep, which ends early on a cancel."""
+    g = _gui()
+    keys = parse_key_combo(combo)
+    dur = max(0.0, float(duration))
+    down: list[str] = []
+    try:
+        for k in keys:
+            _key_down(g, k)
+            down.append(k)
+        wait(dur)
+    finally:
+        _release(g, down)
+
+
+_PASTED_KEYS = ("\n", "\r", "\t")
+
+
+def types_through_clipboard(text: str) -> bool:
+    """Text goes in one paste through the clipboard when it is not ASCII
+    (accents, Greek, CJK, emoji: pyautogui's US-keycode mapping cannot produce
+    them) or holds a line break or a tab, which typed key by key would press
+    Enter or Tab in the middle of the text."""
+    return not text.isascii() or any(k in text for k in _PASTED_KEYS)
+
+
+@dataclass
+class Typed:
+    summary: str
+    typed: int
+    stopped: str | None = None   # the reason it stopped between chunks
+
+
+def type_text(text: str, *, between: Callable[[], str | None] | None = None,
+              copy: Callable[[str], object] | None = None) -> Typed:
+    """Type literal ``text``. Plain ASCII goes through pyautogui's keystroke
+    path in chunks of :data:`TYPE_CHUNK` characters, and ``between()`` is asked
+    after each chunk whether to go on (a reason string stops it there). The
+    rest (:func:`types_through_clipboard`) is delivered via one clipboard paste,
+    written by ``copy`` (the runner's bounded write) or by pyperclip. IME /
+    dead-key composition is not supported. The summary gives counts, never the
+    text."""
     g = _gui()
     if text == "":
-        return "typed empty string"
-    if text.isascii():
-        g.write(text, interval=0.01)
-        return f"typed {len(text)} characters"
-    # Non-ASCII -> clipboard paste (clobbers the clipboard; documented).
+        return Typed("typed empty string", 0)
+    if not types_through_clipboard(text):
+        typed = 0
+        try:
+            while typed < len(text):
+                chunk = text[typed:typed + TYPE_CHUNK]
+                g.write(chunk, interval=0.01)
+                typed += len(chunk)
+                if typed < len(text) and between is not None:
+                    reason = between()
+                    if reason:
+                        return Typed(f"typed {typed} of {len(text)} characters", typed, reason)
+        except BaseException:
+            # pyautogui presses Shift around a capital itself, with no finally.
+            with contextlib.suppress(Exception):
+                g.keyUp("shift")
+            raise
+        return Typed(f"typed {len(text)} characters", len(text))
     try:
-        import pyperclip
+        if copy is not None:
+            copy(text)
+        else:
+            import pyperclip
 
-        pyperclip.copy(text)
+            pyperclip.copy(text)
     except Exception as e:
         raise DeviceUnavailable(
-            "Non-ASCII text needs a clipboard, which is unavailable "
+            "This text goes in through the clipboard, which is unavailable "
             "(install xclip/xsel on Linux). "
-            f"({type(e).__name__}: {e})"
+            f"({type(e).__name__})"
         ) from e
-    paste = "command" if os_kind() == "darwin" else "ctrl"
-    g.hotkey(paste, "v")
-    return f"pasted {len(text)} characters via clipboard (non-ASCII)"
+    press_keys("command+v" if os_kind() == "darwin" else "ctrl+v")
+    return Typed(f"pasted {len(text)} characters via clipboard", len(text))
 
 
-# --- platform edge detection ----------------------------------------------
+def clipboard_text() -> str:
+    import pyperclip
 
-def foreground_window_elevated() -> bool | None:
-    """Windows-only best-effort: is the foreground window owned by an elevated
-    (higher-integrity) process the non-elevated satellite can't drive (UAC /
-    "Run as administrator")? Returns ``True`` / ``False`` when determinable,
-    ``None`` otherwise (non-Windows, or any probe failure). Used to attach a
-    hint when a click on such a window would silently no-op (UIPI)."""
-    if os_kind() != "windows":
-        return None
-    try:
-        import ctypes.wintypes
+    return pyperclip.paste()
 
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        advapi32 = ctypes.windll.advapi32
 
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return None
-        pid = ctypes.wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if not pid.value:
-            return None
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
-        if not h:
-            # Access denied opening the process is itself a strong signal it is
-            # higher-integrity than us.
-            return True
-        try:
-            TOKEN_QUERY = 0x0008
-            token = ctypes.wintypes.HANDLE()
-            if not advapi32.OpenProcessToken(h, TOKEN_QUERY, ctypes.byref(token)):
-                return None
-            try:
-                TokenElevation = 20
-                elevation = ctypes.wintypes.DWORD()
-                ret_len = ctypes.wintypes.DWORD()
-                ok = advapi32.GetTokenInformation(
-                    token, TokenElevation, ctypes.byref(elevation),
-                    ctypes.sizeof(elevation), ctypes.byref(ret_len),
-                )
-                if not ok:
-                    return None
-                return bool(elevation.value)
-            finally:
-                kernel32.CloseHandle(token)
-        finally:
-            kernel32.CloseHandle(h)
-    except Exception:  # noqa: BLE001  # ctypes calls into win32 raise whatever the bridge does
-        return None
+def set_clipboard_text(value: str) -> None:
+    import pyperclip
+
+    pyperclip.copy(value)

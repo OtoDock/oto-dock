@@ -1,9 +1,16 @@
-"""Permission-state lifecycle across the three local layers.
+"""Permission-state lifecycle of the sessions the proxy holds itself (Direct
+LLM's).
 
-The mode + security context are registered BEFORE the spawn (so the session
-JWT minted into the process env can carry the external claim), dropped again
-when the spawn fails, and dropped when the session closes — a session token
-must not find a live context once its session is gone.
+The mode + security context are registered BEFORE the session's tools start
+(so the session JWT minted into their env can carry the external claim),
+dropped again when the start fails, and dropped when the session closes — a
+session token must not find a live context once its session is gone.
+
+A session on a machine: ``tests/session/test_session_liveness.py``
+(registered before the payload, dropped on a failure),
+``tests/remote/test_chat_reload.py`` (the remote layer's close takes the
+context) and ``tests/remote/test_machine_sessions.py`` (a terminal's close
+forgets it).
 """
 
 from __future__ import annotations
@@ -28,24 +35,14 @@ def _config() -> AgentConfig:
                        security_context=_ctx(), sandbox_host_claude_dir="/tmp/x")
 
 
-LAYERS = ["cli", "codex", "direct"]
-
-
-def _layer(kind):
-    if kind == "cli":
-        from core.layers.cli.layer import CLIExecutionLayer
-        return CLIExecutionLayer()
-    if kind == "codex":
-        from core.layers.codex.layer import CodexCLIExecutionLayer
-        return CodexCLIExecutionLayer()
+def _layer():
     from core.layers.direct.layer import DirectLLMExecutionLayer
     return DirectLLMExecutionLayer()
 
 
-@pytest.mark.parametrize("kind", LAYERS)
 @pytest.mark.asyncio
-async def test_registered_before_spawn_and_kept_on_success(kind, monkeypatch):
-    layer = _layer(kind)
+async def test_registered_before_the_start_and_kept_on_success(monkeypatch):
+    layer = _layer()
     sid = str(uuid.uuid4())
     seen = {}
 
@@ -63,14 +60,13 @@ async def test_registered_before_spawn_and_kept_on_success(kind, monkeypatch):
         session_state.cleanup_session_permission_state(sid)
 
 
-@pytest.mark.parametrize("kind", LAYERS)
 @pytest.mark.asyncio
-async def test_failed_spawn_drops_the_registration(kind, monkeypatch):
-    layer = _layer(kind)
+async def test_a_failed_start_drops_the_registration(monkeypatch):
+    layer = _layer()
     sid = str(uuid.uuid4())
 
     async def _boom(session_id, config):
-        raise RuntimeError("spawn failed")
+        raise RuntimeError("start failed")
 
     monkeypatch.setattr(layer, "_start_session_impl", _boom)
     with pytest.raises(RuntimeError):
@@ -79,14 +75,13 @@ async def test_failed_spawn_drops_the_registration(kind, monkeypatch):
     assert sid not in session_state._session_modes
 
 
-@pytest.mark.parametrize("kind", LAYERS)
 @pytest.mark.asyncio
-async def test_close_drops_the_registration(kind):
-    layer = _layer(kind)
+async def test_close_drops_the_registration():
+    layer = _layer()
     sid = str(uuid.uuid4())
     session_state.register_session_state(sid, "auto", _ctx())
     assert session_state.get_session_security(sid) is not None
-    # No process exists for this id — every close step is a no-op except the
+    # No session exists for this id — every close step is a no-op except the
     # permission-state cleanup, which is what this pins.
     await layer.close_session(sid)
     assert session_state.get_session_security(sid) is None

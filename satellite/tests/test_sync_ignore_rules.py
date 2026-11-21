@@ -294,3 +294,26 @@ def test_matcher_cache_swaps_on_table_change(tmp_path):
     snap2 = snapshot_agent_dir(tmp_path)
     # CACHEDIR.TAG marker gone from the slim table → target/ visible again.
     assert any(p.startswith("workspace/proj/target/") for p in snap2)
+
+
+def test_a_pipe_at_a_cache_tag_reads_as_no_marker_and_never_holds_the_scan(tmp_path):
+    """The tag is read as a listed file is: a pipe in its place is no
+    marker, and the scan never waits on it."""
+    import contextlib
+    import os
+    import threading
+    _apply_rules()
+    cache = tmp_path / "workspace" / "proj" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "x.txt").write_text("x")
+    os.mkfifo(cache / "CACHEDIR.TAG")
+    out: dict = {}
+    t = threading.Thread(target=lambda: out.setdefault("snap", snapshot_agent_dir(tmp_path)), daemon=True)
+    t.start()
+    t.join(15)
+    waited = t.is_alive()
+    with contextlib.suppress(OSError):
+        os.close(os.open(cache / "CACHEDIR.TAG", os.O_WRONLY | os.O_NONBLOCK))
+    t.join(5)
+    assert not waited, "the scan waited on a pipe"
+    assert set(out["snap"]) == {"workspace/proj/cache/x.txt"}

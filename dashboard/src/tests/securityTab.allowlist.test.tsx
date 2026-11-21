@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   entries: [] as unknown[],
 }))
 
+vi.mock('@/pages/admin/ApiKeysCard', () => ({ default: () => null }))
 vi.mock('@/api/auth', () => ({ apiFetch: vi.fn(async () => ({ ok: true, json: async () => ({}) })) }))
 vi.mock('@/api/oauth', () => ({
   useBearerAllowlist: () => ({ isLoading: false, data: h.entries }),
@@ -32,8 +33,11 @@ vi.mock('@/api/oauth', () => ({
   useRemoveBearerAllowlist: () => ({ mutateAsync: h.remove, isPending: false }),
   useRemoveAdminBearerRows: () => ({ mutateAsync: h.removeAdmin, isPending: false }),
 }))
+// One object for every render, as the query's cached data is: the tab fills
+// its form from a new object, so a fresh one per render would never settle.
+const settings = vi.hoisted(() => ({ forced_keys: [] as string[] }))
 vi.mock('@/pages/admin/PlatformPage.hooks', () => ({
-  usePlatformSettings: () => ({ data: { forced_keys: [] }, isLoading: false }),
+  usePlatformSettings: () => ({ data: settings, isLoading: false }),
   useSavePlatformSettings: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false }),
 }))
 

@@ -21,18 +21,23 @@
  */
 import { useEffect, useState, type CSSProperties, type KeyboardEvent, type ReactNode, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
+import { Link } from 'react-router-dom'
 
 import {
   accountsStayFor, leavesOffline, moveMemoryOf, useAgentRunTargets, useChatTargets, useMoveChat,
   type ChatTargets, type MoveProgress, type RunTarget,
 } from '../../api/remoteMachines'
+import { useExecutionLayers } from '../../api/agents'
 import { MOVE_PHASE } from '../../api/wireEvents'
+import { useFlag } from '../../hooks/useFlag'
 import { usePortalMenu } from '../../hooks/usePortalMenu'
+import { runsRemote } from '../../lib/engines'
 import { toastError } from '../../lib/http/apiJson'
 import { isLocalTarget } from '../../lib/placement'
 import { MACHINE_STATE } from '../../lib/status/machine'
 import { dotColorClass } from '../remoteBadgeDot'
-import { POPOVER } from '../ui/classes'
+import { userSettingsPath } from '../settings/sections'
+import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, POPOVER } from '../ui/classes'
 import MoveChatConfirm from './MoveChatConfirm'
 
 interface Props {
@@ -181,6 +186,7 @@ function NewChatPill({ agentName, engine, picked, disabledReason, onPick }: {
   onPick?: (target: string, isDefault: boolean) => void
 }) {
   const { data } = useAgentRunTargets(agentName, undefined, undefined, engine || undefined)
+  const { data: layers } = useExecutionLayers()
   const { open, buttonRef, panelRef, style, portalRoot, toggle, close, onKeyDown } = usePortalMenu(PLACE_MENU)
   // A pick the menu no longer offers (the computer was removed, or personal
   // computers were turned off) is dropped: the chat starts at the default.
@@ -221,6 +227,7 @@ function NewChatPill({ agentName, engine, picked, disabledReason, onPick }: {
           onKeyDown={onKeyDown}
           targets={rows}
           busy={false}
+          pairHint={!engine || runsRemote(layers?.[engine])}
           onPick={(t) => { close(); onPick(t.target, t.target === data.default_target) }}
         />,
         portalRoot,
@@ -284,8 +291,16 @@ function NotePanel({ panelRef, style, onKeyDown, lines }: {
   )
 }
 
-/** A pill with no menu: its title on hover, its note on a click or a tap. */
-function PlaceNote({ lines, className, children }: { lines: string[]; className: string; children: ReactNode }) {
+/** A pill with no menu: its title on hover, its note on a click or a tap.
+ *  `disabled` gives it the busy look (the pill's `aria-disabled` styles): the
+ *  status bar's mode button takes it while a turn runs on a live terminal. */
+export function PlaceNote({ lines, className, children, testId = 'runs-on-chip', disabled = false }: {
+  lines: string[]
+  className: string
+  children: ReactNode
+  testId?: string
+  disabled?: boolean
+}) {
   const { open, buttonRef, panelRef, style, portalRoot, toggle, onKeyDown } = usePortalMenu(PLACE_MENU)
   const shown = lines.filter(Boolean)
   const title = shown.join('. ')
@@ -298,7 +313,8 @@ function PlaceNote({ lines, className, children }: { lines: string[]; className:
         title={title}
         aria-label={title}
         aria-expanded={open}
-        data-testid="runs-on-chip"
+        aria-disabled={disabled || undefined}
+        data-testid={testId}
         className={className}
       >
         {children}
@@ -312,15 +328,21 @@ function PlaceNote({ lines, className, children }: { lines: string[]; className:
 }
 
 /** The places as a menu panel: the current one checked, the default marked,
- *  a place that cannot be picked disabled with the server's sentence. */
-function PlacesPanel({ panelRef, style, onKeyDown, targets, busy, onPick }: {
+ *  a place that cannot be picked disabled with the server's sentence. With
+ *  no computer to pick (``pairHint``: the chat's engine runs on one), a
+ *  sentence and a button to the page where a person pairs their own. */
+function PlacesPanel({ panelRef, style, onKeyDown, targets, busy, onPick, pairHint = true }: {
   panelRef: RefObject<HTMLDivElement | null>
   style: CSSProperties
   onKeyDown: (e: KeyboardEvent<HTMLElement>) => void
   targets: (RunTarget & { is_current: boolean })[]
   busy: boolean
   onPick: (t: RunTarget) => void
+  pairHint?: boolean
 }) {
+  const machinesOn = useFlag('remote_machines_available')
+  const pairingOn = useFlag('allow_user_paired_machines')
+  const noMachine = pairHint && machinesOn && pairingOn && targets.every((t) => isLocalTarget(t.target))
   return (
     <div
       ref={panelRef}
@@ -374,6 +396,15 @@ function PlacesPanel({ panelRef, style, onKeyDown, targets, busy, onPick }: {
           </button>
         )
       })}
+      {noMachine && (
+        <div className="px-3 pt-2 pb-1 border-t border-subtle">
+          <p className="text-tertiary">To run chats on your own computer, pair it in User Settings, Remote Machines.</p>
+          <Link role="menuitem" to={userSettingsPath('remote-machines')}
+                className={`${BUTTON_BASE} ${BUTTON_VARIANT.primary} ${BUTTON_SIZE.xs} mt-2`}>
+            Pair your computer
+          </Link>
+        </div>
+      )}
     </div>
   )
 }
@@ -461,15 +492,16 @@ export function ChatTargetsMenu({ chatId, data, disabled, title, ariaLabel, note
   )
 }
 
-/** The chat runs on someone else's computer: read-only for this person,
- *  the server's sentence above the composer. */
+/** Why this person cannot write in the chat now (it runs on someone else's
+ *  computer, a call writes in it): the server's sentence, nearest the
+ *  composer in the banner stack. */
 export function ChatLockNotice({ sentence }: { sentence: string }) {
   if (!sentence) return null
   return (
     <div
       role="status"
       data-testid="chat-lock-notice"
-      className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-control border border-status-info-border bg-status-info-bg text-status-info-fg"
+      className="w-full px-3 py-2 text-xs rounded-control border border-status-info-border bg-status-info-bg text-status-info-fg"
     >
       {sentence}
     </div>

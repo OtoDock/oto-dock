@@ -1,0 +1,38 @@
+[
+ [
+  "''",
+  null
+ ],
+ [
+  "None",
+  null
+ ],
+ [
+  "'owner'",
+  null
+ ],
+ [
+  "'editor'",
+  null
+ ],
+ [
+  "'workspace'",
+  null
+ ],
+ [
+  "'manager'",
+  "must be one of owner, editor, workspace"
+ ],
+ [
+  "'Owner'",
+  "must be one of owner, editor, workspace"
+ ],
+ [
+  "3",
+  "must be one of owner, editor, workspace"
+ ],
+ [
+  "['owner']",
+  "must be one of owner, editor, workspace"
+ ]
+]

@@ -1,0 +1,186 @@
+{
+ "chats": [
+  {
+   "agent": "warm-behind",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "plan",
+   "rows": [],
+   "session_id": "<id1>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  },
+  {
+   "agent": "warm-behind",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "resume_failed",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "<id2>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  },
+  {
+   "agent": "warm-behind",
+   "execution_mode": "",
+   "execution_path": "claude-code-cli",
+   "execution_target": "local",
+   "model": "test-model",
+   "pending_history_seed": "",
+   "permission_mode": "ask",
+   "rows": [],
+   "session_id": "<id3>",
+   "title": "",
+   "tui_theme": "",
+   "user_sub": "user-admin"
+  }
+ ],
+ "frames": [],
+ "layer": {
+  "closed": [],
+  "forgotten_probes": [],
+  "messages": [],
+  "mode_changes": [],
+  "model_changes": [],
+  "prepared_resume": [
+   "<id1>",
+   "<id7>",
+   "<id3>"
+  ],
+  "reconnect_waits": [],
+  "started": [
+   {
+    "agent": "warm-behind",
+    "chat_id": "<id4>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "plan",
+    "model": "test-model",
+    "resume": true,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id1>",
+    "user_sub": "user-admin",
+    "username": ""
+   },
+   {
+    "agent": "warm-behind",
+    "chat_id": "<id5>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "ask",
+    "model": "test-model",
+    "resume": false,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id2>",
+    "user_sub": "user-admin",
+    "username": ""
+   },
+   {
+    "agent": "warm-behind",
+    "chat_id": "<id6>",
+    "client_type": "dashboard",
+    "execution_path": "claude-code-cli",
+    "execution_target": "local",
+    "fallback_reason": null,
+    "interactive": false,
+    "interactive_first_prompt": "",
+    "interactive_theme": "dark",
+    "mode": "ask",
+    "model": "test-model",
+    "resume": true,
+    "resume_handle": "",
+    "role": "admin",
+    "session_id": "<id3>",
+    "user_sub": "user-admin",
+    "username": ""
+   }
+  ]
+ },
+ "results": {
+  "fresh": {
+   "execution_target": "local",
+   "fallback_reason": null,
+   "first_prompt_in_argv": false,
+   "interactive": false,
+   "layer_is_the_fake": true,
+   "session_id": "<id2>"
+  },
+  "resumed": {
+   "execution_target": "local",
+   "fallback_reason": null,
+   "first_prompt_in_argv": false,
+   "interactive": false,
+   "layer_is_the_fake": true,
+   "session_id": "<id1>"
+  },
+  "viewed": [
+   "viewed-chat",
+   "viewed-session",
+   true
+  ],
+  "viewed_adopted": {
+   "execution_target": "local",
+   "fallback_reason": null,
+   "layer_is_the_fake": true,
+   "result_session": "<id3>",
+   "session_id": "<id3>"
+  }
+ },
+ "slots": {
+  "acquired": [
+   [
+    "<id1>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "<id2>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ],
+   [
+    "<id3>",
+    {
+     "execution_path": "claude-code-cli",
+     "mcp_config_path": "",
+     "queue_wait_s": "<ADMISSION_QUEUE_WAIT_S>",
+     "target": "compute-0123456789ab",
+     "user_sub": "user-admin"
+    }
+   ]
+  ],
+  "released": [
+   "<id7>"
+  ]
+ }
+}

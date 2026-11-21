@@ -29,6 +29,7 @@ not run where it is answers with a sentence and stays.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
@@ -37,11 +38,15 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 from auth import roles
-from core import placement
-from services.remote import chat_targets
+from core import drain, placement
+from services.remote import chat_targets, machine_away
 from storage import move_schema
+
+if TYPE_CHECKING:
+    from core.remote import session_files
 
 logger = logging.getLogger("otodock.remote")
 
@@ -52,13 +57,22 @@ CANT_THERE = "You can't move this chat there."
 ALREADY_THERE = "This chat already runs there."
 DIRECT_LOCAL = f"Direct LLM chats run on {chat_targets.place_phrase(placement.LOCAL)}."
 NOT_FOUND = "Chat not found."
+UPDATING = "OtoDock is updating. Move the chat again in a few minutes."
 CONTINUES_WORK = "This chat continues delegated work, so it stays where it runs."
+LANE_BUSY = "This chat is busy with delegated work. Move it when that work ends."
+LANE_HANDOVER = ("This chat continues delegated work. Move it from the Runs on menu, then send "
+                 "your message.")
+#: The refusals of a chat whose turn is open: a waiting move asks again.
+_BUSY = (FINISH_TURN, LANE_BUSY)
 VOICE_IN_USE = "A voice conversation is using this chat. End it before moving the chat."
 
 #: How long a move row waits for the target's proof before it settles.
 PROOF_WINDOW = timedelta(days=14)
 #: How long the agent's scheduled move waits for the chat's turn to end.
 TOOL_WAIT_S = 1800.0
+#: How long, inside that wait, it holds for a machine of the move that is
+#: away (a boot's moves wait for the machines to come back).
+MACHINE_WAIT_S = 120.0
 #: The proof sweep's per-row back-off: the first wait and the longest one.
 PROOF_BACKOFF_S = (60.0, 900.0)
 
@@ -70,11 +84,13 @@ class MoveRefused(Exception):
 @dataclass(frozen=True)
 class Asker:
     """Who asks for a move: their sub, their effective role on the chat's
-    agent and whether they are a platform admin."""
+    agent, whether they are a platform admin, and the session that asks
+    when no person does (a task run moving its own chat)."""
 
     sub: str
     role: str
     platform_admin: bool
+    session_id: str = ""
 
 
 #: The progress frames' pace: a frame when the copy moved this many points of
@@ -110,6 +126,10 @@ class _Progress:
         self.last_at = 0.0
         self.last_phase = ""
         self.sent = 0
+
+    def again(self) -> None:
+        """A second try of the copy starts its phases over: its first report goes."""
+        self.last_pct = None
 
     def __call__(self, done: int, total: int, phase: str) -> None:
         self.job.progress = {"done": done, "total": total, "phase": phase}
@@ -161,6 +181,26 @@ def home_user_of(chat: dict, person: chat_targets.RunPerson) -> str:
     return resolve_visibility(agent, username=username, user_sub=person.sub or "").mount_username
 
 
+def session_place(chat: dict, person: chat_targets.RunPerson) -> str:
+    """Where the chat's engine session lives, for a round that resumes it:
+    the machine its pin names; the platform when the pin says so and the
+    platform holds the session's file (``local`` is also the column's
+    default, which a chat whose round never ran keeps); else ``""``, the
+    agent's default. A run pins its chat to where it ran
+    (``task_run._bind_layer``) and a move to where it went. Synchronous."""
+    from core.remote import session_files
+    pin = chat.get("execution_target") or ""
+    if not pin:
+        return ""
+    if not placement.is_local(pin):
+        return placement.machine_of(pin)
+    scope = session_files.SessionScope(
+        agent=chat.get("agent") or "", engine=chat_targets.chat_engine(chat),
+        home_user=home_user_of(chat, person), session_id=chat.get("session_id") or "",
+        resume_handle=chat.get("codex_thread_id") or "")
+    return placement.LOCAL if scope.refs and session_files.local_stat(scope) else ""
+
+
 def _movable_kind(chat: dict) -> bool:
     from core.session import session_kind
     kind = session_kind.of_chat(chat)
@@ -170,13 +210,16 @@ def _movable_kind(chat: dict) -> bool:
 
 def _continues_delegated_work(chat: dict) -> bool:
     """A delegated worker chat (its delegator continues it with
-    ``continue_id``) or a chat a task continues: the next round runs where
-    the task runs, not where the chat is pinned, and resumes the session
-    there. Synchronous."""
+    ``continue_id``), a chat a task can still continue by itself, or one a
+    delegate's round works in now (queued or running): the reload, the
+    account choice and the account's removal leave such a chat to its
+    rounds. A task's row that stayed behind after its run does not count.
+    Synchronous."""
     if chat.get("parent_chat_id"):
         return True
-    from storage import remote_store
-    return remote_store.chat_continued_by_task(chat)
+    from storage import database as task_store, remote_store
+    return (remote_store.task_can_continue(chat)
+            or bool(task_store.live_delegate_run_ids_for_chat(chat.get("id") or "")))
 
 
 def _server_only(chat: dict) -> bool:
@@ -186,42 +229,87 @@ def _server_only(chat: dict) -> bool:
     return caps is not None and not caps.runtime.supports_remote_execution
 
 
-def may_drive(chat: dict, asker: Asker) -> bool:
-    """Whether the asker may drive (and so move) the chat."""
-    from core.session import session_kind, visibility
+def task_asker(chat: dict, session_id: str) -> Asker | None:
+    """A task run's own chat moves as the task's identity, in every scope: a
+    user-scope run as its creator at the creator's role on the agent, a run
+    with no person behind it (an agent-scope task, every task on a
+    Shared-only agent) as the agent at the run's role. The run identity is
+    the authority here, not the token's principal: a token minted before the
+    task builder named the run's person (a session started by an earlier
+    release, or one re-adopted after a restart) still names nobody. A run
+    with no person asks with its own session, which the rule reads for the
+    knowledge write. ``None`` for any other chat. Synchronous."""
+    from core.config.task_config_builder import rewarm_task_identity
+    from core.session import session_kind
     cid = chat.get("id") or ""
-    if session_kind.is_task_chat_id(cid):
-        from storage import database as task_store
-        run = task_store.get_run(session_kind.run_id_of_chat(cid))
-        if not run:
-            return False
-        return visibility._task_continue_allowed(run, effective_role=asker.role, user_sub=asker.sub)
-    owner = chat.get("user_sub") or ""
-    if visibility.is_shared_chat_owner(owner):
-        return roles.can_edit(asker.role)
-    return owner == asker.sub or asker.platform_admin
+    if not session_kind.is_task_chat_id(cid):
+        return None
+    ident = rewarm_task_identity(cid, chat.get("agent") or "")
+    if ident is None:
+        return None
+    sub = ident.creds_user_sub or ""
+    return Asker(sub=sub, role=ident.role, platform_admin=bool(sub) and roles.is_admin(ident.role),
+                 session_id=session_id)
+
+
+def run_asker(chat: dict, session_id: str) -> Asker | None:
+    """The identity of the run whose session this is, for a task session's
+    own call (``chat_reload.schedule_for_run``): a task's own chat or a
+    worker chat, the run found by its session; the creator at their role
+    for a user-scope run, the agent at the run's role with no person
+    otherwise. ``None`` when no run has the session, or it is a call's
+    wrap-up. Synchronous."""
+    from core.config.task_config_builder import resolve_task_identity
+    from services.scheduler import task_kinds
+    from storage import database as task_store
+    run = task_store.get_run_by_session(session_id) if session_id else None
+    if not run or run.get("task_type") == task_kinds.RUN_WRAPUP:
+        return None
+    ident = resolve_task_identity(
+        chat.get("agent") or "", run.get("scope") or "agent", run.get("created_by"),
+        allow_knowledge_rw=task_kinds.run_allows_knowledge_rw(run.get("task_type")))
+    sub = ident.creds_user_sub or ""
+    return Asker(sub=sub, role=ident.role, platform_admin=bool(sub) and roles.is_admin(ident.role),
+                 session_id=session_id)
+
+
+def _asker_now(chat: dict, asker: Asker) -> Asker:
+    """The asker as they stand when the agent's move fires (the turn that
+    asked may have ended long before, or a restart came between): a task-run
+    chat's identity at its session, a person's role on the agent now.
+    ``MoveRefused`` for a person with no access any more. Synchronous."""
+    from auth.providers import effective_role_of
+    task = task_asker(chat, asker.session_id or chat.get("session_id") or "")
+    if task is not None:
+        return task
+    standing = effective_role_of(asker.sub, chat.get("agent") or "") if asker.sub else roles.NO_ACCESS
+    if standing == roles.NO_ACCESS:
+        raise MoveRefused(NOT_MOVER)
+    return Asker(sub=asker.sub, role=standing, platform_admin=roles.is_admin(standing),
+                 session_id=asker.session_id)
+
+
+def may_drive(chat: dict, asker: Asker) -> bool:
+    """Whether the asker may drive (and so move) the chat: the rule every
+    door asks (``visibility.drive_refusal``)."""
+    from core.session import visibility
+    return not visibility.drive_refusal(chat, asker.sub, asker.role, admin=asker.platform_admin,
+                                        session_id=asker.session_id)
 
 
 def _session_live(chat: dict) -> bool:
-    """A live session of the chat right now: a terminal, or a headless
-    session (a remote one held through its reconnect grace counts)."""
-    from core.session import interactive_session
+    """A live session of the chat on the chat's own place: a terminal, or a
+    headless session held there (one on a machine counts while its machine
+    answers or its reconnect grace holds it). The lock reads this, so a
+    session held elsewhere behind the pin, as a round that fell back to the
+    platform leaves one, is not running on the pinned machine."""
+    from core.session import interactive_session, session_manager
     sid = chat.get("session_id") or ""
     if interactive_session.find_live_for_chat(chat.get("id") or "") is not None:
         return True
-    if not sid:
-        return False
-    pin = chat.get("execution_target") or ""
-    if placement.is_local(pin):
-        from core.session.session_manager import find_layer_for_session
-        return find_layer_for_session(sid) is not None
-    from core.remote.satellite_connection import get_connection_manager
-    from core.session.session_manager import _get_remote_layer
-    layer = _get_remote_layer()
-    machine = placement.machine_of(pin)
-    held = sid in (layer.session_ids_on(machine) if hasattr(layer, "session_ids_on") else ())
-    return ((held and get_connection_manager().is_connected(machine))
-            or bool(getattr(layer, "is_session_grace_held", lambda _s: False)(sid)))
+    live = session_manager.live_session(sid) if sid else None
+    return (live is not None and live.reachable
+            and live.machine_id == placement.machine_of(chat.get("execution_target")))
 
 
 def lock_sentence(chat: dict, person_sub: str) -> str:
@@ -234,9 +322,9 @@ def lock_sentence(chat: dict, person_sub: str) -> str:
         return ""
     from storage import remote_store
     machine = remote_store.get_remote_machine(placement.machine_of(pin))
-    if not machine or placement.machine_is_admin_paired(machine):
+    if not placement.machine_is_personal(machine):
         return ""
-    owner = machine.get("registered_by") or ""
+    owner = placement.owner_of(machine)
     if not owner or owner == person_sub:
         return ""
     locked = _session_live(chat)
@@ -270,7 +358,8 @@ def _idle_timeout_s() -> float:
 
 def open_turn(chat: dict) -> bool:
     """A turn open on the chat: a pump running, a warmup in flight, a prompt
-    waiting, a one-shot delivery running, a terminal turn, an active run."""
+    waiting, a one-shot delivery running, a terminal turn, an active run,
+    a delegate's round queued or running in it."""
     from core.events.stream_pump import _active_pumps
     from core.session import (
         interactive_session,
@@ -297,14 +386,48 @@ def open_turn(chat: dict) -> bool:
         run = task_store.get_run(session_kind.run_id_of_chat(cid)) or {}
         if run.get("status") in run_status.LIVE:
             return True
-    return False
+    return _round_live(chat)
+
+
+def _round_live(chat: dict) -> bool:
+    """A delegate's round works in the chat now, queued or running (a
+    continue of a lane, or of a chat a delegation names). Synchronous."""
+    from storage import database as task_store
+    return bool(task_store.live_delegate_run_ids_for_chat(chat.get("id") or ""))
+
+
+def moving_sentence(chat_id: str) -> str:
+    """The sentence that a move of the chat runs in this process ("This
+    chat is moving to <place>."), else ``""``."""
+    job = _running.get(chat_id)
+    return f"This chat is moving to {job.to_phrase}." if job is not None else ""
+
+
+def _lane_without_memory(chat: dict) -> str:
+    """The refusal of a lane (a delegated worker chat) whose files cannot
+    travel now: its delegator's continue resumes its session by id and
+    never reads a summary, so it moves only with them. ``""`` otherwise
+    (a lane with no session has nothing to lose). Synchronous."""
+    if not chat.get("parent_chat_id") or not (chat.get("session_id")
+                                              or chat.get("codex_thread_id")):
+        return ""
+    if chat.get("compute_machine"):
+        # Its record is in a compute machine's own copy, which no move
+        # carries (that machine refuses ``session_move``).
+        return CONTINUES_WORK
+    current = chat_targets.current_target(chat)
+    if _reachable(current):
+        return ""
+    return ("This chat continues delegated work, so it moves only with its memory. Move it when "
+            f"{chat_targets.place_phrase(current)} is back.")
 
 
 # -- the chip's answer -----------------------------------------------------------
 
-def targets_view(chat: dict, asker: Asker, *, blocked: str = "") -> dict:
+def targets_view(chat: dict, asker: Asker, *, blocked: str = "", own_move: bool = False) -> dict:
     """The chip's answer for ``chat`` as ``asker`` sees it; ``blocked`` is a
-    socket's own refusal (a voice conversation on the chat). Synchronous."""
+    socket's own refusal (a voice conversation on the chat), ``own_move``
+    the agent's tool listing the places of its own chat. Synchronous."""
     from core.session import visibility
     from storage import remote_store
     cid = chat.get("id") or ""
@@ -323,18 +446,18 @@ def targets_view(chat: dict, asker: Asker, *, blocked: str = "") -> dict:
     cur = {"target": current, "label": chat_targets.label_of(current, cur_machine or {}),
            "pairing": ("" if cur_machine is None else
                        placement.PAIRING_ADMIN if placement.machine_is_admin_paired(cur_machine)
+                       else placement.PAIRING_COMPUTE if placement.machine_is_compute(cur_machine)
                        else placement.PAIRING_USER),
            "state": cur_state,
-           "owner": (chat_targets.owner_name(cur_machine.get("registered_by") or "")
-                     if cur_machine and not placement.machine_is_admin_paired(cur_machine) else "")}
+           "owner": (chat_targets.owner_name(placement.owner_of(cur_machine))
+                     if placement.machine_is_personal(cur_machine) else "")}
     for e in entries:
         e["is_current"] = e["target"] == current
     if current not in known:
         entries.insert(0, {"target": current, "label": cur["label"], "pairing": cur["pairing"],
                            "state": cur_state, "reachable": cur_state in remote_status.REACHABLE,
                            "is_default": False, "pickable": False, "why_not": "",
-                           "allowed": True, "moves_files": chat_targets.moves_files(current),
-                           "is_current": True})
+                           "allowed": True, "is_current": True})
     refusal = ""
     if not _movable_kind(chat):
         refusal = KIND_STAYS
@@ -342,7 +465,7 @@ def targets_view(chat: dict, asker: Asker, *, blocked: str = "") -> dict:
         refusal = DIRECT_LOCAL
     elif not may_drive(chat, asker):
         refusal = NOT_MOVER
-    elif _continues_delegated_work(chat):
+    elif remote_store.task_can_continue(chat) or (own_move and chat.get("parent_chat_id")):
         refusal = CONTINUES_WORK
     elif blocked:
         refusal = blocked
@@ -364,21 +487,27 @@ def targets_view(chat: dict, asker: Asker, *, blocked: str = "") -> dict:
 # -- the move ----------------------------------------------------------------------
 
 def _validate(chat: dict, wanted: str, asker: Asker, *, expect_from: str | None,
-              check_turn: bool) -> tuple[chat_targets.Target, chat_targets.RunPerson]:
-    """The synchronous checks; ``MoveRefused`` with the sentence."""
+              check_turn: bool, own_move: bool = False,
+              ) -> tuple[chat_targets.Target, chat_targets.RunPerson]:
+    """The synchronous checks; ``MoveRefused`` with the sentence. A task
+    that can still continue the chat keeps it where that task runs; a lane
+    moves when a person moves it, never by its agent's own move
+    (``own_move``: its resume there would run a turn its delegator never
+    hears), and only with its files."""
+    from storage import remote_store
     if not _movable_kind(chat):
         raise MoveRefused(KIND_STAYS)
     if not may_drive(chat, asker):
         raise MoveRefused(NOT_MOVER)
-    if _continues_delegated_work(chat):
+    if remote_store.task_can_continue(chat) or (own_move and chat.get("parent_chat_id")):
         raise MoveRefused(CONTINUES_WORK)
     lock = lock_sentence(chat, asker.sub)
     if lock:
         raise MoveRefused(lock)
     cid = chat.get("id") or ""
-    job = _running.get(cid)
-    if job is not None:
-        raise MoveRefused(f"This chat is moving to {job.to_phrase}.")
+    moving_now = moving_sentence(cid)
+    if moving_now:
+        raise MoveRefused(moving_now)
     current = chat_targets.current_target(chat)
     if expect_from is not None and (placement.machine_of(expect_from) or placement.LOCAL) != current:
         raise MoveRefused(f"This chat just moved to {chat_targets.place_phrase(current)}.")
@@ -395,21 +524,22 @@ def _validate(chat: dict, wanted: str, asker: Asker, *, expect_from: str | None,
         raise MoveRefused(ALREADY_THERE)
     if not hit.pickable:
         raise MoveRefused(hit.why_not or CANT_THERE)
+    lane = _lane_without_memory(chat)
+    if lane:
+        raise MoveRefused(lane)
     if check_turn and open_turn(chat):
-        raise MoveRefused(FINISH_TURN)
+        raise MoveRefused(LANE_BUSY if _round_live(chat) else FINISH_TURN)
     return hit, person
 
 
-def _expected_memory(chat: dict, target: str | None = None) -> str:
+def _expected_memory(chat: dict) -> str:
     """What the move should carry, as the chip promises it: the files when
-    the chat has a session there, the current place is reachable (or the
-    platform) and, given the ``target``, both places' satellites move them,
-    else a summary."""
-    if not (chat.get("session_id") or chat.get("codex_thread_id")):
+    the chat has a session there and the current place is reachable (or the
+    platform), else a summary. A record in a compute machine's own copy
+    (``chats.compute_machine``) never travels: a summary."""
+    if not (chat.get("session_id") or chat.get("codex_thread_id")) or chat.get("compute_machine"):
         return move_schema.MEMORY_SUMMARY
     current = chat_targets.current_target(chat)
-    if target is not None and _old_satellite(current, target):
-        return move_schema.MEMORY_SUMMARY
     if placement.is_local(current):
         return move_schema.MEMORY_FILES
     from services.remote.remote_status import is_reachable
@@ -424,6 +554,8 @@ async def request_move(chat_id: str, wanted: str, *, asker: Asker,
     of its own (a voice bridge attached to the chat)."""
     from storage import database as task_store
     from storage.pg import run_db
+    if drain.holding():
+        raise MoveRefused(drain.refusal(UPDATING))
     chat = await run_db(task_store.get_chat, chat_id)
     if not chat:
         raise MoveRefused(NOT_FOUND)
@@ -448,15 +580,14 @@ async def _start(chat: dict, hit: chat_targets.Target, person: chat_targets.RunP
         q = await input_queue.loaded(cid)
         claim = q.try_claim()
         if claim is None:
-            raise MoveRefused(f"This chat is moving to {_running[cid].to_phrase}."
-                              if cid in _running else FINISH_TURN)
+            raise MoveRefused(moving_sentence(cid) or FINISH_TURN)
     else:
         q = await input_queue.loaded(cid)
     move_id = str(uuid.uuid4())
     job = _Job(move_id, cid, hit.label, hit.target)
     if cid in _running:
         q.release(claim)
-        raise MoveRefused(f"This chat is moving to {_running[cid].to_phrase}.")
+        raise MoveRefused(moving_sentence(cid))
     if warmup_registry.get(cid) is not None:
         # A person's warmup holds no claim: registering would share its entry
         # and the move's end would remove it.
@@ -468,11 +599,12 @@ async def _start(chat: dict, hit: chat_targets.Target, person: chat_targets.RunP
         fresh = await run_db(_get_chat, cid)
         if not fresh or _turn_open_while_held(fresh):
             raise MoveRefused(FINISH_TURN)
+        if await run_db(_round_live, fresh):
+            # A delegate's round queued after the check above.
+            raise MoveRefused(LANE_BUSY)
         memory = _expected_memory(fresh)
         home_user = await run_db(home_user_of, fresh, person)
         current = chat_targets.current_target(fresh)
-        if _old_satellite(current, hit.target):
-            memory = move_schema.MEMORY_SUMMARY
         await run_db(remote_store.create_chat_move, {
             "id": move_id, "chat_id": cid, "agent": fresh.get("agent") or "",
             "engine": chat_targets.chat_engine(fresh),
@@ -503,58 +635,69 @@ def _get_chat(chat_id: str) -> dict | None:
 
 def _turn_open_while_held(chat: dict) -> bool:
     """``open_turn`` minus the warmup registry (the move itself holds it)."""
-    from core.events.stream_pump import _active_pumps
-    from core.session import interactive_session, session_delivery
-    from core.session.session_state import has_pending_prompt
-    cid, sid = chat.get("id") or "", chat.get("session_id") or ""
-    pump = _active_pumps.get(cid)
-    if pump is not None and not pump.is_done:
-        return True
-    if session_delivery.oneshot_inflight(cid) is not None or (sid and has_pending_prompt(sid)):
-        return True
-    isess = interactive_session.find_live_for_chat(cid)
-    return bool(isess is not None and isess.turn_open)
+    from core.session import chat_rebuild
+    return chat_rebuild.turn_open_while_held(chat)
 
 
-async def _close_live(chat: dict) -> None:
-    """Close the chat's live session where it runs (idle by the gates); a
-    machine that is not connected is sent nothing."""
-    from core.session import interactive_session
-    cid, sid = chat["id"], chat.get("session_id") or ""
-    if interactive_session.find_live_for_chat(cid) is not None:
-        await interactive_session.close_for_chat(cid, reason="moved")
-        return
-    if not sid:
-        return
-    pin = chat.get("execution_target") or ""
+async def _close_live(chat: dict) -> bool:
+    """Close the chat's live session where it runs (idle by the gates, read
+    under the move's own hold); a machine that is not connected is sent
+    nothing. True when a session was closed, or may have been."""
+    from core.session import chat_rebuild
     try:
-        if placement.is_local(pin):
-            from core.session.session_manager import find_layer_for_session
-            layer = find_layer_for_session(sid)
-            if layer is not None:
-                await layer.close_session(sid)
-            return
-        from core.remote.satellite_connection import get_connection_manager
-        from core.session.session_manager import _get_remote_layer
-        machine = placement.machine_of(pin)
-        if get_connection_manager().is_connected(machine):
-            # A machine that is not connected is sent nothing: its record
-            # goes with the reaper's next pass.
-            await _get_remote_layer().close_session(sid)
+        return await chat_rebuild.close_chat_session(chat, reason="moved", require_idle=False,
+                                                     lock=False)
     except Exception:  # noqa: BLE001  # a session that will not close is replaced either way
-        logger.warning("chat move: closing session %s failed", sid[:8], exc_info=True)
+        logger.warning("chat move: closing session %s failed",
+                       (chat.get("session_id") or "")[:8], exc_info=True)
+        return True
 
 
-def _old_satellite(source: str, target: str) -> str:
-    """The ``why`` of a move whose files a place's satellite cannot move
-    (``chat_targets.moves_files``), naming that place; ``""`` when both can."""
-    old_source = not chat_targets.moves_files(source)
-    old_target = not chat_targets.moves_files(target)
-    if old_source and old_target:
-        return move_schema.WHY_OLD_SATELLITE
-    if old_source:
-        return move_schema.WHY_OLD_SOURCE
-    return move_schema.WHY_OLD_TARGET if old_target else ""
+async def _copy(job: _Job, scope: session_files.SessionScope, source: str, target: str,
+                progress: _Progress, *,
+                closed_at_source: bool) -> tuple[session_files.CopyResult | None, str, str]:
+    """The copy, after the source's files stopped growing, tried once more
+    when the engine wrote under the first try (``changed``) or the source
+    answered busy right after this move closed its session there. Every
+    failed try's stagings go. ``(result, why, busy_at)``: the copy's
+    result, else the summary's reason and, for a busy refusal, its place."""
+    from core.remote import session_files
+    stage = job.move_id
+    for attempt in (1, 2):
+        await session_files.wait_quiet(source, scope)
+        try:
+            return await session_files.copy_session(scope, source=source, target=target,
+                                                    move_id=stage, progress=progress), "", ""
+        except Exception as e:  # noqa: BLE001  # every failure cleans up, then falls back
+            why = getattr(e, "why", move_schema.WHY_TRANSFER_FAILED)
+            place = getattr(e, "place", "") or source
+            # The platform's own staging (a pull from a machine lands
+            # there whatever the target), then each machine's.
+            await asyncio.to_thread(session_files.local_discard, scope, stage)
+            for p in (source, target):
+                if placement.is_local(p) or not _reachable(p):
+                    continue
+                await session_files.discard(p, scope, stage)
+            if getattr(e, "committed", False):
+                if _reachable(target):
+                    # A copy that failed at or after its commit leaves the
+                    # session on the target under ids no chat resumes there.
+                    try:
+                        await session_files.delete_files(target, scope)
+                    except Exception as de:  # noqa: BLE001  # the target keeps an unused copy
+                        logger.info("chat move %s: nothing removed on the target: %s",
+                                    job.move_id[:8], de)
+            elif attempt == 1 and _reachable(source) and _reachable(target) and (
+                    getattr(e, "changed", False)
+                    or (why == move_schema.WHY_BUSY and place == source and closed_at_source)):
+                logger.info("chat move %s: the source changed during the copy (%s); trying "
+                            "once more", job.move_id[:8], e)
+                stage = str(uuid.uuid4())
+                progress.again()
+                continue
+            logger.warning("chat move %s: the files did not move (%s): %s", job.move_id[:8], why, e)
+            return None, why, (place if why == move_schema.WHY_BUSY else "")
+    return None, move_schema.WHY_TRANSFER_FAILED, ""
 
 
 def _reachable(place: str) -> bool:
@@ -590,39 +733,16 @@ async def _run(job: _Job, chat: dict, hit: chat_targets.Target, person: chat_tar
     ok, memory, why, message = False, "", "", ""
     busy_at = ""
     try:
-        await _close_live(chat)
+        closed = await _close_live(chat)
         result = None
         if not scope.refs:
             why = move_schema.WHY_NO_FILES
         elif not _reachable(source):
             why = move_schema.WHY_OFFLINE
-        elif old := _old_satellite(source, target):
-            why = old
         else:
             progress = _Progress(job, chat, row.get("actor") or "", await _readers(chat))
-            try:
-                result = await session_files.copy_session(scope, source=source, target=target,
-                                                          move_id=move_id, progress=progress)
-            except Exception as e:  # noqa: BLE001  # every failure cleans up, then falls back
-                why = getattr(e, "why", move_schema.WHY_TRANSFER_FAILED)
-                if why == move_schema.WHY_BUSY:
-                    busy_at = getattr(e, "place", "") or source
-                logger.warning("chat move %s: the files did not move (%s): %s", move_id[:8], why, e)
-                # The platform's own staging (a pull from a machine lands
-                # there whatever the target), then each machine's.
-                await asyncio.to_thread(session_files.local_discard, scope, move_id)
-                for place in (source, target):
-                    if placement.is_local(place) or not _reachable(place):
-                        continue
-                    await session_files.discard(place, scope, move_id)
-                if getattr(e, "committed", False) and _reachable(target):
-                    # A copy that failed at or after its commit leaves the
-                    # session on the target under ids no chat resumes there.
-                    try:
-                        await session_files.delete_files(target, scope)
-                    except Exception as de:  # noqa: BLE001  # the target keeps an unused copy
-                        logger.info("chat move %s: nothing removed on the target: %s",
-                                    move_id[:8], de)
+            result, why, busy_at = await _copy(job, scope, source, target, progress,
+                                               closed_at_source=closed)
         if result is not None:
             if await run_db(lambda: remote_store.rebind_chat_with_files(
                     cid, target, expect_target=was_target, expect_session_id=was_sid,
@@ -650,6 +770,10 @@ async def _run(job: _Job, chat: dict, hit: chat_targets.Target, person: chat_tar
         elif not _reachable(target):
             message = (f"The move to {tp} did not finish: {tp} went offline. "
                        f"The chat stays on {fp}.")
+        elif chat.get("parent_chat_id") and scope.refs:
+            # A lane's delegator resumes its session by id and never reads
+            # a summary: it stays where its files are.
+            message = f"The move to {tp} did not finish. The chat stays on {fp}."
         elif await run_db(lambda: remote_store.rebind_chat_to_target(
                 cid, target, move_id, expect_target=was_target, expect_session_id=was_sid,
                 expect_thread=was_thread)):
@@ -793,68 +917,162 @@ async def schedule_after_turn(chat_id: str, wanted: str, *, asker: Asker,
     if blocked is not None and (why := blocked(chat_id)):
         raise MoveRefused(why)
     hit, person = await run_db(lambda: _validate(chat, wanted, asker, expect_from=None,
-                                                 check_turn=False))
-    memory = await run_db(_expected_memory, chat, hit.target)
+                                                 check_turn=False, own_move=True))
+    memory = await run_db(_expected_memory, chat)
+    from services.remote import chat_reload
+    # The move rebuilds the session on the new place: a reload that waits
+    # for the same turn's end would only close it again.
+    chat_reload.cancel(chat_id)
+    from storage.chat import pending_rebuilds
+    await run_db(functools.partial(
+        pending_rebuilds.save, chat_id, pending_rebuilds.MOVE, person=asker.sub,
+        wait_s=TOOL_WAIT_S, target=hit.target))
+    _arm(chat_id, hit.target, asker, blocked, TOOL_WAIT_S)
+    return {"to_label": hit.label, "memory": memory,
+            "to_phrase": chat_targets.place_phrase(hit.target, hit.label)}
+
+
+def _arm(chat_id: str, target: str, asker: Asker, blocked: Callable[[str], str] | None,
+         wait_s: float) -> None:
+    """Start the chat's waiting move, replacing an earlier one. Its row (what
+    a restart finds) goes when the wait ends, unless a later request
+    replaced it or the platform's own stop cut the wait: the next boot
+    settles the row (``settle_after_restart``)."""
     from core import background
+    from storage.chat import pending_rebuilds
+    from storage.pg import run_db
     earlier = _waiters.pop(chat_id, None)
     if earlier is not None and not earlier.done():
         earlier.cancel()
         logger.info("chat move: chat=%s: the agent's later move replaces its earlier one",
                     chat_id[:8])
-    waiter = background.spawn(_wait_and_move(chat_id, hit.target, asker, blocked, resume=True),
-                              name="chat-move-wait", owner="chat_move")
+
+    async def _waiter() -> None:
+        cut_by_the_stop = False
+        try:
+            await _wait_and_move(chat_id, target, asker, blocked, resume=True, wait_s=wait_s)
+        except asyncio.CancelledError:
+            cut_by_the_stop = drain.stopping()
+            raise
+        finally:
+            if not cut_by_the_stop and _waiters.get(chat_id) is asyncio.current_task():
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(run_db(pending_rebuilds.clear, chat_id,
+                                                pending_rebuilds.MOVE))
+
+    waiter = background.spawn(_waiter(), name="chat-move-wait", owner="chat_move")
     _waiters[chat_id] = waiter
     waiter.add_done_callback(lambda t: _waiters.pop(chat_id, None) if _waiters.get(chat_id) is t
                              else None)
-    return {"to_label": hit.label, "memory": memory,
-            "to_phrase": chat_targets.place_phrase(hit.target, hit.label)}
+
+
+async def settle_after_restart(row: dict, *, lives_on: bool) -> None:
+    """The agent's move that waited when the platform stopped (its row taken
+    by the caller, so this runs once per row): armed again with what is left
+    of its wait when the chat's session lives on (its machine kept the turn,
+    the platform continues the chat, or no turn was cut); the asker is read
+    again when it fires and the target validated then. Otherwise, past its
+    deadline, or with nobody to ask for it, the chat is told it did not
+    move. ``blocked`` is none: a voice conversation does not outlive a
+    restart."""
+    from core.session import session_kind
+    from storage.chat import pending_rebuilds
+    from storage.pg import run_db
+    from ws import wire_events as wire
+    chat_id, target = row["chat_id"], row.get("target") or ""
+    who = row.get("person") or ""
+    left = pending_rebuilds.seconds_left(row)
+    if lives_on and left > 0 and target and (who or session_kind.is_task_chat_id(chat_id)):
+        await run_db(functools.partial(
+            pending_rebuilds.save, chat_id, pending_rebuilds.MOVE, person=who, wait_s=left,
+            target=target))
+        _arm(chat_id, target, Asker(sub=who, role="", platform_admin=False), None, left)
+        logger.info("chat move: chat=%s: its move waits again after the restart", chat_id[:8])
+        return
+    earlier = _waiters.pop(chat_id, None)
+    if earlier is not None and not earlier.done():
+        earlier.cancel()
+    await run_db(_history_row, chat_id, "The chat did not move: the platform restarted. Ask again.",
+                 wire.MOVED_FAILED)
+
+
+def _machine_away(chat: dict, target: str) -> bool:
+    """A machine of the move (where the chat is, where it goes) is away.
+    Synchronous."""
+    return not (_reachable(chat_targets.current_target(chat)) and _reachable(target))
 
 
 async def _wait_and_move(chat_id: str, target: str, asker: Asker,
                          blocked: Callable[[str], str] | None = None, *,
-                         resume: bool = False) -> None:
+                         resume: bool = False, wait_s: float = TOOL_WAIT_S) -> None:
     """Wait for the chat's turn to end, then move it; ``resume``: the chat
     then continues there by itself. The claim alone is not the end: a
     terminal turn, a task run and a person's warmup hold no claim, so the
     claim is given back while one of them is open (``open_turn``) and asked
-    for again."""
+    for again. No claim is asked for while the continue pass holds a cut
+    turn of the chat (its start would be refused), and a machine of the move
+    that is away is waited for up to ``MACHINE_WAIT_S``. The asker is read
+    again when it fires."""
     from core.events import input_queue
     from storage import database as task_store
+    from storage.chat import cut_records
     from storage.pg import run_db
-    deadline = time.monotonic() + TOOL_WAIT_S
+    deadline = time.monotonic() + wait_s
+    q = await input_queue.loaded(chat_id)
+    away_since: float | None = None
     while time.monotonic() < deadline:
-        try:
-            claim = await input_queue.claim_when_free(
-                chat_id, timeout=max(0.0, deadline - time.monotonic()))
-        except asyncio.TimeoutError:
-            break
-        q = await input_queue.loaded(chat_id)
-        chat = await run_db(task_store.get_chat, chat_id)
-        if chat and await run_db(open_turn, chat):
-            q.release(claim, rearm=True)
+        # While new work is held it waits too, its row kept: the boot settles it.
+        if drain.holding() or await run_db(cut_records.unsettled_of, chat_id) is not None:
             await asyncio.sleep(TURN_POLL_S)
             continue
+        claim = await input_queue.claim_when_free(
+            chat_id, timeout=max(0.0, deadline - time.monotonic()))
+        if claim is None:
+            # The wait ran out, or the chat is being deleted (the queue
+            # answers at once then): a deleted chat gets no note.
+            if input_queue.deleting(chat_id) or not await run_db(task_store.get_chat, chat_id):
+                return
+            break
         try:
+            chat = await run_db(task_store.get_chat, chat_id)
             if not chat:
-                raise MoveRefused(NOT_FOUND)
+                q.release(claim, rearm=True)
+                return
+            if drain.holding() or await run_db(open_turn, chat):
+                q.release(claim, rearm=True)
+                await asyncio.sleep(TURN_POLL_S)
+                continue
+            if await run_db(_machine_away, chat, target):
+                away_since = away_since if away_since is not None else time.monotonic()
+                if time.monotonic() - away_since < MACHINE_WAIT_S:
+                    q.release(claim, rearm=True)
+                    await asyncio.sleep(TURN_POLL_S)
+                    continue
             if blocked is not None and (why := blocked(chat_id)):
                 raise MoveRefused(why)
+            asker = await run_db(_asker_now, chat, asker)
             hit, person = await run_db(functools.partial(
-                _validate, chat, target, asker, expect_from=None, check_turn=False))
+                _validate, chat, target, asker, expect_from=None, check_turn=False,
+                own_move=resume))
             await _start(chat, hit, person, asker=asker, origin=move_schema.ORIGIN_TOOL,
                          claim=claim, resume=resume)
             return
-        except MoveRefused as e:
+        except BaseException as e:
+            # A cancel (a later move, the stop) or a failure while the claim
+            # is held gives it back; a second release, or one after _start
+            # gave it back, changes nothing.
             q.release(claim, rearm=True)
-            if str(e) == FINISH_TURN:
+            if not isinstance(e, MoveRefused):
+                raise
+            if str(e) in _BUSY:
                 await asyncio.sleep(TURN_POLL_S)
                 continue
-            await run_db(_history_row, chat_id, f"The chat did not move: {e}", "failed")
+            await run_db(_history_row, chat_id, f"The chat did not move. {e}", "failed")
             return
     label = await run_db(chat_targets.label_of, target)
     await run_db(_history_row, chat_id,
                  f"The move to {chat_targets.place_phrase(target, label)} did not happen: "
-                 "the turn did not end within 30 minutes.", "failed")
+                 "the turn did not end in time.", "failed")
 
 
 # -- the resume after the agent's own move ---------------------------------------
@@ -981,20 +1199,13 @@ async def _resume_after_tool_move(job: _Job, asker: Asker) -> None:
 
 async def _deliver_resume(chat: dict, job: _Job, asker: Asker) -> None:
     from core.events import chat_writer
-    from core.permission_modes import offered_mode
-    from core.session import session_kind
-    from core.session.session_delivery import deliver_prompt
-    from core.session.session_manager import get_layer_capabilities
-    from services.scheduler import delivery
+    from core.session import chat_rebuild, session_kind
     from storage import database as task_store
     from storage.pg import run_db
     from ws import wire_events as wire
     cid = job.chat_id
     run_sub, run_role = _builds_as(chat, asker.sub, asker.role)
-    caps = get_layer_capabilities(chat_targets.chat_engine(chat))
-    stored = chat.get("permission_mode") or ""
-    mode = (offered_mode(stored, caps.permission_modes) if caps and caps.permission_modes
-            else offered_mode(stored))
+    mode = chat_rebuild.chat_mode(chat)
     kind = (session_kind.TASK.name if session_kind.is_task_chat_id(cid)
             else session_kind.DASHBOARD.name)
     text = resume_nudge(job.target, job.to_label)
@@ -1042,15 +1253,17 @@ async def _deliver_resume(chat: dict, job: _Job, asker: Asker) -> None:
         return
     logger.info("chat move %s: chat=%s continues on %s by itself (%s, %s)", job.move_id[:8],
                 cid[:8], job.to_label, mode, kind)
+    # A person's own chat, and a typist's turn in a lane's chat, resume as their own warm-up builds.
+    from core.config import spender
+    build = (chat_rebuild.AS_CHAT if run_sub and await run_db(spender.typist_of_lane, chat, run_sub)
+             else (await run_db(chat_rebuild.wake_build, chat, run_sub, run_role)).build)
     try:
-        await deliver_prompt(
+        await chat_rebuild.rebuild_and_resume(
             cid, text, source="move_resume", session_id=chat.get("session_id") or "",
-            agent=chat.get("agent") or "", user_sub=run_sub, role=run_role,
+            agent=chat.get("agent") or "", person=run_sub, role=run_role,
+            mode=mode, kind=kind, build=build,
             persist_event=_persist, allow_ws=False, allow_pty=False,
-            persistent_fn=delivery._deliver_via_persistent,
-            oneshot_fn=functools.partial(delivery._deliver_via_oneshot, permission_mode=mode,
-                                         client_type=kind, fresh_without_session=True),
-            on_outcome=_outcome,
+            fresh_without_session=True, on_outcome=_outcome,
         )
     except Exception:  # noqa: BLE001  # a rung that raises (the spawn's guard, a broken start) is undone like an undelivered nudge
         logger.warning("chat move %s: the resume on %s raised", job.move_id[:8], job.to_label,
@@ -1104,6 +1317,9 @@ def _handover_refusal(chat: dict, asker: Asker) -> str:
         placement.machine_of(chat.get("execution_target") or "")) or {}
     owner = chat.get("user_sub") or ""
     own_chat = owner == asker.sub and not session_kind.is_task_chat_id(chat.get("id") or "")
+    if placement.machine_is_compute(machine):
+        name = chat_targets.label_of(placement.machine_of(chat.get("execution_target") or ""), machine)
+        return f"This chat is on {name}, a compute machine. Move it from the Runs on menu."
     if placement.machine_is_admin_paired(machine):
         if visibility.is_shared_chat_owner(owner) or own_chat:
             return ""
@@ -1140,18 +1356,22 @@ async def hand_over(chat_id: str, *, asker: Asker) -> dict | None:
     refusal = await run_db(_handover_refusal, chat, asker)
     if refusal:
         raise MoveRefused(refusal)
+    if chat.get("parent_chat_id"):
+        # A lane moves only when a person picks its place: a message must
+        # not send its delegator's work to the sender's own default.
+        raise MoveRefused(LANE_HANDOVER)
     view = await run_db(chat_targets.agent_view, chat.get("agent") or "", asker.sub, asker.role,
                         admin_asker=asker.platform_admin, engine_path=chat_targets.chat_engine(chat))
     default = view["default_target"]
     entry = next((t for t in view["targets"] if t["target"] == default), None)
     if entry is None or not entry["pickable"]:
         label = entry["label"] if entry else chat_targets.label_of(default)
-        raise MoveRefused(f"{chat_targets.place_phrase(default, label, start=True)} is offline, "
-                          "so this chat can't run for you right now.")
+        offline = f"{chat_targets.place_phrase(default, label, start=True)} is offline, so this chat can't run for you right now."
+        raise MoveRefused(machine_away.away_sentence(placement.machine_of(default), label, offline))
     try:
         return await request_move(chat_id, default, asker=asker, origin=move_schema.ORIGIN_HANDOVER)
     except MoveRefused as e:
-        if str(e) != FINISH_TURN:
+        if str(e) not in _BUSY:
             raise
         pin = chat.get("execution_target") or ""
         place = await run_db(chat_targets.label_of, pin)
@@ -1180,13 +1400,17 @@ def _not_yet(move_id: str) -> None:
 
 
 async def sweep() -> None:
-    """Settle the moves waiting for proof (the reaper's 60 s loop): the
-    source's copy goes once the target's session file grew past its copied
-    size with the chat's ids unchanged; nothing is deleted on a changed id,
+    """Settle the moves waiting for proof (a task of its own that the
+    reaper's 60 s tick starts and never waits for): the source's copy goes
+    once the target's session file grew past its copied size with the
+    chat's ids unchanged; nothing is deleted on a changed id,
     a newer move, a gone machine, a gone chat, or a session something else
     still names (another chat's ids, a task that continues it). A row that
-    is not proved yet is asked again later each time (``_not_yet``)."""
+    is not proved yet is asked again later each time (``_not_yet``), and so
+    is one whose machine does not answer a read or a delete within the
+    leftovers sweep's bound: one silent machine holds no other row."""
     from core.remote import session_files
+    from services.remote import switch_leftovers
     from storage import database as task_store, remote_store
     from storage.pg import run_db
     rows = await run_db(remote_store.chat_moves_in, (move_schema.AWAITING_RESUME,))
@@ -1225,7 +1449,8 @@ async def sweep() -> None:
             scope = session_files.SessionScope(
                 agent=row["agent"], engine=row["engine"], home_user=row["home_user"],
                 session_id=row["session_id"], resume_handle=row["resume_handle"])
-            size = await session_files.main_size(target, scope, row["main_rel"])
+            size = await asyncio.wait_for(session_files.main_size(target, scope, row["main_rel"]),
+                                          timeout=switch_leftovers.DELETE_WAIT_S)
             if size is None or size <= int(row["main_size"] or 0):
                 _not_yet(mid)
                 continue
@@ -1243,7 +1468,8 @@ async def sweep() -> None:
                     logger.info("chat move %s: resumed on %s; kept on %s: the session is shared",
                                 mid[:8], row["to_label"], row["from_label"])
                 else:
-                    gone = await session_files.delete_files(source, scope)
+                    gone = await asyncio.wait_for(session_files.delete_files(source, scope),
+                                                  timeout=switch_leftovers.DELETE_WAIT_S)
                     logger.info("chat move %s: resumed on %s; %d files removed from %s",
                                 mid[:8], row["to_label"], gone, row["from_label"])
             await _settle(mid, move_schema.SETTLED)
@@ -1251,6 +1477,10 @@ async def sweep() -> None:
         except session_files.TransferError as e:
             # A machine that answered busy or refused: asked again later.
             logger.info("chat move %s: not proved yet: %s", mid[:8], e)
+            _not_yet(mid)
+        except asyncio.TimeoutError:
+            logger.info("chat move %s: a machine did not answer within %.0f s; asked again later",
+                        mid[:8], switch_leftovers.DELETE_WAIT_S)
             _not_yet(mid)
         except Exception:  # noqa: BLE001  # one row's failure never stops the sweep
             logger.warning("chat move sweep: row %s", mid[:8], exc_info=True)

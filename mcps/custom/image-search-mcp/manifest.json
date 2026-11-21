@@ -13,7 +13,11 @@
   },
 
   "credentials": {
-    "type": "none"
+    "type": "none",
+    "exit": [
+      {"key": "UNSPLASH_ACCESS_KEY", "header": "Authorization", "prefix": "Client-ID ", "hosts": ["api.unsplash.com"]},
+      {"key": "PEXELS_API_KEY", "header": "Authorization", "hosts": ["api.pexels.com"]}
+    ]
   },
 
   "instances": {
@@ -27,7 +31,7 @@
        "help": "Free signup at https://www.pexels.com/api/ (200 req/hr, 20k/month)."},
       {"key": "SERPAPI_KEY", "label": "SerpAPI Key (paid, optional — unlocks Google Images AND Lens reverse search)",
        "input_type": "password", "secret": true,
-       "help": "ONE key serves both: full-web Google Images for find_images (prefer_provider='google'/'all') AND Google Lens for search_by_image. Google's own Custom Search API can no longer enable whole-web search for new engines (deprecated by Google late 2024 / early 2025), so we route through SerpAPI's google_images engine instead. Sign up at https://serpapi.com/manage-api-key — 100 free searches/month, then ~$0.01 per search ($50/mo for 5000 on the Developer plan)."}
+       "help": "ONE key serves both: full-web Google Images for find_images (prefer_provider='google'/'all') AND Google Lens for search_by_image. Google's own Custom Search API can no longer enable whole-web search for new engines (deprecated by Google late 2024 / early 2025). So we route through SerpAPI's google_images engine instead. Sign up at https://serpapi.com/manage-api-key (100 free searches/month, then ~$0.01 per search: $50/mo for 5000 on the Developer plan)."}
     ],
     "max_instances": 0
   },

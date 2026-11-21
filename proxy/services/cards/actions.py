@@ -34,6 +34,7 @@ from services.community import (
 )
 from services.departments import assignment, edge_compiler
 from storage.agents import agent_store, db_departments, db_set_installs
+from storage.pg import run_db
 
 SLUG = {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,38}[a-z0-9]$"}
 IDENT = {"type": "string", "minLength": 1, "maxLength": 80}
@@ -155,13 +156,30 @@ async def _install_words(params: dict[str, Any], u) -> dict[str, str]:
     text = f"Installs the {name} template as the agent {slug}."
     if params.get("display_name"):
         text += f" Its name will be {quoted(params['display_name'])}."
-    text += _dept_words(params)
+    text += await run_db(_dept_words, params)
     if entry.get("apps") or entry.get("checks"):
         text += " Its apps wait for approval on their cards and its checks are offered."
     return {"title": f"Install {name}", "text": text, "label": "Install"}
 
 
 INSTALLERS_ONLY = "Only admins and creators install agents."
+
+
+def _placement_refusal(params: dict[str, Any], u) -> str | None:
+    try:
+        assignment.require_assigner(u)
+        dept = db_departments.get_department(str(params["department_id"]))
+        if not dept:
+            return assignment.NO_SUCH_DEPARTMENT + "."
+        if params.get("level_id") not in {lv["id"] for lv in dept["levels"]}:
+            return assignment.LEVEL_NOT_IN_DEPARTMENT + "."
+        # The department half (the agent half waits for the agent, which the
+        # person will manage as its installer).
+        if not assignment.may_place_into(u, dept):
+            return assignment.PLACE_REFUSED
+    except assignment.AssignmentRefused as exc:
+        return exc.detail
+    return None
 
 
 async def _install_check(params: dict[str, Any], u) -> str | None:
@@ -171,15 +189,7 @@ async def _install_check(params: dict[str, Any], u) -> str | None:
     if entry is None:
         return f"The catalog has no template named {params['template_slug']}."
     if params.get("department_id"):
-        try:
-            assignment.require_assigner(u)
-            dept = db_departments.get_department(str(params["department_id"]))
-            if not dept:
-                return assignment.NO_SUCH_DEPARTMENT + "."
-            if params.get("level_id") not in {lv["id"] for lv in dept["levels"]}:
-                return assignment.LEVEL_NOT_IN_DEPARTMENT + "."
-        except assignment.AssignmentRefused as exc:
-            return exc.detail
+        return await run_db(_placement_refusal, params, u)
     return None
 
 
@@ -195,6 +205,12 @@ async def _install_run(params: dict[str, Any], options: dict[str, bool], u) -> O
     # The role again at the click: the person may have lost it since the draw.
     if u.acting_sub is None or not roles.is_creator_or_above(u.role):
         return Outcome(st.OUTCOME_FAILED, INSTALLERS_ONLY)
+    # The department again at the click, before anything is installed: an
+    # agent installed and then refused its place would stand alone.
+    if params.get("department_id"):
+        refusal = await run_db(_placement_refusal, params, u)
+        if refusal:
+            return Outcome(st.OUTCOME_FAILED, f"The agent was not installed: {refusal}")
     target = str(params.get("target_slug") or params["template_slug"])
     slug = ""
     for _attempt in range(3):
@@ -215,7 +231,7 @@ async def _install_run(params: dict[str, Any], options: dict[str, bool], u) -> O
         return Outcome(st.OUTCOME_FAILED, "The agent was not installed: no free name was found.")
     # Every viewer of the chat reads the outcome: it names who manages it.
     manager = str(getattr(u, "display_name", "") or getattr(u, "name", "") or "the person who pressed")
-    lines = [f"{display(slug)} is installed as {slug}, managed by {manager}."]
+    lines = [f"{await run_db(display, slug)} is installed as {slug}, managed by {manager}."]
     if params.get("department_id"):
         try:
             await assignment.assign(slug, str(params["department_id"]), str(params.get("level_id") or ""), u,
@@ -227,7 +243,7 @@ async def _install_run(params: dict[str, Any], options: dict[str, bool], u) -> O
     if options.get("delegation_edge") and agent and (u.is_admin or u.can_manage_agent(agent)):
         await asyncio.to_thread(agent_store.add_manual_delegation_target, agent, slug)
         await asyncio.to_thread(edge_compiler.recompile)
-        lines.append(f"{display(agent)} can hand work to it.")
+        lines.append(f"{await run_db(display, agent)} can hand work to it.")
     return Outcome(st.OUTCOME_DONE, " ".join(lines), extra={"agent_slug": slug})
 
 
@@ -255,6 +271,13 @@ async def _set_of(params: dict[str, Any]) -> tuple[dict, sets.DepartmentSet | No
     return registry, dset, problems
 
 
+def _adopted_members(dset: sets.DepartmentSet, registry: dict, u, name: str) -> list[str]:
+    """The installed agents the department would take, in words."""
+    return [f"{display(row['slug'])} ({row['slug']})"
+            for row in department_set_installer.plan_members(dset, registry, u, None, name)
+            if row["action"] == department_set_installer.ACTION_ADOPT]
+
+
 async def _set_words(params: dict[str, Any], u) -> dict[str, str]:
     registry, dset, _problems = await _set_of(params)
     name = str(params.get("department_name") or (dset.name if dset else params["set_slug"]))
@@ -265,10 +288,9 @@ async def _set_words(params: dict[str, Any], u) -> dict[str, str]:
         for m in dset.members)
     text = (f"Creates the department {quoted(name)} with {len(dset.members)} agents: {members}. "
             f"Delegation runs {db_departments_mode_words(dset.mode)}.")
-    taken = [row for row in department_set_installer.plan_members(dset, registry, u, None, name)
-             if row["action"] == department_set_installer.ACTION_ADOPT]
+    taken = await run_db(_adopted_members, dset, registry, u, name)
     if taken:
-        who = ", ".join(f"{display(r['slug'])} ({r['slug']})" for r in taken)
+        who = ", ".join(taken)
         text += (f" {who} {'joins' if len(taken) == 1 else 'join'} it: installed from "
                  "these templates before and in no department.")
     if dset.library:
@@ -297,7 +319,7 @@ async def _set_check(params: dict[str, Any], u) -> str | None:
     problem = department_set_installer.department_name_problem(name)
     if problem:
         return problem
-    if department_set_installer.running_job(dset.slug):
+    if await run_db(department_set_installer.running_job, dset.slug):
         return department_set_installer.ALREADY_RUNNING
     return None
 
@@ -337,10 +359,15 @@ INSTALL_DEPARTMENT_SET = Action(
 # move_agent
 # ---------------------------------------------------------------------------
 
-async def _move_words(params: dict[str, Any], u) -> dict[str, str]:
+def _move_facts(params: dict[str, Any]) -> tuple[dict, str, str]:
+    """The department's row, the level's name and the agent's name."""
     dept = db_departments.get_department(params["department_id"]) or {}
     level = next((lv["name"] for lv in dept.get("levels") or [] if lv["id"] == params["level_id"]), "")
-    name = display(params["agent"])
+    return dept, level, display(params["agent"])
+
+
+async def _move_words(params: dict[str, Any], u) -> dict[str, str]:
+    dept, level, name = await run_db(_move_facts, params)
     dept_name = quoted(dept["name"]) if dept.get("name") else ""
     return {"title": f"Move {name} to {dept_name or 'a department'}",
             "text": f"Places {name} at the {level or 'chosen'} level of {dept_name or 'the department'}. "
@@ -348,7 +375,7 @@ async def _move_words(params: dict[str, Any], u) -> dict[str, str]:
             "label": "Move"}
 
 
-async def _move_check(params: dict[str, Any], u) -> str | None:
+def _move_refusal(params: dict[str, Any], u) -> str | None:
     if not agent_store.get_agent(params["agent"]):
         return f"There is no agent named {params['agent']}."
     try:
@@ -358,14 +385,17 @@ async def _move_check(params: dict[str, Any], u) -> str | None:
     return None
 
 
+async def _move_check(params: dict[str, Any], u) -> str | None:
+    return await run_db(_move_refusal, params, u)
+
+
 async def _move_run(params: dict[str, Any], options: dict[str, bool], u) -> Outcome:
     try:
         await assignment.assign(params["agent"], params["department_id"], params["level_id"], u)
     except assignment.AssignmentRefused as exc:
         return Outcome(st.OUTCOME_FAILED, exc.detail.rstrip(".") + ".")
-    dept = db_departments.get_department(params["department_id"]) or {}
-    level = next((lv["name"] for lv in dept.get("levels") or [] if lv["id"] == params["level_id"]), "")
-    return Outcome(st.OUTCOME_DONE, f"{display(params['agent'])} is now in {quoted(dept.get('name') or '')} as {level}.")
+    dept, level, name = await run_db(_move_facts, params)
+    return Outcome(st.OUTCOME_DONE, f"{name} is now in {quoted(dept.get('name') or '')} as {level}.")
 
 
 MOVE_AGENT = Action(

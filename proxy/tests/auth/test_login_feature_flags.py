@@ -57,7 +57,8 @@ def test_build_user_response_always_includes_flags():
     assert _FLAG_KEYS <= set(payload["feature_flags"])
 
 
-# --- the apps' store review ask (two admin settings, read through the flags) ---
+# --- the apps' store review ask (two platform settings, read through the flags;
+# no card and no field of the PUT since 2.0: an operator forces another value) ---
 
 _REVIEW_KEYS = ("store_review_enabled", "store_review_days")
 
@@ -91,24 +92,35 @@ def test_the_store_review_days_read_inside_the_range(_review_settings, stored, r
     assert build_feature_flags()["store_review_days"] == read
 
 
-def test_an_admin_turns_the_store_review_off_and_spaces_it(_review_settings):
-    r = client.put("/v1/admin/platform-settings",
-                   json={"store_review_enabled": False, "store_review_days": "120"})
-    assert r.status_code == 200, r.text
-    got = client.get("/v1/admin/platform-settings").json()
-    assert got["store_review_enabled"] is False and got["store_review_days"] == 120
+def test_a_value_stored_before_the_card_went_is_still_read(_review_settings):
+    db.set_platform_setting("store_review_enabled", "0")
+    db.set_platform_setting("store_review_days", "120")
     flags = build_feature_flags()
     assert flags["store_review_enabled"] is False and flags["store_review_days"] == 120
-    assert client.put("/v1/admin/platform-settings", json={"store_review_days": 30}).status_code == 200
-    assert client.put("/v1/admin/platform-settings", json={"store_review_days": "730"}).status_code == 200
-    assert build_feature_flags()["store_review_days"] == 730
+    got = client.get("/v1/admin/platform-settings").json()
+    assert got["store_review_enabled"] is False and got["store_review_days"] == 120
 
 
-@pytest.mark.parametrize("bad", ["29", "731", "soon", "", "45.5", 45.5, "\u00b2", "4\u00b2", -1, 0])
-def test_a_store_review_days_value_out_of_range_is_refused_before_any_write(_review_settings, bad):
-    r = client.put("/v1/admin/platform-settings",
-                   json={"store_review_enabled": False, "store_review_days": bad})
-    assert r.status_code == 400, r.text
-    assert r.json()["detail"] == "The days before the second ask are a whole number from 30 to 730."
-    assert db.get_platform_setting("store_review_enabled") == ""
-    assert db.get_platform_setting("store_review_days") == ""
+@pytest.mark.parametrize("body", [
+    {"store_review_enabled": True, "store_review_days": "45"},
+    {"store_review_days": "29"},
+    {"store_review_enabled": True},
+])
+def test_an_older_dashboards_put_is_answered_and_writes_neither_key(_review_settings, body):
+    db.set_platform_setting("store_review_enabled", "0")
+    db.set_platform_setting("store_review_days", "120")
+    r = client.put("/v1/admin/platform-settings", json=body)
+    assert r.status_code == 200, r.text
+    assert db.get_platform_setting("store_review_enabled") == "0"
+    assert db.get_platform_setting("store_review_days") == "120"
+
+
+def test_an_operator_forces_the_store_review_off_and_spaced(_review_settings, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "forced_settings",
+                        lambda: {"store_review_enabled": "0", "store_review_days": "180"})
+    flags = build_feature_flags()
+    assert flags["store_review_enabled"] is False and flags["store_review_days"] == 180
+    got = client.get("/v1/admin/platform-settings").json()
+    assert got["store_review_enabled"] is False and got["store_review_days"] == 180
+    assert set(_REVIEW_KEYS) <= set(got["forced_keys"])

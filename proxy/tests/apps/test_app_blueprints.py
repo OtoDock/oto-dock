@@ -16,6 +16,7 @@ import asyncio
 import io
 import json
 import tarfile
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,7 +29,13 @@ from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
 from core.session import session_state
-from services.apps import app_blueprints, app_deploy, app_handlers, app_supervisor
+from services.apps import (
+    app_blueprints,
+    app_deploy,
+    app_handlers,
+    app_supervisor,
+    releases,
+)
 from services.community import (
     community_agent_template_store as tpl,
     template_app_seeder as seeder,
@@ -119,9 +126,10 @@ def _template_apps(tdir: Path) -> list:
     return tpl._discover_apps(tdir, document)
 
 
-def _bundle(files: dict[str, bytes], blueprint: dict | None, *, link: str | None = None) -> bytes:
+def _bundle(files: dict[str, bytes], blueprint: dict | None, *, link: str | None = None,
+            mode: str = "w:gz") -> bytes:
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+    with tarfile.open(fileobj=buf, mode=mode) as tar:
         if blueprint is not None:
             data = json.dumps(blueprint).encode()
             info = tarfile.TarInfo("blueprint.json")
@@ -308,6 +316,52 @@ def test_export_and_import_never_follow_a_link(agent_tree, tmp_path):
     assert list(other.iterdir()) == []
 
 
+def test_a_bundle_task_may_declare_its_mode_and_timeout(agent_tree):
+    task_id = app_blueprints._seed_task({"slug": "go", "prompt": "p", "permission_mode": "autoReview",
+                                         "timeout_seconds": 1800}, AGENT, AGENT, "agent", "board", "tpl")
+    row = task_store.get_dynamic_task(task_id)
+    assert (row["permission_mode"], row["timeout_seconds"]) == ("autoReview", 1800)
+    # A bundle task with neither field seeds today's row.
+    plain = task_store.get_dynamic_task(app_blueprints._seed_task(
+        {"slug": "plain", "prompt": "p"}, AGENT, AGENT, "agent", "board", "tpl"))
+    assert (plain["permission_mode"], plain["timeout_seconds"]) == ("", 600)
+
+
+@pytest.mark.parametrize(("field", "value", "words"), [
+    ("permission_mode", "bypassPermissions", "permission_mode must be"),
+    ("timeout_seconds", 30, "timeout_seconds must be"),
+    ("timeout_seconds", "600", "timeout_seconds must be"),
+])
+def test_a_bundle_task_with_a_bad_field_is_refused_with_the_task_named(agent_tree, field, value, words):
+    with pytest.raises(app_blueprints.BlueprintError, match=words):
+        app_blueprints._seed_task({"slug": "go", "prompt": "p", field: value}, AGENT, AGENT, "agent", "board", "tpl")
+
+
+def test_auto_on_an_engine_with_no_reviewer_seeds_dont_ask(agent_tree):
+    with patch("services.scheduler.task_fields.mode_problem",
+               lambda agent, layer, mode: "no reviewer" if mode else ""):
+        task_id = app_blueprints._seed_task({"slug": "go", "prompt": "p", "permission_mode": "autoReview"},
+                                            AGENT, AGENT, "agent", "board", "tpl")
+    assert task_store.get_dynamic_task(task_id)["permission_mode"] == ""
+
+
+def test_the_export_carries_a_mode_and_timeout_only_when_the_import_would_take_them(agent_tree):
+    actions = [{"id": k, "label": k, "type": "fire_task", "task_id": f"task-exp-{k}"}
+               for k in ("auto", "long", "plain")]
+    task_store.create_dynamic_task("task-exp-auto", AGENT, "A", "p", "cli", "trigger", None, None, None, 1800, AGENT,
+                                   scope="agent", permission_mode="autoReview")
+    task_store.create_dynamic_task("task-exp-long", AGENT, "L", "p", "cli", "trigger", None, None, None, 14400, AGENT,
+                                   scope="agent")
+    task_store.create_dynamic_task("task-exp-plain", AGENT, "P", "p", "cli", "trigger", None, None, None, 600, AGENT,
+                                   scope="agent")
+    items, _ = app_blueprints._task_items(actions)
+    by_slug = {i["slug"]: i for i in items}
+    assert by_slug["auto"]["permission_mode"] == "autoReview" and by_slug["auto"]["timeout_seconds"] == 1800
+    # A person's long task exports without a bound its own import refuses.
+    assert "timeout_seconds" not in by_slug["long"] and "permission_mode" not in by_slug["long"]
+    assert set(by_slug["plain"]) == {"slug", "description", "prompt"}
+
+
 def test_a_bad_bundle_is_refused_with_the_reason(agent_tree):
     for files, bp, link, words in (
         (MINIMAL, None, None, "no blueprint.json"),
@@ -369,6 +423,77 @@ def test_a_bundle_of_countless_empty_entries_is_refused_before_it_is_indexed():
     with pytest.raises(app_blueprints.BlueprintError, match="500 files"):
         app_blueprints.read_bundle(buf.getvalue())
     assert time.monotonic() - started < bound(2)
+
+
+MB = 1024 * 1024
+
+
+def _gz(*parts: bytes | tuple[bytes, int]) -> bytes:
+    """A gzip stream of the parts: bytes, or ``(byte, count)`` for that many
+    copies, compressed as they come so the test never holds them whole."""
+    z = zlib.compressobj(6, zlib.DEFLATED, 31)
+    out = []
+    for part in parts:
+        if isinstance(part, bytes):
+            out.append(z.compress(part))
+            continue
+        byte, count = part
+        block = byte * MB
+        while count > 0:
+            out.append(z.compress(block[:min(count, MB)]))
+            count -= MB
+    out.append(z.flush())
+    return b"".join(out)
+
+
+def _big_header(kind: bytes, size: int) -> list[bytes | tuple[bytes, int]]:
+    """A pax header of one comment record, or a GNU long name, of ``size``
+    bytes, its data really there."""
+    if kind == tarfile.GNUTYPE_LONGNAME:
+        length, head, tail = size + 1, b"", b"\0"
+    else:
+        body = len(" comment=") + size + 1
+        length = body + len(str(body + len(str(body))))
+        head, tail = f"{length} comment=".encode(), b"\n"
+    info = tarfile.TarInfo("big")
+    info.type = kind
+    info.size = length
+    return [info.tobuf(tarfile.USTAR_FORMAT), head, (b"a", size), tail + b"\0" * (-length % tarfile.BLOCKSIZE)]
+
+
+@pytest.mark.parametrize("kind", [tarfile.XHDTYPE, tarfile.GNUTYPE_LONGNAME])
+def test_a_bundle_whose_header_unpacks_past_the_cap_is_refused_before_it_is_read_whole(kind):
+    # tarfile reads a pax or GNU long name header whole when its data is
+    # really there: 48 MB of it in a bundle of 50 KB.
+    import tracemalloc
+    data = _gz(*_big_header(kind, 48 * MB), _bundle(MINIMAL, BP, mode="w"))
+    assert len(data) < MB
+    tracemalloc.start()
+    try:
+        with pytest.raises(app_blueprints.BlueprintError, match="the bundle exceeds 32 MB or 500 files"):
+            app_blueprints.read_bundle(data)
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 64 * MB, peak
+    # The most an export holds (32 MB of files) still reads.
+    files = {**MINIMAL, **{f"client/f{i}.bin": b"\0" * (2 * MB) for i in range(15)}}
+    files["client/last.bin"] = b"\0" * (2 * MB - sum(map(len, MINIMAL.values())) - len(json.dumps(BP)))
+    folder, bp = app_blueprints.read_bundle(_gz(_bundle(files, BP, mode="w")))
+    try:
+        assert bp == BP and (folder / "client" / "last.bin").stat().st_size > MB
+    finally:
+        import shutil
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_a_bundle_cut_inside_a_member_is_refused_as_not_an_archive():
+    plain = _bundle(MINIMAL, BP, mode="w")
+    with tarfile.open(fileobj=io.BytesIO(plain)) as tar:
+        last = tar.getmembers()[-1]
+    data = _gz(plain[:last.offset_data + 2])
+    with pytest.raises(app_blueprints.BlueprintError, match="not a .otoapp archive"):
+        app_blueprints.read_bundle(data)
 
 
 def test_a_template_ships_apps_that_land_pending_with_their_needs(agent_tree, tmp_path):
@@ -543,3 +668,316 @@ def test_a_template_copy_makes_each_members_folder_and_an_export_carries_the_key
     finally:
         import shutil
         shutil.rmtree(folder, ignore_errors=True)
+
+
+SERVER = 'Bun.serve({ port: Number(process.env.PORT), hostname: "0.0.0.0", fetch: () => new Response("ok") });\n'
+
+
+def _template_copy(agent_tree: Path, tmp_path: Path, *, server: bool, seed: bool = True,
+                   record_tree: bool = True, manifest: dict | None = None, consent: bool = True) -> list:
+    """One per-user template app, its seed source written and consented by
+    its owner, seeded for alice unless ``seed`` is False; ``record_tree``
+    False leaves the record's ``tree_sha`` out, ``consent`` False records
+    none."""
+    from storage.agents import agent_store
+    agent_store.create_agent(AGENT, "Blueprint", collaborative=True)
+    tdir = tmp_path / "template"
+    home = _folder(tdir / "user-apps" / "home", manifest if manifest is not None else {"title": "Home", "actions": [
+        {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]})
+    if server:
+        (home / "server").mkdir()
+        (home / "server" / "index.ts").write_text(SERVER)
+    items = _template_apps(tdir)
+    seeder.write_seed_source(AGENT, items[0])
+    agent_store.set_community_template_data(AGENT, {
+        "slug": "ops-team", "version": "1.0.0", "tasks": [], "triggers": [], "notifications": [],
+        "dashboards": [], "user_apps": [{"slug": "home", "sig": items[0].sig,
+                                         **({"tree_sha": items[0].tree_sha} if record_tree else {})}],
+        "consent": {"apps": {"home": {"sig": items[0].sig, "by": "alice-sub", "at": "now"}} if consent else {}}})
+    if seed:
+        assert asyncio.run(seeder.seed_user_copy(AGENT, "alice-sub", "home")) == ("seeded", "release 1")
+    return items
+
+
+def test_a_template_copy_unpinned_and_given_a_server_waits_for_a_person(agent_tree, tmp_path, placed, healthy):
+    """The agent's hard unpin clears the copy's live release and keeps its
+    approved manifest; a server added to the working folder and deployed
+    again is still a server the app gains, so it waits."""
+    _template_copy(agent_tree, tmp_path, server=False)
+    assert _hook("unpin", {"slug": "home", "visibility": "user"}, sid=SID).json()["status"] == "ok"
+    parked = task_store.get_app_by_slug(AGENT, "alice", "home")
+    assert parked["template_state"] == "opted_out" and not parked["release_path"]
+    assert task_store.app_actions_approved(parked)
+    work = agent_tree / "users/alice/workspace/apps/home"
+    (work / "server").mkdir()
+    (work / "server" / "index.ts").write_text(SERVER)
+    out = _hook("pin", {"slug": "home", "visibility": "user"}, sid=SID).json()
+    assert out["status"] == "pending approval" and out["adds_server"] is True, out
+    assert not placed.of("app_server_start")
+
+
+def test_the_update_dialog_reads_whether_the_installed_version_runs_a_server(agent_tree, tmp_path):
+    """A shared app by its live release, a per-user app by the template's
+    stored copy, never through a link: what cannot be read counts as none."""
+    import os
+    import shutil
+
+    from services.community import community_agent_updater as upd
+    tdir = tmp_path / "template"
+    board = _folder(tdir / "apps" / "board", {"title": "Board"})
+    (board / "server").mkdir()
+    (board / "server" / "index.ts").write_text(SERVER)
+    items = _template_apps(tdir)
+    task_store.upsert_user("alice-sub", "alice-sub@test.com", "Alice", "admin")
+    assert upd._installed_runs_server(AGENT, items[0]) is False
+    data = {"consent": {"apps": {"board": {"sig": items[0].sig, "by": "alice-sub", "at": "now"}}}}
+    assert asyncio.run(seeder.seed_shared(AGENT, SimpleNamespace(slug="ops-team", apps=items), data))["seeded"]
+    assert upd._installed_runs_server(AGENT, items[0]) is True
+    (home,) = _template_copy(agent_tree, tmp_path / "user", server=True, seed=False)
+    assert upd._installed_runs_server(AGENT, home) is True
+    source = seeder.seed_source_dir(AGENT, "home")
+    aside = tmp_path / "aside"
+    source.rename(aside)
+    os.symlink(aside, source)
+    assert upd._installed_runs_server(AGENT, home) is False
+    source.unlink()
+    aside.rename(source)
+    shutil.rmtree(source / "server")
+    assert upd._installed_runs_server(AGENT, home) is False
+
+
+def test_a_consent_says_the_server_only_where_the_dialog_showed_one_and_the_app_has_it(agent_tree, tmp_path):
+    """``record_consent`` flags an app's server for a slug the dialog listed
+    whose folder holds one; ``consent_reach`` hands the flag on, and nothing
+    for a copy its owner opted out of."""
+    tdir = tmp_path / "template"
+    board = _folder(tdir / "apps" / "board", {"title": "Board"})
+    (board / "server").mkdir()
+    (board / "server" / "index.ts").write_text(SERVER)
+    _folder(tdir / "apps" / "page", {"title": "Page"})
+    items = _template_apps(tdir)
+    template = SimpleNamespace(apps=items, checks=[])
+    sigs = {i.slug: i.sig for i in items}
+    data: dict = {}
+    seeder.record_consent(data, template, sigs, None, "alice-sub", servers=["board", "page"])
+    assert data["consent"]["apps"]["board"]["server"] is True
+    assert "server" not in data["consent"]["apps"]["page"]
+    seeder.record_consent(data, template, sigs, None, "alice-sub")
+    assert "server" not in data["consent"]["apps"]["board"]
+    board_item = next(i for i in items if i.slug == "board")
+    flagged = {"sig": board_item.sig, "by": "alice-sub", "server": True}
+    assert seeder.consent_reach(board_item, flagged, None) == {"consent_tree": board_item.tree_sha,
+                                                               "consent_server": True}
+    assert seeder.consent_reach(board_item, flagged, {"template_state": "opted_out"}) == {
+        "consent_tree": "", "consent_server": False}
+
+
+def test_a_consented_restore_of_a_template_copy_with_a_server_waits_for_a_person(agent_tree, tmp_path):
+    """A purged copy brought back from the template's own copy brings back
+    an app its owner removed: the consent still approves its manifest, and
+    its server waits on the card, with nothing started."""
+    _template_copy(agent_tree, tmp_path, server=True)
+    from services.apps import app_lifecycle
+    row = task_store.get_app_by_slug(AGENT, "alice", "home")
+    assert asyncio.run(app_lifecycle.purge(row))["opted_out"] is True
+    with patch.object(app_supervisor, "start", side_effect=AssertionError("a restore never starts a server")):
+        out = _hook("pin", {"slug": "home", "visibility": "user"}, sid=SID).json()
+    assert out["status"] == "pending approval" and out["adds_server"] is True and out["restored"], out
+    back = task_store.get_app_by_slug(AGENT, "alice", "home")
+    assert task_store.app_actions_approved(back) and not back["release_path"] and back["pending_release"] == 1
+
+
+def test_a_first_copy_no_consent_covers_waits_for_its_server_with_nothing_else_to_approve(agent_tree, tmp_path):
+    """A member's first copy of a template app with an empty manifest and a
+    server, seeded with no consent: nothing else is to approve, and the
+    server waits all the same."""
+    _template_copy(agent_tree, tmp_path, server=True, seed=False, manifest={"title": "Home"}, consent=False)
+    with patch.object(app_supervisor, "start", side_effect=AssertionError("nothing starts")):
+        status, _why = asyncio.run(seeder.seed_user_copy(AGENT, "alice-sub", "home"))
+    assert status == "pending", status
+    row = task_store.get_app_by_slug(AGENT, "alice", "home")
+    assert task_store.app_actions_approved(row) and row["pending_release"] == 1
+    assert app_deploy.status(row)["adds_server"] is True
+
+
+def test_an_import_of_a_new_app_with_a_server_waits_with_nothing_else_to_approve(agent_tree, tmp_path):
+    """A bundle imported as a new app (the import tool, and a share to
+    another agent) is a first release: its server waits on the card."""
+    folder = _folder(tmp_path / "bundle", {"title": "Board"})
+    (folder / "server").mkdir()
+    (folder / "server" / "index.ts").write_text(SERVER)
+    with patch.object(app_supervisor, "start", side_effect=AssertionError("nothing starts")):
+        out = asyncio.run(app_blueprints.import_folder(AGENT, "", None, "board", folder,
+                                                       template_slug="bundle:board", tasks=[]))
+    assert out["status"] == "pending approval" and out["adds_server"] is True, out
+    row = task_store.get_app_by_slug(AGENT, "", "board")
+    assert task_store.app_actions_approved(row) and row["pending_release"] == 1
+
+
+def test_a_consented_template_update_that_adds_a_server_waits_for_a_person(agent_tree, tmp_path):
+    """A template's new version whose shared app gains a server: the
+    consent approves its manifest, never the release past the waiting line,
+    and nothing starts."""
+    tdir = tmp_path / "template"
+    board = _folder(tdir / "apps" / "board", {"title": "Board", "actions": [
+        {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]})
+    items = _template_apps(tdir)
+    task_store.upsert_user("alice-sub", "alice-sub@test.com", "Alice", "admin")
+    data = {"consent": {"apps": {"board": {"sig": items[0].sig, "by": "alice-sub", "at": "now"}}}}
+    seeded = asyncio.run(seeder.seed_shared(AGENT, SimpleNamespace(slug="ops-team", apps=items), data))
+    assert seeded["seeded"] == ["board"], seeded
+    (board / "server").mkdir()
+    (board / "server" / "index.ts").write_text(SERVER)
+    newer = _template_apps(tdir)
+    data = {"consent": {"apps": {"board": {"sig": newer[0].sig, "by": "alice-sub", "at": "now"}}}}
+    with patch.object(app_supervisor, "start", side_effect=AssertionError("an update never starts a server")):
+        seeded = asyncio.run(seeder.seed_shared(AGENT, SimpleNamespace(slug="ops-team", apps=newer), data))
+    assert [p["slug"] for p in seeded["pending"]] == ["board"], seeded
+    row = task_store.get_app_by_slug(AGENT, "", "board")
+    assert row["pending_release"] == 2 and task_store.app_actions_approved(row)
+    assert app_deploy.status(row)["adds_server"] is True
+
+
+HANDLER_SERVER = (
+    'Bun.serve({ port: Number(process.env.PORT), hostname: "0.0.0.0", fetch(req) {\n'
+    '  const u = new URL(req.url);\n'
+    '  if (u.pathname === "/_health") return new Response("ok");\n'
+    '  if (u.pathname === "/_handler/ping") return new Response("pong");\n'
+    '  return new Response("no", { status: 404 });\n'
+    '} });\n'
+)
+
+
+class _Answer:
+    status_code = 200
+
+    async def aiter_bytes(self):
+        yield b"pong"
+
+    async def aclose(self):
+        return None
+
+
+def test_a_wake_held_while_an_update_waits_for_its_server_is_delivered_after_the_approval(
+        agent_tree, tmp_path, placed, healthy, monkeypatch):
+    """A consented update that brings a server and a trigger handler waits
+    with its manifest approved: a wake in the wait is held as an unapproved
+    manifest's is, never dead, and the same delivery reaches the server
+    once a person approved the release."""
+    from storage import db_app_deliveries as deliveries
+    me = {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}
+    tdir = tmp_path / "template"
+    board = _folder(tdir / "apps" / "board", {"title": "Board", "actions": [me]})
+    items = _template_apps(tdir)
+    task_store.upsert_user("alice-sub", "alice-sub@test.com", "Alice", "admin")
+    data = {"consent": {"apps": {"board": {"sig": items[0].sig, "by": "alice-sub", "at": "now"}}}}
+    assert asyncio.run(seeder.seed_shared(AGENT, SimpleNamespace(slug="ops-team", apps=items), data))["seeded"]
+    (board / "app.json").write_text(json.dumps({"title": "Board", "actions": [me],
+                                                "handlers": {"on_trigger": ["ping"]}}))
+    (board / "server").mkdir()
+    (board / "server" / "index.ts").write_text(HANDLER_SERVER)
+    newer = _template_apps(tdir)
+    data = {"consent": {"apps": {"board": {"sig": newer[0].sig, "by": "alice-sub", "at": "now"}}}}
+    seeded = asyncio.run(seeder.seed_shared(AGENT, SimpleNamespace(slug="ops-team", apps=newer), data))
+    assert [p["slug"] for p in seeded["pending"]] == ["board"], seeded
+    row = task_store.get_app_by_slug(AGENT, "", "board")
+    assert task_store.app_actions_approved(row) and row["pending_release"] == 2
+    sent: list[str] = []
+
+    async def forward(inst, method, path, headers, body, *, timeout):
+        sent.append(path)
+        return _Answer()
+
+    monkeypatch.setattr(app_supervisor, "forward", forward)
+
+    async def run() -> None:
+        d = await app_handlers.enqueue(row, "ping", "trigger:t", {})
+        await app_handlers._fire(deliveries.get(d["id"]))
+        held = deliveries.get(d["id"])
+        assert held["status"] == deliveries.PENDING, held
+        assert held["last_error"] == "the app is waiting for approval" and not sent
+        await app_deploy.approve_pending(task_store.get_app(row["id"]), "alice-sub")
+        await app_handlers._fire(deliveries.get(d["id"]))
+        assert deliveries.get(d["id"])["status"] == deliveries.DONE and sent == ["/_handler/ping"]
+        await app_supervisor.stop_all()
+
+    asyncio.run(run())
+
+
+def _server_at_push(monkeypatch) -> None:
+    """The folder the import just wrote gains a server before the deploy
+    cuts it: written where the import hands the folder to paired machines."""
+    from services.infra import file_bookkeeping
+
+    async def push(agent, root, agent_dir, **kw):
+        (Path(root) / "server").mkdir(exist_ok=True)
+        (Path(root) / "server" / "index.ts").write_text(SERVER)
+
+    monkeypatch.setattr(file_bookkeeping, "push_tree_write", push)
+
+
+def test_a_consented_restore_whose_folder_gains_a_server_before_the_cut_waits(agent_tree, tmp_path, monkeypatch):
+    """The consent covers the template's tree, not what the folder holds at
+    the cut: a restore whose cut brings a server the record does not name
+    waits for a person, and nothing starts."""
+    _template_copy(agent_tree, tmp_path, server=False)
+    from services.apps import app_lifecycle
+    asyncio.run(app_lifecycle.purge(task_store.get_app_by_slug(AGENT, "alice", "home")))
+    _server_at_push(monkeypatch)
+    with patch.object(app_supervisor, "start", side_effect=AssertionError("nothing starts")):
+        out = _hook("pin", {"slug": "home", "visibility": "user"}, sid=SID).json()
+    assert out["status"] == "pending approval" and out["adds_server"] is True, out
+
+
+def test_a_consented_first_seed_whose_folder_gains_a_server_before_the_cut_waits(agent_tree, tmp_path, monkeypatch):
+    _template_copy(agent_tree, tmp_path, server=False, seed=False)
+    _server_at_push(monkeypatch)
+    with patch.object(app_supervisor, "start", side_effect=AssertionError("nothing starts")):
+        status, _why = asyncio.run(seeder.seed_user_copy(AGENT, "alice-sub", "home"))
+    assert status == "pending", status
+    row = task_store.get_app_by_slug(AGENT, "alice", "home")
+    assert row["pending_release"] == 1 and app_deploy.status(row)["adds_server"] is True
+
+
+def test_a_record_with_no_tree_hash_covers_no_server(agent_tree, tmp_path):
+    """A consent whose record names no tree covers no server: the seed of a
+    template app with one waits once on a card. Every record a released
+    install holds carries the hash beside its signature."""
+    _template_copy(agent_tree, tmp_path, server=True, seed=False, record_tree=False)
+    with patch.object(app_supervisor, "start", side_effect=AssertionError("nothing starts")):
+        status, _why = asyncio.run(seeder.seed_user_copy(AGENT, "alice-sub", "home"))
+    assert status == "pending", status
+
+
+def test_a_restore_no_consent_covers_that_brings_a_server_waits(agent_tree, tmp_path):
+    """The stored copy changed, so no consent covers the restore: the row
+    kept its approval through the opt-out, and only the server rule makes
+    the release wait."""
+    _template_copy(agent_tree, tmp_path, server=False)
+    from services.apps import app_lifecycle
+    asyncio.run(app_lifecycle.purge(task_store.get_app_by_slug(AGENT, "alice", "home")))
+    source = seeder.seed_source_dir(AGENT, "home")
+    (source / "server").mkdir()
+    (source / "server" / "index.ts").write_text(SERVER)
+    with patch.object(app_supervisor, "start", side_effect=AssertionError("nothing starts")):
+        out = _hook("pin", {"slug": "home", "visibility": "user"}, sid=SID).json()
+    assert out["status"] == "pending approval" and out["adds_server"] is True, out
+
+
+def test_an_honest_shared_seed_with_a_server_goes_live_with_no_card(agent_tree, tmp_path):
+    """The consented first seed of a shared template app whose cut is the
+    tree the consent names goes live, cold, as before."""
+    tdir = tmp_path / "template"
+    board = _folder(tdir / "apps" / "board", {"title": "Board", "actions": [
+        {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]})
+    (board / "server").mkdir()
+    (board / "server" / "index.ts").write_text(SERVER)
+    items = _template_apps(tdir)
+    task_store.upsert_user("alice-sub", "alice-sub@test.com", "Alice", "admin")
+    data = {"consent": {"apps": {"board": {"sig": items[0].sig, "by": "alice-sub", "at": "now"}}}}
+    with patch.object(app_supervisor, "start", side_effect=AssertionError("a seed never starts a server")):
+        seeded = asyncio.run(seeder.seed_shared(AGENT, SimpleNamespace(slug="ops-team", apps=items), data))
+    assert seeded["seeded"] == ["board"], seeded
+    row = task_store.get_app_by_slug(AGENT, "", "board")
+    assert row["release_path"] and not row["pending_release"]
+    assert releases.code_sha(releases.app_release_dir(row) / "1") == items[0].tree_sha

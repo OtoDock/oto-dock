@@ -368,3 +368,99 @@ async def test_a_frame_the_session_manager_cannot_take_is_logged(spawned, caplog
     assert [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR] == [
         "Error handling start_session"]
     assert spawned == []
+
+
+async def test_an_update_to_the_running_version_is_answered_and_never_applied(spawned, monkeypatch, caplog):
+    """A frame for the running version is read, so answered, and dropped
+    with one line."""
+    from satellite import config
+
+    order = []
+
+    async def _update(msg):
+        order.append(("applied", msg["target_version"]))
+
+    async def _ack(self, msg):
+        order.append(("acked", msg["target_version"]))
+
+    monkeypatch.setattr(ws_client, "_self_update_and_restart", _update)
+    monkeypatch.setattr(ws_client.SatelliteWSClient, "_acknowledge_update", _ack)
+    with caplog.at_level(logging.INFO, logger="satellite"):
+        await _drive(_client(_SM()), [{"type": "update_required", "target_version": config.SATELLITE_VERSION}])
+    assert order == [("acked", config.SATELLITE_VERSION)]
+    assert ("update", "link") not in spawned
+    lines = [r.getMessage() for r in caplog.records if "update" in r.getMessage().lower()]
+    assert lines == [f"Update to {config.SATELLITE_VERSION} not applied: it already runs {config.SATELLITE_VERSION}"]
+
+
+async def test_a_second_update_while_one_applies_is_answered_and_dropped(spawned, monkeypatch):
+    order = []
+    hold = asyncio.Event()
+
+    async def _update(msg):
+        order.append(("applied", msg["target_version"]))
+        await hold.wait()
+
+    async def _ack(self, msg):
+        order.append(("acked", msg["target_version"]))
+
+    monkeypatch.setattr(ws_client, "_self_update_and_restart", _update)
+    monkeypatch.setattr(ws_client.SatelliteWSClient, "_acknowledge_update", _ack)
+    c = _client(_SM())
+    await _drive(c, [{"type": "update_required", "target_version": "9.9.9"}])
+    await _drive(c, [{"type": "update_required", "target_version": "9.9.9"}])
+    assert order == [("acked", "9.9.9"), ("applied", "9.9.9"), ("acked", "9.9.9")]
+    assert spawned.count(("update", "link")) == 1
+    hold.set()
+
+
+async def test_two_update_frames_read_back_to_back_apply_once(spawned, monkeypatch):
+    """The socket hands a buffered frame over with no step between: the claim
+    is taken in the frame handler, before the apply task has started."""
+    applied = []
+    hold = asyncio.Event()
+
+    async def _update(msg):
+        applied.append(msg["target_version"])
+        await hold.wait()
+
+    monkeypatch.setattr(ws_client, "_self_update_and_restart", _update)
+    monkeypatch.setattr(ws_client.SatelliteWSClient, "_acknowledge_update", lambda self, msg: asyncio.sleep(0))
+    await _drive(_client(_SM()), [{"type": "update_required", "target_version": "9.9.9"},
+                                  {"type": "update_required", "target_version": "9.9.9"}])
+    assert applied == ["9.9.9"]
+    assert spawned.count(("update", "link")) == 1
+    hold.set()
+
+
+async def test_an_apply_that_comes_back_lets_the_next_update_apply(spawned, monkeypatch):
+    """A failed extract or venv returns without the exit: the claim is freed."""
+    applied = []
+    hold = asyncio.Event()
+
+    async def _update(msg):
+        applied.append(msg["target_version"])
+        if len(applied) > 1:    # the first came back, the second applies
+            await hold.wait()
+
+    monkeypatch.setattr(ws_client, "_self_update_and_restart", _update)
+    monkeypatch.setattr(ws_client.SatelliteWSClient, "_acknowledge_update", lambda self, msg: asyncio.sleep(0))
+    c = _client(_SM())
+    await _drive(c, [{"type": "update_required", "target_version": "9.9.9"}])
+    await _drive(c, [{"type": "update_required", "target_version": "9.9.9"}])
+    await _drive(c, [{"type": "update_required", "target_version": "9.9.9"}])
+    assert applied == ["9.9.9", "9.9.9"]   # the second still holds the claim at the third
+    hold.set()
+
+
+async def test_an_acknowledgement_cut_short_frees_the_claim(spawned, monkeypatch):
+    from satellite.transport import lifecycle_update
+
+    async def _ack(self, msg):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(ws_client.SatelliteWSClient, "_acknowledge_update", _ack)
+    c = _client(_SM())
+    with pytest.raises(asyncio.CancelledError):
+        await c._frame_update_required({"type": "update_required", "target_version": "9.9.9"})
+    assert lifecycle_update.claim_update({"target_version": "9.9.9"}) == ""
